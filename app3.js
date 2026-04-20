@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
@@ -12,10 +13,13 @@ if (!BOT_TOKEN) {
 }
 
 const DB_PATH = String(process.env.DB_PATH || path.join(__dirname, 'sc1forcrnexus.db')).trim();
-const SC_REGISTRATION_FEE = Math.max(0, Number(process.env.SC_REGISTRATION_FEE || 25000) || 25000);
-const TOPUP_MIN = Math.max(1000, Number(process.env.TOPUP_MIN || 5000) || 5000);
-const TOPUP_EXPIRE_MS = Math.max(60000, Number(process.env.TOPUP_EXPIRE_MS || (5 * 60 * 1000)) || (5 * 60 * 1000));
-const SC_INSTALLER_LOCAL_PATH = String(
+const DEFAULT_SC_REGISTRATION_FEE = Math.max(0, Number(process.env.SC_REGISTRATION_FEE || 25000) || 25000);
+const DEFAULT_TOPUP_MIN = Math.max(1000, Number(process.env.TOPUP_MIN || 5000) || 5000);
+const DEFAULT_TOPUP_EXPIRE_MS = Math.max(60000, Number(process.env.TOPUP_EXPIRE_MS || (5 * 60 * 1000)) || (5 * 60 * 1000));
+const DEFAULT_LICENSE_API_PORT = Math.max(1, Number(process.env.LICENSE_API_PORT || 8099) || 8099);
+const DEFAULT_AUTO_PROVISION_DOMAIN = /^(1|true|yes|on)$/i.test(String(process.env.AUTO_PROVISION_DOMAIN || '1').trim());
+const DEFAULT_CERTBOT_EMAIL = String(process.env.CERTBOT_EMAIL || '').trim();
+const DEFAULT_SC_INSTALLER_LOCAL_PATH = String(
   process.env.SC_INSTALLER_LOCAL_PATH || path.join(__dirname, 'payload', 'setup-autoscript-compat.sh')
 ).trim();
 const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
@@ -26,6 +30,14 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
 const bot = new Telegraf(BOT_TOKEN);
 const userState = new Map();
 const db = new sqlite3.Database(DB_PATH);
+const DYNAMIC_SETTING_KEYS = [
+  'SC_REGISTRATION_FEE',
+  'TOPUP_MIN',
+  'TOPUP_EXPIRE_MS',
+  'AUTO_PROVISION_DOMAIN',
+  'CERTBOT_EMAIL',
+  'SC_INSTALLER_LOCAL_PATH'
+];
 
 function dbRun(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -93,6 +105,107 @@ async function initDb() {
     updated_at INTEGER NOT NULL,
     added_by INTEGER
   )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    updated_by INTEGER
+  )`);
+  await seedDefaultSettings();
+}
+
+async function seedDefaultSettings() {
+  const now = Date.now();
+  const defaults = {
+    SC_REGISTRATION_FEE: String(DEFAULT_SC_REGISTRATION_FEE),
+    TOPUP_MIN: String(DEFAULT_TOPUP_MIN),
+    TOPUP_EXPIRE_MS: String(DEFAULT_TOPUP_EXPIRE_MS),
+    AUTO_PROVISION_DOMAIN: DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0',
+    CERTBOT_EMAIL: DEFAULT_CERTBOT_EMAIL,
+    SC_INSTALLER_LOCAL_PATH: DEFAULT_SC_INSTALLER_LOCAL_PATH
+  };
+  for (const [key, value] of Object.entries(defaults)) {
+    await dbRun(
+      'INSERT OR IGNORE INTO app_settings (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)',
+      [key, String(value), now, 0]
+    );
+  }
+}
+
+async function setDynamicSetting(key, value, userId = 0) {
+  const now = Date.now();
+  await dbRun(
+    `INSERT INTO app_settings (key, value, updated_at, updated_by)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
+    [key, String(value), now, Number(userId) || 0]
+  );
+}
+
+async function getDynamicSetting(key, fallback = '') {
+  const row = await dbGet('SELECT value FROM app_settings WHERE key = ? LIMIT 1', [key]);
+  const v = String(row?.value || '').trim();
+  return v === '' ? String(fallback || '') : v;
+}
+
+function parseBool01(raw, fallback = false) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return fallback;
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+async function getSettingNumber(key, fallback, min = null, max = null) {
+  const raw = await getDynamicSetting(key, String(fallback));
+  let n = Number(raw);
+  if (!Number.isFinite(n)) n = Number(fallback);
+  n = Math.floor(n);
+  if (Number.isFinite(min) && n < min) n = min;
+  if (Number.isFinite(max) && n > max) n = max;
+  return n;
+}
+
+async function getRegistrationFee() {
+  return getSettingNumber('SC_REGISTRATION_FEE', DEFAULT_SC_REGISTRATION_FEE, 0, 1000000000);
+}
+
+async function getTopupMin() {
+  return getSettingNumber('TOPUP_MIN', DEFAULT_TOPUP_MIN, 1000, 1000000000);
+}
+
+async function getTopupExpireMs() {
+  return getSettingNumber('TOPUP_EXPIRE_MS', DEFAULT_TOPUP_EXPIRE_MS, 60000, 86400000);
+}
+
+async function getAutoProvisionDomain() {
+  const raw = await getDynamicSetting('AUTO_PROVISION_DOMAIN', DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0');
+  return parseBool01(raw, DEFAULT_AUTO_PROVISION_DOMAIN);
+}
+
+async function getCertbotEmail() {
+  return getDynamicSetting('CERTBOT_EMAIL', DEFAULT_CERTBOT_EMAIL);
+}
+
+async function getScInstallerLocalPath() {
+  return getDynamicSetting('SC_INSTALLER_LOCAL_PATH', DEFAULT_SC_INSTALLER_LOCAL_PATH);
+}
+
+async function getDynamicSettingsSnapshot() {
+  const [fee, minTopup, expMs, autoProv, certEmail, installerPath] = await Promise.all([
+    getRegistrationFee(),
+    getTopupMin(),
+    getTopupExpireMs(),
+    getAutoProvisionDomain(),
+    getCertbotEmail(),
+    getScInstallerLocalPath()
+  ]);
+  return {
+    SC_REGISTRATION_FEE: String(fee),
+    TOPUP_MIN: String(minTopup),
+    TOPUP_EXPIRE_MS: String(expMs),
+    AUTO_PROVISION_DOMAIN: autoProv ? '1' : '0',
+    CERTBOT_EMAIL: certEmail || '-',
+    SC_INSTALLER_LOCAL_PATH: installerPath
+  };
 }
 
 function normalizeHost(input) {
@@ -258,7 +371,7 @@ async function isRegisteredHost(userId, host) {
   return !!row;
 }
 
-async function registerScIp(userId, ip) {
+async function registerScIp(userId, ip, registrationFee) {
   await ensureUser(userId);
 
   if (await isIpOwnedByOther(ip, userId)) {
@@ -275,7 +388,7 @@ async function registerScIp(userId, ip) {
 
   await dbRun('BEGIN IMMEDIATE TRANSACTION');
   try {
-    const ok = await deductSaldoAtomic(userId, SC_REGISTRATION_FEE);
+    const ok = await deductSaldoAtomic(userId, registrationFee);
     if (!ok) {
       await dbRun('ROLLBACK');
       return { insufficient: true };
@@ -289,7 +402,7 @@ async function registerScIp(userId, ip) {
       [userId, ip, now, now]
     );
 
-    await saveTransaction(userId, -SC_REGISTRATION_FEE, 'sc_registration', `sc_reg_${userId}_${now}`);
+    await saveTransaction(userId, -registrationFee, 'sc_registration', `sc_reg_${userId}_${now}`);
     await dbRun('COMMIT');
     return { success: true };
   } catch (e) {
@@ -316,9 +429,66 @@ function adminMenu() {
     [Markup.button.callback('Tambah Domain API', 'm_admin_add_domain')],
     [Markup.button.callback('List Domain API', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain API', 'm_admin_remove_domain')],
+    [Markup.button.callback('Lihat Env Dinamis', 'm_admin_env_show')],
+    [Markup.button.callback('Ubah Env Dinamis (Menu)', 'm_admin_env_set')],
     [Markup.button.callback('Upload File Update SC', 'm_admin_upload_sc')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
+}
+
+function adminEnvMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Billing', 'm_admin_env_group_billing')],
+    [Markup.button.callback('Provisioning', 'm_admin_env_group_prov')],
+    [Markup.button.callback('Installer', 'm_admin_env_group_installer')],
+    [Markup.button.callback('Input Manual Key', 'm_admin_env_manual')],
+    [Markup.button.callback('Kembali Admin', 'm_admin_env_back_admin')]
+  ]);
+}
+
+function adminEnvGroupMenu(group) {
+  const g = String(group || '').toLowerCase();
+  if (g === 'billing') {
+    return Markup.inlineKeyboard([
+      [Markup.button.callback('SC_REGISTRATION_FEE', 'm_admin_env_pick_SC_REGISTRATION_FEE')],
+      [Markup.button.callback('TOPUP_MIN', 'm_admin_env_pick_TOPUP_MIN')],
+      [Markup.button.callback('TOPUP_EXPIRE_MS', 'm_admin_env_pick_TOPUP_EXPIRE_MS')],
+      [Markup.button.callback('Kembali Env', 'm_admin_env_set')]
+    ]);
+  }
+  if (g === 'prov') {
+    return Markup.inlineKeyboard([
+      [Markup.button.callback('AUTO_PROVISION_DOMAIN', 'm_admin_env_pick_AUTO_PROVISION_DOMAIN')],
+      [Markup.button.callback('CERTBOT_EMAIL', 'm_admin_env_pick_CERTBOT_EMAIL')],
+      [Markup.button.callback('Kembali Env', 'm_admin_env_set')]
+    ]);
+  }
+  if (g === 'installer') {
+    return Markup.inlineKeyboard([
+      [Markup.button.callback('SC_INSTALLER_LOCAL_PATH', 'm_admin_env_pick_SC_INSTALLER_LOCAL_PATH')],
+      [Markup.button.callback('Kembali Env', 'm_admin_env_set')]
+    ]);
+  }
+  return adminEnvMenu();
+}
+
+function envKeyInputHint(key) {
+  switch (String(key || '').toUpperCase()) {
+    case 'SC_REGISTRATION_FEE':
+      return 'Contoh: 25000 (rupiah, angka bulat).';
+    case 'TOPUP_MIN':
+      return 'Contoh: 5000 (minimal topup).';
+    case 'TOPUP_EXPIRE_MS':
+      return 'Contoh: 900000 untuk 15 menit.';
+    case 'AUTO_PROVISION_DOMAIN':
+      return 'Isi: 1 atau 0 (1=aktif, 0=nonaktif).';
+    case 'CERTBOT_EMAIL':
+      return 'Contoh: admin@domainkamu.com (boleh kosong).';
+    case 'SC_INSTALLER_LOCAL_PATH':
+      return 'Contoh: /root/botsc1forcrnexus/payload/setup-autoscript-compat.sh';
+    default:
+      return '';
+  }
 }
 
 async function requireRegistered(ctx) {
@@ -371,6 +541,110 @@ function isDomainLike(input) {
   const d = String(input || '').trim().toLowerCase();
   if (!d) return false;
   return /^[a-z0-9.-]+(:[0-9]{1,5})?$/.test(d);
+}
+
+function normalizeDomainWithoutPort(input) {
+  const raw = normalizeDomain(input);
+  if (!raw) return '';
+  const noPort = raw.replace(/:\d{1,5}$/, '');
+  return noPort.trim();
+}
+
+function isProvisionableDomain(input) {
+  const d = normalizeDomainWithoutPort(input);
+  if (!d) return false;
+  if (isIpv4(d)) return false;
+  return /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(d);
+}
+
+function runCmd(cmd, args, options = {}) {
+  return execFileSync(cmd, args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...options
+  });
+}
+
+function ensureRuntimeDeps() {
+  try {
+    runCmd('nginx', ['-v']);
+  } catch (_) {
+    throw new Error('nginx belum terpasang di server bot.');
+  }
+  try {
+    runCmd('certbot', ['--version']);
+  } catch (_) {
+    throw new Error('certbot belum terpasang di server bot.');
+  }
+}
+
+function writeNginxInstallerVhost(domain, targetPort) {
+  const confPath = `/etc/nginx/sites-available/sc1forcr-installer-${domain}.conf`;
+  const linkPath = `/etc/nginx/sites-enabled/sc1forcr-installer-${domain}.conf`;
+  const cfg = [
+    'server {',
+    '    listen 80;',
+    '    listen [::]:80;',
+    `    server_name ${domain};`,
+    '    client_max_body_size 16m;',
+    '',
+    '    location /.well-known/acme-challenge/ {',
+    '        root /var/www/certbot;',
+    '    }',
+    '',
+    '    location / {',
+    `        proxy_pass http://127.0.0.1:${targetPort};`,
+    '        proxy_http_version 1.1;',
+    '        proxy_set_header Host $host;',
+    '        proxy_set_header X-Real-IP $remote_addr;',
+    '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+    '        proxy_set_header X-Forwarded-Proto $scheme;',
+    '        proxy_read_timeout 300s;',
+    '    }',
+    '}',
+    ''
+  ].join('\n');
+  fs.mkdirSync('/var/www/certbot', { recursive: true });
+  fs.writeFileSync(confPath, cfg, 'utf8');
+  try { fs.chmodSync(confPath, 0o644); } catch (_) {}
+  try {
+    if (!fs.existsSync(linkPath)) fs.symlinkSync(confPath, linkPath);
+  } catch (_) {
+    // If symlink already exists but broken/invalid, overwrite it.
+    try {
+      fs.rmSync(linkPath, { force: true });
+      fs.symlinkSync(confPath, linkPath);
+    } catch (e) {
+      throw new Error(`gagal membuat symlink nginx: ${e.message}`);
+    }
+  }
+}
+
+async function provisionInstallerDomain(domain) {
+  const autoProvisionEnabled = await getAutoProvisionDomain();
+  if (!autoProvisionEnabled) return;
+  if (!isProvisionableDomain(domain)) {
+    throw new Error('domain tidak valid untuk auto-provision SSL.');
+  }
+  if (typeof process.getuid === 'function' && process.getuid() !== 0) {
+    throw new Error('bot harus jalan sebagai root agar bisa auto-setup nginx+SSL.');
+  }
+
+  ensureRuntimeDeps();
+  writeNginxInstallerVhost(domain, DEFAULT_LICENSE_API_PORT);
+  runCmd('nginx', ['-t']);
+  runCmd('systemctl', ['reload', 'nginx']);
+
+  const certbotEmail = await getCertbotEmail();
+  const certbotArgs = ['--nginx', '-d', domain, '--non-interactive', '--agree-tos', '--redirect'];
+  if (certbotEmail) {
+    certbotArgs.push('-m', certbotEmail);
+  } else {
+    certbotArgs.push('--register-unsafely-without-email');
+  }
+  runCmd('certbot', certbotArgs);
+  runCmd('nginx', ['-t']);
+  runCmd('systemctl', ['reload', 'nginx']);
 }
 
 async function addApiDomain(domain, adminId) {
@@ -453,11 +727,12 @@ bot.start(async (ctx) => {
   userState.delete(ctx.chat.id);
   const saldo = await getSaldo(ctx.from.id).catch(() => 0);
   const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
+  const regFee = await getRegistrationFee();
   await ctx.reply(
     'SC 1FORCR Nexus Bot\n\n' +
       `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n` +
       `IP SC terdaftar: ${regs.length}\n` +
-      `Biaya registrasi SC per IP: Rp ${SC_REGISTRATION_FEE.toLocaleString('id-ID')}\n\n` +
+      `Biaya registrasi SC per IP: Rp ${regFee.toLocaleString('id-ID')}\n\n` +
       'Alur:\n' +
       '1) Topup saldo dulu (GoPay).\n' +
       '2) Registrasi IP VPS SC.\n' +
@@ -493,7 +768,10 @@ bot.action('m_admin_add_domain', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_add_domain' });
-  await ctx.reply('Masukkan domain API installer. Contoh: installer.domainkamu.com');
+  await ctx.reply(
+    'Masukkan domain API installer (tanpa port). Contoh: installer.domainkamu.com\n' +
+      'Bot akan auto-setup nginx + SSL certbot di server ini.'
+  );
 });
 
 bot.action('m_admin_remove_domain', async (ctx) => {
@@ -501,6 +779,77 @@ bot.action('m_admin_remove_domain', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_remove_domain' });
   await ctx.reply('Masukkan domain API yang ingin dihapus.');
+});
+
+bot.action('m_admin_env_show', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const snap = await getDynamicSettingsSnapshot();
+  await ctx.reply(
+    'Env dinamis saat ini:\n' +
+      `- SC_REGISTRATION_FEE=${snap.SC_REGISTRATION_FEE}\n` +
+      `- TOPUP_MIN=${snap.TOPUP_MIN}\n` +
+      `- TOPUP_EXPIRE_MS=${snap.TOPUP_EXPIRE_MS}\n` +
+      `- AUTO_PROVISION_DOMAIN=${snap.AUTO_PROVISION_DOMAIN}\n` +
+      `- CERTBOT_EMAIL=${snap.CERTBOT_EMAIL}\n` +
+      `- SC_INSTALLER_LOCAL_PATH=${snap.SC_INSTALLER_LOCAL_PATH}`,
+    adminMenu()
+  );
+});
+
+bot.action('m_admin_env_set', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.delete(ctx.chat.id);
+  await ctx.reply('Pilih grup parameter env yang ingin diubah:', adminEnvMenu());
+});
+
+bot.action('m_admin_env_back_admin', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.delete(ctx.chat.id);
+  await ctx.reply('Kembali ke menu admin.', adminMenu());
+});
+
+bot.action('m_admin_env_manual', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_set_env_key' });
+  await ctx.reply(
+    'Masukkan nama env yang ingin diubah:\n' +
+      DYNAMIC_SETTING_KEYS.map((k) => `- ${k}`).join('\n')
+  );
+});
+
+bot.action('m_admin_env_group_billing', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.delete(ctx.chat.id);
+  await ctx.reply('Env Dinamis - Billing:', adminEnvGroupMenu('billing'));
+});
+
+bot.action('m_admin_env_group_prov', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.delete(ctx.chat.id);
+  await ctx.reply('Env Dinamis - Provisioning:', adminEnvGroupMenu('prov'));
+});
+
+bot.action('m_admin_env_group_installer', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.delete(ctx.chat.id);
+  await ctx.reply('Env Dinamis - Installer:', adminEnvGroupMenu('installer'));
+});
+
+bot.action(/m_admin_env_pick_(.+)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const key = String(ctx.match?.[1] || '').trim().toUpperCase();
+  if (!DYNAMIC_SETTING_KEYS.includes(key)) return ctx.reply('Key env tidak valid.', adminEnvMenu());
+  userState.set(ctx.chat.id, { step: 'admin_set_env_value', envKey: key });
+  const hint = envKeyInputHint(key);
+  await ctx.reply(`Masukkan value baru untuk ${key}:\n${hint}`);
 });
 
 bot.action('m_admin_list_domains', async (ctx) => {
@@ -558,17 +907,19 @@ bot.action('m_install_link', async (ctx) => {
 
 bot.action('m_register_sc', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
+  const regFee = await getRegistrationFee();
   userState.set(ctx.chat.id, { step: 'register_sc_ip' });
   await ctx.reply(
-    `Masukkan IP VPS SC yang ingin didaftarkan.\nBiaya registrasi: Rp ${SC_REGISTRATION_FEE.toLocaleString('id-ID')} / IP.\nKetik "batal" untuk batal.`
+    `Masukkan IP VPS SC yang ingin didaftarkan.\nBiaya registrasi: Rp ${regFee.toLocaleString('id-ID')} / IP.\nKetik "batal" untuk batal.`
   );
 });
 
 bot.action('m_topup_saldo', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
+  const minTopup = await getTopupMin();
   userState.set(ctx.chat.id, { step: 'topup_amount' });
   await ctx.reply(
-    `Masukkan nominal topup (minimal Rp ${TOPUP_MIN.toLocaleString('id-ID')}).\nKetik "batal" untuk batal.`
+    `Masukkan nominal topup (minimal Rp ${minTopup.toLocaleString('id-ID')}).\nKetik "batal" untuk batal.`
   );
 });
 
@@ -636,16 +987,83 @@ bot.on('text', async (ctx) => {
   }
 
   try {
+    if (state.step === 'admin_set_env_key') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const key = String(text || '').trim().toUpperCase();
+      if (!DYNAMIC_SETTING_KEYS.includes(key)) {
+        return ctx.reply(
+          'Key tidak valid. Pilih salah satu:\n' + DYNAMIC_SETTING_KEYS.map((k) => `- ${k}`).join('\n')
+        );
+      }
+      state.step = 'admin_set_env_value';
+      state.envKey = key;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(`Masukkan value baru untuk ${key}:\n${envKeyInputHint(key)}`);
+    }
+
+    if (state.step === 'admin_set_env_value') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const key = String(state.envKey || '').trim().toUpperCase();
+      let value = String(text || '').trim();
+      if (!DYNAMIC_SETTING_KEYS.includes(key)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State env tidak valid, ulangi dari menu env dinamis.', adminEnvMenu());
+      }
+
+      if (key === 'SC_REGISTRATION_FEE') {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 0) return ctx.reply('Harus angka >= 0.');
+        value = String(Math.floor(n));
+      } else if (key === 'TOPUP_MIN') {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 1000) return ctx.reply('Harus angka >= 1000.');
+        value = String(Math.floor(n));
+      } else if (key === 'TOPUP_EXPIRE_MS') {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 60000) return ctx.reply('Harus angka >= 60000 (1 menit).');
+        value = String(Math.floor(n));
+      } else if (key === 'AUTO_PROVISION_DOMAIN') {
+        const s = value.toLowerCase();
+        if (!['0', '1', 'true', 'false', 'yes', 'no', 'on', 'off'].includes(s)) {
+          return ctx.reply('Isi 1/0 (atau true/false).');
+        }
+        value = parseBool01(s, true) ? '1' : '0';
+      } else if (key === 'SC_INSTALLER_LOCAL_PATH') {
+        if (!value) return ctx.reply('Path tidak boleh kosong.');
+      } else if (key === 'CERTBOT_EMAIL') {
+        // Boleh kosong.
+      }
+
+      await setDynamicSetting(key, value, ctx.from.id);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Berhasil update ${key}=${value}`, adminEnvMenu());
+    }
+
     if (state.step === 'admin_add_domain') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      const domain = normalizeDomain(text);
-      if (!isDomainLike(domain)) return ctx.reply('Format domain tidak valid. Contoh: installer.domainkamu.com');
+      const domain = normalizeDomainWithoutPort(text);
+      if (!isDomainLike(domain) || !isProvisionableDomain(domain)) {
+        return ctx.reply('Format domain tidak valid. Contoh: installer.domainkamu.com (tanpa port).');
+      }
+      await ctx.reply(`Proses auto-setup domain ${domain}...\n- set nginx vhost\n- issue SSL certbot`);
+      try {
+        await provisionInstallerDomain(domain);
+      } catch (e) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`Auto-setup domain gagal: ${String(e?.message || e)}`, adminMenu());
+      }
       await addApiDomain(domain, ctx.from.id);
       userState.delete(ctx.chat.id);
-      return ctx.reply(`Domain API ditambahkan: ${domain}`, adminMenu());
+      return ctx.reply(`Domain API ditambahkan dan auto-setup SSL selesai: ${domain}`, adminMenu());
     }
 
     if (state.step === 'admin_remove_domain') {
@@ -653,7 +1071,7 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      const domain = normalizeDomain(text);
+      const domain = normalizeDomainWithoutPort(text);
       if (!isDomainLike(domain)) return ctx.reply('Format domain tidak valid.');
       await removeApiDomain(domain);
       userState.delete(ctx.chat.id);
@@ -661,9 +1079,10 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.step === 'register_sc_ip') {
+      const regFee = await getRegistrationFee();
       const ip = normalizeHost(text);
       if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
-      const result = await registerScIp(ctx.from.id, ip);
+      const result = await registerScIp(ctx.from.id, ip, regFee);
       if (result.already) {
         userState.delete(ctx.chat.id);
         return ctx.reply(`IP ${ip} sudah terdaftar di akun kamu.`, mainMenu());
@@ -673,7 +1092,7 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(
           `Saldo tidak cukup untuk registrasi.\n` +
-            `Biaya: Rp ${SC_REGISTRATION_FEE.toLocaleString('id-ID')}\n` +
+            `Biaya: Rp ${regFee.toLocaleString('id-ID')}\n` +
             `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n\n` +
             `Silakan topup dulu via menu "Topup Saldo GoPay".`,
           mainMenu()
@@ -682,22 +1101,24 @@ bot.on('text', async (ctx) => {
       const saldoNow = await getSaldo(ctx.from.id);
       userState.delete(ctx.chat.id);
       return ctx.reply(
-        `Registrasi SC berhasil.\nIP: ${ip}\nBiaya potong saldo: Rp ${SC_REGISTRATION_FEE.toLocaleString('id-ID')}\nSaldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+        `Registrasi SC berhasil.\nIP: ${ip}\nBiaya potong saldo: Rp ${regFee.toLocaleString('id-ID')}\nSaldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
         mainMenu()
       );
     }
 
     if (state.step === 'topup_amount') {
+      const minTopup = await getTopupMin();
+      const topupExpireMs = await getTopupExpireMs();
       const amount = Number(String(text).replace(/[^0-9]/g, ''));
-      if (!Number.isFinite(amount) || amount < TOPUP_MIN) {
-        return ctx.reply(`Nominal tidak valid. Minimal Rp ${TOPUP_MIN.toLocaleString('id-ID')}.`);
+      if (!Number.isFinite(amount) || amount < minTopup) {
+        return ctx.reply(`Nominal tidak valid. Minimal Rp ${minTopup.toLocaleString('id-ID')}.`);
       }
 
       await ctx.reply('Membuat QR topup GoPay, tunggu...');
       const qr = await createGoPayQr(amount);
       const code = makeUniqueCode(ctx.from.id);
       const now = Date.now();
-      const expires = now + TOPUP_EXPIRE_MS;
+      const expires = now + topupExpireMs;
       const ref = `TOPUP_APP3_${ctx.from.id}_${now}`;
 
       await dbRun(
@@ -712,7 +1133,7 @@ bot.on('text', async (ctx) => {
         `Topup GoPay dibuat.\n` +
         `Nominal: Rp ${amount.toLocaleString('id-ID')}\n` +
         `Ref: ${ref}\n` +
-        `Expired: ${Math.floor(TOPUP_EXPIRE_MS / 60000)} menit`;
+        `Expired: ${Math.floor(topupExpireMs / 60000)} menit`;
 
       try {
         await ctx.replyWithPhoto(qr.qrUrl, {
@@ -870,7 +1291,7 @@ bot.on('document', async (ctx) => {
         return ctx.reply('File tidak terlihat seperti script installer bash yang valid.');
       }
 
-      const targetPath = SC_INSTALLER_LOCAL_PATH;
+      const targetPath = await getScInstallerLocalPath();
       const targetDir = path.dirname(targetPath);
       fs.mkdirSync(targetDir, { recursive: true });
       fs.writeFileSync(targetPath, content);

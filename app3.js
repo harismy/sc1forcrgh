@@ -43,6 +43,15 @@ const DYNAMIC_SETTING_KEYS = [
   'CERTBOT_EMAIL',
   'SC_INSTALLER_LOCAL_PATH'
 ];
+const SETTING_LABELS = {
+  SC_REGISTRATION_PRICE_PER_DAY: 'Harga SC per Hari',
+  SC_REGISTRATION_MIN_DAYS: 'Minimal Hari Pembelian',
+  TOPUP_MIN: 'Minimal Top Up Saldo',
+  TOPUP_EXPIRE_MS: 'Masa Aktif QR Top Up',
+  AUTO_PROVISION_DOMAIN: 'Auto Setup Domain',
+  CERTBOT_EMAIL: 'Email Certbot',
+  SC_INSTALLER_LOCAL_PATH: 'Path Script Installer'
+};
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 function dbRun(sql, params = []) {
@@ -260,7 +269,7 @@ function isIpv4(input) {
 function parseErr(err) {
   const status = err?.response?.status;
   const msg = err?.response?.data?.message || err?.message || 'unknown error';
-  if (status === 401) return 'Unauthorized: key server salah atau tidak terdaftar.';
+  if (status === 401) return 'Tidak diizinkan: key server salah atau tidak terdaftar.';
   if (/ECONNREFUSED|ENOTFOUND|ETIMEDOUT/i.test(msg)) {
     return 'Host tidak bisa diakses. Pastikan API summary aktif di port 8789.';
   }
@@ -288,9 +297,18 @@ function formatRemainingDays(expiresAt) {
   const n = Number(expiresAt || 0);
   if (!n) return 'tanpa batas';
   const diff = n - Date.now();
-  if (diff <= 0) return 'sudah expired';
+  if (diff <= 0) return 'sudah kedaluwarsa';
   const days = Math.ceil(diff / DAY_MS);
   return `${days} hari lagi`;
+}
+
+function formatTopupStatus(status) {
+  const s = String(status || '').trim().toLowerCase();
+  if (s === 'pending') return 'menunggu pembayaran';
+  if (s === 'paid') return 'berhasil';
+  if (s === 'expired') return 'kedaluwarsa';
+  if (s === 'cancelled') return 'dibatalkan';
+  return s || '-';
 }
 
 function normalizeClientName(input) {
@@ -510,11 +528,11 @@ function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc')],
     [Markup.button.callback('SC Saya', 'm_my_sc')],
-    [Markup.button.callback('Link Install', 'm_install_link')],
+    [Markup.button.callback('Link Instalasi', 'm_install_link')],
     [Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
     [Markup.button.callback('Cek Saldo', 'm_cek_saldo')],
-    [Markup.button.callback('Backup SC', 'm_backup_now')],
-    [Markup.button.callback('Restore SC', 'm_restore_upload')],
+    [Markup.button.callback('Cadangkan SC', 'm_backup_now')],
+    [Markup.button.callback('Pulihkan SC', 'm_restore_upload')],
     [Markup.button.callback('Menu Admin', 'm_admin_menu')]
   ]);
 }
@@ -527,7 +545,7 @@ function adminMenu() {
     [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show')],
     [Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
-    [Markup.button.callback('Upload Script SC', 'm_admin_upload_sc')],
+    [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
 }
@@ -536,9 +554,9 @@ function adminEnvMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Tagihan', 'm_admin_env_group_billing')],
     [Markup.button.callback('Domain/SSL', 'm_admin_env_group_prov')],
-    [Markup.button.callback('Installer', 'm_admin_env_group_installer')],
-    [Markup.button.callback('Isi Key Manual', 'm_admin_env_manual')],
-    [Markup.button.callback('Kembali Admin', 'm_admin_env_back_admin')]
+    [Markup.button.callback('File Installer', 'm_admin_env_group_installer')],
+    [Markup.button.callback('Input Manual', 'm_admin_env_manual')],
+    [Markup.button.callback('Kembali', 'm_admin_env_back_admin')]
   ]);
 }
 
@@ -546,23 +564,23 @@ function adminEnvGroupMenu(group) {
   const g = String(group || '').toLowerCase();
   if (g === 'billing') {
     return Markup.inlineKeyboard([
-      [Markup.button.callback('SC_REGISTRATION_PRICE_PER_DAY', 'm_admin_env_pick_SC_REGISTRATION_PRICE_PER_DAY')],
-      [Markup.button.callback('SC_REGISTRATION_MIN_DAYS', 'm_admin_env_pick_SC_REGISTRATION_MIN_DAYS')],
-      [Markup.button.callback('TOPUP_MIN', 'm_admin_env_pick_TOPUP_MIN')],
-      [Markup.button.callback('TOPUP_EXPIRE_MS', 'm_admin_env_pick_TOPUP_EXPIRE_MS')],
+      [Markup.button.callback(getSettingLabel('SC_REGISTRATION_PRICE_PER_DAY'), 'm_admin_env_pick_SC_REGISTRATION_PRICE_PER_DAY')],
+      [Markup.button.callback(getSettingLabel('SC_REGISTRATION_MIN_DAYS'), 'm_admin_env_pick_SC_REGISTRATION_MIN_DAYS')],
+      [Markup.button.callback(getSettingLabel('TOPUP_MIN'), 'm_admin_env_pick_TOPUP_MIN')],
+      [Markup.button.callback(getSettingLabel('TOPUP_EXPIRE_MS'), 'm_admin_env_pick_TOPUP_EXPIRE_MS')],
       [Markup.button.callback('Kembali', 'm_admin_env_set')]
     ]);
   }
   if (g === 'prov') {
     return Markup.inlineKeyboard([
-      [Markup.button.callback('AUTO_PROVISION_DOMAIN', 'm_admin_env_pick_AUTO_PROVISION_DOMAIN')],
-      [Markup.button.callback('CERTBOT_EMAIL', 'm_admin_env_pick_CERTBOT_EMAIL')],
+      [Markup.button.callback(getSettingLabel('AUTO_PROVISION_DOMAIN'), 'm_admin_env_pick_AUTO_PROVISION_DOMAIN')],
+      [Markup.button.callback(getSettingLabel('CERTBOT_EMAIL'), 'm_admin_env_pick_CERTBOT_EMAIL')],
       [Markup.button.callback('Kembali', 'm_admin_env_set')]
     ]);
   }
   if (g === 'installer') {
     return Markup.inlineKeyboard([
-      [Markup.button.callback('SC_INSTALLER_LOCAL_PATH', 'm_admin_env_pick_SC_INSTALLER_LOCAL_PATH')],
+      [Markup.button.callback(getSettingLabel('SC_INSTALLER_LOCAL_PATH'), 'm_admin_env_pick_SC_INSTALLER_LOCAL_PATH')],
       [Markup.button.callback('Kembali', 'm_admin_env_set')]
     ]);
   }
@@ -590,13 +608,36 @@ function envKeyInputHint(key) {
   }
 }
 
+function getSettingLabel(key) {
+  const k = String(key || '').trim().toUpperCase();
+  return SETTING_LABELS[k] || k;
+}
+
+function resolveSettingKeyInput(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  const upper = raw.toUpperCase();
+  if (DYNAMIC_SETTING_KEYS.includes(upper)) return upper;
+
+  const byNum = Number(raw);
+  if (Number.isInteger(byNum) && byNum >= 1 && byNum <= DYNAMIC_SETTING_KEYS.length) {
+    return DYNAMIC_SETTING_KEYS[byNum - 1];
+  }
+
+  const normalized = upper.replace(/\s+/g, ' ').trim();
+  for (const key of DYNAMIC_SETTING_KEYS) {
+    if (getSettingLabel(key).toUpperCase() === normalized) return key;
+  }
+  return '';
+}
+
 async function requireRegistered(ctx) {
   const ok = await hasRegisteredSc(ctx.from.id);
   if (ok) return true;
   await ctx.reply(
     'Akses fitur SC ditolak.\n\n' +
       'Kamu harus registrasi/perpanjang SC 1FORCR Nexus dulu (wajib punya saldo).\n' +
-      'Gunakan menu: "Registrasi SC 1FORCR Nexus".',
+      'Gunakan menu: "Daftar / Perpanjang SC".',
     mainMenu()
   );
   return false;
@@ -799,7 +840,7 @@ async function pollPendingTopups() {
         await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ?", [row.unique_code]);
         await bot.telegram.sendMessage(
           row.user_id,
-          `Top Up Saldo expired.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}`
+          `Top Up Saldo kedaluwarsa.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}`
         ).catch(() => {});
         continue;
       }
@@ -899,15 +940,18 @@ bot.action('m_admin_env_show', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   const snap = await getDynamicSettingsSnapshot();
+  const topupExpireMinute = Math.max(1, Math.floor(Number(snap.TOPUP_EXPIRE_MS || 0) / 60000));
   await ctx.reply(
-    'Env dinamis saat ini:\n' +
-      `- SC_REGISTRATION_PRICE_PER_DAY=${snap.SC_REGISTRATION_PRICE_PER_DAY}\n` +
-      `- SC_REGISTRATION_MIN_DAYS=${snap.SC_REGISTRATION_MIN_DAYS}\n` +
-      `- TOPUP_MIN=${snap.TOPUP_MIN}\n` +
-      `- TOPUP_EXPIRE_MS=${snap.TOPUP_EXPIRE_MS}\n` +
-      `- AUTO_PROVISION_DOMAIN=${snap.AUTO_PROVISION_DOMAIN}\n` +
-      `- CERTBOT_EMAIL=${snap.CERTBOT_EMAIL}\n` +
-      `- SC_INSTALLER_LOCAL_PATH=${snap.SC_INSTALLER_LOCAL_PATH}`,
+    uiBox('PENGATURAN SAAT INI', [
+      `${getSettingLabel('SC_REGISTRATION_PRICE_PER_DAY')} : Rp ${Number(snap.SC_REGISTRATION_PRICE_PER_DAY || 0).toLocaleString('id-ID')}`,
+      `${getSettingLabel('SC_REGISTRATION_MIN_DAYS')} : ${snap.SC_REGISTRATION_MIN_DAYS} hari`,
+      `${getSettingLabel('TOPUP_MIN')} : Rp ${Number(snap.TOPUP_MIN || 0).toLocaleString('id-ID')}`,
+      `${getSettingLabel('TOPUP_EXPIRE_MS')} : ${topupExpireMinute} menit`,
+      `${getSettingLabel('AUTO_PROVISION_DOMAIN')} : ${String(snap.AUTO_PROVISION_DOMAIN) === '1' ? 'Aktif' : 'Nonaktif'}`,
+      `${getSettingLabel('CERTBOT_EMAIL')} : ${snap.CERTBOT_EMAIL || '-'}`,
+      `${getSettingLabel('SC_INSTALLER_LOCAL_PATH')} :`,
+      `${snap.SC_INSTALLER_LOCAL_PATH}`
+    ]),
     adminMenu()
   );
 });
@@ -916,7 +960,7 @@ bot.action('m_admin_env_set', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.delete(ctx.chat.id);
-  await ctx.reply('Pilih grup parameter env yang ingin diubah:', adminEnvMenu());
+  await ctx.reply('Pilih grup pengaturan yang ingin diubah:', adminEnvMenu());
 });
 
 bot.action('m_admin_env_back_admin', async (ctx) => {
@@ -931,8 +975,12 @@ bot.action('m_admin_env_manual', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_set_env_key' });
   await ctx.reply(
-    'Masukkan nama env yang ingin diubah:\n' +
-      DYNAMIC_SETTING_KEYS.map((k) => `- ${k}`).join('\n')
+    uiBox('PILIH PENGATURAN (INPUT MANUAL)', [
+      ...DYNAMIC_SETTING_KEYS.map((k, i) => `${i + 1}) ${getSettingLabel(k)}`),
+      '',
+      'Ketik nomor, nama pengaturan, atau kode asli.',
+      'Contoh: 1'
+    ])
   );
 });
 
@@ -940,31 +988,31 @@ bot.action('m_admin_env_group_billing', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.delete(ctx.chat.id);
-  await ctx.reply('Env Dinamis - Billing:', adminEnvGroupMenu('billing'));
+  await ctx.reply('Pengaturan Tagihan:', adminEnvGroupMenu('billing'));
 });
 
 bot.action('m_admin_env_group_prov', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.delete(ctx.chat.id);
-  await ctx.reply('Env Dinamis - Provisioning:', adminEnvGroupMenu('prov'));
+  await ctx.reply('Pengaturan Domain & SSL:', adminEnvGroupMenu('prov'));
 });
 
 bot.action('m_admin_env_group_installer', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.delete(ctx.chat.id);
-  await ctx.reply('Env Dinamis - Installer:', adminEnvGroupMenu('installer'));
+  await ctx.reply('Pengaturan File Installer:', adminEnvGroupMenu('installer'));
 });
 
 bot.action(/m_admin_env_pick_(.+)/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   const key = String(ctx.match?.[1] || '').trim().toUpperCase();
-  if (!DYNAMIC_SETTING_KEYS.includes(key)) return ctx.reply('Key env tidak valid.', adminEnvMenu());
+  if (!DYNAMIC_SETTING_KEYS.includes(key)) return ctx.reply('Pengaturan tidak valid.', adminEnvMenu());
   userState.set(ctx.chat.id, { step: 'admin_set_env_value', envKey: key });
   const hint = envKeyInputHint(key);
-  await ctx.reply(`Masukkan value baru untuk ${key}:\n${hint}`);
+  await ctx.reply(`Masukkan nilai baru untuk "${getSettingLabel(key)}":\n${hint}`);
 });
 
 bot.action('m_admin_list_domains', async (ctx) => {
@@ -1000,7 +1048,7 @@ bot.action('m_my_sc', async (ctx) => {
   }
   const lines = regs.map(
     (r, i) =>
-      `${i + 1}. ${r.vps_ip}\n   Client: ${normalizeClientName(r.client_name) || '-'}\n   Expired: ${formatDateTime(r.expires_at)}\n   Status: ${formatRemainingDays(r.expires_at)}`
+      `${i + 1}. ${r.vps_ip}\n   Nama Client : ${normalizeClientName(r.client_name) || '-'}\n   Expired     : ${formatDateTime(r.expires_at)}\n   Status      : ${formatRemainingDays(r.expires_at)}`
   );
   return ctx.reply(`IP SC terdaftar (${regs.length}):\n${lines.join('\n')}`, mainMenu());
 });
@@ -1018,7 +1066,7 @@ bot.action('m_install_link', async (ctx) => {
   const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
   const cmd = `bash -c \"$(curl -fsSL ${installerUrl})\"`;
   return ctx.reply(
-    `Link installer:\n${installerUrl}\n\nPerintah install di VPS terdaftar:\n${cmd}`,
+    `Link instalasi:\n${installerUrl}\n\nPerintah instal di VPS terdaftar:\n${cmd}`,
     mainMenu()
   );
 });
@@ -1060,12 +1108,12 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
   if (!code) return;
   const row = await dbGet('SELECT * FROM pending_deposits_app3 WHERE unique_code = ? AND user_id = ?', [code, ctx.from.id]);
   if (!row) return ctx.reply('Transaksi Top Up Saldo tidak ditemukan.');
-  if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${row.status}`);
+  if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${formatTopupStatus(row.status)}`);
 
   const now = Date.now();
   if (Number(row.expires_at || 0) > 0 && now > Number(row.expires_at || 0)) {
     await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ?", [row.unique_code]);
-    return ctx.reply('Top Up Saldo sudah expired.');
+    return ctx.reply('Top Up Saldo sudah kedaluwarsa.');
   }
 
   const st = await checkGoPayStatus(String(row.provider_tx_id || '')).catch((e) => ({ error: e.message }));
@@ -1078,7 +1126,7 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
     }
     return ctx.reply('Top Up Saldo sudah diproses sebelumnya.');
   }
-  return ctx.reply(`Top Up Saldo masih pending. Status gateway: ${st.status || 'pending'}`);
+  return ctx.reply(`Top Up Saldo masih menunggu. Status gateway: ${formatTopupStatus(st.status || 'pending')}`);
 });
 
 bot.action(/m_cancel_topup_(.+)/, async (ctx) => {
@@ -1087,7 +1135,7 @@ bot.action(/m_cancel_topup_(.+)/, async (ctx) => {
   if (!code) return;
   const row = await dbGet('SELECT * FROM pending_deposits_app3 WHERE unique_code = ? AND user_id = ?', [code, ctx.from.id]);
   if (!row) return ctx.reply('Transaksi Top Up Saldo tidak ditemukan.');
-  if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${row.status}`);
+  if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${formatTopupStatus(row.status)}`);
   await dbRun("UPDATE pending_deposits_app3 SET status='cancelled' WHERE unique_code = ?", [code]);
   return ctx.reply('Top Up Saldo dibatalkan.');
 });
@@ -1139,16 +1187,19 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      const key = String(text || '').trim().toUpperCase();
-      if (!DYNAMIC_SETTING_KEYS.includes(key)) {
+      const key = resolveSettingKeyInput(text);
+      if (!key) {
         return ctx.reply(
-          'Key tidak valid. Pilih salah satu:\n' + DYNAMIC_SETTING_KEYS.map((k) => `- ${k}`).join('\n')
+          uiBox('PENGATURAN TIDAK VALID', [
+            'Pilih salah satu dari daftar berikut:',
+            ...DYNAMIC_SETTING_KEYS.map((k, i) => `${i + 1}) ${getSettingLabel(k)}`)
+          ])
         );
       }
       state.step = 'admin_set_env_value';
       state.envKey = key;
       userState.set(ctx.chat.id, state);
-      return ctx.reply(`Masukkan value baru untuk ${key}:\n${envKeyInputHint(key)}`);
+      return ctx.reply(`Masukkan nilai baru untuk "${getSettingLabel(key)}":\n${envKeyInputHint(key)}`);
     }
 
     if (state.step === 'admin_add_saldo_user') {
@@ -1207,7 +1258,7 @@ bot.on('text', async (ctx) => {
       let value = String(text || '').trim();
       if (!DYNAMIC_SETTING_KEYS.includes(key)) {
         userState.delete(ctx.chat.id);
-        return ctx.reply('State env tidak valid, ulangi dari menu env dinamis.', adminEnvMenu());
+        return ctx.reply('State pengaturan tidak valid, ulangi dari menu pengaturan.', adminEnvMenu());
       }
 
       if (key === 'SC_REGISTRATION_PRICE_PER_DAY') {
@@ -1240,7 +1291,7 @@ bot.on('text', async (ctx) => {
 
       await setDynamicSetting(key, value, ctx.from.id);
       userState.delete(ctx.chat.id);
-      return ctx.reply(`Berhasil update ${key}=${value}`, adminEnvMenu());
+      return ctx.reply(`Berhasil update "${getSettingLabel(key)}" menjadi: ${value}`, adminEnvMenu());
     }
 
     if (state.step === 'admin_add_domain') {
@@ -1356,7 +1407,7 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(
           `Saldo tidak cukup untuk registrasi/perpanjang.\n` +
-            `Client Name: ${clientName}\n` +
+            `Nama Client: ${clientName}\n` +
             `IP: ${ip}\n` +
             `Durasi: ${Math.floor(days)} hari\n` +
             `Total biaya: Rp ${totalFee.toLocaleString('id-ID')}\n` +
@@ -1369,7 +1420,7 @@ bot.on('text', async (ctx) => {
       userState.delete(ctx.chat.id);
       return ctx.reply(
         `Registrasi/perpanjang SC berhasil.\n` +
-          `Client Name: ${result.clientName || clientName}\n` +
+          `Nama Client: ${result.clientName || clientName}\n` +
           `IP: ${ip}\n` +
           `Durasi: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
@@ -1430,7 +1481,7 @@ bot.on('text', async (ctx) => {
 
     if (state.step === 'backup_host') {
       const host = normalizeHost(text);
-      if (!isIpv4(host)) return ctx.reply('Host harus IP VPS yang valid.');
+      if (!isIpv4(host)) return ctx.reply('IP VPS harus valid.');
       if (!(await isRegisteredHost(ctx.from.id, host))) {
         return ctx.reply('IP belum terdaftar di akun kamu. Registrasi dulu di menu Registrasi SC.');
       }
@@ -1504,14 +1555,14 @@ bot.on('text', async (ctx) => {
       userState.delete(ctx.chat.id);
       await ctx.replyWithDocument(
         { source: content, filename },
-        { caption: `Backup selesai.\nHost: ${state.host}\nSSH: ${backupPayload.data.ssh.length}, VMESS: ${backupPayload.data.vmess.length}, VLESS: ${backupPayload.data.vless.length}, TROJAN: ${backupPayload.data.trojan.length}, ZIVPN: ${backupPayload.data.zivpn_auth.length}` }
+        { caption: `Backup selesai.\nIP VPS: ${state.host}\nSSH: ${backupPayload.data.ssh.length}, VMESS: ${backupPayload.data.vmess.length}, VLESS: ${backupPayload.data.vless.length}, TROJAN: ${backupPayload.data.trojan.length}, ZIVPN: ${backupPayload.data.zivpn_auth.length}` }
       );
       return;
     }
 
     if (state.step === 'restore_host') {
       const host = normalizeHost(text);
-      if (!isIpv4(host)) return ctx.reply('Host harus IP VPS yang valid.');
+      if (!isIpv4(host)) return ctx.reply('IP VPS harus valid.');
       if (!(await isRegisteredHost(ctx.from.id, host))) {
         return ctx.reply('IP belum terdaftar di akun kamu. Registrasi dulu di menu Registrasi SC.');
       }

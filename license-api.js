@@ -98,6 +98,34 @@ function getBaseUrl(req) {
   return `${proto}://${host}`.replace(/\/$/, '');
 }
 
+function renderNotRegisteredNotice(ip = '') {
+  const ipText = ip || '-';
+  return [
+    '============================================================',
+    '               SC 1FORCR NEXUS - AKSES DITOLAK            ',
+    '============================================================',
+    '',
+    `IP Anda (${ipText}) belum terdaftar.`,
+    '',
+    'Silakan lakukan registrasi IP VPS Anda terlebih dahulu di bot:',
+    'https://t.me/sc1forcrnexusbot',
+    '',
+    'Setelah registrasi berhasil, silakan ulangi install/update.',
+    '============================================================'
+  ].join('\n');
+}
+
+function renderNotRegisteredBash(ip = '') {
+  const msg = renderNotRegisteredNotice(ip);
+  return `#!/usr/bin/env bash
+set -euo pipefail
+cat <<'EOF'
+${msg}
+EOF
+exit 1
+`;
+}
+
 function requireBearer(req, res, next) {
   if (!LICENSE_API_TOKEN) {
     return res.status(500).json({ ok: false, message: 'LICENSE_API_TOKEN not configured' });
@@ -141,7 +169,7 @@ app.get('/sc1forcr/installer.sh', async (req, res) => {
     const ip = getClientIp(req);
     const reg = await findActiveRegistrationByIp(ip);
     if (!reg) {
-      return res.status(403).type('text/plain').send('IP VPS belum terdaftar/aktif.');
+      return res.type('text/plain').send(renderNotRegisteredBash(ip));
     }
 
     const baseUrl = getBaseUrl(req);
@@ -175,7 +203,7 @@ app.get('/sc1forcr/payload/setup-autoscript-compat.sh', async (req, res) => {
     if (!allowDomain) return res.status(403).type('text/plain').send('Forbidden domain');
     const ip = getClientIp(req);
     const reg = await findActiveRegistrationByIp(ip);
-    if (!reg) return res.status(403).type('text/plain').send('IP VPS belum terdaftar/aktif.');
+    if (!reg) return res.type('text/plain').send(renderNotRegisteredBash(ip));
     if (!fs.existsSync(SC_INSTALLER_LOCAL_PATH)) {
       return res.status(404).type('text/plain').send('Installer lokal belum diupload admin.');
     }
@@ -195,7 +223,7 @@ app.post('/sc1forcr/license/activate', requireBearer, async (req, res) => {
         ok: false,
         allowed: false,
         status: 'rejected',
-        message: 'IP belum terdaftar atau belum aktif',
+        message: 'IP anda belum terdaftar silahkan melakukan registrasi di bot https://t.me/sc1forcrnexusbot',
         ip
       });
     }

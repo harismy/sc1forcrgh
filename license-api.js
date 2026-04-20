@@ -108,6 +108,11 @@ function getBaseUrl(req) {
   return `${proto}://${host}`.replace(/\/$/, '');
 }
 
+function normalizeScriptLineEndings(input) {
+  const s = String(input || '');
+  return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
 function renderNotRegisteredNotice(ip = '') {
   const ipText = ip || '-';
   return [
@@ -262,7 +267,7 @@ app.get('/sc1forcr/payload/setup-autoscript-compat.sh', async (req, res) => {
     if (!fs.existsSync(SC_INSTALLER_LOCAL_PATH)) {
       return res.status(404).type('text/plain').send('Installer lokal belum diupload admin.');
     }
-    const content = fs.readFileSync(SC_INSTALLER_LOCAL_PATH, 'utf8');
+    const content = normalizeScriptLineEndings(fs.readFileSync(SC_INSTALLER_LOCAL_PATH, 'utf8'));
     return res.type('text/plain').send(content);
   } catch (e) {
     return res.status(500).type('text/plain').send(`Internal error: ${e.message}`);

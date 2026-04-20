@@ -17,7 +17,7 @@ const DEFAULT_SC_REGISTRATION_PRICE_PER_DAY = Math.max(
   0,
   Number(process.env.SC_REGISTRATION_PRICE_PER_DAY || process.env.SC_REGISTRATION_FEE || 25000) || 25000
 );
-const DEFAULT_SC_REGISTRATION_MIN_DAYS = Math.max(1, Number(process.env.SC_REGISTRATION_MIN_DAYS || 3) || 3);
+const DEFAULT_SC_REGISTRATION_MIN_DAYS = Math.max(1, Number(process.env.SC_REGISTRATION_MIN_DAYS || 1) || 1);
 const DEFAULT_TOPUP_MIN = Math.max(1000, Number(process.env.TOPUP_MIN || 5000) || 5000);
 const DEFAULT_TOPUP_EXPIRE_MS = Math.max(60000, Number(process.env.TOPUP_EXPIRE_MS || (5 * 60 * 1000)) || (5 * 60 * 1000));
 const DEFAULT_LICENSE_API_PORT = Math.max(1, Number(process.env.LICENSE_API_PORT || 8099) || 8099);
@@ -260,6 +260,11 @@ function parseErr(err) {
     return 'Host tidak bisa diakses. Pastikan API summary aktif di port 8789.';
   }
   return msg;
+}
+
+function normalizeScriptLineEndings(input) {
+  const s = String(input || '');
+  return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
 function formatDateTime(ts) {
@@ -547,7 +552,7 @@ function envKeyInputHint(key) {
     case 'SC_REGISTRATION_PRICE_PER_DAY':
       return 'Contoh: 25000 (rupiah per hari, angka bulat).';
     case 'SC_REGISTRATION_MIN_DAYS':
-      return 'Contoh: 3 (minimal hari pembelian user).';
+      return 'Contoh: 1 (minimal hari pembelian user).';
     case 'TOPUP_MIN':
       return 'Contoh: 5000 (minimal topup).';
     case 'TOPUP_EXPIRE_MS':
@@ -1405,7 +1410,9 @@ bot.on('document', async (ctx) => {
       if (!content.length) return ctx.reply('File kosong.');
       if (content.length > 5 * 1024 * 1024) return ctx.reply('File terlalu besar (maks 5MB).');
 
-      const textSample = content.toString('utf8', 0, Math.min(content.length, 2000));
+      const normalizedText = normalizeScriptLineEndings(content.toString('utf8'));
+      const normalizedContent = Buffer.from(normalizedText, 'utf8');
+      const textSample = normalizedText.slice(0, 2000);
       if (!/setup-autoscript-compat|^#!\/usr\/bin\/env bash|^#!\/bin\/bash/m.test(textSample)) {
         return ctx.reply('File tidak terlihat seperti script installer bash yang valid.');
       }
@@ -1413,14 +1420,14 @@ bot.on('document', async (ctx) => {
       const targetPath = await getScInstallerLocalPath();
       const targetDir = path.dirname(targetPath);
       fs.mkdirSync(targetDir, { recursive: true });
-      fs.writeFileSync(targetPath, content);
+      fs.writeFileSync(targetPath, normalizedContent);
       try { fs.chmodSync(targetPath, 0o755); } catch (_) {}
 
       userState.delete(ctx.chat.id);
       return ctx.reply(
         `Upload update SC berhasil.\n` +
           `Path lokal: ${targetPath}\n` +
-          `Ukuran: ${content.length} bytes`,
+          `Ukuran: ${normalizedContent.length} bytes`,
         adminMenu()
       );
     } catch (err) {

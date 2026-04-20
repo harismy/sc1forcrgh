@@ -11,7 +11,7 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const DB_PATH = String(process.env.DB_PATH || path.join(__dirname, '..', '..', 'sellvpn.db')).trim();
+const DB_PATH = String(process.env.DB_PATH || path.join(__dirname, 'sc1forcrnexus.db')).trim();
 const SC_REGISTRATION_FEE = Math.max(0, Number(process.env.SC_REGISTRATION_FEE || 25000) || 25000);
 const TOPUP_MIN = Math.max(1000, Number(process.env.TOPUP_MIN || 5000) || 5000);
 const TOPUP_EXPIRE_MS = Math.max(60000, Number(process.env.TOPUP_EXPIRE_MS || (5 * 60 * 1000)) || (5 * 60 * 1000));

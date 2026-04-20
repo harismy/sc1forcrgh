@@ -52,7 +52,7 @@ fi
 echo
 echo "Isi variabel .env"
 prompt_required "BOT_TOKEN (token bot Telegram)" BOT_TOKEN
-prompt_default "DB_PATH (path sqlite utama)" "/root/BotVPN/sellvpn.db" DB_PATH
+prompt_default "DB_PATH (path sqlite bot ini)" "${APP_DIR}/sc1forcrnexus.db" DB_PATH
 prompt_default "SC_REGISTRATION_FEE" "25000" SC_REGISTRATION_FEE
 prompt_default "TOPUP_MIN" "5000" TOPUP_MIN
 prompt_default "TOPUP_EXPIRE_MS (ms)" "300000" TOPUP_EXPIRE_MS

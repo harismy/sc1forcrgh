@@ -537,6 +537,14 @@ function mainMenu() {
   ]);
 }
 
+function registerScMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Registrasi Baru', 'm_register_sc_new')],
+    [Markup.button.callback('Perpanjang SC', 'm_register_sc_extend')],
+    [Markup.button.callback('Kembali', 'm_register_sc_back')]
+  ]);
+}
+
 function adminMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain')],
@@ -1074,9 +1082,28 @@ bot.action('m_install_link', async (ctx) => {
 bot.action('m_register_sc', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
-  userState.set(ctx.chat.id, { step: 'register_sc_client_name' });
   await ctx.reply(
     uiBox('REGISTRASI / PERPANJANG SC', [
+      'Pilih jenis layanan:',
+      '- Registrasi Baru',
+      '- Perpanjang SC',
+      '',
+      `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari`,
+      `Minimal Durasi  : ${minDays} hari`,
+      '',
+      'Perpanjang cukup masukkan IP VPS yang terdaftar.',
+      'Tekan tombol di bawah ini.'
+    ]),
+    registerScMenu()
+  );
+});
+
+bot.action('m_register_sc_new', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+  userState.set(ctx.chat.id, { step: 'register_sc_client_name' });
+  await ctx.reply(
+    uiBox('REGISTRASI BARU SC', [
       'Masukkan nama client.',
       'Contoh: Haris Premium 01',
       '',
@@ -1086,6 +1113,25 @@ bot.action('m_register_sc', async (ctx) => {
       'Ketik "batal" untuk membatalkan.'
     ])
   );
+});
+
+bot.action('m_register_sc_extend', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  userState.set(ctx.chat.id, { step: 'extend_sc_ip' });
+  await ctx.reply(
+    uiBox('PERPANJANG SC', [
+      'Masukkan IP VPS yang ingin diperpanjang.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action('m_register_sc_back', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  userState.delete(ctx.chat.id);
+  await ctx.reply('Kembali ke menu utama.', mainMenu());
 });
 
 bot.action('m_topup_saldo', async (ctx) => {
@@ -1344,7 +1390,7 @@ bot.on('text', async (ctx) => {
         uiBox('LANJUT REGISTRASI SC', [
           `Nama Client : ${clientName}`,
           '',
-          'Masukkan IP VPS yang ingin didaftarkan/perpanjang.',
+          'Masukkan IP VPS yang ingin didaftarkan.',
           'Contoh: 103.10.10.2'
         ])
       );
@@ -1423,6 +1469,97 @@ bot.on('text', async (ctx) => {
           `Nama Client: ${result.clientName || clientName}\n` +
           `IP: ${ip}\n` +
           `Durasi: ${Math.floor(days)} hari\n` +
+          `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
+          `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+        mainMenu()
+      );
+    }
+
+    if (state.step === 'extend_sc_ip') {
+      const ip = normalizeHost(text);
+      if (!isIpv4(ip)) {
+        return ctx.reply(
+          uiBox('INPUT IP VPS', [
+            'Format IP tidak valid.',
+            'Contoh: 103.10.10.2'
+          ])
+        );
+      }
+
+      const [pricePerDay, minDays, reg, ownedByOther] = await Promise.all([
+        getRegistrationPricePerDay(),
+        getRegistrationMinDays(),
+        getUserRegistration(ctx.from.id, ip),
+        isIpOwnedByOther(ip, ctx.from.id)
+      ]);
+
+      if (!reg) {
+        if (ownedByOther) {
+          userState.delete(ctx.chat.id);
+          return ctx.reply(`IP ${ip} terdaftar di user lain dan tidak bisa diperpanjang dari akun ini.`, mainMenu());
+        }
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`IP ${ip} belum pernah terdaftar di akun kamu. Gunakan menu "Registrasi Baru".`, mainMenu());
+      }
+
+      const clientName = normalizeClientName(reg.client_name || ctx.from.first_name || ip) || ip;
+      state.step = 'extend_sc_days';
+      state.ip = ip;
+      state.clientName = clientName;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('KONFIRMASI PERPANJANGAN SC', [
+          `Nama Client   : ${clientName}`,
+          `IP VPS        : ${ip}`,
+          `Expired Saat Ini : ${formatDateTime(reg.expires_at)}`,
+          '',
+          `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
+          `Minimal Hari  : ${minDays}`,
+          `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
+          '',
+          'Masukkan jumlah hari perpanjangan.'
+        ])
+      );
+    }
+
+    if (state.step === 'extend_sc_days') {
+      const ip = String(state.ip || '').trim();
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State perpanjangan tidak valid. Ulangi dari menu perpanjang.', mainMenu());
+      }
+      const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+      const days = Number(String(text).replace(/[^0-9]/g, ''));
+      if (!Number.isFinite(days) || days < minDays) {
+        return ctx.reply(`Jumlah hari tidak valid. Minimal ${minDays} hari.`);
+      }
+
+      const totalFee = Math.floor(days) * pricePerDay;
+      const clientName = normalizeClientName(state.clientName || ip) || ip;
+      const result = await registerScIp(ctx.from.id, ip, clientName, Math.floor(days), totalFee);
+      if (result.insufficient) {
+        const saldo = await getSaldo(ctx.from.id);
+        userState.delete(ctx.chat.id);
+        return ctx.reply(
+          `Saldo tidak cukup untuk perpanjang SC.\n` +
+            `Nama Client: ${clientName}\n` +
+            `IP: ${ip}\n` +
+            `Durasi: ${Math.floor(days)} hari\n` +
+            `Total biaya: Rp ${totalFee.toLocaleString('id-ID')}\n` +
+            `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n\n` +
+            'Silakan top up dulu via menu "Top Up Saldo".',
+          mainMenu()
+        );
+      }
+
+      const saldoNow = await getSaldo(ctx.from.id);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Perpanjang SC berhasil.\n` +
+          `Nama Client: ${result.clientName || clientName}\n` +
+          `IP: ${ip}\n` +
+          `Durasi tambah: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
           `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,

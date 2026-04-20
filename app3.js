@@ -15,6 +15,13 @@ const DB_PATH = String(process.env.DB_PATH || path.join(__dirname, 'sc1forcrnexu
 const SC_REGISTRATION_FEE = Math.max(0, Number(process.env.SC_REGISTRATION_FEE || 25000) || 25000);
 const TOPUP_MIN = Math.max(1000, Number(process.env.TOPUP_MIN || 5000) || 5000);
 const TOPUP_EXPIRE_MS = Math.max(60000, Number(process.env.TOPUP_EXPIRE_MS || (5 * 60 * 1000)) || (5 * 60 * 1000));
+const SC_INSTALLER_LOCAL_PATH = String(
+  process.env.SC_INSTALLER_LOCAL_PATH || path.join(__dirname, 'payload', 'setup-autoscript-compat.sh')
+).trim();
+const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
+  .split(',')
+  .map((v) => Number(String(v || '').trim()))
+  .filter((n) => Number.isInteger(n) && n > 0);
 
 const bot = new Telegraf(BOT_TOKEN);
 const userState = new Map();
@@ -77,6 +84,14 @@ async function initDb() {
     reference_id TEXT,
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS api_domains (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    domain TEXT NOT NULL UNIQUE,
+    is_active INTEGER DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    added_by INTEGER
   )`);
 }
 
@@ -287,10 +302,22 @@ function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Registrasi SC 1FORCR Nexus', 'm_register_sc')],
     [Markup.button.callback('Cek Registrasi SC Saya', 'm_my_sc')],
+    [Markup.button.callback('Ambil Link Install SC', 'm_install_link')],
     [Markup.button.callback('Topup Saldo GoPay', 'm_topup_saldo')],
     [Markup.button.callback('Cek Saldo', 'm_cek_saldo')],
     [Markup.button.callback('Auto Backup SC (kirim file)', 'm_backup_now')],
-    [Markup.button.callback('Restore by Upload Backup', 'm_restore_upload')]
+    [Markup.button.callback('Restore by Upload Backup', 'm_restore_upload')],
+    [Markup.button.callback('Menu Admin API', 'm_admin_menu')]
+  ]);
+}
+
+function adminMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Tambah Domain API', 'm_admin_add_domain')],
+    [Markup.button.callback('List Domain API', 'm_admin_list_domains')],
+    [Markup.button.callback('Hapus Domain API', 'm_admin_remove_domain')],
+    [Markup.button.callback('Upload File Update SC', 'm_admin_upload_sc')],
+    [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
 }
 
@@ -329,6 +356,44 @@ async function apiPost(host, key, endpoint, body = {}, timeoutMs = 120000) {
 
 function makeUniqueCode(userId) {
   return `${Date.now()}_${userId}_${Math.floor(Math.random() * 1000)}`;
+}
+
+function isAdmin(userId) {
+  return ADMIN_IDS.includes(Number(userId));
+}
+
+function normalizeDomain(input) {
+  const host = normalizeHost(input);
+  return String(host || '').toLowerCase();
+}
+
+function isDomainLike(input) {
+  const d = String(input || '').trim().toLowerCase();
+  if (!d) return false;
+  return /^[a-z0-9.-]+(:[0-9]{1,5})?$/.test(d);
+}
+
+async function addApiDomain(domain, adminId) {
+  const now = Date.now();
+  await dbRun(
+    `INSERT INTO api_domains (domain, is_active, created_at, updated_at, added_by)
+     VALUES (?, 1, ?, ?, ?)
+     ON CONFLICT(domain) DO UPDATE SET is_active=1, updated_at=excluded.updated_at, added_by=excluded.added_by`,
+    [domain, now, now, adminId]
+  );
+}
+
+async function removeApiDomain(domain) {
+  await dbRun('DELETE FROM api_domains WHERE LOWER(domain)=LOWER(?)', [domain]);
+}
+
+async function listApiDomains() {
+  return dbAll('SELECT domain, is_active, updated_at FROM api_domains ORDER BY domain ASC');
+}
+
+async function getPrimaryApiDomain() {
+  const row = await dbGet('SELECT domain FROM api_domains WHERE is_active = 1 ORDER BY updated_at DESC, id DESC LIMIT 1');
+  return String(row?.domain || '').trim();
 }
 
 async function markPendingPaid(row) {
@@ -396,7 +461,8 @@ bot.start(async (ctx) => {
       'Alur:\n' +
       '1) Topup saldo dulu (GoPay).\n' +
       '2) Registrasi IP VPS SC.\n' +
-      '3) Setelah registrasi aktif, fitur SC (backup/restore/dinamis) bisa dipakai.',
+      '3) Setelah registrasi aktif, fitur SC (backup/restore/dinamis) bisa dipakai.' +
+      (isAdmin(ctx.from.id) ? '\n\nAdmin: gunakan /admin untuk kelola domain API installer.' : ''),
     mainMenu()
   );
 });
@@ -404,6 +470,56 @@ bot.start(async (ctx) => {
 bot.command('menu', async (ctx) => {
   userState.delete(ctx.chat.id);
   await ctx.reply('Pilih menu:', mainMenu());
+});
+
+bot.command('admin', async (ctx) => {
+  userState.delete(ctx.chat.id);
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  await ctx.reply('Menu admin SC1FORCR Nexus:', adminMenu());
+});
+
+bot.action('m_admin_menu', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  await ctx.reply('Menu admin SC1FORCR Nexus:', adminMenu());
+});
+
+bot.action('m_admin_back', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply('Kembali ke menu utama.', mainMenu());
+});
+
+bot.action('m_admin_add_domain', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_add_domain' });
+  await ctx.reply('Masukkan domain API installer. Contoh: installer.domainkamu.com');
+});
+
+bot.action('m_admin_remove_domain', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_remove_domain' });
+  await ctx.reply('Masukkan domain API yang ingin dihapus.');
+});
+
+bot.action('m_admin_list_domains', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const rows = await listApiDomains().catch(() => []);
+  if (!rows.length) return ctx.reply('Belum ada domain API tersimpan.', adminMenu());
+  const lines = rows.map((r, i) => `${i + 1}. ${r.domain} (${Number(r.is_active) === 1 ? 'aktif' : 'nonaktif'})`);
+  await ctx.reply(`Domain API:\n${lines.join('\n')}`, adminMenu());
+});
+
+bot.action('m_admin_upload_sc', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_upload_sc_script' });
+  await ctx.reply(
+    'Upload file update SC (.sh) sebagai document.\n' +
+      'File akan disimpan lokal di VPS bot ini sebagai sumber installer.'
+  );
 });
 
 bot.action('m_cek_saldo', async (ctx) => {
@@ -420,6 +536,24 @@ bot.action('m_my_sc', async (ctx) => {
   }
   const lines = regs.map((r, i) => `${i + 1}. ${r.vps_ip}`);
   return ctx.reply(`IP SC terdaftar (${regs.length}):\n${lines.join('\n')}`, mainMenu());
+});
+
+bot.action('m_install_link', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!(await requireRegistered(ctx))) return;
+  const domain = await getPrimaryApiDomain();
+  if (!domain) {
+    return ctx.reply(
+      'Domain API installer belum diset admin.\nHubungi admin agar tambah domain via menu admin.',
+      mainMenu()
+    );
+  }
+  const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
+  const cmd = `bash -c \"$(curl -fsSL ${installerUrl})\"`;
+  return ctx.reply(
+    `Link installer:\n${installerUrl}\n\nPerintah install di VPS terdaftar:\n${cmd}`,
+    mainMenu()
+  );
 });
 
 bot.action('m_register_sc', async (ctx) => {
@@ -502,6 +636,30 @@ bot.on('text', async (ctx) => {
   }
 
   try {
+    if (state.step === 'admin_add_domain') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const domain = normalizeDomain(text);
+      if (!isDomainLike(domain)) return ctx.reply('Format domain tidak valid. Contoh: installer.domainkamu.com');
+      await addApiDomain(domain, ctx.from.id);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Domain API ditambahkan: ${domain}`, adminMenu());
+    }
+
+    if (state.step === 'admin_remove_domain') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const domain = normalizeDomain(text);
+      if (!isDomainLike(domain)) return ctx.reply('Format domain tidak valid.');
+      await removeApiDomain(domain);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Domain API dihapus (jika ada): ${domain}`, adminMenu());
+    }
+
     if (state.step === 'register_sc_ip') {
       const ip = normalizeHost(text);
       if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
@@ -684,7 +842,54 @@ bot.on('text', async (ctx) => {
 
 bot.on('document', async (ctx) => {
   const state = userState.get(ctx.chat.id);
-  if (!state || state.step !== 'restore_wait_file') return;
+  if (!state) return;
+
+  if (state.step === 'admin_upload_sc_script') {
+    try {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const doc = ctx.message.document;
+      const fileName = String(doc?.file_name || '').toLowerCase();
+      if (!fileName.endsWith('.sh')) {
+        return ctx.reply('File harus .sh');
+      }
+
+      const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+      const fileResp = await axios.get(fileLink.toString(), {
+        timeout: 120000,
+        responseType: 'arraybuffer'
+      });
+      const content = Buffer.from(fileResp.data || '');
+      if (!content.length) return ctx.reply('File kosong.');
+      if (content.length > 5 * 1024 * 1024) return ctx.reply('File terlalu besar (maks 5MB).');
+
+      const textSample = content.toString('utf8', 0, Math.min(content.length, 2000));
+      if (!/setup-autoscript-compat|^#!\/usr\/bin\/env bash|^#!\/bin\/bash/m.test(textSample)) {
+        return ctx.reply('File tidak terlihat seperti script installer bash yang valid.');
+      }
+
+      const targetPath = SC_INSTALLER_LOCAL_PATH;
+      const targetDir = path.dirname(targetPath);
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.writeFileSync(targetPath, content);
+      try { fs.chmodSync(targetPath, 0o755); } catch (_) {}
+
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Upload update SC berhasil.\n` +
+          `Path lokal: ${targetPath}\n` +
+          `Ukuran: ${content.length} bytes`,
+        adminMenu()
+      );
+    } catch (err) {
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Gagal upload file update SC: ${parseErr(err)}`, adminMenu());
+    }
+  }
+
+  if (state.step !== 'restore_wait_file') return;
 
   try {
     if (!(await isRegisteredHost(ctx.from.id, state.host))) {

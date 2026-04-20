@@ -267,6 +267,12 @@ function parseErr(err) {
   return msg;
 }
 
+function uiBox(title, lines = []) {
+  const sep = '============================================================';
+  const body = Array.isArray(lines) ? lines.map((x) => String(x ?? '')) : [String(lines || '')];
+  return [sep, ` ${String(title || '').trim()}`, sep, '', ...body, sep].join('\n');
+}
+
 function normalizeScriptLineEndings(input) {
   const s = String(input || '');
   return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -502,35 +508,36 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
 
 function mainMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Registrasi SC 1FORCR Nexus', 'm_register_sc')],
-    [Markup.button.callback('Cek Registrasi SC Saya', 'm_my_sc')],
-    [Markup.button.callback('Ambil Link Install SC', 'm_install_link')],
-    [Markup.button.callback('Topup Saldo GoPay', 'm_topup_saldo')],
+    [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc')],
+    [Markup.button.callback('SC Saya', 'm_my_sc')],
+    [Markup.button.callback('Link Install', 'm_install_link')],
+    [Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
     [Markup.button.callback('Cek Saldo', 'm_cek_saldo')],
-    [Markup.button.callback('Auto Backup SC (kirim file)', 'm_backup_now')],
-    [Markup.button.callback('Restore by Upload Backup', 'm_restore_upload')],
-    [Markup.button.callback('Menu Admin API', 'm_admin_menu')]
+    [Markup.button.callback('Backup SC', 'm_backup_now')],
+    [Markup.button.callback('Restore SC', 'm_restore_upload')],
+    [Markup.button.callback('Menu Admin', 'm_admin_menu')]
   ]);
 }
 
 function adminMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Tambah Domain API', 'm_admin_add_domain')],
-    [Markup.button.callback('List Domain API', 'm_admin_list_domains')],
-    [Markup.button.callback('Hapus Domain API', 'm_admin_remove_domain')],
-    [Markup.button.callback('Lihat Env Dinamis', 'm_admin_env_show')],
-    [Markup.button.callback('Ubah Env Dinamis (Menu)', 'm_admin_env_set')],
-    [Markup.button.callback('Upload File Update SC', 'm_admin_upload_sc')],
+    [Markup.button.callback('Tambah Domain', 'm_admin_add_domain')],
+    [Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
+    [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain')],
+    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
+    [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show')],
+    [Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
+    [Markup.button.callback('Upload Script SC', 'm_admin_upload_sc')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
 }
 
 function adminEnvMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Billing', 'm_admin_env_group_billing')],
-    [Markup.button.callback('Provisioning', 'm_admin_env_group_prov')],
+    [Markup.button.callback('Tagihan', 'm_admin_env_group_billing')],
+    [Markup.button.callback('Domain/SSL', 'm_admin_env_group_prov')],
     [Markup.button.callback('Installer', 'm_admin_env_group_installer')],
-    [Markup.button.callback('Input Manual Key', 'm_admin_env_manual')],
+    [Markup.button.callback('Isi Key Manual', 'm_admin_env_manual')],
     [Markup.button.callback('Kembali Admin', 'm_admin_env_back_admin')]
   ]);
 }
@@ -543,20 +550,20 @@ function adminEnvGroupMenu(group) {
       [Markup.button.callback('SC_REGISTRATION_MIN_DAYS', 'm_admin_env_pick_SC_REGISTRATION_MIN_DAYS')],
       [Markup.button.callback('TOPUP_MIN', 'm_admin_env_pick_TOPUP_MIN')],
       [Markup.button.callback('TOPUP_EXPIRE_MS', 'm_admin_env_pick_TOPUP_EXPIRE_MS')],
-      [Markup.button.callback('Kembali Env', 'm_admin_env_set')]
+      [Markup.button.callback('Kembali', 'm_admin_env_set')]
     ]);
   }
   if (g === 'prov') {
     return Markup.inlineKeyboard([
       [Markup.button.callback('AUTO_PROVISION_DOMAIN', 'm_admin_env_pick_AUTO_PROVISION_DOMAIN')],
       [Markup.button.callback('CERTBOT_EMAIL', 'm_admin_env_pick_CERTBOT_EMAIL')],
-      [Markup.button.callback('Kembali Env', 'm_admin_env_set')]
+      [Markup.button.callback('Kembali', 'm_admin_env_set')]
     ]);
   }
   if (g === 'installer') {
     return Markup.inlineKeyboard([
       [Markup.button.callback('SC_INSTALLER_LOCAL_PATH', 'm_admin_env_pick_SC_INSTALLER_LOCAL_PATH')],
-      [Markup.button.callback('Kembali Env', 'm_admin_env_set')]
+      [Markup.button.callback('Kembali', 'm_admin_env_set')]
     ]);
   }
   return adminEnvMenu();
@@ -569,7 +576,7 @@ function envKeyInputHint(key) {
     case 'SC_REGISTRATION_MIN_DAYS':
       return 'Contoh: 1 (minimal hari pembelian user).';
     case 'TOPUP_MIN':
-      return 'Contoh: 5000 (minimal topup).';
+      return 'Contoh: 5000 (minimal top up saldo).';
     case 'TOPUP_EXPIRE_MS':
       return 'Contoh: 900000 untuk 15 menit.';
     case 'AUTO_PROVISION_DOMAIN':
@@ -792,7 +799,7 @@ async function pollPendingTopups() {
         await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ?", [row.unique_code]);
         await bot.telegram.sendMessage(
           row.user_id,
-          `Topup expired.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}`
+          `Top Up Saldo expired.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}`
         ).catch(() => {});
         continue;
       }
@@ -805,7 +812,7 @@ async function pollPendingTopups() {
           const saldoNow = await getSaldo(row.user_id).catch(() => 0);
           await bot.telegram.sendMessage(
             row.user_id,
-            `Topup berhasil.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}\nSaldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`
+            `Top Up Saldo berhasil.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}\nSaldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`
           ).catch(() => {});
         }
       }
@@ -821,16 +828,19 @@ bot.start(async (ctx) => {
   const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
   const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
   await ctx.reply(
-    'SC 1FORCR Nexus Bot\n\n' +
-      `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n` +
-      `IP SC terdaftar: ${regs.length}\n` +
-      `Harga SC: Rp ${pricePerDay.toLocaleString('id-ID')} / hari\n` +
-      `Minimal pembelian: ${minDays} hari\n\n` +
-      'Alur:\n' +
-      '1) Topup saldo dulu (GoPay).\n' +
-      '2) Registrasi/perpanjang IP VPS SC (pilih durasi hari).\n' +
-      '3) Setelah registrasi aktif, fitur SC (backup/restore/dinamis) bisa dipakai.' +
-      (isAdmin(ctx.from.id) ? '\n\nAdmin: gunakan /admin untuk kelola domain API installer.' : ''),
+    uiBox('SC 1FORCR NEXUS - INFORMASI AKUN', [
+      `Saldo Kamu       : Rp ${Number(saldo).toLocaleString('id-ID')}`,
+      `IP Terdaftar     : ${regs.length}`,
+      `Harga SC / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
+      `Minimal Hari     : ${minDays} hari`,
+      '',
+      'Alur Cepat:',
+      '1) Top Up Saldo',
+      '2) Daftar / Perpanjang SC',
+      '3) Gunakan fitur SC (backup/restore)',
+      isAdmin(ctx.from.id) ? '' : '',
+      isAdmin(ctx.from.id) ? 'Admin: gunakan /admin untuk kelola layanan.' : ''
+    ]),
     mainMenu()
   );
 });
@@ -872,6 +882,17 @@ bot.action('m_admin_remove_domain', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_remove_domain' });
   await ctx.reply('Masukkan domain API yang ingin dihapus.');
+});
+
+bot.action('m_admin_add_saldo', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_add_saldo_user' });
+  await ctx.reply(
+    'Masukkan Telegram User ID yang ingin ditambah saldo.\n' +
+      'Contoh: 123456789\n' +
+      'Ketik "batal" untuk batal.'
+  );
 });
 
 bot.action('m_admin_env_show', async (ctx) => {
@@ -1007,11 +1028,15 @@ bot.action('m_register_sc', async (ctx) => {
   const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
   userState.set(ctx.chat.id, { step: 'register_sc_client_name' });
   await ctx.reply(
-    'Masukkan Client Name (nama pelanggan).\n' +
-      'Contoh: Haris Premium 01\n\n' +
-      `Harga: Rp ${pricePerDay.toLocaleString('id-ID')} / hari\n` +
-      `Minimal durasi: ${minDays} hari\n` +
-      'Ketik "batal" untuk batal.'
+    uiBox('REGISTRASI / PERPANJANG SC', [
+      'Masukkan nama client.',
+      'Contoh: Haris Premium 01',
+      '',
+      `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari`,
+      `Minimal Durasi  : ${minDays} hari`,
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
   );
 });
 
@@ -1020,7 +1045,12 @@ bot.action('m_topup_saldo', async (ctx) => {
   const minTopup = await getTopupMin();
   userState.set(ctx.chat.id, { step: 'topup_amount' });
   await ctx.reply(
-    `Masukkan nominal topup (minimal Rp ${minTopup.toLocaleString('id-ID')}).\nKetik "batal" untuk batal.`
+    uiBox('TOP UP SALDO', [
+      `Minimal Top Up : Rp ${minTopup.toLocaleString('id-ID')}`,
+      '',
+      'Masukkan nominal top up.',
+      'Ketik "batal" untuk membatalkan.'
+    ])
   );
 });
 
@@ -1029,13 +1059,13 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
   const code = String(ctx.match?.[1] || '');
   if (!code) return;
   const row = await dbGet('SELECT * FROM pending_deposits_app3 WHERE unique_code = ? AND user_id = ?', [code, ctx.from.id]);
-  if (!row) return ctx.reply('Transaksi topup tidak ditemukan.');
-  if (row.status !== 'pending') return ctx.reply(`Status topup: ${row.status}`);
+  if (!row) return ctx.reply('Transaksi Top Up Saldo tidak ditemukan.');
+  if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${row.status}`);
 
   const now = Date.now();
   if (Number(row.expires_at || 0) > 0 && now > Number(row.expires_at || 0)) {
     await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ?", [row.unique_code]);
-    return ctx.reply('Topup sudah expired.');
+    return ctx.reply('Top Up Saldo sudah expired.');
   }
 
   const st = await checkGoPayStatus(String(row.provider_tx_id || '')).catch((e) => ({ error: e.message }));
@@ -1044,11 +1074,11 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
     const credited = await markPendingPaid(row);
     const saldoNow = await getSaldo(ctx.from.id).catch(() => 0);
     if (credited) {
-      return ctx.reply(`Topup berhasil. Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`, mainMenu());
+      return ctx.reply(`Top Up Saldo berhasil. Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`, mainMenu());
     }
-    return ctx.reply('Topup sudah diproses sebelumnya.');
+    return ctx.reply('Top Up Saldo sudah diproses sebelumnya.');
   }
-  return ctx.reply(`Topup masih pending. Status gateway: ${st.status || 'pending'}`);
+  return ctx.reply(`Top Up Saldo masih pending. Status gateway: ${st.status || 'pending'}`);
 });
 
 bot.action(/m_cancel_topup_(.+)/, async (ctx) => {
@@ -1056,24 +1086,40 @@ bot.action(/m_cancel_topup_(.+)/, async (ctx) => {
   const code = String(ctx.match?.[1] || '');
   if (!code) return;
   const row = await dbGet('SELECT * FROM pending_deposits_app3 WHERE unique_code = ? AND user_id = ?', [code, ctx.from.id]);
-  if (!row) return ctx.reply('Transaksi topup tidak ditemukan.');
-  if (row.status !== 'pending') return ctx.reply(`Status topup: ${row.status}`);
+  if (!row) return ctx.reply('Transaksi Top Up Saldo tidak ditemukan.');
+  if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${row.status}`);
   await dbRun("UPDATE pending_deposits_app3 SET status='cancelled' WHERE unique_code = ?", [code]);
-  return ctx.reply('Topup dibatalkan.');
+  return ctx.reply('Top Up Saldo dibatalkan.');
 });
 
 bot.action('m_backup_now', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
   userState.set(ctx.chat.id, { step: 'backup_host' });
-  await ctx.reply('Masukkan IP VPS sumber backup (wajib IP yang sudah terdaftar). Ketik "batal" untuk batal.');
+  await ctx.reply(
+    uiBox('BACKUP SC', [
+      'Masukkan IP VPS sumber backup.',
+      'Syarat: IP harus sudah terdaftar di akun kamu.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
 });
 
 bot.action('m_restore_upload', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
   userState.set(ctx.chat.id, { step: 'restore_host' });
-  await ctx.reply('Masukkan IP VPS tujuan restore (wajib IP yang sudah terdaftar). Ketik "batal" untuk batal.');
+  await ctx.reply(
+    uiBox('RESTORE SC', [
+      'Masukkan IP VPS tujuan restore.',
+      'Syarat: IP harus sudah terdaftar di akun kamu.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
 });
 
 bot.on('text', async (ctx) => {
@@ -1103,6 +1149,53 @@ bot.on('text', async (ctx) => {
       state.envKey = key;
       userState.set(ctx.chat.id, state);
       return ctx.reply(`Masukkan value baru untuk ${key}:\n${envKeyInputHint(key)}`);
+    }
+
+    if (state.step === 'admin_add_saldo_user') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const targetUserId = Number(String(text || '').replace(/[^0-9]/g, ''));
+      if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+        return ctx.reply('User ID tidak valid. Contoh: 123456789');
+      }
+      state.step = 'admin_add_saldo_amount';
+      state.targetUserId = targetUserId;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `User ID: ${targetUserId}\n` +
+          'Masukkan nominal saldo yang ingin ditambahkan (rupiah).\n' +
+          'Contoh: 25000'
+      );
+    }
+
+    if (state.step === 'admin_add_saldo_amount') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const targetUserId = Number(state.targetUserId || 0);
+      if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State tambah saldo tidak valid. Ulangi dari menu admin.', adminMenu());
+      }
+      const amount = Number(String(text || '').replace(/[^0-9]/g, ''));
+      if (!Number.isFinite(amount) || amount < 1) {
+        return ctx.reply('Nominal tidak valid. Minimal Rp 1.');
+      }
+      const nominal = Math.floor(amount);
+      await addSaldo(targetUserId, nominal);
+      await saveTransaction(targetUserId, nominal, 'admin_credit', `admin_${ctx.from.id}_${Date.now()}`);
+      const saldoNow = await getSaldo(targetUserId);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Berhasil tambah saldo.\n` +
+          `User ID: ${targetUserId}\n` +
+          `Nominal: Rp ${nominal.toLocaleString('id-ID')}\n` +
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+        adminMenu()
+      );
     }
 
     if (state.step === 'admin_set_env_value') {
@@ -1186,17 +1279,36 @@ bot.on('text', async (ctx) => {
     if (state.step === 'register_sc_client_name') {
       const clientName = normalizeClientName(text);
       if (!clientName || clientName.length < 2) {
-        return ctx.reply('Client Name minimal 2 karakter.');
+        return ctx.reply(
+          uiBox('INPUT NAMA CLIENT', [
+            'Nama client minimal 2 karakter.',
+            'Contoh: Haris Premium 01'
+          ])
+        );
       }
       state.step = 'register_sc_ip';
       state.clientName = clientName;
       userState.set(ctx.chat.id, state);
-      return ctx.reply(`Client Name: ${clientName}\nMasukkan IP VPS SC yang ingin didaftarkan/perpanjang.`);
+      return ctx.reply(
+        uiBox('LANJUT REGISTRASI SC', [
+          `Nama Client : ${clientName}`,
+          '',
+          'Masukkan IP VPS yang ingin didaftarkan/perpanjang.',
+          'Contoh: 103.10.10.2'
+        ])
+      );
     }
 
     if (state.step === 'register_sc_ip') {
       const ip = normalizeHost(text);
-      if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      if (!isIpv4(ip)) {
+        return ctx.reply(
+          uiBox('INPUT IP VPS', [
+            'Format IP tidak valid.',
+            'Contoh: 103.10.10.2'
+          ])
+        );
+      }
       if (await isIpOwnedByOther(ip, ctx.from.id)) {
         userState.delete(ctx.chat.id);
         return ctx.reply(`IP ${ip} sudah terdaftar oleh user lain.`, mainMenu());
@@ -1211,12 +1323,17 @@ bot.on('text', async (ctx) => {
       state.clientName = normalizeClientName(state.clientName || reg?.client_name || ctx.from.first_name || ip) || ip;
       userState.set(ctx.chat.id, state);
       return ctx.reply(
-        `Client Name: ${state.clientName}\n` +
-        `IP: ${ip}\n` +
-          (reg ? `Expired saat ini: ${formatDateTime(reg.expires_at)}\n` : 'Status saat ini: belum terdaftar\n') +
-          `Masukkan jumlah hari (minimal ${minDays}).\n` +
-          `Harga per hari: Rp ${pricePerDay.toLocaleString('id-ID')}\n` +
-          `Contoh ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`
+        uiBox('KONFIRMASI DATA SC', [
+          `Nama Client   : ${state.clientName}`,
+          `IP VPS        : ${ip}`,
+          reg ? `Expired Saat Ini : ${formatDateTime(reg.expires_at)}` : 'Status         : Belum terdaftar',
+          '',
+          `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
+          `Minimal Hari  : ${minDays}`,
+          `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
+          '',
+          'Masukkan jumlah hari sekarang.'
+        ])
       );
     }
 
@@ -1244,7 +1361,7 @@ bot.on('text', async (ctx) => {
             `Durasi: ${Math.floor(days)} hari\n` +
             `Total biaya: Rp ${totalFee.toLocaleString('id-ID')}\n` +
             `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n\n` +
-            `Silakan topup dulu via menu "Topup Saldo GoPay".`,
+            'Silakan top up dulu via menu "Top Up Saldo".',
           mainMenu()
         );
       }
@@ -1270,7 +1387,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply(`Nominal tidak valid. Minimal Rp ${minTopup.toLocaleString('id-ID')}.`);
       }
 
-      await ctx.reply('Membuat QR topup GoPay, tunggu...');
+      await ctx.reply('Membuat QR Top Up Saldo, tunggu...');
       const qr = await createGoPayQr(amount);
       const code = makeUniqueCode(ctx.from.id);
       const now = Date.now();
@@ -1286,7 +1403,7 @@ bot.on('text', async (ctx) => {
 
       userState.delete(ctx.chat.id);
       const caption =
-        `Topup GoPay dibuat.\n` +
+        `Top Up Saldo dibuat.\n` +
         `Nominal: Rp ${amount.toLocaleString('id-ID')}\n` +
         `Ref: ${ref}\n` +
         `Expired: ${Math.floor(topupExpireMs / 60000)} menit`;
@@ -1295,16 +1412,16 @@ bot.on('text', async (ctx) => {
         await ctx.replyWithPhoto(qr.qrUrl, {
           caption,
           ...Markup.inlineKeyboard([
-            [Markup.button.callback('Cek Status Topup', `m_check_topup_${code}`)],
-            [Markup.button.callback('Batalkan Topup', `m_cancel_topup_${code}`)]
+            [Markup.button.callback('Cek Status', `m_check_topup_${code}`)],
+            [Markup.button.callback('Batalkan', `m_cancel_topup_${code}`)]
           ])
         });
       } catch (_) {
         await ctx.reply(
           `${caption}\nQR: ${qr.qrUrl}`,
           Markup.inlineKeyboard([
-            [Markup.button.callback('Cek Status Topup', `m_check_topup_${code}`)],
-            [Markup.button.callback('Batalkan Topup', `m_cancel_topup_${code}`)]
+            [Markup.button.callback('Cek Status', `m_check_topup_${code}`)],
+            [Markup.button.callback('Batalkan', `m_cancel_topup_${code}`)]
           ])
         );
       }

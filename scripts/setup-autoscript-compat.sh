@@ -3352,10 +3352,7 @@ function parseXrayRecentIpMap() {
   const nowMs = Date.now();
   const cutoffTs = nowMs - (XRAY_RECENT_WINDOW_MINUTES * 60 * 1000);
   const activeCutoffTs = nowMs - (XRAY_ACTIVE_WINDOW_SECONDS * 1000);
-  const hitMap = new Map();
-  const lastSeenMap = new Map();
-  const latestIpByUser = new Map();
-  const latestTsByUser = new Map();
+  const userIpStats = new Map(); // email -> Map(ip -> { hits, firstSeen, lastSeen })
   const lines = String(tailOut || '').split('\n');
   for (const lineRaw of lines) {
     const line = String(lineRaw || '').trim();
@@ -3383,29 +3380,47 @@ function parseXrayRecentIpMap() {
     const src = String(srcJson?.[1] || srcTxt?.[1] || '').trim();
     const ip = extractIp(src);
     if (!ip) continue;
-    const key = `${email}|${ip}`;
-    hitMap.set(key, (hitMap.get(key) || 0) + 1);
     const lastSeen = Number.isFinite(ts) && ts > 0 ? ts : nowMs;
-    lastSeenMap.set(key, lastSeen);
-    const prevTs = latestTsByUser.get(email) || 0;
-    if (lastSeen >= prevTs) {
-      latestTsByUser.set(email, lastSeen);
-      latestIpByUser.set(email, ip);
+    if (!userIpStats.has(email)) userIpStats.set(email, new Map());
+    const ipMap = userIpStats.get(email);
+    if (!ipMap.has(ip)) {
+      ipMap.set(ip, { hits: 0, firstSeen: lastSeen, lastSeen });
     }
+    const stat = ipMap.get(ip);
+    stat.hits += 1;
+    if (lastSeen < stat.firstSeen) stat.firstSeen = lastSeen;
+    if (lastSeen > stat.lastSeen) stat.lastSeen = lastSeen;
   }
 
-  for (const [key, hits] of hitMap.entries()) {
-    const sep = key.indexOf('|');
-    if (sep <= 0) continue;
-    const email = key.slice(0, sep);
-    const ip = key.slice(sep + 1);
-    const lastSeen = lastSeenMap.get(key) || 0;
-    const isActive = lastSeen >= activeCutoffTs;
-    const isLatestIp = latestIpByUser.get(email) === ip;
-    if (!isActive) continue;
-    if (!isLatestIp && hits < XRAY_MIN_HITS_PER_IP) continue;
-    if (!map.has(email)) map.set(email, new Set());
-    map.get(email).add(ip);
+  // Anti false-positive mobile handoff:
+  // ketika jaringan seluler berpindah IP cepat, IP lama sering masih muncul
+  // dalam window log tapi bukan sesi paralel. Hanya hitung IP lain jika ada
+  // overlap waktu dengan periode setelah IP terbaru mulai aktif.
+  for (const [email, ipMap] of userIpStats.entries()) {
+    const active = [];
+    for (const [ip, stat] of ipMap.entries()) {
+      if ((stat.lastSeen || 0) < activeCutoffTs) continue;
+      active.push({ ip, ...stat });
+    }
+    if (active.length === 0) continue;
+
+    active.sort((a, b) => b.lastSeen - a.lastSeen);
+    const latest = active[0];
+    const chosen = new Set([latest.ip]);
+    for (let i = 1; i < active.length; i += 1) {
+      const cur = active[i];
+      if (cur.hits < XRAY_MIN_HITS_PER_IP) continue;
+      // dianggap sesi paralel jika masih ada aktivitas IP ini setelah
+      // IP terbaru mulai muncul di log.
+      const overlapsLatestPeriod = cur.lastSeen >= latest.firstSeen;
+      if (overlapsLatestPeriod) {
+        chosen.add(cur.ip);
+      } else if (IPLIMIT_DEBUG) {
+        const lagSec = Math.max(0, Math.floor((latest.firstSeen - cur.lastSeen) / 1000));
+        console.log(`[iplimit-debug][xray] mobile-handoff filtered user=${email} old_ip=${cur.ip} lag=${lagSec}s hits=${cur.hits}`);
+      }
+    }
+    map.set(email, chosen);
   }
   return map;
 }
@@ -4126,6 +4141,70 @@ async function lockIfExceeded(nowTs) {
   return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
 
+function readActiveXrayEmailsFromConfig() {
+  const set = new Set();
+  const candidates = ['/usr/local/etc/xray/config.json', '/etc/xray/config.json'];
+  for (const cfgPath of candidates) {
+    try {
+      if (!fs.existsSync(cfgPath)) continue;
+      const root = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      const inbounds = Array.isArray(root?.inbounds) ? root.inbounds : [];
+      for (const ib of inbounds) {
+        const clients = Array.isArray(ib?.settings?.clients) ? ib.settings.clients : [];
+        for (const c of clients) {
+          const email = String(c?.email || '').trim().toLowerCase();
+          if (email) set.add(email);
+        }
+      }
+      if (set.size > 0) return set;
+    } catch (_) {
+      // ignore broken/temporary config and continue fallback path
+    }
+  }
+  return set;
+}
+
+function applyXrayConfigAndRestart(cfg) {
+  const cfgText = `${JSON.stringify(cfg, null, 2)}\n`;
+  const targets = ['/usr/local/etc/xray/config.json', '/etc/xray/config.json'];
+
+  for (const p of targets) {
+    try {
+      fs.mkdirSync(require('path').dirname(p), { recursive: true });
+      fs.writeFileSync(p, cfgText, 'utf8');
+    } catch (e) {
+      if (IPLIMIT_DEBUG) {
+        console.log(`[iplimit-debug][xray] write config failed path=${p} err=${String(e?.message || e)}`);
+      }
+    }
+  }
+
+  // Cukup restart xray. Jangan sentuh service lain agar minim dampak ke SSHWS/UDPHC/ZIVPN.
+  restartService('xray');
+}
+
+async function detectLockedUsersStillInXrayConfig() {
+  const lockedRows = await all(
+    "SELECT LOWER(username) AS username FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') " +
+    "UNION ALL SELECT LOWER(username) AS username FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') " +
+    "UNION ALL SELECT LOWER(username) AS username FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')"
+  ).catch(() => []);
+  if (!lockedRows.length) return { changed: false, users: [] };
+  const lockedSet = new Set(
+    lockedRows.map((r) => String(r?.username || '').trim().toLowerCase()).filter(Boolean)
+  );
+  if (lockedSet.size === 0) return { changed: false, users: [] };
+
+  const activeEmails = readActiveXrayEmailsFromConfig();
+  if (activeEmails.size === 0) return { changed: false, users: [] };
+
+  const leaked = [];
+  for (const u of lockedSet) {
+    if (activeEmails.has(u)) leaked.push(u);
+  }
+  return { changed: leaked.length > 0, users: leaked };
+}
+
 async function rebuildXrayFromDb() {
   const vmessRows = await all("SELECT username, uuid FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
   const vlessRows = await all("SELECT username, uuid FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
@@ -4156,7 +4235,7 @@ async function rebuildXrayFromDb() {
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
   };
-  writeXrayConfigAndReload(cfg);
+  applyXrayConfigAndRestart(cfg);
 }
 
 async function main() {
@@ -4166,9 +4245,15 @@ async function main() {
   const e = await enforceExpiredAccounts();
   const u = await unlockExpired(now);
   const l = await lockIfExceeded(now);
+  const staleLockSync = await detectLockedUsersStillInXrayConfig().catch(() => ({ changed: false, users: [] }));
   await cleanupOrphanXrayDropRules().catch(() => {});
-  if (e.xrayChanged || u.xrayChanged || l.xrayChanged) {
-    await rebuildXrayFromDb().catch(() => {});
+  if (staleLockSync.changed && IPLIMIT_DEBUG) {
+    console.log(`[iplimit-debug][xray] stale-locked-user-in-config -> force rebuild users=${staleLockSync.users.join(',')}`);
+  }
+  if (e.xrayChanged || u.xrayChanged || l.xrayChanged || staleLockSync.changed) {
+    await rebuildXrayFromDb().catch((err) => {
+      console.error('[iplimit-checker] rebuildXrayFromDb failed:', err?.message || err);
+    });
   }
   if ((e.zivpnChanged || u.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
     restartService(ZIVPN_SERVICE);

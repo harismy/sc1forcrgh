@@ -57,6 +57,7 @@ async function initDb() {
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     last_used_at INTEGER,
+    expires_at INTEGER,
     UNIQUE(user_id, vps_ip)
   )`);
   await dbRun(`CREATE TABLE IF NOT EXISTS api_domains (
@@ -67,6 +68,15 @@ async function initDb() {
     updated_at INTEGER NOT NULL,
     added_by INTEGER
   )`);
+  await ensureScRegistrationSchema();
+}
+
+async function ensureScRegistrationSchema() {
+  const cols = await dbAll('PRAGMA table_info(sc_registrations)');
+  const hasExpires = cols.some((c) => String(c?.name || '').toLowerCase() === 'expires_at');
+  if (!hasExpires) {
+    await dbRun('ALTER TABLE sc_registrations ADD COLUMN expires_at INTEGER');
+  }
 }
 
 function cleanIp(raw) {
@@ -115,8 +125,36 @@ function renderNotRegisteredNotice(ip = '') {
   ].join('\n');
 }
 
+function renderExpiredNotice(ip = '') {
+  const ipText = ip || '-';
+  return [
+    '============================================================',
+    '               SC 1FORCR NEXUS - AKSES DITOLAK            ',
+    '============================================================',
+    '',
+    `Script 1FORCRNEXUS anda sudah expired untuk IP (${ipText}).`,
+    '',
+    'Silahkan perpanjang melalui bot resmi:',
+    'https://t.me/sc1forcrnexusbot',
+    '',
+    'Setelah perpanjang berhasil, silakan ulangi install/update.',
+    '============================================================'
+  ].join('\n');
+}
+
 function renderNotRegisteredBash(ip = '') {
   const msg = renderNotRegisteredNotice(ip);
+  return `#!/usr/bin/env bash
+set -euo pipefail
+cat <<'EOF'
+${msg}
+EOF
+exit 1
+`;
+}
+
+function renderExpiredBash(ip = '') {
+  const msg = renderExpiredNotice(ip);
   return `#!/usr/bin/env bash
 set -euo pipefail
 cat <<'EOF'
@@ -149,8 +187,17 @@ async function isDomainAllowed(req) {
 
 async function findActiveRegistrationByIp(ip) {
   if (!ip) return null;
+  const now = Date.now();
   return dbGet(
-    "SELECT user_id, vps_ip, status, updated_at FROM sc_registrations WHERE vps_ip = ? AND status = 'active' LIMIT 1",
+    "SELECT user_id, vps_ip, status, updated_at, expires_at FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    [ip, now]
+  );
+}
+
+async function findLatestRegistrationByIp(ip) {
+  if (!ip) return null;
+  return dbGet(
+    'SELECT user_id, vps_ip, status, updated_at, expires_at FROM sc_registrations WHERE vps_ip = ? ORDER BY updated_at DESC, id DESC LIMIT 1',
     [ip]
   );
 }
@@ -169,6 +216,9 @@ app.get('/sc1forcr/installer.sh', async (req, res) => {
     const ip = getClientIp(req);
     const reg = await findActiveRegistrationByIp(ip);
     if (!reg) {
+      const latest = await findLatestRegistrationByIp(ip);
+      const isExpired = Number(latest?.expires_at || 0) > 0 && Date.now() > Number(latest.expires_at);
+      if (latest && isExpired) return res.type('text/plain').send(renderExpiredBash(ip));
       return res.type('text/plain').send(renderNotRegisteredBash(ip));
     }
 
@@ -203,7 +253,12 @@ app.get('/sc1forcr/payload/setup-autoscript-compat.sh', async (req, res) => {
     if (!allowDomain) return res.status(403).type('text/plain').send('Forbidden domain');
     const ip = getClientIp(req);
     const reg = await findActiveRegistrationByIp(ip);
-    if (!reg) return res.type('text/plain').send(renderNotRegisteredBash(ip));
+    if (!reg) {
+      const latest = await findLatestRegistrationByIp(ip);
+      const isExpired = Number(latest?.expires_at || 0) > 0 && Date.now() > Number(latest.expires_at);
+      if (latest && isExpired) return res.type('text/plain').send(renderExpiredBash(ip));
+      return res.type('text/plain').send(renderNotRegisteredBash(ip));
+    }
     if (!fs.existsSync(SC_INSTALLER_LOCAL_PATH)) {
       return res.status(404).type('text/plain').send('Installer lokal belum diupload admin.');
     }
@@ -219,6 +274,22 @@ app.post('/sc1forcr/license/activate', requireBearer, async (req, res) => {
     const ip = cleanIp(req.body?.ip) || getClientIp(req);
     const reg = await findActiveRegistrationByIp(ip);
     if (!reg) {
+      const latest = await findLatestRegistrationByIp(ip);
+      const isExpired = Number(latest?.expires_at || 0) > 0 && Date.now() > Number(latest.expires_at);
+      if (latest && isExpired) {
+        await dbRun(
+          "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE vps_ip = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+          [Date.now(), ip, Date.now()]
+        ).catch(() => {});
+        return res.status(403).json({
+          ok: false,
+          allowed: false,
+          status: 'expired',
+          message: 'Script 1FORCRNEXUS anda sudah expired silahkan perpanjang melalui bot',
+          ip,
+          expires_at: Number(latest.expires_at || 0) || null
+        });
+      }
       return res.status(403).json({
         ok: false,
         allowed: false,
@@ -241,7 +312,7 @@ app.post('/sc1forcr/license/activate', requireBearer, async (req, res) => {
       message: 'License valid',
       bound_ip: reg.vps_ip,
       user_id: reg.user_id,
-      expires_at: null
+      expires_at: Number(reg.expires_at || 0) || null
     });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });

@@ -13,7 +13,11 @@ if (!BOT_TOKEN) {
 }
 
 const DB_PATH = String(process.env.DB_PATH || path.join(__dirname, 'sc1forcrnexus.db')).trim();
-const DEFAULT_SC_REGISTRATION_FEE = Math.max(0, Number(process.env.SC_REGISTRATION_FEE || 25000) || 25000);
+const DEFAULT_SC_REGISTRATION_PRICE_PER_DAY = Math.max(
+  0,
+  Number(process.env.SC_REGISTRATION_PRICE_PER_DAY || process.env.SC_REGISTRATION_FEE || 25000) || 25000
+);
+const DEFAULT_SC_REGISTRATION_MIN_DAYS = Math.max(1, Number(process.env.SC_REGISTRATION_MIN_DAYS || 3) || 3);
 const DEFAULT_TOPUP_MIN = Math.max(1000, Number(process.env.TOPUP_MIN || 5000) || 5000);
 const DEFAULT_TOPUP_EXPIRE_MS = Math.max(60000, Number(process.env.TOPUP_EXPIRE_MS || (5 * 60 * 1000)) || (5 * 60 * 1000));
 const DEFAULT_LICENSE_API_PORT = Math.max(1, Number(process.env.LICENSE_API_PORT || 8099) || 8099);
@@ -31,13 +35,15 @@ const bot = new Telegraf(BOT_TOKEN);
 const userState = new Map();
 const db = new sqlite3.Database(DB_PATH);
 const DYNAMIC_SETTING_KEYS = [
-  'SC_REGISTRATION_FEE',
+  'SC_REGISTRATION_PRICE_PER_DAY',
+  'SC_REGISTRATION_MIN_DAYS',
   'TOPUP_MIN',
   'TOPUP_EXPIRE_MS',
   'AUTO_PROVISION_DOMAIN',
   'CERTBOT_EMAIL',
   'SC_INSTALLER_LOCAL_PATH'
 ];
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function dbRun(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -84,6 +90,7 @@ async function initDb() {
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     last_used_at INTEGER,
+    expires_at INTEGER,
     UNIQUE(user_id, vps_ip)
   )`);
   await dbRun(`CREATE TABLE IF NOT EXISTS pending_deposits_app3 (
@@ -111,13 +118,23 @@ async function initDb() {
     updated_at INTEGER NOT NULL,
     updated_by INTEGER
   )`);
+  await ensureScRegistrationSchema();
   await seedDefaultSettings();
+}
+
+async function ensureScRegistrationSchema() {
+  const cols = await dbAll('PRAGMA table_info(sc_registrations)');
+  const hasExpires = cols.some((c) => String(c?.name || '').toLowerCase() === 'expires_at');
+  if (!hasExpires) {
+    await dbRun('ALTER TABLE sc_registrations ADD COLUMN expires_at INTEGER');
+  }
 }
 
 async function seedDefaultSettings() {
   const now = Date.now();
   const defaults = {
-    SC_REGISTRATION_FEE: String(DEFAULT_SC_REGISTRATION_FEE),
+    SC_REGISTRATION_PRICE_PER_DAY: String(DEFAULT_SC_REGISTRATION_PRICE_PER_DAY),
+    SC_REGISTRATION_MIN_DAYS: String(DEFAULT_SC_REGISTRATION_MIN_DAYS),
     TOPUP_MIN: String(DEFAULT_TOPUP_MIN),
     TOPUP_EXPIRE_MS: String(DEFAULT_TOPUP_EXPIRE_MS),
     AUTO_PROVISION_DOMAIN: DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0',
@@ -164,8 +181,17 @@ async function getSettingNumber(key, fallback, min = null, max = null) {
   return n;
 }
 
-async function getRegistrationFee() {
-  return getSettingNumber('SC_REGISTRATION_FEE', DEFAULT_SC_REGISTRATION_FEE, 0, 1000000000);
+async function getRegistrationPricePerDay() {
+  const rawNew = await getDynamicSetting('SC_REGISTRATION_PRICE_PER_DAY', '');
+  if (rawNew) {
+    const n = Number(rawNew);
+    if (Number.isFinite(n)) return Math.max(0, Math.floor(n));
+  }
+  return getSettingNumber('SC_REGISTRATION_FEE', DEFAULT_SC_REGISTRATION_PRICE_PER_DAY, 0, 1000000000);
+}
+
+async function getRegistrationMinDays() {
+  return getSettingNumber('SC_REGISTRATION_MIN_DAYS', DEFAULT_SC_REGISTRATION_MIN_DAYS, 1, 3650);
 }
 
 async function getTopupMin() {
@@ -190,8 +216,9 @@ async function getScInstallerLocalPath() {
 }
 
 async function getDynamicSettingsSnapshot() {
-  const [fee, minTopup, expMs, autoProv, certEmail, installerPath] = await Promise.all([
-    getRegistrationFee(),
+  const [pricePerDay, minDays, minTopup, expMs, autoProv, certEmail, installerPath] = await Promise.all([
+    getRegistrationPricePerDay(),
+    getRegistrationMinDays(),
     getTopupMin(),
     getTopupExpireMs(),
     getAutoProvisionDomain(),
@@ -199,7 +226,8 @@ async function getDynamicSettingsSnapshot() {
     getScInstallerLocalPath()
   ]);
   return {
-    SC_REGISTRATION_FEE: String(fee),
+    SC_REGISTRATION_PRICE_PER_DAY: String(pricePerDay),
+    SC_REGISTRATION_MIN_DAYS: String(minDays),
     TOPUP_MIN: String(minTopup),
     TOPUP_EXPIRE_MS: String(expMs),
     AUTO_PROVISION_DOMAIN: autoProv ? '1' : '0',
@@ -232,6 +260,21 @@ function parseErr(err) {
     return 'Host tidak bisa diakses. Pastikan API summary aktif di port 8789.';
   }
   return msg;
+}
+
+function formatDateTime(ts) {
+  const n = Number(ts || 0);
+  if (!n) return '-';
+  return new Date(n).toLocaleString('id-ID', { hour12: false, timeZone: 'Asia/Jakarta' });
+}
+
+function formatRemainingDays(expiresAt) {
+  const n = Number(expiresAt || 0);
+  if (!n) return 'tanpa batas';
+  const diff = n - Date.now();
+  if (diff <= 0) return 'sudah expired';
+  const days = Math.ceil(diff / DAY_MS);
+  return `${days} hari lagi`;
 }
 
 function loadVars() {
@@ -341,37 +384,60 @@ async function saveTransaction(userId, amount, type, referenceId) {
 }
 
 async function getActiveRegistrations(userId) {
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [Date.now(), Date.now()]
+  ).catch(() => {});
   return dbAll(
-    "SELECT vps_ip, created_at, updated_at FROM sc_registrations WHERE user_id = ? AND status = 'active' ORDER BY updated_at DESC",
-    [userId]
+    "SELECT vps_ip, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) ORDER BY updated_at DESC",
+    [userId, Date.now()]
   );
 }
 
 async function isIpOwnedByOther(ip, userId) {
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [Date.now(), Date.now()]
+  ).catch(() => {});
   const row = await dbGet(
-    "SELECT user_id FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND user_id <> ? LIMIT 1",
-    [ip, userId]
+    "SELECT user_id FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND user_id <> ? AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    [ip, userId, Date.now()]
   );
   return !!row;
 }
 
 async function hasRegisteredSc(userId) {
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [Date.now(), Date.now()]
+  ).catch(() => {});
   const row = await dbGet(
-    "SELECT 1 AS ok FROM sc_registrations WHERE user_id = ? AND status = 'active' LIMIT 1",
-    [userId]
+    "SELECT 1 AS ok FROM sc_registrations WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    [userId, Date.now()]
   );
   return !!row;
 }
 
 async function isRegisteredHost(userId, host) {
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [Date.now(), Date.now()]
+  ).catch(() => {});
   const row = await dbGet(
-    "SELECT 1 AS ok FROM sc_registrations WHERE user_id = ? AND vps_ip = ? AND status = 'active' LIMIT 1",
-    [userId, host]
+    "SELECT 1 AS ok FROM sc_registrations WHERE user_id = ? AND vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    [userId, host, Date.now()]
   );
   return !!row;
 }
 
-async function registerScIp(userId, ip, registrationFee) {
+async function getUserRegistration(userId, ip) {
+  return dbGet(
+    'SELECT id, user_id, vps_ip, status, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1',
+    [userId, ip]
+  );
+}
+
+async function registerScIp(userId, ip, days, totalFee) {
   await ensureUser(userId);
 
   if (await isIpOwnedByOther(ip, userId)) {
@@ -379,32 +445,35 @@ async function registerScIp(userId, ip, registrationFee) {
   }
 
   const existing = await dbGet(
-    "SELECT id, status FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
+    "SELECT id, status, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
     [userId, ip]
   );
-  if (existing && String(existing.status).toLowerCase() === 'active') {
-    return { already: true };
-  }
 
   await dbRun('BEGIN IMMEDIATE TRANSACTION');
   try {
-    const ok = await deductSaldoAtomic(userId, registrationFee);
+    const ok = await deductSaldoAtomic(userId, totalFee);
     if (!ok) {
       await dbRun('ROLLBACK');
       return { insufficient: true };
     }
 
     const now = Date.now();
+    const baseExpiry = Math.max(now, Number(existing?.expires_at || 0));
+    const nextExpiry = baseExpiry + (days * DAY_MS);
     await dbRun(
       `INSERT INTO sc_registrations (user_id, vps_ip, status, created_at, updated_at)
        VALUES (?, ?, 'active', ?, ?)
        ON CONFLICT(user_id, vps_ip) DO UPDATE SET status='active', updated_at=excluded.updated_at`,
       [userId, ip, now, now]
     );
+    await dbRun(
+      'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ? WHERE user_id = ? AND vps_ip = ?',
+      ['active', now, nextExpiry, userId, ip]
+    );
 
-    await saveTransaction(userId, -registrationFee, 'sc_registration', `sc_reg_${userId}_${now}`);
+    await saveTransaction(userId, -totalFee, 'sc_registration', `sc_reg_${userId}_${ip}_${days}d_${now}`);
     await dbRun('COMMIT');
-    return { success: true };
+    return { success: true, expiresAt: nextExpiry };
   } catch (e) {
     await dbRun('ROLLBACK').catch(() => {});
     throw e;
@@ -450,7 +519,8 @@ function adminEnvGroupMenu(group) {
   const g = String(group || '').toLowerCase();
   if (g === 'billing') {
     return Markup.inlineKeyboard([
-      [Markup.button.callback('SC_REGISTRATION_FEE', 'm_admin_env_pick_SC_REGISTRATION_FEE')],
+      [Markup.button.callback('SC_REGISTRATION_PRICE_PER_DAY', 'm_admin_env_pick_SC_REGISTRATION_PRICE_PER_DAY')],
+      [Markup.button.callback('SC_REGISTRATION_MIN_DAYS', 'm_admin_env_pick_SC_REGISTRATION_MIN_DAYS')],
       [Markup.button.callback('TOPUP_MIN', 'm_admin_env_pick_TOPUP_MIN')],
       [Markup.button.callback('TOPUP_EXPIRE_MS', 'm_admin_env_pick_TOPUP_EXPIRE_MS')],
       [Markup.button.callback('Kembali Env', 'm_admin_env_set')]
@@ -474,8 +544,10 @@ function adminEnvGroupMenu(group) {
 
 function envKeyInputHint(key) {
   switch (String(key || '').toUpperCase()) {
-    case 'SC_REGISTRATION_FEE':
-      return 'Contoh: 25000 (rupiah, angka bulat).';
+    case 'SC_REGISTRATION_PRICE_PER_DAY':
+      return 'Contoh: 25000 (rupiah per hari, angka bulat).';
+    case 'SC_REGISTRATION_MIN_DAYS':
+      return 'Contoh: 3 (minimal hari pembelian user).';
     case 'TOPUP_MIN':
       return 'Contoh: 5000 (minimal topup).';
     case 'TOPUP_EXPIRE_MS':
@@ -496,7 +568,7 @@ async function requireRegistered(ctx) {
   if (ok) return true;
   await ctx.reply(
     'Akses fitur SC ditolak.\n\n' +
-      'Kamu harus registrasi SC 1FORCR Nexus dulu (wajib punya saldo).\n' +
+      'Kamu harus registrasi/perpanjang SC 1FORCR Nexus dulu (wajib punya saldo).\n' +
       'Gunakan menu: "Registrasi SC 1FORCR Nexus".',
     mainMenu()
   );
@@ -727,15 +799,16 @@ bot.start(async (ctx) => {
   userState.delete(ctx.chat.id);
   const saldo = await getSaldo(ctx.from.id).catch(() => 0);
   const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
-  const regFee = await getRegistrationFee();
+  const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
   await ctx.reply(
     'SC 1FORCR Nexus Bot\n\n' +
       `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n` +
       `IP SC terdaftar: ${regs.length}\n` +
-      `Biaya registrasi SC per IP: Rp ${regFee.toLocaleString('id-ID')}\n\n` +
+      `Harga SC: Rp ${pricePerDay.toLocaleString('id-ID')} / hari\n` +
+      `Minimal pembelian: ${minDays} hari\n\n` +
       'Alur:\n' +
       '1) Topup saldo dulu (GoPay).\n' +
-      '2) Registrasi IP VPS SC.\n' +
+      '2) Registrasi/perpanjang IP VPS SC (pilih durasi hari).\n' +
       '3) Setelah registrasi aktif, fitur SC (backup/restore/dinamis) bisa dipakai.' +
       (isAdmin(ctx.from.id) ? '\n\nAdmin: gunakan /admin untuk kelola domain API installer.' : ''),
     mainMenu()
@@ -787,7 +860,8 @@ bot.action('m_admin_env_show', async (ctx) => {
   const snap = await getDynamicSettingsSnapshot();
   await ctx.reply(
     'Env dinamis saat ini:\n' +
-      `- SC_REGISTRATION_FEE=${snap.SC_REGISTRATION_FEE}\n` +
+      `- SC_REGISTRATION_PRICE_PER_DAY=${snap.SC_REGISTRATION_PRICE_PER_DAY}\n` +
+      `- SC_REGISTRATION_MIN_DAYS=${snap.SC_REGISTRATION_MIN_DAYS}\n` +
       `- TOPUP_MIN=${snap.TOPUP_MIN}\n` +
       `- TOPUP_EXPIRE_MS=${snap.TOPUP_EXPIRE_MS}\n` +
       `- AUTO_PROVISION_DOMAIN=${snap.AUTO_PROVISION_DOMAIN}\n` +
@@ -883,7 +957,10 @@ bot.action('m_my_sc', async (ctx) => {
   if (regs.length === 0) {
     return ctx.reply('Belum ada IP SC terdaftar.', mainMenu());
   }
-  const lines = regs.map((r, i) => `${i + 1}. ${r.vps_ip}`);
+  const lines = regs.map(
+    (r, i) =>
+      `${i + 1}. ${r.vps_ip}\n   Expired: ${formatDateTime(r.expires_at)}\n   Status: ${formatRemainingDays(r.expires_at)}`
+  );
   return ctx.reply(`IP SC terdaftar (${regs.length}):\n${lines.join('\n')}`, mainMenu());
 });
 
@@ -907,10 +984,13 @@ bot.action('m_install_link', async (ctx) => {
 
 bot.action('m_register_sc', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const regFee = await getRegistrationFee();
+  const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
   userState.set(ctx.chat.id, { step: 'register_sc_ip' });
   await ctx.reply(
-    `Masukkan IP VPS SC yang ingin didaftarkan.\nBiaya registrasi: Rp ${regFee.toLocaleString('id-ID')} / IP.\nKetik "batal" untuk batal.`
+    `Masukkan IP VPS SC yang ingin didaftarkan/perpanjang.\n` +
+      `Harga: Rp ${pricePerDay.toLocaleString('id-ID')} / hari\n` +
+      `Minimal durasi: ${minDays} hari\n` +
+      'Ketik "batal" untuk batal.'
   );
 });
 
@@ -1016,9 +1096,13 @@ bot.on('text', async (ctx) => {
         return ctx.reply('State env tidak valid, ulangi dari menu env dinamis.', adminEnvMenu());
       }
 
-      if (key === 'SC_REGISTRATION_FEE') {
+      if (key === 'SC_REGISTRATION_PRICE_PER_DAY') {
         const n = Number(value);
         if (!Number.isFinite(n) || n < 0) return ctx.reply('Harus angka >= 0.');
+        value = String(Math.floor(n));
+      } else if (key === 'SC_REGISTRATION_MIN_DAYS') {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 1) return ctx.reply('Harus angka >= 1.');
         value = String(Math.floor(n));
       } else if (key === 'TOPUP_MIN') {
         const n = Number(value);
@@ -1079,20 +1163,50 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.step === 'register_sc_ip') {
-      const regFee = await getRegistrationFee();
       const ip = normalizeHost(text);
       if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
-      const result = await registerScIp(ctx.from.id, ip, regFee);
-      if (result.already) {
+      if (await isIpOwnedByOther(ip, ctx.from.id)) {
         userState.delete(ctx.chat.id);
-        return ctx.reply(`IP ${ip} sudah terdaftar di akun kamu.`, mainMenu());
+        return ctx.reply(`IP ${ip} sudah terdaftar oleh user lain.`, mainMenu());
       }
+      const [pricePerDay, minDays, reg] = await Promise.all([
+        getRegistrationPricePerDay(),
+        getRegistrationMinDays(),
+        getUserRegistration(ctx.from.id, ip)
+      ]);
+      state.step = 'register_sc_days';
+      state.ip = ip;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `IP: ${ip}\n` +
+          (reg ? `Expired saat ini: ${formatDateTime(reg.expires_at)}\n` : 'Status saat ini: belum terdaftar\n') +
+          `Masukkan jumlah hari (minimal ${minDays}).\n` +
+          `Harga per hari: Rp ${pricePerDay.toLocaleString('id-ID')}\n` +
+          `Contoh ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`
+      );
+    }
+
+    if (state.step === 'register_sc_days') {
+      const ip = String(state.ip || '').trim();
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State registrasi tidak valid. Ulangi dari menu registrasi.', mainMenu());
+      }
+      const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+      const days = Number(String(text).replace(/[^0-9]/g, ''));
+      if (!Number.isFinite(days) || days < minDays) {
+        return ctx.reply(`Jumlah hari tidak valid. Minimal ${minDays} hari.`);
+      }
+      const totalFee = Math.floor(days) * pricePerDay;
+      const result = await registerScIp(ctx.from.id, ip, Math.floor(days), totalFee);
       if (result.insufficient) {
         const saldo = await getSaldo(ctx.from.id);
         userState.delete(ctx.chat.id);
         return ctx.reply(
-          `Saldo tidak cukup untuk registrasi.\n` +
-            `Biaya: Rp ${regFee.toLocaleString('id-ID')}\n` +
+          `Saldo tidak cukup untuk registrasi/perpanjang.\n` +
+            `IP: ${ip}\n` +
+            `Durasi: ${Math.floor(days)} hari\n` +
+            `Total biaya: Rp ${totalFee.toLocaleString('id-ID')}\n` +
             `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n\n` +
             `Silakan topup dulu via menu "Topup Saldo GoPay".`,
           mainMenu()
@@ -1101,7 +1215,12 @@ bot.on('text', async (ctx) => {
       const saldoNow = await getSaldo(ctx.from.id);
       userState.delete(ctx.chat.id);
       return ctx.reply(
-        `Registrasi SC berhasil.\nIP: ${ip}\nBiaya potong saldo: Rp ${regFee.toLocaleString('id-ID')}\nSaldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+        `Registrasi/perpanjang SC berhasil.\n` +
+          `IP: ${ip}\n` +
+          `Durasi: ${Math.floor(days)} hari\n` +
+          `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
+          `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
         mainMenu()
       );
     }

@@ -1,0 +1,15 @@
+{
+  "name": "sc1forcr-nexus-bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "app3.js",
+  "scripts": {
+    "start": "node app3.js"
+  },
+  "dependencies": {
+    "axios": "^1.12.2",
+    "dotenv": "^16.6.1",
+    "sqlite3": "^5.1.7",
+    "telegraf": "^4.16.3"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "PAYMENT_GATEWAY_MODE": "gopay",
+  "GOPAY_API_BASE_URL": "https://api-gopay.sawargipay.cloud",
+  "GOPAY_API_KEY": "ISI_API_KEY_GOPAY"
+}

@@ -4,11 +4,20 @@
   "private": true,
   "main": "app3.js",
   "scripts": {
+<<<<<<< HEAD
     "start": "node app3.js"
+=======
+    "start": "node app3.js",
+    "start:api": "node license-api.js"
+>>>>>>> 12d9022 (update)
   },
   "dependencies": {
     "axios": "^1.12.2",
     "dotenv": "^16.6.1",
+<<<<<<< HEAD
+=======
+    "express": "^4.21.2",
+>>>>>>> 12d9022 (update)
     "sqlite3": "^5.1.7",
     "telegraf": "^4.16.3"
   }

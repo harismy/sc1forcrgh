@@ -59,6 +59,11 @@ prompt_default "TOPUP_MIN" "5000" TOPUP_MIN
 prompt_default "TOPUP_EXPIRE_MS (ms)" "300000" TOPUP_EXPIRE_MS
 prompt_default "LICENSE_API_PORT" "8099" LICENSE_API_PORT
 prompt_default "LICENSE_PUBLIC_BASE_URL (boleh kosong)" "" LICENSE_PUBLIC_BASE_URL
+<<<<<<< HEAD
+=======
+prompt_default "AUTO_PROVISION_DOMAIN (1=auto nginx+ssl saat add domain admin)" "1" AUTO_PROVISION_DOMAIN
+prompt_default "CERTBOT_EMAIL (kosong=unsafe no-email)" "" CERTBOT_EMAIL
+>>>>>>> 12d9022 (update)
 prompt_default "INSTALL_SCRIPT_URL" "https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh" INSTALL_SCRIPT_URL
 prompt_default "SC_INSTALLER_LOCAL_PATH" "${APP_DIR}/payload/setup-autoscript-compat.sh" SC_INSTALLER_LOCAL_PATH
 prompt_required "LICENSE_API_TOKEN (token rahasia verifikasi lisensi)" LICENSE_API_TOKEN
@@ -79,6 +84,11 @@ TOPUP_EXPIRE_MS=${TOPUP_EXPIRE_MS}
 LICENSE_API_PORT=${LICENSE_API_PORT}
 LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
 LICENSE_PUBLIC_BASE_URL=${LICENSE_PUBLIC_BASE_URL}
+<<<<<<< HEAD
+=======
+AUTO_PROVISION_DOMAIN=${AUTO_PROVISION_DOMAIN}
+CERTBOT_EMAIL=${CERTBOT_EMAIL}
+>>>>>>> 12d9022 (update)
 INSTALL_SCRIPT_URL=${INSTALL_SCRIPT_URL}
 SC_INSTALLER_LOCAL_PATH=${SC_INSTALLER_LOCAL_PATH}
 EOF

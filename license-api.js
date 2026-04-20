@@ -53,6 +53,7 @@ async function initDb() {
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     vps_ip TEXT NOT NULL,
+    client_name TEXT,
     status TEXT DEFAULT 'active',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -74,8 +75,12 @@ async function initDb() {
 async function ensureScRegistrationSchema() {
   const cols = await dbAll('PRAGMA table_info(sc_registrations)');
   const hasExpires = cols.some((c) => String(c?.name || '').toLowerCase() === 'expires_at');
+  const hasClientName = cols.some((c) => String(c?.name || '').toLowerCase() === 'client_name');
   if (!hasExpires) {
     await dbRun('ALTER TABLE sc_registrations ADD COLUMN expires_at INTEGER');
+  }
+  if (!hasClientName) {
+    await dbRun('ALTER TABLE sc_registrations ADD COLUMN client_name TEXT');
   }
 }
 
@@ -194,7 +199,7 @@ async function findActiveRegistrationByIp(ip) {
   if (!ip) return null;
   const now = Date.now();
   return dbGet(
-    "SELECT user_id, vps_ip, status, updated_at, expires_at FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    "SELECT user_id, vps_ip, client_name, status, updated_at, expires_at FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
     [ip, now]
   );
 }
@@ -202,7 +207,7 @@ async function findActiveRegistrationByIp(ip) {
 async function findLatestRegistrationByIp(ip) {
   if (!ip) return null;
   return dbGet(
-    'SELECT user_id, vps_ip, status, updated_at, expires_at FROM sc_registrations WHERE vps_ip = ? ORDER BY updated_at DESC, id DESC LIMIT 1',
+    'SELECT user_id, vps_ip, client_name, status, updated_at, expires_at FROM sc_registrations WHERE vps_ip = ? ORDER BY updated_at DESC, id DESC LIMIT 1',
     [ip]
   );
 }
@@ -315,6 +320,8 @@ app.post('/sc1forcr/license/activate', requireBearer, async (req, res) => {
       allowed: true,
       status: 'active',
       message: 'License valid',
+      distribution: 'BOT 1FORCR NEXUS',
+      client_name: String(reg.client_name || reg.vps_ip || ip).trim(),
       bound_ip: reg.vps_ip,
       user_id: reg.user_id,
       expires_at: Number(reg.expires_at || 0) || null

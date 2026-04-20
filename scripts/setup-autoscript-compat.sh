@@ -170,7 +170,7 @@ license_check_enabled() {
 }
 
 enforce_install_license() {
-  local enabled vps_ip machine_id resp ok msg status expires bound_ip key_hash
+  local enabled vps_ip machine_id resp ok msg status expires bound_ip key_hash distribution client_name
   enabled="$(license_check_enabled)"
   if [[ "${enabled}" != "1" ]]; then
     log "License gate nonaktif (LICENSE_ENFORCE=0)."
@@ -229,13 +229,19 @@ enforce_install_license() {
   status="-"
   expires="-"
   bound_ip="${vps_ip}"
+  distribution="Community / Open Source"
+  client_name="${vps_ip}"
   if command -v jq >/dev/null 2>&1; then
     ok="$(echo "${resp}" | jq -r 'if (.ok == true or .allowed == true or ((.status // "")|ascii_downcase) == "active") then "1" else "0" end' 2>/dev/null || echo "0")"
     msg="$(echo "${resp}" | jq -r '.message // .msg // .reason // "License rejected"' 2>/dev/null || echo "License rejected")"
     status="$(echo "${resp}" | jq -r '.status // "-"' 2>/dev/null || echo "-")"
     expires="$(echo "${resp}" | jq -r '.expires_at // .expired_at // .expired // "-"' 2>/dev/null || echo "-")"
     bound_ip="$(echo "${resp}" | jq -r '.bound_ip // .ip // empty' 2>/dev/null || echo "${vps_ip}")"
+    distribution="$(echo "${resp}" | jq -r '.distribution // .source // "Community / Open Source"' 2>/dev/null || echo "Community / Open Source")"
+    client_name="$(echo "${resp}" | jq -r '.client_name // .client // .name // empty' 2>/dev/null || echo "")"
     [[ -z "${bound_ip}" ]] && bound_ip="${vps_ip}"
+    [[ -z "${client_name}" || "${client_name}" == "null" ]] && client_name="${bound_ip}"
+    [[ -z "${distribution}" || "${distribution}" == "null" ]] && distribution="Community / Open Source"
   else
     if echo "${resp}" | grep -qiE '"ok"[[:space:]]*:[[:space:]]*true|"allowed"[[:space:]]*:[[:space:]]*true|"status"[[:space:]]*:[[:space:]]*"active"'; then
       ok="1"
@@ -257,6 +263,8 @@ LICENSE_STATUS=${status}
 LICENSE_MESSAGE=${msg}
 LICENSE_BOUND_IP=${bound_ip}
 LICENSE_EXPIRES_AT=${expires}
+LICENSE_DISTRIBUTION=${distribution}
+LICENSE_CLIENT_NAME=${client_name}
 LICENSE_KEY_HASH=${key_hash}
 LICENSE_CHECK_AT=$(date '+%F %T')
 EOF
@@ -7023,6 +7031,46 @@ draw_dashboard() {
     print_line "  $(printf '%-13s' "$key") : $value"
   }
 
+  read_license_value() {
+    local key="$1"
+    local file="/etc/sc-1forcr-license"
+    if [[ ! -f "${file}" ]]; then
+      echo ""
+      return
+    fi
+    sed -n "s/^${key}=//p" "${file}" | head -n1
+  }
+
+  format_expiry_in() {
+    local raw="$1"
+    local ts now rem d h m
+    raw="$(echo "${raw}" | tr -cd '0-9')"
+    if [[ -z "${raw}" ]]; then
+      echo "Unlimited"
+      return
+    fi
+    ts="${raw}"
+    if [[ "${#ts}" -ge 13 ]]; then
+      ts="$((ts / 1000))"
+    fi
+    now="$(date +%s)"
+    rem="$((ts - now))"
+    if (( rem <= 0 )); then
+      echo "Expired"
+      return
+    fi
+    d="$((rem / 86400))"
+    h="$(((rem % 86400) / 3600))"
+    m="$(((rem % 3600) / 60))"
+    if (( d > 0 )); then
+      echo "${d}d ${h}h ${m}m"
+    elif (( h > 0 )); then
+      echo "${h}h ${m}m"
+    else
+      echo "${m}m"
+    fi
+  }
+
   # Data collection
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
   ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
@@ -7035,6 +7083,13 @@ draw_dashboard() {
   ip="${ip:-unknown}"
   city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
   isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
+  local license_distribution license_client_name license_expires_raw expiry_in_text
+  license_distribution="$(read_license_value "LICENSE_DISTRIBUTION")"
+  license_client_name="$(read_license_value "LICENSE_CLIENT_NAME")"
+  license_expires_raw="$(read_license_value "LICENSE_EXPIRES_AT")"
+  [[ -z "${license_distribution}" ]] && license_distribution="Community / Open Source"
+  [[ -z "${license_client_name}" ]] && license_client_name="${ip}"
+  expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
 
   udpcustom="$(detect_udpcustom_service)"
   ssh_on="$(onoff_word ssh)"
@@ -7117,9 +7172,9 @@ draw_dashboard() {
 
   print_line "${BLUE}${BOLD}■ VERSION & CLIENT${NC}"
   kv_line "Version" "${SCRIPT_VERSION:-unknown}"
-  kv_line "Distribusi" "Community / Open Source"
-  kv_line "Client Name" "${ip}"
-  kv_line "Expiry In" "Unlimited"
+  kv_line "Distribusi" "${license_distribution}"
+  kv_line "Client Name" "${license_client_name}"
+  kv_line "Expiry In" "${expiry_in_text}"
   print_bottom
 
   printf '\n'
@@ -8875,4 +8930,3 @@ EOF
 }
 
 main "$@"
-

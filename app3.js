@@ -86,6 +86,7 @@ async function initDb() {
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     vps_ip TEXT NOT NULL,
+    client_name TEXT,
     status TEXT DEFAULT 'active',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -125,8 +126,12 @@ async function initDb() {
 async function ensureScRegistrationSchema() {
   const cols = await dbAll('PRAGMA table_info(sc_registrations)');
   const hasExpires = cols.some((c) => String(c?.name || '').toLowerCase() === 'expires_at');
+  const hasClientName = cols.some((c) => String(c?.name || '').toLowerCase() === 'client_name');
   if (!hasExpires) {
     await dbRun('ALTER TABLE sc_registrations ADD COLUMN expires_at INTEGER');
+  }
+  if (!hasClientName) {
+    await dbRun('ALTER TABLE sc_registrations ADD COLUMN client_name TEXT');
   }
 }
 
@@ -282,6 +287,12 @@ function formatRemainingDays(expiresAt) {
   return `${days} hari lagi`;
 }
 
+function normalizeClientName(input) {
+  const raw = String(input || '').trim().replace(/\s+/g, ' ');
+  if (!raw) return '';
+  return raw.slice(0, 60);
+}
+
 function loadVars() {
   try {
     const raw = fs.readFileSync(path.join(__dirname, '.vars.json'), 'utf8');
@@ -394,7 +405,7 @@ async function getActiveRegistrations(userId) {
     [Date.now(), Date.now()]
   ).catch(() => {});
   return dbAll(
-    "SELECT vps_ip, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) ORDER BY updated_at DESC",
+    "SELECT vps_ip, client_name, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) ORDER BY updated_at DESC",
     [userId, Date.now()]
   );
 }
@@ -437,12 +448,12 @@ async function isRegisteredHost(userId, host) {
 
 async function getUserRegistration(userId, ip) {
   return dbGet(
-    'SELECT id, user_id, vps_ip, status, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1',
+    'SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1',
     [userId, ip]
   );
 }
 
-async function registerScIp(userId, ip, days, totalFee) {
+async function registerScIp(userId, ip, clientName, days, totalFee) {
   await ensureUser(userId);
 
   if (await isIpOwnedByOther(ip, userId)) {
@@ -450,7 +461,7 @@ async function registerScIp(userId, ip, days, totalFee) {
   }
 
   const existing = await dbGet(
-    "SELECT id, status, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
+    "SELECT id, status, expires_at, client_name FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
     [userId, ip]
   );
 
@@ -465,20 +476,24 @@ async function registerScIp(userId, ip, days, totalFee) {
     const now = Date.now();
     const baseExpiry = Math.max(now, Number(existing?.expires_at || 0));
     const nextExpiry = baseExpiry + (days * DAY_MS);
+    const finalClientName = normalizeClientName(clientName || existing?.client_name || ip);
     await dbRun(
-      `INSERT INTO sc_registrations (user_id, vps_ip, status, created_at, updated_at)
-       VALUES (?, ?, 'active', ?, ?)
-       ON CONFLICT(user_id, vps_ip) DO UPDATE SET status='active', updated_at=excluded.updated_at`,
-      [userId, ip, now, now]
+      `INSERT INTO sc_registrations (user_id, vps_ip, client_name, status, created_at, updated_at)
+       VALUES (?, ?, ?, 'active', ?, ?)
+       ON CONFLICT(user_id, vps_ip) DO UPDATE SET
+         status='active',
+         updated_at=excluded.updated_at,
+         client_name=excluded.client_name`,
+      [userId, ip, finalClientName, now, now]
     );
     await dbRun(
-      'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ? WHERE user_id = ? AND vps_ip = ?',
-      ['active', now, nextExpiry, userId, ip]
+      'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ?, client_name = ? WHERE user_id = ? AND vps_ip = ?',
+      ['active', now, nextExpiry, finalClientName, userId, ip]
     );
 
     await saveTransaction(userId, -totalFee, 'sc_registration', `sc_reg_${userId}_${ip}_${days}d_${now}`);
     await dbRun('COMMIT');
-    return { success: true, expiresAt: nextExpiry };
+    return { success: true, expiresAt: nextExpiry, clientName: finalClientName };
   } catch (e) {
     await dbRun('ROLLBACK').catch(() => {});
     throw e;
@@ -964,7 +979,7 @@ bot.action('m_my_sc', async (ctx) => {
   }
   const lines = regs.map(
     (r, i) =>
-      `${i + 1}. ${r.vps_ip}\n   Expired: ${formatDateTime(r.expires_at)}\n   Status: ${formatRemainingDays(r.expires_at)}`
+      `${i + 1}. ${r.vps_ip}\n   Client: ${normalizeClientName(r.client_name) || '-'}\n   Expired: ${formatDateTime(r.expires_at)}\n   Status: ${formatRemainingDays(r.expires_at)}`
   );
   return ctx.reply(`IP SC terdaftar (${regs.length}):\n${lines.join('\n')}`, mainMenu());
 });
@@ -990,9 +1005,10 @@ bot.action('m_install_link', async (ctx) => {
 bot.action('m_register_sc', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
-  userState.set(ctx.chat.id, { step: 'register_sc_ip' });
+  userState.set(ctx.chat.id, { step: 'register_sc_client_name' });
   await ctx.reply(
-    `Masukkan IP VPS SC yang ingin didaftarkan/perpanjang.\n` +
+    'Masukkan Client Name (nama pelanggan).\n' +
+      'Contoh: Haris Premium 01\n\n' +
       `Harga: Rp ${pricePerDay.toLocaleString('id-ID')} / hari\n` +
       `Minimal durasi: ${minDays} hari\n` +
       'Ketik "batal" untuk batal.'
@@ -1167,6 +1183,17 @@ bot.on('text', async (ctx) => {
       return ctx.reply(`Domain API dihapus (jika ada): ${domain}`, adminMenu());
     }
 
+    if (state.step === 'register_sc_client_name') {
+      const clientName = normalizeClientName(text);
+      if (!clientName || clientName.length < 2) {
+        return ctx.reply('Client Name minimal 2 karakter.');
+      }
+      state.step = 'register_sc_ip';
+      state.clientName = clientName;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(`Client Name: ${clientName}\nMasukkan IP VPS SC yang ingin didaftarkan/perpanjang.`);
+    }
+
     if (state.step === 'register_sc_ip') {
       const ip = normalizeHost(text);
       if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
@@ -1181,8 +1208,10 @@ bot.on('text', async (ctx) => {
       ]);
       state.step = 'register_sc_days';
       state.ip = ip;
+      state.clientName = normalizeClientName(state.clientName || reg?.client_name || ctx.from.first_name || ip) || ip;
       userState.set(ctx.chat.id, state);
       return ctx.reply(
+        `Client Name: ${state.clientName}\n` +
         `IP: ${ip}\n` +
           (reg ? `Expired saat ini: ${formatDateTime(reg.expires_at)}\n` : 'Status saat ini: belum terdaftar\n') +
           `Masukkan jumlah hari (minimal ${minDays}).\n` +
@@ -1203,12 +1232,14 @@ bot.on('text', async (ctx) => {
         return ctx.reply(`Jumlah hari tidak valid. Minimal ${minDays} hari.`);
       }
       const totalFee = Math.floor(days) * pricePerDay;
-      const result = await registerScIp(ctx.from.id, ip, Math.floor(days), totalFee);
+      const clientName = normalizeClientName(state.clientName || ip) || ip;
+      const result = await registerScIp(ctx.from.id, ip, clientName, Math.floor(days), totalFee);
       if (result.insufficient) {
         const saldo = await getSaldo(ctx.from.id);
         userState.delete(ctx.chat.id);
         return ctx.reply(
           `Saldo tidak cukup untuk registrasi/perpanjang.\n` +
+            `Client Name: ${clientName}\n` +
             `IP: ${ip}\n` +
             `Durasi: ${Math.floor(days)} hari\n` +
             `Total biaya: Rp ${totalFee.toLocaleString('id-ID')}\n` +
@@ -1221,6 +1252,7 @@ bot.on('text', async (ctx) => {
       userState.delete(ctx.chat.id);
       return ctx.reply(
         `Registrasi/perpanjang SC berhasil.\n` +
+          `Client Name: ${result.clientName || clientName}\n` +
           `IP: ${ip}\n` +
           `Durasi: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +

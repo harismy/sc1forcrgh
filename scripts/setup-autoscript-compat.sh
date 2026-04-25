@@ -6731,6 +6731,41 @@ edit_limit_ip_account() {
   echo "Berhasil update limit IP akun ${type^^} '${username}' jadi ${new_limit}."
 }
 
+edit_limit_ip_all_accounts() {
+  local type table new_limit changed title
+  type="$(pick_type)"
+  [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
+  table="$(account_table_by_type "${type}")"
+  [[ -z "${table}" ]] && { echo "Tabel akun tidak ditemukan."; return; }
+
+  case "${type}" in
+    ssh|zivpn) title="SSH/ZIVPN/UDPHC" ;;
+    vmess) title="VMESS" ;;
+    vless) title="VLESS" ;;
+    trojan) title="TROJAN" ;;
+    *) title="${type^^}" ;;
+  esac
+
+  echo "EDIT LIMIT IP SEMUA USER (${title})"
+  prompt_input new_limit "Limit IP baru untuk semua akun ${title} [0]: " || return
+  new_limit="${new_limit:-0}"
+  if [[ ! "${new_limit}" =~ ^[0-9]+$ ]]; then
+    echo "Limit IP harus angka 0 atau lebih."
+    return
+  fi
+
+  changed="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE CAST(COALESCE(limitip,0) AS INTEGER) <> ${new_limit};" 2>/dev/null || echo 0)"
+  [[ "${changed}" =~ ^[0-9]+$ ]] || changed="0"
+
+  sqlite3 "${DB_PATH}" "UPDATE ${table} SET limitip=${new_limit};" >/dev/null 2>&1 || {
+    echo "Gagal update limit IP."
+    return
+  }
+
+  echo "Berhasil update limit IP semua akun ${title} jadi ${new_limit}."
+  echo "Total akun ter-update: ${changed}"
+}
+
 account_table_by_type() {
   case "$1" in
     ssh|zivpn) echo "account_sshs" ;;
@@ -7125,9 +7160,10 @@ akun_menu() {
     echo "6) List Account"
     echo "7) Unlock Account"
     echo "8) Lihat Detail Account"
+    echo "9) Edit Limit IP Massal (Per Protocol)"
     echo "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-8]: "; then
+    if ! prompt_input am "Pilih menu [0-9]: "; then
       return
     fi
     clear
@@ -7140,6 +7176,7 @@ akun_menu() {
       6) list_accounts ;;
       7) unlock_account ;;
       8) show_account_detail ;;
+      9) edit_limit_ip_all_accounts ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

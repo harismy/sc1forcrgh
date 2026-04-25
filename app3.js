@@ -864,7 +864,7 @@ async function buildInstallerQuickCopyText() {
     return '\n\nLink installer belum tersedia. Hubungi admin untuk set domain installer.';
   }
   const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
-  const cmd = `bash -c "$(curl -fsSL ${installerUrl})"`;
+  const cmd = ```bash -c "$(curl -fsSL ${installerUrl})"```;
   return `\n\nLink installer:\n${installerUrl}\n\nPerintah install (copy-paste):\n${cmd}`;
 }
 

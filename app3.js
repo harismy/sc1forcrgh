@@ -434,6 +434,45 @@ async function getActiveRegistrations(userId) {
   );
 }
 
+async function listActiveRegistrationsForAdmin(limit = 15) {
+  const now = Date.now();
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [now, now]
+  ).catch(() => {});
+  const safeLimit = Math.max(1, Math.min(50, Number(limit) || 15));
+  return dbAll(
+    "SELECT user_id, vps_ip, client_name, expires_at, updated_at FROM sc_registrations " +
+      "WHERE status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) " +
+      "ORDER BY updated_at DESC LIMIT ?",
+    [now, safeLimit]
+  );
+}
+
+async function adminRemoveRegisteredIp(ip, adminId) {
+  const now = Date.now();
+  const rows = await dbAll(
+    "SELECT id, user_id, vps_ip, client_name, expires_at FROM sc_registrations " +
+      "WHERE LOWER(vps_ip)=LOWER(?) AND status='active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
+    [ip, now]
+  );
+  if (!rows.length) {
+    return { removed: 0, rows: [] };
+  }
+  const tx = await dbRun(
+    "UPDATE sc_registrations SET status = 'deleted_by_admin', updated_at = ?, expires_at = ? " +
+      "WHERE LOWER(vps_ip)=LOWER(?) AND status='active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
+    [now, now, ip, now]
+  );
+  await saveTransaction(
+    Number(adminId) || 0,
+    0,
+    'admin_remove_sc_ip',
+    `admin_remove_sc_ip_${ip}_${now}`
+  ).catch(() => {});
+  return { removed: Number(tx?.changes || 0), rows };
+}
+
 async function isIpOwnedByOther(ip, userId) {
   await dbRun(
     "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
@@ -550,6 +589,7 @@ function adminMenu() {
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain')],
     [Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain')],
+    [Markup.button.callback('Hapus IP VPS Terdaftar', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show')],
     [Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
@@ -818,6 +858,16 @@ async function getPrimaryApiDomain() {
   return String(row?.domain || '').trim();
 }
 
+async function buildInstallerQuickCopyText() {
+  const domain = await getPrimaryApiDomain();
+  if (!domain) {
+    return '\n\nLink installer belum tersedia. Hubungi admin untuk set domain installer.';
+  }
+  const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
+  const cmd = `bash -c "$(curl -fsSL ${installerUrl})"`;
+  return `\n\nLink installer:\n${installerUrl}\n\nPerintah install (copy-paste):\n${cmd}`;
+}
+
 async function markPendingPaid(row) {
   if (!row) return false;
   await dbRun('BEGIN IMMEDIATE TRANSACTION');
@@ -931,6 +981,28 @@ bot.action('m_admin_remove_domain', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_remove_domain' });
   await ctx.reply('Masukkan domain API yang ingin dihapus.');
+});
+
+bot.action('m_admin_remove_sc_ip', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_remove_sc_ip' });
+  const rows = await listActiveRegistrationsForAdmin(12).catch(() => []);
+  const preview = rows.length
+    ? rows.map((r, i) => `${i + 1}. ${r.vps_ip} (user ${r.user_id})`).join('\n')
+    : '(tidak ada registrasi aktif)';
+  await ctx.reply(
+    uiBox('HAPUS IP VPS TERDAFTAR', [
+      'Masukkan IP VPS yang ingin dihapus dari registrasi aktif.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Preview IP aktif:',
+      preview,
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ]),
+    adminMenu()
+  );
 });
 
 bot.action('m_admin_add_saldo', async (ctx) => {
@@ -1373,6 +1445,29 @@ bot.on('text', async (ctx) => {
       return ctx.reply(`Domain API dihapus (jika ada): ${domain}`, adminMenu());
     }
 
+    if (state.step === 'admin_remove_sc_ip') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = normalizeHost(text);
+      if (!isIpv4(ip)) {
+        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      }
+      const result = await adminRemoveRegisteredIp(ip, ctx.from.id);
+      userState.delete(ctx.chat.id);
+      if (!result.removed) {
+        return ctx.reply(`IP ${ip} tidak ditemukan pada registrasi aktif.`, adminMenu());
+      }
+      const users = Array.from(new Set((result.rows || []).map((r) => Number(r.user_id || 0)).filter((n) => n > 0)));
+      return ctx.reply(
+        `Berhasil hapus registrasi aktif untuk IP ${ip}.\n` +
+          `Baris terhapus: ${result.removed}\n` +
+          `User terdampak: ${users.length ? users.join(', ') : '-'}`,
+        adminMenu()
+      );
+    }
+
     if (state.step === 'register_sc_client_name') {
       const clientName = normalizeClientName(text);
       if (!clientName || clientName.length < 2) {
@@ -1463,6 +1558,7 @@ bot.on('text', async (ctx) => {
         );
       }
       const saldoNow = await getSaldo(ctx.from.id);
+      const installerText = await buildInstallerQuickCopyText();
       userState.delete(ctx.chat.id);
       return ctx.reply(
         `Registrasi/perpanjang SC berhasil.\n` +
@@ -1471,7 +1567,8 @@ bot.on('text', async (ctx) => {
           `Durasi: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
+          installerText,
         mainMenu()
       );
     }
@@ -1554,6 +1651,7 @@ bot.on('text', async (ctx) => {
       }
 
       const saldoNow = await getSaldo(ctx.from.id);
+      const installerText = await buildInstallerQuickCopyText();
       userState.delete(ctx.chat.id);
       return ctx.reply(
         `Perpanjang SC berhasil.\n` +
@@ -1562,7 +1660,8 @@ bot.on('text', async (ctx) => {
           `Durasi tambah: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
+          installerText,
         mainMenu()
       );
     }

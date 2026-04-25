@@ -19,10 +19,21 @@ set -euo pipefail
 #   LICENSE_API_URL=https://license.example.com/api/v1/activate
 #   LICENSE_API_TOKEN=server-secret-token
 #   LICENSE_KEY=LSC-XXXX-XXXX-XXXX
+#   WILDCARD_ENABLE=0                           (opsional, 1=aktif wildcard cert DNS-01)
+#   WILDCARD_BASE_DOMAIN=example.com            (opsional, wajib saat wildcard aktif)
+#   WILDCARD_CF_API_TOKEN=                      (opsional, token Cloudflare DNS edit)
 #   UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
 #   ZIVPN_SERVICE_NAME=zivpn
+#   ZIVPN_RELOAD_ON_AUTH_CHANGE=0                (opsional, legacy: 1=restart, 0=tanpa restart)
+#   ZIVPN_AUTH_APPLY_MODE=reload                 (opsional: none|reload|restart|reload-restart)
+#   ZIVPN_AUTH_MODE=http                         (opsional: http|passwords)
+#   ZIVPN_HTTP_AUTH_URL=                         (opsional, default: http://127.0.0.1:${API_PORT}/internal/zivpn-auth?token=...)
+#   ZIVPN_HTTP_AUTH_TOKEN=                       (opsional, default mengikuti API_AUTH_TOKEN)
+#   ZIVPN_LIVE_TTL_SECONDS=90                    (opsional, TTL session live ZIVPN di API)
+#   ZIVPN_ACTIVE_WINDOW_SECONDS=90               (opsional, jendela aktif ZIVPN di checker)
+#   ZIVPN_HANDOFF_GRACE_SECONDS=20               (opsional, toleransi perpindahan IP seluler)
 #   ZIVPN_LISTEN_PORT=5667
 #   ZIVPN_DNAT_RANGE=6000:19999
 #   ZIVPN_DNAT_IFACE=eth0                          (opsional, default auto-detect)
@@ -30,7 +41,7 @@ set -euo pipefail
 #   UDPCUSTOM_SERVICE_NAME=sc-1forcr-udpcustom
 #   UDPCUSTOM_LISTEN_PORT=5667
 #   UDPCUSTOM_DNAT_RANGE=                        (opsional, default kosong = tanpa DNAT range untuk performa)
-#   UDPCUSTOM_DNAT_AUTO_RANGE=6000:6999         (opsional, dipakai jika backend UDPHC aktif & DNAT range kosong)
+#   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
 #   DROPBEAR_PORT=109
@@ -57,6 +68,9 @@ set -euo pipefail
 #   XRAY_RECENT_WINDOW_MINUTES=60                (opsional, jendela menit log xray untuk hitung multi-login)
 #   XRAY_ACTIVE_WINDOW_SECONDS=600               (opsional, jendela detik untuk IP aktif xray)
 #   XRAY_MIN_HITS_PER_IP=1                       (opsional, minimal hit/log per IP pada jendela aktif)
+#   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
+#   XRAY_PATHS_VLESS=/vless                      (opsional, multi path dipisah koma)
+#   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -67,6 +81,9 @@ LICENSE_ENFORCE="${LICENSE_ENFORCE:-1}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
 LICENSE_KEY="${LICENSE_KEY:-}"
+WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}"
+WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}"
+WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}"
 SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
@@ -75,6 +92,14 @@ API_PORT="${API_PORT:-8088}"
 ZIVPN_BIN_URL="${ZIVPN_BIN_URL:-}"
 ZIVPN_RELEASE_TAG="${ZIVPN_RELEASE_TAG:-udp-zivpn_1.4.9}"
 ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE_NAME:-zivpn}"
+ZIVPN_RELOAD_ON_AUTH_CHANGE="${ZIVPN_RELOAD_ON_AUTH_CHANGE:-0}"
+ZIVPN_AUTH_APPLY_MODE="${ZIVPN_AUTH_APPLY_MODE:-reload}"
+ZIVPN_AUTH_MODE="${ZIVPN_AUTH_MODE:-http}"
+ZIVPN_HTTP_AUTH_URL="${ZIVPN_HTTP_AUTH_URL:-}"
+ZIVPN_HTTP_AUTH_TOKEN="${ZIVPN_HTTP_AUTH_TOKEN:-}"
+ZIVPN_LIVE_TTL_SECONDS="${ZIVPN_LIVE_TTL_SECONDS:-90}"
+ZIVPN_ACTIVE_WINDOW_SECONDS="${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}"
+ZIVPN_HANDOFF_GRACE_SECONDS="${ZIVPN_HANDOFF_GRACE_SECONDS:-20}"
 ZIVPN_LISTEN_PORT="${ZIVPN_LISTEN_PORT:-5667}"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 ZIVPN_DNAT_IFACE="${ZIVPN_DNAT_IFACE:-}"
@@ -82,7 +107,7 @@ UDPCUSTOM_BIN_URL="${UDPCUSTOM_BIN_URL:-https://raw.github.com/http-custom/udp-c
 UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE_NAME:-sc-1forcr-udpcustom}"
 UDPCUSTOM_LISTEN_PORT="${UDPCUSTOM_LISTEN_PORT:-5667}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
-UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
+UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
 ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
@@ -109,6 +134,9 @@ XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-60}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-600}"
 XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-1}"
+XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
+XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
+XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
@@ -136,9 +164,88 @@ fi
 if [[ -z "${API_AUTH_TOKEN}" ]]; then
   API_AUTH_TOKEN="$(openssl rand -hex 24)"
 fi
+if [[ -z "${ZIVPN_HTTP_AUTH_TOKEN}" ]]; then
+  ZIVPN_HTTP_AUTH_TOKEN="${API_AUTH_TOKEN}"
+fi
+if [[ -z "${ZIVPN_HTTP_AUTH_URL}" ]]; then
+  ZIVPN_HTTP_AUTH_URL="http://127.0.0.1:${API_PORT}/internal/zivpn-auth?token=${ZIVPN_HTTP_AUTH_TOKEN}"
+fi
 
 log() {
   echo "[autoscript-compat] $*"
+}
+
+flag_enabled() {
+  case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_xray_paths_csv() {
+  local raw fallback p normalized out
+  raw="${1:-}"
+  fallback="${2:-/}"
+  out=""
+  IFS=',' read -ra __xray_paths <<< "${raw}"
+  for p in "${__xray_paths[@]}"; do
+    normalized="$(echo "${p}" | tr -d '\r' | xargs)"
+    [[ -z "${normalized}" ]] && continue
+    [[ "${normalized}" != /* ]] && normalized="/${normalized}"
+    normalized="/$(echo "${normalized}" | sed -E 's#^/+##; s#/+#/#g')"
+    if [[ -z "${out}" ]]; then
+      out="${normalized}"
+    elif [[ ",${out}," != *",${normalized},"* ]]; then
+      out="${out},${normalized}"
+    fi
+  done
+  if [[ -z "${out}" ]]; then
+    normalized="$(echo "${fallback}" | tr -d '\r' | xargs)"
+    [[ -z "${normalized}" ]] && normalized="/"
+    [[ "${normalized}" != /* ]] && normalized="/${normalized}"
+    normalized="/$(echo "${normalized}" | sed -E 's#^/+##; s#/+#/#g')"
+    out="${normalized}"
+  fi
+  echo "${out}"
+}
+
+build_nginx_ws_locations() {
+  local paths_csv backend canonical path out
+  paths_csv="${1:-}"
+  backend="${2:-}"
+  canonical="${3:-}"
+  out=""
+  [[ -z "${backend}" || -z "${canonical}" ]] && return 0
+  IFS=',' read -ra __ws_paths <<< "${paths_csv}"
+  for path in "${__ws_paths[@]}"; do
+    path="$(echo "${path}" | xargs)"
+    [[ -z "${path}" ]] && continue
+    out+=$'    location '"${path}"$' {\n'
+    out+=$'        access_log off;\n'
+    out+=$'        proxy_redirect off;\n'
+    if [[ "${path}" != "${canonical}" ]]; then
+      out+=$'        rewrite ^ '"${canonical}"$' break;\n'
+    fi
+    out+=$'        proxy_pass http://127.0.0.1:'"${backend}"$';\n'
+    out+=$'        proxy_http_version 1.1;\n'
+    out+=$'        proxy_set_header Upgrade "websocket";\n'
+    out+=$'        proxy_set_header Connection "Upgrade";\n'
+    out+=$'        proxy_set_header Host \\$host;\n'
+    out+=$'    }\n\n'
+  done
+  printf '%s' "${out}"
+}
+XRAY_PATHS_VMESS="$(normalize_xray_paths_csv "${XRAY_PATHS_VMESS}" "/vmess")"
+XRAY_PATHS_VLESS="$(normalize_xray_paths_csv "${XRAY_PATHS_VLESS}" "/vless")"
+XRAY_PATHS_TROJAN="$(normalize_xray_paths_csv "${XRAY_PATHS_TROJAN}" "/trojan")"
+
+tls_cert_domain() {
+  if flag_enabled "${WILDCARD_ENABLE:-0}" && [[ -n "${WILDCARD_BASE_DOMAIN:-}" ]]; then
+    echo "${WILDCARD_BASE_DOMAIN}"
+    return 0
+  fi
+  echo "${DOMAIN}"
+  return 0
 }
 
 detect_public_ipv4() {
@@ -429,6 +536,7 @@ install_base_packages() {
 
   # Paket opsional (beberapa distro/repo lama tidak selalu menyediakan).
   install_optional_pkg_if_available python3-certbot-nginx || true
+  install_optional_pkg_if_available python3-certbot-dns-cloudflare || true
   install_optional_pkg_if_available vnstat || true
   install_optional_pkg_if_available speedtest-cli || true
 }
@@ -765,7 +873,64 @@ setup_vnstat() {
   fi
 }
 
+issue_letsencrypt_cert() {
+  local certbot_email_arg cert_domain
+  cert_domain="$(tls_cert_domain)"
+  if [[ -z "${cert_domain}" ]]; then
+    log "Domain sertifikat TLS kosong. Skip issue cert."
+    return 1
+  fi
+
+  if [[ -z "${EMAIL}" || "${EMAIL}" == "admin@example.com" || "${EMAIL}" == *"@example.com" ]]; then
+    certbot_email_arg="--register-unsafely-without-email"
+  else
+    certbot_email_arg="-m ${EMAIL}"
+  fi
+
+  if flag_enabled "${WILDCARD_ENABLE:-0}"; then
+    if [[ -z "${WILDCARD_BASE_DOMAIN:-}" ]]; then
+      log "WILDCARD_ENABLE=1 tapi WILDCARD_BASE_DOMAIN kosong."
+      return 1
+    fi
+    if [[ -z "${WILDCARD_CF_API_TOKEN:-}" ]]; then
+      log "WILDCARD_ENABLE=1 tapi WILDCARD_CF_API_TOKEN kosong."
+      return 1
+    fi
+    if ! certbot --help plugins 2>/dev/null | grep -qi 'dns-cloudflare'; then
+      log "Plugin certbot dns-cloudflare belum tersedia."
+      return 1
+    fi
+    mkdir -p /root/.secrets/certbot
+    cat > /root/.secrets/certbot/cloudflare.ini <<EOF
+dns_cloudflare_api_token = ${WILDCARD_CF_API_TOKEN}
+EOF
+    chmod 600 /root/.secrets/certbot/cloudflare.ini
+    log "Issue wildcard cert Let's Encrypt untuk *.${WILDCARD_BASE_DOMAIN} (DNS-01 Cloudflare)..."
+    certbot certonly \
+      --dns-cloudflare \
+      --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
+      --dns-cloudflare-propagation-seconds 30 \
+      --cert-name "${WILDCARD_BASE_DOMAIN}" \
+      -d "${WILDCARD_BASE_DOMAIN}" \
+      -d "*.${WILDCARD_BASE_DOMAIN}" \
+      --non-interactive --agree-tos ${certbot_email_arg}
+    return $?
+  fi
+
+  log "Issue cert Let's Encrypt (webroot) untuk ${DOMAIN}..."
+  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}
+}
+
 setup_nginx_and_cert() {
+  local vmess_primary vless_primary trojan_primary
+  local vmess_locations vless_locations trojan_locations
+  vmess_primary="$(echo "${XRAY_PATHS_VMESS}" | cut -d',' -f1)"
+  vless_primary="$(echo "${XRAY_PATHS_VLESS}" | cut -d',' -f1)"
+  trojan_primary="$(echo "${XRAY_PATHS_TROJAN}" | cut -d',' -f1)"
+  vmess_locations="$(build_nginx_ws_locations "${XRAY_PATHS_VMESS}" "10001" "${vmess_primary}")"
+  vless_locations="$(build_nginx_ws_locations "${XRAY_PATHS_VLESS}" "10002" "${vless_primary}")"
+  trojan_locations="$(build_nginx_ws_locations "${XRAY_PATHS_TROJAN}" "10003" "${trojan_primary}")"
+
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
@@ -791,35 +956,7 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
-    location /vmess {
-        access_log off;
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vless {
-        access_log off;
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10002;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /trojan {
-        access_log off;
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10003;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
+${vmess_locations}${vless_locations}${trojan_locations}
 
     location / {
         access_log off;
@@ -843,26 +980,20 @@ EOF
   systemctl enable nginx
   systemctl restart nginx
 
-  log "Issue cert Let's Encrypt (webroot)..."
-  local certbot_email_arg
-  if [[ -z "${EMAIL}" || "${EMAIL}" == "admin@example.com" || "${EMAIL}" == *"@example.com" ]]; then
-    certbot_email_arg="--register-unsafely-without-email"
-  else
-    certbot_email_arg="-m ${EMAIL}"
-  fi
-  if ! certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}; then
+  if ! issue_letsencrypt_cert; then
     log "Let's Encrypt gagal. Lanjut tanpa TLS 443 (haproxy belum diaktifkan)."
   fi
 }
 
 setup_haproxy_tls_mux() {
-  local fullchain privkey pem
-  fullchain="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-  privkey="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-  pem="/etc/haproxy/certs/${DOMAIN}.pem"
+  local fullchain privkey pem cert_domain
+  cert_domain="$(tls_cert_domain)"
+  fullchain="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
+  privkey="/etc/letsencrypt/live/${cert_domain}/privkey.pem"
+  pem="/etc/haproxy/certs/${cert_domain}.pem"
 
   if [[ ! -s "${fullchain}" || ! -s "${privkey}" ]]; then
-    log "Sertifikat tidak ditemukan untuk ${DOMAIN}, skip setup haproxy 443."
+    log "Sertifikat tidak ditemukan untuk ${cert_domain}, skip setup haproxy 443."
     return 0
   fi
 
@@ -947,14 +1078,41 @@ ensure_zivpn_tls_assets() {
 }
 
 ensure_zivpn_config_schema() {
-  local cfg listen cert key tmp
+  local cfg listen cert key tmp auth_mode
   cfg="/etc/zivpn/config.json"
   cert="/etc/zivpn/zivpn.crt"
   key="/etc/zivpn/zivpn.key"
   listen=":${ZIVPN_LISTEN_PORT}"
+  auth_mode="$(echo "${ZIVPN_AUTH_MODE:-http}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${auth_mode}" != "passwords" ]]; then
+    auth_mode="http"
+  fi
 
   if [[ ! -f "${cfg}" ]]; then
-    cat > "${cfg}" <<EOF
+    if [[ "${auth_mode}" == "http" ]]; then
+      cat > "${cfg}" <<EOF
+{
+  "listen": "${listen}",
+  "cert": "${cert}",
+  "key": "${key}",
+  "obfs": "zivpn",
+  "auth": {
+    "mode": "http",
+    "type": "http",
+    "url": "${ZIVPN_HTTP_AUTH_URL}",
+    "http": {
+      "url": "${ZIVPN_HTTP_AUTH_URL}",
+      "insecure": true
+    },
+    "config": {
+      "url": "${ZIVPN_HTTP_AUTH_URL}",
+      "insecure": true
+    }
+  }
+}
+EOF
+    else
+      cat > "${cfg}" <<EOF
 {
   "listen": "${listen}",
   "cert": "${cert}",
@@ -966,6 +1124,7 @@ ensure_zivpn_config_schema() {
   }
 }
 EOF
+    fi
     return 0
   fi
 
@@ -979,10 +1138,26 @@ EOF
     --arg listen "${listen}" \
     --arg cert "${cert}" \
     --arg key "${key}" \
+    --arg auth_mode "${auth_mode}" \
+    --arg auth_url "${ZIVPN_HTTP_AUTH_URL}" \
     '
-      .auth = (.auth // {"mode":"passwords","config":[]}) |
-      .auth.mode = (.auth.mode // "passwords") |
-      .auth.config = (if (.auth.config | type) == "array" then .auth.config else [] end) |
+      .auth = (.auth // {}) |
+      (
+        if $auth_mode == "http" then
+          .auth.mode = "http" |
+          .auth.type = "http" |
+          .auth.url = $auth_url |
+          .auth.http = (.auth.http // {}) |
+          .auth.http.url = $auth_url |
+          .auth.http.insecure = true |
+          .auth.config = (if (.auth.config | type) == "object" then .auth.config else {} end) |
+          .auth.config.url = $auth_url |
+          .auth.config.insecure = true
+        else
+          .auth.mode = (if ((.auth.mode | type) == "string" and .auth.mode != "") then .auth.mode else "passwords" end) |
+          .auth.config = (if (.auth.config | type) == "array" then .auth.config else [] end)
+        end
+      ) |
       .listen = (if ((.listen | type) == "string" and .listen != "") then .listen else $listen end) |
       .cert = $cert |
       .key = $key |
@@ -1126,6 +1301,32 @@ fw_delete_udp_dnat_range() {
   esac
 }
 
+fw_delete_udp_dnat_to_port_all() {
+  local to_port="$1" fw handle
+  [[ -z "${to_port}" ]] && return 0
+  fw="$(fw_backend_kind)"
+  case "${fw}" in
+    iptables)
+      while IFS= read -r handle; do
+        [[ -z "${handle}" ]] && continue
+        iptables -w 10 -t nat -D PREROUTING "${handle}" >/dev/null 2>&1 || true
+      done < <(
+        iptables -w 10 -t nat -L PREROUTING --line-numbers -n 2>/dev/null | \
+          awk -v p="${to_port}" '$0 ~ /DNAT/ && $0 ~ ("to::" p "($|[^0-9])") {print $1}' | sort -rn
+      )
+      ;;
+    nft)
+      while IFS= read -r handle; do
+        [[ -z "${handle}" ]] && continue
+        nft delete rule ip nat prerouting handle "${handle}" >/dev/null 2>&1 || true
+      done < <(
+        nft -a list chain ip nat prerouting 2>/dev/null | \
+          awk -v p="${to_port}" '$0 ~ ("dnat to :" p "($|[^0-9])") {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
+      )
+      ;;
+  esac
+}
+
 fw_persist_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -1228,9 +1429,8 @@ setup_udpcustom_udp_nat_rules() {
     return 0
   fi
 
-  local listen_port backend effective_dnat_range
+  local listen_port backend
   backend="$(echo "${ACTIVE_UDP_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
-  effective_dnat_range="${UDPCUSTOM_DNAT_RANGE}"
   listen_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   if [[ -z "${listen_port}" ]]; then
     listen_port="$(echo "${UDPCUSTOM_LISTEN_PORT}" | tr -cd '0-9')"
@@ -1239,28 +1439,15 @@ setup_udpcustom_udp_nat_rules() {
     listen_port="5667"
   fi
 
-  log "Set rule UDP UDPHC: listen=${listen_port}, dnat_range=${UDPCUSTOM_DNAT_RANGE:-none}"
+  log "Set rule UDP UDPHC: listen=${listen_port}, dnat_range=disabled"
 
   fw_allow_udp_input "${listen_port}"
 
-  if [[ -z "${effective_dnat_range}" && ( "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ) ]]; then
-    effective_dnat_range="${UDPCUSTOM_DNAT_AUTO_RANGE}"
-    log "UDPHC aktif dengan DNAT auto-range: ${effective_dnat_range}"
-  fi
-
-  if [[ -n "${effective_dnat_range}" ]]; then
-    fw_add_udp_dnat_range "${effective_dnat_range}" "${listen_port}"
-    # Hindari overlap jalur saat pindah dari ZIVPN ke UDPHC.
+  # UDPHC default: tanpa DNAT range. Bersihkan semua DNAT legacy yang menuju port UDPHC.
+  if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
+    fw_delete_udp_dnat_to_port_all "${listen_port}"
     fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${listen_port}"
-  else
-    log "UDPHC tanpa DNAT range (default performa). Isi UDPCUSTOM_DNAT_RANGE jika perlu mode tembak port."
-    if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
-      # Saat UDPHC aktif tanpa range, bersihkan DNAT range ZIVPN agar tidak membingungkan jalur trafik.
-      fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${listen_port}"
-      log "DNAT range ZIVPN ${ZIVPN_DNAT_RANGE} dibersihkan (backend UDPHC aktif)."
-    else
-      log "DNAT UDPHC tidak diubah karena UDPCUSTOM_DNAT_RANGE kosong."
-    fi
+    log "DNAT legacy ke port ${listen_port} dibersihkan (backend UDPHC aktif)."
   fi
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
@@ -1322,8 +1509,19 @@ PORT=${API_PORT}
 DB_PATH=${DB_PATH}
 DOMAIN=${DOMAIN}
 AUTH_TOKEN=${API_AUTH_TOKEN}
+LICENSE_ENFORCE=${LICENSE_ENFORCE}
+LICENSE_API_URL=${LICENSE_API_URL}
+LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
+LICENSE_KEY=${LICENSE_KEY}
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
+ZIVPN_RELOAD_ON_AUTH_CHANGE=${ZIVPN_RELOAD_ON_AUTH_CHANGE}
+ZIVPN_AUTH_APPLY_MODE=${ZIVPN_AUTH_APPLY_MODE}
+ZIVPN_AUTH_MODE=${ZIVPN_AUTH_MODE}
+ZIVPN_HTTP_AUTH_TOKEN=${ZIVPN_HTTP_AUTH_TOKEN}
+ZIVPN_LIVE_TTL_SECONDS=${ZIVPN_LIVE_TTL_SECONDS}
+ZIVPN_ACTIVE_WINDOW_SECONDS=${ZIVPN_ACTIVE_WINDOW_SECONDS}
+ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 SSH_WS_PORT=2082
 SSH_WS_TARGET_PORT=${ssh_ws_target_port}
 SSH_HTTP_BACKEND_HOST=127.0.0.1
@@ -1347,6 +1545,9 @@ XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
+XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
+XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
+XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
@@ -1373,14 +1574,108 @@ const DOMAIN = String(process.env.DOMAIN || '').trim();
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
+const ZIVPN_AUTH_MODE = String(process.env.ZIVPN_AUTH_MODE || 'http').trim().toLowerCase();
+const ZIVPN_HTTP_AUTH_TOKEN = String(process.env.ZIVPN_HTTP_AUTH_TOKEN || AUTH_TOKEN).trim();
+const ZIVPN_LIVE_TTL_SECONDS_RAW = Number(process.env.ZIVPN_LIVE_TTL_SECONDS || 90);
+const ZIVPN_LIVE_TTL_SECONDS = Number.isFinite(ZIVPN_LIVE_TTL_SECONDS_RAW) && ZIVPN_LIVE_TTL_SECONDS_RAW >= 20
+  ? Math.min(Math.floor(ZIVPN_LIVE_TTL_SECONDS_RAW), 1800)
+  : 90;
+const ZIVPN_RELOAD_ON_AUTH_CHANGE = String(process.env.ZIVPN_RELOAD_ON_AUTH_CHANGE || '0').trim() === '1';
+const ZIVPN_AUTH_APPLY_MODE_RAW = String(process.env.ZIVPN_AUTH_APPLY_MODE || '').trim().toLowerCase();
+const ZIVPN_AUTH_APPLY_MODE = ZIVPN_AUTH_APPLY_MODE_RAW || (ZIVPN_RELOAD_ON_AUTH_CHANGE ? 'restart' : 'reload');
 const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
 const UDPCUSTOM_SERVICE = process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
+const LICENSE_ENFORCE = String(process.env.LICENSE_ENFORCE || '1').trim().toLowerCase();
 
 const db = new sqlite3.Database(DB_PATH);
+let licenseApiStopped = false;
+
+function parseLicenseExpiresEpoch(raw) {
+  const digits = String(raw ?? '').replace(/[^0-9]/g, '');
+  if (!digits) return 0;
+  let n = Number(digits);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  if (digits.length >= 13) n = Math.floor(n / 1000);
+  return n > 0 ? Math.floor(n) : 0;
+}
+function readLicenseFileState() {
+  try {
+    const p = '/etc/sc-1forcr-license';
+    if (!fs.existsSync(p)) return { status: '', expiresAt: 0 };
+    const raw = String(fs.readFileSync(p, 'utf8') || '');
+    const map = new Map();
+    for (const line of raw.split(/\r?\n/)) {
+      const i = line.indexOf('=');
+      if (i <= 0) continue;
+      const k = line.slice(0, i).trim();
+      const v = line.slice(i + 1).trim();
+      if (k) map.set(k, v);
+    }
+    const status = String(map.get('LICENSE_STATUS') || '').trim().toLowerCase();
+    const expiresAt = parseLicenseExpiresEpoch(map.get('LICENSE_EXPIRES_AT') || '');
+    return { status, expiresAt };
+  } catch (_) {
+    return { status: '', expiresAt: 0 };
+  }
+}
+function isRuntimeLicenseDenied() {
+  if (LICENSE_ENFORCE === '0' || LICENSE_ENFORCE === 'false' || LICENSE_ENFORCE === 'no' || LICENSE_ENFORCE === 'off') {
+    return false;
+  }
+  const state = readLicenseFileState();
+  const badStatuses = new Set(['expired', 'rejected', 'deny', 'denied', 'blocked', 'suspended', 'inactive']);
+  if (state.status && badStatuses.has(state.status)) return true;
+  if (state.expiresAt > 0) {
+    const now = Math.floor(Date.now() / 1000);
+    if (now >= state.expiresAt) return true;
+  }
+  return false;
+}
+function stopApiByLicense(reason) {
+  if (licenseApiStopped) return;
+  licenseApiStopped = true;
+  console.error(`[license-guard] API disabled: ${String(reason || 'license-invalid')}`);
+  try {
+    execFileSync('systemctl', ['disable', '--now', 'sc-1forcr-api'], { stdio: 'ignore' });
+  } catch (_) {
+    try { execFileSync('systemctl', ['stop', 'sc-1forcr-api'], { stdio: 'ignore' }); } catch (_) {}
+  }
+}
+function runtimeLicenseGuard(_req, res, next) {
+  if (!isRuntimeLicenseDenied()) return next();
+  stopApiByLicense('expired-or-rejected');
+  return res.status(403).json({
+    meta: { code: 403, message: 'license expired' },
+    message: 'license expired'
+  });
+}
+
+function normalizeXrayPath(raw, fallback = '/') {
+  const source = String(raw || '').trim();
+  const base = source || String(fallback || '/').trim() || '/';
+  let path = base.startsWith('/') ? base : `/${base}`;
+  path = path.replace(/\/+/g, '/');
+  return path || '/';
+}
+function parseXrayPathList(raw, fallback) {
+  const list = String(raw || '')
+    .split(',')
+    .map((v) => normalizeXrayPath(v, ''))
+    .filter((v) => v && v !== '/')
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+  if (list.length > 0) return list;
+  return [normalizeXrayPath(fallback, '/')];
+}
+const XRAY_PATHS_VMESS = parseXrayPathList(process.env.XRAY_PATHS_VMESS, '/vmess');
+const XRAY_PATHS_VLESS = parseXrayPathList(process.env.XRAY_PATHS_VLESS, '/vless');
+const XRAY_PATHS_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/trojan');
+const XRAY_PATH_VMESS = XRAY_PATHS_VMESS[0];
+const XRAY_PATH_VLESS = XRAY_PATHS_VLESS[0];
+const XRAY_PATH_TROJAN = XRAY_PATHS_TROJAN[0];
 
 function ok(res, data, message = 'success') {
   return res.json({ meta: { code: 200, message }, data });
@@ -1399,6 +1694,95 @@ function parseIntId(raw) {
   const n = Number(s);
   return Number.isInteger(n) ? n : null;
 }
+function parseZivpnAuthString(raw) {
+  const authRaw = String(raw || '').trim();
+  if (!authRaw) return { username: '', password: '' };
+  const sep = authRaw.indexOf(':');
+  if (sep <= 0) return { username: '', password: '' };
+  const username = authRaw.slice(0, sep).trim().toLowerCase();
+  const password = authRaw.slice(sep + 1);
+  return { username, password };
+}
+function isExpiredDate(dateExp) {
+  const raw = String(dateExp || '').trim();
+  if (!raw) return false;
+  const iso = raw.length <= 10 ? `${raw}T23:59:59` : raw;
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return false;
+  return dt.getTime() <= Date.now();
+}
+function getRequestIp(req) {
+  const direct = String(req?.socket?.remoteAddress || '').trim();
+  const real = String(req?.headers?.['x-real-ip'] || '').trim();
+  const fwd = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+  const ip = real || fwd || direct || '-';
+  return ip.replace(/^::ffff:/, '');
+}
+function isLoopbackIp(ip) {
+  const v = String(ip || '').trim().toLowerCase();
+  return v === '127.0.0.1' || v === '::1' || v === 'localhost';
+}
+function parseIpFromAddr(raw) {
+  const v = String(raw || '').trim();
+  if (!v) return '';
+  if (v.startsWith('[')) {
+    const m = v.match(/^\[([^\]]+)\](?::\d+)?$/);
+    if (m) return String(m[1] || '').trim();
+  }
+  if (v.includes(':') && !v.includes('.')) {
+    const colonCount = (v.match(/:/g) || []).length;
+    if (colonCount > 1) return v;
+  }
+  const mPort = v.match(/^(.+):(\d{1,5})$/);
+  if (mPort) return String(mPort[1] || '').trim();
+  return v;
+}
+function resolveZivpnAuthIp(req) {
+  const bodyAddr = String(req?.body?.addr || req?.body?.source || '').trim();
+  const fromBody = parseIpFromAddr(bodyAddr).replace(/^::ffff:/, '');
+  if (fromBody && !isLoopbackIp(fromBody)) return fromBody;
+  return getRequestIp(req);
+}
+function logZivpnAuth(result, reason, ip, user = '') {
+  const r = String(result || '').trim().toLowerCase() || 'unknown';
+  const rs = String(reason || '').trim().toLowerCase() || 'n/a';
+  const src = String(ip || '-').trim() || '-';
+  const u = String(user || '').trim() || '-';
+  console.log(`[zivpn-auth] result=${r} reason=${rs} ip=${src} user=${u}`);
+}
+async function touchZivpnLiveSession(username, ip) {
+  try {
+    const u = String(username || '').trim().toLowerCase();
+    const src = String(ip || '').trim();
+    if (!u || !src || src === '-' || isLoopbackIp(src)) return;
+    const nowTs = Math.floor(Date.now() / 1000);
+    await run(
+      `INSERT INTO zivpn_live_sessions(username, ip, first_seen, last_seen, hits)
+       VALUES(?, ?, ?, ?, 1)
+       ON CONFLICT(username, ip)
+       DO UPDATE SET last_seen=excluded.last_seen, hits=zivpn_live_sessions.hits + 1`,
+      [u, src, nowTs, nowTs]
+    ).catch(() => {});
+  } catch (_) {}
+}
+async function cleanupZivpnLiveSessions() {
+  try {
+    const nowTs = Math.floor(Date.now() / 1000);
+    const ttl = Math.max(20, Number(ZIVPN_LIVE_TTL_SECONDS || 90));
+    await run("DELETE FROM zivpn_live_sessions WHERE last_seen < ?", [nowTs - ttl]).catch(() => {});
+  } catch (_) {}
+}
+async function ensureApiRuntimeTables() {
+  await run(`CREATE TABLE IF NOT EXISTS zivpn_live_sessions (
+    username TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    hits INTEGER DEFAULT 1,
+    PRIMARY KEY (username, ip)
+  )`).catch(() => {});
+  await cleanupZivpnLiveSessions().catch(() => {});
+}
 function getOwnerInfo(req, body = {}) {
   const ownerTelegramId = parseIntId(
     req?.headers?.['x-telegram-user-id'] ??
@@ -1414,6 +1798,73 @@ function getOwnerInfo(req, body = {}) {
   );
   return { ownerTelegramId, ownerTelegramChatId };
 }
+app.post('/internal/zivpn-auth', async (req, res) => {
+  if (isRuntimeLicenseDenied()) {
+    stopApiByLicense('expired-or-rejected');
+    return res.status(403).json({ ok: false, id: '' });
+  }
+  const reqIp = resolveZivpnAuthIp(req);
+  try {
+    const queryToken = String(req.query?.token || '').trim();
+    const headerToken = String(req.headers?.['x-auth-token'] || '').trim();
+    if (ZIVPN_HTTP_AUTH_TOKEN && queryToken !== ZIVPN_HTTP_AUTH_TOKEN && headerToken !== ZIVPN_HTTP_AUTH_TOKEN) {
+      logZivpnAuth('deny', 'bad-token', reqIp);
+      return res.status(401).json({ ok: false, id: '' });
+    }
+    const authRaw = String(req.body?.auth || '').trim();
+    if (!authRaw) {
+      logZivpnAuth('deny', 'empty-auth', reqIp);
+      return res.json({ ok: false, id: '' });
+    }
+    let row = null;
+    const userPass = parseZivpnAuthString(authRaw);
+    if (userPass.username && userPass.password) {
+      row = await get(
+        "SELECT username, password, status, date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?) LIMIT 1",
+        [userPass.username]
+      ).catch(() => null);
+      if (!row) {
+        logZivpnAuth('deny', 'user-not-found', reqIp, userPass.username);
+        return res.json({ ok: false, id: '' });
+      }
+      if (String(row?.password || '') !== userPass.password) {
+        logZivpnAuth('deny', 'bad-password', reqIp, userPass.username);
+        return res.json({ ok: false, id: '' });
+      }
+    } else {
+      row = await get(
+        "SELECT username, password, status, date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?) LIMIT 1",
+        [authRaw]
+      ).catch(() => null);
+      if (!row) {
+        row = await get(
+          "SELECT username, password, status, date_exp FROM account_sshs WHERE password=? ORDER BY LOWER(username) LIMIT 1",
+          [authRaw]
+        ).catch(() => null);
+      }
+    }
+    if (!row) {
+      logZivpnAuth('deny', 'user-not-found', reqIp, authRaw);
+      return res.json({ ok: false, id: '' });
+    }
+    const status = String(row?.status || '').trim().toUpperCase();
+    const resolvedUser = String(row?.username || authRaw).trim() || authRaw;
+    if (status !== 'AKTIF') {
+      logZivpnAuth('deny', `status-${status || 'unknown'}`, reqIp, resolvedUser);
+      return res.json({ ok: false, id: '' });
+    }
+    if (isExpiredDate(row?.date_exp)) {
+      logZivpnAuth('deny', 'expired', reqIp, resolvedUser);
+      return res.json({ ok: false, id: '' });
+    }
+    await touchZivpnLiveSession(resolvedUser, reqIp);
+    logZivpnAuth('allow', 'ok', reqIp, resolvedUser);
+    return res.json({ ok: true, id: resolvedUser });
+  } catch (_) {
+    logZivpnAuth('deny', 'internal-error', reqIp);
+    return res.json({ ok: false, id: '' });
+  }
+});
 function telegramNotify(text) {
   return new Promise((resolve) => {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !text) return resolve(false);
@@ -1493,6 +1944,30 @@ async function notifyExpiredAccountEvent(service, account = {}, owner = {}) {
     await telegramNotify(msg);
   } catch (_) {}
 }
+async function notifyExpiredAccountsBatchEvent(service, accounts = []) {
+  try {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    const list = Array.isArray(accounts) ? accounts : [];
+    if (list.length === 0) return;
+    const rows = list.slice(0, 30).map((acc, idx) => {
+      const user = String(acc?.username || '-').trim() || '-';
+      const exp = String(acc?.date_exp || acc?.exp || acc?.expired || '-').trim() || '-';
+      const lim = String(acc?.limitip ?? '0').trim() || '0';
+      return `${idx + 1}. ${user} | exp ${exp} | lim ${lim}`;
+    });
+    const remain = list.length > 30 ? `\n... +${list.length - 30} akun lainnya` : '';
+    const msg =
+      `SC 1FORCR NOTIF\n` +
+      `Event    : EXPIRED_BATCH\n` +
+      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
+      `Domain   : ${DOMAIN || '-'}\n` +
+      `Total    : ${list.length}\n` +
+      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n\n` +
+      rows.join('\n') +
+      remain;
+    await telegramNotify(msg);
+  } catch (_) {}
+}
 function ymdLocal(d) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -1510,6 +1985,26 @@ function ymdPlusDays(days, baseYmd = '') {
   d.setDate(d.getDate() + Number(days || 0));
   return ymdLocal(d);
 }
+function parseDateExpToDate(v) {
+  const s = String(v || '').trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = new Date(`${s}T00:00:00`);
+    return Number.isFinite(d.getTime()) ? d : null;
+  }
+  if (/^\d{4}-\d{2}-\d{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$/.test(s)) {
+    const iso = s.includes('T') ? s : s.replace(' ', 'T');
+    const d = new Date(iso);
+    return Number.isFinite(d.getTime()) ? d : null;
+  }
+  return null;
+}
+function ymdFromDateExp(v) {
+  const s = String(v || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const d = parseDateExpToDate(s);
+  return d ? ymdLocal(d) : '';
+}
 function datetimeLocal(d) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -1522,6 +2017,14 @@ function datetimeLocal(d) {
 function dateExpPlusMinutes(minutes) {
   const m = Number(minutes || 0);
   const d = new Date(Date.now() + Math.max(1, m) * 60 * 1000);
+  return datetimeLocal(d);
+}
+function dateExpPlusDays(days, baseExp = '') {
+  const addDays = Math.max(0, Number(days || 0));
+  const now = Date.now();
+  const baseParsed = parseDateExpToDate(baseExp);
+  const base = (baseParsed && baseParsed.getTime() > now) ? baseParsed : new Date(now);
+  const d = new Date(base.getTime() + (addDays * 24 * 60 * 60 * 1000));
   return datetimeLocal(d);
 }
 function nowTime() {
@@ -1613,7 +2116,8 @@ function ensureLinuxUser(username, password, expDate) {
   if (!exists) safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', '/bin/bash', username]);
   safeExec('chpasswd', [], `${username}:${password}\n`);
   safeExec('usermod', ['-s', '/bin/bash', username]);
-  if (expDate) safeExec('chage', ['-E', expDate, username]);
+  const linuxExpDate = ymdFromDateExp(expDate);
+  if (linuxExpDate) safeExec('chage', ['-E', linuxExpDate, username]);
 }
 
 function deleteLinuxUser(username) {
@@ -1628,10 +2132,27 @@ function unlockLinuxUser(username) {
   safeExec('passwd', ['-u', username]);
 }
 
-function zivpnReload() {
-  if (!safeExec('systemctl', ['restart', ZIVPN_SERVICE])) {
-    safeExec('service', [ZIVPN_SERVICE, 'restart']);
+function zivpnReloadByRestart() {
+  if (safeExec('systemctl', ['restart', ZIVPN_SERVICE])) return true;
+  return safeExec('service', [ZIVPN_SERVICE, 'restart']);
+}
+
+function zivpnReloadBySignal() {
+  if (safeExec('systemctl', ['reload', ZIVPN_SERVICE])) return true;
+  if (safeExec('systemctl', ['kill', '-s', 'HUP', ZIVPN_SERVICE])) return true;
+  if (safeExec('service', [ZIVPN_SERVICE, 'reload'])) return true;
+  return false;
+}
+
+function applyZivpnAuthChange() {
+  const mode = String(ZIVPN_AUTH_APPLY_MODE || 'reload').trim().toLowerCase();
+  if (mode === 'none' || mode === 'off' || mode === 'disabled') return true;
+  if (mode === 'restart') return zivpnReloadByRestart();
+  if (mode === 'reload-restart') {
+    if (zivpnReloadBySignal()) return true;
+    return zivpnReloadByRestart();
   }
+  return zivpnReloadBySignal();
 }
 
 let zivpnReloadTimer = null;
@@ -1639,7 +2160,7 @@ function scheduleZivpnReload(delayMs = 8000) {
   if (zivpnReloadTimer) clearTimeout(zivpnReloadTimer);
   zivpnReloadTimer = setTimeout(() => {
     zivpnReloadTimer = null;
-    zivpnReload();
+    applyZivpnAuthChange();
   }, Number(delayMs) || 8000);
 }
 
@@ -1659,6 +2180,7 @@ function scheduleUdpcustomReload(delayMs = 5000) {
 }
 
 function syncZivpnUser(username, addMode) {
+  if (ZIVPN_AUTH_MODE !== 'passwords') return;
   try {
     let root = { auth: { mode: 'passwords', config: [] } };
     if (fs.existsSync(ZIVPN_CONFIG)) root = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
@@ -1751,22 +2273,24 @@ async function syncSshBackendsFromDb() {
       }
     }
 
-    try {
-      let z = { auth: { mode: 'passwords', config: [] } };
-      if (fs.existsSync(ZIVPN_CONFIG)) z = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
-      if (!z.auth || typeof z.auth !== 'object') z.auth = {};
-      const prev = Array.isArray(z.auth.config)
-        ? Array.from(new Set(z.auth.config.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))).sort()
-        : [];
-      const next = Array.from(new Set(zivpnUsers.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))).sort();
-      const changed = z.auth.mode !== 'passwords' || JSON.stringify(prev) !== JSON.stringify(next);
-      if (changed) {
-        z.auth.mode = 'passwords';
-        z.auth.config = next;
-        fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(z, null, 2));
-        scheduleZivpnReload(1500);
-      }
-    } catch (_) {}
+    if (ZIVPN_AUTH_MODE === 'passwords') {
+      try {
+        let z = { auth: { mode: 'passwords', config: [] } };
+        if (fs.existsSync(ZIVPN_CONFIG)) z = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
+        if (!z.auth || typeof z.auth !== 'object') z.auth = {};
+        const prev = Array.isArray(z.auth.config)
+          ? Array.from(new Set(z.auth.config.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))).sort()
+          : [];
+        const next = Array.from(new Set(zivpnUsers.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))).sort();
+        const changed = z.auth.mode !== 'passwords' || JSON.stringify(prev) !== JSON.stringify(next);
+        if (changed) {
+          z.auth.mode = 'passwords';
+          z.auth.config = next;
+          fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(z, null, 2));
+          scheduleZivpnReload(1500);
+        }
+      } catch (_) {}
+    }
 
     try {
       let u = { auth: { mode: 'passwords', config: [] } };
@@ -1794,15 +2318,15 @@ async function syncSshBackendsFromDb() {
 function vmessLink(host, id, tls) {
   const payload = {
     v: '2', ps: `vmess-${host}`, add: host, port: tls ? '443' : '80', id, aid: '0',
-    net: 'ws', type: 'none', host, path: '/vmess', tls: tls ? 'tls' : 'none', sni: host
+    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
 function vlessLink(host, id, tls) {
-  return `vless://${id}@${host}:${tls ? '443' : '80'}?type=ws&path=%2Fvless&security=${tls ? 'tls' : 'none'}&sni=${host}#vless-${host}`;
+  return `vless://${id}@${host}:${tls ? '443' : '80'}?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=${tls ? 'tls' : 'none'}&sni=${host}#vless-${host}`;
 }
 function trojanLink(host, pass, tls) {
-  return `trojan://${pass}@${host}:${tls ? '443' : '80'}?type=ws&path=%2Ftrojan&security=${tls ? 'tls' : 'none'}&sni=${host}#trojan-${host}`;
+  return `trojan://${pass}@${host}:${tls ? '443' : '80'}?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=${tls ? 'tls' : 'none'}&sni=${host}#trojan-${host}`;
 }
 
 async function renderAndReloadXray() {
@@ -1820,17 +2344,17 @@ async function renderAndReloadXray() {
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
+        streamSettings: { network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } }
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } }
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -1863,6 +2387,11 @@ async function cleanupExpiredXrayAccounts() {
     { table: 'account_trojans', type: 'trojan' }
   ];
   let changed = false;
+  const expiredBatch = {
+    vmess: [],
+    vless: [],
+    trojan: []
+  };
   for (const item of targets) {
     const rows = await all(
       `SELECT username, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
@@ -1873,25 +2402,25 @@ async function cleanupExpiredXrayAccounts() {
       const u = String(row?.username || '').trim();
       const exp = String(row?.date_exp || '').trim();
       if (!u || !isExpiredDateValue(exp)) continue;
-      await notifyExpiredAccountEvent(item.type, {
+      expiredBatch[item.type].push({
         username: u,
         date_exp: exp,
         limitip: String(row?.limitip ?? '0')
-      }, {
-        owner_telegram_id: row?.owner_telegram_id,
-        owner_telegram_chat_id: row?.owner_telegram_chat_id
       });
       await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
       changed = true;
     }
   }
+  await notifyExpiredAccountsBatchEvent('vmess', expiredBatch.vmess);
+  await notifyExpiredAccountsBatchEvent('vless', expiredBatch.vless);
+  await notifyExpiredAccountsBatchEvent('trojan', expiredBatch.trojan);
   if (changed) {
     await renderAndReloadXray().catch(() => {});
   }
 }
 
 app.get('/vps/health', (_req, res) => ok(res, { ok: true, domain: DOMAIN }));
-app.use('/vps', auth);
+app.use('/vps', runtimeLicenseGuard, auth);
 
 app.get('/vps/my-accounts', async (req, res) => {
   try {
@@ -1974,8 +2503,8 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   const limitip = Number(body?.limitip || 0);
   if (!username) throw new Error('username required');
   await ensureUsernameNotExists('account_sshs', username);
-  const expDate = isTrial ? dateExpPlusMinutes(60) : ymdPlusDays(expDays);
-  const linuxExpDate = isTrial ? ymdLocal(new Date(Date.now() + 60 * 60 * 1000)) : expDate;
+  const expDate = isTrial ? dateExpPlusMinutes(60) : dateExpPlusDays(expDays);
+  const linuxExpDate = ymdFromDateExp(expDate);
   ensureLinuxUser(username, password, linuxExpDate);
   await run(
     "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
@@ -2028,16 +2557,15 @@ async function renewSsh(req, res) {
     const bodyPass = String(req.body?.password || '').trim();
     const bodyQuota = Number(req.body?.kuota);
     const bodyLimitIp = Number(req.body?.limitip);
-    const today = ymdPlusDays(0);
     const fromExp = String(row?.date_exp || '-');
     const baseExp = String(row?.date_exp || '');
-    const renewBase = (/^\d{4}-\d{2}-\d{2}$/.test(baseExp) && baseExp > today) ? baseExp : today;
-    const expDate = ymdPlusDays(exp, renewBase);
+    const expDate = dateExpPlusDays(exp, baseExp);
+    const linuxExpDate = ymdFromDateExp(expDate);
     if (!row) {
       const pass = bodyPass || username;
       const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : 0;
       const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : 0;
-      ensureLinuxUser(username, pass, expDate);
+      ensureLinuxUser(username, pass, linuxExpDate);
       await run(
         "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
         [username, pass, expDate, 'AKTIF', nextQuota, nextLimitIp, owner.ownerTelegramId, owner.ownerTelegramChatId]
@@ -2062,7 +2590,7 @@ async function renewSsh(req, res) {
     const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
     const currentLimitIp = Number(row?.limitip || 0);
     const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : currentLimitIp;
-    ensureLinuxUser(username, pass, expDate);
+    ensureLinuxUser(username, pass, linuxExpDate);
     await run(
       "UPDATE account_sshs SET password=?, date_exp=?, quota=?, limitip=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)",
       [pass, expDate, nextQuota, nextLimitIp, username]
@@ -2094,16 +2622,29 @@ app.patch('/vps/locksshvpn/:username', async (req, res) => {
   return ok(res, { username });
 });
 
+async function syncAfterManualSshUnlock(username) {
+  const u = String(username || '').trim();
+  if (!u) return;
+  await run(
+    "UPDATE temp_ip_locks SET locked_until=0 WHERE account_type='ssh' AND LOWER(username)=LOWER(?)",
+    [u]
+  ).catch(() => {});
+  safeExec('systemctl', ['start', 'sc-1forcr-iplimit.service']);
+  safeExec('systemctl', ['restart', 'sc-1forcr-iplimit.timer']);
+}
+
 app.patch('/vps/unlocksshvpn/:username', async (req, res) => {
   const username = String(req.params.username || '').trim();
   unlockLinuxUser(username);
   await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
+  await syncAfterManualSshUnlock(username);
   return ok(res, { username });
 });
 app.patch('/vps/unlocksshvpn/:username/pw', async (req, res) => {
   const username = String(req.params.username || '').trim();
   unlockLinuxUser(username);
   await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
+  await syncAfterManualSshUnlock(username);
   return ok(res, { username });
 });
 
@@ -2119,7 +2660,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
     finalUsername = await generateTrialUsername(protocolTable[protocol], 'trial');
   }
   if (!finalUsername) throw new Error('username required');
-  const expDate = trial ? dateExpPlusMinutes(60) : ymdPlusDays(expDays);
+  const expDate = trial ? dateExpPlusMinutes(60) : dateExpPlusDays(expDays);
   let data = null;
   if (protocol === 'vmess') {
     await ensureUsernameNotExists('account_vmesses', finalUsername);
@@ -2132,7 +2673,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: '/vmess', stn: '/vmess', upgrade: '/upvmess' },
+      path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, upgrade: '/upvmess', aliases: XRAY_PATHS_VMESS },
       serviceName: 'vmess-grpc',
       link: { tls: vmessLink(DOMAIN, uuid, true), none: vmessLink(DOMAIN, uuid, false), grpc: vmessLink(DOMAIN, uuid, true), uptls: vmessLink(DOMAIN, uuid, true), upntls: vmessLink(DOMAIN, uuid, false) }
     };
@@ -2147,7 +2688,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: '/vless', stn: '/vless', upgrade: '/upvless' },
+      path: { ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, upgrade: '/upvless', aliases: XRAY_PATHS_VLESS },
       serviceName: 'vless-grpc',
       link: { tls: vlessLink(DOMAIN, uuid, true), none: vlessLink(DOMAIN, uuid, false), grpc: vlessLink(DOMAIN, uuid, true), uptls: vlessLink(DOMAIN, uuid, true), upntls: vlessLink(DOMAIN, uuid, false) }
     };
@@ -2162,7 +2703,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: DOMAIN, username: finalUsername, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: '/trojan', stn: '/trojan', upgrade: '/uptrojan' },
+      path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, upgrade: '/uptrojan', aliases: XRAY_PATHS_TROJAN },
       serviceName: 'trojan-grpc',
       link: { tls: trojanLink(DOMAIN, pass, true), none: trojanLink(DOMAIN, pass, false), grpc: trojanLink(DOMAIN, pass, true), uptls: trojanLink(DOMAIN, pass, true), upntls: trojanLink(DOMAIN, pass, false) }
     };
@@ -2235,11 +2776,9 @@ async function renewXray(table, username, exp, req) {
   const row = await get(`SELECT ${secretCol} AS secret, date_exp, quota, limitip FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]).catch(() => null);
   const bodyQuota = Number(body?.kuota);
   const bodyLimitIp = Number(body?.limitip);
-  const today = ymdPlusDays(0);
   const fromExp = String(row?.date_exp || '-');
   const baseExp = String(row?.date_exp || '');
-  const renewBase = (/^\d{4}-\d{2}-\d{2}$/.test(baseExp) && baseExp > today) ? baseExp : today;
-  const expDate = ymdPlusDays(exp, renewBase);
+  const expDate = dateExpPlusDays(exp, baseExp);
 
   if (!row) {
     const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : 0;
@@ -2305,17 +2844,17 @@ async function setStatusXray(table, username, status) {
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
+        streamSettings: { network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } }
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } }
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -2354,6 +2893,15 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '127.0.0.1', () => {
+  if (isRuntimeLicenseDenied()) {
+    stopApiByLicense('expired-or-rejected');
+    return;
+  }
+  setInterval(() => {
+    if (isRuntimeLicenseDenied()) stopApiByLicense('expired-or-rejected');
+  }, 30 * 1000);
+  ensureApiRuntimeTables().catch(() => {});
+  setInterval(() => { cleanupZivpnLiveSessions().catch(() => {}); }, 60 * 1000);
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
   cleanupExpiredXrayAccounts().catch(() => {});
@@ -2371,6 +2919,33 @@ const SSH_HOST = process.env.SSH_WS_TARGET_HOST || '127.0.0.1';
 const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 109);
 const HTTP_BACKEND_HOST = process.env.SSH_HTTP_BACKEND_HOST || '127.0.0.1';
 const HTTP_BACKEND_PORT = Number(process.env.SSH_HTTP_BACKEND_PORT || 80);
+function normalizePath(raw, fallback = '/') {
+  const source = String(raw || '').trim();
+  const base = source || String(fallback || '/').trim() || '/';
+  let p = base.startsWith('/') ? base : `/${base}`;
+  p = p.replace(/\/+/g, '/');
+  return p || '/';
+}
+function parsePathList(raw, fallback) {
+  const list = String(raw || '')
+    .split(',')
+    .map((v) => normalizePath(v, ''))
+    .filter((v) => v && v !== '/')
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+  if (list.length > 0) return list;
+  return [normalizePath(fallback, '/')];
+}
+const XRAY_HTTP_PATHS = [
+  ...parsePathList(process.env.XRAY_PATHS_VMESS, '/vmess'),
+  ...parsePathList(process.env.XRAY_PATHS_VLESS, '/vless'),
+  ...parsePathList(process.env.XRAY_PATHS_TROJAN, '/trojan')
+].filter((v, i, arr) => arr.indexOf(v) === i);
+function isXrayProxyPath(path) {
+  for (const p of XRAY_HTTP_PATHS) {
+    if (path === p || path.startsWith(`${p}/`) || path.startsWith(`${p}?`)) return true;
+  }
+  return false;
+}
 
 function firstLine(head) {
   const i = head.indexOf('\r\n');
@@ -2453,7 +3028,7 @@ const server = net.createServer((client) => {
       return;
     }
 
-    if (path.startsWith('/vps/') || path.startsWith('/vmess') || path.startsWith('/vless') || path.startsWith('/trojan')) {
+    if (path.startsWith('/vps/') || isXrayProxyPath(path)) {
       const req = Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]);
       startHttpProxy(req);
       return;
@@ -2763,6 +3338,7 @@ const { execFileSync } = require('child_process');
 const DB_PATH = process.env.DB_PATH || '/usr/sbin/potatonc/potato.db';
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
+const ZIVPN_AUTH_MODE = String(process.env.ZIVPN_AUTH_MODE || 'http').trim().toLowerCase();
 const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
 const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
@@ -2795,6 +3371,25 @@ const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 1);
 const XRAY_MIN_HITS_PER_IP = Number.isFinite(XRAY_MIN_HITS_PER_IP_RAW) && XRAY_MIN_HITS_PER_IP_RAW >= 1
   ? Math.min(Math.floor(XRAY_MIN_HITS_PER_IP_RAW), 20)
   : 1;
+function normalizeXrayPath(raw, fallback = '/') {
+  const source = String(raw || '').trim();
+  const base = source || String(fallback || '/').trim() || '/';
+  let path = base.startsWith('/') ? base : `/${base}`;
+  path = path.replace(/\/+/g, '/');
+  return path || '/';
+}
+function parseXrayPathList(raw, fallback) {
+  const list = String(raw || '')
+    .split(',')
+    .map((v) => normalizeXrayPath(v, ''))
+    .filter((v) => v && v !== '/')
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+  if (list.length > 0) return list;
+  return [normalizeXrayPath(fallback, '/')];
+}
+const XRAY_PATH_VMESS = parseXrayPathList(process.env.XRAY_PATHS_VMESS, '/vmess')[0];
+const XRAY_PATH_VLESS = parseXrayPathList(process.env.XRAY_PATHS_VLESS, '/vless')[0];
+const XRAY_PATH_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/trojan')[0];
 const XRAY_LOG_TAIL_LINES_RAW = Number(process.env.XRAY_LOG_TAIL_LINES || 8000);
 const XRAY_LOG_TAIL_LINES = Number.isFinite(XRAY_LOG_TAIL_LINES_RAW) && XRAY_LOG_TAIL_LINES_RAW >= 1000
   ? Math.min(Math.floor(XRAY_LOG_TAIL_LINES_RAW), 60000)
@@ -2812,12 +3407,29 @@ const UDPHC_LOG_LINES_CHECKER_RAW = Number(process.env.UDPHC_LOG_LINES_CHECKER |
 const UDPHC_LOG_LINES_CHECKER = Number.isFinite(UDPHC_LOG_LINES_CHECKER_RAW) && UDPHC_LOG_LINES_CHECKER_RAW >= 1000
   ? Math.min(Math.floor(UDPHC_LOG_LINES_CHECKER_RAW), 60000)
   : 6000;
+const ZIVPN_AUTH_LOG_LINES_RAW = Number(process.env.ZIVPN_AUTH_LOG_LINES || 8000);
+const ZIVPN_AUTH_LOG_LINES = Number.isFinite(ZIVPN_AUTH_LOG_LINES_RAW) && ZIVPN_AUTH_LOG_LINES_RAW >= 1000
+  ? Math.min(Math.floor(ZIVPN_AUTH_LOG_LINES_RAW), 60000)
+  : 8000;
+const ZIVPN_ACTIVE_WINDOW_SECONDS_RAW = Number(process.env.ZIVPN_ACTIVE_WINDOW_SECONDS || 90);
+const ZIVPN_ACTIVE_WINDOW_SECONDS = Number.isFinite(ZIVPN_ACTIVE_WINDOW_SECONDS_RAW) && ZIVPN_ACTIVE_WINDOW_SECONDS_RAW >= 20
+  ? Math.min(Math.floor(ZIVPN_ACTIVE_WINDOW_SECONDS_RAW), 1800)
+  : 90;
+const ZIVPN_HANDOFF_GRACE_SECONDS_RAW = Number(process.env.ZIVPN_HANDOFF_GRACE_SECONDS || 20);
+const ZIVPN_HANDOFF_GRACE_SECONDS = Number.isFinite(ZIVPN_HANDOFF_GRACE_SECONDS_RAW) && ZIVPN_HANDOFF_GRACE_SECONDS_RAW >= 3
+  ? Math.min(Math.floor(ZIVPN_HANDOFF_GRACE_SECONDS_RAW), 120)
+  : 20;
 const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '1').trim() === '1';
 const UDPCUSTOM_LOG_UNITS = Array.from(new Set([
   UDPCUSTOM_SERVICE,
   'sc-1forcr-udpcustom',
   'udp-custom',
   'udpcustom'
+].map((v) => String(v || '').trim()).filter(Boolean)));
+const ZIVPN_AUTH_LOG_UNITS = Array.from(new Set([
+  String(process.env.SC_API_SERVICE || '').trim(),
+  String(process.env.API_SERVICE_NAME || '').trim(),
+  'sc-1forcr-api'
 ].map((v) => String(v || '').trim()).filter(Boolean)));
 
 const db = new sqlite3.Database(DB_PATH);
@@ -2861,9 +3473,9 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       `Limit IP : ${Number(limitip || 0)}\n` +
       `Detected : ${Number(detected || 0)}\n` +
       `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
+      `Unlock   : ${Number(LOCK_MINUTES || 15)} menit\n` +
       `TG User  : ${ownerId || '-'}\n` +
-      `TG Chat  : ${ownerChatId || '-'}\n` +
-      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+      `TG Chat  : ${ownerChatId || '-'}`;
     await telegramNotify(msg);
   } catch (_) {}
 }
@@ -2884,6 +3496,29 @@ async function notifyExpiredAccount(service, username, exp, limitip = 0, ownerId
       `TG User  : ${ownerId || '-'}\n` +
       `TG Chat  : ${ownerChatId || '-'}\n` +
       `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+    await telegramNotify(msg);
+  } catch (_) {}
+}
+async function notifyExpiredAccountsBatch(service, accounts = []) {
+  try {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    const list = Array.isArray(accounts) ? accounts : [];
+    if (list.length === 0) return;
+    const rows = list.slice(0, 30).map((acc, idx) => {
+      const user = String(acc?.username || '-').trim() || '-';
+      const exp = String(acc?.exp || acc?.date_exp || '-').trim() || '-';
+      const lim = Number(acc?.limitip || 0);
+      return `${idx + 1}. ${user} | exp ${exp} | lim ${lim}`;
+    });
+    const remain = list.length > 30 ? `\n... +${list.length - 30} akun lainnya` : '';
+    const msg =
+      `SC 1FORCR NOTIF\n` +
+      `Event    : EXPIRED_BATCH\n` +
+      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
+      `Total    : ${list.length}\n` +
+      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n\n` +
+      rows.join('\n') +
+      remain;
     await telegramNotify(msg);
   } catch (_) {}
 }
@@ -3056,6 +3691,20 @@ function parseUdpcustomSessionEvent(lineRaw) {
   };
 }
 
+function parseZivpnAuthLogLine(lineRaw) {
+  const line = String(lineRaw || '').trim();
+  if (!line || !/\[zivpn-auth\]/i.test(line)) return null;
+  if (!/result=allow/i.test(line)) return null;
+  const userMatch = line.match(/\buser=([^\s]+)/i);
+  const ipMatch = line.match(/\bip=([^\s]+)/i);
+  const username = String(userMatch?.[1] || '').trim().toLowerCase();
+  const ipRaw = String(ipMatch?.[1] || '').trim();
+  if (!username || !ipRaw || ipRaw === '-') return null;
+  const ip = extractIp(ipRaw);
+  if (!ip || isLoopbackIp(ip)) return null;
+  return { username, ip };
+}
+
 function parseSshAndUdpUsage() {
   const ipMap = new Map();
   const sessionMap = new Map();
@@ -3064,6 +3713,8 @@ function parseSshAndUdpUsage() {
   const wsClientPortMap = new Map();
   const udphcSessionMap = new Map();
   const udphcIpMap = new Map();
+  const zivpnSessionMap = new Map();
+  const zivpnIpMap = new Map();
   let udphcParsedCount = 0;
   let udphcActiveSessions = 0;
   const dropbearPorts = getDropbearPortSet();
@@ -3336,7 +3987,86 @@ function parseSshAndUdpUsage() {
     console.log(`[iplimit-debug][udphc] units=${UDPCUSTOM_LOG_UNITS.join(',')} parsed=${udphcParsedCount} active_sessions=${udphcActiveSessions}`);
   }
 
-  return { ipMap, sessionMap, recentAuthMap, procSessionMap, wsClientPortMap, udphcSessionMap, udphcIpMap };
+  // Tambahan sumber untuk ZIVPN mode HTTP:
+  // baca log auth API dan hitung IP unik per user.
+  if (ZIVPN_AUTH_MODE === 'http') {
+    let zParsedCount = 0;
+    for (const unit of ZIVPN_AUTH_LOG_UNITS) {
+      let zlog = '';
+      try {
+        zlog = execFileSync(
+          'journalctl',
+          ['-u', unit, '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', String(ZIVPN_AUTH_LOG_LINES), '--no-pager'],
+          { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
+        );
+      } catch (_) {}
+      for (const lineRaw of String(zlog || '').split('\n')) {
+        const parsed = parseZivpnAuthLogLine(lineRaw);
+        if (!parsed) continue;
+        zParsedCount += 1;
+        addIpToUserMap(zivpnIpMap, parsed.username, parsed.ip);
+        addSessionKeyToUserMap(zivpnSessionMap, parsed.username, `zivpn-ip:${parsed.ip}`);
+      }
+    }
+    if (IPLIMIT_DEBUG) {
+      let zUsers = 0;
+      for (const [, ips] of zivpnIpMap.entries()) {
+        if ((ips?.size || 0) > 0) zUsers += 1;
+      }
+      console.log(`[iplimit-debug][zivpn] units=${ZIVPN_AUTH_LOG_UNITS.join(',')} parsed=${zParsedCount} users=${zUsers}`);
+    }
+  }
+
+  return { ipMap, sessionMap, recentAuthMap, procSessionMap, wsClientPortMap, udphcSessionMap, udphcIpMap, zivpnSessionMap, zivpnIpMap };
+}
+
+async function readZivpnLiveMap(nowTs) {
+  const ipMap = new Map();
+  const sessionMap = new Map();
+  try {
+    const cutoff = Number(nowTs || Math.floor(Date.now() / 1000)) - Math.max(20, Number(ZIVPN_ACTIVE_WINDOW_SECONDS || 90));
+    await run("DELETE FROM zivpn_live_sessions WHERE last_seen < ?", [cutoff]).catch(() => {});
+    const rows = await all(
+      "SELECT username, ip, first_seen, last_seen, hits FROM zivpn_live_sessions WHERE last_seen >= ?",
+      [cutoff]
+    ).catch(() => []);
+    const byUser = new Map();
+    for (const row of rows) {
+      const user = String(row?.username || '').trim().toLowerCase();
+      const ip = extractIp(String(row?.ip || '').trim());
+      if (!user || !ip || isLoopbackIp(ip)) continue;
+      if (!byUser.has(user)) byUser.set(user, []);
+      byUser.get(user).push({
+        ip,
+        firstSeen: Number(row?.first_seen || 0),
+        lastSeen: Number(row?.last_seen || 0),
+        hits: Number(row?.hits || 0)
+      });
+    }
+
+    const handoffGrace = Math.max(3, Number(ZIVPN_HANDOFF_GRACE_SECONDS || 20));
+    for (const [user, list] of byUser.entries()) {
+      if (!Array.isArray(list) || list.length === 0) continue;
+      let maxLastSeen = 0;
+      for (const item of list) {
+        const ls = Number(item?.lastSeen || 0);
+        if (ls > maxLastSeen) maxLastSeen = ls;
+      }
+      for (const item of list) {
+        const ip = String(item?.ip || '').trim();
+        const ls = Number(item?.lastSeen || 0);
+        if (!ip || !Number.isFinite(ls) || ls <= 0) continue;
+        // Anti false-positive mobile handoff:
+        // IP lama yang tidak lagi aktif akan cepat tertinggal last_seen-nya.
+        // Hanya IP yang "masih sempat aktif" dekat dengan IP terbaru yang dihitung.
+        const ageFromLatest = maxLastSeen - ls;
+        if (ageFromLatest > handoffGrace) continue;
+        addIpToUserMap(ipMap, user, ip);
+        addSessionKeyToUserMap(sessionMap, user, `zivpn-live:${ip}`);
+      }
+    }
+  } catch (_) {}
+  return { ipMap, sessionMap };
 }
 
 function parseXrayRecentIpMap() {
@@ -3427,6 +4157,7 @@ function parseXrayRecentIpMap() {
 
 function removeZivpnUser(username) {
   try {
+    if (ZIVPN_AUTH_MODE !== 'passwords') return false;
     if (!fs.existsSync(ZIVPN_CONFIG)) return false;
     const root = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
     if (!root.auth || typeof root.auth !== 'object') return false;
@@ -3443,6 +4174,7 @@ function removeZivpnUser(username) {
 
 function addZivpnUser(username) {
   try {
+    if (ZIVPN_AUTH_MODE !== 'passwords') return false;
     let root = { auth: { mode: 'passwords', config: [] } };
     if (fs.existsSync(ZIVPN_CONFIG)) root = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
     if (!root.auth || typeof root.auth !== 'object') root.auth = {};
@@ -3552,6 +4284,30 @@ function getUdpCustomListenPort() {
   } catch (_) {
     return UDPCUSTOM_LISTEN_PORT;
   }
+}
+
+function getZivpnListenPort() {
+  try {
+    if (!fs.existsSync(ZIVPN_CONFIG)) return 5667;
+    const root = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
+    const raw = String(root?.listen || '').trim();
+    const m = raw.match(/^:([0-9]{1,5})$/);
+    if (!m) return 5667;
+    const n = Number(m[1]);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) return 5667;
+    return n;
+  } catch (_) {
+    return 5667;
+  }
+}
+
+function getActiveUdpLockPort() {
+  if (ACTIVE_UDP_BACKEND === 'zivpn') return getZivpnListenPort();
+  if (ACTIVE_UDP_BACKEND === 'udpcustom' || ACTIVE_UDP_BACKEND === 'udp-custom' || ACTIVE_UDP_BACKEND === 'udphc') {
+    return getUdpCustomListenPort();
+  }
+  if (safeExec('systemctl', ['is-active', '--quiet', ZIVPN_SERVICE])) return getZivpnListenPort();
+  return getUdpCustomListenPort();
 }
 
 function isIpv6(ip) {
@@ -3785,6 +4541,14 @@ function isExpiredDate(dateExp, todayYmd = '') {
 }
 
 async function ensureTables() {
+  await run(`CREATE TABLE IF NOT EXISTS zivpn_live_sessions (
+    username TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    hits INTEGER DEFAULT 1,
+    PRIMARY KEY (username, ip)
+  )`).catch(() => {});
   await run(`CREATE TABLE IF NOT EXISTS temp_ip_locks (
     account_type TEXT NOT NULL,
     username TEXT NOT NULL,
@@ -3817,26 +4581,30 @@ async function enforceExpiredAccounts() {
   let zivpnChanged = false;
   let udpcustomChanged = false;
   let xrayChanged = false;
+  const expiredBatch = {
+    'ssh/zivpn/udphc': [],
+    vmess: [],
+    vless: [],
+    trojan: []
+  };
 
   const sshRows = await all(
     "SELECT username, password, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM account_sshs " +
     "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
     "AND TRIM(COALESCE(date_exp,'')) <> '' " +
-    "AND date(date_exp) <= date('now','localtime')"
+    "AND ((LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(date_exp) <= datetime('now','localtime')) " +
+    "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) <= date('now','localtime')))"
   ).catch(() => []);
   for (const row of sshRows) {
     const user = String(row?.username || '').trim();
     const pass = String(row?.password || '').trim();
     const exp = String(row?.date_exp || '').trim();
     if (!user || !isExpiredDate(exp, today)) continue;
-    await notifyExpiredAccount(
-      'ssh/zivpn/udphc',
-      user,
+    expiredBatch['ssh/zivpn/udphc'].push({
+      username: user,
       exp,
-      Number(row?.limitip || 0),
-      Number(row?.owner_telegram_id || 0) || null,
-      Number(row?.owner_telegram_chat_id || 0) || null
-    );
+      limitip: Number(row?.limitip || 0)
+    });
 
     if (!safeExec('userdel', ['-r', user])) {
       safeExec('passwd', ['-l', user]);
@@ -3866,26 +4634,29 @@ async function enforceExpiredAccounts() {
       `SELECT username, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
       "AND TRIM(COALESCE(date_exp,'')) <> '' " +
-      "AND date(date_exp) <= date('now','localtime')"
+      "AND ((LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(date_exp) <= datetime('now','localtime')) " +
+      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) <= date('now','localtime')))"
     ).catch(() => []);
     for (const row of rows) {
       const user = String(row?.username || '').trim();
       const exp = String(row?.date_exp || '').trim();
       if (!user || !isExpiredDate(exp, today)) continue;
-      await notifyExpiredAccount(
-        item.type,
-        user,
+      expiredBatch[item.type].push({
+        username: user,
         exp,
-        Number(row?.limitip || 0),
-        Number(row?.owner_telegram_id || 0) || null,
-        Number(row?.owner_telegram_chat_id || 0) || null
-      );
+        limitip: Number(row?.limitip || 0)
+      });
       await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       xrayChanged = true;
     }
   }
+
+  await notifyExpiredAccountsBatch('ssh/zivpn/udphc', expiredBatch['ssh/zivpn/udphc']);
+  await notifyExpiredAccountsBatch('vmess', expiredBatch.vmess);
+  await notifyExpiredAccountsBatch('vless', expiredBatch.vless);
+  await notifyExpiredAccountsBatch('trojan', expiredBatch.trojan);
 
   return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
@@ -3894,7 +4665,7 @@ async function unlockExpired(nowTs) {
   const rows = await all("SELECT account_type, username, zivpn_removed FROM temp_ip_locks WHERE locked_until <= ?", [nowTs]);
   if (rows.length === 0) return { zivpnChanged: false, udpcustomChanged: false, xrayChanged: false };
 
-  const udpcustomPort = getUdpCustomListenPort();
+  const udpLockPort = getActiveUdpLockPort();
   let zivpnChanged = false;
   let udpcustomChanged = false;
   let xrayChanged = false;
@@ -3904,7 +4675,7 @@ async function unlockExpired(nowTs) {
     const ipRows = await all("SELECT ip FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => []);
     if (t === 'ssh') {
       for (const item of ipRows) {
-        removeUdpDropRule(String(item?.ip || ''), udpcustomPort);
+        removeUdpDropRule(String(item?.ip || ''), udpLockPort);
       }
     } else if (t === 'vmess' || t === 'vless' || t === 'trojan') {
       for (const item of ipRows) {
@@ -3962,6 +4733,7 @@ async function unlockExpired(nowTs) {
 
 async function lockIfExceeded(nowTs) {
   const sshUsage = parseSshAndUdpUsage();
+  const zivpnLive = await readZivpnLiveMap(nowTs);
   const sshIpMap = sshUsage.ipMap;
   const sshSessionMap = sshUsage.sessionMap;
   const sshRecentAuthMap = sshUsage.recentAuthMap || new Map();
@@ -3969,8 +4741,12 @@ async function lockIfExceeded(nowTs) {
   const sshWsClientPortMap = sshUsage.wsClientPortMap || new Map();
   const sshUdphcSessionMap = sshUsage.udphcSessionMap || new Map();
   const sshUdphcIpMap = sshUsage.udphcIpMap || new Map();
+  const sshZivpnSessionMap = sshUsage.zivpnSessionMap || new Map();
+  const sshZivpnIpMap = sshUsage.zivpnIpMap || new Map();
+  const sshZivpnLiveSessionMap = zivpnLive.sessionMap || new Map();
+  const sshZivpnLiveIpMap = zivpnLive.ipMap || new Map();
   const xrayMap = parseXrayRecentIpMap();
-  const udpcustomPort = getUdpCustomListenPort();
+  const udpLockPort = getActiveUdpLockPort();
   let zivpnChanged = false;
   let udpcustomChanged = false;
   let xrayChanged = false;
@@ -3984,6 +4760,18 @@ async function lockIfExceeded(nowTs) {
     const u = String(g?.username || '').trim().toLowerCase();
     if (!t || !u) continue;
     graceMap.set(`${t}|${u}`, Number(g?.grace_until || 0));
+  }
+  if (IPLIMIT_DEBUG && ZIVPN_AUTH_MODE === 'http') {
+    let liveUsers = 0;
+    let liveIps = 0;
+    for (const [, ips] of sshZivpnLiveIpMap.entries()) {
+      const n = Number(ips?.size || 0);
+      if (n > 0) {
+        liveUsers += 1;
+        liveIps += n;
+      }
+    }
+    console.log(`[iplimit-debug][zivpn-live] users=${liveUsers} ips=${liveIps} ttl=${ZIVPN_ACTIVE_WINDOW_SECONDS}s`);
   }
 
   const sshRows = await all(
@@ -4022,18 +4810,26 @@ async function lockIfExceeded(nowTs) {
     const cntProc = setMaxSize(sshProcSessionMap);
     const cntUdphc = setMaxSize(sshUdphcSessionMap);
     const cntUdphcIp = setMaxSize(sshUdphcIpMap);
+    const cntZivpn = setMaxSize(sshZivpnSessionMap);
+    const cntZivpnIp = setMaxSize(sshZivpnIpMap);
+    const cntZivpnLive = setMaxSize(sshZivpnLiveSessionMap);
+    const cntZivpnLiveIp = setMaxSize(sshZivpnLiveIpMap);
+    const hasLiveZivpn = cntZivpnLive > 0 || cntZivpnLiveIp > 0;
+    const cntZivpnEffective = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
+      ? Math.max(cntZivpnLive, cntZivpnLiveIp)
+      : Math.max(cntZivpn, cntZivpnIp, cntZivpnLive, cntZivpnLiveIp);
     // Sumber realtime utama:
     // - ipMap/sessionMap untuk SSH normal
     // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
     // - udphcSessionMap/udphcIpMap untuk jalur UDPHC native.
-    const cntActive = Math.max(cntIp, cntSession, cntWsPorts, cntUdphc, cntUdphcIp);
+    const cntActive = Math.max(cntIp, cntSession, cntWsPorts, cntUdphc, cntUdphcIp, cntZivpnEffective);
     // proc/recent dipakai sebagai fallback kuantitatif ringan (cap) agar kasus 2 HP tetap terdeteksi.
     // recent sudah dedup berdasarkan source IP, jadi tidak overcount karena port reconnect.
     const cntProcHint = Math.min(Math.max(cntProc, 0), 3);
     const cntRecentHint = Math.min(Math.max(cntRecent, 0), 3);
     const cnt = Math.max(cntActive, cntProcHint, cntRecentHint);
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
     }
     if (cnt <= lim) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;
@@ -4051,19 +4847,27 @@ async function lockIfExceeded(nowTs) {
     safeExec('passwd', ['-l', user]);
 
     // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
+    const zivpnLockIps = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
+      ? Array.from(setUnionValues(sshZivpnLiveIpMap))
+      : Array.from(new Set([
+          ...Array.from(setUnionValues(sshZivpnIpMap)),
+          ...Array.from(setUnionValues(sshZivpnLiveIpMap))
+        ]));
     const lockIps = Array.from(new Set([
       ...Array.from(setUnionValues(sshIpMap)),
-      ...Array.from(setUnionValues(sshUdphcIpMap))
+      ...Array.from(setUnionValues(sshUdphcIpMap)),
+      ...zivpnLockIps
     ]));
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     for (const ip of lockIps) {
-      if (addUdpDropRule(ip, udpcustomPort)) {
+      if (addUdpDropRule(ip, udpLockPort)) {
         await run("INSERT OR IGNORE INTO temp_ip_lock_ips(account_type, username, ip) VALUES('ssh', ?, ?)", [user, ip]).catch(() => {});
       }
     }
 
     const removed = removeZivpnUser(user) ? 1 : 0;
     if (removed) zivpnChanged = true;
+    await run("DELETE FROM zivpn_live_sessions WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     let udphcSecretChanged = false;
     if (pass) {
       if (removeUdpcustomUser(pass)) udphcSecretChanged = true;
@@ -4220,17 +5024,17 @@ async function rebuildXrayFromDb() {
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
+        streamSettings: { network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } }
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } }
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -4384,7 +5188,7 @@ UDPCUSTOM_SERVICE="${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
 ACTIVE_UDP_BACKEND="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
-UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
+UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 
 fw_backend_kind() {
   if command -v iptables >/dev/null 2>&1; then
@@ -4459,6 +5263,31 @@ fw_delete_udp_dnat_range() {
   esac
 }
 
+fw_delete_udp_dnat_to_port_all() {
+  local to_port="$1" handle
+  [[ -z "${to_port}" ]] && return 0
+  case "$(fw_backend_kind)" in
+    iptables)
+      while IFS= read -r handle; do
+        [[ -z "${handle}" ]] && continue
+        iptables -w 10 -t nat -D PREROUTING "${handle}" >/dev/null 2>&1 || true
+      done < <(
+        iptables -w 10 -t nat -L PREROUTING --line-numbers -n 2>/dev/null | \
+          awk -v p="${to_port}" '$0 ~ /DNAT/ && $0 ~ ("to::" p "($|[^0-9])") {print $1}' | sort -rn
+      )
+      ;;
+    nft)
+      while IFS= read -r handle; do
+        [[ -z "${handle}" ]] && continue
+        nft delete rule ip nat prerouting handle "${handle}" >/dev/null 2>&1 || true
+      done < <(
+        nft -a list chain ip nat prerouting 2>/dev/null | \
+          awk -v p="${to_port}" '$0 ~ ("dnat to :" p "($|[^0-9])") {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
+      )
+      ;;
+  esac
+}
+
 fw_persist_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -4482,9 +5311,7 @@ case "${ACTIVE_UDP_BACKEND}" in
     systemctl enable "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
     systemctl restart "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
     fw_allow_udp_input "${udphc_port}"
-    range="${UDPCUSTOM_DNAT_RANGE}"
-    [[ -z "${range}" ]] && range="${UDPCUSTOM_DNAT_AUTO_RANGE}"
-    fw_add_udp_dnat_range "${range}" "${udphc_port}"
+    fw_delete_udp_dnat_to_port_all "${udphc_port}"
     fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${udphc_port}"
     ;;
   *)
@@ -5022,8 +5849,10 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
+ZIVPN_HANDOFF_GRACE_SECONDS="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-20}" | tr -cd '0-9')"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
+[[ -z "${ZIVPN_HANDOFF_GRACE_SECONDS}" || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -lt 3 || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -gt 120 ]] && ZIVPN_HANDOFF_GRACE_SECONDS="20"
 
 if [[ "${ONLINE_NOTIFY_ENABLE}" != "1" ]]; then
   exit 0
@@ -5059,6 +5888,63 @@ detect_udphc_service() {
     return
   fi
   echo "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
+}
+
+refresh_zivpn_live_from_api_log() {
+  [[ -f "${DB_PATH}" ]] || return 0
+  local has_live_table lookback
+  has_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
+  [[ "${has_live_table}" == "1" ]] || return 0
+
+  lookback="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
+  [[ -z "${lookback}" || ! "${lookback}" =~ ^[0-9]+$ ]] && lookback="300"
+  if [[ "${lookback}" -lt 300 ]]; then lookback="300"; fi
+  if [[ "${lookback}" -gt 3600 ]]; then lookback="3600"; fi
+
+  journalctl -u sc-1forcr-api --since "-${lookback} seconds" -n 4000 -o short-unix --no-pager 2>/dev/null \
+    | awk '
+      /\[zivpn-auth\]/ && /result=allow/ {
+        ts=0; u=""; ip="";
+        if (match($0, /^[0-9]+(\.[0-9]+)?/)) {
+          ts_raw=substr($0, RSTART, RLENGTH);
+          sub(/\..*$/, "", ts_raw);
+          ts=ts_raw+0;
+        }
+        if (match($0, /user=[^ ]+/)) { u=substr($0, RSTART+5, RLENGTH-5) }
+        if (match($0, /ip=[^ ]+/)) { ip=substr($0, RSTART+3, RLENGTH-3) }
+        if (u ~ /^[a-zA-Z0-9._-]+$/ && ip ~ /^[0-9a-fA-F:.]+$/ && ip != "127.0.0.1" && ip != "::1" && ts > 0) {
+          print tolower(u) "|" ip "|" ts
+        }
+      }
+    ' | awk -F'|' '
+      {
+        key=$1 "|" $2;
+        ts=$3+0;
+        if (ts > max[key]) max[key]=ts;
+      }
+      END {
+        for (k in max) print k "|" max[k];
+      }
+    ' | while IFS='|' read -r u ip ev_ts; do
+      [[ -z "${u}" || -z "${ip}" || -z "${ev_ts}" ]] && continue
+      is_active="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_sshs WHERE LOWER(username)=LOWER('${u}') AND UPPER(TRIM(COALESCE(status,'')))='AKTIF';" 2>/dev/null || echo 0)"
+      [[ "${is_active}" == "1" ]] || continue
+      sqlite3 "${DB_PATH}" "
+        INSERT INTO zivpn_live_sessions(username, ip, first_seen, last_seen, hits)
+        VALUES('${u}', '${ip}', ${ev_ts}, ${ev_ts}, 1)
+        ON CONFLICT(username, ip)
+        DO UPDATE SET
+          first_seen = CASE
+            WHEN excluded.first_seen < zivpn_live_sessions.first_seen THEN excluded.first_seen
+            ELSE zivpn_live_sessions.first_seen
+          END,
+          last_seen = CASE
+            WHEN excluded.last_seen > zivpn_live_sessions.last_seen THEN excluded.last_seen
+            ELSE zivpn_live_sessions.last_seen
+          END,
+          hits = zivpn_live_sessions.hits + 1;
+      " >/dev/null 2>&1 || true
+    done
 }
 
 ssh_users="$(who 2>/dev/null \
@@ -5151,6 +6037,43 @@ udphc_users="$(journalctl -u "${udphc_service}" -n 12000 -o short-unix --no-page
   ' | sort || true)"
 udphc_cnt="$(echo "${udphc_users}" | awk 'NF{n++} END{print n+0}')"
 
+zivpn_users=""
+zivpn_cnt=0
+if [[ -f "${DB_PATH}" ]]; then
+  has_zivpn_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
+  if [[ "${has_zivpn_live_table}" == "1" ]]; then
+    refresh_zivpn_live_from_api_log
+    zivpn_users="$(sqlite3 -separator '|' "${DB_PATH}" "
+      WITH active AS (
+        SELECT LOWER(z.username) AS username, z.ip, z.last_seen
+        FROM zivpn_live_sessions z
+        JOIN account_sshs s ON LOWER(s.username)=LOWER(z.username)
+        WHERE z.last_seen >= (strftime('%s','now') - ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS})
+          AND UPPER(TRIM(COALESCE(s.status,'')))='AKTIF'
+      ),
+      active_filtered AS (
+        SELECT a.username, a.ip
+        FROM active a
+        JOIN (
+          SELECT username, MAX(last_seen) AS max_last_seen
+          FROM active
+          GROUP BY username
+        ) m ON m.username = a.username
+        WHERE (m.max_last_seen - a.last_seen) <= ${ZIVPN_HANDOFF_GRACE_SECONDS}
+      ),
+      agg AS (
+        SELECT username, COUNT(DISTINCT ip) AS ip_count
+        FROM active_filtered
+        GROUP BY username
+      )
+      SELECT username || '(' || ip_count || 'ip)'
+      FROM agg
+      ORDER BY username;
+    " 2>/dev/null || true)"
+    zivpn_cnt="$(echo "${zivpn_users}" | awk 'NF{n++} END{print n+0}')"
+  fi
+fi
+
 acct_ssh="-"; acct_vmess="-"; acct_vless="-"; acct_trojan="-"
 if [[ -f "${DB_PATH}" ]]; then
   acct_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF';" 2>/dev/null || echo "-")"
@@ -5191,6 +6114,7 @@ Domain   : ${DOMAIN}
 Waktu    : $(date '+%F %T')
 Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
 Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik (XRAY last seen)
+Handoff  : ${ZIVPN_HANDOFF_GRACE_SECONDS} detik (ZIVPN)
 
 RINGKASAN AKUN AKTIF 
 - SSH/UDPHC : ${acct_ssh}
@@ -5208,6 +6132,9 @@ ONLINE TERDETEKSI
   ==============================================
 - UDPHC     : ${udphc_cnt}
   User      : $(short_list "${udphc_users}" 10)
+  ==============================================
+- ZIVPN     : ${zivpn_cnt}
+  User      : $(short_list "${zivpn_users}" 10)
   ==============================================
 "
 
@@ -5269,6 +6196,9 @@ LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
 LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
 LICENSE_KEY=${LICENSE_KEY}
+WILDCARD_ENABLE=${WILDCARD_ENABLE}
+WILDCARD_BASE_DOMAIN=${WILDCARD_BASE_DOMAIN}
+WILDCARD_CF_API_TOKEN=${WILDCARD_CF_API_TOKEN}
 UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
@@ -5287,6 +6217,7 @@ AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
+ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
@@ -5300,6 +6231,9 @@ XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
+XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
+XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
+XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
   chmod 600 /etc/sc-1forcr.env
@@ -5318,7 +6252,7 @@ source /etc/sc-1forcr.env
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
-UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
+UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
@@ -5341,6 +6275,61 @@ xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
+normalize_xray_paths_csv() {
+  local raw fallback p normalized out
+  raw="${1:-}"
+  fallback="${2:-/}"
+  out=""
+  IFS=',' read -ra __xray_paths <<< "${raw}"
+  for p in "${__xray_paths[@]}"; do
+    normalized="$(echo "${p}" | tr -d '\r' | xargs)"
+    [[ -z "${normalized}" ]] && continue
+    [[ "${normalized}" != /* ]] && normalized="/${normalized}"
+    normalized="/$(echo "${normalized}" | sed -E 's#^/+##; s#/+#/#g')"
+    if [[ -z "${out}" ]]; then
+      out="${normalized}"
+    elif [[ ",${out}," != *",${normalized},"* ]]; then
+      out="${out},${normalized}"
+    fi
+  done
+  if [[ -z "${out}" ]]; then
+    normalized="$(echo "${fallback}" | tr -d '\r' | xargs)"
+    [[ -z "${normalized}" ]] && normalized="/"
+    [[ "${normalized}" != /* ]] && normalized="/${normalized}"
+    normalized="/$(echo "${normalized}" | sed -E 's#^/+##; s#/+#/#g')"
+    out="${normalized}"
+  fi
+  echo "${out}"
+}
+build_nginx_ws_locations() {
+  local paths_csv backend canonical path out
+  paths_csv="${1:-}"
+  backend="${2:-}"
+  canonical="${3:-}"
+  out=""
+  [[ -z "${backend}" || -z "${canonical}" ]] && return 0
+  IFS=',' read -ra __ws_paths <<< "${paths_csv}"
+  for path in "${__ws_paths[@]}"; do
+    path="$(echo "${path}" | xargs)"
+    [[ -z "${path}" ]] && continue
+    out+=$'    location '"${path}"$' {\n'
+    out+=$'        access_log off;\n'
+    out+=$'        proxy_redirect off;\n'
+    if [[ "${path}" != "${canonical}" ]]; then
+      out+=$'        rewrite ^ '"${canonical}"$' break;\n'
+    fi
+    out+=$'        proxy_pass http://127.0.0.1:'"${backend}"$';\n'
+    out+=$'        proxy_http_version 1.1;\n'
+    out+=$'        proxy_set_header Upgrade "websocket";\n'
+    out+=$'        proxy_set_header Connection "Upgrade";\n'
+    out+=$'        proxy_set_header Host \\$host;\n'
+    out+=$'    }\n\n'
+  done
+  printf '%s' "${out}"
+}
+XRAY_PATHS_VMESS="$(normalize_xray_paths_csv "${XRAY_PATHS_VMESS:-/vmess}" "/vmess")"
+XRAY_PATHS_VLESS="$(normalize_xray_paths_csv "${XRAY_PATHS_VLESS:-/vless}" "/vless")"
+XRAY_PATHS_TROJAN="$(normalize_xray_paths_csv "${XRAY_PATHS_TROJAN:-/trojan}" "/trojan")"
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
@@ -5928,7 +6917,7 @@ delete_account() {
 }
 
 unlock_account() {
-  local type ep username resp code message
+  local type ep username resp code message username_sql
   type="$(pick_type)"
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_unlock "$type")"
@@ -5941,6 +6930,15 @@ unlock_account() {
   if [[ "${code}" != "200" ]]; then
     echo "Gagal unlock akun ${type^^}: ${message}"
     return
+  fi
+  username_sql="${username//\'/''}"
+  if [[ "${type}" == "ssh" || "${type}" == "zivpn" ]]; then
+    # Manual unlock harus langsung sinkron dengan checker:
+    # - percepat release lock tmp (drop rules / temp lock table)
+    # Jangan paksa restart/switch backend UDP saat unlock manual.
+    sqlite3 "${DB_PATH}" "UPDATE temp_ip_locks SET locked_until=0 WHERE account_type='ssh' AND LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
   fi
   echo "Akun ${type^^} '${username}' berhasil di-unlock."
   telegram_notify_action "UNLOCK" "${type}" "${username}"
@@ -5967,14 +6965,13 @@ list_accounts() {
   }
 
   echo "Pilih list akun:"
-  echo "1) SSH/ZIVPN (DB)"
-  echo "2) VMESS (DB)"
-  echo "3) VLESS (DB)"
-  echo "4) TROJAN (DB)"
-  echo "5) ZIVPN auth.config"
-  echo "6) Semua"
+  echo "1) SSH/ZIVPN/UDPHC"
+  echo "2) VMESS"
+  echo "3) VLESS"
+  echo "4) TROJAN"
+  echo "5) Semua"
   echo "0) Kembali"
-  prompt_input l "Input [0-6]: " || return
+  prompt_input l "Input [0-5]: " || return
   clear
 
   case "${l}" in
@@ -5992,16 +6989,6 @@ list_accounts() {
       print_account_table "account_trojans" "TROJAN"
       ;;
     5)
-      echo "LIST AKUN ZIVPN auth.config"
-      printf "%-4s %-24s\n" "NO" "USERNAME"
-      printf "%-4s %-24s\n" "----" "------------------------"
-      if [[ -f /etc/zivpn/config.json ]]; then
-        jq -r '.auth.config[]?' /etc/zivpn/config.json | nl -w1 -s' ' || true
-      else
-        echo "File /etc/zivpn/config.json tidak ditemukan."
-      fi
-      ;;
-    6)
       print_account_table "account_sshs" "SSH/ZIVPN"
       echo
       print_account_table "account_vmesses" "VMESS"
@@ -6009,15 +6996,6 @@ list_accounts() {
       print_account_table "account_vlesses" "VLESS"
       echo
       print_account_table "account_trojans" "TROJAN"
-      echo
-      echo "LIST AKUN ZIVPN auth.config"
-      printf "%-4s %-24s\n" "NO" "USERNAME"
-      printf "%-4s %-24s\n" "----" "------------------------"
-      if [[ -f /etc/zivpn/config.json ]]; then
-        jq -r '.auth.config[]?' /etc/zivpn/config.json | nl -w1 -s' ' || true
-      else
-        echo "File /etc/zivpn/config.json tidak ditemukan."
-      fi
       ;;
     *)
       echo "Pilihan tidak valid."
@@ -6055,13 +7033,6 @@ Host         : ${DOMAIN}
 SSH WS       : ${DOMAIN}:80@${d_user}:${d_pass}
 SSH SSL      : ${DOMAIN}:443@${d_user}:${d_pass}
 EOT_SSH_DETAIL
-      if [[ -f /etc/zivpn/config.json ]]; then
-        if jq -e --arg u "${d_user}" '.auth.config // [] | map(tostring|ascii_downcase) | index($u|ascii_downcase)' /etc/zivpn/config.json >/dev/null 2>&1; then
-          echo "ZIVPN AUTH   : TERDAFTAR"
-        else
-          echo "ZIVPN AUTH   : TIDAK TERDAFTAR"
-        fi
-      fi
       ;;
     vmess)
       row="$(sqlite3 -separator '|' "${DB_PATH}" \
@@ -6396,6 +7367,29 @@ cleanup_zivpn_dnat_for_udphc() {
   fi
 }
 
+cleanup_udphc_dnat_for_port() {
+  local udphc_port handle
+  udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+  [[ -z "${udphc_port}" ]] && udphc_port="5667"
+  if command -v iptables >/dev/null 2>&1; then
+    while IFS= read -r handle; do
+      [[ -z "${handle}" ]] && continue
+      iptables -w 10 -t nat -D PREROUTING "${handle}" >/dev/null 2>&1 || true
+    done < <(
+      iptables -w 10 -t nat -L PREROUTING --line-numbers -n 2>/dev/null | \
+        awk -v p="${udphc_port}" '$0 ~ /DNAT/ && $0 ~ ("to::" p "($|[^0-9])") {print $1}' | sort -rn
+    )
+  elif command -v nft >/dev/null 2>&1; then
+    while IFS= read -r handle; do
+      [[ -z "${handle}" ]] && continue
+      nft delete rule ip nat prerouting handle "${handle}" >/dev/null 2>&1 || true
+    done < <(
+      nft -a list chain ip nat prerouting 2>/dev/null | \
+        awk -v p="${udphc_port}" '$0 ~ ("dnat to :" p "($|[^0-9])") {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
+    )
+  fi
+}
+
 ensure_zivpn_dnat_for_zivpn() {
   local zivpn_port range_nft
   [[ -z "${ZIVPN_DNAT_RANGE}" ]] && return 0
@@ -6429,37 +7423,39 @@ switch_udp_to_zivpn() {
   systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
   systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
   systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+  ACTIVE_UDP_BACKEND="zivpn"
+  update_sc_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
+  update_app_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
   ensure_zivpn_dnat_for_zivpn
   echo "Mode UDP aktif: ZIVPN (UDPHC dimatikan)."
 }
 
 switch_udp_to_udpcustom() {
-  local udpcustom udphc_port dnat_range range_nft
+  local udpcustom udphc_port
   udpcustom="$(detect_udpcustom_service)"
   udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   [[ -z "${udphc_port}" ]] && udphc_port="5667"
-  dnat_range="${UDPCUSTOM_DNAT_RANGE}"
-  [[ -z "${dnat_range}" ]] && dnat_range="${UDPCUSTOM_DNAT_AUTO_RANGE}"
   systemctl disable --now "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
   systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
   systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
   cleanup_zivpn_dnat_for_udphc
-  if [[ -n "${dnat_range}" ]]; then
-    if command -v iptables >/dev/null 2>&1; then
-      iptables -w 10 -C INPUT -p udp --dport "${udphc_port}" -j ACCEPT >/dev/null 2>&1 || \
-        iptables -w 10 -I INPUT -p udp --dport "${udphc_port}" -j ACCEPT
-      iptables -w 10 -t nat -C PREROUTING -p udp --dport "${dnat_range}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1 || \
-        iptables -w 10 -t nat -I PREROUTING -p udp --dport "${dnat_range}" -j DNAT --to-destination ":${udphc_port}"
-    elif command -v nft >/dev/null 2>&1; then
-      range_nft="${dnat_range/:/-}"
-      nft add table ip nat >/dev/null 2>&1 || true
-      nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }' >/dev/null 2>&1 || true
-      nft list chain ip nat prerouting 2>/dev/null | grep -F -- "udp dport ${range_nft} dnat to :${udphc_port}" >/dev/null 2>&1 || \
-        nft add rule ip nat prerouting udp dport "${range_nft}" dnat to ":${udphc_port}"
+  # UDPHC mode default: tanpa DNAT range.
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -w 10 -C INPUT -p udp --dport "${udphc_port}" -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -p udp --dport "${udphc_port}" -j ACCEPT
+  elif command -v nft >/dev/null 2>&1; then
+    if nft list chain inet filter input >/dev/null 2>&1; then
+      nft list chain inet filter input | grep -F -- "udp dport ${udphc_port} accept" >/dev/null 2>&1 || \
+        nft add rule inet filter input udp dport "${udphc_port}" accept
+    elif nft list chain ip filter input >/dev/null 2>&1; then
+      nft list chain ip filter input | grep -F -- "udp dport ${udphc_port} accept" >/dev/null 2>&1 || \
+        nft add rule ip filter input udp dport "${udphc_port}" accept
     fi
-  else
-    echo "UDPHC aktif tanpa DNAT range."
   fi
+  cleanup_udphc_dnat_for_port
+  ACTIVE_UDP_BACKEND="udpcustom"
+  update_sc_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
+  update_app_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
   echo "Mode UDP aktif: UDPHC (ZIVPN dimatikan)."
 }
 
@@ -6694,7 +7690,9 @@ backup_restore_menu() {
 }
 
 change_domain_menu() {
-  local new_domain email app_env pem email_arg
+  local new_domain email app_env pem cert_domain
+  local vmess_primary vless_primary trojan_primary
+  local vmess_locations vless_locations trojan_locations
   prompt_input new_domain "Masukkan domain baru: " || return
   if [[ -z "${new_domain}" ]]; then
     echo "Domain tidak boleh kosong."
@@ -6710,6 +7708,12 @@ change_domain_menu() {
 
   DOMAIN="${new_domain}"
   EMAIL="${email}"
+  vmess_primary="$(echo "${XRAY_PATHS_VMESS}" | cut -d',' -f1)"
+  vless_primary="$(echo "${XRAY_PATHS_VLESS}" | cut -d',' -f1)"
+  trojan_primary="$(echo "${XRAY_PATHS_TROJAN}" | cut -d',' -f1)"
+  vmess_locations="$(build_nginx_ws_locations "${XRAY_PATHS_VMESS}" "10001" "${vmess_primary}")"
+  vless_locations="$(build_nginx_ws_locations "${XRAY_PATHS_VLESS}" "10002" "${vless_primary}")"
+  trojan_locations="$(build_nginx_ws_locations "${XRAY_PATHS_TROJAN}" "10003" "${trojan_primary}")"
 
   mkdir -p /var/www/html
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
@@ -6735,35 +7739,7 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
-    location /vmess {
-        access_log off;
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vless {
-        access_log off;
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10002;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /trojan {
-        access_log off;
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10003;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
+${vmess_locations}${vless_locations}${trojan_locations}
 
     location / {
         access_log off;
@@ -6786,21 +7762,20 @@ EONGINX
   nginx -t || { echo "Konfigurasi nginx invalid."; return; }
   systemctl restart nginx || true
 
-  if [[ "${email}" == "admin@example.com" || "${email}" == *"@example.com" ]]; then
-    email_arg="--register-unsafely-without-email"
-  else
-    email_arg="-m ${email}"
-  fi
-
-  if ! certbot certonly --webroot -w /var/www/html -d "${new_domain}" --non-interactive --agree-tos ${email_arg}; then
+  if ! issue_letsencrypt_cert; then
     echo "Gagal issue cert untuk domain ${new_domain}."
-    echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
+    if flag_enabled "${WILDCARD_ENABLE:-0}"; then
+      echo "Pastikan WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN valid, lalu ulangi."
+    else
+      echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
+    fi
     return
   fi
 
-  pem="/etc/haproxy/certs/${new_domain}.pem"
+  cert_domain="$(tls_cert_domain)"
+  pem="/etc/haproxy/certs/${cert_domain}.pem"
   mkdir -p /etc/haproxy/certs
-  cat "/etc/letsencrypt/live/${new_domain}/fullchain.pem" "/etc/letsencrypt/live/${new_domain}/privkey.pem" > "${pem}" || {
+  cat "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" "/etc/letsencrypt/live/${cert_domain}/privkey.pem" > "${pem}" || {
     echo "Gagal menyiapkan sertifikat HAProxy."
     return
   }
@@ -6838,10 +7813,14 @@ EOHAP
   }
   systemctl restart haproxy || true
 
-  pem="/etc/haproxy/certs/${new_domain}.pem"
+  pem="/etc/haproxy/certs/${cert_domain}.pem"
   if [[ ! -s "${pem}" ]]; then
     echo "Gagal issue cert untuk domain ${new_domain}."
-    echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
+    if flag_enabled "${WILDCARD_ENABLE:-0}"; then
+      echo "Pastikan wildcard cert berhasil terbit untuk ${cert_domain}."
+    else
+      echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
+    fi
     return
   fi
 
@@ -6943,6 +7922,121 @@ menu_bool_01() {
     1|true|yes|on) echo "1" ;;
     *) echo "0" ;;
   esac
+}
+
+read_license_value_global() {
+  local key="$1"
+  local file="/etc/sc-1forcr-license"
+  if [[ ! -f "${file}" ]]; then
+    echo ""
+    return
+  fi
+  sed -n "s/^${key}=//p" "${file}" | head -n1
+}
+
+parse_license_expire_epoch() {
+  local raw ts
+  raw="$(echo "${1:-}" | tr -cd '0-9')"
+  [[ -z "${raw}" ]] && { echo "0"; return; }
+  ts="${raw}"
+  if [[ "${#ts}" -ge 13 ]]; then
+    ts="$((ts / 1000))"
+  fi
+  [[ -z "${ts}" || "${ts}" -le 0 ]] && ts="0"
+  echo "${ts}"
+}
+
+refresh_license_cache_guard() {
+  local enabled now_s last_s stamp_file
+  local ip_text resp status msg bound_ip expires distribution client_name key_hash
+  enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
+  [[ "${enabled}" != "1" ]] && return 0
+  [[ -z "${LICENSE_API_URL:-}" || -z "${LICENSE_API_TOKEN:-}" || -z "${LICENSE_KEY:-}" ]] && return 0
+  command -v jq >/dev/null 2>&1 || return 0
+
+  stamp_file="/tmp/sc-1forcr-license-refresh.ts"
+  now_s="$(date +%s)"
+  last_s=0
+  if [[ -f "${stamp_file}" ]]; then
+    last_s="$(tr -cd '0-9' < "${stamp_file}" 2>/dev/null || echo 0)"
+    [[ -z "${last_s}" ]] && last_s=0
+  fi
+  if (( now_s - last_s < 60 )); then
+    return 0
+  fi
+  printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
+
+  ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ip_text="${ip_text:-unknown}"
+
+  resp="$(curl -fsS --max-time 10 \
+    -X POST "${LICENSE_API_URL}" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "license_key=${LICENSE_KEY}" \
+    --data-urlencode "ip=${ip_text}" 2>/dev/null || true)"
+  [[ -z "${resp}" ]] && return 0
+  echo "${resp}" | jq . >/dev/null 2>&1 || return 0
+
+  status="$(echo "${resp}" | jq -r '.status // (if .allowed==true then "active" else "rejected" end) // "rejected"' 2>/dev/null || echo "rejected")"
+  msg="$(echo "${resp}" | jq -r '.message // "-" ' 2>/dev/null || echo "-")"
+  bound_ip="$(echo "${resp}" | jq -r '.bound_ip // .ip // empty' 2>/dev/null || echo "")"
+  expires="$(echo "${resp}" | jq -r '.expires_at // .expired_at // .expired // "-" ' 2>/dev/null || echo "-")"
+  distribution="$(echo "${resp}" | jq -r '.distribution // "BOT 1FORCR NEXUS"' 2>/dev/null || echo "BOT 1FORCR NEXUS")"
+  client_name="$(echo "${resp}" | jq -r '.client_name // .client // .name // empty' 2>/dev/null || echo "")"
+  [[ -z "${bound_ip}" || "${bound_ip}" == "null" ]] && bound_ip="${ip_text}"
+  [[ -z "${client_name}" || "${client_name}" == "null" ]] && client_name="${bound_ip}"
+  key_hash="$(printf '%s' "${LICENSE_KEY}" | sha256sum | awk '{print $1}')"
+
+  cat > /etc/sc-1forcr-license <<EOF
+LICENSE_STATUS=${status}
+LICENSE_MESSAGE=${msg}
+LICENSE_BOUND_IP=${bound_ip}
+LICENSE_EXPIRES_AT=${expires}
+LICENSE_DISTRIBUTION=${distribution}
+LICENSE_CLIENT_NAME=${client_name}
+LICENSE_KEY_HASH=${key_hash}
+LICENSE_CHECK_AT=$(date '+%F %T')
+EOF
+  chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
+}
+
+enforce_menu_license_access() {
+  local enabled ip_text status expires_raw expires_epoch now_epoch
+  enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
+  [[ "${enabled}" != "1" ]] && return 0
+  refresh_license_cache_guard
+
+  ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ip_text="${ip_text:-unknown}"
+  status="$(echo "$(read_license_value_global "LICENSE_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
+  expires_raw="$(read_license_value_global "LICENSE_EXPIRES_AT")"
+  expires_epoch="$(parse_license_expire_epoch "${expires_raw}")"
+  now_epoch="$(date +%s)"
+
+  if [[ "${status}" == "expired" || "${status}" == "rejected" || "${status}" == "deny" || "${status}" == "denied" || "${status}" == "blocked" || "${status}" == "suspended" || "${status}" == "inactive" ]] || \
+     [[ "${expires_epoch}" -gt 0 && "${now_epoch}" -ge "${expires_epoch}" ]]; then
+    clear
+    cat <<EOF
+============================================================
+               SC 1FORCR NEXUS - AKSES DITOLAK            
+============================================================
+
+Script 1FORCRNEXUS anda sudah expired untuk IP (${ip_text}).
+
+Silahkan perpanjang melalui bot resmi:
+https://t.me/sc1forcrnexusbot
+
+Setelah perpanjang berhasil, silakan ulangi install/update.
+============================================================
+EOF
+    systemctl disable --now sc-1forcr-api >/dev/null 2>&1 || systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
+    return 1
+  fi
+  # Lisensi sudah valid lagi: pastikan API aktif kembali tanpa perlu install/update ulang.
+  systemctl enable sc-1forcr-api >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-api >/dev/null 2>&1 || true
+  return 0
 }
 
 get_server_capacity_profile() {
@@ -7156,6 +8250,59 @@ draw_dashboard() {
     fi
   }
 
+  refresh_license_cache() {
+    local enabled now_s last_s stamp_file
+    local resp status msg bound_ip expires distribution client_name key_hash
+    enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
+    [[ "${enabled}" != "1" ]] && return 0
+    [[ -z "${LICENSE_API_URL:-}" || -z "${LICENSE_API_TOKEN:-}" || -z "${LICENSE_KEY:-}" ]] && return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    stamp_file="/tmp/sc-1forcr-license-refresh.ts"
+    now_s="$(date +%s)"
+    last_s=0
+    if [[ -f "${stamp_file}" ]]; then
+      last_s="$(tr -cd '0-9' < "${stamp_file}" 2>/dev/null || echo 0)"
+      [[ -z "${last_s}" ]] && last_s=0
+    fi
+    # Hindari spam API saat user bolak-balik menu.
+    if (( now_s - last_s < 60 )); then
+      return 0
+    fi
+    printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
+
+    resp="$(curl -fsS --max-time 10 \
+      -X POST "${LICENSE_API_URL}" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "license_key=${LICENSE_KEY}" \
+      --data-urlencode "ip=${ip}" 2>/dev/null || true)"
+    [[ -z "${resp}" ]] && return 0
+    echo "${resp}" | jq . >/dev/null 2>&1 || return 0
+
+    status="$(echo "${resp}" | jq -r '.status // (if .allowed==true then "active" else "rejected" end) // "rejected"' 2>/dev/null || echo "rejected")"
+    msg="$(echo "${resp}" | jq -r '.message // "-" ' 2>/dev/null || echo "-")"
+    bound_ip="$(echo "${resp}" | jq -r '.bound_ip // .ip // empty' 2>/dev/null || echo "")"
+    expires="$(echo "${resp}" | jq -r '.expires_at // .expired_at // .expired // "-" ' 2>/dev/null || echo "-")"
+    distribution="$(echo "${resp}" | jq -r '.distribution // "BOT 1FORCR NEXUS"' 2>/dev/null || echo "BOT 1FORCR NEXUS")"
+    client_name="$(echo "${resp}" | jq -r '.client_name // .client // .name // empty' 2>/dev/null || echo "")"
+    [[ -z "${bound_ip}" || "${bound_ip}" == "null" ]] && bound_ip="${ip}"
+    [[ -z "${client_name}" || "${client_name}" == "null" ]] && client_name="${bound_ip}"
+    key_hash="$(printf '%s' "${LICENSE_KEY}" | sha256sum | awk '{print $1}')"
+
+    cat > /etc/sc-1forcr-license <<EOF
+LICENSE_STATUS=${status}
+LICENSE_MESSAGE=${msg}
+LICENSE_BOUND_IP=${bound_ip}
+LICENSE_EXPIRES_AT=${expires}
+LICENSE_DISTRIBUTION=${distribution}
+LICENSE_CLIENT_NAME=${client_name}
+LICENSE_KEY_HASH=${key_hash}
+LICENSE_CHECK_AT=$(date '+%F %T')
+EOF
+    chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
+  }
+
   # Data collection
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
   ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
@@ -7166,6 +8313,7 @@ draw_dashboard() {
 
   ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip="${ip:-unknown}"
+  refresh_license_cache
   city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
   isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
   local license_distribution license_client_name license_expires_raw expiry_in_text
@@ -8246,6 +9394,156 @@ show_udpcustom_online() {
       }' | sort
 }
 
+refresh_zivpn_live_from_api_log_menu() {
+  local win lookback has_live_table is_active
+  [[ -f "${DB_PATH}" ]] || return 0
+  win="$(echo "${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}" | tr -cd '0-9')"
+  [[ -z "${win}" || "${win}" -lt 20 ]] && win="90"
+  lookback="${win}"
+  if [[ "${lookback}" -lt 300 ]]; then lookback="300"; fi
+  if [[ "${lookback}" -gt 3600 ]]; then lookback="3600"; fi
+
+  has_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
+  [[ "${has_live_table}" == "1" ]] || return 0
+
+  journalctl -u sc-1forcr-api --since "-${lookback} seconds" -n 4000 -o short-unix --no-pager 2>/dev/null \
+    | awk '
+      /\[zivpn-auth\]/ && /result=allow/ {
+        ts=0; u=""; ip="";
+        if (match($0, /^[0-9]+(\.[0-9]+)?/)) {
+          ts_raw=substr($0, RSTART, RLENGTH);
+          sub(/\..*$/, "", ts_raw);
+          ts=ts_raw+0;
+        }
+        if (match($0, /user=[^ ]+/)) { u=substr($0, RSTART+5, RLENGTH-5) }
+        if (match($0, /ip=[^ ]+/)) { ip=substr($0, RSTART+3, RLENGTH-3) }
+        if (u ~ /^[a-zA-Z0-9._-]+$/ && ip ~ /^[0-9a-fA-F:.]+$/ && ip != "127.0.0.1" && ip != "::1" && ts > 0) {
+          print tolower(u) "|" ip "|" ts
+        }
+      }
+    ' | awk -F'|' '
+      {
+        key=$1 "|" $2;
+        ts=$3+0;
+        if (ts > max[key]) max[key]=ts;
+      }
+      END {
+        for (k in max) print k "|" max[k];
+      }
+    ' | while IFS='|' read -r u ip ev_ts; do
+      [[ -z "${u}" || -z "${ip}" || -z "${ev_ts}" ]] && continue
+      is_active="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_sshs WHERE LOWER(username)=LOWER('${u}') AND UPPER(TRIM(COALESCE(status,'')))='AKTIF';" 2>/dev/null || echo 0)"
+      [[ "${is_active}" == "1" ]] || continue
+      sqlite3 "${DB_PATH}" "
+        INSERT INTO zivpn_live_sessions(username, ip, first_seen, last_seen, hits)
+        VALUES('${u}', '${ip}', ${ev_ts}, ${ev_ts}, 1)
+        ON CONFLICT(username, ip)
+        DO UPDATE SET
+          first_seen = CASE
+            WHEN excluded.first_seen < zivpn_live_sessions.first_seen THEN excluded.first_seen
+            ELSE zivpn_live_sessions.first_seen
+          END,
+          last_seen = CASE
+            WHEN excluded.last_seen > zivpn_live_sessions.last_seen THEN excluded.last_seen
+            ELSE zivpn_live_sessions.last_seen
+          END,
+          hits = zivpn_live_sessions.hits + 1;
+      " >/dev/null 2>&1 || true
+    done
+}
+
+show_zivpn_online() {
+  local win handoff_grace has_live_table
+  win="$(echo "${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}" | tr -cd '0-9')"
+  [[ -z "${win}" || "${win}" -lt 20 ]] && win="90"
+  [[ "${win}" -gt 1800 ]] && win="1800"
+  handoff_grace="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-20}" | tr -cd '0-9')"
+  [[ -z "${handoff_grace}" || "${handoff_grace}" -lt 3 ]] && handoff_grace="20"
+  [[ "${handoff_grace}" -gt 120 ]] && handoff_grace="120"
+
+  echo "=== ZIVPN ONLINE (LIVE DB) ==="
+  echo "Jendela aktif: ${win} detik"
+  echo "Toleransi handoff: ${handoff_grace} detik"
+  if [[ ! -f "${DB_PATH}" ]]; then
+    echo "DB tidak ditemukan: ${DB_PATH}"
+    return
+  fi
+
+  has_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
+  if [[ "${has_live_table}" != "1" ]]; then
+    echo "Tabel zivpn_live_sessions belum ada."
+    echo "Jalankan update script terbaru lalu restart: sc-1forcr-api dan sc-1forcr-iplimit.service"
+    return
+  fi
+  refresh_zivpn_live_from_api_log_menu
+
+  sqlite3 -header -column "${DB_PATH}" "
+    WITH active AS (
+      SELECT LOWER(username) AS username, ip, last_seen
+      FROM zivpn_live_sessions
+      WHERE last_seen >= (strftime('%s','now') - ${win})
+    ),
+    active_filtered AS (
+      SELECT a.username, a.ip, a.last_seen
+      FROM active a
+      JOIN (
+        SELECT username, MAX(last_seen) AS max_last_seen
+        FROM active
+        GROUP BY username
+      ) m ON m.username = a.username
+      WHERE (m.max_last_seen - a.last_seen) <= ${handoff_grace}
+    ),
+    agg AS (
+      SELECT
+        username,
+        COUNT(DISTINCT ip) AS connected_ip,
+        MAX(last_seen) AS last_seen,
+        GROUP_CONCAT(ip, ', ') AS ip_list
+      FROM active_filtered
+      GROUP BY username
+    )
+    SELECT
+      a.username AS username,
+      CASE
+        WHEN CAST(COALESCE(s.limitip,0) AS INTEGER) > 0 AND a.connected_ip > CAST(COALESCE(s.limitip,0) AS INTEGER) THEN 'MULTI_LOGIN'
+        ELSE 'AMAN'
+      END AS status,
+      CAST(COALESCE(s.limitip,0) AS INTEGER) AS limit_ip,
+      a.connected_ip AS terhubung_ip,
+      datetime(a.last_seen, 'unixepoch', 'localtime') AS last_seen,
+      COALESCE(a.ip_list, '-') AS ip_list
+    FROM agg a
+    JOIN account_sshs s ON LOWER(s.username) = a.username
+    WHERE UPPER(TRIM(COALESCE(s.status,'')))='AKTIF'
+    ORDER BY a.last_seen DESC, a.username ASC;
+  " || true
+
+  echo
+  sqlite3 -noheader "${DB_PATH}" "
+    WITH active AS (
+      SELECT LOWER(username) AS username, ip, last_seen
+      FROM zivpn_live_sessions
+      WHERE last_seen >= (strftime('%s','now') - ${win})
+    ),
+    active_filtered AS (
+      SELECT a.username, a.ip
+      FROM active a
+      JOIN (
+        SELECT username, MAX(last_seen) AS max_last_seen
+        FROM active
+        GROUP BY username
+      ) m ON m.username = a.username
+      WHERE (m.max_last_seen - a.last_seen) <= ${handoff_grace}
+    )
+    SELECT
+      'Total User Aktif : ' || COUNT(DISTINCT username) || char(10) ||
+      'Total IP Aktif   : ' || COUNT(DISTINCT ip)
+    FROM active_filtered af
+    JOIN account_sshs s ON LOWER(s.username)=af.username
+    WHERE UPPER(TRIM(COALESCE(s.status,'')))='AKTIF';
+  " 2>/dev/null || true
+}
+
 update_script_from_repo() {
   local url tmp active_backend alt_url downloaded_ok
   local udpcustom_svc zstat ustat
@@ -8336,6 +9634,9 @@ Time     : $(date '+%F %T')"
     LICENSE_API_URL="${LICENSE_API_URL:-}" \
     LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}" \
     LICENSE_KEY="${LICENSE_KEY:-}" \
+    WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}" \
+    WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}" \
+    WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}" \
     UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
     DB_PATH="${DB_PATH}" \
     APP_DIR="/opt/sc-1forcr" \
@@ -8352,6 +9653,9 @@ Time     : $(date '+%F %T')"
     XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES}" \
     XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
     XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP}" \
+    XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \
+    XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
+    XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN}" \
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
     AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
@@ -8668,14 +9972,15 @@ monitor_online_menu() {
     echo "===================================="
     echo "      MONITOR USER ONLINE"
     echo "===================================="
-    echo "1) Lihat User Login SSH (Realtime)"
-    echo "2) SSH + UDP CUSTOM realtime"
+    echo "1) SSH"
+    echo "2) SSH + UDP CUSTOM"
     echo "3) VMESS"
     echo "4) VLESS"
     echo "5) TROJAN"
+    echo "6) ZIVPN"
     echo "0) Kembali"
     echo
-    if ! prompt_input o "Pilih menu [0-5]: "; then
+    if ! prompt_input o "Pilih menu [0-6]: "; then
       return
     fi
     clear
@@ -8685,6 +9990,7 @@ monitor_online_menu() {
       3) show_xray_online_by_table "account_vmesses" "VMESS" ;;
       4) show_xray_online_by_table "account_vlesses" "VLESS" ;;
       5) show_xray_online_by_table "account_trojans" "TROJAN" ;;
+      6) show_zivpn_online ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -8696,6 +10002,9 @@ monitor_online_menu() {
 SHOW_FULL_MENU=1
 
 while true; do
+  if ! enforce_menu_license_access; then
+    exit 1
+  fi
   clear
   if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
     draw_dashboard
@@ -8996,7 +10305,7 @@ Catatan:
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
 - Rule UDP ZIVPN otomatis dipasang: INPUT udp ${ZIVPN_LISTEN_PORT}, DNAT ${ZIVPN_DNAT_RANGE} -> ${ZIVPN_LISTEN_PORT}.
 - UDP Custom juga otomatis disiapkan di service ${UDPCUSTOM_SERVICE_NAME} (config: /root/udp/config.json).
-- UDP Custom akan pakai DNAT range ${UDPCUSTOM_DNAT_RANGE:-${UDPCUSTOM_DNAT_AUTO_RANGE}} saat backend UDPHC aktif (override via UDPCUSTOM_DNAT_RANGE).
+- UDP Custom (UDPHC) default tanpa DNAT range; rule DNAT legacy ke port UDPHC akan dibersihkan otomatis.
 - Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
 - vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
 - Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.

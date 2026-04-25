@@ -249,6 +249,7 @@ LICENSE_ENFORCE=1 \\
 LICENSE_API_URL="${activateUrl}" \\
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN}" \\
 LICENSE_KEY="IP_REGISTERED_${ip}" \\
+UPDATE_SCRIPT_URL="${sourceUrl}" \\
 bash "$TMP_SC"
 `;
     return res.type('text/plain').send(script);

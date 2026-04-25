@@ -1144,7 +1144,7 @@ bot.action('m_install_link', async (ctx) => {
     );
   }
   const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
-  const cmd = `bash -c \"$(curl -fsSL ${installerUrl})\"`;
+  const cmd = ```bash -c \"$(curl -fsSL ${installerUrl})\"```;
   return ctx.reply(
     `Link instalasi:\n${installerUrl}\n\nPerintah instal di VPS terdaftar:\n${cmd}`,
     mainMenu()

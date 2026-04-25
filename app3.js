@@ -858,14 +858,35 @@ async function getPrimaryApiDomain() {
   return String(row?.domain || '').trim();
 }
 
+function escapeHtml(input) {
+  return String(input || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 async function buildInstallerQuickCopyText() {
   const domain = await getPrimaryApiDomain();
   if (!domain) {
-    return '\n\nLink installer belum tersedia. Hubungi admin untuk set domain installer.';
+    return {
+      ok: false,
+      text: 'Link installer belum tersedia. Hubungi admin untuk set domain installer.',
+      parse_mode: undefined
+    };
   }
   const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
-  const cmd = ```bash -c "$(curl -fsSL ${installerUrl})"```;
-  return `\n\nLink installer:\n${installerUrl}\n\nPerintah install (copy-paste):\n${cmd}`;
+  const cmd = `bash -c "$(curl -fsSL ${installerUrl})"`;
+  const safeUrl = escapeHtml(installerUrl);
+  const safeCmd = escapeHtml(cmd);
+  return {
+    ok: true,
+    text:
+      `Link instalasi:\n<code>${safeUrl}</code>\n\n` +
+      `Perintah install (copas sekali klik):\n<pre><code>${safeCmd}</code></pre>`,
+    parse_mode: 'HTML'
+  };
 }
 
 async function markPendingPaid(row) {
@@ -1136,19 +1157,18 @@ bot.action('m_my_sc', async (ctx) => {
 bot.action('m_install_link', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
-  const domain = await getPrimaryApiDomain();
-  if (!domain) {
+  const installerText = await buildInstallerQuickCopyText();
+  if (!installerText.ok) {
     return ctx.reply(
       'Domain API installer belum diset admin.\nHubungi admin agar tambah domain via menu admin.',
       mainMenu()
     );
   }
-  const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
-  const cmd = ```bash -c \"$(curl -fsSL ${installerUrl})\"```;
-  return ctx.reply(
-    `Link instalasi:\n${installerUrl}\n\nPerintah instal di VPS terdaftar:\n${cmd}`,
-    mainMenu()
-  );
+  return ctx.reply(installerText.text, {
+    ...mainMenu(),
+    parse_mode: installerText.parse_mode,
+    disable_web_page_preview: true
+  });
 });
 
 bot.action('m_register_sc', async (ctx) => {
@@ -1560,17 +1580,25 @@ bot.on('text', async (ctx) => {
       const saldoNow = await getSaldo(ctx.from.id);
       const installerText = await buildInstallerQuickCopyText();
       userState.delete(ctx.chat.id);
-      return ctx.reply(
+      await ctx.reply(
         `Registrasi/perpanjang SC berhasil.\n` +
           `Nama Client: ${result.clientName || clientName}\n` +
           `IP: ${ip}\n` +
           `Durasi: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
-          installerText,
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
         mainMenu()
       );
+      if (installerText.ok) {
+        await ctx.reply(installerText.text, {
+          parse_mode: installerText.parse_mode,
+          disable_web_page_preview: true
+        });
+      } else {
+        await ctx.reply(installerText.text);
+      }
+      return;
     }
 
     if (state.step === 'extend_sc_ip') {
@@ -1653,17 +1681,25 @@ bot.on('text', async (ctx) => {
       const saldoNow = await getSaldo(ctx.from.id);
       const installerText = await buildInstallerQuickCopyText();
       userState.delete(ctx.chat.id);
-      return ctx.reply(
+      await ctx.reply(
         `Perpanjang SC berhasil.\n` +
           `Nama Client: ${result.clientName || clientName}\n` +
           `IP: ${ip}\n` +
           `Durasi tambah: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
-          installerText,
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
         mainMenu()
       );
+      if (installerText.ok) {
+        await ctx.reply(installerText.text, {
+          parse_mode: installerText.parse_mode,
+          disable_web_page_preview: true
+        });
+      } else {
+        await ctx.reply(installerText.text);
+      }
+      return;
     }
 
     if (state.step === 'topup_amount') {

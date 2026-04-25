@@ -883,7 +883,6 @@ async function buildInstallerQuickCopyText() {
   return {
     ok: true,
     text:
-      `Link instalasi:\n<code>${safeUrl}</code>\n\n` +
       `Link instalasi untuk di vps:\n<pre><code>${safeCmd}</code></pre>`,
     parse_mode: 'HTML'
   };

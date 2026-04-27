@@ -698,14 +698,13 @@ async function adminRemoveRegisteredIp(ip, adminId) {
   if (!affectedUsers.length) {
     return { removed: 0, rows, affectedUsers: [], removedRowsAllIps: 0 };
   }
-  const placeholders = affectedUsers.map(() => '?').join(',');
   const tx = await dbRun(
     `UPDATE sc_registrations
      SET status = 'deleted_by_admin', updated_at = ?, expires_at = ?
-     WHERE user_id IN (${placeholders})
+     WHERE LOWER(TRIM(REPLACE(vps_ip, char(13), ''))) = LOWER(TRIM(?))
        AND status='active'
        AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)`,
-    [now, now, ...affectedUsers, now]
+    [now, now, ip, now]
   );
   await saveTransaction(
     Number(adminId) || 0,

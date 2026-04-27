@@ -650,6 +650,29 @@ async function lockScAccessByHost(host, key, actorId, reason = 'admin_remove_sc_
   });
 }
 
+async function unlockScAccessByHost(host, key, actorId, reason = 'renew_after_expired') {
+  return apiPost(host, key, '/internal/sc-access-lock', {
+    blocked: false,
+    reason: String(reason || 'renew_after_expired'),
+    actor: String(actorId || '')
+  });
+}
+
+async function tryAutoUnlockAfterRenew(userId, host, reason = 'renew_after_expired') {
+  const ip = normalizeHost(host);
+  if (!isIpv4(ip)) return { attempted: false, ok: false, message: 'ip tidak valid' };
+  const key = await getServerKeyForHost(userId, ip);
+  if (String(key || '').trim().length < 8) {
+    return { attempted: false, ok: false, message: 'key server belum tersimpan' };
+  }
+  try {
+    const res = await unlockScAccessByHost(ip, key, userId, reason);
+    return { attempted: true, ok: res?.blocked === false, message: 'unlock berhasil' };
+  } catch (err) {
+    return { attempted: true, ok: false, message: parseErr(err) };
+  }
+}
+
 async function notifyScExpiredOnHost(host, key, payload = {}) {
   return apiPost(host, key, '/internal/sc-expired-notify', payload);
 }
@@ -841,7 +864,8 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
     }
 
     const now = Date.now();
-    const isCarryForward = String(existing?.status || '').trim().toLowerCase() === 'active';
+    const prevStatus = String(existing?.status || '').trim().toLowerCase();
+    const isCarryForward = prevStatus === 'active';
     const baseExpiry = isCarryForward ? Math.max(now, Number(existing?.expires_at || 0)) : now;
     const nextExpiry = baseExpiry + (days * DAY_MS);
     const finalClientName = normalizeClientName(clientName || existing?.client_name || ip);
@@ -861,7 +885,13 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
 
     await saveTransaction(userId, -totalFee, 'sc_registration', `sc_reg_${userId}_${ip}_${days}d_${now}`);
     await dbRun('COMMIT');
-    return { success: true, expiresAt: nextExpiry, clientName: finalClientName };
+    return {
+      success: true,
+      expiresAt: nextExpiry,
+      clientName: finalClientName,
+      prevStatus,
+      reactivatedFromExpired: prevStatus === 'expired'
+    };
   } catch (e) {
     await dbRun('ROLLBACK').catch(() => {});
     throw e;
@@ -935,6 +965,7 @@ function adminMenu() {
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain')],
     [Markup.button.callback('Hapus IP VPS Terdaftar', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Buka Kunci Akses SC VPS', 'm_admin_unlock_sc_access')],
+    [Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
     [Markup.button.callback('Trigger Update SC/API', 'm_admin_trigger_update')],
     [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show')],
@@ -1000,6 +1031,36 @@ function envKeyInputHint(key) {
     default:
       return '';
   }
+}
+
+function adminIpKeyListKeyboard(page, totalPages) {
+  const p = Math.max(0, Number(page) || 0);
+  const total = Math.max(1, Number(totalPages) || 1);
+  const rows = [];
+  if (total > 1) {
+    const nav = [];
+    if (p > 0) nav.push(Markup.button.callback('Prev', `m_admin_list_ip_keys_${p - 1}`));
+    if (p < total - 1) nav.push(Markup.button.callback('Next', `m_admin_list_ip_keys_${p + 1}`));
+    if (nav.length) rows.push(nav);
+  }
+  rows.push([Markup.button.callback('Refresh', `m_admin_list_ip_keys_${p}`)]);
+  rows.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function countServerKeysForAdmin() {
+  const row = await dbGet('SELECT COUNT(*) AS c FROM sc_server_keys');
+  return Number(row?.c || 0);
+}
+
+async function listServerKeysForAdminPage(page = 0, pageSize = 12) {
+  const p = Math.max(0, Number(page) || 0);
+  const size = Math.max(5, Math.min(30, Number(pageSize) || 12));
+  const offset = p * size;
+  return dbAll(
+    'SELECT user_id, vps_ip, server_key, updated_at FROM sc_server_keys ORDER BY updated_at DESC LIMIT ? OFFSET ?',
+    [size, offset]
+  );
 }
 
 function getSettingLabel(key) {
@@ -1859,6 +1920,35 @@ bot.action('m_admin_list_domains', async (ctx) => {
   if (!rows.length) return ctx.reply('Belum ada domain API tersimpan.', adminMenu());
   const lines = rows.map((r, i) => `${i + 1}. ${r.domain} (${Number(r.is_active) === 1 ? 'aktif' : 'nonaktif'})`);
   await ctx.reply(`Domain API:\n${lines.join('\n')}`, adminMenu());
+});
+
+bot.action(/m_admin_list_ip_keys_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const page = Math.max(0, Number(ctx.match?.[1] || 0));
+  const pageSize = 10;
+  const total = await countServerKeysForAdmin().catch(() => 0);
+  if (total <= 0) {
+    return ctx.reply('Belum ada data IP+KEY tersimpan.', adminMenu());
+  }
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, totalPages - 1);
+  const rows = await listServerKeysForAdminPage(safePage, pageSize).catch(() => []);
+  const startNo = safePage * pageSize;
+  const lines = rows.map((r, i) => {
+    const no = startNo + i + 1;
+    const uid = Number(r?.user_id || 0);
+    const ip = normalizeHost(r?.vps_ip || '-');
+    const key = String(r?.server_key || '').trim() || '-';
+    const at = formatDateTime(r?.updated_at);
+    return `${no}. id=${uid} | ip=${ip}\nkey=${key}\nupdated=${at}`;
+  });
+  const text = uiBox(`DAFTAR IP+KEY+ID (PAGE ${safePage + 1}/${totalPages})`, [
+    `Total data: ${total}`,
+    '',
+    ...(lines.length ? lines : ['(kosong)'])
+  ]);
+  return ctx.reply(text, adminIpKeyListKeyboard(safePage, totalPages));
 });
 
 bot.action('m_admin_upload_sc', async (ctx) => {
@@ -2794,6 +2884,10 @@ bot.on('text', async (ctx) => {
       }
       const saldoNow = await getSaldo(ctx.from.id);
       const installerText = await buildInstallerQuickCopyText();
+      let unlockResult = { attempted: false, ok: false, message: '' };
+      if (result.reactivatedFromExpired) {
+        unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'renew_after_natural_expired');
+      }
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Registrasi/perpanjang SC berhasil.\n` +
@@ -2802,7 +2896,10 @@ bot.on('text', async (ctx) => {
           `Durasi: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
+          `${result.reactivatedFromExpired
+            ? `\nUnlock menu VPS otomatis: ${unlockResult.ok ? 'berhasil' : `gagal (${unlockResult.message || 'unknown'})`}`
+            : ''}`,
         mainMenu()
       );
       if (installerText.ok) {
@@ -2895,6 +2992,10 @@ bot.on('text', async (ctx) => {
 
       const saldoNow = await getSaldo(ctx.from.id);
       const installerText = await buildInstallerQuickCopyText();
+      let unlockResult = { attempted: false, ok: false, message: '' };
+      if (result.reactivatedFromExpired) {
+        unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'renew_after_natural_expired');
+      }
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Perpanjang SC berhasil.\n` +
@@ -2903,7 +3004,10 @@ bot.on('text', async (ctx) => {
           `Durasi tambah: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
+          `${result.reactivatedFromExpired
+            ? `\nUnlock menu VPS otomatis: ${unlockResult.ok ? 'berhasil' : `gagal (${unlockResult.message || 'unknown'})`}`
+            : ''}`,
         mainMenu()
       );
       if (installerText.ok) {

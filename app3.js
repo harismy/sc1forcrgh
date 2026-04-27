@@ -979,14 +979,10 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
 
 function mainMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc')],
-    [Markup.button.callback('SC Saya', 'm_my_sc')],
-    [Markup.button.callback('Link Instalasi', 'm_install_link')],
-    [Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
-    [Markup.button.callback('Cek Saldo', 'm_cek_saldo')],
-    [Markup.button.callback('Cadangkan SC', 'm_backup_now')],
-    [Markup.button.callback('Pulihkan SC', 'm_restore_upload')],
-    [Markup.button.callback('Hapus Semua Akun', 'm_delete_all_accounts')],
+    [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('SC Saya', 'm_my_sc')],
+    [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
+    [Markup.button.callback('Cek Saldo', 'm_cek_saldo'), Markup.button.callback('Cadangkan SC', 'm_backup_now')],
+    [Markup.button.callback('Pulihkan SC', 'm_restore_upload'), Markup.button.callback('Hapus Semua Akun', 'm_delete_all_accounts')],
     [Markup.button.callback('Migrasi Akun', 'm_migrate_accounts')],
     [Markup.button.callback('Menu Admin', 'm_admin_menu')]
   ]);
@@ -1039,18 +1035,12 @@ function registerScMenu() {
 
 function adminMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Tambah Domain', 'm_admin_add_domain')],
-    [Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
-    [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain')],
-    [Markup.button.callback('Hapus IP VPS Terdaftar', 'm_admin_remove_sc_ip')],
-    [Markup.button.callback('Buka Kunci Akses SC VPS', 'm_admin_unlock_sc_access')],
-    [Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
-    [Markup.button.callback('Trigger Update SC/API', 'm_admin_trigger_update')],
-    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
-    [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show')],
-    [Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
-    [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc')],
-    [Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
+    [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
+    [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
+    [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
+    [Markup.button.callback('Trigger Update SC/API', 'm_admin_trigger_update'), Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
+    [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
+    [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
 }
@@ -1787,8 +1777,7 @@ bot.action('m_admin_remove_sc_ip', async (ctx) => {
       preview,
       '',
       'Ketik "batal" untuk membatalkan.'
-    ]),
-    adminMenu()
+    ])
   );
 });
 
@@ -1802,8 +1791,7 @@ bot.action('m_admin_unlock_sc_access', async (ctx) => {
       'Contoh: 103.10.10.2',
       'Bot akan gunakan key tersimpan otomatis.',
       'Ketik "batal" untuk membatalkan.'
-    ]),
-    adminMenu()
+    ])
   );
 });
 
@@ -1839,8 +1827,7 @@ bot.action('m_admin_update_scope_single', async (ctx) => {
       '',
       'Setelah itu bot akan minta key server dan target update (SC/API/BOTH).',
       'Ketik "batal" untuk membatalkan.'
-    ]),
-    adminMenu()
+    ])
   );
 });
 

@@ -597,6 +597,15 @@ function protocolKeyboard(prefix, cancelAction) {
   return Markup.inlineKeyboard(rows);
 }
 
+function deleteProtocolKeyboard(prefix, cancelAction) {
+  const rows = [
+    [Markup.button.callback('SEMUA PROTOKOL (SSH+VMESS+VLESS+TROJAN)', `${prefix}_all`)],
+    ...ACCOUNT_PROTOCOLS.map((p) => [Markup.button.callback(p.label, `${prefix}_${p.type}`)]),
+    [Markup.button.callback('Batal', cancelAction)]
+  ];
+  return Markup.inlineKeyboard(rows);
+}
+
 function registerScMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Registrasi Baru', 'm_register_sc_new')],
@@ -796,6 +805,15 @@ async function deleteAllByProtocol(host, key, type) {
     deleted += Number(res?.deleted || 0);
   }
   return { exported: usernames.length, deleted, mode: 'batch-delete' };
+}
+
+async function deleteAllProtocols(host, key) {
+  const types = ['ssh', 'vmess', 'vless', 'trojan'];
+  const results = {};
+  for (const type of types) {
+    results[type] = await deleteAllByProtocol(host, key, type);
+  }
+  return results;
 }
 
 function makeUniqueCode(userId) {
@@ -1378,7 +1396,7 @@ bot.action('m_delete_all_accounts', async (ctx) => {
   );
 });
 
-bot.action(/m_delall_proto_(ssh|vmess|vless|trojan)/, async (ctx) => {
+bot.action(/m_delall_proto_(all|ssh|vmess|vless|trojan)/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const state = userState.get(ctx.chat.id);
   if (!state || state.step !== 'delete_all_choose_protocol') {
@@ -1391,7 +1409,7 @@ bot.action(/m_delall_proto_(ssh|vmess|vless|trojan)/, async (ctx) => {
   return ctx.reply(
     uiBox('KONFIRMASI HAPUS SEMUA AKUN', [
       `Host      : ${state.host}`,
-      `Protokol  : ${protocolLabel(protocol)}`,
+      `Protokol  : ${protocol === 'all' ? 'SEMUA PROTOKOL' : protocolLabel(protocol)}`,
       '',
       'Lanjutkan hapus semua akun?'
     ]),
@@ -1417,15 +1435,28 @@ bot.action('m_delall_confirm_yes', async (ctx) => {
   try {
     await ctx.reply('Menghapus akun, tunggu...');
     const type = String(state.protocol || '').toLowerCase();
-    const stats = await deleteAllByProtocol(state.host, state.key, type);
+    let summaryText = '';
+    if (type === 'all') {
+      const allStats = await deleteAllProtocols(state.host, state.key);
+      const lines = ['Rincian hasil:'];
+      for (const t of ['ssh', 'vmess', 'vless', 'trojan']) {
+        const st = allStats[t] || { exported: 0, deleted: 0 };
+        lines.push(`- ${protocolLabel(t)}: data ${st.exported}, terhapus ${st.deleted}`);
+      }
+      summaryText = lines.join('\n');
+    } else {
+      const stats = await deleteAllByProtocol(state.host, state.key, type);
+      summaryText =
+        `Rincian hasil:\n` +
+        `- ${protocolLabel(type)}: data ${stats.exported}, terhapus ${stats.deleted}`;
+    }
     await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip = ? AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.host]).catch(() => {});
     userState.delete(ctx.chat.id);
     return ctx.reply(
       `Hapus semua akun selesai.\n` +
         `Host: ${state.host}\n` +
-        `Protokol: ${protocolLabel(type)}\n` +
-        `Data ditemukan: ${stats.exported}\n` +
-        `Terhapus: ${stats.deleted}`,
+        `Protokol: ${type === 'all' ? 'SEMUA PROTOKOL' : protocolLabel(type)}\n` +
+        `${summaryText}`,
       mainMenu()
     );
   } catch (err) {
@@ -2033,7 +2064,7 @@ bot.on('text', async (ctx) => {
           `Host: ${state.host}`,
           'Pilih protokol yang ingin dihapus semua akunnya.'
         ]),
-        protocolKeyboard('m_delall_proto', 'm_delall_confirm_no')
+        deleteProtocolKeyboard('m_delall_proto', 'm_delall_confirm_no')
       );
     }
 

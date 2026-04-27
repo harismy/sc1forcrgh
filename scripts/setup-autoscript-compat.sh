@@ -5784,6 +5784,10 @@ def to_int(v, d=0):
     except Exception:
         return d
 
+def restored_status(_raw):
+    # Restore akun dipaksa aktif agar langsung usable setelah import.
+    return "AKTIF"
+
 def upsert_ssh(rows):
     for r in rows:
         u = str((r or {}).get("username", "")).strip()
@@ -5806,7 +5810,7 @@ def upsert_ssh(rows):
                 u,
                 str((r or {}).get("password", "")),
                 str((r or {}).get("date_exp", "")),
-                str((r or {}).get("status", "AKTIF")) or "AKTIF",
+                restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
                 to_int((r or {}).get("limitip", 0)),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
@@ -5836,7 +5840,7 @@ def upsert_uuid(table, rows):
                 u,
                 str((r or {}).get("uuid", "")),
                 str((r or {}).get("date_exp", "")),
-                str((r or {}).get("status", "AKTIF")) or "AKTIF",
+                restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
                 to_int((r or {}).get("limitip", 0)),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
@@ -5866,7 +5870,7 @@ def upsert_trojan(rows):
                 u,
                 str((r or {}).get("password", "")),
                 str((r or {}).get("date_exp", "")),
-                str((r or {}).get("status", "AKTIF")) or "AKTIF",
+                restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
                 to_int((r or {}).get("limitip", 0)),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,

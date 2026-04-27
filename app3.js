@@ -572,8 +572,29 @@ function mainMenu() {
     [Markup.button.callback('Cek Saldo', 'm_cek_saldo')],
     [Markup.button.callback('Cadangkan SC', 'm_backup_now')],
     [Markup.button.callback('Pulihkan SC', 'm_restore_upload')],
+    [Markup.button.callback('Hapus Semua Akun', 'm_delete_all_accounts')],
+    [Markup.button.callback('Migrasi Akun', 'm_migrate_accounts')],
     [Markup.button.callback('Menu Admin', 'm_admin_menu')]
   ]);
+}
+
+const ACCOUNT_PROTOCOLS = [
+  { type: 'ssh', label: 'SSH (termasuk UDP/ZIVPN)' },
+  { type: 'vmess', label: 'VMESS' },
+  { type: 'vless', label: 'VLESS' },
+  { type: 'trojan', label: 'TROJAN' }
+];
+
+function protocolLabel(type) {
+  const t = String(type || '').trim().toLowerCase();
+  const found = ACCOUNT_PROTOCOLS.find((p) => p.type === t);
+  return found ? found.label : t.toUpperCase();
+}
+
+function protocolKeyboard(prefix, cancelAction) {
+  const rows = ACCOUNT_PROTOCOLS.map((p) => [Markup.button.callback(p.label, `${prefix}_${p.type}`)]);
+  rows.push([Markup.button.callback('Batal', cancelAction)]);
+  return Markup.inlineKeyboard(rows);
 }
 
 function registerScMenu() {
@@ -710,6 +731,71 @@ async function apiPost(host, key, endpoint, body = {}, timeoutMs = 120000) {
   });
   if (!res.data?.ok) throw new Error(res.data?.message || 'request gagal');
   return res.data;
+}
+
+function uniqUsernames(accounts) {
+  const out = [];
+  const seen = new Set();
+  for (const row of Array.isArray(accounts) ? accounts : []) {
+    const u = String(row?.username || '').trim();
+    if (!u) continue;
+    const key = u.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(u);
+  }
+  return out;
+}
+
+function chunkArray(input, size = 200) {
+  const arr = Array.isArray(input) ? input : [];
+  const out = [];
+  const chunkSize = Math.max(1, Number(size) || 200);
+  for (let i = 0; i < arr.length; i += chunkSize) {
+    out.push(arr.slice(i, i + chunkSize));
+  }
+  return out;
+}
+
+async function rebuildXrayFromType(host, key, type, sampleUser) {
+  const t = String(type || '').trim().toLowerCase();
+  const u = String(sampleUser || '').trim();
+  if (!u) return { ok: false, skipped: true, message: 'sample username kosong' };
+  const routeMap = {
+    vmess: '/vps/renewvmess',
+    vless: '/vps/renewvless',
+    trojan: '/vps/renewtrojan'
+  };
+  const base = routeMap[t];
+  if (!base) return { ok: false, skipped: true, message: 'protocol non-xray' };
+  await apiPost(host, key, `${base}/${encodeURIComponent(u)}/0`, {});
+  return { ok: true };
+}
+
+async function deleteAllByProtocol(host, key, type) {
+  const t = String(type || '').trim().toLowerCase();
+  const exported = await apiGet(host, key, '/internal/export-accounts', { type: t, limit: 50000 });
+  const accounts = Array.isArray(exported?.accounts) ? exported.accounts : [];
+  const usernames = uniqUsernames(accounts);
+  if (usernames.length === 0) {
+    return { exported: 0, deleted: 0, mode: 'empty' };
+  }
+
+  if (t === 'ssh') {
+    const res = await apiPost(host, key, '/internal/delete-all-accounts', { type: 'ssh' });
+    return {
+      exported: usernames.length,
+      deleted: Number(res?.deleted_db || 0),
+      mode: 'delete-all'
+    };
+  }
+
+  let deleted = 0;
+  for (const part of chunkArray(usernames, 200)) {
+    const res = await apiPost(host, key, '/internal/delete-accounts', { type: t, usernames: part });
+    deleted += Number(res?.deleted || 0);
+  }
+  return { exported: usernames.length, deleted, mode: 'batch-delete' };
 }
 
 function makeUniqueCode(userId) {
@@ -1277,6 +1363,180 @@ bot.action(/m_cancel_topup_(.+)/, async (ctx) => {
   return ctx.reply('Top Up Saldo dibatalkan.');
 });
 
+bot.action('m_delete_all_accounts', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!(await requireRegistered(ctx))) return;
+  userState.set(ctx.chat.id, { step: 'delete_all_host' });
+  await ctx.reply(
+    uiBox('HAPUS SEMUA AKUN', [
+      'Masukkan IP VPS target.',
+      'Aksi ini menghapus semua akun berdasarkan protokol yang nanti dipilih.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action(/m_delall_proto_(ssh|vmess|vless|trojan)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (!state || state.step !== 'delete_all_choose_protocol') {
+    return ctx.reply('Sesi hapus akun tidak aktif. Ulangi dari menu.', mainMenu());
+  }
+  const protocol = String(ctx.match?.[1] || '').toLowerCase();
+  state.protocol = protocol;
+  state.step = 'delete_all_confirm';
+  userState.set(ctx.chat.id, state);
+  return ctx.reply(
+    uiBox('KONFIRMASI HAPUS SEMUA AKUN', [
+      `Host      : ${state.host}`,
+      `Protokol  : ${protocolLabel(protocol)}`,
+      '',
+      'Lanjutkan hapus semua akun?'
+    ]),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Ya, Hapus', 'm_delall_confirm_yes')],
+      [Markup.button.callback('Batal', 'm_delall_confirm_no')]
+    ])
+  );
+});
+
+bot.action('m_delall_confirm_no', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  userState.delete(ctx.chat.id);
+  return ctx.reply('Hapus semua akun dibatalkan.', mainMenu());
+});
+
+bot.action('m_delall_confirm_yes', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (!state || state.step !== 'delete_all_confirm') {
+    return ctx.reply('Sesi hapus akun tidak aktif. Ulangi dari menu.', mainMenu());
+  }
+  try {
+    await ctx.reply('Menghapus akun, tunggu...');
+    const type = String(state.protocol || '').toLowerCase();
+    const stats = await deleteAllByProtocol(state.host, state.key, type);
+    await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip = ? AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.host]).catch(() => {});
+    userState.delete(ctx.chat.id);
+    return ctx.reply(
+      `Hapus semua akun selesai.\n` +
+        `Host: ${state.host}\n` +
+        `Protokol: ${protocolLabel(type)}\n` +
+        `Data ditemukan: ${stats.exported}\n` +
+        `Terhapus: ${stats.deleted}`,
+      mainMenu()
+    );
+  } catch (err) {
+    userState.delete(ctx.chat.id);
+    return ctx.reply(`Gagal hapus semua akun: ${parseErr(err)}`, mainMenu());
+  }
+});
+
+bot.action('m_migrate_accounts', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!(await requireRegistered(ctx))) return;
+  userState.set(ctx.chat.id, { step: 'migrate_src_host' });
+  await ctx.reply(
+    uiBox('MIGRASI AKUN', [
+      'Masukkan IP VPS sumber data akun.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action(/m_migrate_proto_(ssh|vmess|vless|trojan)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (!state || state.step !== 'migrate_choose_protocol') {
+    return ctx.reply('Sesi migrasi tidak aktif. Ulangi dari menu.', mainMenu());
+  }
+  const protocol = String(ctx.match?.[1] || '').toLowerCase();
+  state.protocol = protocol;
+  state.step = 'migrate_confirm';
+  userState.set(ctx.chat.id, state);
+  return ctx.reply(
+    uiBox('KONFIRMASI MIGRASI AKUN', [
+      `Sumber    : ${state.srcHost}`,
+      `Tujuan    : ${state.dstHost}`,
+      `Protokol  : ${protocolLabel(protocol)}`,
+      '',
+      'Lanjutkan migrasi akun?'
+    ]),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Ya, Migrasi', 'm_migrate_confirm_yes')],
+      [Markup.button.callback('Batal', 'm_migrate_confirm_no')]
+    ])
+  );
+});
+
+bot.action('m_migrate_confirm_no', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  userState.delete(ctx.chat.id);
+  return ctx.reply('Migrasi dibatalkan.', mainMenu());
+});
+
+bot.action('m_migrate_confirm_yes', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (!state || state.step !== 'migrate_confirm') {
+    return ctx.reply('Sesi migrasi tidak aktif. Ulangi dari menu.', mainMenu());
+  }
+
+  try {
+    await ctx.reply('Migrasi akun berjalan, tunggu...');
+    const type = String(state.protocol || '').toLowerCase();
+    const exported = await apiGet(state.srcHost, state.srcKey, '/internal/export-accounts', { type, limit: 50000 });
+    const srcAccounts = Array.isArray(exported?.accounts) ? exported.accounts : [];
+    const accounts = srcAccounts
+      .map((row) => ({ ...(row || {}), status: 'AKTIF' }))
+      .filter((row) => String(row?.username || '').trim().length > 0);
+
+    if (accounts.length === 0) {
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Migrasi selesai.\n` +
+          `Sumber: ${state.srcHost}\n` +
+          `Tujuan: ${state.dstHost}\n` +
+          `Protokol: ${protocolLabel(type)}\n` +
+          'Tidak ada akun yang bisa dipindahkan.',
+        mainMenu()
+      );
+    }
+
+    const imported = await apiPost(state.dstHost, state.dstKey, '/internal/import-accounts', { type, accounts });
+    const lines = [
+      `Migrasi selesai.`,
+      `Sumber: ${state.srcHost}`,
+      `Tujuan: ${state.dstHost}`,
+      `Protokol: ${protocolLabel(type)}`,
+      `Total sumber: ${accounts.length}`,
+      `Imported: ${Number(imported?.imported || 0)}`,
+      `Skipped: ${Number(imported?.skipped || 0)}`
+    ];
+
+    if (['vmess', 'vless', 'trojan'].includes(type)) {
+      const sampleUser = String(accounts[0]?.username || '').trim();
+      try {
+        await rebuildXrayFromType(state.dstHost, state.dstKey, type, sampleUser);
+        lines.push(`XRAY reload: OK (${type.toUpperCase()})`);
+      } catch (reloadErr) {
+        lines.push(`XRAY reload: gagal (${parseErr(reloadErr)})`);
+      }
+    }
+
+    await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip IN (?, ?) AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.srcHost, state.dstHost]).catch(() => {});
+    userState.delete(ctx.chat.id);
+    return ctx.reply(lines.join('\n'), mainMenu());
+  } catch (err) {
+    userState.delete(ctx.chat.id);
+    return ctx.reply(`Gagal migrasi: ${parseErr(err)}`, mainMenu());
+  }
+});
+
 bot.action('m_backup_now', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
@@ -1750,6 +2010,82 @@ bot.on('text', async (ctx) => {
       return;
     }
 
+    if (state.step === 'delete_all_host') {
+      const host = normalizeHost(text);
+      if (!isIpv4(host)) return ctx.reply('IP VPS harus valid.');
+      if (!(await isRegisteredHost(ctx.from.id, host))) {
+        return ctx.reply('IP belum terdaftar di akun kamu. Registrasi dulu di menu Registrasi SC.');
+      }
+      state.host = host;
+      state.step = 'delete_all_key';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply('Masukkan key server target.');
+    }
+
+    if (state.step === 'delete_all_key') {
+      const key = String(text || '').trim();
+      if (key.length < 8) return ctx.reply('Key tidak valid.');
+      state.key = key;
+      state.step = 'delete_all_choose_protocol';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('PILIH PROTOKOL', [
+          `Host: ${state.host}`,
+          'Pilih protokol yang ingin dihapus semua akunnya.'
+        ]),
+        protocolKeyboard('m_delall_proto', 'm_delall_confirm_no')
+      );
+    }
+
+    if (state.step === 'migrate_src_host') {
+      const srcHost = normalizeHost(text);
+      if (!isIpv4(srcHost)) return ctx.reply('IP VPS sumber harus valid.');
+      if (!(await isRegisteredHost(ctx.from.id, srcHost))) {
+        return ctx.reply('IP sumber belum terdaftar di akun kamu.');
+      }
+      state.srcHost = srcHost;
+      state.step = 'migrate_src_key';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply('Masukkan key server sumber.');
+    }
+
+    if (state.step === 'migrate_src_key') {
+      const srcKey = String(text || '').trim();
+      if (srcKey.length < 8) return ctx.reply('Key sumber tidak valid.');
+      state.srcKey = srcKey;
+      state.step = 'migrate_dst_host';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply('Masukkan IP VPS tujuan migrasi.');
+    }
+
+    if (state.step === 'migrate_dst_host') {
+      const dstHost = normalizeHost(text);
+      if (!isIpv4(dstHost)) return ctx.reply('IP VPS tujuan harus valid.');
+      if (!(await isRegisteredHost(ctx.from.id, dstHost))) {
+        return ctx.reply('IP tujuan belum terdaftar di akun kamu.');
+      }
+      state.dstHost = dstHost;
+      state.step = 'migrate_dst_key';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply('Masukkan key server tujuan.');
+    }
+
+    if (state.step === 'migrate_dst_key') {
+      const dstKey = String(text || '').trim();
+      if (dstKey.length < 8) return ctx.reply('Key tujuan tidak valid.');
+      state.dstKey = dstKey;
+      state.step = 'migrate_choose_protocol';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('PILIH PROTOKOL MIGRASI', [
+          `Sumber : ${state.srcHost}`,
+          `Tujuan : ${state.dstHost}`,
+          'Pilih protokol yang ingin dimigrasikan.'
+        ]),
+        protocolKeyboard('m_migrate_proto', 'm_migrate_confirm_no')
+      );
+    }
+
     if (state.step === 'backup_host') {
       const host = normalizeHost(text);
       if (!isIpv4(host)) return ctx.reply('IP VPS harus valid.');
@@ -1938,14 +2274,44 @@ bot.on('document', async (ctx) => {
     const types = ['ssh', 'vmess', 'vless', 'trojan'];
     const resultLines = [];
 
+    const restoredAccountsByType = {};
     for (const type of types) {
-      const accounts = Array.isArray(backupData[type]) ? backupData[type] : [];
+      const rawAccounts = Array.isArray(backupData[type]) ? backupData[type] : [];
+      const accounts = rawAccounts
+        .map((row) => ({ ...(row || {}), status: 'AKTIF' }))
+        .filter((row) => String(row?.username || '').trim().length > 0);
+      restoredAccountsByType[type] = accounts;
       if (accounts.length === 0) {
         resultLines.push(`${type.toUpperCase()}: 0 akun (skip)`);
         continue;
       }
       const imported = await apiPost(state.host, state.key, '/internal/import-accounts', { type, accounts });
       resultLines.push(`${type.toUpperCase()}: imported ${Number(imported.imported || 0)}, skipped ${Number(imported.skipped || 0)}`);
+    }
+
+    // Paksa render ulang config Xray dari data restore agar akun VMESS/VLESS/TROJAN langsung aktif.
+    const xrayRebuildPlans = [
+      { type: 'vmess', renewBase: '/vps/renewvmess' },
+      { type: 'vless', renewBase: '/vps/renewvless' },
+      { type: 'trojan', renewBase: '/vps/renewtrojan' }
+    ];
+    let xrayReloadDone = false;
+    for (const plan of xrayRebuildPlans) {
+      const list = restoredAccountsByType[plan.type] || [];
+      if (list.length === 0) continue;
+      const sampleUser = String(list[0]?.username || '').trim();
+      if (!sampleUser) continue;
+      try {
+        await apiPost(state.host, state.key, `${plan.renewBase}/${encodeURIComponent(sampleUser)}/0`, {});
+        resultLines.push(`XRAY reload: OK (${plan.type.toUpperCase()})`);
+        xrayReloadDone = true;
+        break;
+      } catch (reloadErr) {
+        resultLines.push(`XRAY reload ${plan.type.toUpperCase()}: gagal (${parseErr(reloadErr)})`);
+      }
+    }
+    if (!xrayReloadDone) {
+      resultLines.push('XRAY reload: skip (tidak ada akun VMESS/VLESS/TROJAN)');
     }
 
     resultLines.push('ZIVPN auth: mengikuti akun SSH (mode unified)');

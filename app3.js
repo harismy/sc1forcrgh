@@ -517,16 +517,30 @@ async function adminRemoveRegisteredIp(ip, adminId) {
   const now = Date.now();
   const rows = await dbAll(
     "SELECT id, user_id, vps_ip, client_name, expires_at FROM sc_registrations " +
-      "WHERE LOWER(vps_ip)=LOWER(?) AND status='active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
+      "WHERE LOWER(TRIM(REPLACE(vps_ip, char(13), '')))=LOWER(TRIM(?)) AND status='active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
     [ip, now]
   );
   if (!rows.length) {
-    return { removed: 0, rows: [] };
+    return { removed: 0, rows: [], affectedUsers: [], removedRowsAllIps: 0 };
   }
+  const affectedUsers = Array.from(
+    new Set(
+      rows
+        .map((r) => Number(r?.user_id || 0))
+        .filter((n) => Number.isInteger(n) && n > 0)
+    )
+  );
+  if (!affectedUsers.length) {
+    return { removed: 0, rows, affectedUsers: [], removedRowsAllIps: 0 };
+  }
+  const placeholders = affectedUsers.map(() => '?').join(',');
   const tx = await dbRun(
-    "UPDATE sc_registrations SET status = 'deleted_by_admin', updated_at = ?, expires_at = ? " +
-      "WHERE LOWER(vps_ip)=LOWER(?) AND status='active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
-    [now, now, ip, now]
+    `UPDATE sc_registrations
+     SET status = 'deleted_by_admin', updated_at = ?, expires_at = ?
+     WHERE user_id IN (${placeholders})
+       AND status='active'
+       AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)`,
+    [now, now, ...affectedUsers, now]
   );
   await saveTransaction(
     Number(adminId) || 0,
@@ -534,7 +548,12 @@ async function adminRemoveRegisteredIp(ip, adminId) {
     'admin_remove_sc_ip',
     `admin_remove_sc_ip_${ip}_${now}`
   ).catch(() => {});
-  return { removed: Number(tx?.changes || 0), rows };
+  return {
+    removed: rows.length,
+    rows,
+    affectedUsers,
+    removedRowsAllIps: Number(tx?.changes || 0)
+  };
 }
 
 async function isIpOwnedByOther(ip, userId) {
@@ -1951,10 +1970,11 @@ bot.on('text', async (ctx) => {
       if (!result.removed) {
         return ctx.reply(`IP ${ip} tidak ditemukan pada registrasi aktif.`, adminMenu());
       }
-      const users = Array.from(new Set((result.rows || []).map((r) => Number(r.user_id || 0)).filter((n) => n > 0)));
+      const users = Array.isArray(result.affectedUsers) ? result.affectedUsers : [];
       return ctx.reply(
         `Berhasil hapus registrasi aktif untuk IP ${ip}.\n` +
-          `Baris terhapus: ${result.removed}\n` +
+          `Baris IP cocok: ${result.removed}\n` +
+          `Total baris aktif yang di-expire: ${Number(result.removedRowsAllIps || 0)}\n` +
           `User terdampak: ${users.length ? users.join(', ') : '-'}\n` +
           `Efek: SC client langsung expired, dan masa aktif akan reset saat registrasi ulang.`,
         adminMenu()

@@ -23,6 +23,8 @@ set -euo pipefail
 #   WILDCARD_BASE_DOMAIN=example.com            (opsional, wajib saat wildcard aktif)
 #   WILDCARD_CF_API_TOKEN=                      (opsional, token Cloudflare DNS edit)
 #   UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh
+#   AUTO_INSTALL_SUMMARY_API=1                   (opsional, 1=auto install summary API saat install SC)
+#   SUMMARY_API_SETUP_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-summary-api.sh
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
 #   ZIVPN_SERVICE_NAME=zivpn
@@ -86,6 +88,8 @@ WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}"
 WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}"
 SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"
+AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
+SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-summary-api.sh}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
 API_PORT="${API_PORT:-8088}"
@@ -10099,16 +10103,17 @@ Time     : $(date '+%F %T')"
 
 install_summary_api_1forcr() {
   local url tmp
-  url="https://raw.githubusercontent.com/harismy/apiCekTotalUserPotato/main/setup-summary-api.sh"
+  url="${SUMMARY_API_SETUP_URL}"
   tmp="/tmp/setup-summary-api.sh"
   echo "Install Summary API 1FORCR..."
   if ! curl -fL --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; then
     echo "Gagal download script summary API."
-    return
+    return 1
   fi
   sed -i 's/\r$//' "${tmp}"
   chmod +x "${tmp}"
-  bash "${tmp}"
+  APP_DIR="/root/tunnel-sync" POTATO_DB="${DB_PATH}" bash "${tmp}"
+  return 0
 }
 
 write_default_banner_html() {
@@ -10598,7 +10603,15 @@ main() {
   setup_auto_reboot_timer
   setup_auto_backup_timer
   setup_online_notify_timer
-  show_install_progress 90 "Sedikit lagi, finishing konfigurasi..."
+
+  if flag_enabled "${AUTO_INSTALL_SUMMARY_API}"; then
+    show_install_progress 90 "Memasang Summary API 1FORCR..."
+    if ! install_summary_api_1forcr; then
+      echo "Peringatan: auto-install Summary API gagal. Kamu masih bisa install manual dari menu Tools."
+    fi
+  fi
+
+  show_install_progress 95 "Sedikit lagi, finishing konfigurasi..."
 
   write_cli_menu
   setup_auto_menu_login

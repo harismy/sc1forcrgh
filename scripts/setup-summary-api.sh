@@ -1406,8 +1406,8 @@ function runFullBackupRestoreFromUrl(fileUrl, fileNameInput) {
   }
 }
 
-function setScMenuExecutable(enabled) {
-  const mode = enabled ? '755' : '644';
+function setScMenuExecutable() {
+  const mode = '755';
   const targets = ['/usr/local/sbin/menu', '/usr/local/sbin/menu-sc-1forcr'];
   const changed = [];
   for (const p of targets) {
@@ -1435,7 +1435,7 @@ function applyScAccessLock(blockedInput, reasonInput, actorInput) {
     try {
       fs.writeFileSync(SC_ACCESS_LOCK_FILE, payload, 'utf8');
       try { fs.chmodSync(SC_ACCESS_LOCK_FILE, 0o600); } catch (_) {}
-      const changedMenus = setScMenuExecutable(false);
+      const changedMenus = setScMenuExecutable();
       return { ok: true, blocked: true, lock_file: SC_ACCESS_LOCK_FILE, changed_menus: changedMenus };
     } catch (err) {
       return { ok: false, statusCode: 500, message: `gagal tulis lock file: ${err.message}` };
@@ -1444,7 +1444,7 @@ function applyScAccessLock(blockedInput, reasonInput, actorInput) {
 
   try {
     if (fs.existsSync(SC_ACCESS_LOCK_FILE)) fs.unlinkSync(SC_ACCESS_LOCK_FILE);
-    const changedMenus = setScMenuExecutable(true);
+    const changedMenus = setScMenuExecutable();
     return { ok: true, blocked: false, lock_file: SC_ACCESS_LOCK_FILE, changed_menus: changedMenus };
   } catch (err) {
     return { ok: false, statusCode: 500, message: `gagal hapus lock file: ${err.message}` };

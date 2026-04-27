@@ -506,6 +506,36 @@ async function saveServerKeyForHost(userId, host, key) {
   ).catch(() => {});
 }
 
+async function getOwnerUserIdsByHost(host) {
+  const ip = normalizeHost(host);
+  if (!isIpv4(ip)) return [];
+  const rows = await dbAll(
+    "SELECT DISTINCT user_id FROM sc_registrations WHERE vps_ip = ? ORDER BY user_id ASC",
+    [ip]
+  ).catch(() => []);
+  return rows
+    .map((r) => Number(r?.user_id || 0))
+    .filter((n) => Number.isInteger(n) && n > 0);
+}
+
+async function saveServerKeyForHostAllOwners(host, key, actorId = 0) {
+  const ip = normalizeHost(host);
+  const k = String(key || '').trim();
+  if (!isIpv4(ip) || k.length < 8) return { saved_for: 0 };
+
+  const ids = await getOwnerUserIdsByHost(ip);
+  const uidActor = Number(actorId || 0);
+  if (uidActor > 0 && !ids.includes(uidActor)) ids.push(uidActor);
+  if (!ids.length) return { saved_for: 0 };
+
+  let saved = 0;
+  for (const uid of ids) {
+    await saveServerKeyForHost(uid, ip, k);
+    saved += 1;
+  }
+  return { saved_for: saved };
+}
+
 async function getServerKeyForHost(userId, host) {
   const uid = Number(userId || 0);
   const ip = normalizeHost(host);
@@ -1145,11 +1175,12 @@ function normalizeReleaseDescription(input) {
   return raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n{2,}/g, '\n').slice(0, 1200);
 }
 
-function buildUpdateNoticeText(component, version, description, host = '', scope = 'single') {
+function buildUpdateNoticeText(component, version, description, host = '', scope = 'single', serverKey = '') {
   const c = String(component || '').trim().toUpperCase() || '-';
   const v = String(version || '').trim() || '-';
   const d = String(description || '').trim() || '-';
   const h = String(host || '').trim();
+  const k = String(serverKey || '').trim();
   const lines = [
     'Info Update SC',
     `Komponen : ${c}`,
@@ -1157,6 +1188,7 @@ function buildUpdateNoticeText(component, version, description, host = '', scope
     `Ruang    : ${scope === 'global' ? 'Global' : 'Single VPS'}`
   ];
   if (h) lines.push(`Host     : ${h}`);
+  if (k) lines.push(`ServerKey: ${k}`);
   lines.push('', 'Deskripsi update:', d);
   return lines.join('\n');
 }
@@ -1215,9 +1247,9 @@ async function runAdminUpdateSingle(ctx, host, key, component, version, descript
     release_actor: String(ctx.from?.id || '')
   };
   const resp = await apiPost(host, key, '/internal/trigger-update', payload, 40 * 60 * 1000);
-  await saveServerKeyForHost(ctx.from.id, host, key);
+  await saveServerKeyForHostAllOwners(host, key, ctx.from.id);
   const users = await getActiveUserIdsByHosts([host]).catch(() => []);
-  const notice = buildUpdateNoticeText(component, version, description, host, 'single');
+  const notice = buildUpdateNoticeText(component, version, description, host, 'single', key);
   const notify = await broadcastUpdateNoticeToUsers(users, notice).catch(() => ({ total: users.length, sent: 0, failed: users.length }));
   const steps = Array.isArray(resp?.steps) ? resp.steps : [];
   const lines = steps.map((s) => `- ${String(s?.step || '-')} : ${s?.ok ? 'OK' : 'FAIL'}`);
@@ -1268,7 +1300,7 @@ async function runAdminUpdateGlobal(ctx, component, version, description) {
         },
         40 * 60 * 1000
       );
-      await saveServerKeyForHost(ctx.from.id, host, key);
+      await saveServerKeyForHostAllOwners(host, key, ctx.from.id);
       success += 1;
       successHosts.push(host);
     } catch (err) {
@@ -1699,7 +1731,7 @@ bot.action('m_admin_remove_sc_ip', async (ctx) => {
     uiBox('HAPUS IP VPS TERDAFTAR', [
       'Masukkan IP VPS yang ingin dihapus dari registrasi aktif.',
       'Contoh: 103.10.10.2',
-      'Setelah input IP, bot akan minta key server untuk lock akses menu di VPS tersebut.',
+      'Bot akan coba ambil key server otomatis dari database key tersimpan.',
       '',
       'Preview IP aktif:',
       preview,
@@ -1718,8 +1750,7 @@ bot.action('m_admin_unlock_sc_access', async (ctx) => {
     uiBox('BUKA KUNCI AKSES SC VPS', [
       'Masukkan IP VPS yang ingin dibuka kunci akses menunya.',
       'Contoh: 103.10.10.2',
-      '',
-      'Setelah itu bot akan meminta key server.',
+      'Bot akan gunakan key tersimpan otomatis.',
       'Ketik "batal" untuk membatalkan.'
     ]),
     adminMenu()
@@ -2568,61 +2599,40 @@ bot.on('text', async (ctx) => {
       if (!isIpv4(ip)) {
         return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
       }
-      state.targetIpForAdminRemove = ip;
-      state.step = 'admin_remove_sc_ip_key';
-      userState.set(ctx.chat.id, state);
-      return ctx.reply(
-        `IP target: ${ip}\n` +
-          'Masukkan key server VPS tersebut untuk lock akses menu lokal VPS.',
-        adminMenu()
-      );
-    }
-
-    if (state.step === 'admin_remove_sc_ip_key') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      const ip = normalizeHost(state.targetIpForAdminRemove || '');
-      if (!isIpv4(ip)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('State hapus IP tidak valid. Ulangi dari menu admin.', adminMenu());
-      }
-      const key = String(text || '').trim();
-      if (key.length < 8) {
-        return ctx.reply('Key server tidak valid.');
-      }
-      await saveServerKeyForHost(ctx.from.id, ip, key);
-
+      const key = await getServerKeyForHost(ctx.from.id, ip);
       const result = await adminRemoveRegisteredIp(ip, ctx.from.id);
       if (!result.removed) {
         userState.delete(ctx.chat.id);
         return ctx.reply(`IP ${ip} tidak ditemukan pada registrasi aktif.`, adminMenu());
       }
 
-      let lockMsg = 'Lock menu VPS: gagal (unknown)';
-      try {
-        const lockResp = await lockScAccessByHost(ip, key, ctx.from.id, 'admin_remove_sc_ip');
-        const blocked = lockResp?.blocked === true;
-        lockMsg = blocked ? 'Lock menu VPS: berhasil' : 'Lock menu VPS: gagal';
-      } catch (lockErr) {
-        lockMsg = `Lock menu VPS: gagal (${parseErr(lockErr)})`;
+      let lockMsg = 'Lock menu VPS: skip (key belum tersimpan)';
+      if (String(key || '').trim().length >= 8) {
+        try {
+          const lockResp = await lockScAccessByHost(ip, key, ctx.from.id, 'admin_remove_sc_ip');
+          const blocked = lockResp?.blocked === true;
+          lockMsg = blocked ? 'Lock menu VPS: berhasil' : 'Lock menu VPS: gagal';
+        } catch (lockErr) {
+          lockMsg = `Lock menu VPS: gagal (${parseErr(lockErr)})`;
+        }
       }
 
       const users = Array.isArray(result.affectedUsers) ? result.affectedUsers : [];
       const userNotify = await notifyExpiredUsersInBot(ctx, users, ip, 'admin_remove_sc_ip').catch(() => ({ total: users.length, ok: 0, fail: users.length }));
 
-      let vpsNotifyMsg = 'Notif bot VPS: gagal (unknown)';
-      try {
-        await notifyScExpiredOnHost(ip, key, {
-          ip,
-          reason: 'admin_remove_sc_ip',
-          actor: String(ctx.from.id || ''),
-          users: users.map((u) => String(u))
-        });
-        vpsNotifyMsg = 'Notif bot VPS: berhasil';
-      } catch (notifyErr) {
-        vpsNotifyMsg = `Notif bot VPS: gagal (${parseErr(notifyErr)})`;
+      let vpsNotifyMsg = 'Notif bot VPS: skip (key belum tersimpan)';
+      if (String(key || '').trim().length >= 8) {
+        try {
+          await notifyScExpiredOnHost(ip, key, {
+            ip,
+            reason: 'admin_remove_sc_ip',
+            actor: String(ctx.from.id || ''),
+            users: users.map((u) => String(u))
+          });
+          vpsNotifyMsg = 'Notif bot VPS: berhasil';
+        } catch (notifyErr) {
+          vpsNotifyMsg = `Notif bot VPS: gagal (${parseErr(notifyErr)})`;
+        }
       }
 
       userState.delete(ctx.chat.id);
@@ -2648,31 +2658,15 @@ bot.on('text', async (ctx) => {
       if (!isIpv4(ip)) {
         return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
       }
-      state.targetIpForAdminUnlock = ip;
-      state.step = 'admin_unlock_sc_ip_key';
-      userState.set(ctx.chat.id, state);
-      return ctx.reply(
-        `IP target: ${ip}\n` +
-          'Masukkan key server VPS tersebut untuk membuka lock akses menu.',
-        adminMenu()
-      );
-    }
-
-    if (state.step === 'admin_unlock_sc_ip_key') {
-      if (!isAdmin(ctx.from.id)) {
+      const key = await getServerKeyForHost(ctx.from.id, ip);
+      if (String(key || '').trim().length < 8) {
         userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
+        return ctx.reply(
+          `Gagal unlock akses SC VPS untuk ${ip}: key server belum tersimpan.\n` +
+            'Simpan dulu key lewat fitur yang meminta key (backup/restore/migrasi/trigger update).',
+          adminMenu()
+        );
       }
-      const ip = normalizeHost(state.targetIpForAdminUnlock || '');
-      if (!isIpv4(ip)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('State unlock akses SC tidak valid. Ulangi dari menu admin.', adminMenu());
-      }
-      const key = String(text || '').trim();
-      if (key.length < 8) {
-        return ctx.reply('Key server tidak valid.');
-      }
-      await saveServerKeyForHost(ctx.from.id, ip, key);
       try {
         const unlockResp = await apiPost(ip, key, '/internal/sc-access-lock', {
           blocked: false,

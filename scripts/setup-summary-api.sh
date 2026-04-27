@@ -1218,6 +1218,86 @@ function runFullBackupRestoreFromUrl(fileUrl, fileNameInput) {
   }
 }
 
+function parseEnvLine(rawContent, key) {
+  const content = String(rawContent || '');
+  const re = new RegExp(`^${String(key).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=(.*)$`, 'm');
+  const m = content.match(re);
+  if (!m) return '';
+  return String(m[1] || '').trim().replace(/^["']|["']$/g, '');
+}
+
+function readCoreApiRuntimeConfig() {
+  const envFile = '/opt/sc-1forcr/.env';
+  let token = String(process.env.CORE_AUTH_TOKEN || '').trim();
+  let port = Number(process.env.CORE_API_PORT || 8088);
+
+  try {
+    if (fs.existsSync(envFile)) {
+      const raw = fs.readFileSync(envFile, 'utf8');
+      if (!token) token = parseEnvLine(raw, 'AUTH_TOKEN');
+      const p = Number(parseEnvLine(raw, 'API_PORT') || 0);
+      if (Number.isFinite(p) && p > 0) port = p;
+    }
+  } catch (_) {}
+
+  if (!token) return { ok: false, message: 'AUTH_TOKEN API utama tidak ditemukan' };
+  if (!Number.isFinite(port) || port < 1) port = 8088;
+  return { ok: true, token, port };
+}
+
+async function renewXrayAccount(typeInput, usernameInput, daysInput) {
+  const type = String(typeInput || '').trim().toLowerCase();
+  const username = String(usernameInput || '').trim();
+  const days = Number.isFinite(Number(daysInput)) ? Math.max(0, Math.floor(Number(daysInput))) : 0;
+  const routeMap = {
+    vmess: '/vps/renewvmess',
+    vless: '/vps/renewvless',
+    trojan: '/vps/renewtrojan'
+  };
+  const renewBase = routeMap[type];
+  if (!renewBase) {
+    return { ok: false, statusCode: 400, message: 'type harus vmess/vless/trojan' };
+  }
+  if (!username) {
+    return { ok: false, statusCode: 400, message: 'username required' };
+  }
+
+  const core = readCoreApiRuntimeConfig();
+  if (!core.ok) {
+    return { ok: false, statusCode: 500, message: core.message };
+  }
+
+  const url = `http://127.0.0.1:${core.port}${renewBase}/${encodeURIComponent(username)}/${days}`;
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: core.token,
+        'Content-Type': 'application/json'
+      },
+      body: '{}'
+    });
+    const text = await resp.text();
+    let body = null;
+    try { body = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!resp.ok) {
+      return {
+        ok: false,
+        statusCode: Number(resp.status || 500),
+        message: `core renew gagal (${resp.status})`,
+        core_response: body || text || null
+      };
+    }
+    return { ok: true, type, username, days, core_response: body || text || null };
+  } catch (err) {
+    return {
+      ok: false,
+      statusCode: 500,
+      message: err?.message || 'request renew ke API utama gagal'
+    };
+  }
+}
+
 function authorizeAndRun(req, res, runHandler) {
   const incomingToken = String(req.headers['x-sync-token'] || '').trim();
   if (!incomingToken) {
@@ -1381,6 +1461,29 @@ app.post('/internal/restore-full-backup-url', (req, res) => {
       return res.status(Number(result.statusCode || 500)).json({ ok: false, message: result.message });
     }
     return res.json(result);
+  });
+});
+
+app.post('/internal/renew-xray-account', (req, res) => {
+  const type = String(req.body?.type || '').trim();
+  const username = String(req.body?.username || '').trim();
+  const days = Number(req.body?.days || 0);
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    renewXrayAccount(type, username, days)
+      .then((result) => {
+        if (!result.ok) {
+          return res.status(Number(result.statusCode || 500)).json({
+            ok: false,
+            message: result.message,
+            core_response: result.core_response || null
+          });
+        }
+        return res.json(result);
+      })
+      .catch((err) => {
+        return res.status(500).json({ ok: false, message: err?.message || 'renew gagal' });
+      });
   });
 });
 

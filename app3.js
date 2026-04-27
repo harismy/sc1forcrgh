@@ -276,6 +276,14 @@ function parseErr(err) {
   return msg;
 }
 
+function parseRenewErr(err) {
+  const status = Number(err?.response?.status || 0);
+  if (status === 404) {
+    return 'endpoint renew tidak tersedia di API summary (:8789), perlu trigger via API utama (:8088)';
+  }
+  return parseErr(err);
+}
+
 function uiBox(title, lines = []) {
   const sep = '============================================================';
   const body = Array.isArray(lines) ? lines.map((x) => String(x ?? '')) : [String(lines || '')];
@@ -770,15 +778,33 @@ async function rebuildXrayFromType(host, key, type, sampleUser) {
   const t = String(type || '').trim().toLowerCase();
   const u = String(sampleUser || '').trim();
   if (!u) return { ok: false, skipped: true, message: 'sample username kosong' };
-  const routeMap = {
-    vmess: '/vps/renewvmess',
-    vless: '/vps/renewvless',
-    trojan: '/vps/renewtrojan'
-  };
-  const base = routeMap[t];
-  if (!base) return { ok: false, skipped: true, message: 'protocol non-xray' };
-  await apiPost(host, key, `${base}/${encodeURIComponent(u)}/0`, {});
+  if (!['vmess', 'vless', 'trojan'].includes(t)) {
+    return { ok: false, skipped: true, message: 'protocol non-xray' };
+  }
+  await apiPost(host, key, '/internal/renew-xray-account', {
+    type: t,
+    username: u,
+    days: 0
+  });
   return { ok: true };
+}
+
+async function tryRebuildXrayAny(host, key, preferredType = '') {
+  const pref = String(preferredType || '').trim().toLowerCase();
+  const ordered = ['vmess', 'vless', 'trojan'];
+  if (ordered.includes(pref)) {
+    ordered.splice(ordered.indexOf(pref), 1);
+    ordered.unshift(pref);
+  }
+  for (const type of ordered) {
+    const exported = await apiGet(host, key, '/internal/export-accounts', { type, limit: 1 });
+    const list = Array.isArray(exported?.accounts) ? exported.accounts : [];
+    const sampleUser = String(list[0]?.username || '').trim();
+    if (!sampleUser) continue;
+    await rebuildXrayFromType(host, key, type, sampleUser);
+    return { ok: true, type, username: sampleUser };
+  }
+  return { ok: false, message: 'tidak ada akun VMESS/VLESS/TROJAN aktif untuk trigger rebuild' };
 }
 
 async function deleteAllByProtocol(host, key, type) {
@@ -1436,6 +1462,8 @@ bot.action('m_delall_confirm_yes', async (ctx) => {
     await ctx.reply('Menghapus akun, tunggu...');
     const type = String(state.protocol || '').toLowerCase();
     let summaryText = '';
+    const xrayNeedsReload = type === 'all' || type === 'vmess' || type === 'vless' || type === 'trojan';
+    let xrayReloadLine = '';
     if (type === 'all') {
       const allStats = await deleteAllProtocols(state.host, state.key);
       const lines = ['Rincian hasil:'];
@@ -1450,13 +1478,25 @@ bot.action('m_delall_confirm_yes', async (ctx) => {
         `Rincian hasil:\n` +
         `- ${protocolLabel(type)}: data ${stats.exported}, terhapus ${stats.deleted}`;
     }
+    if (xrayNeedsReload) {
+      try {
+        const rr = await tryRebuildXrayAny(state.host, state.key, type === 'all' ? '' : type);
+        if (rr.ok) {
+          xrayReloadLine = `\nXRAY reload: OK (${rr.type.toUpperCase()} / ${rr.username})`;
+        } else {
+          xrayReloadLine = `\nXRAY reload: skip (${rr.message})`;
+        }
+      } catch (reloadErr) {
+        xrayReloadLine = `\nXRAY reload: gagal (${parseErr(reloadErr)})`;
+      }
+    }
     await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip = ? AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.host]).catch(() => {});
     userState.delete(ctx.chat.id);
     return ctx.reply(
       `Hapus semua akun selesai.\n` +
         `Host: ${state.host}\n` +
         `Protokol: ${type === 'all' ? 'SEMUA PROTOKOL' : protocolLabel(type)}\n` +
-        `${summaryText}`,
+        `${summaryText}${xrayReloadLine}`,
       mainMenu()
     );
   } catch (err) {
@@ -1555,7 +1595,7 @@ bot.action('m_migrate_confirm_yes', async (ctx) => {
         await rebuildXrayFromType(state.dstHost, state.dstKey, type, sampleUser);
         lines.push(`XRAY reload: OK (${type.toUpperCase()})`);
       } catch (reloadErr) {
-        lines.push(`XRAY reload: gagal (${parseErr(reloadErr)})`);
+        lines.push(`XRAY reload: gagal (${parseRenewErr(reloadErr)})`);
       }
     }
 

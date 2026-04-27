@@ -8410,6 +8410,7 @@ draw_dashboard() {
   local GREEN="${ESC}[0;32m"
   local YELLOW="${ESC}[0;33m"
   local BLUE="${ESC}[0;34m"
+  local MAGENTA="${ESC}[0;35m"
   local CYAN="${ESC}[0;36m"
   local BOLD="${ESC}[1m"
   local NC="${ESC}[0m"

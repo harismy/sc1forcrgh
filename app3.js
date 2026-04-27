@@ -319,6 +319,50 @@ function formatTopupStatus(status) {
   return s || '-';
 }
 
+function toYmdUtc(dateObj) {
+  const d = dateObj instanceof Date ? dateObj : new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function isDateExpExpired(dateExp) {
+  const raw = String(dateExp || '').trim();
+  if (!raw) return true;
+  const normalized = raw.replace(' ', 'T');
+  const ms = Date.parse(normalized);
+  if (!Number.isFinite(ms)) return true;
+  const end = new Date(ms);
+  const now = new Date();
+  return end.getTime() < now.getTime();
+}
+
+function normalizeAccountForImport(type, row, opts = {}) {
+  const t = String(type || '').trim().toLowerCase();
+  const out = { ...(row || {}) };
+  const forceActive = opts.forceActive !== false;
+  if (forceActive) out.status = 'AKTIF';
+
+  const shouldFixDate = opts.ensureNotExpired !== false;
+  if (shouldFixDate) {
+    const future = new Date(Date.now() + (24 * 60 * 60 * 1000));
+    const fallbackDate = toYmdUtc(future);
+    if (isDateExpExpired(out.date_exp)) {
+      out.date_exp = fallbackDate;
+      out.exp = fallbackDate;
+      out.to = fallbackDate;
+    }
+  }
+
+  if (t === 'ssh') {
+    const username = String(out.username || '').trim();
+    if (!String(out.password || '').trim()) out.password = username || '123456';
+  }
+
+  return out;
+}
+
 function normalizeClientName(input) {
   const raw = String(input || '').trim().replace(/\s+/g, ' ');
   if (!raw) return '';
@@ -442,6 +486,18 @@ async function getActiveRegistrations(userId) {
   );
 }
 
+async function getLatestRegistrationState(userId) {
+  const now = Date.now();
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [now, now]
+  ).catch(() => {});
+  return dbGet(
+    "SELECT vps_ip, client_name, status, expires_at, updated_at FROM sc_registrations WHERE user_id = ? ORDER BY updated_at DESC LIMIT 1",
+    [userId]
+  );
+}
+
 async function listActiveRegistrationsForAdmin(limit = 15) {
   const now = Date.now();
   await dbRun(
@@ -545,7 +601,8 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
     }
 
     const now = Date.now();
-    const baseExpiry = Math.max(now, Number(existing?.expires_at || 0));
+    const isCarryForward = String(existing?.status || '').trim().toLowerCase() === 'active';
+    const baseExpiry = isCarryForward ? Math.max(now, Number(existing?.expires_at || 0)) : now;
     const nextExpiry = baseExpiry + (days * DAY_MS);
     const finalClientName = normalizeClientName(clientName || existing?.client_name || ip);
     await dbRun(
@@ -1292,6 +1349,28 @@ bot.action('m_my_sc', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
   if (regs.length === 0) {
+    const latest = await getLatestRegistrationState(ctx.from.id).catch(() => null);
+    if (latest) {
+      const st = String(latest.status || '').trim().toLowerCase();
+      if (st === 'expired') {
+        return ctx.reply(
+          `SC kamu saat ini expired.\n` +
+            `IP terakhir : ${latest.vps_ip || '-'}\n` +
+            `Expired     : ${formatDateTime(latest.expires_at)}\n\n` +
+            `Silakan perpanjang dari menu "Daftar / Perpanjang SC".`,
+          mainMenu()
+        );
+      }
+      if (st === 'deleted_by_admin') {
+        return ctx.reply(
+          `IP SC kamu telah dihapus admin.\n` +
+            `IP terakhir : ${latest.vps_ip || '-'}\n` +
+            `Status      : expired by admin\n\n` +
+            `Masa aktif sudah direset. Silakan registrasi ulang dari menu "Daftar / Perpanjang SC".`,
+          mainMenu()
+        );
+      }
+    }
     return ctx.reply('Belum ada IP SC terdaftar.', mainMenu());
   }
   const lines = regs.map(
@@ -1613,7 +1692,7 @@ bot.action('m_migrate_confirm_yes', async (ctx) => {
       const exported = await apiGet(state.srcHost, state.srcKey, '/internal/export-accounts', { type: t, limit: 50000 });
       const srcAccounts = Array.isArray(exported?.accounts) ? exported.accounts : [];
       const accounts = srcAccounts
-        .map((row) => ({ ...(row || {}), status: 'AKTIF' }))
+        .map((row) => normalizeAccountForImport(t, row, { forceActive: true, ensureNotExpired: true }))
         .filter((row) => String(row?.username || '').trim().length > 0);
 
       if (accounts.length === 0) {
@@ -1876,7 +1955,8 @@ bot.on('text', async (ctx) => {
       return ctx.reply(
         `Berhasil hapus registrasi aktif untuk IP ${ip}.\n` +
           `Baris terhapus: ${result.removed}\n` +
-          `User terdampak: ${users.length ? users.join(', ') : '-'}`,
+          `User terdampak: ${users.length ? users.join(', ') : '-'}\n` +
+          `Efek: SC client langsung expired, dan masa aktif akan reset saat registrasi ulang.`,
         adminMenu()
       );
     }
@@ -2412,7 +2492,7 @@ bot.on('document', async (ctx) => {
     for (const type of types) {
       const rawAccounts = Array.isArray(backupData[type]) ? backupData[type] : [];
       const accounts = rawAccounts
-        .map((row) => ({ ...(row || {}), status: 'AKTIF' }))
+        .map((row) => normalizeAccountForImport(type, row, { forceActive: true, ensureNotExpired: true }))
         .filter((row) => String(row?.username || '').trim().length > 0);
       restoredAccountsByType[type] = accounts;
       if (accounts.length === 0) {

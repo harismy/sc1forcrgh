@@ -1775,19 +1775,15 @@ bot.on('text', async (ctx) => {
         apiGet(state.host, key, '/internal/export-accounts', { type: 'trojan', limit: 50000 })
       ]);
 
-      let zivpnAuth = [];
-      try {
-        const za = await apiGet(state.host, key, '/internal/export-zivpn-auth');
-        zivpnAuth = Array.isArray(za.users) ? za.users : [];
-      } catch (_) {
-        try {
-          const zcfg = await apiGet(state.host, key, '/internal/export-zivpn-config');
-          const cfgList = zcfg?.config?.auth?.config;
-          zivpnAuth = Array.isArray(cfgList) ? cfgList : [];
-        } catch (__){
-          zivpnAuth = [];
-        }
-      }
+      // ZIVPN disatukan dengan SSH: auth source mengikuti akun SSH.
+      const sshAccounts = Array.isArray(ssh.accounts) ? ssh.accounts : [];
+      const zivpnAuth = Array.from(
+        new Set(
+          sshAccounts
+            .map((r) => String(r?.username || '').trim().toLowerCase())
+            .filter(Boolean)
+        )
+      );
 
       let bannerHtml = '';
       let bannerTxt = '';
@@ -1807,11 +1803,11 @@ bot.on('text', async (ctx) => {
           user_id: ctx.from.id
         },
         data: {
-          ssh: Array.isArray(ssh.accounts) ? ssh.accounts : [],
+          ssh: sshAccounts,
           vmess: Array.isArray(vmess.accounts) ? vmess.accounts : [],
           vless: Array.isArray(vless.accounts) ? vless.accounts : [],
           trojan: Array.isArray(trojan.accounts) ? trojan.accounts : [],
-          zivpn_auth: Array.isArray(zivpnAuth) ? zivpnAuth : [],
+          zivpn_auth: zivpnAuth,
           banner_html: bannerHtml,
           banner_txt: bannerTxt
         }
@@ -1826,7 +1822,7 @@ bot.on('text', async (ctx) => {
       userState.delete(ctx.chat.id);
       await ctx.replyWithDocument(
         { source: content, filename },
-        { caption: `Backup selesai.\nIP VPS: ${state.host}\nSSH: ${backupPayload.data.ssh.length}, VMESS: ${backupPayload.data.vmess.length}, VLESS: ${backupPayload.data.vless.length}, TROJAN: ${backupPayload.data.trojan.length}, ZIVPN: ${backupPayload.data.zivpn_auth.length}` }
+        { caption: `Backup selesai.\nIP VPS: ${state.host}\nSSH/ZIVPN: ${backupPayload.data.ssh.length}, VMESS: ${backupPayload.data.vmess.length}, VLESS: ${backupPayload.data.vless.length}, TROJAN: ${backupPayload.data.trojan.length}` }
       );
       return;
     }
@@ -1952,16 +1948,7 @@ bot.on('document', async (ctx) => {
       resultLines.push(`${type.toUpperCase()}: imported ${Number(imported.imported || 0)}, skipped ${Number(imported.skipped || 0)}`);
     }
 
-    if (Array.isArray(backupData.zivpn_auth)) {
-      try {
-        const restoreZ = await apiPost(state.host, state.key, '/internal/restore-zivpn-auth', {
-          users: backupData.zivpn_auth
-        });
-        resultLines.push(`ZIVPN auth: restored (${Number(restoreZ.total_entries || 0)})`);
-      } catch (zErr) {
-        resultLines.push(`ZIVPN auth: gagal (${parseErr(zErr)})`);
-      }
-    }
+    resultLines.push('ZIVPN auth: mengikuti akun SSH (mode unified)');
 
     if (Object.prototype.hasOwnProperty.call(backupData, 'banner_html') || Object.prototype.hasOwnProperty.call(backupData, 'banner_txt')) {
       try {

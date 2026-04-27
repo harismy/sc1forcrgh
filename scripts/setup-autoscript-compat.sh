@@ -239,6 +239,12 @@ XRAY_PATHS_VMESS="$(normalize_xray_paths_csv "${XRAY_PATHS_VMESS}" "/vmess")"
 XRAY_PATHS_VLESS="$(normalize_xray_paths_csv "${XRAY_PATHS_VLESS}" "/vless")"
 XRAY_PATHS_TROJAN="$(normalize_xray_paths_csv "${XRAY_PATHS_TROJAN}" "/trojan")"
 
+# Jaga kompatibilitas HC/potato style:
+# path inbound Xray dikunci ke path standar agar selalu sinkron dengan route nginx.
+XRAY_PATHS_VMESS="/vmess"
+XRAY_PATHS_VLESS="/vless"
+XRAY_PATHS_TROJAN="/trojan"
+
 tls_cert_domain() {
   if flag_enabled "${WILDCARD_ENABLE:-0}" && [[ -n "${WILDCARD_BASE_DOMAIN:-}" ]]; then
     echo "${WILDCARD_BASE_DOMAIN}"
@@ -677,29 +683,44 @@ DROPBEAR_BANNER="${banner_file}"
 DROPBEAR_RECEIVE_WINDOW=65536
 EOF
 
-  local src_dir archive_url archive_path build_dir custom_bin
+  local src_dir archive_url archive_path build_dir custom_bin dropbear_bin
   src_dir="/usr/local/src"
   archive_url="https://matt.ucc.asn.au/dropbear/releases/dropbear-${DROPBEAR_VERSION}.tar.bz2"
   archive_path="${src_dir}/dropbear-${DROPBEAR_VERSION}.tar.bz2"
   build_dir="${src_dir}/dropbear-${DROPBEAR_VERSION}"
   custom_bin="/usr/local/sbin/dropbear-${DROPBEAR_VERSION}"
+  dropbear_bin="${custom_bin}"
 
   if [[ ! -x "${custom_bin}" ]]; then
     log "Build Dropbear ${DROPBEAR_VERSION} from source..."
     mkdir -p "${src_dir}"
     rm -rf "${build_dir}"
-    curl -fL --retry 5 --retry-delay 2 "${archive_url}" -o "${archive_path}"
-    tar -xjf "${archive_path}" -C "${src_dir}"
-    (
-      cd "${build_dir}"
-      ./configure --prefix=/usr/local --sysconfdir=/etc/dropbear
-      make -j"$(nproc || echo 1)"
-      cp -f dropbear "${custom_bin}"
-      if [[ -x ./dropbearkey ]]; then
-        cp -f ./dropbearkey /usr/local/bin/dropbearkey-sc1
+    if curl -fL --retry 5 --retry-delay 2 "${archive_url}" -o "${archive_path}"; then
+      if tar -xjf "${archive_path}" -C "${src_dir}"; then
+        (
+          cd "${build_dir}"
+          ./configure --prefix=/usr/local --sysconfdir=/etc/dropbear
+          make -j"$(nproc || echo 1)"
+          cp -f dropbear "${custom_bin}"
+          if [[ -x ./dropbearkey ]]; then
+            cp -f ./dropbearkey /usr/local/bin/dropbearkey-sc1
+          fi
+        )
+        chmod 755 "${custom_bin}"
+      else
+        log "Warning: gagal extract source Dropbear. Fallback ke binary bawaan sistem."
       fi
-    )
-    chmod 755 "${custom_bin}"
+    else
+      log "Warning: gagal download source Dropbear (${archive_url}). Fallback ke binary bawaan sistem."
+    fi
+  fi
+
+  if [[ ! -x "${dropbear_bin}" ]]; then
+    if command -v dropbear >/dev/null 2>&1; then
+      dropbear_bin="$(command -v dropbear)"
+    else
+      dropbear_bin="/usr/sbin/dropbear"
+    fi
   fi
 
   mkdir -p /etc/dropbear
@@ -707,6 +728,10 @@ EOF
     [[ -s /etc/dropbear/dropbear_rsa_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1 || true
     [[ -s /etc/dropbear/dropbear_ecdsa_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key >/dev/null 2>&1 || true
     [[ -s /etc/dropbear/dropbear_ed25519_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1 || true
+  elif command -v dropbearkey >/dev/null 2>&1; then
+    [[ -s /etc/dropbear/dropbear_rsa_host_key ]] || dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1 || true
+    [[ -s /etc/dropbear/dropbear_ecdsa_host_key ]] || dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key >/dev/null 2>&1 || true
+    [[ -s /etc/dropbear/dropbear_ed25519_host_key ]] || dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1 || true
   fi
 
   mkdir -p /etc/systemd/system/dropbear.service.d
@@ -715,14 +740,14 @@ EOF
 [Service]
 Type=simple
 ExecStart=
-ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
+ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
 EOF
   else
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
 Type=simple
 ExecStart=
-ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port}
+ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port}
 EOF
   fi
 
@@ -922,15 +947,6 @@ EOF
 }
 
 setup_nginx_and_cert() {
-  local vmess_primary vless_primary trojan_primary
-  local vmess_locations vless_locations trojan_locations
-  vmess_primary="$(echo "${XRAY_PATHS_VMESS}" | cut -d',' -f1)"
-  vless_primary="$(echo "${XRAY_PATHS_VLESS}" | cut -d',' -f1)"
-  trojan_primary="$(echo "${XRAY_PATHS_TROJAN}" | cut -d',' -f1)"
-  vmess_locations="$(build_nginx_ws_locations "${XRAY_PATHS_VMESS}" "10001" "${vmess_primary}")"
-  vless_locations="$(build_nginx_ws_locations "${XRAY_PATHS_VLESS}" "10002" "${vless_primary}")"
-  trojan_locations="$(build_nginx_ws_locations "${XRAY_PATHS_TROJAN}" "10003" "${trojan_primary}")"
-
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
@@ -956,7 +972,68 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
-${vmess_locations}${vless_locations}${trojan_locations}
+    location /vmess {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /yourbug {
+        access_log off;
+        proxy_redirect off;
+        rewrite ^ /vmess break;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /yourbug/vless {
+        access_log off;
+        proxy_redirect off;
+        rewrite ^ /vless break;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /yourbug/trojan {
+        access_log off;
+        proxy_redirect off;
+        rewrite ^ /trojan break;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
 
     location / {
         access_log off;
@@ -1899,7 +1976,7 @@ async function notifyAccountEvent(action, service, account, owner) {
     const chatId = Number.isInteger(chatIdNum) && chatIdNum !== 0 ? String(chatIdNum) : '-';
     const username = String(account?.username || '-');
     const exp = String(account?.exp || account?.expired || account?.to || '-');
-    const limitip = String(account?.limitip || '0');
+    const limitip = String(account?.limitip ?? account?.iplimit ?? '0');
     const kind = /^trial/i.test(username) || String(action || '').toLowerCase() === 'trial' ? 'TRIAL' : 'REGULER';
     const msg =
       `SC 1FORCR NOTIF\n` +
@@ -1927,7 +2004,7 @@ async function notifyExpiredAccountEvent(service, account = {}, owner = {}) {
       : '-';
     const username = String(account?.username || '-');
     const exp = String(account?.exp || account?.expired || account?.date_exp || '-');
-    const limitip = String(account?.limitip || '0');
+    const limitip = String(account?.limitip ?? account?.iplimit ?? '0');
     const kind = /^trial/i.test(username) ? 'TRIAL' : 'REGULER';
     const msg =
       `SC 1FORCR NOTIF\n` +
@@ -2673,8 +2750,10 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, upgrade: '/upvmess', aliases: XRAY_PATHS_VMESS },
+      path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: '/upvmess', aliases: XRAY_PATHS_VMESS },
       serviceName: 'vmess-grpc',
+      limitip: String(limitip),
+      iplimit: String(limitip),
       link: { tls: vmessLink(DOMAIN, uuid, true), none: vmessLink(DOMAIN, uuid, false), grpc: vmessLink(DOMAIN, uuid, true), uptls: vmessLink(DOMAIN, uuid, true), upntls: vmessLink(DOMAIN, uuid, false) }
     };
   } else if (protocol === 'vless') {
@@ -2688,8 +2767,10 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, upgrade: '/upvless', aliases: XRAY_PATHS_VLESS },
+      path: { ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: '/upvless', aliases: XRAY_PATHS_VLESS },
       serviceName: 'vless-grpc',
+      limitip: String(limitip),
+      iplimit: String(limitip),
       link: { tls: vlessLink(DOMAIN, uuid, true), none: vlessLink(DOMAIN, uuid, false), grpc: vlessLink(DOMAIN, uuid, true), uptls: vlessLink(DOMAIN, uuid, true), upntls: vlessLink(DOMAIN, uuid, false) }
     };
   } else if (protocol === 'trojan') {
@@ -2703,8 +2784,10 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: DOMAIN, username: finalUsername, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, upgrade: '/uptrojan', aliases: XRAY_PATHS_TROJAN },
+      path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: '/uptrojan', aliases: XRAY_PATHS_TROJAN },
       serviceName: 'trojan-grpc',
+      limitip: String(limitip),
+      iplimit: String(limitip),
       link: { tls: trojanLink(DOMAIN, pass, true), none: trojanLink(DOMAIN, pass, false), grpc: trojanLink(DOMAIN, pass, true), uptls: trojanLink(DOMAIN, pass, true), upntls: trojanLink(DOMAIN, pass, false) }
     };
   }
@@ -2919,33 +3002,6 @@ const SSH_HOST = process.env.SSH_WS_TARGET_HOST || '127.0.0.1';
 const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 109);
 const HTTP_BACKEND_HOST = process.env.SSH_HTTP_BACKEND_HOST || '127.0.0.1';
 const HTTP_BACKEND_PORT = Number(process.env.SSH_HTTP_BACKEND_PORT || 80);
-function normalizePath(raw, fallback = '/') {
-  const source = String(raw || '').trim();
-  const base = source || String(fallback || '/').trim() || '/';
-  let p = base.startsWith('/') ? base : `/${base}`;
-  p = p.replace(/\/+/g, '/');
-  return p || '/';
-}
-function parsePathList(raw, fallback) {
-  const list = String(raw || '')
-    .split(',')
-    .map((v) => normalizePath(v, ''))
-    .filter((v) => v && v !== '/')
-    .filter((v, i, arr) => arr.indexOf(v) === i);
-  if (list.length > 0) return list;
-  return [normalizePath(fallback, '/')];
-}
-const XRAY_HTTP_PATHS = [
-  ...parsePathList(process.env.XRAY_PATHS_VMESS, '/vmess'),
-  ...parsePathList(process.env.XRAY_PATHS_VLESS, '/vless'),
-  ...parsePathList(process.env.XRAY_PATHS_TROJAN, '/trojan')
-].filter((v, i, arr) => arr.indexOf(v) === i);
-function isXrayProxyPath(path) {
-  for (const p of XRAY_HTTP_PATHS) {
-    if (path === p || path.startsWith(`${p}/`) || path.startsWith(`${p}?`)) return true;
-  }
-  return false;
-}
 
 function firstLine(head) {
   const i = head.indexOf('\r\n');
@@ -3023,14 +3079,20 @@ const server = net.createServer((client) => {
       return;
     }
 
-    if (head.includes('upgrade: websocket') || (head.includes('upgrade:') && head.includes('host:'))) {
-      startWsSshTunnel(rest);
+    if (
+      path.startsWith('/vps/') ||
+      path.startsWith('/vmess') ||
+      path.startsWith('/vless') ||
+      path.startsWith('/trojan') ||
+      path.startsWith('/yourbug')
+    ) {
+      const req = Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]);
+      startHttpProxy(req);
       return;
     }
 
-    if (path.startsWith('/vps/') || isXrayProxyPath(path)) {
-      const req = Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]);
-      startHttpProxy(req);
+    if (head.includes('upgrade: websocket') || (head.includes('upgrade:') && head.includes('host:'))) {
+      startWsSshTunnel(rest);
       return;
     }
 
@@ -3129,6 +3191,82 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func normalizePath(raw, fallback string) string {
+	src := strings.TrimSpace(raw)
+	base := src
+	if base == "" {
+		base = strings.TrimSpace(fallback)
+	}
+	if base == "" {
+		base = "/"
+	}
+	if !strings.HasPrefix(base, "/") {
+		base = "/" + base
+	}
+	for strings.Contains(base, "//") {
+		base = strings.ReplaceAll(base, "//", "/")
+	}
+	if base == "" {
+		return "/"
+	}
+	return base
+}
+
+func parsePathList(raw, fallback string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, 4)
+	for _, part := range strings.Split(raw, ",") {
+		p := normalizePath(part, "")
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	return []string{normalizePath("", fallback)}
+}
+
+func parseXrayProxyPaths() []string {
+	combined := []string{}
+	for _, p := range parsePathList(os.Getenv("XRAY_PATHS_VMESS"), "/vmess") {
+		combined = append(combined, p)
+	}
+	for _, p := range parsePathList(os.Getenv("XRAY_PATHS_VLESS"), "/vless") {
+		combined = append(combined, p)
+	}
+	for _, p := range parsePathList(os.Getenv("XRAY_PATHS_TROJAN"), "/trojan") {
+		combined = append(combined, p)
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(combined))
+	for _, p := range combined {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+func isXrayProxyPath(path string, xrayPaths []string) bool {
+	if !strings.HasPrefix(path, "/") {
+		return false
+	}
+	for _, p := range xrayPaths {
+		if p == "/" {
+			return true
+		}
+		if path == p || strings.HasPrefix(path, p+"/") || strings.HasPrefix(path, p+"?") {
+			return true
+		}
+	}
+	return false
 }
 
 func writeAll(conn net.Conn, data []byte) error {
@@ -3243,22 +3381,8 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		return
 	}
 
-	if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
-		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-		if err != nil {
-			return
-		}
-		_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
-		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-			_ = sshUp.Close()
-			return
-		}
-		tunnelBoth(client, sshUp)
-		return
-	}
-
 	// keep API and xray ws paths reachable through the same mux.
-	if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
+	if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") || strings.Contains(first, " /yourbug") {
 		httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
 		if err != nil {
 			return
@@ -3272,6 +3396,20 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			return
 		}
 		tunnelBoth(client, httpUp)
+		return
+	}
+
+	if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+		if err != nil {
+			return
+		}
+		_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+			_ = sshUp.Close()
+			return
+		}
+		tunnelBoth(client, sshUp)
 		return
 	}
 
@@ -5412,7 +5550,8 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 mode="${1:-manual}"
 mkdir -p "${AUTO_BACKUP_DIR}" /var/lib/sc-1forcr
 
-if [[ "${AUTO_BACKUP_ENABLE}" != "1" ]]; then
+# Gate hanya untuk mode terjadwal; mode manual dari menu tetap boleh jalan.
+if [[ "${mode}" == "scheduled" && "${AUTO_BACKUP_ENABLE}" != "1" ]]; then
   exit 0
 fi
 
@@ -5437,6 +5576,7 @@ python3 - "${DB_PATH}" "${DOMAIN}" "${backup_json}" <<'PY'
 import json
 import sqlite3
 import sys
+import os
 from datetime import datetime, timezone
 
 db_path = sys.argv[1]
@@ -5478,22 +5618,16 @@ payload = {
     },
 }
 
-try:
-    with open("/etc/zivpn/config.json", "r", encoding="utf-8") as f:
-        zcfg = json.load(f)
-    auth = ((zcfg or {}).get("auth") or {}).get("config")
-    if isinstance(auth, list):
-        out = []
-        seen = set()
-        for item in auth:
-            v = str(item).strip().lower()
-            if not v or v in seen:
-                continue
-            seen.add(v)
-            out.append(v)
-        payload["data"]["zivpn_auth"] = out
-except Exception:
-    pass
+# ZIVPN disatukan dengan SSH: sumber user auth mengikuti akun SSH di DB.
+ssh_users = []
+ssh_seen = set()
+for item in payload["data"]["ssh"]:
+    u = str((item or {}).get("username", "")).strip().lower()
+    if not u or u in ssh_seen:
+        continue
+    ssh_seen.add(u)
+    ssh_users.append(u)
+payload["data"]["zivpn_auth"] = ssh_users
 
 try:
     with open("/etc/sc-1forcr/banner.html", "r", encoding="utf-8") as f:
@@ -5522,12 +5656,13 @@ keep_days="$(echo "${AUTO_BACKUP_KEEP_DAYS}" | tr -cd '0-9')"
 find "${AUTO_BACKUP_DIR}" -maxdepth 1 -type f -name 'sc1forcr-accounts-*-WIB.json' -mtime +"${keep_days}" -delete >/dev/null 2>&1 || true
 
 if [[ -n "${TELEGRAM_BOT_TOKEN}" && -n "${TELEGRAM_CHAT_ID}" ]]; then
+  TELEGRAM_BOT_TOKEN="$(echo "${TELEGRAM_BOT_TOKEN}" | tr -d '[:space:]')"
+  TELEGRAM_CHAT_ID="$(echo "${TELEGRAM_CHAT_ID}" | tr -d '[:space:]')"
   host="$(hostname 2>/dev/null || echo vps)"
   ssh_count="$(jq -r '.data.ssh | length' "${backup_json}" 2>/dev/null || echo 0)"
   vmess_count="$(jq -r '.data.vmess | length' "${backup_json}" 2>/dev/null || echo 0)"
   vless_count="$(jq -r '.data.vless | length' "${backup_json}" 2>/dev/null || echo 0)"
   trojan_count="$(jq -r '.data.trojan | length' "${backup_json}" 2>/dev/null || echo 0)"
-  zivpn_count="$(jq -r '.data.zivpn_auth | length' "${backup_json}" 2>/dev/null || echo 0)"
   banner_html_on="$(jq -r 'if (.data.banner_html // "") != "" then "yes" else "no" end' "${backup_json}" 2>/dev/null || echo no)"
   banner_txt_on="$(jq -r 'if (.data.banner_txt // "") != "" then "yes" else "no" end' "${backup_json}" 2>/dev/null || echo no)"
   caption="SC 1FORCR NOTIF
@@ -5536,13 +5671,22 @@ Domain   : ${DOMAIN}
 Host     : ${host}
 WIB      : $(TZ=Asia/Jakarta date '+%F %T')
 File     : $(basename "${backup_json}")
-Akun     : SSH=${ssh_count} VMESS=${vmess_count} VLESS=${vless_count} TROJAN=${trojan_count} ZIVPN=${zivpn_count}
+Akun     : SSH/ZIVPN=${ssh_count} VMESS=${vmess_count} VLESS=${vless_count} TROJAN=${trojan_count}
 Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
-  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+
+  tg_api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
+  if ! curl -fsS --retry 2 --retry-delay 1 --max-time 40 -X POST "${tg_api}/sendDocument" \
     -F "chat_id=${TELEGRAM_CHAT_ID}" \
     -F "disable_content_type_detection=true" \
-    -F "caption=${caption}" \
-    -F "document=@${backup_json}" >/dev/null 2>&1 || true
+    --form-string "caption=${caption}" \
+    -F "document=@${backup_json}" >/dev/null 2>&1; then
+    # Fallback: minimal kirim notifikasi teks jika upload dokumen gagal.
+    curl -fsS --retry 2 --retry-delay 1 --max-time 20 -X POST "${tg_api}/sendMessage" \
+      -d "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=${caption}
+Backup file tersimpan lokal: ${backup_json}" >/dev/null 2>&1 || true
+    logger -t sc-1forcr "Auto-backup Telegram sendDocument gagal, fallback sendMessage dipakai."
+  fi
 fi
 
 echo "Backup akun selesai: ${backup_json}"
@@ -5736,6 +5880,8 @@ upsert_uuid("account_vlesses", data.get("vless") or [])
 upsert_trojan(data.get("trojan") or [])
 
 zivpn_auth = data.get("zivpn_auth") or []
+if not isinstance(zivpn_auth, list) or len(zivpn_auth) == 0:
+    zivpn_auth = [str((r or {}).get("username", "")).strip().lower() for r in (data.get("ssh") or [])]
 if isinstance(zivpn_auth, list):
     clean = []
     seen = set()
@@ -5745,29 +5891,31 @@ if isinstance(zivpn_auth, list):
             continue
         seen.add(v)
         clean.append(v)
-    try:
-        with open("/etc/zivpn/config.json", "r", encoding="utf-8") as f:
-            zcfg = json.load(f)
-    except Exception:
-        zcfg = {}
-    if not isinstance(zcfg, dict):
-        zcfg = {}
-    auth = zcfg.get("auth")
-    if not isinstance(auth, dict):
-        auth = {}
-    auth["mode"] = "passwords"
-    auth["config"] = clean
-    zcfg["auth"] = auth
-    try:
-        with open("/etc/zivpn/config.json", "w", encoding="utf-8") as f:
-            json.dump(zcfg, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    # Jika mode auth ZIVPN pakai HTTP/DB, jangan paksakan menulis config passwords.
+    # Hanya tulis config auth.passwords saat explicit mode passwords.
+    if str(os.environ.get("ZIVPN_AUTH_MODE", "http")).strip().lower() == "passwords":
+        try:
+            with open("/etc/zivpn/config.json", "r", encoding="utf-8") as f:
+                zcfg = json.load(f)
+        except Exception:
+            zcfg = {}
+        if not isinstance(zcfg, dict):
+            zcfg = {}
+        auth = zcfg.get("auth")
+        if not isinstance(auth, dict):
+            auth = {}
+        auth["mode"] = "passwords"
+        auth["config"] = clean
+        zcfg["auth"] = auth
+        try:
+            with open("/etc/zivpn/config.json", "w", encoding="utf-8") as f:
+                json.dump(zcfg, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 banner_html = str(data.get("banner_html") or "")
 banner_txt = str(data.get("banner_txt") or "")
 try:
-    import os
     os.makedirs("/etc/sc-1forcr", exist_ok=True)
     if banner_html:
         with open("/etc/sc-1forcr/banner.html", "w", encoding="utf-8") as f:
@@ -7728,8 +7876,6 @@ backup_restore_menu() {
 
 change_domain_menu() {
   local new_domain email app_env pem cert_domain
-  local vmess_primary vless_primary trojan_primary
-  local vmess_locations vless_locations trojan_locations
   prompt_input new_domain "Masukkan domain baru: " || return
   if [[ -z "${new_domain}" ]]; then
     echo "Domain tidak boleh kosong."
@@ -7745,12 +7891,6 @@ change_domain_menu() {
 
   DOMAIN="${new_domain}"
   EMAIL="${email}"
-  vmess_primary="$(echo "${XRAY_PATHS_VMESS}" | cut -d',' -f1)"
-  vless_primary="$(echo "${XRAY_PATHS_VLESS}" | cut -d',' -f1)"
-  trojan_primary="$(echo "${XRAY_PATHS_TROJAN}" | cut -d',' -f1)"
-  vmess_locations="$(build_nginx_ws_locations "${XRAY_PATHS_VMESS}" "10001" "${vmess_primary}")"
-  vless_locations="$(build_nginx_ws_locations "${XRAY_PATHS_VLESS}" "10002" "${vless_primary}")"
-  trojan_locations="$(build_nginx_ws_locations "${XRAY_PATHS_TROJAN}" "10003" "${trojan_primary}")"
 
   mkdir -p /var/www/html
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
@@ -7776,7 +7916,68 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
-${vmess_locations}${vless_locations}${trojan_locations}
+    location /vmess {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /yourbug {
+        access_log off;
+        proxy_redirect off;
+        rewrite ^ /vmess break;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /yourbug/vless {
+        access_log off;
+        proxy_redirect off;
+        rewrite ^ /vless break;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /yourbug/trojan {
+        access_log off;
+        proxy_redirect off;
+        rewrite ^ /trojan break;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
 
     location / {
         access_log off;

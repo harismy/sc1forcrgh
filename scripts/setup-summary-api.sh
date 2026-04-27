@@ -74,6 +74,7 @@ const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/loca
 const RESTORE_TMP_DIR = String(process.env.RESTORE_TMP_DIR || '/tmp').trim();
 const BANNER_HTML_FILE = String(process.env.BANNER_HTML_FILE || '/etc/sc-1forcr/banner.html').trim();
 const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/banner.txt').trim();
+const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -419,6 +420,150 @@ function getAccountTableByType(rawType) {
   if (type === 'vless') return 'account_vlesses';
   if (type === 'trojan') return 'account_trojans';
   return '';
+}
+
+function getXrayProtocolByType(rawType) {
+  const type = String(rawType || '').trim().toLowerCase();
+  if (type === 'vmess' || type === 'vless' || type === 'trojan') return type;
+  return '';
+}
+
+function getXrayCredentialFromRow(type, row) {
+  const r = row && typeof row === 'object' ? row : {};
+  const fromUuid = String(r.uuid || '').trim();
+  const fromId = String(r.id || '').trim();
+  const fromPassword = String(r.password || '').trim();
+  if (type === 'vmess' || type === 'vless') {
+    return fromUuid || fromId || '';
+  }
+  if (type === 'trojan') {
+    return fromPassword || fromUuid || '';
+  }
+  return '';
+}
+
+function normalizeXrayClientsForType(type, rows, templateClient) {
+  const list = Array.isArray(rows) ? rows : [];
+  const tpl = (templateClient && typeof templateClient === 'object') ? { ...templateClient } : {};
+  const out = [];
+  for (const row of list) {
+    const username = String(row?.username || '').trim();
+    if (!username) continue;
+    const cred = getXrayCredentialFromRow(type, row);
+    if (!cred) continue;
+    const c = { ...tpl };
+    if (type === 'vmess' || type === 'vless') {
+      c.id = cred;
+      c.email = username;
+      if (type === 'vmess' && c.alterId === undefined) c.alterId = 0;
+      delete c.password;
+    } else if (type === 'trojan') {
+      c.password = cred;
+      c.email = username;
+      delete c.id;
+      delete c.alterId;
+    }
+    out.push(c);
+  }
+  return out;
+}
+
+function restartXrayService() {
+  try {
+    execFileSync('systemctl', ['restart', 'xray'], { stdio: 'ignore' });
+    return { ok: true, method: 'systemctl' };
+  } catch (_) {
+    try {
+      execFileSync('service', ['xray', 'restart'], { stdio: 'ignore' });
+      return { ok: true, method: 'service' };
+    } catch (err) {
+      return { ok: false, message: err?.message || 'restart xray gagal' };
+    }
+  }
+}
+
+function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
+  return new Promise((resolve) => {
+    const type = getXrayProtocolByType(typeInput);
+    if (!type) {
+      return resolve({ ok: false, statusCode: 400, message: 'type harus vmess/vless/trojan' });
+    }
+    const table = getAccountTableByType(type);
+    if (!table) {
+      return resolve({ ok: false, statusCode: 400, message: 'table type tidak valid' });
+    }
+    if (!fs.existsSync(XRAY_CONFIG_FILE)) {
+      return resolve({ ok: false, statusCode: 500, message: `config xray tidak ditemukan: ${XRAY_CONFIG_FILE}` });
+    }
+
+    const cfgDb = new sqlite3.Database(DB);
+    cfgDb.all(
+      `SELECT * FROM ${table} WHERE UPPER(TRIM(COALESCE(status, '')))='AKTIF' ORDER BY rowid DESC`,
+      [],
+      (dbErr, rows) => {
+        cfgDb.close();
+        if (dbErr) {
+          return resolve({ ok: false, statusCode: 500, message: dbErr.message });
+        }
+
+        let parsed;
+        try {
+          const raw = fs.readFileSync(XRAY_CONFIG_FILE, 'utf8');
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          return resolve({ ok: false, statusCode: 500, message: `gagal baca config xray: ${err.message}` });
+        }
+
+        const inbounds = Array.isArray(parsed?.inbounds) ? parsed.inbounds : [];
+        const targetInbounds = inbounds.filter((ib) => String(ib?.protocol || '').trim().toLowerCase() === type);
+        if (!targetInbounds.length) {
+          return resolve({ ok: false, statusCode: 400, message: `inbound ${type} tidak ditemukan di config xray` });
+        }
+
+        const firstTemplate = Array.isArray(targetInbounds[0]?.settings?.clients) && targetInbounds[0].settings.clients[0]
+          ? targetInbounds[0].settings.clients[0]
+          : {};
+        const normalizedClients = normalizeXrayClientsForType(type, rows || [], firstTemplate);
+
+        for (const ib of targetInbounds) {
+          if (!ib.settings || typeof ib.settings !== 'object') ib.settings = {};
+          ib.settings.clients = normalizedClients.map((c) => ({ ...c }));
+        }
+
+        try {
+          const tmp = `${XRAY_CONFIG_FILE}.tmp-${Date.now()}`;
+          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2), 'utf8');
+          fs.renameSync(tmp, XRAY_CONFIG_FILE);
+        } catch (writeErr) {
+          return resolve({ ok: false, statusCode: 500, message: `gagal tulis config xray: ${writeErr.message}` });
+        }
+
+        const shouldRestart = !!restartAfter;
+        let restart = null;
+        if (shouldRestart) {
+          restart = restartXrayService();
+          if (!restart.ok) {
+            return resolve({
+              ok: false,
+              statusCode: 500,
+              message: restart.message || 'restart xray gagal',
+              type,
+              synced_clients: normalizedClients.length
+            });
+          }
+        }
+        return resolve({
+          ok: true,
+          type,
+          table,
+          synced_clients: normalizedClients.length,
+          restart_applied: shouldRestart,
+          xray_restart: restart,
+          xray_needs_restart: !shouldRestart
+        });
+      }
+    );
+  });
 }
 
 function detectZivpnUsersContainer(root) {
@@ -878,16 +1023,37 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
               linux_user_sync: linuxUserSync
             });
           }
-          return res.json({
-            ok: true,
-            type,
-            table,
-            imported,
-            skipped,
-            usernames: importedUsernames,
-            linux_user_sync: linuxUserSync || null,
-            zivpn_service_reload: zivpnServiceReload
-          });
+          const finalizeOk = (xraySyncResult = null) => {
+            return res.json({
+              ok: true,
+              type,
+              table,
+              imported,
+              skipped,
+              usernames: importedUsernames,
+              linux_user_sync: linuxUserSync || null,
+              zivpn_service_reload: zivpnServiceReload,
+              xray_sync: xraySyncResult
+            });
+          };
+          if (getXrayProtocolByType(type)) {
+            return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
+              if (!syncRes.ok) {
+                return res.status(Number(syncRes.statusCode || 500)).json({
+                  ok: false,
+                  message: syncRes.message || 'sync xray gagal',
+                  type,
+                  table,
+                  imported,
+                  skipped,
+                  usernames: importedUsernames,
+                  xray_sync: syncRes
+                });
+              }
+              return finalizeOk(syncRes);
+            });
+          }
+          return finalizeOk(null);
         });
       });
     };
@@ -983,14 +1149,33 @@ function sendDeleteAccounts(db, res, rawType, usernamesInput) {
             linux_user_delete: linuxUserDelete
           });
         }
-        return res.json({
-          ok: true,
-          type,
-          table,
-          deleted,
-          linux_user_delete: linuxUserDelete || null,
-          zivpn_service_reload: zivpnServiceReload
-        });
+        const finalizeOk = (xraySyncResult = null) => {
+          return res.json({
+            ok: true,
+            type,
+            table,
+            deleted,
+            linux_user_delete: linuxUserDelete || null,
+            zivpn_service_reload: zivpnServiceReload,
+            xray_sync: xraySyncResult
+          });
+        };
+        if (getXrayProtocolByType(type)) {
+          return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
+            if (!syncRes.ok) {
+              return res.status(Number(syncRes.statusCode || 500)).json({
+                ok: false,
+                message: syncRes.message || 'sync xray gagal',
+                type,
+                table,
+                deleted,
+                xray_sync: syncRes
+              });
+            }
+            return finalizeOk(syncRes);
+          });
+        }
+        return finalizeOk(null);
       });
     });
   };
@@ -1487,6 +1672,36 @@ app.post('/internal/renew-xray-account', (req, res) => {
   });
 });
 
+app.post('/internal/sync-xray-from-db', (req, res) => {
+  const type = String(req.body?.type || '').trim().toLowerCase();
+  const restartRaw = req.body?.restart;
+  const restart = restartRaw === true || /^(1|true|yes|on)$/i.test(String(restartRaw || '').trim());
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    syncXrayConfigFromDbByType(type, restart)
+      .then((result) => {
+        if (!result.ok) {
+          return res.status(Number(result.statusCode || 500)).json(result);
+        }
+        return res.json(result);
+      })
+      .catch((err) => {
+        return res.status(500).json({ ok: false, message: err?.message || 'sync xray gagal' });
+      });
+  });
+});
+
+app.post('/internal/apply-xray-restart', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const restart = restartXrayService();
+    if (!restart.ok) {
+      return res.status(500).json({ ok: false, message: restart.message || 'restart xray gagal' });
+    }
+    return res.json({ ok: true, xray_restart: restart });
+  });
+});
+
 app.post('/internal/zivpn-service', (req, res) => {
   const action = String(req.body?.action || '').trim();
   return authorizeAndRun(req, res, (db) => {
@@ -1513,6 +1728,7 @@ ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=
 BANNER_HTML_FILE=/etc/sc-1forcr/banner.html
 BANNER_TXT_FILE=/etc/sc-1forcr/banner.txt
+XRAY_CONFIG_FILE=/usr/local/etc/xray/config.json
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
@@ -1595,6 +1811,12 @@ print_result() {
   echo
   echo "ZIVPN service control check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"action\":\"status\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/zivpn-service\" && echo"
+  echo
+  echo "Sync Xray from DB check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"type\":\"vmess\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sync-xray-from-db\" && echo"
+  echo
+  echo "Apply Xray restart check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/apply-xray-restart\" && echo"
   echo
   echo "Full restore from Telegram URL check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" \\"

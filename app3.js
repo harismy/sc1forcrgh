@@ -614,6 +614,15 @@ function deleteProtocolKeyboard(prefix, cancelAction) {
   return Markup.inlineKeyboard(rows);
 }
 
+function migrateProtocolKeyboard(prefix, cancelAction) {
+  const rows = [
+    [Markup.button.callback('SEMUA PROTOKOL (SSH+VMESS+VLESS+TROJAN)', `${prefix}_all`)],
+    ...ACCOUNT_PROTOCOLS.map((p) => [Markup.button.callback(p.label, `${prefix}_${p.type}`)]),
+    [Markup.button.callback('Batal', cancelAction)]
+  ];
+  return Markup.inlineKeyboard(rows);
+}
+
 function registerScMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Registrasi Baru', 'm_register_sc_new')],
@@ -781,12 +790,21 @@ async function rebuildXrayFromType(host, key, type, sampleUser) {
   if (!['vmess', 'vless', 'trojan'].includes(t)) {
     return { ok: false, skipped: true, message: 'protocol non-xray' };
   }
-  await apiPost(host, key, '/internal/renew-xray-account', {
-    type: t,
-    username: u,
-    days: 0
-  });
-  return { ok: true };
+  try {
+    await apiPost(host, key, '/internal/sync-xray-from-db', { type: t, restart: false });
+    return { ok: true, mode: 'sync-xray-from-db' };
+  } catch (syncErr) {
+    await apiPost(host, key, '/internal/renew-xray-account', {
+      type: t,
+      username: u,
+      days: 0
+    });
+    return { ok: true, mode: 'renew-fallback' };
+  }
+}
+
+async function applyXrayRestart(host, key) {
+  return apiPost(host, key, '/internal/apply-xray-restart', {});
 }
 
 async function tryRebuildXrayAny(host, key, preferredType = '') {
@@ -1462,8 +1480,8 @@ bot.action('m_delall_confirm_yes', async (ctx) => {
     await ctx.reply('Menghapus akun, tunggu...');
     const type = String(state.protocol || '').toLowerCase();
     let summaryText = '';
-    const xrayNeedsReload = type === 'all' || type === 'vmess' || type === 'vless' || type === 'trojan';
     let xrayReloadLine = '';
+    let needXrayRestart = false;
     if (type === 'all') {
       const allStats = await deleteAllProtocols(state.host, state.key);
       const lines = ['Rincian hasil:'];
@@ -1478,16 +1496,33 @@ bot.action('m_delall_confirm_yes', async (ctx) => {
         `Rincian hasil:\n` +
         `- ${protocolLabel(type)}: data ${stats.exported}, terhapus ${stats.deleted}`;
     }
-    if (xrayNeedsReload) {
-      try {
-        const rr = await tryRebuildXrayAny(state.host, state.key, type === 'all' ? '' : type);
-        if (rr.ok) {
-          xrayReloadLine = `\nXRAY reload: OK (${rr.type.toUpperCase()} / ${rr.username})`;
-        } else {
-          xrayReloadLine = `\nXRAY reload: skip (${rr.message})`;
+    if (type === 'all') {
+      const syncLines = [];
+      for (const t of ['vmess', 'vless', 'trojan']) {
+        try {
+          const r = await apiPost(state.host, state.key, '/internal/sync-xray-from-db', { type: t, restart: false });
+          needXrayRestart = true;
+          syncLines.push(`- ${t.toUpperCase()}: OK (${Number(r?.synced_clients || 0)} client)`);
+        } catch (syncErr) {
+          syncLines.push(`- ${t.toUpperCase()}: gagal (${parseErr(syncErr)})`);
         }
-      } catch (reloadErr) {
-        xrayReloadLine = `\nXRAY reload: gagal (${parseErr(reloadErr)})`;
+      }
+      xrayReloadLine = `\nXRAY sync:\n${syncLines.join('\n')}`;
+    } else if (['vmess', 'vless', 'trojan'].includes(type)) {
+      try {
+        const r = await apiPost(state.host, state.key, '/internal/sync-xray-from-db', { type, restart: false });
+        needXrayRestart = true;
+        xrayReloadLine = `\nXRAY sync: OK (${type.toUpperCase()} ${Number(r?.synced_clients || 0)} client)`;
+      } catch (syncErr) {
+        xrayReloadLine = `\nXRAY sync: gagal (${parseErr(syncErr)})`;
+      }
+    }
+    if (needXrayRestart) {
+      try {
+        await applyXrayRestart(state.host, state.key);
+        xrayReloadLine += '\nXRAY restart: OK (single-restart batch)';
+      } catch (restartErr) {
+        xrayReloadLine += `\nXRAY restart: gagal (${parseErr(restartErr)})`;
       }
     }
     await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip = ? AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.host]).catch(() => {});
@@ -1519,7 +1554,7 @@ bot.action('m_migrate_accounts', async (ctx) => {
   );
 });
 
-bot.action(/m_migrate_proto_(ssh|vmess|vless|trojan)/, async (ctx) => {
+bot.action(/m_migrate_proto_(all|ssh|vmess|vless|trojan)/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const state = userState.get(ctx.chat.id);
   if (!state || state.step !== 'migrate_choose_protocol') {
@@ -1533,7 +1568,7 @@ bot.action(/m_migrate_proto_(ssh|vmess|vless|trojan)/, async (ctx) => {
     uiBox('KONFIRMASI MIGRASI AKUN', [
       `Sumber    : ${state.srcHost}`,
       `Tujuan    : ${state.dstHost}`,
-      `Protokol  : ${protocolLabel(protocol)}`,
+      `Protokol  : ${protocol === 'all' ? 'SEMUA PROTOKOL' : protocolLabel(protocol)}`,
       '',
       'Lanjutkan migrasi akun?'
     ]),
@@ -1560,42 +1595,70 @@ bot.action('m_migrate_confirm_yes', async (ctx) => {
   try {
     await ctx.reply('Migrasi akun berjalan, tunggu...');
     const type = String(state.protocol || '').toLowerCase();
-    const exported = await apiGet(state.srcHost, state.srcKey, '/internal/export-accounts', { type, limit: 50000 });
-    const srcAccounts = Array.isArray(exported?.accounts) ? exported.accounts : [];
-    const accounts = srcAccounts
-      .map((row) => ({ ...(row || {}), status: 'AKTIF' }))
-      .filter((row) => String(row?.username || '').trim().length > 0);
+    const migrateTypes = type === 'all' ? ['ssh', 'vmess', 'vless', 'trojan'] : [type];
+    const lines = [
+      'Migrasi selesai.',
+      `Sumber: ${state.srcHost}`,
+      `Tujuan: ${state.dstHost}`,
+      `Protokol: ${type === 'all' ? 'SEMUA PROTOKOL' : protocolLabel(type)}`
+    ];
 
-    if (accounts.length === 0) {
+    let totalFound = 0;
+    let totalImported = 0;
+    let totalSkipped = 0;
+    let migratedAny = false;
+    let xrayTouched = false;
+
+    for (const t of migrateTypes) {
+      const exported = await apiGet(state.srcHost, state.srcKey, '/internal/export-accounts', { type: t, limit: 50000 });
+      const srcAccounts = Array.isArray(exported?.accounts) ? exported.accounts : [];
+      const accounts = srcAccounts
+        .map((row) => ({ ...(row || {}), status: 'AKTIF' }))
+        .filter((row) => String(row?.username || '').trim().length > 0);
+
+      if (accounts.length === 0) {
+        lines.push(`- ${protocolLabel(t)}: sumber 0 (skip)`);
+        continue;
+      }
+
+      migratedAny = true;
+      totalFound += accounts.length;
+      const imported = await apiPost(state.dstHost, state.dstKey, '/internal/import-accounts', { type: t, accounts });
+      const importedN = Number(imported?.imported || 0);
+      const skippedN = Number(imported?.skipped || 0);
+      totalImported += importedN;
+      totalSkipped += skippedN;
+      lines.push(`- ${protocolLabel(t)}: sumber ${accounts.length}, imported ${importedN}, skipped ${skippedN}`);
+
+      if (['vmess', 'vless', 'trojan'].includes(t)) {
+        const sampleUser = String(accounts[0]?.username || '').trim();
+        try {
+          await rebuildXrayFromType(state.dstHost, state.dstKey, t, sampleUser);
+          xrayTouched = true;
+          lines.push(`  XRAY sync ${t.toUpperCase()}: OK`);
+        } catch (reloadErr) {
+          lines.push(`  XRAY sync ${t.toUpperCase()}: gagal (${parseRenewErr(reloadErr)})`);
+        }
+      }
+    }
+
+    if (!migratedAny) {
       userState.delete(ctx.chat.id);
       return ctx.reply(
-        `Migrasi selesai.\n` +
-          `Sumber: ${state.srcHost}\n` +
-          `Tujuan: ${state.dstHost}\n` +
-          `Protokol: ${protocolLabel(type)}\n` +
-          'Tidak ada akun yang bisa dipindahkan.',
+        `${lines.join('\n')}\nTidak ada akun yang bisa dipindahkan.`,
         mainMenu()
       );
     }
 
-    const imported = await apiPost(state.dstHost, state.dstKey, '/internal/import-accounts', { type, accounts });
-    const lines = [
-      `Migrasi selesai.`,
-      `Sumber: ${state.srcHost}`,
-      `Tujuan: ${state.dstHost}`,
-      `Protokol: ${protocolLabel(type)}`,
-      `Total sumber: ${accounts.length}`,
-      `Imported: ${Number(imported?.imported || 0)}`,
-      `Skipped: ${Number(imported?.skipped || 0)}`
-    ];
-
-    if (['vmess', 'vless', 'trojan'].includes(type)) {
-      const sampleUser = String(accounts[0]?.username || '').trim();
+    lines.push(`Total sumber: ${totalFound}`);
+    lines.push(`Total imported: ${totalImported}`);
+    lines.push(`Total skipped: ${totalSkipped}`);
+    if (xrayTouched) {
       try {
-        await rebuildXrayFromType(state.dstHost, state.dstKey, type, sampleUser);
-        lines.push(`XRAY reload: OK (${type.toUpperCase()})`);
-      } catch (reloadErr) {
-        lines.push(`XRAY reload: gagal (${parseRenewErr(reloadErr)})`);
+        await applyXrayRestart(state.dstHost, state.dstKey);
+        lines.push('XRAY restart: OK (single-restart batch)');
+      } catch (restartErr) {
+        lines.push(`XRAY restart: gagal (${parseErr(restartErr)})`);
       }
     }
 
@@ -2153,7 +2216,7 @@ bot.on('text', async (ctx) => {
           `Tujuan : ${state.dstHost}`,
           'Pilih protokol yang ingin dimigrasikan.'
         ]),
-        protocolKeyboard('m_migrate_proto', 'm_migrate_confirm_no')
+        migrateProtocolKeyboard('m_migrate_proto', 'm_migrate_confirm_no')
       );
     }
 
@@ -2360,29 +2423,26 @@ bot.on('document', async (ctx) => {
       resultLines.push(`${type.toUpperCase()}: imported ${Number(imported.imported || 0)}, skipped ${Number(imported.skipped || 0)}`);
     }
 
-    // Paksa render ulang config Xray dari data restore agar akun VMESS/VLESS/TROJAN langsung aktif.
-    const xrayRebuildPlans = [
-      { type: 'vmess', renewBase: '/vps/renewvmess' },
-      { type: 'vless', renewBase: '/vps/renewvless' },
-      { type: 'trojan', renewBase: '/vps/renewtrojan' }
-    ];
-    let xrayReloadDone = false;
-    for (const plan of xrayRebuildPlans) {
-      const list = restoredAccountsByType[plan.type] || [];
-      if (list.length === 0) continue;
-      const sampleUser = String(list[0]?.username || '').trim();
-      if (!sampleUser) continue;
+    // Paksa sinkronisasi DB -> config Xray untuk setiap protocol Xray.
+    let xrayTouched = false;
+    for (const t of ['vmess', 'vless', 'trojan']) {
+      const list = restoredAccountsByType[t] || [];
+      if (!list.length) continue;
       try {
-        await apiPost(state.host, state.key, `${plan.renewBase}/${encodeURIComponent(sampleUser)}/0`, {});
-        resultLines.push(`XRAY reload: OK (${plan.type.toUpperCase()})`);
-        xrayReloadDone = true;
-        break;
-      } catch (reloadErr) {
-        resultLines.push(`XRAY reload ${plan.type.toUpperCase()}: gagal (${parseErr(reloadErr)})`);
+        const r = await apiPost(state.host, state.key, '/internal/sync-xray-from-db', { type: t, restart: false });
+        xrayTouched = true;
+        resultLines.push(`XRAY sync ${t.toUpperCase()}: OK (${Number(r?.synced_clients || 0)} client)`);
+      } catch (syncErr) {
+        resultLines.push(`XRAY sync ${t.toUpperCase()}: gagal (${parseErr(syncErr)})`);
       }
     }
-    if (!xrayReloadDone) {
-      resultLines.push('XRAY reload: skip (tidak ada akun VMESS/VLESS/TROJAN)');
+    if (xrayTouched) {
+      try {
+        await applyXrayRestart(state.host, state.key);
+        resultLines.push('XRAY restart: OK (single-restart batch)');
+      } catch (restartErr) {
+        resultLines.push(`XRAY restart: gagal (${parseErr(restartErr)})`);
+      }
     }
 
     resultLines.push('ZIVPN auth: mengikuti akun SSH (mode unified)');

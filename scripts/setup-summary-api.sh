@@ -75,6 +75,9 @@ const RESTORE_TMP_DIR = String(process.env.RESTORE_TMP_DIR || '/tmp').trim();
 const BANNER_HTML_FILE = String(process.env.BANNER_HTML_FILE || '/etc/sc-1forcr/banner.html').trim();
 const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/banner.txt').trim();
 const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
+const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
+const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
+const UPDATE_INFO_FILE = String(process.env.UPDATE_INFO_FILE || '/etc/sc-1forcr/update-info.env').trim();
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -1403,12 +1406,219 @@ function runFullBackupRestoreFromUrl(fileUrl, fileNameInput) {
   }
 }
 
+function setScMenuExecutable(enabled) {
+  const mode = enabled ? '755' : '644';
+  const targets = ['/usr/local/sbin/menu', '/usr/local/sbin/menu-sc-1forcr'];
+  const changed = [];
+  for (const p of targets) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      execFileSync('chmod', [mode, p], { stdio: 'ignore' });
+      changed.push(p);
+    } catch (_) {}
+  }
+  return changed;
+}
+
+function applyScAccessLock(blockedInput, reasonInput, actorInput) {
+  const blocked = blockedInput === true || /^(1|true|yes|on)$/i.test(String(blockedInput || '').trim());
+  const reason = String(reasonInput || 'locked_by_admin').trim() || 'locked_by_admin';
+  const actor = String(actorInput || '').trim() || '-';
+
+  if (blocked) {
+    const payload = [
+      `blocked=1`,
+      `reason=${reason}`,
+      `actor=${actor}`,
+      `at=${new Date().toISOString()}`
+    ].join('\n') + '\n';
+    try {
+      fs.writeFileSync(SC_ACCESS_LOCK_FILE, payload, 'utf8');
+      try { fs.chmodSync(SC_ACCESS_LOCK_FILE, 0o600); } catch (_) {}
+      const changedMenus = setScMenuExecutable(false);
+      return { ok: true, blocked: true, lock_file: SC_ACCESS_LOCK_FILE, changed_menus: changedMenus };
+    } catch (err) {
+      return { ok: false, statusCode: 500, message: `gagal tulis lock file: ${err.message}` };
+    }
+  }
+
+  try {
+    if (fs.existsSync(SC_ACCESS_LOCK_FILE)) fs.unlinkSync(SC_ACCESS_LOCK_FILE);
+    const changedMenus = setScMenuExecutable(true);
+    return { ok: true, blocked: false, lock_file: SC_ACCESS_LOCK_FILE, changed_menus: changedMenus };
+  } catch (err) {
+    return { ok: false, statusCode: 500, message: `gagal hapus lock file: ${err.message}` };
+  }
+}
+
+function runCommand(command, timeoutMs = 20 * 60 * 1000) {
+  try {
+    const out = execFileSync('bash', ['-lc', String(command || '')], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: Number(timeoutMs) || (20 * 60 * 1000)
+    });
+    return { ok: true, output: String(out || '').trim() };
+  } catch (err) {
+    return {
+      ok: false,
+      message: err?.message || 'command gagal',
+      stderr: String(err?.stderr || '').trim(),
+      stdout: String(err?.stdout || '').trim()
+    };
+  }
+}
+
+function triggerScAutoUpdate() {
+  const cmd = [
+    'set -euo pipefail',
+    '[ -f /etc/sc-1forcr.env ] && source /etc/sc-1forcr.env || true',
+    'URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"',
+    'TMP="$(mktemp /tmp/sc-1forcr-update-XXXXXX.sh)"',
+    'curl -fsSL "$URL" -o "$TMP"',
+    "sed -i 's/\\r$//' \"$TMP\"",
+    'chmod +x "$TMP"',
+    'bash "$TMP"',
+    'rm -f "$TMP"'
+  ].join('\n');
+  const run = runCommand(cmd, 35 * 60 * 1000);
+  if (!run.ok) {
+    return {
+      ok: false,
+      statusCode: 500,
+      message: run.message || 'trigger update SC gagal',
+      stderr: run.stderr || null,
+      stdout: run.stdout || null
+    };
+  }
+  return { ok: true, component: 'sc', output: run.output || '' };
+}
+
+function restartCoreApiServices() {
+  const cmd = [
+    'set -e',
+    'systemctl restart sc-1forcr-api',
+    'systemctl restart sc-1forcr-sshws || true'
+  ].join('\n');
+  const run = runCommand(cmd, 2 * 60 * 1000);
+  if (!run.ok) {
+    return {
+      ok: false,
+      statusCode: 500,
+      message: run.message || 'restart API gagal',
+      stderr: run.stderr || null,
+      stdout: run.stdout || null
+    };
+  }
+  return { ok: true, component: 'api', output: run.output || '' };
+}
+
+function sanitizeUpdateLine(input, maxLen = 512) {
+  return String(input || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n+/g, ' | ')
+    .replace(/[^\x20-\x7E]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, Math.max(1, Number(maxLen) || 512));
+}
+
+function writeReleaseInfoFile(componentInput, versionInput, descriptionInput, actorInput) {
+  const component = sanitizeUpdateLine(componentInput || '', 16).toLowerCase() || 'both';
+  const version = sanitizeUpdateLine(versionInput || '', 64);
+  const description = sanitizeUpdateLine(descriptionInput || '', 1200);
+  const actor = sanitizeUpdateLine(actorInput || '', 64);
+  const now = new Date();
+  const iso = now.toISOString();
+  const local = now.toLocaleString('id-ID', { hour12: false, timeZone: 'Asia/Jakarta' });
+
+  try {
+    const dir = require('path').dirname(UPDATE_INFO_FILE);
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (_) {}
+
+  const payload = [
+    `UPDATE_COMPONENT=${component || '-'}`,
+    `UPDATE_VERSION=${version || '-'}`,
+    `UPDATE_DESC=${description || '-'}`,
+    `UPDATE_ACTOR=${actor || '-'}`,
+    `UPDATE_AT_ISO=${iso}`,
+    `UPDATE_AT_LOCAL=${sanitizeUpdateLine(local, 80) || '-'}`,
+    ''
+  ].join('\n');
+
+  try {
+    fs.writeFileSync(UPDATE_INFO_FILE, payload, 'utf8');
+    try { fs.chmodSync(UPDATE_INFO_FILE, 0o644); } catch (_) {}
+    return {
+      ok: true,
+      path: UPDATE_INFO_FILE,
+      component: component || '-',
+      version: version || '-',
+      description: description || '-',
+      actor: actor || '-',
+      at_iso: iso,
+      at_local: local
+    };
+  } catch (err) {
+    return { ok: false, statusCode: 500, message: `gagal tulis update info: ${err.message}` };
+  }
+}
+
 function parseEnvLine(rawContent, key) {
   const content = String(rawContent || '');
   const re = new RegExp(`^${String(key).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=(.*)$`, 'm');
   const m = content.match(re);
   if (!m) return '';
   return String(m[1] || '').trim().replace(/^["']|["']$/g, '');
+}
+
+function readScTelegramConfig() {
+  let token = String(process.env.SC_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  let chatId = String(process.env.SC_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID || '').trim();
+  try {
+    if (fs.existsSync(SC_RUNTIME_ENV_FILE)) {
+      const raw = fs.readFileSync(SC_RUNTIME_ENV_FILE, 'utf8');
+      if (!token) token = parseEnvLine(raw, 'TELEGRAM_BOT_TOKEN');
+      if (!chatId) chatId = parseEnvLine(raw, 'TELEGRAM_CHAT_ID');
+    }
+  } catch (_) {}
+  return { token, chatId };
+}
+
+async function sendScTelegramMessage(textInput) {
+  const text = String(textInput || '').trim();
+  if (!text) return { ok: false, statusCode: 400, message: 'message kosong' };
+  const cfg = readScTelegramConfig();
+  if (!cfg.token || !cfg.chatId) {
+    return { ok: false, statusCode: 400, message: 'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum diset di VPS' };
+  }
+  const url = `https://api.telegram.org/bot${cfg.token}/sendMessage`;
+  try {
+    const body = new URLSearchParams();
+    body.append('chat_id', cfg.chatId);
+    body.append('text', text);
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    });
+    const raw = await resp.text();
+    let parsed = null;
+    try { parsed = raw ? JSON.parse(raw) : null; } catch (_) {}
+    if (!resp.ok || !parsed?.ok) {
+      return {
+        ok: false,
+        statusCode: Number(resp.status || 500),
+        message: 'telegram sendMessage gagal',
+        telegram_response: parsed || raw || null
+      };
+    }
+    return { ok: true, chat_id: cfg.chatId };
+  } catch (err) {
+    return { ok: false, statusCode: 500, message: err?.message || 'request telegram gagal' };
+  }
 }
 
 function readCoreApiRuntimeConfig() {
@@ -1702,6 +1912,95 @@ app.post('/internal/apply-xray-restart', (req, res) => {
   });
 });
 
+app.post('/internal/sc-access-lock', (req, res) => {
+  const blocked = req.body?.blocked;
+  const reason = String(req.body?.reason || '').trim();
+  const actor = String(req.body?.actor || '').trim();
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = applyScAccessLock(blocked, reason, actor);
+    if (!result.ok) {
+      return res.status(Number(result.statusCode || 500)).json(result);
+    }
+    return res.json(result);
+  });
+});
+
+app.post('/internal/sc-expired-notify', (req, res) => {
+  const ip = String(req.body?.ip || '').trim() || '-';
+  const reason = String(req.body?.reason || 'expired').trim();
+  const actor = String(req.body?.actor || '-').trim();
+  const users = Array.isArray(req.body?.users) ? req.body.users : [];
+  const usersText = users
+    .map((u) => String(u || '').trim())
+    .filter(Boolean)
+    .slice(0, 50)
+    .join(', ');
+  const customMessage = String(req.body?.message || '').trim();
+  const message = customMessage || [
+    'SC 1FORCR NOTIF',
+    `Status : SC expired`,
+    `IP VPS : ${ip}`,
+    `Reason : ${reason}`,
+    `Actor  : ${actor}`,
+    `Users  : ${usersText || '-'}`,
+    '',
+    'Silakan perpanjang SC jika ingin akses kembali.'
+  ].join('\n');
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    sendScTelegramMessage(message)
+      .then((result) => {
+        if (!result.ok) {
+          return res.status(Number(result.statusCode || 500)).json(result);
+        }
+        return res.json({ ok: true, sent: true, chat_id: result.chat_id });
+      })
+      .catch((err) => {
+        return res.status(500).json({ ok: false, message: err?.message || 'notif telegram gagal' });
+      });
+  });
+});
+
+app.post('/internal/trigger-update', (req, res) => {
+  const component = String(req.body?.component || 'both').trim().toLowerCase();
+  const releaseVersion = String(req.body?.release_version || '').trim();
+  const releaseDescription = String(req.body?.release_description || '').trim();
+  const releaseActor = String(req.body?.release_actor || '').trim();
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    if (!['sc', 'api', 'both'].includes(component)) {
+      return res.status(400).json({ ok: false, message: 'component harus sc/api/both' });
+    }
+
+    const result = { ok: true, component, steps: [] };
+    if (component === 'sc' || component === 'both') {
+      const scRes = triggerScAutoUpdate();
+      result.steps.push({ step: 'sc_update', ...scRes });
+      if (!scRes.ok) {
+        return res.status(Number(scRes.statusCode || 500)).json({ ok: false, message: scRes.message, result });
+      }
+    }
+    if (component === 'api' || component === 'both') {
+      const apiRes = restartCoreApiServices();
+      result.steps.push({ step: 'api_restart', ...apiRes });
+      if (!apiRes.ok) {
+        return res.status(Number(apiRes.statusCode || 500)).json({ ok: false, message: apiRes.message, result });
+      }
+    }
+    const releaseInfo = writeReleaseInfoFile(component, releaseVersion, releaseDescription, releaseActor);
+    if (!releaseInfo.ok) {
+      return res.status(Number(releaseInfo.statusCode || 500)).json({
+        ok: false,
+        message: releaseInfo.message || 'gagal tulis info update',
+        result
+      });
+    }
+    result.release_info = releaseInfo;
+    return res.json(result);
+  });
+});
+
 app.post('/internal/zivpn-service', (req, res) => {
   const action = String(req.body?.action || '').trim();
   return authorizeAndRun(req, res, (db) => {
@@ -1729,6 +2028,9 @@ ZIVPN_SERVICE=
 BANNER_HTML_FILE=/etc/sc-1forcr/banner.html
 BANNER_TXT_FILE=/etc/sc-1forcr/banner.txt
 XRAY_CONFIG_FILE=/usr/local/etc/xray/config.json
+SC_ACCESS_LOCK_FILE=/etc/sc-1forcr-access.lock
+SC_RUNTIME_ENV_FILE=/etc/sc-1forcr.env
+UPDATE_INFO_FILE=/etc/sc-1forcr/update-info.env
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
@@ -1817,6 +2119,15 @@ print_result() {
   echo
   echo "Apply Xray restart check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/apply-xray-restart\" && echo"
+  echo
+  echo "SC access lock check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"blocked\":true,\"reason\":\"admin_remove_sc_ip\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sc-access-lock\" && echo"
+  echo
+  echo "SC expired notify check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"ip\":\"1.2.3.4\",\"reason\":\"admin_remove_sc_ip\",\"actor\":\"123\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sc-expired-notify\" && echo"
+  echo
+  echo "Trigger update check:"
+  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"component\":\"both\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/trigger-update\" && echo"
   echo
   echo "Full restore from Telegram URL check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" \\"

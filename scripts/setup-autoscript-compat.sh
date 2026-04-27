@@ -6719,10 +6719,11 @@ IP Limit     : ${lim}
 EOT_SSH
       ;;
     zivpn)
-      local host user exp
+      local host user exp lim
       host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
       user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
       exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
+      lim="$(echo "${raw}" | jq -r '.data.limitip // "0"' )"
       cat <<EOT_ZIVPN
 =============================
  ZIVPN SSH ACCOUNT
@@ -6730,6 +6731,7 @@ EOT_SSH
 udp password : ${user}
 Hostname     : ${host}
 Expired      : ${exp}
+IP Limit     : ${lim}
 EOT_ZIVPN
       ;;
     vmess|vless|trojan)
@@ -6776,9 +6778,8 @@ create_account() {
     prompt_input exp "Expired (hari) [30]: " || continue
     exp="${exp:-30}"
     if [[ "$type" == "zivpn" ]]; then
-      # Mode ringkas ZIVPN: cukup username + masa aktif.
-      # Nilai lain tetap disimpan default di belakang layar.
-      limitip="0"
+      prompt_input limitip "Limit IP [2]: " || continue
+      limitip="${limitip:-2}"
       quota="0"
       password="${username}"
     else
@@ -6829,7 +6830,7 @@ schedule_trial_delete_1h() {
 }
 
 create_trial_account() {
-  local type ep username password resp code
+  local type ep username password limitip resp code
   while true; do
     type="$(pick_type)"
     [[ -z "${type}" ]] && return
@@ -6840,17 +6841,21 @@ create_trial_account() {
 
     if [[ "${type}" == "zivpn" ]]; then
       password="${username}"
+      prompt_input limitip "Limit IP trial [1]: " || continue
+      limitip="${limitip:-1}"
     elif [[ "${type}" == "ssh" ]]; then
       prompt_input password "Password [default=username]: " || continue
       password="${password:-$username}"
+      limitip="0"
     else
       password=""
+      limitip="0"
     fi
 
     if [[ -n "${password}" ]]; then
-      resp="$(api_call "POST" "${ep}" "$(jq -nc --arg u "${username}" --arg p "${password}" --argjson e 1 --arg l "0" --arg q "0" '{username:$u,password:$p,expired:$e,limitip:$l,kuota:$q}')")"
+      resp="$(api_call "POST" "${ep}" "$(jq -nc --arg u "${username}" --arg p "${password}" --argjson e 1 --arg l "${limitip}" --arg q "0" '{username:$u,password:$p,expired:$e,limitip:$l,kuota:$q}')")"
     else
-      resp="$(api_call "POST" "${ep}" "$(jq -nc --arg u "${username}" --argjson e 1 --arg l "0" --arg q "0" '{username:$u,expired:$e,limitip:$l,kuota:$q}')")"
+      resp="$(api_call "POST" "${ep}" "$(jq -nc --arg u "${username}" --argjson e 1 --arg l "${limitip}" --arg q "0" '{username:$u,expired:$e,limitip:$l,kuota:$q}')")"
     fi
 
     print_created_account "${type}" "${resp}"
@@ -8244,7 +8249,27 @@ EOF
 }
 
 enforce_menu_license_access() {
-  local enabled ip_text status expires_raw expires_epoch now_epoch
+  local enabled ip_text status expires_raw expires_epoch now_epoch lock_file lock_reason
+  lock_file="/etc/sc-1forcr-access.lock"
+  if [[ -f "${lock_file}" ]]; then
+    lock_reason="$(sed -n 's/^reason=//p' "${lock_file}" | head -n1)"
+    [[ -z "${lock_reason}" ]] && lock_reason="locked_by_admin"
+    clear
+    cat <<EOF
+============================================================
+               SC 1FORCR NEXUS - AKSES DITOLAK            
+============================================================
+
+Akses menu VPS dinonaktifkan admin.
+Reason : ${lock_reason}
+
+Status : SC expired.
+Aksi   : SC harus diperpanjang terlebih dahulu.
+Hubungi admin untuk membuka akses kembali setelah perpanjang.
+============================================================
+EOF
+    return 1
+  fi
   enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
   [[ "${enabled}" != "1" ]] && return 0
   refresh_license_cache_guard
@@ -8265,6 +8290,8 @@ enforce_menu_license_access() {
 ============================================================
 
 Script 1FORCRNEXUS anda sudah expired untuk IP (${ip_text}).
+Status : SC expired.
+Aksi   : SC harus diperpanjang terlebih dahulu.
 
 Silahkan perpanjang melalui bot resmi:
 https://t.me/sc1forcrnexusbot
@@ -8462,6 +8489,32 @@ draw_dashboard() {
     sed -n "s/^${key}=//p" "${file}" | head -n1
   }
 
+  read_update_info_value() {
+    local key="$1"
+    local file="/etc/sc-1forcr/update-info.env"
+    if [[ ! -f "${file}" ]]; then
+      echo ""
+      return
+    fi
+    sed -n "s/^${key}=//p" "${file}" | head -n1
+  }
+
+  truncate_text() {
+    local txt="$1"
+    local max="${2:-70}"
+    local len
+    len="${#txt}"
+    if (( len <= max )); then
+      printf '%s' "${txt}"
+      return
+    fi
+    if (( max <= 3 )); then
+      printf '%s' "${txt:0:max}"
+      return
+    fi
+    printf '%s...' "${txt:0:$((max - 3))}"
+  }
+
   format_expiry_in() {
     local raw="$1"
     local ts now rem d h m
@@ -8559,12 +8612,22 @@ EOF
   city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
   isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
   local license_distribution license_client_name license_expires_raw expiry_in_text
+  local update_component update_version update_desc update_time update_desc_short
   license_distribution="$(read_license_value "LICENSE_DISTRIBUTION")"
   license_client_name="$(read_license_value "LICENSE_CLIENT_NAME")"
   license_expires_raw="$(read_license_value "LICENSE_EXPIRES_AT")"
+  update_component="$(read_update_info_value "UPDATE_COMPONENT")"
+  update_version="$(read_update_info_value "UPDATE_VERSION")"
+  update_desc="$(read_update_info_value "UPDATE_DESC")"
+  update_time="$(read_update_info_value "UPDATE_AT_LOCAL")"
+  update_desc_short="$(truncate_text "${update_desc:-"-"}" 80)"
   [[ -z "${license_distribution}" ]] && license_distribution="Community / Open Source"
   [[ -z "${license_client_name}" ]] && license_client_name="${ip}"
   expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
+  [[ -z "${update_component}" ]] && update_component="-"
+  [[ -z "${update_version}" ]] && update_version="-"
+  [[ -z "${update_desc_short}" ]] && update_desc_short="-"
+  [[ -z "${update_time}" ]] && update_time="-"
 
   udpcustom="$(detect_udpcustom_service)"
   ssh_on="$(onoff_word ssh)"
@@ -8650,6 +8713,13 @@ EOF
   kv_line "Distribusi" "${license_distribution}"
   kv_line "Client Name" "${license_client_name}"
   kv_line "Expiry In" "${expiry_in_text}"
+  print_mid
+
+  print_line "${MAGENTA}${BOLD}LAST UPDATE INFO${NC}"
+  kv_line "Update Ver" "${update_version}"
+  kv_line "Komponen" "${update_component^^}"
+  kv_line "Waktu" "${update_time}"
+  kv_line "Ringkas" "${update_desc_short}"
   print_bottom
 
   printf '\n'
@@ -10373,11 +10443,28 @@ rm -f /usr/local/sbin/sc-1forcr-auto-backup
 rm -f /usr/local/sbin/sc-1forcr-restore-backup
 rm -f /usr/local/sbin/sc-1forcr-online-notify
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
+rm -f /etc/profile.d/sc-1forcr-auto-menu.sh
 
 echo "Uninstall SC 1FORCR selesai."
 echo "Catatan: layanan inti (ssh/nginx/xray/zivpn) tidak dihapus otomatis."
 EOF
   chmod +x /usr/local/sbin/uninstall-sc-1forcr
+}
+
+setup_auto_menu_login() {
+  cat > /etc/profile.d/sc-1forcr-auto-menu.sh <<'EOF'
+#!/usr/bin/env bash
+# Auto-open menu for first interactive root login.
+if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  if [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
+    if [[ -x /usr/local/sbin/menu ]]; then
+      export SC_MENU_AUTO_STARTED=1
+      /usr/local/sbin/menu >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+EOF
+  chmod 644 /etc/profile.d/sc-1forcr-auto-menu.sh
 }
 
 write_version_marker() {
@@ -10514,6 +10601,7 @@ main() {
   show_install_progress 90 "Sedikit lagi, finishing konfigurasi..."
 
   write_cli_menu
+  setup_auto_menu_login
   write_version_marker
   post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."

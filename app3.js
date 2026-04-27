@@ -53,6 +53,8 @@ const SETTING_LABELS = {
   SC_INSTALLER_LOCAL_PATH: 'Path Script Installer'
 };
 const DAY_MS = 24 * 60 * 60 * 1000;
+const SC_NOTIFY_INTERVAL_MS = 30 * 60 * 1000;
+const SC_H2_WINDOW_MS = 2 * DAY_MS;
 
 function dbRun(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -127,6 +129,20 @@ async function initDb() {
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL,
     updated_by INTEGER
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS sc_server_keys (
+    user_id INTEGER NOT NULL,
+    vps_ip TEXT NOT NULL,
+    server_key TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, vps_ip)
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS sc_notify_state (
+    user_id INTEGER NOT NULL,
+    vps_ip TEXT NOT NULL,
+    event TEXT NOT NULL,
+    last_sent_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, vps_ip, event)
   )`);
   await ensureScRegistrationSchema();
   await seedDefaultSettings();
@@ -475,6 +491,58 @@ async function saveTransaction(userId, amount, type, referenceId) {
   ).catch(() => {});
 }
 
+async function saveServerKeyForHost(userId, host, key) {
+  const uid = Number(userId || 0);
+  const ip = normalizeHost(host);
+  const k = String(key || '').trim();
+  if (!uid || !isIpv4(ip) || k.length < 8) return;
+  await dbRun(
+    `INSERT INTO sc_server_keys (user_id, vps_ip, server_key, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, vps_ip) DO UPDATE SET
+       server_key=excluded.server_key,
+       updated_at=excluded.updated_at`,
+    [uid, ip, k, Date.now()]
+  ).catch(() => {});
+}
+
+async function getServerKeyForHost(userId, host) {
+  const uid = Number(userId || 0);
+  const ip = normalizeHost(host);
+  if (!uid || !isIpv4(ip)) return '';
+  const row = await dbGet('SELECT server_key FROM sc_server_keys WHERE user_id = ? AND vps_ip = ? LIMIT 1', [uid, ip]);
+  const own = String(row?.server_key || '').trim();
+  if (own) return own;
+  const fallback = await dbGet(
+    'SELECT server_key FROM sc_server_keys WHERE vps_ip = ? ORDER BY updated_at DESC LIMIT 1',
+    [ip]
+  );
+  return String(fallback?.server_key || '').trim();
+}
+
+async function shouldSendScNotify(userId, host, event, intervalMs = SC_NOTIFY_INTERVAL_MS) {
+  const uid = Number(userId || 0);
+  const ip = normalizeHost(host);
+  const ev = String(event || '').trim().toLowerCase();
+  if (!uid || !isIpv4(ip) || !ev) return false;
+  const now = Date.now();
+  const row = await dbGet(
+    'SELECT last_sent_at FROM sc_notify_state WHERE user_id = ? AND vps_ip = ? AND event = ? LIMIT 1',
+    [uid, ip, ev]
+  );
+  const last = Number(row?.last_sent_at || 0);
+  if (last > 0 && now - last < Math.max(60000, Number(intervalMs) || SC_NOTIFY_INTERVAL_MS)) {
+    return false;
+  }
+  await dbRun(
+    `INSERT INTO sc_notify_state (user_id, vps_ip, event, last_sent_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, vps_ip, event) DO UPDATE SET last_sent_at=excluded.last_sent_at`,
+    [uid, ip, ev, now]
+  ).catch(() => {});
+  return true;
+}
+
 async function getActiveRegistrations(userId) {
   await dbRun(
     "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
@@ -511,6 +579,24 @@ async function listActiveRegistrationsForAdmin(limit = 15) {
       "ORDER BY updated_at DESC LIMIT ?",
     [now, safeLimit]
   );
+}
+
+async function listActiveScHosts(limit = 1000) {
+  const now = Date.now();
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [now, now]
+  ).catch(() => {});
+  const safeLimit = Math.max(1, Math.min(5000, Number(limit) || 1000));
+  const rows = await dbAll(
+    "SELECT DISTINCT vps_ip FROM sc_registrations " +
+      "WHERE status='active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) " +
+      "ORDER BY updated_at DESC LIMIT ?",
+    [now, safeLimit]
+  );
+  return rows
+    .map((r) => normalizeHost(r?.vps_ip || ''))
+    .filter((ip) => isIpv4(ip));
 }
 
 async function adminRemoveRegisteredIp(ip, adminId) {
@@ -554,6 +640,141 @@ async function adminRemoveRegisteredIp(ip, adminId) {
     affectedUsers,
     removedRowsAllIps: Number(tx?.changes || 0)
   };
+}
+
+async function lockScAccessByHost(host, key, actorId, reason = 'admin_remove_sc_ip') {
+  return apiPost(host, key, '/internal/sc-access-lock', {
+    blocked: true,
+    reason: String(reason || 'admin_remove_sc_ip'),
+    actor: String(actorId || '')
+  });
+}
+
+async function notifyScExpiredOnHost(host, key, payload = {}) {
+  return apiPost(host, key, '/internal/sc-expired-notify', payload);
+}
+
+async function notifyExpiredUsersInBot(ctx, userIds, ip, reason = 'admin_remove_sc_ip') {
+  const ids = Array.isArray(userIds)
+    ? Array.from(new Set(userIds.map((n) => Number(n || 0)).filter((n) => Number.isInteger(n) && n > 0)))
+    : [];
+  let ok = 0;
+  let fail = 0;
+  for (const uid of ids) {
+    try {
+      await ctx.telegram.sendMessage(
+        uid,
+        `SC kamu telah expired oleh admin.\n` +
+          `IP VPS: ${ip}\n` +
+          `Reason: ${reason}\n\n` +
+          `Silakan perpanjang SC untuk akses kembali.`
+      );
+      ok += 1;
+    } catch (_) {
+      fail += 1;
+    }
+  }
+  return { total: ids.length, ok, fail };
+}
+
+async function notifySingleUserInBot(userId, message) {
+  const uid = Number(userId || 0);
+  if (!uid) return false;
+  try {
+    await bot.telegram.sendMessage(uid, String(message || '').trim());
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function runNaturalScExpiryJobs() {
+  const now = Date.now();
+  const remindUntil = now + SC_H2_WINDOW_MS;
+  const activeRows = await dbAll(
+    "SELECT user_id, vps_ip, client_name, status, expires_at FROM sc_registrations " +
+      "WHERE status='active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [remindUntil]
+  ).catch(() => []);
+
+  for (const row of activeRows) {
+    const uid = Number(row?.user_id || 0);
+    const host = normalizeHost(row?.vps_ip || '');
+    const expTs = Number(row?.expires_at || 0);
+    if (!uid || !isIpv4(host) || !expTs) continue;
+
+    if (expTs <= now) {
+      await dbRun(
+        "UPDATE sc_registrations SET status='expired', updated_at=? WHERE user_id=? AND vps_ip=? AND status='active'",
+        [now, uid, host]
+      ).catch(() => {});
+
+      const canNotifyUser = await shouldSendScNotify(uid, host, 'natural_expired_user', SC_NOTIFY_INTERVAL_MS);
+      if (canNotifyUser) {
+        await notifySingleUserInBot(
+          uid,
+          `SC kamu sudah expired karena masa aktif habis.\n` +
+            `IP VPS: ${host}\n` +
+            `Expired: ${formatDateTime(expTs)}\n\n` +
+            `Akses menu SC ditolak sampai diperpanjang.`
+        );
+      }
+
+      const serverKey = await getServerKeyForHost(uid, host);
+      if (serverKey) {
+        await lockScAccessByHost(host, serverKey, uid, 'natural_expired').catch(() => {});
+        const canNotifyLocal = await shouldSendScNotify(uid, host, 'natural_expired_local', SC_NOTIFY_INTERVAL_MS);
+        if (canNotifyLocal) {
+          await notifyScExpiredOnHost(host, serverKey, {
+            ip: host,
+            reason: 'natural_expired',
+            actor: String(uid),
+            users: [String(uid)],
+            message:
+              'SC 1FORCR NOTIF\n' +
+              'Status : SC expired (natural)\n' +
+              `IP VPS : ${host}\n` +
+              `User   : ${uid}\n\n` +
+              'SC harus diperpanjang untuk akses kembali.'
+          }).catch(() => {});
+        }
+      }
+      continue;
+    }
+
+    const canRemind = await shouldSendScNotify(uid, host, 'h2_reminder_user', SC_NOTIFY_INTERVAL_MS);
+    if (canRemind) {
+      const remain = formatRemainingDays(expTs);
+      await notifySingleUserInBot(
+        uid,
+        `Pengingat H-2: masa aktif SC akan segera habis.\n` +
+          `IP VPS: ${host}\n` +
+          `Expired: ${formatDateTime(expTs)}\n` +
+          `Sisa: ${remain}\n\n` +
+          `Silakan perpanjang agar akses tidak terblokir.`
+      );
+    }
+
+    const serverKey = await getServerKeyForHost(uid, host);
+    if (serverKey) {
+      const canRemindLocal = await shouldSendScNotify(uid, host, 'h2_reminder_local', SC_NOTIFY_INTERVAL_MS);
+      if (canRemindLocal) {
+        await notifyScExpiredOnHost(host, serverKey, {
+          ip: host,
+          reason: 'h2_reminder',
+          actor: String(uid),
+          users: [String(uid)],
+          message:
+            'SC 1FORCR NOTIF\n' +
+            'Reminder : H-2 masa aktif SC\n' +
+            `IP VPS   : ${host}\n` +
+            `User     : ${uid}\n` +
+            `Expired  : ${formatDateTime(expTs)}\n\n` +
+            'Silakan perpanjang sebelum expired.'
+        }).catch(() => {});
+      }
+    }
+  }
 }
 
 async function isIpOwnedByOther(ip, userId) {
@@ -713,6 +934,8 @@ function adminMenu() {
     [Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain')],
     [Markup.button.callback('Hapus IP VPS Terdaftar', 'm_admin_remove_sc_ip')],
+    [Markup.button.callback('Buka Kunci Akses SC VPS', 'm_admin_unlock_sc_access')],
+    [Markup.button.callback('Trigger Update SC/API', 'm_admin_trigger_update')],
     [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show')],
     [Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
@@ -805,6 +1028,20 @@ function resolveSettingKeyInput(input) {
 async function requireRegistered(ctx) {
   const ok = await hasRegisteredSc(ctx.from.id);
   if (ok) return true;
+  const latest = await getLatestRegistrationState(ctx.from.id).catch(() => null);
+  if (latest) {
+    const st = String(latest.status || '').trim().toLowerCase();
+    if (st === 'expired' || st === 'deleted_by_admin') {
+      await ctx.reply(
+        'Akses fitur SC ditolak karena SC kamu expired.\n\n' +
+          `IP terakhir: ${latest.vps_ip || '-'}\n` +
+          `Expired: ${formatDateTime(latest.expires_at)}\n\n` +
+          'SC harus diperpanjang dulu dari menu: "Daftar / Perpanjang SC".',
+        mainMenu()
+      );
+      return false;
+    }
+  }
   await ctx.reply(
     'Akses fitur SC ditolak.\n\n' +
       'Kamu harus registrasi/perpanjang SC 1FORCR Nexus dulu (wajib punya saldo).\n' +
@@ -833,6 +1070,168 @@ async function apiPost(host, key, endpoint, body = {}, timeoutMs = 120000) {
   });
   if (!res.data?.ok) throw new Error(res.data?.message || 'request gagal');
   return res.data;
+}
+
+function normalizeReleaseVersion(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  return raw.replace(/\s+/g, ' ').slice(0, 64);
+}
+
+function normalizeReleaseDescription(input) {
+  const raw = String(input || '').trim();
+  if (!raw) return '';
+  return raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n{2,}/g, '\n').slice(0, 1200);
+}
+
+function buildUpdateNoticeText(component, version, description, host = '', scope = 'single') {
+  const c = String(component || '').trim().toUpperCase() || '-';
+  const v = String(version || '').trim() || '-';
+  const d = String(description || '').trim() || '-';
+  const h = String(host || '').trim();
+  const lines = [
+    'Info Update SC',
+    `Komponen : ${c}`,
+    `Versi    : ${v}`,
+    `Ruang    : ${scope === 'global' ? 'Global' : 'Single VPS'}`
+  ];
+  if (h) lines.push(`Host     : ${h}`);
+  lines.push('', 'Deskripsi update:', d);
+  return lines.join('\n');
+}
+
+async function getActiveUserIdsByHosts(hostsInput) {
+  const hosts = Array.from(
+    new Set(
+      (Array.isArray(hostsInput) ? hostsInput : [])
+        .map((h) => normalizeHost(h))
+        .filter((h) => isIpv4(h))
+    )
+  );
+  if (!hosts.length) return [];
+  const now = Date.now();
+  const placeholders = hosts.map(() => '?').join(',');
+  const rows = await dbAll(
+    `SELECT DISTINCT user_id
+     FROM sc_registrations
+     WHERE status='active'
+       AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)
+       AND vps_ip IN (${placeholders})`,
+    [now, ...hosts]
+  );
+  return Array.from(
+    new Set(
+      rows
+        .map((r) => Number(r?.user_id || 0))
+        .filter((n) => Number.isInteger(n) && n > 0)
+    )
+  );
+}
+
+async function broadcastUpdateNoticeToUsers(userIdsInput, message) {
+  const userIds = Array.from(
+    new Set(
+      (Array.isArray(userIdsInput) ? userIdsInput : [])
+        .map((n) => Number(n || 0))
+        .filter((n) => Number.isInteger(n) && n > 0)
+    )
+  );
+  let sent = 0;
+  let failed = 0;
+  for (const uid of userIds) {
+    const ok = await notifySingleUserInBot(uid, message);
+    if (ok) sent += 1;
+    else failed += 1;
+  }
+  return { total: userIds.length, sent, failed };
+}
+
+async function runAdminUpdateSingle(ctx, host, key, component, version, description) {
+  const payload = {
+    component,
+    release_version: version || '',
+    release_description: description || '',
+    release_actor: String(ctx.from?.id || '')
+  };
+  const resp = await apiPost(host, key, '/internal/trigger-update', payload, 40 * 60 * 1000);
+  await saveServerKeyForHost(ctx.from.id, host, key);
+  const users = await getActiveUserIdsByHosts([host]).catch(() => []);
+  const notice = buildUpdateNoticeText(component, version, description, host, 'single');
+  const notify = await broadcastUpdateNoticeToUsers(users, notice).catch(() => ({ total: users.length, sent: 0, failed: users.length }));
+  const steps = Array.isArray(resp?.steps) ? resp.steps : [];
+  const lines = steps.map((s) => `- ${String(s?.step || '-')} : ${s?.ok ? 'OK' : 'FAIL'}`);
+  return {
+    host,
+    steps,
+    message:
+      `Trigger update selesai.\n` +
+      `Host: ${host}\n` +
+      `Target: ${String(component || '').toUpperCase()}\n` +
+      `Versi: ${version || '-'}\n` +
+      `Deskripsi: ${description || '-'}\n` +
+      `${lines.length ? lines.join('\n') : '-'}\n` +
+      `Notif user: ${notify.sent}/${notify.total} terkirim`
+  };
+}
+
+async function runAdminUpdateGlobal(ctx, component, version, description) {
+  const hosts = await listActiveScHosts(2000).catch(() => []);
+  if (!hosts.length) {
+    return {
+      ok: false,
+      message: 'Tidak ada host aktif untuk trigger update global.'
+    };
+  }
+  let success = 0;
+  let fail = 0;
+  let skipped = 0;
+  const failLines = [];
+  const successHosts = [];
+  for (const host of hosts) {
+    const key = await getServerKeyForHost(ctx.from.id, host);
+    if (String(key || '').trim().length < 8) {
+      skipped += 1;
+      if (failLines.length < 20) failLines.push(`- ${host}: skip (key belum tersimpan)`);
+      continue;
+    }
+    try {
+      await apiPost(
+        host,
+        key,
+        '/internal/trigger-update',
+        {
+          component,
+          release_version: version || '',
+          release_description: description || '',
+          release_actor: String(ctx.from?.id || '')
+        },
+        40 * 60 * 1000
+      );
+      await saveServerKeyForHost(ctx.from.id, host, key);
+      success += 1;
+      successHosts.push(host);
+    } catch (err) {
+      fail += 1;
+      if (failLines.length < 20) failLines.push(`- ${host}: ${parseErr(err)}`);
+    }
+  }
+  const users = await getActiveUserIdsByHosts(successHosts).catch(() => []);
+  const notice = buildUpdateNoticeText(component, version, description, '', 'global');
+  const notify = await broadcastUpdateNoticeToUsers(users, notice).catch(() => ({ total: users.length, sent: 0, failed: users.length }));
+  return {
+    ok: true,
+    message:
+      `Trigger update global selesai.\n` +
+      `Target: ${String(component || '').toUpperCase()}\n` +
+      `Versi: ${version || '-'}\n` +
+      `Deskripsi: ${description || '-'}\n` +
+      `Total host aktif: ${hosts.length}\n` +
+      `Sukses: ${success}\n` +
+      `Gagal: ${fail}\n` +
+      `Skip (tanpa key): ${skipped}\n` +
+      `Notif user: ${notify.sent}/${notify.total} terkirim` +
+      `${failLines.length ? `\n\nDetail (maks 20):\n${failLines.join('\n')}` : ''}`
+  };
 }
 
 function uniqUsernames(accounts) {
@@ -1239,6 +1638,7 @@ bot.action('m_admin_remove_sc_ip', async (ctx) => {
     uiBox('HAPUS IP VPS TERDAFTAR', [
       'Masukkan IP VPS yang ingin dihapus dari registrasi aktif.',
       'Contoh: 103.10.10.2',
+      'Setelah input IP, bot akan minta key server untuk lock akses menu di VPS tersebut.',
       '',
       'Preview IP aktif:',
       preview,
@@ -1246,6 +1646,119 @@ bot.action('m_admin_remove_sc_ip', async (ctx) => {
       'Ketik "batal" untuk membatalkan.'
     ]),
     adminMenu()
+  );
+});
+
+bot.action('m_admin_unlock_sc_access', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_unlock_sc_ip' });
+  await ctx.reply(
+    uiBox('BUKA KUNCI AKSES SC VPS', [
+      'Masukkan IP VPS yang ingin dibuka kunci akses menunya.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Setelah itu bot akan meminta key server.',
+      'Ketik "batal" untuk membatalkan.'
+    ]),
+    adminMenu()
+  );
+});
+
+bot.action('m_admin_trigger_update', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_update_scope' });
+  await ctx.reply(
+    uiBox('TRIGGER UPDATE SC/API', [
+      'Pilih mode trigger update.',
+      '',
+      '1) Single VPS (input IP + key).',
+      '2) Global (semua VPS aktif yang key-nya sudah tersimpan).',
+      '',
+      'Catatan: mode global akan skip host yang key server-nya belum ada di database bot.'
+    ]),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Single VPS', 'm_admin_update_scope_single')],
+      [Markup.button.callback('Global Semua VPS', 'm_admin_update_scope_global')],
+      [Markup.button.callback('Batal', 'm_admin_back')]
+    ])
+  );
+});
+
+bot.action('m_admin_update_scope_single', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_update_host' });
+  return ctx.reply(
+    uiBox('TRIGGER UPDATE - SINGLE VPS', [
+      'Masukkan IP VPS target update.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Setelah itu bot akan minta key server dan target update (SC/API/BOTH).',
+      'Ketik "batal" untuk membatalkan.'
+    ]),
+    adminMenu()
+  );
+});
+
+bot.action('m_admin_update_scope_global', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const hosts = await listActiveScHosts(2000).catch(() => []);
+  userState.set(ctx.chat.id, { step: 'admin_update_global_component' });
+  return ctx.reply(
+    uiBox('TRIGGER UPDATE - GLOBAL', [
+      `Total host aktif terdeteksi: ${hosts.length}`,
+      'Pilih komponen yang akan di-trigger ke semua host aktif.',
+      '',
+      'Host tanpa key tersimpan akan otomatis di-skip.'
+    ]),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('SC Saja', 'm_admin_update_component_sc')],
+      [Markup.button.callback('API Saja', 'm_admin_update_component_api')],
+      [Markup.button.callback('SC + API', 'm_admin_update_component_both')],
+      [Markup.button.callback('Batal', 'm_admin_back')]
+    ])
+  );
+});
+
+bot.action(/m_admin_update_component_(sc|api|both)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const state = userState.get(ctx.chat.id);
+  if (!state || !['admin_update_component', 'admin_update_global_component'].includes(String(state.step || ''))) {
+    return ctx.reply('Sesi trigger update tidak aktif. Ulangi dari menu admin.', adminMenu());
+  }
+  const component = String(ctx.match?.[1] || '').toLowerCase();
+  if (state.step === 'admin_update_global_component') {
+    state.targetUpdateScope = 'global';
+    state.targetUpdateComponent = component;
+    state.step = 'admin_update_global_version';
+    userState.set(ctx.chat.id, state);
+    return ctx.reply(
+      uiBox('INFO RELEASE UPDATE (GLOBAL)', [
+        `Target komponen: ${component.toUpperCase()}`,
+        '',
+        'Masukkan versi update.',
+        'Contoh: v1.2.9',
+        'Ketik "-" jika mau dikosongkan.'
+      ])
+    );
+  }
+  state.targetUpdateScope = 'single';
+  state.targetUpdateComponent = component;
+  state.step = 'admin_update_version';
+  userState.set(ctx.chat.id, state);
+  return ctx.reply(
+    uiBox('INFO RELEASE UPDATE (SINGLE)', [
+      `Host: ${state.targetUpdateHost || '-'}`,
+      `Target komponen: ${component.toUpperCase()}`,
+      '',
+      'Masukkan versi update.',
+      'Contoh: v1.2.9',
+      'Ketik "-" jika mau dikosongkan.'
+    ])
   );
 });
 
@@ -1965,20 +2478,229 @@ bot.on('text', async (ctx) => {
       if (!isIpv4(ip)) {
         return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
       }
+      state.targetIpForAdminRemove = ip;
+      state.step = 'admin_remove_sc_ip_key';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `IP target: ${ip}\n` +
+          'Masukkan key server VPS tersebut untuk lock akses menu lokal VPS.',
+        adminMenu()
+      );
+    }
+
+    if (state.step === 'admin_remove_sc_ip_key') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = normalizeHost(state.targetIpForAdminRemove || '');
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State hapus IP tidak valid. Ulangi dari menu admin.', adminMenu());
+      }
+      const key = String(text || '').trim();
+      if (key.length < 8) {
+        return ctx.reply('Key server tidak valid.');
+      }
+      await saveServerKeyForHost(ctx.from.id, ip, key);
+
       const result = await adminRemoveRegisteredIp(ip, ctx.from.id);
-      userState.delete(ctx.chat.id);
       if (!result.removed) {
+        userState.delete(ctx.chat.id);
         return ctx.reply(`IP ${ip} tidak ditemukan pada registrasi aktif.`, adminMenu());
       }
+
+      let lockMsg = 'Lock menu VPS: gagal (unknown)';
+      try {
+        const lockResp = await lockScAccessByHost(ip, key, ctx.from.id, 'admin_remove_sc_ip');
+        const blocked = lockResp?.blocked === true;
+        lockMsg = blocked ? 'Lock menu VPS: berhasil' : 'Lock menu VPS: gagal';
+      } catch (lockErr) {
+        lockMsg = `Lock menu VPS: gagal (${parseErr(lockErr)})`;
+      }
+
       const users = Array.isArray(result.affectedUsers) ? result.affectedUsers : [];
+      const userNotify = await notifyExpiredUsersInBot(ctx, users, ip, 'admin_remove_sc_ip').catch(() => ({ total: users.length, ok: 0, fail: users.length }));
+
+      let vpsNotifyMsg = 'Notif bot VPS: gagal (unknown)';
+      try {
+        await notifyScExpiredOnHost(ip, key, {
+          ip,
+          reason: 'admin_remove_sc_ip',
+          actor: String(ctx.from.id || ''),
+          users: users.map((u) => String(u))
+        });
+        vpsNotifyMsg = 'Notif bot VPS: berhasil';
+      } catch (notifyErr) {
+        vpsNotifyMsg = `Notif bot VPS: gagal (${parseErr(notifyErr)})`;
+      }
+
+      userState.delete(ctx.chat.id);
       return ctx.reply(
         `Berhasil hapus registrasi aktif untuk IP ${ip}.\n` +
           `Baris IP cocok: ${result.removed}\n` +
           `Total baris aktif yang di-expire: ${Number(result.removedRowsAllIps || 0)}\n` +
           `User terdampak: ${users.length ? users.join(', ') : '-'}\n` +
-          `Efek: SC client langsung expired, dan masa aktif akan reset saat registrasi ulang.`,
+          `${lockMsg}\n` +
+          `Notif user Bot SC: ${userNotify.ok}/${userNotify.total} terkirim\n` +
+          `${vpsNotifyMsg}\n` +
+          `Efek: SC client expired + menu VPS terkunci (jika lock berhasil).`,
         adminMenu()
       );
+    }
+
+    if (state.step === 'admin_unlock_sc_ip') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = normalizeHost(text);
+      if (!isIpv4(ip)) {
+        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      }
+      state.targetIpForAdminUnlock = ip;
+      state.step = 'admin_unlock_sc_ip_key';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `IP target: ${ip}\n` +
+          'Masukkan key server VPS tersebut untuk membuka lock akses menu.',
+        adminMenu()
+      );
+    }
+
+    if (state.step === 'admin_unlock_sc_ip_key') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = normalizeHost(state.targetIpForAdminUnlock || '');
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State unlock akses SC tidak valid. Ulangi dari menu admin.', adminMenu());
+      }
+      const key = String(text || '').trim();
+      if (key.length < 8) {
+        return ctx.reply('Key server tidak valid.');
+      }
+      await saveServerKeyForHost(ctx.from.id, ip, key);
+      try {
+        const unlockResp = await apiPost(ip, key, '/internal/sc-access-lock', {
+          blocked: false,
+          reason: 'admin_unlock_sc_access',
+          actor: String(ctx.from.id || '')
+        });
+        userState.delete(ctx.chat.id);
+        return ctx.reply(
+          `Unlock akses SC VPS berhasil.\n` +
+            `IP: ${ip}\n` +
+            `Blocked: ${unlockResp?.blocked === true ? 'yes' : 'no'}`,
+          adminMenu()
+        );
+      } catch (unlockErr) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`Gagal unlock akses SC VPS: ${parseErr(unlockErr)}`, adminMenu());
+      }
+    }
+
+    if (state.step === 'admin_update_host') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = normalizeHost(text);
+      if (!isIpv4(ip)) {
+        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      }
+      state.targetUpdateHost = ip;
+      state.step = 'admin_update_key';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(`IP target: ${ip}\nMasukkan key server target.`);
+    }
+
+    if (state.step === 'admin_update_key') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const key = String(text || '').trim();
+      if (key.length < 8) {
+        return ctx.reply('Key server tidak valid.');
+      }
+      state.targetUpdateKey = key;
+      state.step = 'admin_update_component';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('PILIH TARGET UPDATE', [
+          `Host: ${state.targetUpdateHost}`,
+          'Pilih komponen yang akan di-trigger update.'
+        ]),
+        Markup.inlineKeyboard([
+          [Markup.button.callback('SC Saja', 'm_admin_update_component_sc')],
+          [Markup.button.callback('API Saja', 'm_admin_update_component_api')],
+          [Markup.button.callback('SC + API', 'm_admin_update_component_both')],
+          [Markup.button.callback('Batal', 'm_admin_back')]
+        ])
+      );
+    }
+
+    if (state.step === 'admin_update_version' || state.step === 'admin_update_global_version') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const raw = String(text || '').trim();
+      const version = (raw === '-' || raw.toLowerCase() === 'skip') ? '' : normalizeReleaseVersion(raw);
+      state.targetUpdateVersion = version;
+      state.step = state.step === 'admin_update_global_version' ? 'admin_update_global_desc' : 'admin_update_desc';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('DESKRIPSI UPDATE', [
+          `Versi: ${version || '-'}`,
+          '',
+          'Masukkan deskripsi update (apa saja yang berubah).',
+          'Ketik "-" jika mau dikosongkan.'
+        ])
+      );
+    }
+
+    if (state.step === 'admin_update_desc' || state.step === 'admin_update_global_desc') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const raw = String(text || '').trim();
+      const description = (raw === '-' || raw.toLowerCase() === 'skip') ? '' : normalizeReleaseDescription(raw);
+      const component = String(state.targetUpdateComponent || '').trim().toLowerCase();
+      const version = normalizeReleaseVersion(state.targetUpdateVersion || '');
+      if (!['sc', 'api', 'both'].includes(component)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State update tidak valid (component). Ulangi dari menu admin.', adminMenu());
+      }
+
+      const isGlobal = state.step === 'admin_update_global_desc' || String(state.targetUpdateScope || '') === 'global';
+      try {
+        if (isGlobal) {
+          await ctx.reply(`Menjalankan trigger update GLOBAL (${component.toUpperCase()})...`);
+          const result = await runAdminUpdateGlobal(ctx, component, version, description);
+          userState.delete(ctx.chat.id);
+          if (!result.ok) return ctx.reply(result.message || 'Trigger update global gagal.', adminMenu());
+          return ctx.reply(result.message, adminMenu());
+        }
+
+        const host = normalizeHost(state.targetUpdateHost || '');
+        const key = String(state.targetUpdateKey || '').trim();
+        if (!isIpv4(host) || key.length < 8) {
+          userState.delete(ctx.chat.id);
+          return ctx.reply('State trigger update tidak valid. Ulangi dari menu admin.', adminMenu());
+        }
+        await ctx.reply(`Menjalankan trigger update (${component.toUpperCase()}) ke ${host}...`);
+        const result = await runAdminUpdateSingle(ctx, host, key, component, version, description);
+        userState.delete(ctx.chat.id);
+        return ctx.reply(result.message, adminMenu());
+      } catch (err) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`Trigger update gagal: ${parseErr(err)}`, adminMenu());
+      }
     }
 
     if (state.step === 'register_sc_client_name') {
@@ -2260,6 +2982,7 @@ bot.on('text', async (ctx) => {
       const key = String(text || '').trim();
       if (key.length < 8) return ctx.reply('Key tidak valid.');
       state.key = key;
+      await saveServerKeyForHost(ctx.from.id, state.host, key);
       state.step = 'delete_all_choose_protocol';
       userState.set(ctx.chat.id, state);
       return ctx.reply(
@@ -2287,6 +3010,7 @@ bot.on('text', async (ctx) => {
       const srcKey = String(text || '').trim();
       if (srcKey.length < 8) return ctx.reply('Key sumber tidak valid.');
       state.srcKey = srcKey;
+      await saveServerKeyForHost(ctx.from.id, state.srcHost, srcKey);
       state.step = 'migrate_dst_host';
       userState.set(ctx.chat.id, state);
       return ctx.reply('Masukkan IP VPS tujuan migrasi.');
@@ -2308,6 +3032,7 @@ bot.on('text', async (ctx) => {
       const dstKey = String(text || '').trim();
       if (dstKey.length < 8) return ctx.reply('Key tujuan tidak valid.');
       state.dstKey = dstKey;
+      await saveServerKeyForHost(ctx.from.id, state.dstHost, dstKey);
       state.step = 'migrate_choose_protocol';
       userState.set(ctx.chat.id, state);
       return ctx.reply(
@@ -2335,6 +3060,7 @@ bot.on('text', async (ctx) => {
     if (state.step === 'backup_key') {
       const key = text;
       if (key.length < 8) return ctx.reply('Key tidak valid.');
+      await saveServerKeyForHost(ctx.from.id, state.host, key);
 
       await ctx.reply('Membuat backup, tunggu...');
 
@@ -2412,6 +3138,7 @@ bot.on('text', async (ctx) => {
     if (state.step === 'restore_key') {
       if (text.length < 8) return ctx.reply('Key tidak valid.');
       state.key = text;
+      await saveServerKeyForHost(ctx.from.id, state.host, text);
       state.step = 'restore_wait_file';
       userState.set(ctx.chat.id, state);
       return ctx.reply('Upload file backup sebagai document (.json).');
@@ -2581,7 +3308,11 @@ bot.catch((err, ctx) => {
   try {
     await initDb();
     setInterval(pollPendingTopups, 15000);
+    setInterval(() => {
+      runNaturalScExpiryJobs().catch(() => {});
+    }, SC_NOTIFY_INTERVAL_MS);
     await pollPendingTopups();
+    await runNaturalScExpiryJobs().catch(() => {});
     await bot.launch();
     console.log('app3 bot running...');
   } catch (e) {

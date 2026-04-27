@@ -10460,12 +10460,12 @@ EOF
 setup_auto_menu_login() {
   cat > /etc/profile.d/sc-1forcr-auto-menu.sh <<'EOF'
 #!/usr/bin/env bash
-# Auto-open menu for first interactive root login.
-if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  if [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
+# Auto-open menu for interactive root SSH login.
+if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; then
+  if [[ -n "${SSH_CONNECTION:-}" ]] && [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
     if [[ -x /usr/local/sbin/menu ]]; then
       export SC_MENU_AUTO_STARTED=1
-      /usr/local/sbin/menu >/dev/null 2>&1 || true
+      /usr/local/sbin/menu || true
     fi
   fi
 fi

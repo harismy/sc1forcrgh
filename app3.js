@@ -24,8 +24,12 @@ const DEFAULT_LICENSE_API_PORT = Math.max(1, Number(process.env.LICENSE_API_PORT
 const DEFAULT_AUTO_PROVISION_DOMAIN = /^(1|true|yes|on)$/i.test(String(process.env.AUTO_PROVISION_DOMAIN || '1').trim());
 const DEFAULT_CERTBOT_EMAIL = String(process.env.CERTBOT_EMAIL || '').trim();
 const DEFAULT_SC_INSTALLER_LOCAL_PATH = String(
-  process.env.SC_INSTALLER_LOCAL_PATH || path.join(__dirname, 'payload', 'setup-autoscript-compat.sh')
+  process.env.SC_INSTALLER_LOCAL_PATH || path.join(__dirname, 'scripts', 'setup-autoscript-compat.sh')
 ).trim();
+const DEFAULT_SUMMARY_API_LOCAL_PATH = String(
+  process.env.SUMMARY_API_LOCAL_PATH || path.join(__dirname, 'scripts', 'setup-summary-api.sh')
+).trim();
+const LEGACY_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'payload', 'setup-autoscript-compat.sh');
 const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
   .split(',')
   .map((v) => Number(String(v || '').trim()))
@@ -146,6 +150,7 @@ async function initDb() {
   )`);
   await ensureScRegistrationSchema();
   await seedDefaultSettings();
+  await autoMigrateLegacyInstallerPathSetting();
 }
 
 async function ensureScRegistrationSchema() {
@@ -176,6 +181,25 @@ async function seedDefaultSettings() {
       'INSERT OR IGNORE INTO app_settings (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)',
       [key, String(value), now, 0]
     );
+  }
+}
+
+function normalizeLegacyInstallerPathValue(rawValue) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return raw;
+  const normalized = raw.replace(/\\/g, '/');
+  if (normalized.endsWith('/payload/setup-autoscript-compat.sh')) {
+    return normalized.replace(/\/payload\/setup-autoscript-compat\.sh$/, '/scripts/setup-autoscript-compat.sh');
+  }
+  return raw;
+}
+
+async function autoMigrateLegacyInstallerPathSetting() {
+  const row = await dbGet('SELECT value FROM app_settings WHERE key = ? LIMIT 1', ['SC_INSTALLER_LOCAL_PATH']);
+  const current = String(row?.value || '').trim();
+  const migrated = normalizeLegacyInstallerPathValue(current);
+  if (migrated && migrated !== current) {
+    await setDynamicSetting('SC_INSTALLER_LOCAL_PATH', migrated, 0);
   }
 }
 
@@ -242,7 +266,32 @@ async function getCertbotEmail() {
 }
 
 async function getScInstallerLocalPath() {
-  return getDynamicSetting('SC_INSTALLER_LOCAL_PATH', DEFAULT_SC_INSTALLER_LOCAL_PATH);
+  const dynamicPath = String(await getDynamicSetting('SC_INSTALLER_LOCAL_PATH', DEFAULT_SC_INSTALLER_LOCAL_PATH)).trim();
+  const candidates = [
+    DEFAULT_SC_INSTALLER_LOCAL_PATH,
+    dynamicPath,
+    normalizeLegacyInstallerPathValue(dynamicPath),
+    LEGACY_SC_INSTALLER_LOCAL_PATH
+  ].filter(Boolean);
+  const uniq = [...new Set(candidates)];
+  for (const p of uniq) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
+  return DEFAULT_SC_INSTALLER_LOCAL_PATH;
+}
+
+async function getSummaryApiLocalPath() {
+  const envPath = String(process.env.SUMMARY_API_LOCAL_PATH || '').trim();
+  const candidates = [DEFAULT_SUMMARY_API_LOCAL_PATH, envPath].filter(Boolean);
+  const uniq = [...new Set(candidates)];
+  for (const p of uniq) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
+  return DEFAULT_SUMMARY_API_LOCAL_PATH;
 }
 
 async function getDynamicSettingsSnapshot() {
@@ -1001,6 +1050,7 @@ function adminMenu() {
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show')],
     [Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
     [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc')],
+    [Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
 }
@@ -1057,7 +1107,7 @@ function envKeyInputHint(key) {
     case 'CERTBOT_EMAIL':
       return 'Contoh: admin@domainkamu.com (boleh kosong).';
     case 'SC_INSTALLER_LOCAL_PATH':
-      return 'Contoh: /root/botsc1forcrnexus/payload/setup-autoscript-compat.sh';
+      return 'Contoh: /root/botsc1forcrnexus/scripts/setup-autoscript-compat.sh';
     default:
       return '';
   }
@@ -1989,6 +2039,16 @@ bot.action('m_admin_upload_sc', async (ctx) => {
   await ctx.reply(
     'Upload file update SC (.sh) sebagai document.\n' +
       'File akan disimpan lokal di VPS bot ini sebagai sumber installer.'
+  );
+});
+
+bot.action('m_admin_upload_summary_api', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_upload_summary_api_script' });
+  await ctx.reply(
+    'Upload file update Summary API (.sh) sebagai document.\n' +
+      'File akan disimpan lokal di VPS bot ini sebagai sumber installer Summary API.'
   );
 });
 
@@ -3295,6 +3355,53 @@ bot.on('document', async (ctx) => {
     } catch (err) {
       userState.delete(ctx.chat.id);
       return ctx.reply(`Gagal upload file update SC: ${parseErr(err)}`, adminMenu());
+    }
+  }
+
+  if (state.step === 'admin_upload_summary_api_script') {
+    try {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const doc = ctx.message.document;
+      const fileName = String(doc?.file_name || '').toLowerCase();
+      if (!fileName.endsWith('.sh')) {
+        return ctx.reply('File harus .sh');
+      }
+
+      const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+      const fileResp = await axios.get(fileLink.toString(), {
+        timeout: 120000,
+        responseType: 'arraybuffer'
+      });
+      const content = Buffer.from(fileResp.data || '');
+      if (!content.length) return ctx.reply('File kosong.');
+      if (content.length > 5 * 1024 * 1024) return ctx.reply('File terlalu besar (maks 5MB).');
+
+      const normalizedText = normalizeScriptLineEndings(content.toString('utf8'));
+      const normalizedContent = Buffer.from(normalizedText, 'utf8');
+      const textSample = normalizedText.slice(0, 2000);
+      if (!/setup-summary-api|^#!\/usr\/bin\/env bash|^#!\/bin\/bash/m.test(textSample)) {
+        return ctx.reply('File tidak terlihat seperti script setup summary api yang valid.');
+      }
+
+      const targetPath = await getSummaryApiLocalPath();
+      const targetDir = path.dirname(targetPath);
+      fs.mkdirSync(targetDir, { recursive: true });
+      fs.writeFileSync(targetPath, normalizedContent);
+      try { fs.chmodSync(targetPath, 0o755); } catch (_) {}
+
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Upload update Summary API berhasil.\n` +
+          `Path lokal: ${targetPath}\n` +
+          `Ukuran: ${normalizedContent.length} bytes`,
+        adminMenu()
+      );
+    } catch (err) {
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Gagal upload file update Summary API: ${parseErr(err)}`, adminMenu());
     }
   }
 

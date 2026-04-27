@@ -22,7 +22,7 @@ set -euo pipefail
 #   WILDCARD_ENABLE=0                           (opsional, 1=aktif wildcard cert DNS-01)
 #   WILDCARD_BASE_DOMAIN=example.com            (opsional, wajib saat wildcard aktif)
 #   WILDCARD_CF_API_TOKEN=                      (opsional, token Cloudflare DNS edit)
-#   UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh
+#   UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-autoscript-compat.sh
 #   AUTO_INSTALL_SUMMARY_API=1                   (opsional, 1=auto install summary API saat install SC)
 #   SUMMARY_API_SETUP_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-summary-api.sh
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
@@ -87,7 +87,7 @@ WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}"
 WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}"
 WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}"
 SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
-UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"
+UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-autoscript-compat.sh}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-summary-api.sh}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
@@ -9869,7 +9869,7 @@ update_script_from_repo() {
   if [[ -z "${url}" ]]; then
     echo "UPDATE_SCRIPT_URL belum diisi di /etc/sc-1forcr.env"
     echo "Contoh:"
-    echo "UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/<user>/<repo>/main/setup-autoscript-compat.sh"
+    echo "UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/<user>/<repo>/main/scripts/setup-autoscript-compat.sh"
     return
   fi
 

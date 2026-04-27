@@ -9,11 +9,13 @@ const PORT = Math.max(1, Number(process.env.LICENSE_API_PORT || 8099) || 8099);
 const LICENSE_API_TOKEN = String(process.env.LICENSE_API_TOKEN || '').trim();
 const INSTALL_SCRIPT_URL = String(
   process.env.INSTALL_SCRIPT_URL ||
-  'https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh'
+  'https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-autoscript-compat.sh'
 ).trim();
-const SC_INSTALLER_LOCAL_PATH = String(
-  process.env.SC_INSTALLER_LOCAL_PATH || path.join(__dirname, 'payload', 'setup-autoscript-compat.sh')
-).trim();
+const DEFAULT_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'scripts', 'setup-autoscript-compat.sh');
+const LEGACY_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'payload', 'setup-autoscript-compat.sh');
+const DEFAULT_SUMMARY_API_LOCAL_PATH = path.join(__dirname, 'scripts', 'setup-summary-api.sh');
+const ENV_SC_INSTALLER_LOCAL_PATH = String(process.env.SC_INSTALLER_LOCAL_PATH || '').trim();
+const ENV_SUMMARY_API_LOCAL_PATH = String(process.env.SUMMARY_API_LOCAL_PATH || '').trim();
 const LICENSE_PUBLIC_BASE_URL = String(process.env.LICENSE_PUBLIC_BASE_URL || '').trim();
 
 const db = new sqlite3.Database(DB_PATH);
@@ -116,6 +118,37 @@ function getBaseUrl(req) {
 function normalizeScriptLineEndings(input) {
   const s = String(input || '');
   return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function uniqPaths(paths) {
+  return [...new Set((Array.isArray(paths) ? paths : []).map((p) => String(p || '').trim()).filter(Boolean))];
+}
+
+function resolveScInstallerLocalPath() {
+  const candidates = uniqPaths([
+    DEFAULT_SC_INSTALLER_LOCAL_PATH,
+    ENV_SC_INSTALLER_LOCAL_PATH,
+    LEGACY_SC_INSTALLER_LOCAL_PATH
+  ]);
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
+  return DEFAULT_SC_INSTALLER_LOCAL_PATH;
+}
+
+function resolveSummaryApiLocalPath() {
+  const candidates = uniqPaths([
+    DEFAULT_SUMMARY_API_LOCAL_PATH,
+    ENV_SUMMARY_API_LOCAL_PATH
+  ]);
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
+  return DEFAULT_SUMMARY_API_LOCAL_PATH;
 }
 
 function renderNotRegisteredNotice(ip = '') {
@@ -233,11 +266,27 @@ app.get('/sc1forcr/installer.sh', async (req, res) => {
     }
 
     const baseUrl = getBaseUrl(req);
-    const hasLocalInstaller = fs.existsSync(SC_INSTALLER_LOCAL_PATH);
+    const scInstallerPath = resolveScInstallerLocalPath();
+    const hasLocalInstaller = fs.existsSync(scInstallerPath);
     const sourceUrl = hasLocalInstaller
-      ? `${baseUrl}/sc1forcr/payload/setup-autoscript-compat.sh`
+      ? `${baseUrl}/sc1forcr/payload/scripts/setup-autoscript-compat.sh`
       : INSTALL_SCRIPT_URL;
+    const summaryApiPath = resolveSummaryApiLocalPath();
+    const hasLocalSummaryApi = fs.existsSync(summaryApiPath);
+    const summaryApiUrl = hasLocalSummaryApi
+      ? `${baseUrl}/sc1forcr/payload/scripts/setup-summary-api.sh`
+      : '';
     const activateUrl = `${baseUrl}/sc1forcr/license/activate`;
+    const envLines = [
+      'LICENSE_ENFORCE=1',
+      `LICENSE_API_URL="${activateUrl}"`,
+      `LICENSE_API_TOKEN="${LICENSE_API_TOKEN}"`,
+      `LICENSE_KEY="IP_REGISTERED_${ip}"`,
+      `UPDATE_SCRIPT_URL="${sourceUrl}"`
+    ];
+    if (hasLocalSummaryApi) {
+      envLines.push(`SUMMARY_API_SETUP_URL="${summaryApiUrl}"`);
+    }
     const script = `#!/usr/bin/env bash
 set -euo pipefail
 
@@ -245,11 +294,7 @@ TMP_SC="/tmp/setup-autoscript-compat.sh"
 curl -fsSL "${sourceUrl}" -o "$TMP_SC"
 chmod +x "$TMP_SC"
 
-LICENSE_ENFORCE=1 \\
-LICENSE_API_URL="${activateUrl}" \\
-LICENSE_API_TOKEN="${LICENSE_API_TOKEN}" \\
-LICENSE_KEY="IP_REGISTERED_${ip}" \\
-UPDATE_SCRIPT_URL="${sourceUrl}" \\
+${envLines.map((v) => `${v} \\`).join('\n')}
 bash "$TMP_SC"
 `;
     return res.type('text/plain').send(script);
@@ -270,10 +315,57 @@ app.get('/sc1forcr/payload/setup-autoscript-compat.sh', async (req, res) => {
       if (latest && isExpired) return res.type('text/plain').send(renderExpiredBash(ip));
       return res.type('text/plain').send(renderNotRegisteredBash(ip));
     }
-    if (!fs.existsSync(SC_INSTALLER_LOCAL_PATH)) {
+    const scInstallerPath = resolveScInstallerLocalPath();
+    if (!fs.existsSync(scInstallerPath)) {
       return res.status(404).type('text/plain').send('Installer lokal belum diupload admin.');
     }
-    const content = normalizeScriptLineEndings(fs.readFileSync(SC_INSTALLER_LOCAL_PATH, 'utf8'));
+    const content = normalizeScriptLineEndings(fs.readFileSync(scInstallerPath, 'utf8'));
+    return res.type('text/plain').send(content);
+  } catch (e) {
+    return res.status(500).type('text/plain').send(`Internal error: ${e.message}`);
+  }
+});
+
+app.get('/sc1forcr/payload/scripts/setup-autoscript-compat.sh', async (req, res) => {
+  try {
+    const allowDomain = await isDomainAllowed(req);
+    if (!allowDomain) return res.status(403).type('text/plain').send('Forbidden domain');
+    const ip = getClientIp(req);
+    const reg = await findActiveRegistrationByIp(ip);
+    if (!reg) {
+      const latest = await findLatestRegistrationByIp(ip);
+      const isExpired = Number(latest?.expires_at || 0) > 0 && Date.now() > Number(latest.expires_at);
+      if (latest && isExpired) return res.type('text/plain').send(renderExpiredBash(ip));
+      return res.type('text/plain').send(renderNotRegisteredBash(ip));
+    }
+    const scInstallerPath = resolveScInstallerLocalPath();
+    if (!fs.existsSync(scInstallerPath)) {
+      return res.status(404).type('text/plain').send('Installer lokal belum diupload admin.');
+    }
+    const content = normalizeScriptLineEndings(fs.readFileSync(scInstallerPath, 'utf8'));
+    return res.type('text/plain').send(content);
+  } catch (e) {
+    return res.status(500).type('text/plain').send(`Internal error: ${e.message}`);
+  }
+});
+
+app.get('/sc1forcr/payload/scripts/setup-summary-api.sh', async (req, res) => {
+  try {
+    const allowDomain = await isDomainAllowed(req);
+    if (!allowDomain) return res.status(403).type('text/plain').send('Forbidden domain');
+    const ip = getClientIp(req);
+    const reg = await findActiveRegistrationByIp(ip);
+    if (!reg) {
+      const latest = await findLatestRegistrationByIp(ip);
+      const isExpired = Number(latest?.expires_at || 0) > 0 && Date.now() > Number(latest.expires_at);
+      if (latest && isExpired) return res.type('text/plain').send(renderExpiredBash(ip));
+      return res.type('text/plain').send(renderNotRegisteredBash(ip));
+    }
+    const summaryApiPath = resolveSummaryApiLocalPath();
+    if (!fs.existsSync(summaryApiPath)) {
+      return res.status(404).type('text/plain').send('Summary API installer lokal belum tersedia.');
+    }
+    const content = normalizeScriptLineEndings(fs.readFileSync(summaryApiPath, 'utf8'));
     return res.type('text/plain').send(content);
   } catch (e) {
     return res.status(500).type('text/plain').send(`Internal error: ${e.message}`);

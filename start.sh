@@ -61,7 +61,7 @@ prompt_default "LICENSE_API_PORT" "8099" LICENSE_API_PORT
 prompt_default "LICENSE_PUBLIC_BASE_URL (boleh kosong)" "" LICENSE_PUBLIC_BASE_URL
 prompt_default "AUTO_PROVISION_DOMAIN (1=auto nginx+ssl saat add domain admin)" "1" AUTO_PROVISION_DOMAIN
 prompt_default "CERTBOT_EMAIL (kosong=unsafe no-email)" "" CERTBOT_EMAIL
-prompt_default "INSTALL_SCRIPT_URL" "https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-autoscript-compat.sh" INSTALL_SCRIPT_URL
+prompt_default "INSTALL_SCRIPT_URL (opsional, kosong=otomatis via VPS bot)" "" INSTALL_SCRIPT_URL
 prompt_default "SC_INSTALLER_LOCAL_PATH" "${APP_DIR}/scripts/setup-autoscript-compat.sh" SC_INSTALLER_LOCAL_PATH
 prompt_default "SUMMARY_API_LOCAL_PATH" "${APP_DIR}/scripts/setup-summary-api.sh" SUMMARY_API_LOCAL_PATH
 prompt_required "LICENSE_API_TOKEN (token rahasia verifikasi lisensi)" LICENSE_API_TOKEN

@@ -371,8 +371,13 @@ function formatRemainingDays(expiresAt) {
   if (!n) return 'tanpa batas';
   const diff = n - Date.now();
   if (diff <= 0) return 'sudah kedaluwarsa';
-  const days = Math.ceil(diff / DAY_MS);
-  return `${days} hari lagi`;
+  const totalMinutes = Math.floor(diff / 60000);
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days} hari ${hours} jam ${minutes} menit`;
+  if (hours > 0) return `${hours} jam ${minutes} menit`;
+  return `${Math.max(1, minutes)} menit`;
 }
 
 function formatTopupStatus(status) {

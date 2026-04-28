@@ -7,10 +7,6 @@ const sqlite3 = require('sqlite3').verbose();
 const DB_PATH = String(process.env.DB_PATH || path.join(__dirname, 'sc1forcrnexus.db')).trim();
 const PORT = Math.max(1, Number(process.env.LICENSE_API_PORT || 8099) || 8099);
 const LICENSE_API_TOKEN = String(process.env.LICENSE_API_TOKEN || '').trim();
-const INSTALL_SCRIPT_URL = String(
-  process.env.INSTALL_SCRIPT_URL ||
-  'https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-autoscript-compat.sh'
-).trim();
 const DEFAULT_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'scripts', 'setup-autoscript-compat.sh');
 const LEGACY_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'payload', 'setup-autoscript-compat.sh');
 const DEFAULT_SUMMARY_API_LOCAL_PATH = path.join(__dirname, 'scripts', 'setup-summary-api.sh');
@@ -268,9 +264,10 @@ app.get('/sc1forcr/installer.sh', async (req, res) => {
     const baseUrl = getBaseUrl(req);
     const scInstallerPath = resolveScInstallerLocalPath();
     const hasLocalInstaller = fs.existsSync(scInstallerPath);
-    const sourceUrl = hasLocalInstaller
-      ? `${baseUrl}/sc1forcr/payload/scripts/setup-autoscript-compat.sh`
-      : INSTALL_SCRIPT_URL;
+    if (!hasLocalInstaller) {
+      return res.status(500).type('text/plain').send('Installer lokal belum tersedia di VPS bot (scripts/setup-autoscript-compat.sh).');
+    }
+    const sourceUrl = `${baseUrl}/sc1forcr/payload/scripts/setup-autoscript-compat.sh`;
     const summaryApiPath = resolveSummaryApiLocalPath();
     const hasLocalSummaryApi = fs.existsSync(summaryApiPath);
     const summaryApiUrl = hasLocalSummaryApi

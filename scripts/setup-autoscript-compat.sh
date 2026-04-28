@@ -22,9 +22,9 @@ set -euo pipefail
 #   WILDCARD_ENABLE=0                           (opsional, 1=aktif wildcard cert DNS-01)
 #   WILDCARD_BASE_DOMAIN=example.com            (opsional, wajib saat wildcard aktif)
 #   WILDCARD_CF_API_TOKEN=                      (opsional, token Cloudflare DNS edit)
-#   UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-autoscript-compat.sh
+#   UPDATE_SCRIPT_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-autoscript-compat.sh
 #   AUTO_INSTALL_SUMMARY_API=1                   (opsional, 1=auto install summary API saat install SC)
-#   SUMMARY_API_SETUP_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-summary-api.sh
+#   SUMMARY_API_SETUP_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-summary-api.sh
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
 #   ZIVPN_SERVICE_NAME=zivpn
@@ -87,9 +87,9 @@ WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}"
 WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}"
 WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}"
 SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
-UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-autoscript-compat.sh}"
+UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
-SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-summary-api.sh}"
+SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
 API_PORT="${API_PORT:-8088}"
@@ -9862,15 +9862,23 @@ show_zivpn_online() {
 }
 
 update_script_from_repo() {
-  local url tmp active_backend alt_url downloaded_ok
+  local url tmp active_backend downloaded_ok derived_url
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver
   url="${UPDATE_SCRIPT_URL:-}"
+  derived_url=""
+  if [[ -n "${LICENSE_API_URL:-}" ]]; then
+    derived_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')/sc1forcr/payload/scripts/setup-autoscript-compat.sh"
+  fi
+  # Local-first: jika URL update kosong/masih default github, pakai endpoint installer VPS bot.
+  if [[ -n "${derived_url}" ]] && { [[ -z "${url}" ]] || [[ "${url}" == *"raw.githubusercontent.com/"* ]]; }; then
+    url="${derived_url}"
+  fi
   if [[ -z "${url}" ]]; then
-    echo "UPDATE_SCRIPT_URL belum diisi di /etc/sc-1forcr.env"
-    echo "Contoh:"
-    echo "UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/<user>/<repo>/main/scripts/setup-autoscript-compat.sh"
+    echo "UPDATE_SCRIPT_URL belum terdeteksi."
+    echo "Pastikan LICENSE_API_URL mengarah ke VPS bot, atau isi UPDATE_SCRIPT_URL ke endpoint VPS bot."
+    echo "Contoh: https://<domain-bot>/sc1forcr/payload/scripts/setup-autoscript-compat.sh"
     return
   fi
 
@@ -9883,15 +9891,6 @@ update_script_from_repo() {
   echo "Download update script dari: ${url}"
   if curl -fsSL "${url}" -o "${tmp}"; then
     downloaded_ok=1
-  else
-    # Fallback path otomatis untuk repo yang menyimpan file di /scripts/.
-    alt_url="$(echo "${url}" | sed 's|/main/setup-autoscript-compat\.sh$|/main/scripts/setup-autoscript-compat.sh|')"
-    if [[ "${alt_url}" != "${url}" ]]; then
-      echo "URL utama gagal, coba fallback: ${alt_url}"
-      if curl -fsSL "${alt_url}" -o "${tmp}"; then
-        downloaded_ok=1
-      fi
-    fi
   fi
   if [[ "${downloaded_ok}" != "1" ]]; then
     echo "Gagal download update script."
@@ -10103,8 +10102,22 @@ Time     : $(date '+%F %T')"
 }
 
 install_summary_api_1forcr() {
-  local url tmp
+  local url tmp derived_url
   url="${SUMMARY_API_SETUP_URL}"
+  derived_url=""
+  if [[ -n "${LICENSE_API_URL:-}" ]]; then
+    derived_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')/sc1forcr/payload/scripts/setup-summary-api.sh"
+  fi
+  # Local-first: jika URL summary kosong/masih default github, pakai endpoint installer VPS bot.
+  if [[ -n "${derived_url}" ]] && { [[ -z "${url}" ]] || [[ "${url}" == *"raw.githubusercontent.com/"* ]]; }; then
+    url="${derived_url}"
+  fi
+  if [[ -z "${url}" ]]; then
+    echo "SUMMARY_API_SETUP_URL belum terdeteksi."
+    echo "Pastikan LICENSE_API_URL mengarah ke VPS bot, atau isi SUMMARY_API_SETUP_URL ke endpoint VPS bot."
+    echo "Contoh: https://<domain-bot>/sc1forcr/payload/scripts/setup-summary-api.sh"
+    return 1
+  fi
   tmp="/tmp/setup-summary-api.sh"
   echo "Install Summary API 1FORCR..."
   if ! curl -fL --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; then

@@ -6266,6 +6266,78 @@ short_list() {
   fi
 }
 
+msg="SC 1FORCR NOTIF
+Event    : ONLINE_REPORT
+Domain   : ${DOMAIN}
+Waktu    : $(date '+%F %T')
+Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
+Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik (XRAY last seen)
+Handoff  : ${ZIVPN_HANDOFF_GRACE_SECONDS} detik (ZIVPN)
+
+RINGKASAN AKUN AKTIF 
+- SSH/UDPHC : ${acct_ssh}
+- VMESS     : ${acct_vmess}
+- VLESS     : ${acct_vless}
+- TROJAN    : ${acct_trojan}
+
+ONLINE TERDETEKSI
+  ==============================================
+- SSH       : ${ssh_cnt}
+  User      : $(short_list "${ssh_users}" 10)
+  ==============================================
+- XRAY      : ${xray_cnt}
+  User      : $(short_list "${xray_users}" 10)
+  ==============================================
+- UDPHC     : ${udphc_cnt}
+  User      : $(short_list "${udphc_users}" 10)
+  ==============================================
+- ZIVPN     : ${zivpn_cnt}
+  User      : $(short_list "${zivpn_users}" 10)
+  ==============================================
+"
+
+send_tg "${msg}"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-online-notify
+
+  cat > /etc/systemd/system/sc-1forcr-online-notify.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Online Account Notify
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-online-notify
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR online account notifier every ${notify_interval_h} hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${notify_interval_h}h
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-online-notify.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  if [[ "${ONLINE_NOTIFY_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  fi
+}
+
 setup_auto_pull_update_timer() {
   local interval
   interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" | tr -cd '0-9')"
@@ -6385,78 +6457,6 @@ EOF
     systemctl start sc-1forcr-pull-update.service >/dev/null 2>&1 || true
   else
     systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
-  fi
-}
-
-msg="SC 1FORCR NOTIF
-Event    : ONLINE_REPORT
-Domain   : ${DOMAIN}
-Waktu    : $(date '+%F %T')
-Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
-Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik (XRAY last seen)
-Handoff  : ${ZIVPN_HANDOFF_GRACE_SECONDS} detik (ZIVPN)
-
-RINGKASAN AKUN AKTIF 
-- SSH/UDPHC : ${acct_ssh}
-- VMESS     : ${acct_vmess}
-- VLESS     : ${acct_vless}
-- TROJAN    : ${acct_trojan}
-
-ONLINE TERDETEKSI
-  ==============================================
-- SSH       : ${ssh_cnt}
-  User      : $(short_list "${ssh_users}" 10)
-  ==============================================
-- XRAY      : ${xray_cnt}
-  User      : $(short_list "${xray_users}" 10)
-  ==============================================
-- UDPHC     : ${udphc_cnt}
-  User      : $(short_list "${udphc_users}" 10)
-  ==============================================
-- ZIVPN     : ${zivpn_cnt}
-  User      : $(short_list "${zivpn_users}" 10)
-  ==============================================
-"
-
-send_tg "${msg}"
-EOF
-  chmod +x /usr/local/sbin/sc-1forcr-online-notify
-
-  cat > /etc/systemd/system/sc-1forcr-online-notify.service <<'EOF'
-[Unit]
-Description=SC 1FORCR Online Account Notify
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/sc-1forcr-online-notify
-NoNewPrivileges=true
-PrivateTmp=true
-EOF
-
-  cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF
-[Unit]
-Description=Run SC 1FORCR online account notifier every ${notify_interval_h} hours
-
-[Timer]
-OnBootSec=10min
-OnUnitActiveSec=${notify_interval_h}h
-AccuracySec=1min
-RandomizedDelaySec=0
-Persistent=true
-Unit=sc-1forcr-online-notify.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload
-  if [[ "${ONLINE_NOTIFY_ENABLE}" == "1" ]]; then
-    systemctl enable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
-    systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
-  else
-    systemctl disable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
   fi
 }
 

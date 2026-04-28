@@ -1469,14 +1469,16 @@ function runCommand(command, timeoutMs = 20 * 60 * 1000) {
   }
 }
 
-function triggerScAutoUpdate() {
+function triggerScAutoUpdate(updateScriptUrlInput = '') {
   const cmd = [
     'set -euo pipefail',
     '[ -f /etc/sc-1forcr.env ] && source /etc/sc-1forcr.env || true',
     'BASE_FROM_LICENSE="$(printf \'%s\' "${LICENSE_API_URL:-}" | sed \'s|/sc1forcr/license/activate$||\')"',
     'DERIVED_URL=""',
     'if [[ -n "$BASE_FROM_LICENSE" ]]; then DERIVED_URL="${BASE_FROM_LICENSE}/sc1forcr/payload/scripts/setup-autoscript-compat.sh"; fi',
+    `URL_OVERRIDE="${String(updateScriptUrlInput || '').replace(/"/g, '\\"')}"`,
     'URL="${UPDATE_SCRIPT_URL:-}"',
+    'if [[ -n "$URL_OVERRIDE" ]]; then URL="$URL_OVERRIDE"; fi',
     'if [[ -n "$DERIVED_URL" ]] && { [[ -z "$URL" ]] || [[ "$URL" == *"raw.githubusercontent.com/"* ]]; }; then URL="$DERIVED_URL"; fi',
     'if [[ -z "$URL" ]]; then',
     '  echo "UPDATE_SCRIPT_URL tidak tersedia dan LICENSE_API_URL tidak valid." >&2',
@@ -1979,6 +1981,7 @@ app.post('/internal/trigger-update', (req, res) => {
   const releaseVersion = String(req.body?.release_version || '').trim();
   const releaseDescription = String(req.body?.release_description || '').trim();
   const releaseActor = String(req.body?.release_actor || '').trim();
+  const updateScriptUrl = String(req.body?.update_script_url || '').trim();
   return authorizeAndRun(req, res, (db) => {
     db.close();
     if (!['sc', 'api', 'both'].includes(component)) {
@@ -1987,7 +1990,7 @@ app.post('/internal/trigger-update', (req, res) => {
 
     const result = { ok: true, component, steps: [] };
     if (component === 'sc' || component === 'both') {
-      const scRes = triggerScAutoUpdate();
+      const scRes = triggerScAutoUpdate(updateScriptUrl);
       result.steps.push({ step: 'sc_update', ...scRes });
       if (!scRes.ok) {
         return res.status(Number(scRes.statusCode || 500)).json({ ok: false, message: scRes.message, result });

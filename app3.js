@@ -1305,11 +1305,13 @@ async function broadcastUpdateNoticeToUsers(userIdsInput, message) {
 }
 
 async function runAdminUpdateSingle(ctx, host, key, component, version, description) {
+  const scriptUrls = await buildBotScriptUrls();
   const payload = {
     component,
     release_version: version || '',
     release_description: description || '',
-    release_actor: String(ctx.from?.id || '')
+    release_actor: String(ctx.from?.id || ''),
+    update_script_url: scriptUrls.updateScriptUrl || ''
   };
   const resp = await apiPost(host, key, '/internal/trigger-update', payload, 40 * 60 * 1000);
   await saveServerKeyForHostAllOwners(host, key, ctx.from.id);
@@ -1334,6 +1336,7 @@ async function runAdminUpdateSingle(ctx, host, key, component, version, descript
 
 async function runAdminUpdateGlobal(ctx, component, version, description) {
   const hosts = await listActiveScHosts(2000).catch(() => []);
+  const scriptUrls = await buildBotScriptUrls();
   if (!hosts.length) {
     return {
       ok: false,
@@ -1361,7 +1364,8 @@ async function runAdminUpdateGlobal(ctx, component, version, description) {
           component,
           release_version: version || '',
           release_description: description || '',
-          release_actor: String(ctx.from?.id || '')
+          release_actor: String(ctx.from?.id || ''),
+          update_script_url: scriptUrls.updateScriptUrl || ''
         },
         40 * 60 * 1000
       );
@@ -1666,6 +1670,15 @@ async function buildInstallerQuickCopyText() {
     text:
       `Link instalasi untuk di vps:\n<pre><code>${safeCmd}</code></pre>`,
     parse_mode: 'HTML'
+  };
+}
+
+async function buildBotScriptUrls() {
+  const domain = await getPrimaryApiDomain().catch(() => '');
+  const d = String(domain || '').trim();
+  if (!d) return { updateScriptUrl: '' };
+  return {
+    updateScriptUrl: `https://${d}/sc1forcr/payload/scripts/setup-autoscript-compat.sh`
   };
 }
 

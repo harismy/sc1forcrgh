@@ -645,6 +645,26 @@ async function getLatestRegistrationState(userId) {
   );
 }
 
+async function getRegistrationStateByIp(userId, ip, adminMode = false) {
+  const now = Date.now();
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [now, now]
+  ).catch(() => {});
+  const host = normalizeHost(ip);
+  if (!isIpv4(host)) return null;
+  if (adminMode) {
+    return dbGet(
+      "SELECT user_id, vps_ip, client_name, status, expires_at, updated_at FROM sc_registrations WHERE LOWER(TRIM(REPLACE(vps_ip, char(13), ''))) = LOWER(TRIM(?)) ORDER BY updated_at DESC LIMIT 1",
+      [host]
+    );
+  }
+  return dbGet(
+    "SELECT user_id, vps_ip, client_name, status, expires_at, updated_at FROM sc_registrations WHERE user_id = ? AND LOWER(TRIM(REPLACE(vps_ip, char(13), ''))) = LOWER(TRIM(?)) ORDER BY updated_at DESC LIMIT 1",
+    [userId, host]
+  );
+}
+
 async function listActiveRegistrationsForAdmin(limit = 15) {
   const now = Date.now();
   await dbRun(
@@ -979,6 +999,7 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('SC Saya', 'm_my_sc')],
+    [Markup.button.callback('Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
     [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
     [Markup.button.callback('Cek Saldo', 'm_cek_saldo'), Markup.button.callback('Cadangkan SC', 'm_backup_now')],
     [Markup.button.callback('Pulihkan SC', 'm_restore_upload'), Markup.button.callback('Hapus Semua Akun', 'm_delete_all_accounts')],
@@ -2079,6 +2100,19 @@ bot.action('m_my_sc', async (ctx) => {
   return ctx.reply(`IP SC terdaftar (${regs.length}):\n${lines.join('\n')}`, mainMenu());
 });
 
+bot.action('m_check_sc_ip_expiry', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  userState.set(ctx.chat.id, { step: 'check_sc_ip_expiry' });
+  return ctx.reply(
+    uiBox('CEK EXPIRED IP VPS', [
+      'Masukkan IP VPS yang ingin dicek.',
+      'Contoh: 103.10.10.2',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
 bot.action('m_install_link', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
@@ -2831,6 +2865,32 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(`Trigger update gagal: ${parseErr(err)}`, adminMenu());
       }
+    }
+
+    if (state.step === 'check_sc_ip_expiry') {
+      const ip = normalizeHost(text);
+      if (!isIpv4(ip)) {
+        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      }
+      const row = await getRegistrationStateByIp(ctx.from.id, ip, isAdmin(ctx.from.id));
+      userState.delete(ctx.chat.id);
+      if (!row) {
+        return ctx.reply(`IP ${ip} tidak ditemukan pada data SC kamu.`, mainMenu());
+      }
+
+      const st = String(row.status || '').trim().toLowerCase() || '-';
+      const exp = Number(row.expires_at || 0);
+      const statusText = st === 'active' ? formatRemainingDays(exp) : (st === 'deleted_by_admin' ? 'Expired by admin' : 'Expired');
+      return ctx.reply(
+        uiBox('STATUS IP VPS', [
+          `IP          : ${normalizeHost(row.vps_ip || ip)}`,
+          `Client Name : ${normalizeClientName(row.client_name) || '-'}`,
+          `Status DB   : ${st}`,
+          `Expired At  : ${formatDateTime(row.expires_at)}`,
+          `Sisa Aktif  : ${statusText}`
+        ]),
+        mainMenu()
+      );
     }
 
     if (state.step === 'register_sc_client_name') {

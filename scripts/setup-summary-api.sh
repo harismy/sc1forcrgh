@@ -1472,7 +1472,7 @@ function runCommand(command, timeoutMs = 20 * 60 * 1000) {
 function triggerScAutoUpdate(updateScriptUrlInput = '') {
   const cmd = [
     'set -euo pipefail',
-    '[ -f /etc/sc-1forcr.env ] && source /etc/sc-1forcr.env || true',
+    'if [[ -f /etc/sc-1forcr.env ]]; then set -a; source /etc/sc-1forcr.env; set +a; fi',
     'BASE_FROM_LICENSE="$(printf \'%s\' "${LICENSE_API_URL:-}" | sed \'s|/sc1forcr/license/activate$||\')"',
     'DERIVED_URL=""',
     'if [[ -n "$BASE_FROM_LICENSE" ]]; then DERIVED_URL="${BASE_FROM_LICENSE}/sc1forcr/payload/scripts/setup-autoscript-compat.sh"; fi',

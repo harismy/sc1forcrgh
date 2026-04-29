@@ -1714,7 +1714,10 @@ function isRuntimeLicenseDenied() {
   }
   const state = readLicenseFileState();
   const badStatuses = new Set(['expired', 'rejected', 'deny', 'denied', 'blocked', 'suspended', 'inactive']);
-  if (state.status && badStatuses.has(state.status)) return true;
+  // Jangan langsung deny hanya karena status transient "rejected" saat expires_at masih valid.
+  if (state.status && badStatuses.has(state.status) && !(state.expiresAt > 0 && Math.floor(Date.now() / 1000) < state.expiresAt)) {
+    return true;
+  }
   if (state.expiresAt > 0) {
     const now = Math.floor(Date.now() / 1000);
     if (now >= state.expiresAt) return true;
@@ -8415,7 +8418,8 @@ EOF
   expires_epoch="$(parse_license_expire_epoch "${expires_raw}")"
   now_epoch="$(date +%s)"
 
-  if [[ "${status}" == "expired" || "${status}" == "rejected" || "${status}" == "deny" || "${status}" == "denied" || "${status}" == "blocked" || "${status}" == "suspended" || "${status}" == "inactive" ]] || \
+  if { [[ "${status}" == "expired" || "${status}" == "rejected" || "${status}" == "deny" || "${status}" == "denied" || "${status}" == "blocked" || "${status}" == "suspended" || "${status}" == "inactive" ]] && \
+       [[ "${expires_epoch}" -le 0 || "${now_epoch}" -ge "${expires_epoch}" ]]; } || \
      [[ "${expires_epoch}" -gt 0 && "${now_epoch}" -ge "${expires_epoch}" ]]; then
     clear
     cat <<EOF
@@ -8433,7 +8437,6 @@ https://t.me/sc1forcrnexusbot
 Setelah perpanjang berhasil, silakan ulangi install/update.
 ============================================================
 EOF
-    systemctl disable --now sc-1forcr-api >/dev/null 2>&1 || systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
     return 1
   fi
   # Lisensi sudah valid lagi: pastikan API aktif kembali tanpa perlu install/update ulang.
@@ -10691,6 +10694,49 @@ apply_final_service_restart_chain() {
   systemctl restart sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
 }
 
+sync_zivpn_auth_token_with_api_runtime() {
+  local app_env api_tok api_port
+  app_env="/opt/sc-1forcr/.env"
+  if [[ ! -f "${app_env}" ]]; then
+    app_env="/opt/potato-compat/.env"
+  fi
+  if [[ ! -f "${app_env}" ]]; then
+    echo "Skip sync token ZIVPN: app env tidak ditemukan."
+    return 0
+  fi
+
+  api_tok="$(grep -m1 '^API_AUTH_TOKEN=' "${app_env}" 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
+  if [[ -z "${api_tok}" ]]; then
+    api_tok="$(grep -m1 '^AUTH_TOKEN=' "${app_env}" 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
+  fi
+  if [[ -z "${api_tok}" ]]; then
+    echo "Skip sync token ZIVPN: API token runtime kosong."
+    return 0
+  fi
+
+  api_port="$(grep -m1 '^API_PORT=' /etc/sc-1forcr.env 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
+  if [[ -z "${api_port}" ]]; then
+    api_port="$(grep -m1 '^API_PORT=' "${app_env}" 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
+  fi
+  [[ -z "${api_port}" ]] && api_port="8088"
+
+  ZIVPN_HTTP_AUTH_TOKEN="${api_tok}"
+  ZIVPN_HTTP_AUTH_URL="http://127.0.0.1:${api_port}/internal/zivpn-auth?token=${api_tok}"
+  API_AUTH_TOKEN="${api_tok}"
+  API_PORT="${api_port}"
+
+  update_sc_env_var "API_AUTH_TOKEN" "${API_AUTH_TOKEN}"
+  update_sc_env_var "API_PORT" "${API_PORT}"
+  update_sc_env_var "ZIVPN_HTTP_AUTH_TOKEN" "${ZIVPN_HTTP_AUTH_TOKEN}"
+  update_sc_env_var "ZIVPN_HTTP_AUTH_URL" "${ZIVPN_HTTP_AUTH_URL}"
+
+  update_app_env_var "API_AUTH_TOKEN" "${API_AUTH_TOKEN}"
+  update_app_env_var "AUTH_TOKEN" "${API_AUTH_TOKEN}"
+  update_app_env_var "API_PORT" "${API_PORT}"
+
+  echo "Sinkron token ZIVPN<->API: OK (port ${API_PORT}, token $(mask_secret "${API_AUTH_TOKEN}"))"
+}
+
 show_install_banner() {
   cat <<'EOF'
 =========================================
@@ -10776,6 +10822,7 @@ main() {
   write_cli_menu
   setup_auto_menu_login
   write_version_marker
+  sync_zivpn_auth_token_with_api_runtime
   apply_final_service_restart_chain
   post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."

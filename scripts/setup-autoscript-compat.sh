@@ -52,6 +52,7 @@ set -euo pipefail
 #   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
 #   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
+#   AUTO_PULL_UPDATE_ENABLE=0                    (opsional, default nonaktif; update manual via menu)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
@@ -80,6 +81,7 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 API_AUTH_TOKEN="${API_AUTH_TOKEN:-}"
+AUTH_TOKEN="${AUTH_TOKEN:-}"
 LICENSE_ENFORCE="${LICENSE_ENFORCE:-1}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
@@ -126,7 +128,7 @@ AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
-AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-0}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-30}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
@@ -169,11 +171,18 @@ fi
 # EMAIL opsional: jika kosong/invalid, certbot dijalankan tanpa email
 # dengan --register-unsafely-without-email.
 
-if [[ -z "${API_AUTH_TOKEN}" ]]; then
+if [[ -z "${API_AUTH_TOKEN}" && -n "${AUTH_TOKEN}" ]]; then
+  API_AUTH_TOKEN="${AUTH_TOKEN}"
+fi
+if [[ -z "${AUTH_TOKEN}" && -n "${API_AUTH_TOKEN}" ]]; then
+  AUTH_TOKEN="${API_AUTH_TOKEN}"
+fi
+if [[ -z "${API_AUTH_TOKEN}" && -z "${AUTH_TOKEN}" ]]; then
   API_AUTH_TOKEN="$(openssl rand -hex 24)"
+  AUTH_TOKEN="${API_AUTH_TOKEN}"
 fi
 if [[ -z "${ZIVPN_HTTP_AUTH_TOKEN}" ]]; then
-  ZIVPN_HTTP_AUTH_TOKEN="${API_AUTH_TOKEN}"
+  ZIVPN_HTTP_AUTH_TOKEN="${AUTH_TOKEN}"
 fi
 if [[ -z "${ZIVPN_HTTP_AUTH_URL}" ]]; then
   ZIVPN_HTTP_AUTH_URL="http://127.0.0.1:${API_PORT}/internal/zivpn-auth?token=${ZIVPN_HTTP_AUTH_TOKEN}"
@@ -6345,136 +6354,13 @@ EOF
 }
 
 setup_auto_pull_update_timer() {
-  local interval
-  interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" | tr -cd '0-9')"
-  [[ -z "${interval}" || "${interval}" -lt 5 ]] && interval=30
-
-  cat > /usr/local/sbin/sc-1forcr-pull-update <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-if [[ -f /etc/sc-1forcr.env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source /etc/sc-1forcr.env
-  set +a
-fi
-
-# Jaga kompatibilitas token lama: beberapa runtime menyimpan AUTH_TOKEN
-# tanpa API_AUTH_TOKEN. Pastikan installer update tidak membuat token baru acak.
-if [[ -z "${API_AUTH_TOKEN:-}" && -n "${AUTH_TOKEN:-}" ]]; then
-  API_AUTH_TOKEN="${AUTH_TOKEN}"
-fi
-if [[ -z "${ZIVPN_HTTP_AUTH_TOKEN:-}" && -n "${API_AUTH_TOKEN:-}" ]]; then
-  ZIVPN_HTTP_AUTH_TOKEN="${API_AUTH_TOKEN}"
-fi
-
-BASE_URL="${LICENSE_API_URL:-}"
-BASE_URL="$(printf '%s' "${BASE_URL}" | sed 's|/sc1forcr/license/activate$||')"
-UPDATE_URL="${UPDATE_SCRIPT_URL:-}"
-SUMMARY_URL="${SUMMARY_API_SETUP_URL:-}"
-DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
-
-if [[ -n "${BASE_URL}" ]]; then
-  if [[ -z "${UPDATE_URL}" ]]; then
-    UPDATE_URL="${BASE_URL}/sc1forcr/payload/scripts/setup-autoscript-compat.sh"
-  fi
-  if [[ -z "${SUMMARY_URL}" ]]; then
-    SUMMARY_URL="${BASE_URL}/sc1forcr/payload/scripts/setup-summary-api.sh"
-  fi
-fi
-
-if [[ -z "${UPDATE_URL}" ]]; then
-  echo "[pull-update] skip: UPDATE_URL kosong"
-  exit 0
-fi
-
-mkdir -p /var/lib/sc-1forcr
-
-SC_TMP="$(mktemp /tmp/sc-1forcr-pull-sc-XXXXXX.sh)"
-SC_HASH_FILE="/var/lib/sc-1forcr/pull-update.sc.sha256"
-SC_NEW_HASH=""
-SC_OLD_HASH="$(cat "${SC_HASH_FILE}" 2>/dev/null || true)"
-
-curl -fsSL "${UPDATE_URL}" -o "${SC_TMP}"
-sed -i 's/\r$//' "${SC_TMP}"
-chmod +x "${SC_TMP}"
-bash -n "${SC_TMP}"
-SC_NEW_HASH="$(sha256sum "${SC_TMP}" | awk '{print $1}')"
-
-if [[ "${SC_NEW_HASH}" != "${SC_OLD_HASH}" ]]; then
-  echo "[pull-update] apply SC update from ${UPDATE_URL}"
-  API_AUTH_TOKEN="${API_AUTH_TOKEN:-}" \
-  ZIVPN_HTTP_AUTH_TOKEN="${ZIVPN_HTTP_AUTH_TOKEN:-${API_AUTH_TOKEN:-}}" \
-  bash "${SC_TMP}"
-  echo "${SC_NEW_HASH}" > "${SC_HASH_FILE}"
-else
-  echo "[pull-update] SC up-to-date"
-fi
-rm -f "${SC_TMP}" >/dev/null 2>&1 || true
-
-if [[ "${AUTO_INSTALL_SUMMARY_API:-1}" != "1" ]]; then
-  exit 0
-fi
-if [[ -z "${SUMMARY_URL}" ]]; then
-  echo "[pull-update] skip summary-api: SUMMARY_URL kosong"
-  exit 0
-fi
-
-SM_TMP="$(mktemp /tmp/sc-1forcr-pull-summary-XXXXXX.sh)"
-SM_HASH_FILE="/var/lib/sc-1forcr/pull-update.summary.sha256"
-SM_NEW_HASH=""
-SM_OLD_HASH="$(cat "${SM_HASH_FILE}" 2>/dev/null || true)"
-
-curl -fsSL "${SUMMARY_URL}" -o "${SM_TMP}"
-sed -i 's/\r$//' "${SM_TMP}"
-chmod +x "${SM_TMP}"
-bash -n "${SM_TMP}"
-SM_NEW_HASH="$(sha256sum "${SM_TMP}" | awk '{print $1}')"
-
-if [[ "${SM_NEW_HASH}" != "${SM_OLD_HASH}" ]]; then
-  echo "[pull-update] apply Summary API update from ${SUMMARY_URL}"
-  APP_DIR="/root/tunnel-sync" POTATO_DB="${DB_PATH}" bash "${SM_TMP}"
-  echo "${SM_NEW_HASH}" > "${SM_HASH_FILE}"
-else
-  echo "[pull-update] Summary API up-to-date"
-fi
-rm -f "${SM_TMP}" >/dev/null 2>&1 || true
-EOF
-  chmod +x /usr/local/sbin/sc-1forcr-pull-update
-
-  cat > /etc/systemd/system/sc-1forcr-pull-update.service <<'EOF'
-[Unit]
-Description=SC 1FORCR Pull Update
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/sc-1forcr-pull-update
-EOF
-
-  cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF
-[Unit]
-Description=SC 1FORCR Pull Update Timer
-
-[Timer]
-OnBootSec=7m
-OnUnitActiveSec=${interval}m
-Unit=sc-1forcr-pull-update.service
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload
-  if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
-    systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
-    systemctl start sc-1forcr-pull-update.service >/dev/null 2>&1 || true
-  else
-    systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
-  fi
+  # Auto pull update dimatikan secara default agar update hanya manual via menu.
+  systemctl stop sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  systemctl disable sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  systemctl stop sc-1forcr-pull-update.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/sc-1forcr-pull-update.timer
+  rm -f /etc/systemd/system/sc-1forcr-pull-update.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 write_cli_menu() {

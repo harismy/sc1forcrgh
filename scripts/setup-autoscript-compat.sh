@@ -6360,6 +6360,15 @@ if [[ -f /etc/sc-1forcr.env ]]; then
   set +a
 fi
 
+# Jaga kompatibilitas token lama: beberapa runtime menyimpan AUTH_TOKEN
+# tanpa API_AUTH_TOKEN. Pastikan installer update tidak membuat token baru acak.
+if [[ -z "${API_AUTH_TOKEN:-}" && -n "${AUTH_TOKEN:-}" ]]; then
+  API_AUTH_TOKEN="${AUTH_TOKEN}"
+fi
+if [[ -z "${ZIVPN_HTTP_AUTH_TOKEN:-}" && -n "${API_AUTH_TOKEN:-}" ]]; then
+  ZIVPN_HTTP_AUTH_TOKEN="${API_AUTH_TOKEN}"
+fi
+
 BASE_URL="${LICENSE_API_URL:-}"
 BASE_URL="$(printf '%s' "${BASE_URL}" | sed 's|/sc1forcr/license/activate$||')"
 UPDATE_URL="${UPDATE_SCRIPT_URL:-}"
@@ -6395,6 +6404,8 @@ SC_NEW_HASH="$(sha256sum "${SC_TMP}" | awk '{print $1}')"
 
 if [[ "${SC_NEW_HASH}" != "${SC_OLD_HASH}" ]]; then
   echo "[pull-update] apply SC update from ${UPDATE_URL}"
+  API_AUTH_TOKEN="${API_AUTH_TOKEN:-}" \
+  ZIVPN_HTTP_AUTH_TOKEN="${ZIVPN_HTTP_AUTH_TOKEN:-${API_AUTH_TOKEN:-}}" \
   bash "${SC_TMP}"
   echo "${SC_NEW_HASH}" > "${SC_HASH_FILE}"
 else
@@ -6538,6 +6549,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 source /etc/sc-1forcr.env
+AUTH_TOKEN="${AUTH_TOKEN:-${API_AUTH_TOKEN:-}}"
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
@@ -10726,6 +10738,7 @@ sync_zivpn_auth_token_with_api_runtime() {
   API_PORT="${api_port}"
 
   update_sc_env_var "API_AUTH_TOKEN" "${API_AUTH_TOKEN}"
+  update_sc_env_var "AUTH_TOKEN" "${API_AUTH_TOKEN}"
   update_sc_env_var "API_PORT" "${API_PORT}"
   update_sc_env_var "ZIVPN_HTTP_AUTH_TOKEN" "${ZIVPN_HTTP_AUTH_TOKEN}"
   update_sc_env_var "ZIVPN_HTTP_AUTH_URL" "${ZIVPN_HTTP_AUTH_URL}"

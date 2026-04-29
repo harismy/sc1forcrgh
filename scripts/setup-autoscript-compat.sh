@@ -59,6 +59,7 @@ set -euo pipefail
 #   ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=300      (opsional, jendela realtime XRAY dalam detik)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
+#   IPLIMIT_AUTO_LOCK_ENABLE=1                   (opsional, 1=auto lock aktif, 0=monitor only)
 #   IPLIMIT_AUTO_TUNE=1                          (opsional, 1=otomatis tuning berbasis RAM/vCPU)
 #   IPLIMIT_DEBUG=1                              (opsional, 0=hemat log, 1=debug detail)
 #   DROPBEAR_LOG_MAX_LINES=auto                  (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
@@ -129,6 +130,7 @@ AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-30}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
+IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
 IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
@@ -1617,6 +1619,7 @@ UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
 DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
@@ -1721,12 +1724,7 @@ function isRuntimeLicenseDenied() {
 function stopApiByLicense(reason) {
   if (licenseApiStopped) return;
   licenseApiStopped = true;
-  console.error(`[license-guard] API disabled: ${String(reason || 'license-invalid')}`);
-  try {
-    execFileSync('systemctl', ['disable', '--now', 'sc-1forcr-api'], { stdio: 'ignore' });
-  } catch (_) {
-    try { execFileSync('systemctl', ['stop', 'sc-1forcr-api'], { stdio: 'ignore' }); } catch (_) {}
-  }
+  console.error(`[license-guard] runtime denied: ${String(reason || 'license-invalid')} (api stays running)`);
 }
 function runtimeLicenseGuard(_req, res, next) {
   if (!isRuntimeLicenseDenied()) return next();
@@ -3497,6 +3495,7 @@ const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CH
   : 10;
 const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
+const AUTO_LOCK_ENABLED = !/^(0|false|off|no)$/i.test(String(process.env.IPLIMIT_AUTO_LOCK_ENABLE || '1').trim());
 const LOCK_SECONDS = LOCK_MINUTES * 60;
 const LOCK_RECHECK_GRACE_SECONDS = Math.max(180, CHECK_INTERVAL_MINUTES * 120);
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
@@ -4876,6 +4875,10 @@ async function unlockExpired(nowTs) {
 }
 
 async function lockIfExceeded(nowTs) {
+  if (!AUTO_LOCK_ENABLED) {
+    if (IPLIMIT_DEBUG) console.log('[iplimit-debug] auto lock disabled by IPLIMIT_AUTO_LOCK_ENABLE=0');
+    return { ssh: 0, xray: 0 };
+  }
   const sshUsage = parseSshAndUdpUsage();
   const zivpnLive = await readZivpnLiveMap(nowTs);
   const sshIpMap = sshUsage.ipMap;
@@ -6502,6 +6505,7 @@ AUTO_PULL_UPDATE_INTERVAL_MINUTES=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}
 ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
 DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}

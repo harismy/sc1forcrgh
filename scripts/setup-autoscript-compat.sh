@@ -10706,6 +10706,61 @@ apply_final_service_restart_chain() {
   systemctl restart sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
 }
 
+update_sc_env_var() {
+  local key="$1" value="$2" tmp
+  [[ -z "${key}" ]] && return 0
+  tmp="$(mktemp)"
+  awk -v k="${key}" -v v="${value}" '
+    BEGIN { done=0 }
+    $0 ~ ("^" k "=") { print k "=" v; done=1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' /etc/sc-1forcr.env > "${tmp}" && mv -f "${tmp}" /etc/sc-1forcr.env
+  chmod 600 /etc/sc-1forcr.env >/dev/null 2>&1 || true
+}
+
+update_app_env_var() {
+  local key="$1" value="$2" app_env tmp
+  [[ -z "${key}" ]] && return 0
+  app_env="/opt/sc-1forcr/.env"
+  [[ ! -f "${app_env}" ]] && app_env="/opt/potato-compat/.env"
+  [[ ! -f "${app_env}" ]] && return 0
+  tmp="$(mktemp)"
+  awk -v k="${key}" -v v="${value}" '
+    BEGIN { done=0 }
+    $0 ~ ("^" k "=") { print k "=" v; done=1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' "${app_env}" > "${tmp}" && mv -f "${tmp}" "${app_env}"
+}
+
+install_summary_api_1forcr() {
+  local url tmp derived_url
+  url="${SUMMARY_API_SETUP_URL:-}"
+  derived_url=""
+  if [[ -n "${LICENSE_API_URL:-}" ]]; then
+    derived_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')/sc1forcr/payload/scripts/setup-summary-api.sh"
+  fi
+  if [[ -n "${derived_url}" ]] && { [[ -z "${url}" ]] || [[ "${url}" == *"raw.githubusercontent.com/"* ]]; }; then
+    url="${derived_url}"
+  fi
+  if [[ -z "${url}" ]]; then
+    echo "SUMMARY_API_SETUP_URL belum terdeteksi."
+    echo "Pastikan LICENSE_API_URL mengarah ke VPS bot, atau isi SUMMARY_API_SETUP_URL ke endpoint VPS bot."
+    echo "Contoh: https://<domain-bot>/sc1forcr/payload/scripts/setup-summary-api.sh"
+    return 1
+  fi
+  tmp="/tmp/setup-summary-api.sh"
+  echo "Install Summary API 1FORCR..."
+  if ! curl -fL --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; then
+    echo "Gagal download script summary API."
+    return 1
+  fi
+  sed -i 's/\r$//' "${tmp}"
+  chmod +x "${tmp}"
+  APP_DIR="/root/tunnel-sync" POTATO_DB="${DB_PATH}" bash "${tmp}"
+}
+
 sync_zivpn_auth_token_with_api_runtime() {
   local app_env api_tok api_port
   app_env="/opt/sc-1forcr/.env"

@@ -29,7 +29,7 @@ set -euo pipefail
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
 #   ZIVPN_SERVICE_NAME=zivpn
 #   ZIVPN_RELOAD_ON_AUTH_CHANGE=0                (opsional, legacy: 1=restart, 0=tanpa restart)
-#   ZIVPN_AUTH_APPLY_MODE=reload                 (opsional: none|reload|restart|reload-restart)
+#   ZIVPN_AUTH_APPLY_MODE=reload-restart         (opsional: none|reload|restart|reload-restart)
 #   ZIVPN_AUTH_MODE=http                         (opsional: http|passwords)
 #   ZIVPN_HTTP_AUTH_URL=                         (opsional, default: http://127.0.0.1:${API_PORT}/internal/zivpn-auth?token=...)
 #   ZIVPN_HTTP_AUTH_TOKEN=                       (opsional, default mengikuti API_AUTH_TOKEN)
@@ -97,7 +97,7 @@ ZIVPN_BIN_URL="${ZIVPN_BIN_URL:-}"
 ZIVPN_RELEASE_TAG="${ZIVPN_RELEASE_TAG:-udp-zivpn_1.4.9}"
 ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE_NAME:-zivpn}"
 ZIVPN_RELOAD_ON_AUTH_CHANGE="${ZIVPN_RELOAD_ON_AUTH_CHANGE:-0}"
-ZIVPN_AUTH_APPLY_MODE="${ZIVPN_AUTH_APPLY_MODE:-reload}"
+ZIVPN_AUTH_APPLY_MODE="${ZIVPN_AUTH_APPLY_MODE:-reload-restart}"
 ZIVPN_AUTH_MODE="${ZIVPN_AUTH_MODE:-http}"
 ZIVPN_HTTP_AUTH_URL="${ZIVPN_HTTP_AUTH_URL:-}"
 ZIVPN_HTTP_AUTH_TOKEN="${ZIVPN_HTTP_AUTH_TOKEN:-}"
@@ -1665,7 +1665,7 @@ const ZIVPN_LIVE_TTL_SECONDS = Number.isFinite(ZIVPN_LIVE_TTL_SECONDS_RAW) && ZI
   : 90;
 const ZIVPN_RELOAD_ON_AUTH_CHANGE = String(process.env.ZIVPN_RELOAD_ON_AUTH_CHANGE || '0').trim() === '1';
 const ZIVPN_AUTH_APPLY_MODE_RAW = String(process.env.ZIVPN_AUTH_APPLY_MODE || '').trim().toLowerCase();
-const ZIVPN_AUTH_APPLY_MODE = ZIVPN_AUTH_APPLY_MODE_RAW || (ZIVPN_RELOAD_ON_AUTH_CHANGE ? 'restart' : 'reload');
+const ZIVPN_AUTH_APPLY_MODE = ZIVPN_AUTH_APPLY_MODE_RAW || (ZIVPN_RELOAD_ON_AUTH_CHANGE ? 'restart' : 'reload-restart');
 const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
 const UDPCUSTOM_SERVICE = process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
@@ -2228,7 +2228,7 @@ function zivpnReloadBySignal() {
 }
 
 function applyZivpnAuthChange() {
-  const mode = String(ZIVPN_AUTH_APPLY_MODE || 'reload').trim().toLowerCase();
+  const mode = String(ZIVPN_AUTH_APPLY_MODE || 'reload-restart').trim().toLowerCase();
   if (mode === 'none' || mode === 'off' || mode === 'disabled') return true;
   if (mode === 'restart') return zivpnReloadByRestart();
   if (mode === 'reload-restart') {

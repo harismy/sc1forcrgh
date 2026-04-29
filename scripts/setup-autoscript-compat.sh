@@ -33,9 +33,9 @@ set -euo pipefail
 #   ZIVPN_AUTH_MODE=http                         (opsional: http|passwords)
 #   ZIVPN_HTTP_AUTH_URL=                         (opsional, default: http://127.0.0.1:${API_PORT}/internal/zivpn-auth?token=...)
 #   ZIVPN_HTTP_AUTH_TOKEN=                       (opsional, default mengikuti API_AUTH_TOKEN)
-#   ZIVPN_LIVE_TTL_SECONDS=90                    (opsional, TTL session live ZIVPN di API)
+#   ZIVPN_LIVE_TTL_SECONDS=300                   (opsional, TTL session live ZIVPN di API)
 #   ZIVPN_ACTIVE_WINDOW_SECONDS=90               (opsional, jendela aktif ZIVPN di checker)
-#   ZIVPN_HANDOFF_GRACE_SECONDS=20               (opsional, toleransi perpindahan IP seluler)
+#   ZIVPN_HANDOFF_GRACE_SECONDS=90               (opsional, toleransi perpindahan IP seluler)
 #   ZIVPN_LISTEN_PORT=5667
 #   ZIVPN_DNAT_RANGE=6000:19999
 #   ZIVPN_DNAT_IFACE=eth0                          (opsional, default auto-detect)
@@ -101,9 +101,9 @@ ZIVPN_AUTH_APPLY_MODE="${ZIVPN_AUTH_APPLY_MODE:-reload-restart}"
 ZIVPN_AUTH_MODE="${ZIVPN_AUTH_MODE:-http}"
 ZIVPN_HTTP_AUTH_URL="${ZIVPN_HTTP_AUTH_URL:-}"
 ZIVPN_HTTP_AUTH_TOKEN="${ZIVPN_HTTP_AUTH_TOKEN:-}"
-ZIVPN_LIVE_TTL_SECONDS="${ZIVPN_LIVE_TTL_SECONDS:-90}"
+ZIVPN_LIVE_TTL_SECONDS="${ZIVPN_LIVE_TTL_SECONDS:-300}"
 ZIVPN_ACTIVE_WINDOW_SECONDS="${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}"
-ZIVPN_HANDOFF_GRACE_SECONDS="${ZIVPN_HANDOFF_GRACE_SECONDS:-20}"
+ZIVPN_HANDOFF_GRACE_SECONDS="${ZIVPN_HANDOFF_GRACE_SECONDS:-90}"
 ZIVPN_LISTEN_PORT="${ZIVPN_LISTEN_PORT:-5667}"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 ZIVPN_DNAT_IFACE="${ZIVPN_DNAT_IFACE:-}"
@@ -1659,7 +1659,7 @@ const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
 const ZIVPN_AUTH_MODE = String(process.env.ZIVPN_AUTH_MODE || 'http').trim().toLowerCase();
 const ZIVPN_HTTP_AUTH_TOKEN = String(process.env.ZIVPN_HTTP_AUTH_TOKEN || AUTH_TOKEN).trim();
-const ZIVPN_LIVE_TTL_SECONDS_RAW = Number(process.env.ZIVPN_LIVE_TTL_SECONDS || 90);
+const ZIVPN_LIVE_TTL_SECONDS_RAW = Number(process.env.ZIVPN_LIVE_TTL_SECONDS || 300);
 const ZIVPN_LIVE_TTL_SECONDS = Number.isFinite(ZIVPN_LIVE_TTL_SECONDS_RAW) && ZIVPN_LIVE_TTL_SECONDS_RAW >= 20
   ? Math.min(Math.floor(ZIVPN_LIVE_TTL_SECONDS_RAW), 1800)
   : 90;
@@ -1851,7 +1851,7 @@ async function touchZivpnLiveSession(username, ip) {
 async function cleanupZivpnLiveSessions() {
   try {
     const nowTs = Math.floor(Date.now() / 1000);
-    const ttl = Math.max(20, Number(ZIVPN_LIVE_TTL_SECONDS || 90));
+    const ttl = Math.max(20, Number(ZIVPN_LIVE_TTL_SECONDS || 300));
     await run("DELETE FROM zivpn_live_sessions WHERE last_seen < ?", [nowTs - ttl]).catch(() => {});
   } catch (_) {}
 }
@@ -3559,7 +3559,7 @@ const ZIVPN_ACTIVE_WINDOW_SECONDS_RAW = Number(process.env.ZIVPN_ACTIVE_WINDOW_S
 const ZIVPN_ACTIVE_WINDOW_SECONDS = Number.isFinite(ZIVPN_ACTIVE_WINDOW_SECONDS_RAW) && ZIVPN_ACTIVE_WINDOW_SECONDS_RAW >= 20
   ? Math.min(Math.floor(ZIVPN_ACTIVE_WINDOW_SECONDS_RAW), 1800)
   : 90;
-const ZIVPN_HANDOFF_GRACE_SECONDS_RAW = Number(process.env.ZIVPN_HANDOFF_GRACE_SECONDS || 20);
+const ZIVPN_HANDOFF_GRACE_SECONDS_RAW = Number(process.env.ZIVPN_HANDOFF_GRACE_SECONDS || 90);
 const ZIVPN_HANDOFF_GRACE_SECONDS = Number.isFinite(ZIVPN_HANDOFF_GRACE_SECONDS_RAW) && ZIVPN_HANDOFF_GRACE_SECONDS_RAW >= 3
   ? Math.min(Math.floor(ZIVPN_HANDOFF_GRACE_SECONDS_RAW), 120)
   : 20;
@@ -4188,7 +4188,7 @@ async function readZivpnLiveMap(nowTs) {
       });
     }
 
-    const handoffGrace = Math.max(3, Number(ZIVPN_HANDOFF_GRACE_SECONDS || 20));
+    const handoffGrace = Math.max(3, Number(ZIVPN_HANDOFF_GRACE_SECONDS || 90));
     for (const [user, list] of byUser.entries()) {
       if (!Array.isArray(list) || list.length === 0) continue;
       let maxLastSeen = 0;
@@ -6007,10 +6007,10 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
-ZIVPN_HANDOFF_GRACE_SECONDS="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-20}" | tr -cd '0-9')"
+ZIVPN_HANDOFF_GRACE_SECONDS="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
-[[ -z "${ZIVPN_HANDOFF_GRACE_SECONDS}" || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -lt 3 || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -gt 120 ]] && ZIVPN_HANDOFF_GRACE_SECONDS="20"
+[[ -z "${ZIVPN_HANDOFF_GRACE_SECONDS}" || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -lt 3 || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -gt 120 ]] && ZIVPN_HANDOFF_GRACE_SECONDS="90"
 
 if [[ "${ONLINE_NOTIFY_ENABLE}" != "1" ]]; then
   exit 0
@@ -9900,7 +9900,7 @@ show_zivpn_online() {
   win="$(echo "${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}" | tr -cd '0-9')"
   [[ -z "${win}" || "${win}" -lt 20 ]] && win="90"
   [[ "${win}" -gt 1800 ]] && win="1800"
-  handoff_grace="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-20}" | tr -cd '0-9')"
+  handoff_grace="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
   [[ -z "${handoff_grace}" || "${handoff_grace}" -lt 3 ]] && handoff_grace="20"
   [[ "${handoff_grace}" -gt 120 ]] && handoff_grace="120"
 
@@ -10679,6 +10679,14 @@ post_install_preflight() {
 EOF
 }
 
+apply_final_service_restart_chain() {
+  echo "Menerapkan restart berurutan layanan inti..."
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+  sleep 2
+  systemctl restart "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
+}
+
 show_install_banner() {
   cat <<'EOF'
 =========================================
@@ -10764,6 +10772,7 @@ main() {
   write_cli_menu
   setup_auto_menu_login
   write_version_marker
+  apply_final_service_restart_chain
   post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."
 

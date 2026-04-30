@@ -1741,6 +1741,7 @@ SSH_WS_HANDSHAKE_TIMEOUT_SECONDS=auto
 SSH_WS_MAX_HEADER_BYTES=auto
 SSH_WS_MAX_PRELUDE_REQUESTS=auto
 SSH_WS_PRELUDE_RESPONSE=ok
+SSH_WS_UPGRADE_RESPONSE=101
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 DROPBEAR_PORT=${DROPBEAR_PORT}
@@ -3142,6 +3143,7 @@ const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 109);
 const HTTP_BACKEND_HOST = process.env.SSH_HTTP_BACKEND_HOST || '127.0.0.1';
 const HTTP_BACKEND_PORT = Number(process.env.SSH_HTTP_BACKEND_PORT || 80);
 const PRELUDE_RESPONSE = String(process.env.SSH_WS_PRELUDE_RESPONSE || 'ok').trim().toLowerCase();
+const UPGRADE_RESPONSE = String(process.env.SSH_WS_UPGRADE_RESPONSE || '101').trim().toLowerCase();
 
 function firstLine(head) {
   const i = head.indexOf('\r\n');
@@ -3180,11 +3182,14 @@ const server = net.createServer((client) => {
 
   const startWsSshTunnel = (leftover) => {
     const cleaned = stripPayloadJunk(leftover);
+    const response = UPGRADE_RESPONSE === 'ok'
+      ? 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+      : 'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n';
     startPipeTo(
       SSH_HOST,
       SSH_PORT,
       cleaned,
-      'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'
+      response
     );
   };
 
@@ -3516,7 +3521,7 @@ func dropClientPreludeJunk(client net.Conn, reader *bufio.Reader, maxHeaderBytes
 	}
 }
 
-func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, handshakeTimeoutSec int, maxHeaderBytes int, maxPreludeRequests int, preludeResponse string) {
+func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, handshakeTimeoutSec int, maxHeaderBytes int, maxPreludeRequests int, preludeResponse string, upgradeResponse string) {
 	defer client.Close()
 	_ = client.SetReadDeadline(time.Now().Add(time.Duration(handshakeTimeoutSec) * time.Second))
 	reader := bufio.NewReaderSize(client, 64*1024)
@@ -3553,7 +3558,11 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			if err != nil {
 				return
 			}
-			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+			if upgradeResponse == "ok" {
+				_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
+			} else {
+				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+			}
 			_ = client.SetReadDeadline(time.Time{})
 			tunnelAfterWsUpgrade(client, sshUp, reader, maxHeaderBytes)
 			return
@@ -3649,6 +3658,7 @@ func main() {
 	maxHeaderBytes := envInt("SSH_WS_MAX_HEADER_BYTES", profile.maxHeaderBytes)
 	maxPreludeRequests := envInt("SSH_WS_MAX_PRELUDE_REQUESTS", profile.maxPreludeRequests)
 	preludeResponse := strings.ToLower(envOr("SSH_WS_PRELUDE_RESPONSE", "ok"))
+	upgradeResponse := strings.ToLower(envOr("SSH_WS_UPGRADE_RESPONSE", "101"))
 	if maxConns < 32 {
 		maxConns = 32
 	}
@@ -3668,7 +3678,7 @@ func main() {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d (max_conns=%d, hs_timeout=%ds, max_header=%d, prelude=%d, prelude_response=%s)\n", port, sshHost, sshPort, httpHost, httpPort, maxConns, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests, preludeResponse)
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d (max_conns=%d, hs_timeout=%ds, max_header=%d, prelude=%d, prelude_response=%s, upgrade_response=%s)\n", port, sshHost, sshPort, httpHost, httpPort, maxConns, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests, preludeResponse, upgradeResponse)
 
 	for {
 		conn, err := ln.Accept()
@@ -3680,7 +3690,7 @@ func main() {
 		case sem <- struct{}{}:
 			go func(c net.Conn) {
 				defer func() { <-sem }()
-				handleConn(c, sshHost, sshPort, httpHost, httpPort, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests, preludeResponse)
+				handleConn(c, sshHost, sshPort, httpHost, httpPort, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests, preludeResponse, upgradeResponse)
 			}(conn)
 		default:
 			_ = conn.Close()

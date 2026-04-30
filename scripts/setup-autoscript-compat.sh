@@ -245,9 +245,14 @@ build_nginx_ws_locations() {
     fi
     out+=$'        proxy_pass http://127.0.0.1:'"${backend}"$';\n'
     out+=$'        proxy_http_version 1.1;\n'
+    out+=$'        proxy_method GET;\n'
     out+=$'        proxy_set_header Upgrade "websocket";\n'
     out+=$'        proxy_set_header Connection "Upgrade";\n'
     out+=$'        proxy_set_header Host \\$host;\n'
+    out+=$'        proxy_read_timeout 3600s;\n'
+    out+=$'        proxy_send_timeout 3600s;\n'
+    out+=$'        proxy_connect_timeout 60s;\n'
+    out+=$'        proxy_buffering off;\n'
     out+=$'    }\n\n'
   done
   printf '%s' "${out}"
@@ -994,9 +999,14 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /yourbug {
@@ -1005,9 +1015,14 @@ server {
         rewrite ^ /vmess break;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /vless {
@@ -1015,9 +1030,14 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /yourbug/vless {
@@ -1026,9 +1046,14 @@ server {
         rewrite ^ /vless break;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /trojan {
@@ -1036,9 +1061,14 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /yourbug/trojan {
@@ -1047,9 +1077,29 @@ server {
         rewrite ^ /trojan break;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
+    }
+
+    location ~ ^/(ssh-ws|ws|ws-ssh|ssh)$ {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location / {
@@ -1057,6 +1107,7 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -6122,16 +6173,20 @@ refresh_zivpn_live_from_api_log() {
 }
 
 ssh_users="$(
+  dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+  dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
+  [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
   tmp_ss_pid_ip="$(mktemp)"
   tmp_pid_user="$(mktemp)"
   tmp_pair="$(mktemp)"
   trap 'rm -f "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}"' RETURN
 
-  ss -Htnp state established 2>/dev/null | awk '
+  ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
     {
       l=$4
       r=$5
-      if (l ~ /:22$/) {
+      if (l ~ /:22$/ || l ~ (":" p1 "$") || l ~ (":" p2 "$")) {
         ip=r
         gsub(/^\[/, "", ip)
         gsub(/\]$/, "", ip)
@@ -6194,10 +6249,18 @@ if [[ -f /var/log/xray/access.log ]]; then
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
         return v
       }
+      function norm_ip(v) {
+        v=clean(v)
+        gsub(/^\[/, "", v)
+        gsub(/\]$/, "", v)
+        sub(/:[0-9]+$/, "", v)
+        return v
+      }
       {
         ts = substr($0, 1, 19)
         if (ts == "" || ts < cutoff) next
         u=""
+        src=""
         if (match($0, /"email":"[^"]+"/)) {
           u=substr($0, RSTART+9, RLENGTH-10)
         } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
@@ -6209,10 +6272,27 @@ if [[ -f /var/log/xray/access.log ]]; then
           u=substr($0, RSTART, RLENGTH)
           sub(/^user:[[:space:]]*/, "", u)
         }
+        if (match($0, /"source":"[^"]+"/)) {
+          src=substr($0, RSTART+10, RLENGTH-11)
+        } else if (match($0, /from[[:space:]]+[0-9a-fA-F\.:]+/)) {
+          src=substr($0, RSTART, RLENGTH)
+          sub(/^from[[:space:]]+/, "", src)
+        }
         u=clean(tolower(u))
-        if (u ~ /^[a-z0-9._-]+$/) c[u]++
+        src=norm_ip(src)
+        if (u !~ /^[a-z0-9._-]+$/) next
+        if (src == "" || src == "127.0.0.1" || src == "::1") next
+        key=u "|" src
+        seen[key]=1
       }
-      END { for (u in c) printf "%s(%d)\n", u, c[u] }
+      END {
+        for (k in seen) {
+          split(k, a, "|")
+          user=a[1]
+          ipcnt[user]++
+        }
+        for (u in ipcnt) printf "%s(%d)\n", u, ipcnt[u]
+      }
     ' | sort || true)"
   xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
 fi
@@ -6596,9 +6676,14 @@ build_nginx_ws_locations() {
     fi
     out+=$'        proxy_pass http://127.0.0.1:'"${backend}"$';\n'
     out+=$'        proxy_http_version 1.1;\n'
+    out+=$'        proxy_method GET;\n'
     out+=$'        proxy_set_header Upgrade "websocket";\n'
     out+=$'        proxy_set_header Connection "Upgrade";\n'
     out+=$'        proxy_set_header Host \\$host;\n'
+    out+=$'        proxy_read_timeout 3600s;\n'
+    out+=$'        proxy_send_timeout 3600s;\n'
+    out+=$'        proxy_connect_timeout 60s;\n'
+    out+=$'        proxy_buffering off;\n'
     out+=$'    }\n\n'
   done
   printf '%s' "${out}"
@@ -8072,9 +8157,14 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /yourbug {
@@ -8083,9 +8173,14 @@ server {
         rewrite ^ /vmess break;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /vless {
@@ -8093,9 +8188,14 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /yourbug/vless {
@@ -8104,9 +8204,14 @@ server {
         rewrite ^ /vless break;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /trojan {
@@ -8114,9 +8219,14 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /yourbug/trojan {
@@ -8125,9 +8235,29 @@ server {
         rewrite ^ /trojan break;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
+    }
+
+    location ~ ^/(ssh-ws|ws|ws-ssh|ssh)$ {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location / {
@@ -8135,6 +8265,7 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
+        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;

@@ -6260,25 +6260,50 @@ count_lines() {
   echo "${data}" | awk 'NF{n++} END{print n+0}'
 }
 
-short_list() {
-  local data="$1" max="${2:-12}" total shown rest base
-  total="$(count_lines "${data}")"
-  [[ -z "${total}" || ! "${total}" =~ ^[0-9]+$ ]] && total="0"
-  shown="${max}"
-  if [[ "${shown}" -gt "${total}" ]]; then
-    shown="${total}"
-  fi
-  if [[ "${shown}" -le 0 ]]; then
-    echo "-"
-    return
-  fi
-  base="$(echo "${data}" | awk 'NF' | head -n "${shown}" | awk 'BEGIN{first=1} {if(!first) printf ", "; printf "%s", $0; first=0} END{print ""}')"
-  rest=$((total - shown))
-  if [[ "${rest}" -gt 0 ]]; then
-    echo "${base} (+${rest} lainnya)"
-  else
-    echo "${base}"
-  fi
+format_user_rows() {
+  local data="$1"
+  echo "${data}" | awk '
+    function parse_row(raw, name, val, tmp) {
+      name = raw
+      val = "-"
+      if (raw ~ /\([0-9]+ip\)$/) {
+        tmp = raw
+        sub(/^.*\(/, "", tmp)
+        sub(/ip\)$/, "", tmp)
+        val = tmp
+        sub(/\([0-9]+ip\)$/, "", name)
+      } else if (raw ~ /\([0-9]+\)$/) {
+        tmp = raw
+        sub(/^.*\(/, "", tmp)
+        sub(/\)$/, "", tmp)
+        val = tmp
+        sub(/\([0-9]+\)$/, "", name)
+      }
+      gsub(/[[:space:]]+$/, "", name)
+      if (name == "") name = "-"
+      users[++n] = name
+      vals[n] = val
+      if (length(name) > maxw) maxw = length(name)
+    }
+    BEGIN {
+      n = 0
+      maxw = 4
+    }
+    NF {
+      parse_row($0)
+    }
+    END {
+      if (n == 0) {
+        printf "  %-4s | %s\n", "Akun", "IP"
+        printf "  %-4s | %s\n", "-", "-"
+        exit
+      }
+      printf "  %-" maxw "s | %s\n", "Akun", "IP"
+      for (i = 1; i <= n; i++) {
+        printf "  %-" maxw "s | %s\n", users[i], vals[i]
+      }
+    }
+  '
 }
 
 msg="SC 1FORCR NOTIF
@@ -6298,16 +6323,16 @@ RINGKASAN AKUN AKTIF
 ONLINE TERDETEKSI
   ==============================================
 - SSH       : ${ssh_cnt}
-  User      : $(short_list "${ssh_users}" 10)
+$(format_user_rows "${ssh_users}")
   ==============================================
 - XRAY      : ${xray_cnt}
-  User      : $(short_list "${xray_users}" 10)
+$(format_user_rows "${xray_users}")
   ==============================================
 - UDPHC     : ${udphc_cnt}
-  User      : $(short_list "${udphc_users}" 10)
+$(format_user_rows "${udphc_users}")
   ==============================================
 - ZIVPN     : ${zivpn_cnt}
-  User      : $(short_list "${zivpn_users}" 10)
+$(format_user_rows "${zivpn_users}")
   ==============================================
 "
 

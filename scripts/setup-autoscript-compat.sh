@@ -7534,6 +7534,22 @@ set_online_notify_config_menu() {
   echo "- Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik"
 }
 
+trigger_online_notify_now() {
+  local notify_bin
+  notify_bin="/usr/local/sbin/sc-1forcr-online-notify"
+  echo "Trigger notif akun online manual..."
+  if [[ ! -x "${notify_bin}" ]]; then
+    echo "Script notifier tidak ditemukan: ${notify_bin}"
+    return 1
+  fi
+  if ONLINE_NOTIFY_ENABLE=1 "${notify_bin}"; then
+    echo "Notifikasi online berhasil dikirim ke Telegram."
+  else
+    echo "Gagal mengirim notifikasi online manual."
+    return 1
+  fi
+}
+
 tools_menu() {
   while true; do
     clear
@@ -7547,9 +7563,10 @@ tools_menu() {
     echo "5) Setting BOT Telegram"
     echo "6) Setting Checker IP Limit"
     echo "7) Setting Notif Akun Online"
+    echo "8) Kirim Notif Online Sekarang"
     echo "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-7]: "; then
+    if ! prompt_input tm "Pilih menu [0-8]: "; then
       return
     fi
     clear
@@ -7561,6 +7578,7 @@ tools_menu() {
       5) set_telegram_notif_config ;;
       6) set_iplimit_checker_config_menu ;;
       7) set_online_notify_config_menu ;;
+      8) trigger_online_notify_now ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

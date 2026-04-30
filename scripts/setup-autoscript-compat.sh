@@ -136,10 +136,10 @@ IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
 IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
 SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-1}"
-SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-80,443,109,143}"
-SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-8/second}"
-SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-16}"
-SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-12}"
+SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-109,143}"
+SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-30/second}"
+SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-60}"
+SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-64}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
@@ -1505,19 +1505,19 @@ apply_sshws_loop_guard_rules() {
     return 0
   fi
 
-  ports="$(echo "${SSHWS_LOOP_GUARD_PORTS:-80,443,109,143}" | tr -cd '0-9,')"
-  [[ -z "${ports}" ]] && ports="80,443,109,143"
+  ports="$(echo "${SSHWS_LOOP_GUARD_PORTS:-109,143}" | tr -cd '0-9,')"
+  [[ -z "${ports}" ]] && ports="109,143"
 
-  rate="$(echo "${SSHWS_LOOP_GUARD_NEW_ABOVE:-8/second}" | tr -d '[:space:]')"
+  rate="$(echo "${SSHWS_LOOP_GUARD_NEW_ABOVE:-30/second}" | tr -d '[:space:]')"
   if ! [[ "${rate}" =~ ^[0-9]+/(second|minute|hour|day)$ ]]; then
-    rate="8/second"
+    rate="30/second"
   fi
 
-  burst="$(echo "${SSHWS_LOOP_GUARD_BURST:-16}" | tr -cd '0-9')"
-  [[ -z "${burst}" || "${burst}" -lt 1 ]] && burst="16"
+  burst="$(echo "${SSHWS_LOOP_GUARD_BURST:-60}" | tr -cd '0-9')"
+  [[ -z "${burst}" || "${burst}" -lt 1 ]] && burst="60"
 
-  connlimit="$(echo "${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-12}" | tr -cd '0-9')"
-  [[ -z "${connlimit}" || "${connlimit}" -lt 1 ]] && connlimit="12"
+  connlimit="$(echo "${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-64}" | tr -cd '0-9')"
+  [[ -z "${connlimit}" || "${connlimit}" -lt 1 ]] && connlimit="64"
 
   # Rule 1: drop NEW connection spikes per source IP.
   if ! iptables -w 10 -C INPUT -p tcp -m multiport --dports "${ports}" -m conntrack --ctstate NEW \

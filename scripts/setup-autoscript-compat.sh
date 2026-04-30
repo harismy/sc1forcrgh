@@ -10819,9 +10819,8 @@ while true; do
   s_nginx="$(service_onoff nginx)"
 
   echo -e "${CYN}┌──────────────────────────────────────────────────────────────┐${NC}"
-  echo -e "${CYN}│${NC}               ${WHT}• SC 1FORCR MAIN MENU •${NC}                  ${CYN}│${NC}"
-  echo -e "${CYN}└──────────────────────────────────────────────────────────────┘${NC}"
-  echo -e "${CYN}┌──────────────────────────────────────────────────────────────┐${NC}"
+  echo -e "${CYN}│${NC} ${WHT}MAIN MENU${NC}                                                    ${CYN}│${NC}"
+  echo -e "${CYN}├──────────────────────────────────────────────────────────────┤${NC}"
   printf "${CYN}│${NC} %-60s ${CYN}│${NC}\n" "Domain : ${DOMAIN}"
   printf "${CYN}│${NC} %-60s ${CYN}│${NC}\n" "IP VPS : ${local_ip}"
   printf "${CYN}│${NC} %-60s ${CYN}│${NC}\n" "Uptime : ${up_text}"

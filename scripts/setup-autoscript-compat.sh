@@ -3383,21 +3383,6 @@ func flushReaderBufferedTo(reader *bufio.Reader, dst net.Conn) error {
 	return writeAll(dst, buf)
 }
 
-func isLikelyHttpMethod(first string) bool {
-	switch {
-	case strings.HasPrefix(first, "get "),
-		strings.HasPrefix(first, "post "),
-		strings.HasPrefix(first, "head "),
-		strings.HasPrefix(first, "options "),
-		strings.HasPrefix(first, "patch "),
-		strings.HasPrefix(first, "put "),
-		strings.HasPrefix(first, "delete "):
-		return true
-	default:
-		return false
-	}
-}
-
 func readHttpHeader(reader *bufio.Reader, maxHeaderBytes int) ([]byte, string, string, error) {
 	var raw bytes.Buffer
 	for {
@@ -3485,11 +3470,13 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			return
 		}
 
-		// Keep-alive response for staged payloads like:
-		// GET / ... then PATCH / ... Upgrade: websocket.
-		if isLikelyHttpMethod(first) {
-			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
-			continue
+		// For non-upgrade HTTP prelude, close early to avoid clients
+		// getting stuck at 200 OK loops.
+		if strings.HasPrefix(first, "get ") || strings.HasPrefix(first, "post ") ||
+			strings.HasPrefix(first, "head ") || strings.HasPrefix(first, "options ") ||
+			strings.HasPrefix(first, "patch ") || strings.HasPrefix(first, "put ") ||
+			strings.HasPrefix(first, "delete ") {
+			return
 		}
 
 		// fallback to raw SSH.

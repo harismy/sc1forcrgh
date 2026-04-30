@@ -614,6 +614,18 @@ async function getServerKeyForHost(userId, host) {
   return String(fallback?.server_key || '').trim();
 }
 
+async function syncKnownServerKeyAfterScRegistration(userId, host) {
+  const uid = Number(userId || 0);
+  const ip = normalizeHost(host);
+  if (!uid || !isIpv4(ip)) return { ok: false, saved: false, message: 'invalid-user-or-host' };
+  let key = await getServerKeyForHost(uid, ip);
+  if (!key) key = String(process.env.DEFAULT_SERVER_KEY || '').trim();
+  if (!key || key.length < 8) return { ok: false, saved: false, message: 'key-not-found' };
+  await saveServerKeyForHost(uid, ip, key);
+  await saveServerKeyForHostAllOwners(ip, key, uid);
+  return { ok: true, saved: true };
+}
+
 async function shouldSendScNotify(userId, host, event, intervalMs = SC_NOTIFY_INTERVAL_MS) {
   const uid = Number(userId || 0);
   const ip = normalizeHost(host);
@@ -2111,6 +2123,8 @@ bot.action('m_register_sc_extend', async (ctx) => {
       'Masukkan IP VPS yang ingin diperpanjang.',
       'Contoh: 103.10.10.2',
       '',
+      'Setelah itu bot akan minta key server VPS.',
+      '',
       'Ketik "batal" untuk membatalkan.'
     ])
   );
@@ -2846,6 +2860,7 @@ bot.on('text', async (ctx) => {
           `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
         mainMenu()
       );
+      await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
       const hostKeyUnlimited = await getServerKeyForHost(ctx.from.id, ip);
       await syncScRegistrationMetaToHost(ip, hostKeyUnlimited, {
         status: 'active',
@@ -2949,6 +2964,7 @@ bot.on('text', async (ctx) => {
             : ''}`,
         mainMenu()
       );
+      await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
       const hostKeyReg = await getServerKeyForHost(ctx.from.id, ip);
       await syncScRegistrationMetaToHost(ip, hostKeyReg, {
         status: 'active',
@@ -3032,6 +3048,7 @@ bot.on('text', async (ctx) => {
       if (!result.success) {
         return ctx.reply('Gagal daftarkan SC unlimited manual.', adminMenu());
       }
+      await syncKnownServerKeyAfterScRegistration(targetUserId, ip).catch(() => {});
       const hostKeyAdminUnl = await getServerKeyForHost(targetUserId, ip);
       await syncScRegistrationMetaToHost(ip, hostKeyAdminUnl, {
         status: 'active',
@@ -3077,7 +3094,7 @@ bot.on('text', async (ctx) => {
       }
 
       const clientName = normalizeClientName(reg.client_name || ctx.from.first_name || ip) || ip;
-      state.step = 'extend_sc_days';
+      state.step = 'extend_sc_key';
       state.ip = ip;
       state.clientName = clientName;
       userState.set(ctx.chat.id, state);
@@ -3087,6 +3104,32 @@ bot.on('text', async (ctx) => {
           `IP VPS        : ${ip}`,
           `Expired Saat Ini : ${formatDateTime(reg.expires_at)}`,
           '',
+          'Masukkan key server VPS terlebih dahulu.',
+          'Key ini akan disimpan otomatis di database bot.',
+          '',
+          'Contoh key: abcdefgh12345678'
+        ])
+      );
+    }
+
+    if (state.step === 'extend_sc_key') {
+      const ip = String(state.ip || '').trim();
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State perpanjangan tidak valid. Ulangi dari menu perpanjang.', mainMenu());
+      }
+      const serverKey = String(text || '').trim();
+      if (serverKey.length < 8) {
+        return ctx.reply('Key server tidak valid. Minimal 8 karakter.');
+      }
+      const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+      state.serverKey = serverKey;
+      state.step = 'extend_sc_days';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('INPUT DURASI PERPANJANGAN', [
+          `Nama Client   : ${state.clientName || ip}`,
+          `IP VPS        : ${ip}`,
           `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
           `Minimal Hari  : ${minDays}`,
           `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
@@ -3110,6 +3153,7 @@ bot.on('text', async (ctx) => {
 
       const totalFee = Math.floor(days) * pricePerDay;
       const clientName = normalizeClientName(state.clientName || ip) || ip;
+      const serverKey = String(state.serverKey || '').trim();
       const result = await registerScIp(ctx.from.id, ip, clientName, Math.floor(days), totalFee);
       if (result.insufficient) {
         const saldo = await getSaldo(ctx.from.id);
@@ -3146,6 +3190,11 @@ bot.on('text', async (ctx) => {
             : ''}`,
         mainMenu()
       );
+      if (serverKey.length >= 8) {
+        await saveServerKeyForHost(ctx.from.id, ip, serverKey);
+        await saveServerKeyForHostAllOwners(ip, serverKey, ctx.from.id);
+      }
+      await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
       const hostKeyExtend = await getServerKeyForHost(ctx.from.id, ip);
       await syncScRegistrationMetaToHost(ip, hostKeyExtend, {
         status: 'active',

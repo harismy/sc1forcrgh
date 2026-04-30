@@ -3159,7 +3159,7 @@ const server = net.createServer((client) => {
       return;
     }
 
-    if (head.includes('upgrade: websocket')) {
+    if (head.includes('upgrade: websocket') || (head.includes('upgrade:') && head.includes('host:'))) {
       startWsSshTunnel(rest);
       return;
     }
@@ -3477,8 +3477,8 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			return
 		}
 
-		// websocket upgrade to SSH tunnel.
-		if strings.Contains(header, "upgrade: websocket") {
+		// websocket upgrade to SSH tunnel (compat mode for legacy HC payloads).
+		if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
 			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
 			if err != nil {
 				return

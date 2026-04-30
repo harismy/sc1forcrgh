@@ -1669,6 +1669,10 @@ ZIVPN_ACTIVE_WINDOW_SECONDS=${ZIVPN_ACTIVE_WINDOW_SECONDS}
 ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 SSH_WS_PORT=2082
 SSH_WS_TARGET_PORT=${ssh_ws_target_port}
+SSH_WS_MAX_CONNS=2048
+SSH_WS_HANDSHAKE_TIMEOUT_SECONDS=12
+SSH_WS_MAX_HEADER_BYTES=131072
+SSH_WS_MAX_PRELUDE_REQUESTS=8
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 DROPBEAR_PORT=${DROPBEAR_PORT}
@@ -3229,6 +3233,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -3293,8 +3298,45 @@ func flushReaderBufferedTo(reader *bufio.Reader, dst net.Conn) error {
 	return writeAll(dst, buf)
 }
 
-func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int) {
+func isLikelyHttpMethod(first string) bool {
+	switch {
+	case strings.HasPrefix(first, "get "),
+		strings.HasPrefix(first, "post "),
+		strings.HasPrefix(first, "head "),
+		strings.HasPrefix(first, "options "),
+		strings.HasPrefix(first, "patch "),
+		strings.HasPrefix(first, "put "),
+		strings.HasPrefix(first, "delete "):
+		return true
+	default:
+		return false
+	}
+}
+
+func readHttpHeader(reader *bufio.Reader, maxHeaderBytes int) ([]byte, string, string, error) {
+	var raw bytes.Buffer
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return nil, "", "", err
+		}
+		raw.Write(line)
+		if raw.Len() > maxHeaderBytes {
+			return nil, "", "", fmt.Errorf("header too large")
+		}
+		if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
+			break
+		}
+	}
+	rawStr := raw.String()
+	first := strings.ToLower(strings.TrimSpace(strings.SplitN(rawStr, "\r\n", 2)[0]))
+	header := strings.ToLower(rawStr)
+	return raw.Bytes(), first, header, nil
+}
+
+func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, handshakeTimeoutSec int, maxHeaderBytes int, maxPreludeRequests int) {
 	defer client.Close()
+	_ = client.SetReadDeadline(time.Now().Add(time.Duration(handshakeTimeoutSec) * time.Second))
 	reader := bufio.NewReaderSize(client, 64*1024)
 
 	peek, err := reader.Peek(4)
@@ -3303,6 +3345,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		if err != nil {
 			return
 		}
+		_ = client.SetReadDeadline(time.Time{})
 		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 			_ = sshUp.Close()
 			return
@@ -3311,67 +3354,69 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		return
 	}
 
-	var raw bytes.Buffer
-	for {
-		line, err := reader.ReadBytes('\n')
+	for i := 0; i < maxPreludeRequests; i++ {
+		rawHeader, first, header, err := readHttpHeader(reader, maxHeaderBytes)
 		if err != nil {
 			return
 		}
-		raw.Write(line)
-		if raw.Len() > 128*1024 {
+
+		// CONNECT mode from payload apps.
+		if strings.HasPrefix(first, "connect ") {
+			_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			continue
+		}
+
+		if strings.Contains(header, "upgrade: websocket") || (strings.Contains(header, "upgrade:") && strings.Contains(header, "host:")) {
+			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+			if err != nil {
+				return
+			}
+			_ = client.SetReadDeadline(time.Time{})
+			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+				_ = sshUp.Close()
+				return
+			}
+			tunnelBoth(client, sshUp)
 			return
 		}
-		if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
-			break
+
+		// keep API and xray ws paths reachable through the same mux.
+		if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
+			httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
+			if err != nil {
+				return
+			}
+			_ = client.SetReadDeadline(time.Time{})
+			if err := writeAll(httpUp, rawHeader); err != nil {
+				_ = httpUp.Close()
+				return
+			}
+			if err := flushReaderBufferedTo(reader, httpUp); err != nil {
+				_ = httpUp.Close()
+				return
+			}
+			tunnelBoth(client, httpUp)
+			return
 		}
-	}
 
-	header := strings.ToLower(raw.String())
-	first := strings.ToLower(strings.TrimSpace(strings.SplitN(raw.String(), "\r\n", 2)[0]))
-
-	// CONNECT mode from payload apps.
-	if strings.HasPrefix(first, "connect ") {
-		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		raw.Reset()
-
-		// CONNECT clients may still send HTTP payload lines before SSH banner.
-		// Discard those lines until we see SSH- and then start raw SSH tunnel.
-		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
-		for i := 0; i < 64; i++ {
-			nextPeek, nextErr := reader.Peek(4)
-			if nextErr != nil {
-				_ = client.SetReadDeadline(time.Time{})
-				return
-			}
-			if string(nextPeek) == "SSH-" {
-				_ = client.SetReadDeadline(time.Time{})
-				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-				if err != nil {
-					return
-				}
-				if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-					_ = sshUp.Close()
-					return
-				}
-				tunnelBoth(client, sshUp)
-				return
-			}
-			// Drop one line of HTTP payload and keep scanning.
-			if _, err := reader.ReadBytes('\n'); err != nil {
-				_ = client.SetReadDeadline(time.Time{})
-				return
-			}
+		// Keep-alive response for staged payloads like:
+		// GET / ... then PATCH / ... Upgrade: websocket.
+		if isLikelyHttpMethod(first) {
+			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
+			continue
 		}
-		_ = client.SetReadDeadline(time.Time{})
-		return
-	}
 
-	if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+		// fallback to raw SSH.
 		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
 		if err != nil {
 			return
 		}
-		_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+		_ = client.SetReadDeadline(time.Time{})
+		if err := writeAll(sshUp, rawHeader); err != nil {
+			_ = sshUp.Close()
+			return
+		}
 		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 			_ = sshUp.Close()
 			return
@@ -3379,39 +3424,18 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		tunnelBoth(client, sshUp)
 		return
 	}
+}
 
-	// keep API and xray ws paths reachable through the same mux.
-	if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
-		httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
-		if err != nil {
-			return
-		}
-		if err := writeAll(httpUp, raw.Bytes()); err != nil {
-			_ = httpUp.Close()
-			return
-		}
-		if err := flushReaderBufferedTo(reader, httpUp); err != nil {
-			_ = httpUp.Close()
-			return
-		}
-		tunnelBoth(client, httpUp)
-		return
+func defaultMaxConns() int {
+	cpu := runtime.NumCPU()
+	if cpu < 1 {
+		cpu = 1
 	}
-
-	// fallback to raw SSH.
-	sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-	if err != nil {
-		return
+	max := cpu * 384
+	if max < 256 {
+		max = 256
 	}
-	if err := writeAll(sshUp, raw.Bytes()); err != nil {
-		_ = sshUp.Close()
-		return
-	}
-	if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-		_ = sshUp.Close()
-		return
-	}
-	tunnelBoth(client, sshUp)
+	return max
 }
 
 func main() {
@@ -3420,13 +3444,30 @@ func main() {
 	sshPort := envInt("SSH_WS_TARGET_PORT", 109)
 	httpHost := envOr("SSH_HTTP_BACKEND_HOST", "127.0.0.1")
 	httpPort := envInt("SSH_HTTP_BACKEND_PORT", 80)
+	maxConns := envInt("SSH_WS_MAX_CONNS", defaultMaxConns())
+	handshakeTimeoutSec := envInt("SSH_WS_HANDSHAKE_TIMEOUT_SECONDS", 12)
+	maxHeaderBytes := envInt("SSH_WS_MAX_HEADER_BYTES", 131072)
+	maxPreludeRequests := envInt("SSH_WS_MAX_PRELUDE_REQUESTS", 8)
+	if maxConns < 32 {
+		maxConns = 32
+	}
+	if handshakeTimeoutSec < 3 {
+		handshakeTimeoutSec = 3
+	}
+	if maxHeaderBytes < 8192 {
+		maxHeaderBytes = 8192
+	}
+	if maxPreludeRequests < 2 {
+		maxPreludeRequests = 2
+	}
+	sem := make(chan struct{}, maxConns)
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d\n", port, sshHost, sshPort, httpHost, httpPort)
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d (max_conns=%d, hs_timeout=%ds)\n", port, sshHost, sshPort, httpHost, httpPort, maxConns, handshakeTimeoutSec)
 
 	for {
 		conn, err := ln.Accept()
@@ -3434,7 +3475,15 @@ func main() {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handleConn(conn, sshHost, sshPort, httpHost, httpPort)
+		select {
+		case sem <- struct{}{}:
+			go func(c net.Conn) {
+				defer func() { <-sem }()
+				handleConn(c, sshHost, sshPort, httpHost, httpPort, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests)
+			}(conn)
+		default:
+			_ = conn.Close()
+		}
 	}
 }
 EOF

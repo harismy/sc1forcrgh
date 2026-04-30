@@ -2093,6 +2093,8 @@ bot.action('m_register_sc_new', async (ctx) => {
       `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari`,
       `Minimal Durasi  : ${minDays} hari`,
       '',
+      'Setelah input IP, bot akan minta key server VPS.',
+      '',
       'Ketik "batal" untuk membatalkan.'
     ])
   );
@@ -2109,6 +2111,8 @@ bot.action('m_register_sc_unlimited', async (ctx) => {
       '',
       `Harga paket     : Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}`,
       'Masa aktif      : tanpa batas',
+      '',
+      'Setelah input IP, bot akan minta key server VPS.',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -2826,6 +2830,33 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(`IP ${ip} sudah terdaftar oleh user lain.`, mainMenu());
       }
+      state.step = 'register_sc_unlimited_key';
+      state.ip = ip;
+      state.clientName = normalizeClientName(state.clientName || ctx.from.first_name || ip) || ip;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('INPUT KEY UNTUK SERVER VPS', [
+          `Nama Client : ${state.clientName}`,
+          `IP VPS      : ${ip}`,
+          '',
+          'Masukkan key server VPS.',
+          '',
+          'Contoh key: abcdefgh12345678'
+        ])
+      );
+    }
+
+    if (state.step === 'register_sc_unlimited_key') {
+      const ip = String(state.ip || '').trim();
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State registrasi unlimited tidak valid. Ulangi dari menu registrasi.', mainMenu());
+      }
+      const serverKey = String(text || '').trim();
+      if (serverKey.length < 8) {
+        return ctx.reply('Key server tidak valid. Minimal 8 karakter.');
+      }
+
       const unlimitedPrice = await getUnlimitedPrice();
       const clientName = normalizeClientName(state.clientName || ctx.from.first_name || ip) || ip;
       const result = await registerScIpUnlimited(ctx.from.id, ip, clientName, {
@@ -2838,7 +2869,7 @@ bot.on('text', async (ctx) => {
         const saldo = await getSaldo(ctx.from.id);
         userState.delete(ctx.chat.id);
         return ctx.reply(
-            `Saldo tidak cukup untuk SC Unlimited.\n` +
+          `Saldo tidak cukup untuk SC Unlimited.\n` +
             `Nama Client: ${clientName}\n` +
             `IP: ${ip}\n` +
             `Total biaya: Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}\n` +
@@ -2860,9 +2891,10 @@ bot.on('text', async (ctx) => {
           `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
         mainMenu()
       );
+      await saveServerKeyForHost(ctx.from.id, ip, serverKey);
+      await saveServerKeyForHostAllOwners(ip, serverKey, ctx.from.id);
       await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
-      const hostKeyUnlimited = await getServerKeyForHost(ctx.from.id, ip);
-      await syncScRegistrationMetaToHost(ip, hostKeyUnlimited, {
+      await syncScRegistrationMetaToHost(ip, serverKey, {
         status: 'active',
         client_name: result.clientName || clientName,
         expires_at: 0
@@ -2897,7 +2929,7 @@ bot.on('text', async (ctx) => {
         getRegistrationMinDays(),
         getUserRegistration(ctx.from.id, ip)
       ]);
-      state.step = 'register_sc_days';
+      state.step = 'register_sc_key';
       state.ip = ip;
       state.clientName = normalizeClientName(state.clientName || reg?.client_name || ctx.from.first_name || ip) || ip;
       userState.set(ctx.chat.id, state);
@@ -2907,6 +2939,35 @@ bot.on('text', async (ctx) => {
           `IP VPS        : ${ip}`,
           reg ? `Expired Saat Ini : ${formatDateTime(reg.expires_at)}` : 'Status         : Belum terdaftar',
           '',
+          `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
+          `Minimal Hari  : ${minDays}`,
+          `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
+          '',
+          'Masukkan key server VPS terlebih dahulu.',
+          '',
+          'Contoh key: abcdefgh12345678'
+        ])
+      );
+    }
+
+    if (state.step === 'register_sc_key') {
+      const ip = String(state.ip || '').trim();
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State registrasi tidak valid. Ulangi dari menu registrasi.', mainMenu());
+      }
+      const serverKey = String(text || '').trim();
+      if (serverKey.length < 8) {
+        return ctx.reply('Key server tidak valid. Minimal 8 karakter.');
+      }
+      const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+      state.serverKey = serverKey;
+      state.step = 'register_sc_days';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('INPUT DURASI REGISTRASI SC', [
+          `Nama Client   : ${state.clientName || ip}`,
+          `IP VPS        : ${ip}`,
           `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
           `Minimal Hari  : ${minDays}`,
           `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
@@ -2929,6 +2990,7 @@ bot.on('text', async (ctx) => {
       }
       const totalFee = Math.floor(days) * pricePerDay;
       const clientName = normalizeClientName(state.clientName || ip) || ip;
+      const serverKey = String(state.serverKey || '').trim();
       const result = await registerScIp(ctx.from.id, ip, clientName, Math.floor(days), totalFee);
       if (result.insufficient) {
         const saldo = await getSaldo(ctx.from.id);
@@ -2964,8 +3026,12 @@ bot.on('text', async (ctx) => {
             : ''}`,
         mainMenu()
       );
+      if (serverKey.length >= 8) {
+        await saveServerKeyForHost(ctx.from.id, ip, serverKey);
+        await saveServerKeyForHostAllOwners(ip, serverKey, ctx.from.id);
+      }
       await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
-      const hostKeyReg = await getServerKeyForHost(ctx.from.id, ip);
+      const hostKeyReg = serverKey.length >= 8 ? serverKey : await getServerKeyForHost(ctx.from.id, ip);
       await syncScRegistrationMetaToHost(ip, hostKeyReg, {
         status: 'active',
         client_name: result.clientName || clientName,

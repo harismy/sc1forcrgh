@@ -8803,7 +8803,7 @@ draw_dashboard() {
     local raw="$1"
     local ts now rem d h m
     raw="$(echo "${raw}" | tr -cd '0-9')"
-    if [[ -z "${raw}" ]]; then
+    if [[ -z "${raw}" || "${raw}" == "0" ]]; then
       echo "Unlimited"
       return
     fi
@@ -9011,11 +9011,6 @@ EOF
   kv_line "Expiry In" "${expiry_in_text}"
   print_mid
 
-  print_line "${MAGENTA}${BOLD}LAST UPDATE INFO${NC}"
-  kv_line "Update Ver" "${update_version}"
-  kv_line "Komponen" "${update_component^^}"
-  kv_line "Waktu" "${update_time}"
-  kv_line "Ringkas" "${update_desc_short}"
   print_bottom
 
   printf '\n'
@@ -10395,7 +10390,7 @@ Time     : $(date '+%F %T')"
 
 install_summary_api_1forcr() {
   local url tmp derived_url
-  url="${SUMMARY_API_SETUP_URL}"
+  url="${SUMMARY_API_SETUP_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
     derived_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')/sc1forcr/payload/scripts/setup-summary-api.sh"

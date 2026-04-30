@@ -77,6 +77,7 @@ const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/ba
 const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
 const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
 const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
+const SC_REG_META_FILE = String(process.env.SC_REG_META_FILE || '/etc/sc-1forcr-registration.env').trim();
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -1469,6 +1470,37 @@ function parseEnvLine(rawContent, key) {
   return String(m[1] || '').trim().replace(/^["']|["']$/g, '');
 }
 
+function applyScRegistrationMeta(payloadInput = {}) {
+  const payload = payloadInput && typeof payloadInput === 'object' ? payloadInput : {};
+  const clientName = sanitizeUpdateLine(payload.client_name || payload.client || '', 96);
+  const status = sanitizeUpdateLine(payload.status || 'active', 24).toLowerCase() || 'active';
+  const nowIso = new Date().toISOString();
+
+  let expiresAt = Number(payload.expires_at);
+  if (!Number.isFinite(expiresAt)) expiresAt = Number(payload.expired_at);
+  if (!Number.isFinite(expiresAt)) expiresAt = Number(payload.expiry);
+  if (!Number.isFinite(expiresAt)) expiresAt = 0;
+  expiresAt = Math.floor(Math.max(0, expiresAt));
+
+  const lines = [
+    `SC_STATUS=${status || 'active'}`,
+    `SC_CLIENT_NAME=${clientName || '-'}`,
+    `SC_EXPIRES_AT=${expiresAt}`,
+    `SC_UPDATED_AT_ISO=${nowIso}`,
+    ''
+  ].join('\n');
+
+  try {
+    const dir = require('path').dirname(SC_REG_META_FILE);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(SC_REG_META_FILE, lines, 'utf8');
+    try { fs.chmodSync(SC_REG_META_FILE, 0o644); } catch (_) {}
+    return { ok: true, path: SC_REG_META_FILE, status, client_name: clientName || '-', expires_at: expiresAt };
+  } catch (err) {
+    return { ok: false, statusCode: 500, message: `gagal tulis sc registration meta: ${err.message}` };
+  }
+}
+
 function readScTelegramConfig() {
   let token = String(process.env.SC_TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || '').trim();
   let chatId = String(process.env.SC_TELEGRAM_CHAT_ID || process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -1857,6 +1889,17 @@ app.post('/internal/sc-expired-notify', (req, res) => {
   });
 });
 
+app.post('/internal/sc-registration-meta', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = applyScRegistrationMeta(req.body || {});
+    if (!result.ok) {
+      return res.status(Number(result.statusCode || 500)).json(result);
+    }
+    return res.json(result);
+  });
+});
+
 app.post('/internal/trigger-update', (req, res) => {
   return authorizeAndRun(req, res, (db) => {
     db.close();
@@ -1896,6 +1939,7 @@ BANNER_TXT_FILE=/etc/sc-1forcr/banner.txt
 XRAY_CONFIG_FILE=/usr/local/etc/xray/config.json
 SC_ACCESS_LOCK_FILE=/etc/sc-1forcr-access.lock
 SC_RUNTIME_ENV_FILE=/etc/sc-1forcr.env
+SC_REG_META_FILE=/etc/sc-1forcr-registration.env
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF

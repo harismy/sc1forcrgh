@@ -17,6 +17,7 @@ const DEFAULT_SC_REGISTRATION_PRICE_PER_DAY = Math.max(
   0,
   Number(process.env.SC_REGISTRATION_PRICE_PER_DAY || process.env.SC_REGISTRATION_FEE || 25000) || 25000
 );
+const SC_UNLIMITED_PRICE = Math.max(0, Number(process.env.SC_UNLIMITED_PRICE || 70000) || 70000);
 const DEFAULT_SC_REGISTRATION_MIN_DAYS = Math.max(1, Number(process.env.SC_REGISTRATION_MIN_DAYS || 1) || 1);
 const DEFAULT_TOPUP_MIN = Math.max(1000, Number(process.env.TOPUP_MIN || 5000) || 5000);
 const DEFAULT_TOPUP_EXPIRE_MS = Math.max(60000, Number(process.env.TOPUP_EXPIRE_MS || (5 * 60 * 1000)) || (5 * 60 * 1000));
@@ -40,6 +41,7 @@ const userState = new Map();
 const db = new sqlite3.Database(DB_PATH);
 const DYNAMIC_SETTING_KEYS = [
   'SC_REGISTRATION_PRICE_PER_DAY',
+  'SC_UNLIMITED_PRICE',
   'SC_REGISTRATION_MIN_DAYS',
   'TOPUP_MIN',
   'TOPUP_EXPIRE_MS',
@@ -49,6 +51,7 @@ const DYNAMIC_SETTING_KEYS = [
 ];
 const SETTING_LABELS = {
   SC_REGISTRATION_PRICE_PER_DAY: 'Harga SC per Hari',
+  SC_UNLIMITED_PRICE: 'Harga SC Unlimited',
   SC_REGISTRATION_MIN_DAYS: 'Minimal Hari Pembelian',
   TOPUP_MIN: 'Minimal Top Up Saldo',
   TOPUP_EXPIRE_MS: 'Masa Aktif QR Top Up',
@@ -169,6 +172,7 @@ async function seedDefaultSettings() {
   const now = Date.now();
   const defaults = {
     SC_REGISTRATION_PRICE_PER_DAY: String(DEFAULT_SC_REGISTRATION_PRICE_PER_DAY),
+    SC_UNLIMITED_PRICE: String(SC_UNLIMITED_PRICE),
     SC_REGISTRATION_MIN_DAYS: String(DEFAULT_SC_REGISTRATION_MIN_DAYS),
     TOPUP_MIN: String(DEFAULT_TOPUP_MIN),
     TOPUP_EXPIRE_MS: String(DEFAULT_TOPUP_EXPIRE_MS),
@@ -248,6 +252,10 @@ async function getRegistrationMinDays() {
   return getSettingNumber('SC_REGISTRATION_MIN_DAYS', DEFAULT_SC_REGISTRATION_MIN_DAYS, 1, 3650);
 }
 
+async function getUnlimitedPrice() {
+  return getSettingNumber('SC_UNLIMITED_PRICE', SC_UNLIMITED_PRICE, 0, 1000000000);
+}
+
 async function getTopupMin() {
   return getSettingNumber('TOPUP_MIN', DEFAULT_TOPUP_MIN, 1000, 1000000000);
 }
@@ -295,8 +303,9 @@ async function getSummaryApiLocalPath() {
 }
 
 async function getDynamicSettingsSnapshot() {
-  const [pricePerDay, minDays, minTopup, expMs, autoProv, certEmail, installerPath] = await Promise.all([
+  const [pricePerDay, unlimitedPrice, minDays, minTopup, expMs, autoProv, certEmail, installerPath] = await Promise.all([
     getRegistrationPricePerDay(),
+    getUnlimitedPrice(),
     getRegistrationMinDays(),
     getTopupMin(),
     getTopupExpireMs(),
@@ -306,6 +315,7 @@ async function getDynamicSettingsSnapshot() {
   ]);
   return {
     SC_REGISTRATION_PRICE_PER_DAY: String(pricePerDay),
+    SC_UNLIMITED_PRICE: String(unlimitedPrice),
     SC_REGISTRATION_MIN_DAYS: String(minDays),
     TOPUP_MIN: String(minTopup),
     TOPUP_EXPIRE_MS: String(expMs),
@@ -848,6 +858,11 @@ async function runNaturalScExpiryJobs() {
 
       const serverKey = await getServerKeyForHost(uid, host);
       if (serverKey) {
+        await syncScRegistrationMetaToHost(host, serverKey, {
+          status: 'expired',
+          client_name: normalizeClientName(row?.client_name || host) || host,
+          expires_at: Number(expTs || 0)
+        }).catch(() => {});
         await lockScAccessByHost(host, serverKey, uid, 'natural_expired').catch(() => {});
         const canNotifyLocal = await shouldSendScNotify(uid, host, 'natural_expired_local', SC_NOTIFY_INTERVAL_MS);
         if (canNotifyLocal) {
@@ -1001,6 +1016,67 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
   }
 }
 
+async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
+  await ensureUser(userId);
+
+  if (await isIpOwnedByOther(ip, userId)) {
+    throw new Error('IP VPS ini sudah terdaftar oleh user lain.');
+  }
+
+  const existing = await dbGet(
+    "SELECT id, status, expires_at, client_name FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
+    [userId, ip]
+  );
+
+  const chargeSaldo = options?.chargeSaldo === true;
+  const totalFee = Math.max(0, Number(options?.totalFee || 0));
+  const txType = String(options?.txType || (chargeSaldo ? 'sc_registration_unlimited' : 'sc_registration_unlimited_admin')).trim();
+  const txRef = String(options?.txRef || `sc_unl_${userId}_${ip}_${Date.now()}`).trim();
+
+  await dbRun('BEGIN IMMEDIATE TRANSACTION');
+  try {
+    if (chargeSaldo) {
+      const ok = await deductSaldoAtomic(userId, totalFee);
+      if (!ok) {
+        await dbRun('ROLLBACK');
+        return { insufficient: true };
+      }
+    }
+
+    const now = Date.now();
+    const prevStatus = String(existing?.status || '').trim().toLowerCase();
+    const finalClientName = normalizeClientName(clientName || existing?.client_name || ip);
+    await dbRun(
+      `INSERT INTO sc_registrations (user_id, vps_ip, client_name, status, created_at, updated_at)
+       VALUES (?, ?, ?, 'active', ?, ?)
+       ON CONFLICT(user_id, vps_ip) DO UPDATE SET
+         status='active',
+         updated_at=excluded.updated_at,
+         client_name=excluded.client_name`,
+      [userId, ip, finalClientName, now, now]
+    );
+    await dbRun(
+      'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ?, client_name = ? WHERE user_id = ? AND vps_ip = ?',
+      ['active', now, 0, finalClientName, userId, ip]
+    );
+
+    if (chargeSaldo && totalFee > 0) {
+      await saveTransaction(userId, -totalFee, txType, txRef);
+    }
+    await dbRun('COMMIT');
+    return {
+      success: true,
+      expiresAt: 0,
+      clientName: finalClientName,
+      prevStatus,
+      reactivatedFromExpired: prevStatus === 'expired'
+    };
+  } catch (e) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('SC Saya', 'm_my_sc')],
@@ -1050,10 +1126,12 @@ function migrateProtocolKeyboard(prefix, cancelAction) {
   return Markup.inlineKeyboard(rows);
 }
 
-function registerScMenu() {
+async function registerScMenu() {
+  const unlimitedPrice = await getUnlimitedPrice();
   return Markup.inlineKeyboard([
     [Markup.button.callback('Registrasi Baru', 'm_register_sc_new')],
     [Markup.button.callback('Perpanjang SC', 'm_register_sc_extend')],
+    [Markup.button.callback(`SC Unlimited (Rp ${Number(unlimitedPrice).toLocaleString('id-ID')})`, 'm_register_sc_unlimited')],
     [Markup.button.callback('Kembali', 'm_register_sc_back')]
   ]);
 }
@@ -1063,7 +1141,7 @@ function adminMenu() {
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
-    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
+    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
     [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
@@ -1085,6 +1163,7 @@ function adminEnvGroupMenu(group) {
   if (g === 'billing') {
     return Markup.inlineKeyboard([
       [Markup.button.callback(getSettingLabel('SC_REGISTRATION_PRICE_PER_DAY'), 'm_admin_env_pick_SC_REGISTRATION_PRICE_PER_DAY')],
+      [Markup.button.callback(getSettingLabel('SC_UNLIMITED_PRICE'), 'm_admin_env_pick_SC_UNLIMITED_PRICE')],
       [Markup.button.callback(getSettingLabel('SC_REGISTRATION_MIN_DAYS'), 'm_admin_env_pick_SC_REGISTRATION_MIN_DAYS')],
       [Markup.button.callback(getSettingLabel('TOPUP_MIN'), 'm_admin_env_pick_TOPUP_MIN')],
       [Markup.button.callback(getSettingLabel('TOPUP_EXPIRE_MS'), 'm_admin_env_pick_TOPUP_EXPIRE_MS')],
@@ -1111,6 +1190,8 @@ function envKeyInputHint(key) {
   switch (String(key || '').toUpperCase()) {
     case 'SC_REGISTRATION_PRICE_PER_DAY':
       return 'Contoh: 25000 (rupiah per hari, angka bulat).';
+    case 'SC_UNLIMITED_PRICE':
+      return 'Contoh: 70000 (rupiah, angka bulat).';
     case 'SC_REGISTRATION_MIN_DAYS':
       return 'Contoh: 1 (minimal hari pembelian user).';
     case 'TOPUP_MIN':
@@ -1226,6 +1307,25 @@ async function apiPost(host, key, endpoint, body = {}, timeoutMs = 120000) {
   });
   if (!res.data?.ok) throw new Error(res.data?.message || 'request gagal');
   return res.data;
+}
+
+async function syncScRegistrationMetaToHost(host, key, meta = {}) {
+  const safeHost = normalizeHost(host);
+  const safeKey = String(key || '').trim();
+  if (!isIpv4(safeHost) || safeKey.length < 8) {
+    return { ok: false, skipped: true, message: 'host/key tidak tersedia' };
+  }
+  try {
+    const payload = {
+      status: String(meta.status || 'active').trim().toLowerCase() || 'active',
+      client_name: String(meta.client_name || '').trim(),
+      expires_at: Number(meta.expires_at || 0)
+    };
+    await apiPost(safeHost, safeKey, '/internal/sc-registration-meta', payload, 30000);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, message: parseErr(err) };
+  }
 }
 
 function normalizeReleaseVersion(input) {
@@ -1742,6 +1842,7 @@ bot.action('m_admin_env_show', async (ctx) => {
   await ctx.reply(
     uiBox('PENGATURAN SAAT INI', [
       `${getSettingLabel('SC_REGISTRATION_PRICE_PER_DAY')} : Rp ${Number(snap.SC_REGISTRATION_PRICE_PER_DAY || 0).toLocaleString('id-ID')}`,
+      `${getSettingLabel('SC_UNLIMITED_PRICE')} : Rp ${Number(snap.SC_UNLIMITED_PRICE || 0).toLocaleString('id-ID')}`,
       `${getSettingLabel('SC_REGISTRATION_MIN_DAYS')} : ${snap.SC_REGISTRATION_MIN_DAYS} hari`,
       `${getSettingLabel('TOPUP_MIN')} : Rp ${Number(snap.TOPUP_MIN || 0).toLocaleString('id-ID')}`,
       `${getSettingLabel('TOPUP_EXPIRE_MS')} : ${topupExpireMinute} menit`,
@@ -1944,20 +2045,27 @@ bot.action('m_install_link', async (ctx) => {
 
 bot.action('m_register_sc', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+  const [pricePerDay, unlimitedPrice, minDays, regMenu] = await Promise.all([
+    getRegistrationPricePerDay(),
+    getUnlimitedPrice(),
+    getRegistrationMinDays(),
+    registerScMenu()
+  ]);
   await ctx.reply(
     uiBox('REGISTRASI / PERPANJANG SC', [
       'Pilih jenis layanan:',
       '- Registrasi Baru',
       '- Perpanjang SC',
+      '- SC Unlimited',
       '',
       `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari`,
+      `Harga Unlimited : Rp ${Number(unlimitedPrice).toLocaleString('id-ID')} sekali bayar`,
       `Minimal Durasi  : ${minDays} hari`,
       '',
       'Perpanjang cukup masukkan IP VPS yang terdaftar.',
       'Tekan tombol di bawah ini.'
     ]),
-    registerScMenu()
+    regMenu
   );
 });
 
@@ -1978,6 +2086,23 @@ bot.action('m_register_sc_new', async (ctx) => {
   );
 });
 
+bot.action('m_register_sc_unlimited', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const unlimitedPrice = await getUnlimitedPrice();
+  userState.set(ctx.chat.id, { step: 'register_sc_unlimited_client_name' });
+  await ctx.reply(
+    uiBox('REGISTRASI SC UNLIMITED', [
+      'Masukkan nama client.',
+      'Contoh: Haris Unlimited 01',
+      '',
+      `Harga paket     : Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}`,
+      'Masa aktif      : tanpa batas',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
 bot.action('m_register_sc_extend', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   userState.set(ctx.chat.id, { step: 'extend_sc_ip' });
@@ -1986,6 +2111,21 @@ bot.action('m_register_sc_extend', async (ctx) => {
       'Masukkan IP VPS yang ingin diperpanjang.',
       'Contoh: 103.10.10.2',
       '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action('m_admin_sc_unlimited', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_sc_unlimited_user_id' });
+  return ctx.reply(
+    uiBox('ADMIN DAFTAR SC UNLIMITED', [
+      'Masukkan Telegram User ID target.',
+      'Contoh: 123456789',
+      '',
+      'Paket ini manual oleh admin, tanpa potong saldo.',
       'Ketik "batal" untuk membatalkan.'
     ])
   );
@@ -2419,6 +2559,10 @@ bot.on('text', async (ctx) => {
         const n = Number(value);
         if (!Number.isFinite(n) || n < 0) return ctx.reply('Harus angka >= 0.');
         value = String(Math.floor(n));
+      } else if (key === 'SC_UNLIMITED_PRICE') {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 0) return ctx.reply('Harus angka >= 0.');
+        value = String(Math.floor(n));
       } else if (key === 'SC_REGISTRATION_MIN_DAYS') {
         const n = Number(value);
         if (!Number.isFinite(n) || n < 1) return ctx.reply('Harus angka >= 1.');
@@ -2514,6 +2658,11 @@ bot.on('text', async (ctx) => {
       let vpsNotifyMsg = 'Notif bot VPS: skip (key belum tersimpan)';
       if (String(key || '').trim().length >= 8) {
         try {
+          await syncScRegistrationMetaToHost(ip, key, {
+            status: 'expired',
+            client_name: '-',
+            expires_at: Date.now()
+          }).catch(() => {});
           await notifyScExpiredOnHost(ip, key, {
             ip,
             reason: 'admin_remove_sc_ip',
@@ -2626,6 +2775,94 @@ bot.on('text', async (ctx) => {
       );
     }
 
+    if (state.step === 'register_sc_unlimited_client_name') {
+      const clientName = normalizeClientName(text);
+      if (!clientName || clientName.length < 2) {
+        return ctx.reply(
+          uiBox('INPUT NAMA CLIENT', [
+            'Nama client minimal 2 karakter.',
+            'Contoh: Haris Unlimited 01'
+          ])
+        );
+      }
+      state.step = 'register_sc_unlimited_ip';
+      state.clientName = clientName;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('LANJUT REGISTRASI UNLIMITED', [
+          `Nama Client : ${clientName}`,
+          '',
+          'Masukkan IP VPS yang ingin didaftarkan.',
+          'Contoh: 103.10.10.2'
+        ])
+      );
+    }
+
+    if (state.step === 'register_sc_unlimited_ip') {
+      const ip = normalizeHost(text);
+      if (!isIpv4(ip)) {
+        return ctx.reply(
+          uiBox('INPUT IP VPS', [
+            'Format IP tidak valid.',
+            'Contoh: 103.10.10.2'
+          ])
+        );
+      }
+      if (await isIpOwnedByOther(ip, ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`IP ${ip} sudah terdaftar oleh user lain.`, mainMenu());
+      }
+      const unlimitedPrice = await getUnlimitedPrice();
+      const clientName = normalizeClientName(state.clientName || ctx.from.first_name || ip) || ip;
+      const result = await registerScIpUnlimited(ctx.from.id, ip, clientName, {
+        chargeSaldo: true,
+        totalFee: unlimitedPrice,
+        txType: 'sc_registration_unlimited',
+        txRef: `sc_unl_${ctx.from.id}_${ip}_${Date.now()}`
+      });
+      if (result.insufficient) {
+        const saldo = await getSaldo(ctx.from.id);
+        userState.delete(ctx.chat.id);
+        return ctx.reply(
+            `Saldo tidak cukup untuk SC Unlimited.\n` +
+            `Nama Client: ${clientName}\n` +
+            `IP: ${ip}\n` +
+            `Total biaya: Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}\n` +
+            `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n\n` +
+            'Silakan top up dulu via menu "Top Up Saldo".',
+          mainMenu()
+        );
+      }
+
+      const saldoNow = await getSaldo(ctx.from.id);
+      const installerText = await buildInstallerQuickCopyText();
+      userState.delete(ctx.chat.id);
+      await ctx.reply(
+        `Registrasi SC Unlimited berhasil.\n` +
+          `Nama Client: ${result.clientName || clientName}\n` +
+          `IP: ${ip}\n` +
+          `Biaya potong saldo: Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}\n` +
+          `Expired: tanpa batas\n` +
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+        mainMenu()
+      );
+      const hostKeyUnlimited = await getServerKeyForHost(ctx.from.id, ip);
+      await syncScRegistrationMetaToHost(ip, hostKeyUnlimited, {
+        status: 'active',
+        client_name: result.clientName || clientName,
+        expires_at: 0
+      }).catch(() => {});
+      if (installerText.ok) {
+        await ctx.reply(installerText.text, {
+          parse_mode: installerText.parse_mode,
+          disable_web_page_preview: true
+        });
+      } else {
+        await ctx.reply(installerText.text);
+      }
+      return;
+    }
+
     if (state.step === 'register_sc_ip') {
       const ip = normalizeHost(text);
       if (!isIpv4(ip)) {
@@ -2712,6 +2949,12 @@ bot.on('text', async (ctx) => {
             : ''}`,
         mainMenu()
       );
+      const hostKeyReg = await getServerKeyForHost(ctx.from.id, ip);
+      await syncScRegistrationMetaToHost(ip, hostKeyReg, {
+        status: 'active',
+        client_name: result.clientName || clientName,
+        expires_at: Number(result.expiresAt || 0)
+      }).catch(() => {});
       if (installerText.ok) {
         await ctx.reply(installerText.text, {
           parse_mode: installerText.parse_mode,
@@ -2721,6 +2964,89 @@ bot.on('text', async (ctx) => {
         await ctx.reply(installerText.text);
       }
       return;
+    }
+
+    if (state.step === 'admin_sc_unlimited_user_id') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const targetUserId = Number(String(text || '').replace(/[^0-9]/g, ''));
+      if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+        return ctx.reply('User ID tidak valid. Contoh: 123456789');
+      }
+      state.targetUserId = targetUserId;
+      state.step = 'admin_sc_unlimited_client_name';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `Target user ID: ${targetUserId}\n` +
+          'Masukkan nama client SC unlimited.\n' +
+          'Contoh: User Premium Unlimited'
+      );
+    }
+
+    if (state.step === 'admin_sc_unlimited_client_name') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const clientName = normalizeClientName(text);
+      if (!clientName || clientName.length < 2) {
+        return ctx.reply('Nama client minimal 2 karakter.');
+      }
+      state.clientName = clientName;
+      state.step = 'admin_sc_unlimited_ip';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `Nama client: ${clientName}\n` +
+          'Masukkan IP VPS target.\n' +
+          'Contoh: 103.10.10.2'
+      );
+    }
+
+    if (state.step === 'admin_sc_unlimited_ip') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = normalizeHost(text);
+      if (!isIpv4(ip)) {
+        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      }
+      const targetUserId = Number(state.targetUserId || 0);
+      if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State target user tidak valid. Ulangi dari menu admin.', adminMenu());
+      }
+      if (await isIpOwnedByOther(ip, targetUserId)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`IP ${ip} sudah terdaftar oleh user lain.`, adminMenu());
+      }
+      const clientName = normalizeClientName(state.clientName || ip) || ip;
+      const result = await registerScIpUnlimited(targetUserId, ip, clientName, {
+        chargeSaldo: false,
+        txType: 'sc_registration_unlimited_admin',
+        txRef: `sc_unl_admin_${ctx.from.id}_${targetUserId}_${ip}_${Date.now()}`
+      });
+      userState.delete(ctx.chat.id);
+      if (!result.success) {
+        return ctx.reply('Gagal daftarkan SC unlimited manual.', adminMenu());
+      }
+      const hostKeyAdminUnl = await getServerKeyForHost(targetUserId, ip);
+      await syncScRegistrationMetaToHost(ip, hostKeyAdminUnl, {
+        status: 'active',
+        client_name: result.clientName || clientName,
+        expires_at: 0
+      }).catch(() => {});
+      return ctx.reply(
+        `SC Unlimited manual berhasil didaftarkan.\n` +
+          `Target user ID: ${targetUserId}\n` +
+          `Nama Client: ${result.clientName || clientName}\n` +
+          `IP: ${ip}\n` +
+          `Biaya: Rp 0 (manual admin)\n` +
+          `Expired: tanpa batas`,
+        adminMenu()
+      );
     }
 
     if (state.step === 'extend_sc_ip') {
@@ -2820,6 +3146,12 @@ bot.on('text', async (ctx) => {
             : ''}`,
         mainMenu()
       );
+      const hostKeyExtend = await getServerKeyForHost(ctx.from.id, ip);
+      await syncScRegistrationMetaToHost(ip, hostKeyExtend, {
+        status: 'active',
+        client_name: result.clientName || clientName,
+        expires_at: Number(result.expiresAt || 0)
+      }).catch(() => {});
       if (installerText.ok) {
         await ctx.reply(installerText.text, {
           parse_mode: installerText.parse_mode,

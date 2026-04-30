@@ -8763,6 +8763,16 @@ draw_dashboard() {
     sed -n "s/^${key}=//p" "${file}" | head -n1
   }
 
+  read_sc_meta_value() {
+    local key="$1"
+    local file="/etc/sc-1forcr-registration.env"
+    if [[ ! -f "${file}" ]]; then
+      echo ""
+      return
+    fi
+    sed -n "s/^${key}=//p" "${file}" | head -n1
+  }
+
   read_update_info_value() {
     local key="$1"
     local file="/etc/sc-1forcr/update-info.env"
@@ -8886,18 +8896,30 @@ EOF
   city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
   isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
   local license_distribution license_client_name license_expires_raw expiry_in_text
+  local sc_meta_status sc_meta_client sc_meta_expires
   local update_component update_version update_desc update_time update_desc_short
   license_distribution="$(read_license_value "LICENSE_DISTRIBUTION")"
   license_client_name="$(read_license_value "LICENSE_CLIENT_NAME")"
   license_expires_raw="$(read_license_value "LICENSE_EXPIRES_AT")"
+  sc_meta_status="$(echo "$(read_sc_meta_value "SC_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
+  sc_meta_client="$(read_sc_meta_value "SC_CLIENT_NAME")"
+  sc_meta_expires="$(read_sc_meta_value "SC_EXPIRES_AT")"
   update_component="$(read_update_info_value "UPDATE_COMPONENT")"
   update_version="$(read_update_info_value "UPDATE_VERSION")"
   update_desc="$(read_update_info_value "UPDATE_DESC")"
   update_time="$(read_update_info_value "UPDATE_AT_LOCAL")"
   update_desc_short="$(truncate_text "${update_desc:-"-"}" 80)"
   [[ -z "${license_distribution}" ]] && license_distribution="Community / Open Source"
-  [[ -z "${license_client_name}" ]] && license_client_name="${ip}"
-  expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
+  if [[ -n "${sc_meta_client}" ]]; then
+    license_client_name="${sc_meta_client}"
+  elif [[ -z "${license_client_name}" ]]; then
+    license_client_name="${ip}"
+  fi
+  if [[ "${sc_meta_status}" == "active" || "${sc_meta_status}" == "unlimited" || -n "${sc_meta_expires}" ]]; then
+    expiry_in_text="$(format_expiry_in "${sc_meta_expires}")"
+  else
+    expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
+  fi
   [[ -z "${update_component}" ]] && update_component="-"
   [[ -z "${update_version}" ]] && update_version="-"
   [[ -z "${update_desc_short}" ]] && update_desc_short="-"

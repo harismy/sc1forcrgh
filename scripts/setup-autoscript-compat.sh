@@ -3231,6 +3231,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"os"
 	"regexp"
@@ -3264,7 +3265,7 @@ func envInt(key string, fallback int) int {
 }
 
 func readMemGiB() int {
-	b, err := os.ReadFile("/proc/meminfo")
+	b, err := ioutil.ReadFile("/proc/meminfo")
 	if err != nil {
 		return 0
 	}

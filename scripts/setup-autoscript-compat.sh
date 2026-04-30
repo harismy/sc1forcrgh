@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
@@ -8885,22 +8885,22 @@ draw_dashboard() {
   }
 
   print_top() {
-    printf "┌%s┐\n" "$(repeat_char '─' "$((BOX_W + 2))")"
+    printf "â”Œ%sâ”\n" "$(repeat_char 'â”€' "$((BOX_W + 2))")"
   }
 
   print_mid() {
-    printf "├%s┤\n" "$(repeat_char '─' "$((BOX_W + 2))")"
+    printf "â”œ%sâ”¤\n" "$(repeat_char 'â”€' "$((BOX_W + 2))")"
   }
 
   print_bottom() {
-    printf "└%s┘\n" "$(repeat_char '─' "$((BOX_W + 2))")"
+    printf "â””%sâ”˜\n" "$(repeat_char 'â”€' "$((BOX_W + 2))")"
   }
 
   print_line() {
     local text="$1"
     local padded
     padded="$(pad_right "$text" "$BOX_W")"
-    printf "│ %s │\n" "$padded"
+    printf "â”‚ %s â”‚\n" "$padded"
   }
 
   print_center() {
@@ -8913,7 +8913,7 @@ draw_dashboard() {
     fi
     left=$(( (BOX_W - vlen) / 2 ))
     right=$(( BOX_W - vlen - left ))
-    printf "│ %*s%s%*s │\n" "$left" "" "$text" "$right" ""
+    printf "â”‚ %*s%s%*s â”‚\n" "$left" "" "$text" "$right" ""
   }
 
   kv_line() {
@@ -9031,7 +9031,7 @@ draw_dashboard() {
 
   clear
   print_top
-  print_center "${CYAN}${BOLD}• SC 1FORCR NEXUS DASHBOARD •${NC}"
+  print_center "${CYAN}${BOLD}â€¢ SC 1FORCR NEXUS DASHBOARD â€¢${NC}"
   print_mid
   print_line "${CYAN}${BOLD}* SYSTEM & RESOURCES${NC}"
   kv_line "OS" "${os_name}"
@@ -10692,25 +10692,25 @@ while true; do
   s_nginx="$(service_onoff nginx)"
 
   if [[ "${SHOW_FULL_MENU}" != "1" ]]; then
-    echo -e "${CYN}┌────────────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${CYN}│ MAIN MENU                                                          │${NC}"
-    echo -e "${CYN}├────────────────────────────────────────────────────────────────────┤${NC}"
-    printf "${CYN}│ %-66s │${NC}\n" "Domain : ${DOMAIN}"
-    printf "${CYN}│ %-66s │${NC}\n" "IP VPS : ${local_ip}"
-    printf "${CYN}│ %-66s │${NC}\n" "Uptime : ${up_text}"
-    echo -e "${CYN}├────────────────────────────────────────────────────────────────────┤${NC}"
-    printf "${CYN}│ [ SSH : %-3s ]   [ XRAY : %-3s ]   [ NGINX : %-3s ]                      │${NC}\n" "${s_ssh}" "${s_xray}" "${s_nginx}"
-    echo -e "${CYN}└────────────────────────────────────────────────────────────────────┘${NC}"
+    echo -e "${CYN}â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”${NC}"
+    echo -e "${CYN}â”‚ MAIN MENU                                                          â”‚${NC}"
+    echo -e "${CYN}â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤${NC}"
+    printf "${CYN}â”‚ %-66s â”‚${NC}\n" "Domain : ${DOMAIN}"
+    printf "${CYN}â”‚ %-66s â”‚${NC}\n" "IP VPS : ${local_ip}"
+    printf "${CYN}â”‚ %-66s â”‚${NC}\n" "Uptime : ${up_text}"
+    echo -e "${CYN}â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤${NC}"
+    printf "${CYN}â”‚ [ SSH : %-3s ]   [ XRAY : %-3s ]   [ NGINX : %-3s ]                      â”‚${NC}\n" "${s_ssh}" "${s_xray}" "${s_nginx}"
+    echo -e "${CYN}â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜${NC}"
   fi
 
-  echo -e "${CYN}┌────────────────────────────────────────────────────────────────────┐${NC}"
-  echo -e "${CYN}│ [01] . MENU AKUN            [05] . MONITOR USER LOCK              │${NC}"
-  echo -e "${CYN}│ [02] . SERVICE MENU         [06] . MONITOR USER LOGIN             │${NC}"
-  echo -e "${CYN}│ [03] . BACKUP/RESTORE       [07] . TOOLS                          │${NC}"
-  echo -e "${CYN}│ [04] . CHANGE DOMAIN                                               │${NC}"
-  echo -e "${CYN}├────────────────────────────────────────────────────────────────────┤${NC}"
-  echo -e "${CYN}│ [ m ] . TAMPILKAN DASHBOARD   [ x ] . EXIT MENU                   │${NC}"
-  echo -e "${CYN}└────────────────────────────────────────────────────────────────────┘${NC}"
+  echo -e "${CYN}â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”${NC}"
+  echo -e "${CYN}â”‚ [01] . MENU AKUN            [05] . MONITOR USER LOCK              â”‚${NC}"
+  echo -e "${CYN}â”‚ [02] . SERVICE MENU         [06] . MONITOR USER LOGIN             â”‚${NC}"
+  echo -e "${CYN}â”‚ [03] . BACKUP/RESTORE       [07] . TOOLS                          â”‚${NC}"
+  echo -e "${CYN}â”‚ [04] . CHANGE DOMAIN                                               â”‚${NC}"
+  echo -e "${CYN}â”œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”¤${NC}"
+  echo -e "${CYN}â”‚ [ m ] . TAMPILKAN DASHBOARD   [ x ] . EXIT MENU                   â”‚${NC}"
+  echo -e "${CYN}â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜${NC}"
   echo
 
   if ! prompt_input m "Select From Options [1-7, m, x] : "; then
@@ -10738,7 +10738,8 @@ while true; do
   SHOW_FULL_MENU=0
   echo
   read -rp "Enter untuk lanjut..." _ || true
-done`r`nMENU_SCRIPT_EOF
+done
+MENU_SCRIPT_EOF
 
   chmod +x "${menu_runtime}"
 
@@ -11169,3 +11170,5 @@ EOF
 }
 
 main "$@"
+
+

@@ -1063,7 +1063,7 @@ function adminMenu() {
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
-    [Markup.button.callback('Trigger Update SC/API', 'm_admin_trigger_update'), Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
+    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
     [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
@@ -1240,24 +1240,6 @@ function normalizeReleaseDescription(input) {
   return raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n{2,}/g, '\n').slice(0, 1200);
 }
 
-function buildUpdateNoticeText(component, version, description, host = '', scope = 'single', serverKey = '') {
-  const c = String(component || '').trim().toUpperCase() || '-';
-  const v = String(version || '').trim() || '-';
-  const d = String(description || '').trim() || '-';
-  const h = String(host || '').trim();
-  const k = String(serverKey || '').trim();
-  const lines = [
-    'Info Update SC',
-    `Komponen : ${c}`,
-    `Versi    : ${v}`,
-    `Ruang    : ${scope === 'global' ? 'Global' : 'Single VPS'}`
-  ];
-  if (h) lines.push(`Host     : ${h}`);
-  if (k) lines.push(`ServerKey: ${k}`);
-  lines.push('', 'Deskripsi update:', d);
-  return lines.join('\n');
-}
-
 async function getActiveUserIdsByHosts(hostsInput) {
   const hosts = Array.from(
     new Set(
@@ -1302,98 +1284,6 @@ async function broadcastUpdateNoticeToUsers(userIdsInput, message) {
     else failed += 1;
   }
   return { total: userIds.length, sent, failed };
-}
-
-async function runAdminUpdateSingle(ctx, host, key, component, version, description) {
-  const scriptUrls = await buildBotScriptUrls();
-  const payload = {
-    component,
-    release_version: version || '',
-    release_description: description || '',
-    release_actor: String(ctx.from?.id || ''),
-    update_script_url: scriptUrls.updateScriptUrl || ''
-  };
-  const resp = await apiPost(host, key, '/internal/trigger-update', payload, 40 * 60 * 1000);
-  await saveServerKeyForHostAllOwners(host, key, ctx.from.id);
-  const users = await getActiveUserIdsByHosts([host]).catch(() => []);
-  const notice = buildUpdateNoticeText(component, version, description, host, 'single', key);
-  const notify = await broadcastUpdateNoticeToUsers(users, notice).catch(() => ({ total: users.length, sent: 0, failed: users.length }));
-  const steps = Array.isArray(resp?.steps) ? resp.steps : [];
-  const lines = steps.map((s) => `- ${String(s?.step || '-')} : ${s?.ok ? 'OK' : 'FAIL'}`);
-  return {
-    host,
-    steps,
-    message:
-      `Trigger update selesai.\n` +
-      `Host: ${host}\n` +
-      `Target: ${String(component || '').toUpperCase()}\n` +
-      `Versi: ${version || '-'}\n` +
-      `Deskripsi: ${description || '-'}\n` +
-      `${lines.length ? lines.join('\n') : '-'}\n` +
-      `Notif user: ${notify.sent}/${notify.total} terkirim`
-  };
-}
-
-async function runAdminUpdateGlobal(ctx, component, version, description) {
-  const hosts = await listActiveScHosts(2000).catch(() => []);
-  const scriptUrls = await buildBotScriptUrls();
-  if (!hosts.length) {
-    return {
-      ok: false,
-      message: 'Tidak ada host aktif untuk trigger update global.'
-    };
-  }
-  let success = 0;
-  let fail = 0;
-  let skipped = 0;
-  const failLines = [];
-  const successHosts = [];
-  for (const host of hosts) {
-    const key = await getServerKeyForHost(ctx.from.id, host);
-    if (String(key || '').trim().length < 8) {
-      skipped += 1;
-      if (failLines.length < 20) failLines.push(`- ${host}: skip (key belum tersimpan)`);
-      continue;
-    }
-    try {
-      await apiPost(
-        host,
-        key,
-        '/internal/trigger-update',
-        {
-          component,
-          release_version: version || '',
-          release_description: description || '',
-          release_actor: String(ctx.from?.id || ''),
-          update_script_url: scriptUrls.updateScriptUrl || ''
-        },
-        40 * 60 * 1000
-      );
-      await saveServerKeyForHostAllOwners(host, key, ctx.from.id);
-      success += 1;
-      successHosts.push(host);
-    } catch (err) {
-      fail += 1;
-      if (failLines.length < 20) failLines.push(`- ${host}: ${parseErr(err)}`);
-    }
-  }
-  const users = await getActiveUserIdsByHosts(successHosts).catch(() => []);
-  const notice = buildUpdateNoticeText(component, version, description, '', 'global');
-  const notify = await broadcastUpdateNoticeToUsers(users, notice).catch(() => ({ total: users.length, sent: 0, failed: users.length }));
-  return {
-    ok: true,
-    message:
-      `Trigger update global selesai.\n` +
-      `Target: ${String(component || '').toUpperCase()}\n` +
-      `Versi: ${version || '-'}\n` +
-      `Deskripsi: ${description || '-'}\n` +
-      `Total host aktif: ${hosts.length}\n` +
-      `Sukses: ${success}\n` +
-      `Gagal: ${fail}\n` +
-      `Skip (tanpa key): ${skipped}\n` +
-      `Notif user: ${notify.sent}/${notify.total} terkirim` +
-      `${failLines.length ? `\n\nDetail (maks 20):\n${failLines.join('\n')}` : ''}`
-  };
 }
 
 function uniqUsernames(accounts) {
@@ -1829,102 +1719,6 @@ bot.action('m_admin_unlock_sc_access', async (ctx) => {
       'Contoh: 103.10.10.2',
       'Bot akan gunakan key tersimpan otomatis.',
       'Ketik "batal" untuk membatalkan.'
-    ])
-  );
-});
-
-bot.action('m_admin_trigger_update', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  userState.set(ctx.chat.id, { step: 'admin_update_scope' });
-  await ctx.reply(
-    uiBox('TRIGGER UPDATE SC/API', [
-      'Pilih mode trigger update.',
-      '',
-      '1) Single VPS (input IP + key).',
-      '2) Global (semua VPS aktif yang key-nya sudah tersimpan).',
-      '',
-      'Catatan: mode global akan skip host yang key server-nya belum ada di database bot.'
-    ]),
-    Markup.inlineKeyboard([
-      [Markup.button.callback('Single VPS', 'm_admin_update_scope_single')],
-      [Markup.button.callback('Global Semua VPS', 'm_admin_update_scope_global')],
-      [Markup.button.callback('Batal', 'm_admin_back')]
-    ])
-  );
-});
-
-bot.action('m_admin_update_scope_single', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  userState.set(ctx.chat.id, { step: 'admin_update_host' });
-  return ctx.reply(
-    uiBox('TRIGGER UPDATE - SINGLE VPS', [
-      'Masukkan IP VPS target update.',
-      'Contoh: 103.10.10.2',
-      '',
-      'Setelah itu bot akan minta key server dan target update (SC/API/BOTH).',
-      'Ketik "batal" untuk membatalkan.'
-    ])
-  );
-});
-
-bot.action('m_admin_update_scope_global', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  const hosts = await listActiveScHosts(2000).catch(() => []);
-  userState.set(ctx.chat.id, { step: 'admin_update_global_component' });
-  return ctx.reply(
-    uiBox('TRIGGER UPDATE - GLOBAL', [
-      `Total host aktif terdeteksi: ${hosts.length}`,
-      'Pilih komponen yang akan di-trigger ke semua host aktif.',
-      '',
-      'Host tanpa key tersimpan akan otomatis di-skip.'
-    ]),
-    Markup.inlineKeyboard([
-      [Markup.button.callback('SC Saja', 'm_admin_update_component_sc')],
-      [Markup.button.callback('API Saja', 'm_admin_update_component_api')],
-      [Markup.button.callback('SC + API', 'm_admin_update_component_both')],
-      [Markup.button.callback('Batal', 'm_admin_back')]
-    ])
-  );
-});
-
-bot.action(/m_admin_update_component_(sc|api|both)/, async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  const state = userState.get(ctx.chat.id);
-  if (!state || !['admin_update_component', 'admin_update_global_component'].includes(String(state.step || ''))) {
-    return ctx.reply('Sesi trigger update tidak aktif. Ulangi dari menu admin.', adminMenu());
-  }
-  const component = String(ctx.match?.[1] || '').toLowerCase();
-  if (state.step === 'admin_update_global_component') {
-    state.targetUpdateScope = 'global';
-    state.targetUpdateComponent = component;
-    state.step = 'admin_update_global_version';
-    userState.set(ctx.chat.id, state);
-    return ctx.reply(
-      uiBox('INFO RELEASE UPDATE (GLOBAL)', [
-        `Target komponen: ${component.toUpperCase()}`,
-        '',
-        'Masukkan versi update.',
-        'Contoh: v1.2.9',
-        'Ketik "-" jika mau dikosongkan.'
-      ])
-    );
-  }
-  state.targetUpdateScope = 'single';
-  state.targetUpdateComponent = component;
-  state.step = 'admin_update_version';
-  userState.set(ctx.chat.id, state);
-  return ctx.reply(
-    uiBox('INFO RELEASE UPDATE (SINGLE)', [
-      `Host: ${state.targetUpdateHost || '-'}`,
-      `Target komponen: ${component.toUpperCase()}`,
-      '',
-      'Masukkan versi update.',
-      'Contoh: v1.2.9',
-      'Ketik "-" jika mau dikosongkan.'
     ])
   );
 });
@@ -2541,7 +2335,6 @@ bot.on('text', async (ctx) => {
     userState.delete(ctx.chat.id);
     return ctx.reply('Dibatalkan.', mainMenu());
   }
-
   try {
     if (state.step === 'admin_set_env_key') {
       if (!isAdmin(ctx.from.id)) {
@@ -2761,7 +2554,7 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(
           `Gagal unlock akses SC VPS untuk ${ip}: key server belum tersimpan.\n` +
-            'Simpan dulu key lewat fitur yang meminta key (backup/restore/migrasi/trigger update).',
+            'Simpan dulu key lewat fitur yang meminta key (backup/restore/migrasi).',
           adminMenu()
         );
       }
@@ -2781,107 +2574,6 @@ bot.on('text', async (ctx) => {
       } catch (unlockErr) {
         userState.delete(ctx.chat.id);
         return ctx.reply(`Gagal unlock akses SC VPS: ${parseErr(unlockErr)}`, adminMenu());
-      }
-    }
-
-    if (state.step === 'admin_update_host') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      const ip = normalizeHost(text);
-      if (!isIpv4(ip)) {
-        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
-      }
-      state.targetUpdateHost = ip;
-      state.step = 'admin_update_key';
-      userState.set(ctx.chat.id, state);
-      return ctx.reply(`IP target: ${ip}\nMasukkan key server target.`);
-    }
-
-    if (state.step === 'admin_update_key') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      const key = String(text || '').trim();
-      if (key.length < 8) {
-        return ctx.reply('Key server tidak valid.');
-      }
-      state.targetUpdateKey = key;
-      state.step = 'admin_update_component';
-      userState.set(ctx.chat.id, state);
-      return ctx.reply(
-        uiBox('PILIH TARGET UPDATE', [
-          `Host: ${state.targetUpdateHost}`,
-          'Pilih komponen yang akan di-trigger update.'
-        ]),
-        Markup.inlineKeyboard([
-          [Markup.button.callback('SC Saja', 'm_admin_update_component_sc')],
-          [Markup.button.callback('API Saja', 'm_admin_update_component_api')],
-          [Markup.button.callback('SC + API', 'm_admin_update_component_both')],
-          [Markup.button.callback('Batal', 'm_admin_back')]
-        ])
-      );
-    }
-
-    if (state.step === 'admin_update_version' || state.step === 'admin_update_global_version') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      const raw = String(text || '').trim();
-      const version = (raw === '-' || raw.toLowerCase() === 'skip') ? '' : normalizeReleaseVersion(raw);
-      state.targetUpdateVersion = version;
-      state.step = state.step === 'admin_update_global_version' ? 'admin_update_global_desc' : 'admin_update_desc';
-      userState.set(ctx.chat.id, state);
-      return ctx.reply(
-        uiBox('DESKRIPSI UPDATE', [
-          `Versi: ${version || '-'}`,
-          '',
-          'Masukkan deskripsi update (apa saja yang berubah).',
-          'Ketik "-" jika mau dikosongkan.'
-        ])
-      );
-    }
-
-    if (state.step === 'admin_update_desc' || state.step === 'admin_update_global_desc') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      const raw = String(text || '').trim();
-      const description = (raw === '-' || raw.toLowerCase() === 'skip') ? '' : normalizeReleaseDescription(raw);
-      const component = String(state.targetUpdateComponent || '').trim().toLowerCase();
-      const version = normalizeReleaseVersion(state.targetUpdateVersion || '');
-      if (!['sc', 'api', 'both'].includes(component)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('State update tidak valid (component). Ulangi dari menu admin.', adminMenu());
-      }
-
-      const isGlobal = state.step === 'admin_update_global_desc' || String(state.targetUpdateScope || '') === 'global';
-      try {
-        if (isGlobal) {
-          await ctx.reply(`Menjalankan trigger update GLOBAL (${component.toUpperCase()})...`);
-          const result = await runAdminUpdateGlobal(ctx, component, version, description);
-          userState.delete(ctx.chat.id);
-          if (!result.ok) return ctx.reply(result.message || 'Trigger update global gagal.', adminMenu());
-          return ctx.reply(result.message, adminMenu());
-        }
-
-        const host = normalizeHost(state.targetUpdateHost || '');
-        const key = String(state.targetUpdateKey || '').trim();
-        if (!isIpv4(host) || key.length < 8) {
-          userState.delete(ctx.chat.id);
-          return ctx.reply('State trigger update tidak valid. Ulangi dari menu admin.', adminMenu());
-        }
-        await ctx.reply(`Menjalankan trigger update (${component.toUpperCase()}) ke ${host}...`);
-        const result = await runAdminUpdateSingle(ctx, host, key, component, version, description);
-        userState.delete(ctx.chat.id);
-        return ctx.reply(result.message, adminMenu());
-      } catch (err) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply(`Trigger update gagal: ${parseErr(err)}`, adminMenu());
       }
     }
 

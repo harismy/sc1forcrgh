@@ -77,7 +77,6 @@ const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/ba
 const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
 const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
 const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
-const UPDATE_INFO_FILE = String(process.env.UPDATE_INFO_FILE || '/etc/sc-1forcr/update-info.env').trim();
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -1451,82 +1450,6 @@ function applyScAccessLock(blockedInput, reasonInput, actorInput) {
   }
 }
 
-function runCommand(command, timeoutMs = 20 * 60 * 1000) {
-  try {
-    const out = execFileSync('bash', ['-lc', String(command || '')], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: Number(timeoutMs) || (20 * 60 * 1000)
-    });
-    return { ok: true, output: String(out || '').trim() };
-  } catch (err) {
-    return {
-      ok: false,
-      message: err?.message || 'command gagal',
-      stderr: String(err?.stderr || '').trim(),
-      stdout: String(err?.stdout || '').trim()
-    };
-  }
-}
-
-function triggerScAutoUpdate(updateScriptUrlInput = '') {
-  const cmd = [
-    'set -euo pipefail',
-    'if [[ -f /etc/sc-1forcr.env ]]; then set -a; source /etc/sc-1forcr.env; set +a; fi',
-    'BASE_FROM_LICENSE="$(printf \'%s\' "${LICENSE_API_URL:-}" | sed \'s|/sc1forcr/license/activate$||\')"',
-    'DERIVED_URL=""',
-    'if [[ -n "$BASE_FROM_LICENSE" ]]; then DERIVED_URL="${BASE_FROM_LICENSE}/sc1forcr/payload/scripts/setup-autoscript-compat.sh"; fi',
-    `URL_OVERRIDE="${String(updateScriptUrlInput || '').replace(/"/g, '\\"')}"`,
-    'URL="${UPDATE_SCRIPT_URL:-}"',
-    'if [[ -n "$URL_OVERRIDE" ]]; then URL="$URL_OVERRIDE"; fi',
-    'if [[ -n "$DERIVED_URL" ]] && { [[ -z "$URL" ]] || [[ "$URL" == *"raw.githubusercontent.com/"* ]]; }; then URL="$DERIVED_URL"; fi',
-    'if [[ -z "$URL" ]]; then',
-    '  echo "UPDATE_SCRIPT_URL tidak tersedia dan LICENSE_API_URL tidak valid." >&2',
-    '  exit 1',
-    'fi',
-    'TMP="$(mktemp /tmp/sc-1forcr-update-XXXXXX.sh)"',
-    'if ! curl -fsSL "$URL" -o "$TMP"; then',
-    '  echo "download update script gagal: $URL" >&2',
-    '  rm -f "$TMP" >/dev/null 2>&1 || true',
-    '  exit 1',
-    'fi',
-    "sed -i 's/\\r$//' \"$TMP\"",
-    'chmod +x "$TMP"',
-    'bash "$TMP"',
-    'rm -f "$TMP"'
-  ].join('\n');
-  const run = runCommand(cmd, 35 * 60 * 1000);
-  if (!run.ok) {
-    return {
-      ok: false,
-      statusCode: 500,
-      message: run.message || 'trigger update SC gagal',
-      stderr: run.stderr || null,
-      stdout: run.stdout || null
-    };
-  }
-  return { ok: true, component: 'sc', output: run.output || '' };
-}
-
-function restartCoreApiServices() {
-  const cmd = [
-    'set -e',
-    'systemctl restart sc-1forcr-api',
-    'systemctl restart sc-1forcr-sshws || true'
-  ].join('\n');
-  const run = runCommand(cmd, 2 * 60 * 1000);
-  if (!run.ok) {
-    return {
-      ok: false,
-      statusCode: 500,
-      message: run.message || 'restart API gagal',
-      stderr: run.stderr || null,
-      stdout: run.stdout || null
-    };
-  }
-  return { ok: true, component: 'api', output: run.output || '' };
-}
-
 function sanitizeUpdateLine(input, maxLen = 512) {
   return String(input || '')
     .replace(/\r\n/g, '\n')
@@ -1536,48 +1459,6 @@ function sanitizeUpdateLine(input, maxLen = 512) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, Math.max(1, Number(maxLen) || 512));
-}
-
-function writeReleaseInfoFile(componentInput, versionInput, descriptionInput, actorInput) {
-  const component = sanitizeUpdateLine(componentInput || '', 16).toLowerCase() || 'both';
-  const version = sanitizeUpdateLine(versionInput || '', 64);
-  const description = sanitizeUpdateLine(descriptionInput || '', 1200);
-  const actor = sanitizeUpdateLine(actorInput || '', 64);
-  const now = new Date();
-  const iso = now.toISOString();
-  const local = now.toLocaleString('id-ID', { hour12: false, timeZone: 'Asia/Jakarta' });
-
-  try {
-    const dir = require('path').dirname(UPDATE_INFO_FILE);
-    fs.mkdirSync(dir, { recursive: true });
-  } catch (_) {}
-
-  const payload = [
-    `UPDATE_COMPONENT=${component || '-'}`,
-    `UPDATE_VERSION=${version || '-'}`,
-    `UPDATE_DESC=${description || '-'}`,
-    `UPDATE_ACTOR=${actor || '-'}`,
-    `UPDATE_AT_ISO=${iso}`,
-    `UPDATE_AT_LOCAL=${sanitizeUpdateLine(local, 80) || '-'}`,
-    ''
-  ].join('\n');
-
-  try {
-    fs.writeFileSync(UPDATE_INFO_FILE, payload, 'utf8');
-    try { fs.chmodSync(UPDATE_INFO_FILE, 0o644); } catch (_) {}
-    return {
-      ok: true,
-      path: UPDATE_INFO_FILE,
-      component: component || '-',
-      version: version || '-',
-      description: description || '-',
-      actor: actor || '-',
-      at_iso: iso,
-      at_local: local
-    };
-  } catch (err) {
-    return { ok: false, statusCode: 500, message: `gagal tulis update info: ${err.message}` };
-  }
 }
 
 function parseEnvLine(rawContent, key) {
@@ -1977,42 +1858,12 @@ app.post('/internal/sc-expired-notify', (req, res) => {
 });
 
 app.post('/internal/trigger-update', (req, res) => {
-  const component = String(req.body?.component || 'both').trim().toLowerCase();
-  const releaseVersion = String(req.body?.release_version || '').trim();
-  const releaseDescription = String(req.body?.release_description || '').trim();
-  const releaseActor = String(req.body?.release_actor || '').trim();
-  const updateScriptUrl = String(req.body?.update_script_url || '').trim();
   return authorizeAndRun(req, res, (db) => {
     db.close();
-    if (!['sc', 'api', 'both'].includes(component)) {
-      return res.status(400).json({ ok: false, message: 'component harus sc/api/both' });
-    }
-
-    const result = { ok: true, component, steps: [] };
-    if (component === 'sc' || component === 'both') {
-      const scRes = triggerScAutoUpdate(updateScriptUrl);
-      result.steps.push({ step: 'sc_update', ...scRes });
-      if (!scRes.ok) {
-        return res.status(Number(scRes.statusCode || 500)).json({ ok: false, message: scRes.message, result });
-      }
-    }
-    if (component === 'api' || component === 'both') {
-      const apiRes = restartCoreApiServices();
-      result.steps.push({ step: 'api_restart', ...apiRes });
-      if (!apiRes.ok) {
-        return res.status(Number(apiRes.statusCode || 500)).json({ ok: false, message: apiRes.message, result });
-      }
-    }
-    const releaseInfo = writeReleaseInfoFile(component, releaseVersion, releaseDescription, releaseActor);
-    if (!releaseInfo.ok) {
-      return res.status(Number(releaseInfo.statusCode || 500)).json({
-        ok: false,
-        message: releaseInfo.message || 'gagal tulis info update',
-        result
-      });
-    }
-    result.release_info = releaseInfo;
-    return res.json(result);
+    return res.status(410).json({
+      ok: false,
+      message: 'endpoint trigger-update sudah dinonaktifkan permanen'
+    });
   });
 });
 
@@ -2045,7 +1896,6 @@ BANNER_TXT_FILE=/etc/sc-1forcr/banner.txt
 XRAY_CONFIG_FILE=/usr/local/etc/xray/config.json
 SC_ACCESS_LOCK_FILE=/etc/sc-1forcr-access.lock
 SC_RUNTIME_ENV_FILE=/etc/sc-1forcr.env
-UPDATE_INFO_FILE=/etc/sc-1forcr/update-info.env
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
@@ -2140,9 +1990,6 @@ print_result() {
   echo
   echo "SC expired notify check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"ip\":\"1.2.3.4\",\"reason\":\"admin_remove_sc_ip\",\"actor\":\"123\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/sc-expired-notify\" && echo"
-  echo
-  echo "Trigger update check:"
-  echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" -d '{\"component\":\"both\"}' \"http://127.0.0.1:${SUMMARY_PORT}/internal/trigger-update\" && echo"
   echo
   echo "Full restore from Telegram URL check:"
   echo "  curl -s -H \"x-sync-token: TOKEN_DARI_SERVERS_KEY\" -H \"content-type: application/json\" \\"

@@ -6306,6 +6306,16 @@ format_user_rows() {
   '
 }
 
+format_protocol_block() {
+  local proto="$1" cnt="$2" users="$3"
+  printf -- "- %-10s: %s\n" "${proto}" "${cnt}"
+  if [[ -z "${cnt}" || ! "${cnt}" =~ ^[0-9]+$ || "${cnt}" -le 0 ]]; then
+    echo "  Akun : -"
+    return
+  fi
+  format_user_rows "${users}"
+}
+
 msg="SC 1FORCR NOTIF
 Event    : ONLINE_REPORT
 Domain   : ${DOMAIN}
@@ -6321,19 +6331,15 @@ RINGKASAN AKUN AKTIF
 - TROJAN    : ${acct_trojan}
 
 ONLINE TERDETEKSI
-  ==============================================
-- SSH       : ${ssh_cnt}
-$(format_user_rows "${ssh_users}")
-  ==============================================
-- XRAY      : ${xray_cnt}
-$(format_user_rows "${xray_users}")
-  ==============================================
-- UDPHC     : ${udphc_cnt}
-$(format_user_rows "${udphc_users}")
-  ==============================================
-- ZIVPN     : ${zivpn_cnt}
-$(format_user_rows "${zivpn_users}")
-  ==============================================
+==============================================
+$(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}")
+----------------------------------------------
+$(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}")
+----------------------------------------------
+$(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}")
+----------------------------------------------
+$(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}")
+==============================================
 "
 
 send_tg "${msg}"

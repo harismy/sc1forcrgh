@@ -567,6 +567,7 @@ install_base_packages() {
   install_optional_pkg_if_available python3-certbot-dns-cloudflare || true
   install_optional_pkg_if_available vnstat || true
   install_optional_pkg_if_available speedtest-cli || true
+  install_optional_pkg_if_available badvpn || true
 }
 
 install_node_if_missing() {
@@ -5381,6 +5382,44 @@ EOF
   systemctl restart ssh || true
   systemctl enable dropbear || true
   systemctl restart dropbear || true
+}
+
+setup_udpgw_service_if_possible() {
+  local udpgw_bin
+  udpgw_bin=""
+  for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
+    if [[ -x "${p}" ]]; then
+      udpgw_bin="${p}"
+      break
+    fi
+  done
+
+  if [[ -z "${udpgw_bin}" ]]; then
+    log "badvpn-udpgw tidak ditemukan. Skip setup UDPGW service."
+    return 0
+  fi
+
+  log "Setup service badvpn-udpgw (127.0.0.1:7300 & 127.0.0.1:7200)..."
+  cat > /etc/systemd/system/sc-1forcr-udpgw@.service <<EOF
+[Unit]
+Description=SC 1FORCR UDPGW on 127.0.0.1:%i
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${udpgw_bin} --listen-addr 127.0.0.1:%i --max-clients 2048 --max-connections-for-client 256
+Restart=always
+RestartSec=1
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-udpgw@7300.service >/dev/null 2>&1 || true
+  systemctl enable --now sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
 }
 
 setup_udp_bootfix_service() {
@@ -10783,6 +10822,10 @@ systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udpcustom >/dev/null 2>&1 || true
 systemctl stop udp-custom >/dev/null 2>&1 || true
 systemctl disable udp-custom >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-udpgw@7300.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-udpgw@7300.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/sc-1forcr-api.service
 rm -f /etc/systemd/system/sc-1forcr-sshws.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.service
@@ -10797,6 +10840,7 @@ rm -f /etc/systemd/system/sc-1forcr-pull-update.service
 rm -f /etc/systemd/system/sc-1forcr-pull-update.timer
 rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
+rm -f /etc/systemd/system/sc-1forcr-udpgw@.service
 rm -f /etc/systemd/system/potato-compat-api.service
 systemctl daemon-reload
 
@@ -10848,13 +10892,15 @@ write_version_marker() {
 }
 
 post_install_preflight() {
-  local fw zstat ustat xstat apistat wsstat zport uport range_nft nat_ok
+  local fw zstat ustat xstat apistat wsstat zport uport range_nft nat_ok udpgw7300 udpgw7200
   fw="$(fw_backend_kind)"
   zstat="$(systemctl is-active "${ZIVPN_SERVICE_NAME}" 2>/dev/null || true)"
   ustat="$(systemctl is-active "${UDPCUSTOM_SERVICE_NAME}" 2>/dev/null || true)"
   xstat="$(systemctl is-active xray 2>/dev/null || true)"
   apistat="$(systemctl is-active sc-1forcr-api 2>/dev/null || true)"
   wsstat="$(systemctl is-active sc-1forcr-sshws 2>/dev/null || true)"
+  udpgw7300="$(systemctl is-active sc-1forcr-udpgw@7300.service 2>/dev/null || true)"
+  udpgw7200="$(systemctl is-active sc-1forcr-udpgw@7200.service 2>/dev/null || true)"
 
   zport="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   [[ -z "${zport}" ]] && zport="${ZIVPN_LISTEN_PORT}"
@@ -10891,8 +10937,10 @@ post_install_preflight() {
 - firewall backend : ${fw}
 - xray/api/sshws   : ${xstat}/${apistat}/${wsstat}
 - zivpn/udphc      : ${zstat}/${ustat}
+- udpgw 7200/7300 : ${udpgw7200}/${udpgw7300}
 - zivpn listen     : ${zport} ($(ss -lunp 2>/dev/null | awk -v p=":${zport}" '$5 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
 - udphc listen     : ${uport} ($(ss -lunp 2>/dev/null | awk -v p=":${uport}" '$5 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
+- udpgw listen     : 7200=$(ss -lntup 2>/dev/null | awk '$5 ~ /:7200$/ {ok=1} END{print ok?"YES":"NO"}') 7300=$(ss -lntup 2>/dev/null | awk '$5 ~ /:7300$/ {ok=1} END{print ok?"YES":"NO"}')
 - zivpn cert/key   : $( [[ -s /etc/zivpn/zivpn.crt && -s /etc/zivpn/zivpn.key ]] && echo OK || echo MISSING )
 - dnat ${ZIVPN_DNAT_RANGE:-none}->${zport} : ${nat_ok}
 =======================
@@ -11065,6 +11113,7 @@ main() {
   setup_zivpn_udp_nat_rules
   setup_udpcustom_service_if_possible
   setup_udpcustom_udp_nat_rules
+  setup_udpgw_service_if_possible
   enforce_single_udp_backend
   show_install_progress 70 "Hampir selesai mas, core service sudah kepasang..."
 

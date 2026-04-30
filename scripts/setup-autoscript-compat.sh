@@ -1740,6 +1740,7 @@ SSH_WS_MAX_CONNS=auto
 SSH_WS_HANDSHAKE_TIMEOUT_SECONDS=auto
 SSH_WS_MAX_HEADER_BYTES=auto
 SSH_WS_MAX_PRELUDE_REQUESTS=auto
+SSH_WS_PRELUDE_RESPONSE=ok
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 DROPBEAR_PORT=${DROPBEAR_PORT}
@@ -3140,6 +3141,7 @@ const SSH_HOST = process.env.SSH_WS_TARGET_HOST || '127.0.0.1';
 const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 109);
 const HTTP_BACKEND_HOST = process.env.SSH_HTTP_BACKEND_HOST || '127.0.0.1';
 const HTTP_BACKEND_PORT = Number(process.env.SSH_HTTP_BACKEND_PORT || 80);
+const PRELUDE_RESPONSE = String(process.env.SSH_WS_PRELUDE_RESPONSE || 'ok').trim().toLowerCase();
 
 function firstLine(head) {
   const i = head.indexOf('\r\n');
@@ -3243,8 +3245,9 @@ const server = net.createServer((client) => {
     }
 
     if (method && /^(get|post|head|options|patch|put|delete|trace)$/.test(method)) {
-      // Ignore HTTP preludes and wait for the real WebSocket upgrade.
-      // Extra 200 OK responses can make payload apps reconnect in a loop.
+      if (PRELUDE_RESPONSE !== 'silent') {
+        client.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
+      }
       stage = 'wait-upgrade';
       if (rest.length > 0) handleHttpLike(rest);
       return;
@@ -3394,6 +3397,32 @@ func tunnelBoth(a, b net.Conn) {
 	<-done
 }
 
+func copyReaderToConn(dst net.Conn, reader *bufio.Reader) {
+	if reader.Buffered() > 0 {
+		buf := make([]byte, reader.Buffered())
+		if _, err := io.ReadFull(reader, buf); err == nil && len(buf) > 0 {
+			_, _ = dst.Write(buf)
+		}
+	}
+	_, _ = io.Copy(dst, reader)
+}
+
+func tunnelAfterWsUpgrade(client net.Conn, sshUp net.Conn, reader *bufio.Reader, maxHeaderBytes int) {
+	defer client.Close()
+	defer sshUp.Close()
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(client, sshUp)
+		done <- struct{}{}
+	}()
+	go func() {
+		dropClientPreludeJunk(client, reader, maxHeaderBytes)
+		copyReaderToConn(sshUp, reader)
+		done <- struct{}{}
+	}()
+	<-done
+}
+
 func flushReaderBufferedTo(reader *bufio.Reader, dst net.Conn) error {
 	n := reader.Buffered()
 	if n <= 0 {
@@ -3446,21 +3475,21 @@ func isKnownHttpJunkPrefix(prefix string) bool {
 		strings.HasPrefix(p, "put ") || strings.HasPrefix(p, "delete ")
 }
 
-func flushClientPreludeAfterUpgrade(client net.Conn, reader *bufio.Reader, sshUp net.Conn, maxHeaderBytes int) error {
+func dropClientPreludeJunk(client net.Conn, reader *bufio.Reader, maxHeaderBytes int) {
 	// Some HC payloads append fake HTTP fragments after [split], for example
 	// "HTTP/ 1\r\n\r\n". Drop those before handing bytes to Dropbear.
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		if reader.Buffered() <= 0 {
-			_ = client.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+			_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
 			_, err := reader.Peek(1)
 			_ = client.SetReadDeadline(time.Time{})
 			if err != nil {
-				return nil
+				return
 			}
 		}
 		n := reader.Buffered()
 		if n <= 0 {
-			return nil
+			return
 		}
 		peekLen := n
 		if peekLen > 16 {
@@ -3468,27 +3497,26 @@ func flushClientPreludeAfterUpgrade(client net.Conn, reader *bufio.Reader, sshUp
 		}
 		peek, err := reader.Peek(peekLen)
 		if err != nil {
-			return nil
+			return
 		}
 		prefix := string(peek)
 		if strings.HasPrefix(prefix, "SSH-") {
-			return flushReaderBufferedTo(reader, sshUp)
+			return
 		}
 		if isKnownHttpJunkPrefix(prefix) {
 			_ = client.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
 			_, _, _, err := readHttpHeader(reader, maxHeaderBytes)
 			_ = client.SetReadDeadline(time.Time{})
 			if err != nil {
-				return nil
+				return
 			}
 			continue
 		}
-		return flushReaderBufferedTo(reader, sshUp)
+		return
 	}
-	return flushReaderBufferedTo(reader, sshUp)
 }
 
-func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, handshakeTimeoutSec int, maxHeaderBytes int, maxPreludeRequests int) {
+func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, handshakeTimeoutSec int, maxHeaderBytes int, maxPreludeRequests int, preludeResponse string) {
 	defer client.Close()
 	_ = client.SetReadDeadline(time.Now().Add(time.Duration(handshakeTimeoutSec) * time.Second))
 	reader := bufio.NewReaderSize(client, 64*1024)
@@ -3526,12 +3554,8 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 				return
 			}
 			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
-			if err := flushClientPreludeAfterUpgrade(client, reader, sshUp, maxHeaderBytes); err != nil {
-				_ = sshUp.Close()
-				return
-			}
 			_ = client.SetReadDeadline(time.Time{})
-			tunnelBoth(client, sshUp)
+			tunnelAfterWsUpgrade(client, sshUp, reader, maxHeaderBytes)
 			return
 		}
 
@@ -3555,11 +3579,12 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		}
 
 		// Payload apps often send one or more HTTP preludes before the real
-		// WebSocket upgrade. Ignore them and continue; sending extra 200 OK
-		// responses before 101 can make HC read the handshake out of order and
-		// reconnect repeatedly. The bounded loop still prevents long-lived local
-		// loops from malformed clients.
+		// WebSocket upgrade. HC commonly expects a 200 OK for this prelude;
+		// keep it configurable because some payloads prefer a silent prelude.
 		if isHttpMethodLine(first) {
+			if preludeResponse != "silent" {
+				_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
+			}
 			continue
 		}
 
@@ -3623,6 +3648,7 @@ func main() {
 	handshakeTimeoutSec := envInt("SSH_WS_HANDSHAKE_TIMEOUT_SECONDS", profile.handshakeTimeoutSec)
 	maxHeaderBytes := envInt("SSH_WS_MAX_HEADER_BYTES", profile.maxHeaderBytes)
 	maxPreludeRequests := envInt("SSH_WS_MAX_PRELUDE_REQUESTS", profile.maxPreludeRequests)
+	preludeResponse := strings.ToLower(envOr("SSH_WS_PRELUDE_RESPONSE", "ok"))
 	if maxConns < 32 {
 		maxConns = 32
 	}
@@ -3642,7 +3668,7 @@ func main() {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d (max_conns=%d, hs_timeout=%ds, max_header=%d, prelude=%d)\n", port, sshHost, sshPort, httpHost, httpPort, maxConns, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests)
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d (max_conns=%d, hs_timeout=%ds, max_header=%d, prelude=%d, prelude_response=%s)\n", port, sshHost, sshPort, httpHost, httpPort, maxConns, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests, preludeResponse)
 
 	for {
 		conn, err := ln.Accept()
@@ -3654,7 +3680,7 @@ func main() {
 		case sem <- struct{}{}:
 			go func(c net.Conn) {
 				defer func() { <-sem }()
-				handleConn(c, sshHost, sshPort, httpHost, httpPort, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests)
+				handleConn(c, sshHost, sshPort, httpHost, httpPort, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests, preludeResponse)
 			}(conn)
 		default:
 			_ = conn.Close()

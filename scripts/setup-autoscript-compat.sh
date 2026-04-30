@@ -1519,6 +1519,14 @@ apply_sshws_loop_guard_rules() {
   connlimit="$(echo "${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-64}" | tr -cd '0-9')"
   [[ -z "${connlimit}" || "${connlimit}" -lt 1 ]] && connlimit="64"
 
+  # Cleanup legacy aggressive guards that included 80/443 and caused HC/CDN
+  # reconnect storms to be rejected before nginx/ssh-ws could handle them.
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 -m conntrack --ctstate NEW \
+    -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-above 8/second --hashlimit-burst 16 \
+    --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
+    -m connlimit --connlimit-above 12 --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+
   # Rule 1: drop NEW connection spikes per source IP.
   if ! iptables -w 10 -C INPUT -p tcp -m multiport --dports "${ports}" -m conntrack --ctstate NEW \
     -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-above "${rate}" --hashlimit-burst "${burst}" \

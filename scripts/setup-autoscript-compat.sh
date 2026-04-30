@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
@@ -622,35 +622,35 @@ setup_default_banner_assets() {
   cat > /etc/sc-1forcr/banner.html <<'EOF'
 <div style="text-align:center; line-height:1.6; font-family: monospace;">
 
-<!-- ╔══════════════╗ -->
-<font color="#00ffff">╔═══════════════════════╗</font><br>
-<font color="#17e8ff">⚡ SSH PREMIUM BY 1FORCR ⚡</font><br>
-<font color="#00ffff">╚═══════════════════════╝</font><br>
+<!-- â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•— -->
+<font color="#00ffff">â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—</font><br>
+<font color="#17e8ff">âš¡ SSH PREMIUM BY 1FORCR âš¡</font><br>
+<font color="#00ffff">â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•</font><br>
 
 
 <!-- ATURAN PAKAI -->
-<font color="#ff45ba"><b>⚠️ ATURAN PEMAKAIAN ⚠️</b></font><br>
+<font color="#ff45ba"><b>âš ï¸ ATURAN PEMAKAIAN âš ï¸</b></font><br>
 <font color="#84ecdb">
-Jika beli akun untuk 1 pengguna <br>→ gunakan hanya untuk 1 orang.<br>
-Jika beli akun untuk 2 pengguna <br>→ gunakan untuk 2 orang saja.<br>
+Jika beli akun untuk 1 pengguna <br>â†’ gunakan hanya untuk 1 orang.<br>
+Jika beli akun untuk 2 pengguna <br>â†’ gunakan untuk 2 orang saja.<br>
 </font><br>
 
-<font color="red"><b>🚫 Melanggar = Akun Expired Otomatis!</b></font><br><br>
+<font color="red"><b>ðŸš« Melanggar = Akun Expired Otomatis!</b></font><br><br>
 
 <!-- KONTAK ADMIN -->
-<font color="#00ffff">╔════ KONTAK ADMIN ════╗</font><br>
+<font color="#00ffff">â•”â•â•â•â• KONTAK ADMIN â•â•â•â•â•—</font><br>
 <font color="#84ecdb">
-📞 Hubungi Admin: <br>
+ðŸ“ž Hubungi Admin: <br>
 <font color="#00ffff">http://wa.me/6289527159281</font><br><br>
-📢 Info Config & SSH: <br>
+ðŸ“¢ Info Config & SSH: <br>
 <font color="#ff45ba">https://t.me/Oneforcr_info</font><br><br>
-🤖 Order via Bot: <br>
+ðŸ¤– Order via Bot: <br>
 <font color="#ff17e8">https://t.me/BOT1FORCR_STORE_bot</font>
 </font><br>
-<font color="#00ffff">╚════════════════════╝</font><br><br>
+<font color="#00ffff">â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•</font><br><br>
 
-<font color="#84ecdb"><i>✨ Terimakasih udah order di 1FORCR ✨</i></font><br>
-<font color="#00ffff">━━━━━━━━━━━━━━━━━━━━━━━━━</font><br>
+<font color="#84ecdb"><i>âœ¨ Terimakasih udah order di 1FORCR âœ¨</i></font><br>
+<font color="#00ffff">â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</font><br>
 
 </div>
 EOF
@@ -3147,32 +3147,18 @@ const server = net.createServer((client) => {
       return;
     }
 
-    if (
-      path.startsWith('/vps/') ||
-      path.startsWith('/vmess') ||
-      path.startsWith('/vless') ||
-      path.startsWith('/trojan') ||
-      path.startsWith('/yourbug')
-    ) {
-      const req = Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]);
-      startHttpProxy(req);
-      return;
-    }
-
     if (head.includes('upgrade: websocket') || (head.includes('upgrade:') && head.includes('host:'))) {
       startWsSshTunnel(rest);
       return;
     }
 
-    if (method && (
-      method.startsWith('get') ||
-      method.startsWith('post') ||
-      method.startsWith('head') ||
-      method.startsWith('options') ||
-      method.startsWith('put') ||
-      method.startsWith('patch') ||
-      method.startsWith('delete')
-    )) {
+    if (path.startsWith('/vps/') || path.startsWith('/vmess') || path.startsWith('/vless') || path.startsWith('/trojan')) {
+      const req = Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]);
+      startHttpProxy(req);
+      return;
+    }
+
+    if (method && (method.startsWith('get') || method.startsWith('post') || method.startsWith('head') || method.startsWith('options'))) {
       client.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
       stage = 'wait-upgrade';
       if (rest.length > 0) handleHttpLike(rest);
@@ -3269,82 +3255,6 @@ func envInt(key string, fallback int) int {
 	return n
 }
 
-func normalizePath(raw, fallback string) string {
-	src := strings.TrimSpace(raw)
-	base := src
-	if base == "" {
-		base = strings.TrimSpace(fallback)
-	}
-	if base == "" {
-		base = "/"
-	}
-	if !strings.HasPrefix(base, "/") {
-		base = "/" + base
-	}
-	for strings.Contains(base, "//") {
-		base = strings.ReplaceAll(base, "//", "/")
-	}
-	if base == "" {
-		return "/"
-	}
-	return base
-}
-
-func parsePathList(raw, fallback string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, 4)
-	for _, part := range strings.Split(raw, ",") {
-		p := normalizePath(part, "")
-		if p == "" || seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, p)
-	}
-	if len(out) > 0 {
-		return out
-	}
-	return []string{normalizePath("", fallback)}
-}
-
-func parseXrayProxyPaths() []string {
-	combined := []string{}
-	for _, p := range parsePathList(os.Getenv("XRAY_PATHS_VMESS"), "/vmess") {
-		combined = append(combined, p)
-	}
-	for _, p := range parsePathList(os.Getenv("XRAY_PATHS_VLESS"), "/vless") {
-		combined = append(combined, p)
-	}
-	for _, p := range parsePathList(os.Getenv("XRAY_PATHS_TROJAN"), "/trojan") {
-		combined = append(combined, p)
-	}
-	seen := map[string]bool{}
-	out := make([]string, 0, len(combined))
-	for _, p := range combined {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, p)
-	}
-	return out
-}
-
-func isXrayProxyPath(path string, xrayPaths []string) bool {
-	if !strings.HasPrefix(path, "/") {
-		return false
-	}
-	for _, p := range xrayPaths {
-		if p == "/" {
-			return true
-		}
-		if path == p || strings.HasPrefix(path, p+"/") || strings.HasPrefix(path, p+"?") {
-			return true
-		}
-	}
-	return false
-}
-
 func writeAll(conn net.Conn, data []byte) error {
 	remaining := data
 	for len(remaining) > 0 {
@@ -3403,114 +3313,66 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 	}
 
 	var raw bytes.Buffer
-	for req := 0; req < 8; req++ {
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		raw.Write(line)
+		if raw.Len() > 128*1024 {
+			return
+		}
+		if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
+			break
+		}
+	}
+
+	header := strings.ToLower(raw.String())
+	first := strings.ToLower(strings.TrimSpace(strings.SplitN(raw.String(), "\r\n", 2)[0]))
+
+	// CONNECT mode from payload apps.
+	if strings.HasPrefix(first, "connect ") {
+		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		raw.Reset()
-		for {
-			line, err := reader.ReadBytes('\n')
-			if err != nil {
+
+		// CONNECT clients may still send HTTP payload lines before SSH banner.
+		// Discard those lines until we see SSH- and then start raw SSH tunnel.
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for i := 0; i < 64; i++ {
+			nextPeek, nextErr := reader.Peek(4)
+			if nextErr != nil {
+				_ = client.SetReadDeadline(time.Time{})
 				return
 			}
-			raw.Write(line)
-			if raw.Len() > 128*1024 {
-				return
-			}
-			if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
-				break
-			}
-		}
-
-		header := strings.ToLower(raw.String())
-		first := strings.ToLower(strings.TrimSpace(strings.SplitN(raw.String(), "\r\n", 2)[0]))
-
-		// CONNECT mode from payload apps.
-		if strings.HasPrefix(first, "connect ") {
-			_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-			raw.Reset()
-
-			// CONNECT clients may still send HTTP payload lines before SSH banner.
-			// Discard those lines until we see SSH- and then start raw SSH tunnel.
-			_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
-			for i := 0; i < 64; i++ {
-				nextPeek, nextErr := reader.Peek(4)
-				if nextErr != nil {
-					_ = client.SetReadDeadline(time.Time{})
+			if string(nextPeek) == "SSH-" {
+				_ = client.SetReadDeadline(time.Time{})
+				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+				if err != nil {
 					return
 				}
-				if string(nextPeek) == "SSH-" {
-					_ = client.SetReadDeadline(time.Time{})
-					sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-					if err != nil {
-						return
-					}
-					if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-						_ = sshUp.Close()
-						return
-					}
-					tunnelBoth(client, sshUp)
+				if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+					_ = sshUp.Close()
 					return
 				}
-				// Drop one line of HTTP payload and keep scanning.
-				if _, err := reader.ReadBytes('\n'); err != nil {
-					_ = client.SetReadDeadline(time.Time{})
-					return
-				}
+				tunnelBoth(client, sshUp)
+				return
 			}
-			_ = client.SetReadDeadline(time.Time{})
-			return
+			// Drop one line of HTTP payload and keep scanning.
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				_ = client.SetReadDeadline(time.Time{})
+				return
+			}
 		}
+		_ = client.SetReadDeadline(time.Time{})
+		return
+	}
 
-		// keep API and xray ws paths reachable through the same mux.
-		if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") || strings.Contains(first, " /yourbug") {
-			httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
-			if err != nil {
-				return
-			}
-			if err := writeAll(httpUp, raw.Bytes()); err != nil {
-				_ = httpUp.Close()
-				return
-			}
-			if err := flushReaderBufferedTo(reader, httpUp); err != nil {
-				_ = httpUp.Close()
-				return
-			}
-			tunnelBoth(client, httpUp)
-			return
-		}
-
-		// websocket upgrade to SSH tunnel (compat mode for legacy HC payloads).
-		if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
-			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-			if err != nil {
-				return
-			}
-			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
-			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-				_ = sshUp.Close()
-				return
-			}
-			tunnelBoth(client, sshUp)
-			return
-		}
-
-		// For dummy HTTP preface payloads, acknowledge and keep waiting for next request
-		// instead of forwarding garbage to SSH backend.
-		if strings.HasPrefix(first, "get ") || strings.HasPrefix(first, "post ") ||
-			strings.HasPrefix(first, "head ") || strings.HasPrefix(first, "options ") ||
-			strings.HasPrefix(first, "put ") || strings.HasPrefix(first, "patch ") ||
-			strings.HasPrefix(first, "delete ") {
-			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
-			continue
-		}
-
-		// fallback to raw SSH.
+	if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
 		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
 		if err != nil {
 			return
 		}
-		if err := writeAll(sshUp, raw.Bytes()); err != nil {
-			_ = sshUp.Close()
-			return
-		}
+		_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
 		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 			_ = sshUp.Close()
 			return
@@ -3518,6 +3380,39 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		tunnelBoth(client, sshUp)
 		return
 	}
+
+	// keep API and xray ws paths reachable through the same mux.
+	if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
+		httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
+		if err != nil {
+			return
+		}
+		if err := writeAll(httpUp, raw.Bytes()); err != nil {
+			_ = httpUp.Close()
+			return
+		}
+		if err := flushReaderBufferedTo(reader, httpUp); err != nil {
+			_ = httpUp.Close()
+			return
+		}
+		tunnelBoth(client, httpUp)
+		return
+	}
+
+	// fallback to raw SSH.
+	sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+	if err != nil {
+		return
+	}
+	if err := writeAll(sshUp, raw.Bytes()); err != nil {
+		_ = sshUp.Close()
+		return
+	}
+	if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+		_ = sshUp.Close()
+		return
+	}
+	tunnelBoth(client, sshUp)
 }
 
 func main() {
@@ -8837,22 +8732,22 @@ draw_dashboard() {
   }
 
   print_top() {
-    printf '┌%s┐\n' "$(repeat_char '─' "$((BOX_W + 2))")"
+    printf 'â”Œ%sâ”\n' "$(repeat_char 'â”€' "$((BOX_W + 2))")"
   }
 
   print_mid() {
-    printf '├%s┤\n' "$(repeat_char '─' "$((BOX_W + 2))")"
+    printf 'â”œ%sâ”¤\n' "$(repeat_char 'â”€' "$((BOX_W + 2))")"
   }
 
   print_bottom() {
-    printf '└%s┘\n' "$(repeat_char '─' "$((BOX_W + 2))")"
+    printf 'â””%sâ”˜\n' "$(repeat_char 'â”€' "$((BOX_W + 2))")"
   }
 
   print_line() {
     local text="$1"
     local padded
     padded="$(pad_right "$text" "$BOX_W")"
-    printf '│ %s │\n' "$padded"
+    printf 'â”‚ %s â”‚\n' "$padded"
   }
 
   print_center() {
@@ -8865,7 +8760,7 @@ draw_dashboard() {
     fi
     left=$(( (BOX_W - vlen) / 2 ))
     right=$(( BOX_W - vlen - left ))
-    printf '│ %*s%s%*s │\n' "$left" "" "$text" "$right" ""
+    printf 'â”‚ %*s%s%*s â”‚\n' "$left" "" "$text" "$right" ""
   }
 
   kv_line() {
@@ -9088,7 +8983,7 @@ EOF
   print_center "${CYAN}${BOLD}SC 1FORCR NEXUS DASHBOARD${NC}"
   print_mid
 
-  print_line "${CYAN}${BOLD}■ SYSTEM & NETWORK${NC}"
+  print_line "${CYAN}${BOLD}â–  SYSTEM & NETWORK${NC}"
   kv_line "OS"  "${os_name}"
   kv_line "RAM"  "${ram_mb:-"-"} | SWAP : ${swap_mb:-"-"}"
   kv_line "UPTIME"  "${uptime_h}h ${uptime_m}m"
@@ -9097,14 +8992,14 @@ EOF
   kv_line "Estimasi akun"  "sekitar ${cap_est} user"
   print_mid
 
-  print_line "${CYAN}${BOLD}■ LOCATION & ISP${NC}"
+  print_line "${CYAN}${BOLD}â–  LOCATION & ISP${NC}"
   kv_line "IP" "${ip}"
   kv_line "CITY" "${city}"
   kv_line "ISP" "${isp}"
   kv_line "DOMAIN" "${DOMAIN:-"-"}"
   print_mid
 
-  print_line "${CYAN}${BOLD}■ TRAFFIC STATS${NC}"
+  print_line "${CYAN}${BOLD}â–  TRAFFIC STATS${NC}"
   kv_line "MONTH" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
   kv_line "RX" "${VNSTAT_MONTH_RX}"
   kv_line "TX" "${VNSTAT_MONTH_TX}"
@@ -9114,18 +9009,18 @@ EOF
   kv_line "CURRENT" "${VNSTAT_RATE}"
   print_mid
 
-  print_line "${CYAN}${BOLD}■ SERVICES STATUS${NC}"
+  print_line "${CYAN}${BOLD}â–  SERVICES STATUS${NC}"
   print_line "  XRAY    : ${xray_color}   | SSH-WS : ${ws_color}   | LOADBLC : ${lb_color}"
   print_line "  ZIVPN   : ${zivpn_color}   | UDPHC  : ${udphc_color}  | SSH     : ${ssh_color}"
   print_line "  HEALTH  : ${health_display}"
   print_mid
 
-  print_line "${CYAN}${BOLD}■ ACCOUNT SUMMARY${NC}"
+  print_line "${CYAN}${BOLD}â–  ACCOUNT SUMMARY${NC}"
   print_line "  SSH/OpenVPN : ${c_ssh}  | VMESS  : ${c_vmess}"
   print_line "  VLESS       : ${c_vless}   | TROJAN : ${c_trojan}"
   print_mid
 
-  print_line "${BLUE}${BOLD}■ VERSION & CLIENT${NC}"
+  print_line "${BLUE}${BOLD}â–  VERSION & CLIENT${NC}"
   kv_line "Version" "${SCRIPT_VERSION:-unknown}"
   kv_line "Distribusi" "${license_distribution}"
   kv_line "Client Name" "${license_client_name}"
@@ -9135,9 +9030,9 @@ EOF
   print_bottom
 
   printf '\n'
-  printf ' %s\n' "$(repeat_char '─' 30)"
+  printf ' %s\n' "$(repeat_char 'â”€' 30)"
   printf " ${BOLD}to access use 'menu' command${NC}\n"
-  printf ' %s\n' "$(repeat_char '─' 30)"
+  printf ' %s\n' "$(repeat_char 'â”€' 30)"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
@@ -10545,35 +10440,35 @@ write_default_banner_html() {
   cat > "${banner_file}" <<'EOF'
 <div style="text-align:center; line-height:1.6; font-family: monospace;">
 
-<!-- ╔══════════════╗ -->
-<font color="#00ffff">╔═══════════════════════╗</font><br>
-<font color="#17e8ff">⚡ SSH PREMIUM BY 1FORCR ⚡</font><br>
-<font color="#00ffff">╚═══════════════════════╝</font><br>
+<!-- â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•— -->
+<font color="#00ffff">â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—</font><br>
+<font color="#17e8ff">âš¡ SSH PREMIUM BY 1FORCR âš¡</font><br>
+<font color="#00ffff">â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•</font><br>
 
 
 <!-- ATURAN PAKAI -->
-<font color="#ff45ba"><b>⚠️ ATURAN PEMAKAIAN ⚠️</b></font><br>
+<font color="#ff45ba"><b>âš ï¸ ATURAN PEMAKAIAN âš ï¸</b></font><br>
 <font color="#84ecdb">
-Jika beli akun untuk 1 pengguna <br>→ gunakan hanya untuk 1 orang.<br>
-Jika beli akun untuk 2 pengguna <br>→ gunakan untuk 2 orang saja.<br>
+Jika beli akun untuk 1 pengguna <br>â†’ gunakan hanya untuk 1 orang.<br>
+Jika beli akun untuk 2 pengguna <br>â†’ gunakan untuk 2 orang saja.<br>
 </font><br>
 
-<font color="red"><b>🚫 Melanggar = Akun Expired Otomatis!</b></font><br><br>
+<font color="red"><b>ðŸš« Melanggar = Akun Expired Otomatis!</b></font><br><br>
 
 <!-- KONTAK ADMIN -->
-<font color="#00ffff">╔════ KONTAK ADMIN ════╗</font><br>
+<font color="#00ffff">â•”â•â•â•â• KONTAK ADMIN â•â•â•â•â•—</font><br>
 <font color="#84ecdb">
-📞 Hubungi Admin: <br>
+ðŸ“ž Hubungi Admin: <br>
 <font color="#00ffff">http://wa.me/6289527159281</font><br><br>
-📢 Info Config & SSH: <br>
+ðŸ“¢ Info Config & SSH: <br>
 <font color="#ff45ba">https://t.me/Oneforcr_info</font><br><br>
-🤖 Order via Bot: <br>
+ðŸ¤– Order via Bot: <br>
 <font color="#ff17e8">https://t.me/BOT1FORCR_STORE_bot</font>
 </font><br>
-<font color="#00ffff">╚════════════════════╝</font><br><br>
+<font color="#00ffff">â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•</font><br><br>
 
-<font color="#84ecdb"><i>✨ Terimakasih udah order di 1FORCR ✨</i></font><br>
-<font color="#00ffff">━━━━━━━━━━━━━━━━━━━━━━━━━</font><br>
+<font color="#84ecdb"><i>âœ¨ Terimakasih udah order di 1FORCR âœ¨</i></font><br>
+<font color="#00ffff">â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</font><br>
 
 </div>
 EOF
@@ -10750,16 +10645,16 @@ while true; do
     echo
   fi
 
-  echo " ┌─────────────────────────────────────────────────"
-  echo " │  1.) > MENU AKUN         5.) > MONITOR USER LOCK"
-  echo " │  2.) > SERVICE MENU      6.) > MONITOR USER LOGIN"
-  echo " │  3.) > BACKUP/RESTORE    7.) > TOOLS"
-  echo " │  4.) > CHANGE DOMAIN"
-  echo " │  m.) > MENU UTAMA"
-  echo " │  x.) > EXIT"
-  echo " └─────────────────────────────────────────────────"
+  echo " â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€"
+  echo " â”‚  1.) > MENU AKUN         5.) > MONITOR USER LOCK"
+  echo " â”‚  2.) > SERVICE MENU      6.) > MONITOR USER LOGIN"
+  echo " â”‚  3.) > BACKUP/RESTORE    7.) > TOOLS"
+  echo " â”‚  4.) > CHANGE DOMAIN"
+  echo " â”‚  m.) > MENU UTAMA"
+  echo " â”‚  x.) > EXIT"
+  echo " â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€"
   if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
-    echo " ─────────────────────────────────────────────────"
+    echo " â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€"
   fi
   echo
   if ! prompt_input m "Select From Options [1-7, m, x] : "; then

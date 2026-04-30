@@ -6039,6 +6039,7 @@ send_tg() {
   [[ -z "${text}" ]] && return 0
   curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${TELEGRAM_CHAT_ID}" \
+    -d "parse_mode=HTML" \
     -d "disable_web_page_preview=true" \
     --data-urlencode "text=${text}" >/dev/null 2>&1 || true
 }
@@ -6331,6 +6332,7 @@ RINGKASAN AKUN AKTIF
 - TROJAN    : ${acct_trojan}
 
 ONLINE TERDETEKSI
+<pre>
 ==============================================
 $(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}")
 ----------------------------------------------
@@ -6340,6 +6342,7 @@ $(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}")
 ----------------------------------------------
 $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}")
 ==============================================
+</pre>
 "
 
 send_tg "${msg}"

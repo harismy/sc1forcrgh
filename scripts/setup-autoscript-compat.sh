@@ -8841,24 +8841,19 @@ read_vnstat_stats() {
 draw_dashboard() {
   local os_name ram_mb swap_mb uptime_s uptime_h uptime_m
   local ip city isp udpcustom
-  local ssh_on xray_on ws_on loadblc_on zivpn_on udphc_on
+  local ssh_on xray_on ws_on nginx_on zivpn_on udphc_on
   local c_ssh c_vmess c_vless c_trojan
-  local health
   local cap_ram_gb cap_cores cap_tier cap_est cap_mode
+  local license_distribution license_client_name license_expires_raw expiry_in_text
 
-  # ANSI colors
   local ESC=$'\033'
   local RED="${ESC}[0;31m"
   local GREEN="${ESC}[0;32m"
-  local YELLOW="${ESC}[0;33m"
-  local BLUE="${ESC}[0;34m"
-  local MAGENTA="${ESC}[0;35m"
   local CYAN="${ESC}[0;36m"
   local BOLD="${ESC}[1m"
   local NC="${ESC}[0m"
 
-  # Lebar box (total karakter dalam satu baris)
-  local BOX_W=72
+  local BOX_W=66
 
   repeat_char() {
     local char="$1"
@@ -8921,13 +8916,10 @@ draw_dashboard() {
     printf '| %*s%s%*s |\n' "$left" "" "$text" "$right" ""
   }
 
-  # key width fixed 16 characters (termasuk warna)
   kv_line() {
     local key="$1"
     local value="$2"
-    local key_padded
-    key_padded="$(printf "%-16s" "$key")"
-    print_line "  ${key_padded} : $value"
+    print_line "  $(printf '%-14s' "$key") : $value"
   }
 
   read_license_value() {
@@ -8948,32 +8940,6 @@ draw_dashboard() {
       return
     fi
     sed -n "s/^${key}=//p" "${file}" | head -n1
-  }
-
-  read_update_info_value() {
-    local key="$1"
-    local file="/etc/sc-1forcr/update-info.env"
-    if [[ ! -f "${file}" ]]; then
-      echo ""
-      return
-    fi
-    sed -n "s/^${key}=//p" "${file}" | head -n1
-  }
-
-  truncate_text() {
-    local txt="$1"
-    local max="${2:-70}"
-    local len
-    len="${#txt}"
-    if (( len <= max )); then
-      printf '%s' "${txt}"
-      return
-    fi
-    if (( max <= 3 )); then
-      printf '%s' "${txt:0:max}"
-      return
-    fi
-    printf '%s...' "${txt:0:$((max - 3))}"
   }
 
   format_expiry_in() {
@@ -9006,60 +8972,6 @@ draw_dashboard() {
     fi
   }
 
-  refresh_license_cache() {
-    local enabled now_s last_s stamp_file
-    local resp status msg bound_ip expires distribution client_name key_hash
-    enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
-    [[ "${enabled}" != "1" ]] && return 0
-    [[ -z "${LICENSE_API_URL:-}" || -z "${LICENSE_API_TOKEN:-}" || -z "${LICENSE_KEY:-}" ]] && return 0
-    command -v jq >/dev/null 2>&1 || return 0
-
-    stamp_file="/tmp/sc-1forcr-license-refresh.ts"
-    now_s="$(date +%s)"
-    last_s=0
-    if [[ -f "${stamp_file}" ]]; then
-      last_s="$(tr -cd '0-9' < "${stamp_file}" 2>/dev/null || echo 0)"
-      [[ -z "${last_s}" ]] && last_s=0
-    fi
-    # Hindari spam API saat user bolak-balik menu.
-    if (( now_s - last_s < 60 )); then
-      return 0
-    fi
-    printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
-
-    resp="$(curl -fsS --max-time 10 \
-      -X POST "${LICENSE_API_URL}" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      --data-urlencode "license_key=${LICENSE_KEY}" \
-      --data-urlencode "ip=${ip}" 2>/dev/null || true)"
-    [[ -z "${resp}" ]] && return 0
-    echo "${resp}" | jq . >/dev/null 2>&1 || return 0
-
-    status="$(echo "${resp}" | jq -r '.status // (if .allowed==true then "active" else "rejected" end) // "rejected"' 2>/dev/null || echo "rejected")"
-    msg="$(echo "${resp}" | jq -r '.message // "-" ' 2>/dev/null || echo "-")"
-    bound_ip="$(echo "${resp}" | jq -r '.bound_ip // .ip // empty' 2>/dev/null || echo "")"
-    expires="$(echo "${resp}" | jq -r '.expires_at // .expired_at // .expired // "-" ' 2>/dev/null || echo "-")"
-    distribution="$(echo "${resp}" | jq -r '.distribution // "BOT 1FORCR NEXUS"' 2>/dev/null || echo "BOT 1FORCR NEXUS")"
-    client_name="$(echo "${resp}" | jq -r '.client_name // .client // .name // empty' 2>/dev/null || echo "")"
-    [[ -z "${bound_ip}" || "${bound_ip}" == "null" ]] && bound_ip="${ip}"
-    [[ -z "${client_name}" || "${client_name}" == "null" ]] && client_name="${bound_ip}"
-    key_hash="$(printf '%s' "${LICENSE_KEY}" | sha256sum | awk '{print $1}')"
-
-    cat > /etc/sc-1forcr-license <<EOF
-LICENSE_STATUS=${status}
-LICENSE_MESSAGE=${msg}
-LICENSE_BOUND_IP=${bound_ip}
-LICENSE_EXPIRES_AT=${expires}
-LICENSE_DISTRIBUTION=${distribution}
-LICENSE_CLIENT_NAME=${client_name}
-LICENSE_KEY_HASH=${key_hash}
-LICENSE_CHECK_AT=$(date '+%F %T')
-EOF
-    chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
-  }
-
-  # Data collection
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
   ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
   swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M"}')"
@@ -9069,23 +8981,16 @@ EOF
 
   ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip="${ip:-unknown}"
-  refresh_license_cache
   city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
   isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
-  local license_distribution license_client_name license_expires_raw expiry_in_text
-  local sc_meta_status sc_meta_client sc_meta_expires
-  local update_component update_version update_desc update_time update_desc_short
+
   license_distribution="$(read_license_value "LICENSE_DISTRIBUTION")"
   license_client_name="$(read_license_value "LICENSE_CLIENT_NAME")"
   license_expires_raw="$(read_license_value "LICENSE_EXPIRES_AT")"
+  local sc_meta_status sc_meta_client sc_meta_expires
   sc_meta_status="$(echo "$(read_sc_meta_value "SC_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
   sc_meta_client="$(read_sc_meta_value "SC_CLIENT_NAME")"
   sc_meta_expires="$(read_sc_meta_value "SC_EXPIRES_AT")"
-  update_component="$(read_update_info_value "UPDATE_COMPONENT")"
-  update_version="$(read_update_info_value "UPDATE_VERSION")"
-  update_desc="$(read_update_info_value "UPDATE_DESC")"
-  update_time="$(read_update_info_value "UPDATE_AT_LOCAL")"
-  update_desc_short="$(truncate_text "${update_desc:-"-"}" 80)"
   [[ -z "${license_distribution}" ]] && license_distribution="Community / Open Source"
   if [[ -n "${sc_meta_client}" ]]; then
     license_client_name="${sc_meta_client}"
@@ -9097,21 +9002,14 @@ EOF
   else
     expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
   fi
+
   udpcustom="$(detect_udpcustom_service)"
   ssh_on="$(onoff_word ssh)"
   xray_on="$(onoff_word xray)"
   ws_on="$(onoff_word sc-1forcr-sshws)"
-  loadblc_on="$(onoff_word haproxy)"
+  nginx_on="$(onoff_word nginx)"
   zivpn_on="$(onoff_word "${ZIVPN_SERVICE}")"
   udphc_on="$(onoff_word "${udpcustom}")"
-
-  health="CHECK"
-  if [[ "${xray_on}" == "ON" && "${ws_on}" == "ON" && "${loadblc_on}" == "ON" ]]; then
-    health="GOOD"
-  fi
-
-  local health_display="${YELLOW}CHECK${NC}"
-  [[ "${health}" == "GOOD" ]] && health_display="${GREEN}GOOD${NC}"
 
   c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs;" 2>/dev/null || echo 0)"
   c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses;" 2>/dev/null || echo 0)"
@@ -9120,90 +9018,52 @@ EOF
 
   read_vnstat_stats
   IFS='|' read -r cap_ram_gb cap_cores cap_tier cap_est <<< "$(get_server_capacity_profile)"
-
   if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" == "1" ]]; then
     cap_mode="AUTO"
   else
     cap_mode="MANUAL"
   fi
 
-  local xray_color="${GREEN}ON${NC}";  [[ "$xray_on" != "ON" ]] && xray_color="${RED}OFF${NC}"
-  local ws_color="${GREEN}ON${NC}";    [[ "$ws_on" != "ON" ]] && ws_color="${RED}OFF${NC}"
-  local lb_color="${GREEN}ON${NC}";    [[ "$loadblc_on" != "ON" ]] && lb_color="${RED}OFF${NC}"
-  local zivpn_color="${GREEN}ON${NC}"; [[ "$zivpn_on" != "ON" ]] && zivpn_color="${RED}OFF${NC}"
-  local udphc_color="${GREEN}ON${NC}"; [[ "$udphc_on" != "ON" ]] && udphc_color="${RED}OFF${NC}"
-  local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
+  local xray_color="${GREEN}ON${NC}"; [[ "$xray_on" != "ON" ]] && xray_color="${RED}OFF${NC}"
+  local ws_color="${GREEN}ON${NC}";   [[ "$ws_on" != "ON" ]] && ws_color="${RED}OFF${NC}"
+  local nginx_color="${GREEN}ON${NC}"; [[ "$nginx_on" != "ON" ]] && nginx_color="${RED}OFF${NC}"
+  local ssh_color="${GREEN}ON${NC}";  [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
 
-  # ========== GAMBAR ULANG DASHBOARD DENGAN LAYOUT BARU ==========
   clear
   print_top
-  print_center "${CYAN}${BOLD}◆ SC 1FORCR NEXUS DASHBOARD ◆${NC}"
+  print_center "${CYAN}${BOLD}� SC 1FORCR NEXUS DASHBOARD �${NC}"
   print_mid
-
-  # SYSTEM
-  print_line "${CYAN}${BOLD}▶ SYSTEM & RESOURCES${NC}"
-  kv_line "OS"     "${os_name}"
-  kv_line "RAM"    "${ram_mb:-"-"} / SWAP : ${swap_mb:-"-"}"
-  kv_line "UPTIME" "${uptime_h}h ${uptime_m}m"
-  kv_line "CPU/RAM" "${cap_cores} vCPU / ${cap_ram_gb} GB RAM"
-  kv_line "Auto Tuning" "${cap_mode} (tier ${cap_tier})"
-  kv_line "Est. Users" "~ ${cap_est}"
+  print_line "${CYAN}${BOLD}* SYSTEM & RESOURCES${NC}"
+  kv_line "OS" "${os_name}"
+  kv_line "RAM/SWAP" "${ram_mb:-"-"} / ${swap_mb:-"-"}"
+  kv_line "Uptime" "${uptime_h}h ${uptime_m}m"
+  kv_line "Spec" "${cap_cores} vCPU / ${cap_ram_gb} GB (tier ${cap_tier})"
+  kv_line "Auto Tuning" "${cap_mode} ~ ${cap_est} user"
   print_mid
-
-  # LOCATION
-  print_line "${CYAN}${BOLD}▶ NETWORK & LOCATION${NC}"
-  kv_line "IP"     "${ip}"
-  kv_line "City"   "${city}"
-  kv_line "ISP"    "${isp}"
+  print_line "${CYAN}${BOLD}* NETWORK & LOCATION${NC}"
   kv_line "Domain" "${DOMAIN:-"-"}"
+  kv_line "IP VPS" "${ip}"
+  kv_line "City" "${city}"
+  kv_line "ISP" "${isp}"
   print_mid
-
-  # TRAFFIC
-  print_line "${CYAN}${BOLD}▶ TRAFFIC STATS${NC}"
-  kv_line "This Month" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
-  kv_line "  RX/TX"    "${VNSTAT_MONTH_RX} / ${VNSTAT_MONTH_TX}"
-  kv_line "Today"      "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]"
-  kv_line "  RX/TX"    "${VNSTAT_DAY_RX} / ${VNSTAT_DAY_TX}"
-  kv_line "Current Rate" "${VNSTAT_RATE}"
+  print_line "${CYAN}${BOLD}* TRAFFIC${NC}"
+  kv_line "Month" "${VNSTAT_MONTH_TOTAL}"
+  kv_line "Day" "${VNSTAT_DAY_TOTAL}"
+  kv_line "Rate" "${VNSTAT_RATE}"
   print_mid
-
-  # SERVICES
-  print_line "${CYAN}${BOLD}▶ SERVICES STATUS${NC}"
-  print_line "  ${BOLD}XRAY${NC}    : ${xray_color}     ${BOLD}SSH-WS${NC} : ${ws_color}     ${BOLD}LOADBLC${NC} : ${lb_color}"
-  print_line "  ${BOLD}ZIVPN${NC}   : ${zivpn_color}     ${BOLD}UDPHC${NC}  : ${udphc_color}    ${BOLD}SSH${NC}    : ${ssh_color}"
-  kv_line "Health" "${health_display}"
+  print_line "${CYAN}${BOLD}* SERVICE STATUS${NC}"
+  print_line "  [ SSH-WS : ${ws_color} ]   [ XRAY : ${xray_color} ]   [ NGINX : ${nginx_color} ]"
+  print_line "  [ SSH    : ${ssh_color} ]   [ ZIVPN: ${zivpn_on} ]   [ UDPHC : ${udphc_on} ]"
   print_mid
-
-  # ACCOUNTS
-  print_line "${CYAN}${BOLD}▶ ACCOUNT SUMMARY${NC}"
-  print_line "  ${BOLD}SSH/OVPN${NC} : ${c_ssh}      ${BOLD}VMESS${NC} : ${c_vmess}"
-  print_line "  ${BOLD}VLESS${NC}    : ${c_vless}      ${BOLD}TROJAN${NC} : ${c_trojan}"
+  print_line "${CYAN}${BOLD}* ACCOUNT SUMMARY${NC}"
+  print_line "  SSH/OVPN : ${c_ssh} | VMESS : ${c_vmess} | VLESS : ${c_vless} | TROJAN : ${c_trojan}"
   print_mid
-
-  # VERSION & LICENSE
-  print_line "${BLUE}${BOLD}▶ VERSION & LICENSE${NC}"
-  kv_line "Script Ver" "${SCRIPT_VERSION:-unknown}"
-  kv_line "Distro"     "${license_distribution}"
-  kv_line "Client"     "${license_client_name}"
-  kv_line "Expires in" "${expiry_in_text}"
-  print_mid
-
-  # UPDATE INFO (jika ada)
-  if [[ -n "${update_component}" && "${update_component}" != "-" ]]; then
-    print_line "${YELLOW}${BOLD}▶ UPDATE AVAILABLE${NC}"
-    kv_line "Component" "${update_component}"
-    kv_line "Version"   "${update_version}"
-    kv_line "Desc"      "${update_desc_short}"
-    kv_line "Time"      "${update_time}"
-    print_mid
-  fi
-
+  print_line "${CYAN}${BOLD}* VERSION & LICENSE${NC}"
+  kv_line "Version" "${SCRIPT_VERSION:-unknown}"
+  kv_line "License" "${license_distribution}"
+  kv_line "Client" "${license_client_name}"
+  kv_line "Expired" "${expiry_in_text}"
   print_bottom
-
-  printf '\n'
-  printf ' %s\n' "$(repeat_char '─' 30)"
-  printf " ${GREEN}${BOLD}➜${NC} Gunakan perintah ${BOLD}menu${NC} untuk mengakses menu utama\n"
-  printf ' %s\n' "$(repeat_char '─' 30)"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h

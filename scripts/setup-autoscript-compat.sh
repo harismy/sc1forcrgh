@@ -8846,7 +8846,7 @@ draw_dashboard() {
   local health
   local cap_ram_gb cap_cores cap_tier cap_est cap_mode
 
-  # ANSI colors (aman untuk bash di Linux)
+  # ANSI colors
   local ESC=$'\033'
   local RED="${ESC}[0;31m"
   local GREEN="${ESC}[0;32m"
@@ -8857,7 +8857,8 @@ draw_dashboard() {
   local BOLD="${ESC}[1m"
   local NC="${ESC}[0m"
 
-  local BOX_W=66
+  # Lebar box (total karakter dalam satu baris)
+  local BOX_W=72
 
   repeat_char() {
     local char="$1"
@@ -8920,10 +8921,13 @@ draw_dashboard() {
     printf '| %*s%s%*s |\n' "$left" "" "$text" "$right" ""
   }
 
+  # key width fixed 16 characters (termasuk warna)
   kv_line() {
     local key="$1"
     local value="$2"
-    print_line "  $(printf '%-13s' "$key") : $value"
+    local key_padded
+    key_padded="$(printf "%-16s" "$key")"
+    print_line "  ${key_padded} : $value"
   }
 
   read_license_value() {
@@ -9093,11 +9097,6 @@ EOF
   else
     expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
   fi
-  [[ -z "${update_component}" ]] && update_component="-"
-  [[ -z "${update_version}" ]] && update_version="-"
-  [[ -z "${update_desc_short}" ]] && update_desc_short="-"
-  [[ -z "${update_time}" ]] && update_time="-"
-
   udpcustom="$(detect_udpcustom_service)"
   ssh_on="$(onoff_word ssh)"
   xray_on="$(onoff_word xray)"
@@ -9135,61 +9134,76 @@ EOF
   local udphc_color="${GREEN}ON${NC}"; [[ "$udphc_on" != "ON" ]] && udphc_color="${RED}OFF${NC}"
   local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
 
+  # ========== GAMBAR ULANG DASHBOARD DENGAN LAYOUT BARU ==========
   clear
   print_top
-  print_center "${CYAN}${BOLD}SC 1FORCR NEXUS DASHBOARD${NC}"
+  print_center "${CYAN}${BOLD}◆ SC 1FORCR NEXUS DASHBOARD ◆${NC}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* SYSTEM & NETWORK${NC}"
-  kv_line "OS"  "${os_name}"
-  kv_line "RAM"  "${ram_mb:-"-"} | SWAP : ${swap_mb:-"-"}"
-  kv_line "UPTIME"  "${uptime_h}h ${uptime_m}m"
-  kv_line "Spesifikasi"  "${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
-  kv_line "Auto tuningSC" "${cap_mode} (tier ${cap_tier})"
-  kv_line "Estimasi akun"  "sekitar ${cap_est} user"
+  # SYSTEM
+  print_line "${CYAN}${BOLD}▶ SYSTEM & RESOURCES${NC}"
+  kv_line "OS"     "${os_name}"
+  kv_line "RAM"    "${ram_mb:-"-"} / SWAP : ${swap_mb:-"-"}"
+  kv_line "UPTIME" "${uptime_h}h ${uptime_m}m"
+  kv_line "CPU/RAM" "${cap_cores} vCPU / ${cap_ram_gb} GB RAM"
+  kv_line "Auto Tuning" "${cap_mode} (tier ${cap_tier})"
+  kv_line "Est. Users" "~ ${cap_est}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* LOCATION & ISP${NC}"
-  kv_line "IP" "${ip}"
-  kv_line "CITY" "${city}"
-  kv_line "ISP" "${isp}"
-  kv_line "DOMAIN" "${DOMAIN:-"-"}"
+  # LOCATION
+  print_line "${CYAN}${BOLD}▶ NETWORK & LOCATION${NC}"
+  kv_line "IP"     "${ip}"
+  kv_line "City"   "${city}"
+  kv_line "ISP"    "${isp}"
+  kv_line "Domain" "${DOMAIN:-"-"}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* TRAFFIC STATS${NC}"
-  kv_line "MONTH" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
-  kv_line "RX" "${VNSTAT_MONTH_RX}"
-  kv_line "TX" "${VNSTAT_MONTH_TX}"
-  kv_line "DAY" "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]"
-  kv_line "RX" "${VNSTAT_DAY_RX}"
-  kv_line "TX" "${VNSTAT_DAY_TX}"
-  kv_line "CURRENT" "${VNSTAT_RATE}"
+  # TRAFFIC
+  print_line "${CYAN}${BOLD}▶ TRAFFIC STATS${NC}"
+  kv_line "This Month" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
+  kv_line "  RX/TX"    "${VNSTAT_MONTH_RX} / ${VNSTAT_MONTH_TX}"
+  kv_line "Today"      "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]"
+  kv_line "  RX/TX"    "${VNSTAT_DAY_RX} / ${VNSTAT_DAY_TX}"
+  kv_line "Current Rate" "${VNSTAT_RATE}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* SERVICES STATUS${NC}"
-  print_line "  XRAY    : ${xray_color}   | SSH-WS : ${ws_color}   | LOADBLC : ${lb_color}"
-  print_line "  ZIVPN   : ${zivpn_color}   | UDPHC  : ${udphc_color}  | SSH     : ${ssh_color}"
-  print_line "  HEALTH  : ${health_display}"
+  # SERVICES
+  print_line "${CYAN}${BOLD}▶ SERVICES STATUS${NC}"
+  print_line "  ${BOLD}XRAY${NC}    : ${xray_color}     ${BOLD}SSH-WS${NC} : ${ws_color}     ${BOLD}LOADBLC${NC} : ${lb_color}"
+  print_line "  ${BOLD}ZIVPN${NC}   : ${zivpn_color}     ${BOLD}UDPHC${NC}  : ${udphc_color}    ${BOLD}SSH${NC}    : ${ssh_color}"
+  kv_line "Health" "${health_display}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* ACCOUNT SUMMARY${NC}"
-  print_line "  SSH/OpenVPN : ${c_ssh}  | VMESS  : ${c_vmess}"
-  print_line "  VLESS       : ${c_vless}   | TROJAN : ${c_trojan}"
+  # ACCOUNTS
+  print_line "${CYAN}${BOLD}▶ ACCOUNT SUMMARY${NC}"
+  print_line "  ${BOLD}SSH/OVPN${NC} : ${c_ssh}      ${BOLD}VMESS${NC} : ${c_vmess}"
+  print_line "  ${BOLD}VLESS${NC}    : ${c_vless}      ${BOLD}TROJAN${NC} : ${c_trojan}"
   print_mid
 
-  print_line "${BLUE}${BOLD}* VERSION & CLIENT${NC}"
-  kv_line "Version" "${SCRIPT_VERSION:-unknown}"
-  kv_line "Distribusi" "${license_distribution}"
-  kv_line "Client Name" "${license_client_name}"
-  kv_line "Expiry In" "${expiry_in_text}"
+  # VERSION & LICENSE
+  print_line "${BLUE}${BOLD}▶ VERSION & LICENSE${NC}"
+  kv_line "Script Ver" "${SCRIPT_VERSION:-unknown}"
+  kv_line "Distro"     "${license_distribution}"
+  kv_line "Client"     "${license_client_name}"
+  kv_line "Expires in" "${expiry_in_text}"
   print_mid
+
+  # UPDATE INFO (jika ada)
+  if [[ -n "${update_component}" && "${update_component}" != "-" ]]; then
+    print_line "${YELLOW}${BOLD}▶ UPDATE AVAILABLE${NC}"
+    kv_line "Component" "${update_component}"
+    kv_line "Version"   "${update_version}"
+    kv_line "Desc"      "${update_desc_short}"
+    kv_line "Time"      "${update_time}"
+    print_mid
+  fi
 
   print_bottom
 
   printf '\n'
-  printf ' %s\n' "$(repeat_char '-' 30)"
-  printf " ${BOLD}to access use 'menu' command${NC}\n"
-  printf ' %s\n' "$(repeat_char '-' 30)"
+  printf ' %s\n' "$(repeat_char '─' 30)"
+  printf " ${GREEN}${BOLD}➜${NC} Gunakan perintah ${BOLD}menu${NC} untuk mengakses menu utama\n"
+  printf ' %s\n' "$(repeat_char '─' 30)"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h

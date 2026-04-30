@@ -10806,38 +10806,17 @@ while true; do
     echo
   fi
 
-  ESC=$'\033'
-  CYN="${ESC}[1;36m"
-  WHT="${ESC}[1;37m"
-  NC="${ESC}[0m"
-  local_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [[ -z "${local_ip}" ]] && local_ip="-"
-  up_text="$(uptime -p 2>/dev/null | sed 's/^up //')"
-  [[ -z "${up_text}" ]] && up_text="-"
-  s_ssh="$(service_onoff ssh)"
-  s_xray="$(service_onoff xray)"
-  s_nginx="$(service_onoff nginx)"
-
-  echo -e "${CYN}┌──────────────────────────────────────────────────────────────┐${NC}"
-  echo -e "${CYN}│${NC}               ${WHT}• SC 1FORCR MAIN MENU •${NC}                  ${CYN}│${NC}"
-  echo -e "${CYN}└──────────────────────────────────────────────────────────────┘${NC}"
-  echo -e "${CYN}┌──────────────────────────────────────────────────────────────┐${NC}"
-  printf "${CYN}│${NC} %-60s ${CYN}│${NC}\n" "Domain : ${DOMAIN}"
-  printf "${CYN}│${NC} %-60s ${CYN}│${NC}\n" "IP VPS : ${local_ip}"
-  printf "${CYN}│${NC} %-60s ${CYN}│${NC}\n" "Uptime : ${up_text}"
-  echo -e "${CYN}└──────────────────────────────────────────────────────────────┘${NC}"
-  echo -e "${CYN}┌──────────────────────────────────────────────────────────────┐${NC}"
-  printf "${CYN}│${NC} [ SSH : %-3s ]   [ XRAY : %-3s ]   [ NGINX : %-3s ]            ${CYN}│${NC}\n" "${s_ssh}" "${s_xray}" "${s_nginx}"
-  echo -e "${CYN}└──────────────────────────────────────────────────────────────┘${NC}"
-  echo -e "${CYN}┌──────────────────────────────────────────────────────────────┐${NC}"
-  echo -e "${CYN}│${NC} [01] • MENU AKUN             [05] • MONITOR USER LOCK       ${CYN}│${NC}"
-  echo -e "${CYN}│${NC} [02] • SERVICE MENU          [06] • MONITOR USER LOGIN      ${CYN}│${NC}"
-  echo -e "${CYN}│${NC} [03] • BACKUP/RESTORE        [07] • TOOLS                   ${CYN}│${NC}"
-  echo -e "${CYN}│${NC} [04] • CHANGE DOMAIN                                        ${CYN}│${NC}"
-  echo -e "${CYN}└──────────────────────────────────────────────────────────────┘${NC}"
-  echo -e "${CYN}┌──────────────────────────────────────────────────────────────┐${NC}"
-  echo -e "${CYN}│${NC} [ m ] • TAMPILKAN DASHBOARD   [ x ] • EXIT MENU             ${CYN}│${NC}"
-  echo -e "${CYN}└──────────────────────────────────────────────────────────────┘${NC}"
+  echo " +-------------------------------------------------"
+  echo " |  1.) > MENU AKUN         5.) > MONITOR USER LOCK"
+  echo " |  2.) > SERVICE MENU      6.) > MONITOR USER LOGIN"
+  echo " |  3.) > BACKUP/RESTORE    7.) > TOOLS"
+  echo " |  4.) > CHANGE DOMAIN"
+  echo " |  m.) > MENU UTAMA"
+  echo " |  x.) > EXIT"
+  echo " +-------------------------------------------------"
+  if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
+    echo " -------------------------------------------------"
+  fi
   echo
   if ! prompt_input m "Select From Options [1-7, m, x] : "; then
     SHOW_FULL_MENU=0

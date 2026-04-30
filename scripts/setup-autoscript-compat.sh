@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
@@ -622,35 +622,34 @@ setup_default_banner_assets() {
   cat > /etc/sc-1forcr/banner.html <<'EOF'
 <div style="text-align:center; line-height:1.6; font-family: monospace;">
 
-<!-- â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•— -->
-<font color="#00ffff">â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—</font><br>
-<font color="#17e8ff">âš¡ SSH PREMIUM BY 1FORCR âš¡</font><br>
-<font color="#00ffff">â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•</font><br>
+<font color="#00ffff">=======================</font><br>
+<font color="#17e8ff">SSH PREMIUM BY 1FORCR</font><br>
+<font color="#00ffff">=======================</font><br>
 
 
 <!-- ATURAN PAKAI -->
-<font color="#ff45ba"><b>âš ï¸ ATURAN PEMAKAIAN âš ï¸</b></font><br>
+<font color="#ff45ba"><b>ATURAN PEMAKAIAN</b></font><br>
 <font color="#84ecdb">
-Jika beli akun untuk 1 pengguna <br>â†’ gunakan hanya untuk 1 orang.<br>
-Jika beli akun untuk 2 pengguna <br>â†’ gunakan untuk 2 orang saja.<br>
+Jika beli akun untuk 1 pengguna <br>- gunakan hanya untuk 1 orang.<br>
+Jika beli akun untuk 2 pengguna <br>- gunakan untuk 2 orang saja.<br>
 </font><br>
 
-<font color="red"><b>ðŸš« Melanggar = Akun Expired Otomatis!</b></font><br><br>
+<font color="red"><b>Melanggar = Akun Expired Otomatis!</b></font><br><br>
 
 <!-- KONTAK ADMIN -->
-<font color="#00ffff">â•”â•â•â•â• KONTAK ADMIN â•â•â•â•â•—</font><br>
+<font color="#00ffff">===== KONTAK ADMIN =====</font><br>
 <font color="#84ecdb">
-ðŸ“ž Hubungi Admin: <br>
+Hubungi Admin: <br>
 <font color="#00ffff">http://wa.me/6289527159281</font><br><br>
-ðŸ“¢ Info Config & SSH: <br>
+Info Config & SSH: <br>
 <font color="#ff45ba">https://t.me/Oneforcr_info</font><br><br>
-ðŸ¤– Order via Bot: <br>
+Order via Bot: <br>
 <font color="#ff17e8">https://t.me/BOT1FORCR_STORE_bot</font>
 </font><br>
-<font color="#00ffff">â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•</font><br><br>
+<font color="#00ffff">========================</font><br><br>
 
-<font color="#84ecdb"><i>âœ¨ Terimakasih udah order di 1FORCR âœ¨</i></font><br>
-<font color="#00ffff">â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</font><br>
+<font color="#84ecdb"><i>Terimakasih udah order di 1FORCR</i></font><br>
+<font color="#00ffff">=========================</font><br>
 
 </div>
 EOF
@@ -8732,22 +8731,22 @@ draw_dashboard() {
   }
 
   print_top() {
-    printf 'â”Œ%sâ”\n' "$(repeat_char 'â”€' "$((BOX_W + 2))")"
+    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
   }
 
   print_mid() {
-    printf 'â”œ%sâ”¤\n' "$(repeat_char 'â”€' "$((BOX_W + 2))")"
+    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
   }
 
   print_bottom() {
-    printf 'â””%sâ”˜\n' "$(repeat_char 'â”€' "$((BOX_W + 2))")"
+    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
   }
 
   print_line() {
     local text="$1"
     local padded
     padded="$(pad_right "$text" "$BOX_W")"
-    printf 'â”‚ %s â”‚\n' "$padded"
+    printf '| %s |\n' "$padded"
   }
 
   print_center() {
@@ -8760,7 +8759,7 @@ draw_dashboard() {
     fi
     left=$(( (BOX_W - vlen) / 2 ))
     right=$(( BOX_W - vlen - left ))
-    printf 'â”‚ %*s%s%*s â”‚\n' "$left" "" "$text" "$right" ""
+    printf '| %*s%s%*s |\n' "$left" "" "$text" "$right" ""
   }
 
   kv_line() {
@@ -8983,7 +8982,7 @@ EOF
   print_center "${CYAN}${BOLD}SC 1FORCR NEXUS DASHBOARD${NC}"
   print_mid
 
-  print_line "${CYAN}${BOLD}â–  SYSTEM & NETWORK${NC}"
+  print_line "${CYAN}${BOLD}* SYSTEM & NETWORK${NC}"
   kv_line "OS"  "${os_name}"
   kv_line "RAM"  "${ram_mb:-"-"} | SWAP : ${swap_mb:-"-"}"
   kv_line "UPTIME"  "${uptime_h}h ${uptime_m}m"
@@ -8992,14 +8991,14 @@ EOF
   kv_line "Estimasi akun"  "sekitar ${cap_est} user"
   print_mid
 
-  print_line "${CYAN}${BOLD}â–  LOCATION & ISP${NC}"
+  print_line "${CYAN}${BOLD}* LOCATION & ISP${NC}"
   kv_line "IP" "${ip}"
   kv_line "CITY" "${city}"
   kv_line "ISP" "${isp}"
   kv_line "DOMAIN" "${DOMAIN:-"-"}"
   print_mid
 
-  print_line "${CYAN}${BOLD}â–  TRAFFIC STATS${NC}"
+  print_line "${CYAN}${BOLD}* TRAFFIC STATS${NC}"
   kv_line "MONTH" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
   kv_line "RX" "${VNSTAT_MONTH_RX}"
   kv_line "TX" "${VNSTAT_MONTH_TX}"
@@ -9009,18 +9008,18 @@ EOF
   kv_line "CURRENT" "${VNSTAT_RATE}"
   print_mid
 
-  print_line "${CYAN}${BOLD}â–  SERVICES STATUS${NC}"
+  print_line "${CYAN}${BOLD}* SERVICES STATUS${NC}"
   print_line "  XRAY    : ${xray_color}   | SSH-WS : ${ws_color}   | LOADBLC : ${lb_color}"
   print_line "  ZIVPN   : ${zivpn_color}   | UDPHC  : ${udphc_color}  | SSH     : ${ssh_color}"
   print_line "  HEALTH  : ${health_display}"
   print_mid
 
-  print_line "${CYAN}${BOLD}â–  ACCOUNT SUMMARY${NC}"
+  print_line "${CYAN}${BOLD}* ACCOUNT SUMMARY${NC}"
   print_line "  SSH/OpenVPN : ${c_ssh}  | VMESS  : ${c_vmess}"
   print_line "  VLESS       : ${c_vless}   | TROJAN : ${c_trojan}"
   print_mid
 
-  print_line "${BLUE}${BOLD}â–  VERSION & CLIENT${NC}"
+  print_line "${BLUE}${BOLD}* VERSION & CLIENT${NC}"
   kv_line "Version" "${SCRIPT_VERSION:-unknown}"
   kv_line "Distribusi" "${license_distribution}"
   kv_line "Client Name" "${license_client_name}"
@@ -9030,9 +9029,9 @@ EOF
   print_bottom
 
   printf '\n'
-  printf ' %s\n' "$(repeat_char 'â”€' 30)"
+  printf ' %s\n' "$(repeat_char '-' 30)"
   printf " ${BOLD}to access use 'menu' command${NC}\n"
-  printf ' %s\n' "$(repeat_char 'â”€' 30)"
+  printf ' %s\n' "$(repeat_char '-' 30)"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
@@ -10440,35 +10439,34 @@ write_default_banner_html() {
   cat > "${banner_file}" <<'EOF'
 <div style="text-align:center; line-height:1.6; font-family: monospace;">
 
-<!-- â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•— -->
-<font color="#00ffff">â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—</font><br>
-<font color="#17e8ff">âš¡ SSH PREMIUM BY 1FORCR âš¡</font><br>
-<font color="#00ffff">â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•</font><br>
+<font color="#00ffff">=======================</font><br>
+<font color="#17e8ff">SSH PREMIUM BY 1FORCR</font><br>
+<font color="#00ffff">=======================</font><br>
 
 
 <!-- ATURAN PAKAI -->
-<font color="#ff45ba"><b>âš ï¸ ATURAN PEMAKAIAN âš ï¸</b></font><br>
+<font color="#ff45ba"><b>ATURAN PEMAKAIAN</b></font><br>
 <font color="#84ecdb">
-Jika beli akun untuk 1 pengguna <br>â†’ gunakan hanya untuk 1 orang.<br>
-Jika beli akun untuk 2 pengguna <br>â†’ gunakan untuk 2 orang saja.<br>
+Jika beli akun untuk 1 pengguna <br>- gunakan hanya untuk 1 orang.<br>
+Jika beli akun untuk 2 pengguna <br>- gunakan untuk 2 orang saja.<br>
 </font><br>
 
-<font color="red"><b>ðŸš« Melanggar = Akun Expired Otomatis!</b></font><br><br>
+<font color="red"><b>Melanggar = Akun Expired Otomatis!</b></font><br><br>
 
 <!-- KONTAK ADMIN -->
-<font color="#00ffff">â•”â•â•â•â• KONTAK ADMIN â•â•â•â•â•—</font><br>
+<font color="#00ffff">===== KONTAK ADMIN =====</font><br>
 <font color="#84ecdb">
-ðŸ“ž Hubungi Admin: <br>
+Hubungi Admin: <br>
 <font color="#00ffff">http://wa.me/6289527159281</font><br><br>
-ðŸ“¢ Info Config & SSH: <br>
+Info Config & SSH: <br>
 <font color="#ff45ba">https://t.me/Oneforcr_info</font><br><br>
-ðŸ¤– Order via Bot: <br>
+Order via Bot: <br>
 <font color="#ff17e8">https://t.me/BOT1FORCR_STORE_bot</font>
 </font><br>
-<font color="#00ffff">â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•</font><br><br>
+<font color="#00ffff">========================</font><br><br>
 
-<font color="#84ecdb"><i>âœ¨ Terimakasih udah order di 1FORCR âœ¨</i></font><br>
-<font color="#00ffff">â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”</font><br>
+<font color="#84ecdb"><i>Terimakasih udah order di 1FORCR</i></font><br>
+<font color="#00ffff">=========================</font><br>
 
 </div>
 EOF
@@ -10645,16 +10643,16 @@ while true; do
     echo
   fi
 
-  echo " â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€"
-  echo " â”‚  1.) > MENU AKUN         5.) > MONITOR USER LOCK"
-  echo " â”‚  2.) > SERVICE MENU      6.) > MONITOR USER LOGIN"
-  echo " â”‚  3.) > BACKUP/RESTORE    7.) > TOOLS"
-  echo " â”‚  4.) > CHANGE DOMAIN"
-  echo " â”‚  m.) > MENU UTAMA"
-  echo " â”‚  x.) > EXIT"
-  echo " â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€"
+  echo " +-------------------------------------------------"
+  echo " |  1.) > MENU AKUN         5.) > MONITOR USER LOCK"
+  echo " |  2.) > SERVICE MENU      6.) > MONITOR USER LOGIN"
+  echo " |  3.) > BACKUP/RESTORE    7.) > TOOLS"
+  echo " |  4.) > CHANGE DOMAIN"
+  echo " |  m.) > MENU UTAMA"
+  echo " |  x.) > EXIT"
+  echo " +-------------------------------------------------"
   if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
-    echo " â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€"
+    echo " -------------------------------------------------"
   fi
   echo
   if ! prompt_input m "Select From Options [1-7, m, x] : "; then

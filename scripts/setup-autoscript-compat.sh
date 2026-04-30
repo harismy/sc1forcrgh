@@ -1020,8 +1020,18 @@ server {
 
     location = /cdn-cgi/trace {
         access_log off;
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+${sshws_nginx_limit_rules}
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /vps/ {
@@ -3259,7 +3269,7 @@ const server = net.createServer((client) => {
       return;
     }
 
-    if (method && (method.startsWith('get') || method.startsWith('post') || method.startsWith('head') || method.startsWith('options'))) {
+    if (method && /\bhttp\//i.test(line)) {
       client.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
       stage = 'wait-upgrade';
       if (rest.length > 0) handleHttpLike(rest);
@@ -3395,6 +3405,56 @@ func flushReaderBufferedTo(reader *bufio.Reader, dst net.Conn) error {
 	return writeAll(dst, buf)
 }
 
+func readHttpHeader(reader *bufio.Reader, maxHeaderBytes int) ([]byte, string, string, error) {
+	var raw bytes.Buffer
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return nil, "", "", err
+		}
+		raw.Write(line)
+		if raw.Len() > maxHeaderBytes {
+			return nil, "", "", fmt.Errorf("header too large")
+		}
+		if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
+			break
+		}
+	}
+	rawStr := raw.String()
+	first := strings.ToLower(strings.TrimSpace(strings.SplitN(rawStr, "\r\n", 2)[0]))
+	header := strings.ToLower(rawStr)
+	return raw.Bytes(), first, header, nil
+}
+
+func looksHttpLike(first string) bool {
+	parts := strings.Fields(strings.ToLower(strings.TrimSpace(first)))
+	if len(parts) < 2 {
+		return false
+	}
+	if !strings.Contains(parts[len(parts)-1], "http/") {
+		return false
+	}
+	return true
+}
+
+func stripBufferedHttpJunk(reader *bufio.Reader) {
+	for i := 0; i < 2 && reader.Buffered() > 0; i++ {
+		n := reader.Buffered()
+		if n > 24 {
+			n = 24
+		}
+		peek, err := reader.Peek(n)
+		if err != nil {
+			return
+		}
+		p := strings.ToLower(strings.TrimSpace(string(peek)))
+		if !(strings.HasPrefix(p, "http/") || looksHttpLike(p)) {
+			return
+		}
+		_, _, _, _ = readHttpHeader(reader, 8192)
+	}
+}
+
 func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int) {
 	defer client.Close()
 	reader := bufio.NewReaderSize(client, 64*1024)
@@ -3413,67 +3473,70 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		return
 	}
 
-	var raw bytes.Buffer
-	for {
-		line, err := reader.ReadBytes('\n')
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer client.SetReadDeadline(time.Time{})
+
+	for i := 0; i < 8; i++ {
+		rawHeader, first, header, err := readHttpHeader(reader, 128*1024)
 		if err != nil {
 			return
 		}
-		raw.Write(line)
-		if raw.Len() > 128*1024 {
+
+		if strings.HasPrefix(first, "connect ") {
+			_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			continue
+		}
+
+		if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+			if err != nil {
+				return
+			}
+			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+			stripBufferedHttpJunk(reader)
+			_ = client.SetReadDeadline(time.Time{})
+			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+				_ = sshUp.Close()
+				return
+			}
+			tunnelBoth(client, sshUp)
 			return
 		}
-		if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
-			break
+
+		// keep API and xray ws paths reachable through the same mux.
+		if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
+			httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
+			if err != nil {
+				return
+			}
+			_ = client.SetReadDeadline(time.Time{})
+			if err := writeAll(httpUp, rawHeader); err != nil {
+				_ = httpUp.Close()
+				return
+			}
+			if err := flushReaderBufferedTo(reader, httpUp); err != nil {
+				_ = httpUp.Close()
+				return
+			}
+			tunnelBoth(client, httpUp)
+			return
 		}
-	}
 
-	header := strings.ToLower(raw.String())
-	first := strings.ToLower(strings.TrimSpace(strings.SplitN(raw.String(), "\r\n", 2)[0]))
-
-	// CONNECT mode from payload apps.
-	if strings.HasPrefix(first, "connect ") {
-		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-		raw.Reset()
-
-		// CONNECT clients may still send HTTP payload lines before SSH banner.
-		// Discard those lines until we see SSH- and then start raw SSH tunnel.
-		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
-		for i := 0; i < 64; i++ {
-			nextPeek, nextErr := reader.Peek(4)
-			if nextErr != nil {
-				_ = client.SetReadDeadline(time.Time{})
-				return
-			}
-			if string(nextPeek) == "SSH-" {
-				_ = client.SetReadDeadline(time.Time{})
-				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-				if err != nil {
-					return
-				}
-				if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-					_ = sshUp.Close()
-					return
-				}
-				tunnelBoth(client, sshUp)
-				return
-			}
-			// Drop one line of HTTP payload and keep scanning.
-			if _, err := reader.ReadBytes('\n'); err != nil {
-				_ = client.SetReadDeadline(time.Time{})
-				return
-			}
+		if looksHttpLike(first) {
+			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
+			continue
 		}
-		_ = client.SetReadDeadline(time.Time{})
-		return
-	}
 
-	if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+		// fallback to raw SSH.
 		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
 		if err != nil {
 			return
 		}
-		_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+		_ = client.SetReadDeadline(time.Time{})
+		if err := writeAll(sshUp, rawHeader); err != nil {
+			_ = sshUp.Close()
+			return
+		}
 		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 			_ = sshUp.Close()
 			return
@@ -3481,39 +3544,6 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		tunnelBoth(client, sshUp)
 		return
 	}
-
-	// keep API and xray ws paths reachable through the same mux.
-	if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
-		httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
-		if err != nil {
-			return
-		}
-		if err := writeAll(httpUp, raw.Bytes()); err != nil {
-			_ = httpUp.Close()
-			return
-		}
-		if err := flushReaderBufferedTo(reader, httpUp); err != nil {
-			_ = httpUp.Close()
-			return
-		}
-		tunnelBoth(client, httpUp)
-		return
-	}
-
-	// fallback to raw SSH.
-	sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-	if err != nil {
-		return
-	}
-	if err := writeAll(sshUp, raw.Bytes()); err != nil {
-		_ = sshUp.Close()
-		return
-	}
-	if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-		_ = sshUp.Close()
-		return
-	}
-	tunnelBoth(client, sshUp)
 }
 
 func main() {
@@ -8285,8 +8315,18 @@ server {
 
     location = /cdn-cgi/trace {
         access_log off;
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+${sshws_nginx_limit_rules}
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /vps/ {

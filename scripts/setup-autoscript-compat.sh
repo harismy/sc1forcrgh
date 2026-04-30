@@ -7345,6 +7345,63 @@ unlock_account() {
   telegram_notify_action "UNLOCK" "${type}" "${username}"
 }
 
+unlock_all_accounts() {
+  local ans type table ep rows username resp code message ok_count fail_count total_count username_sql
+  echo "Unlock semua akun LOCK/LOCK_TMP (SSH/VMESS/VLESS/TROJAN)."
+  if ! prompt_input ans "Lanjutkan? [y/N]: "; then
+    return
+  fi
+  ans="$(echo "${ans}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  [[ "${ans}" != "y" && "${ans}" != "yes" ]] && { echo "Dibatalkan."; return; }
+
+  ok_count=0
+  fail_count=0
+  total_count=0
+
+  for type in ssh vmess vless trojan; do
+    table="$(account_table_by_type "${type}")"
+    ep="$(endpoint_unlock "${type}")"
+    [[ -z "${table}" || -z "${ep}" ]] && continue
+
+    rows="$(sqlite3 "${DB_PATH}" "SELECT username FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') ORDER BY username;" 2>/dev/null || true)"
+    [[ -z "${rows}" ]] && continue
+
+    while IFS= read -r username; do
+      username="$(echo "${username}" | xargs)"
+      [[ -z "${username}" ]] && continue
+      total_count=$((total_count + 1))
+      echo "Unlock ${type^^}: ${username}"
+      resp="$(api_call "PATCH" "${ep}/${username}")"
+      code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+      message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+      if [[ "${code}" == "200" ]]; then
+        ok_count=$((ok_count + 1))
+        telegram_notify_action "UNLOCK" "${type}" "${username}"
+        if [[ "${type}" == "ssh" ]]; then
+          username_sql="${username//\'/''}"
+          sqlite3 "${DB_PATH}" "UPDATE temp_ip_locks SET locked_until=0 WHERE account_type='ssh' AND LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || true
+        fi
+      else
+        fail_count=$((fail_count + 1))
+        echo "  Gagal: ${message}"
+      fi
+    done <<< "${rows}"
+  done
+
+  if [[ "${total_count}" -eq 0 ]]; then
+    echo "Tidak ada akun LOCK/LOCK_TMP yang perlu di-unlock."
+    return
+  fi
+
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+
+  echo "Selesai unlock massal."
+  echo "Total : ${total_count}"
+  echo "Sukses: ${ok_count}"
+  echo "Gagal : ${fail_count}"
+}
+
 list_accounts() {
   print_account_table() {
     local table="$1" title="$2" rows
@@ -7525,11 +7582,12 @@ akun_menu() {
     echo "5) Delete Account"
     echo "6) List Account"
     echo "7) Unlock Account"
-    echo "8) Lihat Detail Account"
-    echo "9) Edit Limit IP Massal (Per Protocol)"
+    echo "8) Unlock Semua Akun"
+    echo "9) Lihat Detail Account"
+    echo "10) Edit Limit IP Semua Akun"
     echo "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-9]: "; then
+    if ! prompt_input am "Pilih menu [0-10]: "; then
       return
     fi
     clear
@@ -7541,8 +7599,9 @@ akun_menu() {
       5) delete_account ;;
       6) list_accounts ;;
       7) unlock_account ;;
-      8) show_account_detail ;;
-      9) edit_limit_ip_all_accounts ;;
+      8) unlock_all_accounts ;;
+      9) show_account_detail ;;
+      10) edit_limit_ip_all_accounts ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -7707,12 +7766,12 @@ tools_menu() {
     echo "===================================="
     echo "1) Informasi Key Script"
     echo "2) Install API 1FORCR"
-    echo "3) Setting Banner HTML"
+    echo "3) Setting Banner"
     echo "4) Update Script"
     echo "5) Setting BOT Telegram"
     echo "6) Setting Checker IP Limit"
-    echo "7) Setting Notif Akun Online"
-    echo "8) Kirim Notif Online Sekarang"
+    echo "7) Setting Notif Akun Online BOT"
+    echo "8) Kirim Notif Online Sekarang ke BOT"
     echo "0) Kembali"
     echo
     if ! prompt_input tm "Pilih menu [0-8]: "; then

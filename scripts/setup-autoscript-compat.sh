@@ -766,6 +766,9 @@ EOF
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
 Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
 ExecStart=
 ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
 EOF
@@ -773,6 +776,9 @@ EOF
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
 Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
 ExecStart=
 ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port}
 EOF
@@ -3485,7 +3491,7 @@ func dropClientPreludeJunk(client net.Conn, reader *bufio.Reader, maxHeaderBytes
 	// "HTTP/ 1\r\n\r\n". Drop those before handing bytes to Dropbear.
 	for i := 0; i < 3; i++ {
 		if reader.Buffered() <= 0 {
-			_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+			_ = client.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 			_, err := reader.Peek(1)
 			_ = client.SetReadDeadline(time.Time{})
 			if err != nil {

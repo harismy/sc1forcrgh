@@ -51,6 +51,8 @@ set -euo pipefail
 #   DROPBEAR_VERSION=2019.78
 #   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
 #   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
+#   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
+#   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
 #   AUTO_PULL_UPDATE_ENABLE=0                    (opsional, default nonaktif; update manual via menu)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
@@ -122,6 +124,8 @@ DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}"
+BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
@@ -1818,6 +1822,8 @@ XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
+BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
@@ -3595,6 +3601,7 @@ write_iplimit_checker() {
   log "Menulis checker limit IP otomatis..."
   cat > "${APP_DIR}/iplimit-checker.js" <<'EOF'
 const fs = require('fs');
+const http = require('http');
 const https = require('https');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
@@ -3610,6 +3617,13 @@ const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
+const BOT_ACCOUNT_EVENT_WEBHOOK_URL = String(process.env.BOT_ACCOUNT_EVENT_WEBHOOK_URL || '').trim();
+const BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN = String(
+  process.env.BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN ||
+  process.env.AUTH_TOKEN ||
+  process.env.API_AUTH_TOKEN ||
+  ''
+).trim();
 const ACTIVE_UDP_BACKEND = String(process.env.ACTIVE_UDP_BACKEND || '').trim().toLowerCase();
 const CHECK_INTERVAL_MINUTES_RAW = Number(process.env.IPLIMIT_CHECK_INTERVAL_MINUTES || 10);
 const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CHECK_INTERVAL_MINUTES_RAW > 0
@@ -3725,10 +3739,74 @@ function telegramNotify(text) {
   });
 }
 
+function postJson(urlRaw, payload, token = '') {
+  return new Promise((resolve) => {
+    if (!urlRaw || !payload) return resolve(false);
+    let url;
+    try {
+      url = new URL(urlRaw);
+    } catch (_) {
+      return resolve(false);
+    }
+    if (!['http:', 'https:'].includes(url.protocol)) return resolve(false);
+    const body = JSON.stringify(payload);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    };
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+      headers['X-SC-Event-Token'] = token;
+    }
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: `${url.pathname || '/'}${url.search || ''}`,
+      method: 'POST',
+      headers
+    }, (res) => {
+      res.on('data', () => {});
+      res.on('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300));
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(4500, () => {
+      try { req.destroy(); } catch (_) {}
+      resolve(false);
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function notifyAccountBotMultiLogin(event) {
+  try {
+    if (!BOT_ACCOUNT_EVENT_WEBHOOK_URL || !BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN) return false;
+    return await postJson(BOT_ACCOUNT_EVENT_WEBHOOK_URL, event, BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN);
+  } catch (_) {
+    return false;
+  }
+}
+
 async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null) {
   try {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const list = Array.isArray(ips) ? ips.filter(Boolean).slice(0, 8) : [];
+    const event = {
+      event: 'MULTI_LOGIN',
+      action: 'LOCK_TMP',
+      service: String(service || '-').toUpperCase(),
+      username: String(username || '-'),
+      limitip: Number(limitip || 0),
+      detected: Number(detected || 0),
+      ips: list,
+      unlock_minutes: Number(LOCK_MINUTES || 15),
+      owner_telegram_id: ownerId || null,
+      owner_telegram_chat_id: ownerChatId || ownerId || null,
+      occurred_at: new Date().toISOString()
+    };
+    await notifyAccountBotMultiLogin(event);
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const msg =
       `SC 1FORCR NOTIF\n` +
       `Event    : MULTI_LOGIN\n` +
@@ -6660,6 +6738,8 @@ DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
+BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
 AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
@@ -6923,13 +7003,13 @@ EOF
 }
 
 pick_type() {
-  echo "Pilih tipe:" >&2
-  echo "0) kembali" >&2
-  echo "1) ssh" >&2
-  echo "2) vmess" >&2
-  echo "3) vless" >&2
-  echo "4) trojan" >&2
-  echo "5) zivpn" >&2
+  draw_menu_panel "Pilih tipe:" \
+    "0) kembali" \
+    "1) ssh" \
+    "2) vmess" \
+    "3) vless" \
+    "4) trojan" \
+    "5) zivpn" >&2
   if ! prompt_input t "Input [0-5]: "; then
     echo ""
     return 0
@@ -7524,13 +7604,13 @@ list_accounts() {
     done <<< "${rows}"
   }
 
-  echo "Pilih list akun:"
-  echo "1) SSH/ZIVPN/UDPHC"
-  echo "2) VMESS"
-  echo "3) VLESS"
-  echo "4) TROJAN"
-  echo "5) Semua"
-  echo "0) Kembali"
+  draw_menu_panel "Pilih list akun:" \
+    "1) SSH/ZIVPN/UDPHC" \
+    "2) VMESS" \
+    "3) VLESS" \
+    "4) TROJAN" \
+    "5) Semua" \
+    "0) Kembali"
   prompt_input l "Input [0-5]: " || return
   clear
 
@@ -7674,20 +7754,18 @@ EOT_TROJAN_DETAIL
 akun_menu() {
   while true; do
     clear
-    echo "===================================="
-    echo "           MENU AKUN"
-    echo "===================================="
-    echo "1) Add Account"
-    echo "2) Trial Account (1 jam)"
-    echo "3) Renew Account"
-    echo "4) Edit Limit IP"
-    echo "5) Delete Account"
-    echo "6) List Account"
-    echo "7) Unlock Account"
-    echo "8) Unlock Semua Akun"
-    echo "9) Lihat Detail Account"
-    echo "10) Edit Limit IP Semua Akun"
-    echo "0) Kembali"
+    draw_menu_panel "MENU AKUN" \
+      "1) Add Account" \
+      "2) Trial Account (1 jam)" \
+      "3) Renew Account" \
+      "4) Edit Limit IP" \
+      "5) Delete Account" \
+      "6) List Account" \
+      "7) Unlock Account" \
+      "8) Unlock Semua Akun" \
+      "9) Lihat Detail Account" \
+      "10) Edit Limit IP Semua Akun" \
+      "0) Kembali"
     echo
     if ! prompt_input am "Pilih menu [0-10]: "; then
       return
@@ -7719,7 +7797,7 @@ set_iplimit_checker_config_menu() {
   [[ -z "${current_interval}" ]] && current_interval="10"
   [[ -z "${current_lock}" ]] && current_lock="15"
 
-  echo "=== SETTING IP LIMIT CHECKER ==="
+  draw_menu_header "SETTING IP LIMIT CHECKER"
   echo "Interval checker saat ini : ${current_interval} menit"
   echo "Durasi unlock (lock tmp)  : ${current_lock} menit"
   echo
@@ -7775,7 +7853,7 @@ set_online_notify_config_menu() {
   [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 168 ]] && current_interval="3"
   [[ -z "${current_window}" || "${current_window}" -lt 60 || "${current_window}" -gt 86400 ]] && current_window="300"
 
-  echo "=== SETTING NOTIF AKUN ONLINE ==="
+  draw_menu_header "SETTING NOTIF AKUN ONLINE"
   echo "Status saat ini    : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "Interval saat ini  : ${current_interval} jam"
   echo "Window realtime    : ${current_window} detik (XRAY last seen)"
@@ -7863,18 +7941,16 @@ trigger_online_notify_now() {
 tools_menu() {
   while true; do
     clear
-    echo "===================================="
-    echo "          MENU TOOLS"
-    echo "===================================="
-    echo "1) Informasi Key Script"
-    echo "2) Install API 1FORCR"
-    echo "3) Setting Banner"
-    echo "4) Update Script"
-    echo "5) Setting BOT Telegram"
-    echo "6) Setting Checker IP Limit"
-    echo "7) Setting Notif Akun Online BOT"
-    echo "8) Kirim Notif Online Sekarang ke BOT"
-    echo "0) Kembali"
+    draw_menu_panel "MENU TOOLS" \
+      "1) Informasi Key Script" \
+      "2) Install API 1FORCR" \
+      "3) Setting Banner" \
+      "4) Update Script" \
+      "5) Setting BOT Telegram" \
+      "6) Setting Checker IP Limit" \
+      "7) Setting Notif Akun Online BOT" \
+      "8) Kirim Notif Online Sekarang ke BOT" \
+      "0) Kembali"
     echo
     if ! prompt_input tm "Pilih menu [0-8]: "; then
       return
@@ -8115,7 +8191,7 @@ diagnose_udp_backends() {
   zport="$(udp_port_from_config /etc/zivpn/config.json 5667)"
   uport="$(udp_port_from_config /root/udp/config.json 5667)"
 
-  echo "=== DIAGNOSE UDP BACKEND ==="
+  draw_menu_header "DIAGNOSE UDP BACKEND"
   echo "ZIVPN service   : ${ZIVPN_SERVICE} (${zstat:-unknown})"
   echo "UDPHC service   : ${udpcustom} (${ustat:-unknown})"
   echo "ZIVPN port      : ${zport} ($(is_udp_port_listening "${zport}" && echo LISTEN || echo NO-LISTEN))"
@@ -8193,14 +8269,15 @@ repair_udp_backends() {
 service_menu() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
-  echo "0) kembali"
-  echo "1) status semua"
-  echo "2) restart semua"
-  echo "3) restart backend UDP aktif"
-  echo "4) aktifkan ZIVPN (matikan UDPHC)"
-  echo "5) aktifkan UDPHC (matikan ZIVPN)"
-  echo "6) status backend UDP"
-  echo "7) diagnose + auto-repair UDP backend"
+  draw_menu_panel "SERVICE MENU" \
+    "0) kembali" \
+    "1) status semua" \
+    "2) restart semua" \
+    "3) restart backend UDP aktif" \
+    "4) aktifkan ZIVPN (matikan UDPHC)" \
+    "5) aktifkan UDPHC (matikan ZIVPN)" \
+    "6) status backend UDP" \
+    "7) diagnose + auto-repair UDP backend"
   prompt_input s "Pilih [0-7]: " || return
   clear
   case "$s" in
@@ -8237,9 +8314,10 @@ service_menu() {
 
 backup_restore_menu() {
   local full_file
-  echo "0) Kembali"
-  echo "1) BACKUP AKUN + AUTH ZIVPN (1 file JSON) & kirim ke Telegram"
-  echo "2) Restore AKUN + AUTH ZIVPN (.json) dari path file"
+  draw_menu_panel "BACKUP/RESTORE" \
+    "0) Kembali" \
+    "1) BACKUP AKUN + AUTH ZIVPN (1 file JSON) & kirim ke Telegram" \
+    "2) Restore AKUN + AUTH ZIVPN (.json) dari path file"
   prompt_input b "Pilih [0-2]: " || return
   clear
   case "$b" in
@@ -8565,7 +8643,7 @@ EOHAP
 }
 
 monitor_temp_lock_menu() {
-  echo "=== AKUN LOCK SEMENTARA (IP LIMIT) ==="
+  draw_menu_header "AKUN LOCK SEMENTARA (IP LIMIT)"
   if [[ ! -f "${DB_PATH}" ]]; then
     echo "DB tidak ditemukan: ${DB_PATH}"
     return
@@ -10136,14 +10214,14 @@ show_xray_online_by_table() {
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY LOWER(username);" > "${t_users}" 2>/dev/null || true
   if [[ ! -s "${t_users}" ]]; then
-    echo "=== ${label} ONLINE ==="
+    draw_menu_header "${label} ONLINE"
     echo "Tidak ada akun ${label} di DB."
     return
   fi
 
   xray_log_snapshot "${t_seen}"
 
-  echo "=== ${label} USER LOGIN (berdasarkan log xray terbaru) ==="
+  draw_menu_header "${label} USER LOGIN (berdasarkan log xray terbaru)"
   if [[ ! -s "${t_seen}" ]]; then
     echo "Tidak ada aktivitas terbaru."
     echo
@@ -10184,7 +10262,7 @@ show_xray_online_by_table() {
 show_udpcustom_online() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
-  echo "=== UDP CUSTOM ONLINE (log terbaru) ==="
+  draw_menu_header "UDP CUSTOM ONLINE (log terbaru)"
   journalctl -u "${udpcustom}" -n 1200 --no-pager 2>/dev/null | \
     sed -nE '
       s/.*\[src:([^]]+)\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected.*/\2|\1/p;
@@ -10275,7 +10353,7 @@ show_zivpn_online() {
   [[ -z "${handoff_grace}" || "${handoff_grace}" -lt 3 ]] && handoff_grace="20"
   [[ "${handoff_grace}" -gt 120 ]] && handoff_grace="120"
 
-  echo "=== ZIVPN ONLINE (LIVE DB) ==="
+  draw_menu_header "ZIVPN ONLINE (LIVE DB)"
   echo "Jendela aktif: ${win} detik"
   echo "Toleransi handoff: ${handoff_grace} detik"
   if [[ ! -f "${DB_PATH}" ]]; then
@@ -10548,7 +10626,7 @@ Online   : ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h win=${ONLINE
 }
 
 show_sc_key_info() {
-  echo "=== INFORMASI KEY SC ==="
+  draw_menu_header "INFORMASI KEY SC"
   echo "Domain        : ${DOMAIN}"
   echo "API Base      : https://${DOMAIN}/vps"
   echo "Auth Token    : ${AUTH_TOKEN}"
@@ -10556,7 +10634,7 @@ show_sc_key_info() {
 
 set_telegram_notif_config() {
   local token chat send_test ans
-  echo "=== SETTING NOTIF TELEGRAM ==="
+  draw_menu_header "SETTING NOTIF TELEGRAM"
   echo "Bot Token     : $(mask_secret "${TELEGRAM_BOT_TOKEN:-}")"
   echo "Chat ID       : ${TELEGRAM_CHAT_ID:-"-"}"
   echo
@@ -10739,14 +10817,12 @@ set_html_banner_menu() {
   mkdir -p /etc/sc-1forcr
 
   while true; do
-    echo "===================================="
-    echo "        SETTING BANNER HTML"
-    echo "===================================="
-    echo "1) Set/Edit banner"
-    echo "2) Lihat banner aktif"
-    echo "3) Nonaktifkan banner"
-    echo "4) Pakai template default 1FORCR"
-    echo "0) Kembali"
+    draw_menu_panel "SETTING BANNER HTML" \
+      "1) Set/Edit banner" \
+      "2) Lihat banner aktif" \
+      "3) Nonaktifkan banner" \
+      "4) Pakai template default 1FORCR" \
+      "0) Kembali"
     echo
     if ! prompt_input bm "Pilih menu [0-4]: "; then
       return
@@ -10771,7 +10847,7 @@ set_html_banner_menu() {
         ;;
       2)
         if [[ -f "${banner_file}" ]]; then
-          echo "=== BANNER AKTIF (${banner_file}) ==="
+          draw_menu_header "BANNER AKTIF (${banner_file})"
           cat "${banner_file}"
         else
           echo "Belum ada banner aktif."
@@ -10802,16 +10878,14 @@ set_html_banner_menu() {
 monitor_online_menu() {
   while true; do
     clear
-    echo "===================================="
-    echo "      MONITOR USER ONLINE"
-    echo "===================================="
-    echo "1) SSH"
-    echo "2) SSH + UDP CUSTOM"
-    echo "3) VMESS"
-    echo "4) VLESS"
-    echo "5) TROJAN"
-    echo "6) ZIVPN"
-    echo "0) Kembali"
+    draw_menu_panel "MONITOR USER ONLINE" \
+      "1) SSH" \
+      "2) SSH + UDP CUSTOM" \
+      "3) VMESS" \
+      "4) VLESS" \
+      "5) TROJAN" \
+      "6) ZIVPN" \
+      "0) Kembali"
     echo
     if ! prompt_input o "Pilih menu [0-6]: "; then
       return
@@ -10880,19 +10954,49 @@ menu_pad_right() {
 
 menu_print_line() {
   local text="$1"
+  local width="${2:-58}"
   local padded
-  padded="$(menu_pad_right "${text}" 58)"
+  padded="$(menu_pad_right "${text}" "${width}")"
   printf ' %s|%s%s%s|%s\n' "${MENU_AQUA}" "${MENU_NC}" "${padded}" "${MENU_PURPLE}" "${MENU_NC}"
+}
+
+draw_menu_header() {
+  local title="$1"
+  local width="${2:-58}"
+  local title_len
+  title_len="$(menu_visible_len "  ${title}")"
+  (( title_len > width )) && width="${title_len}"
+  printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' "${width}")" "${MENU_NC}"
+  menu_print_line "  ${MENU_AQUA}${MENU_BOLD}${title}${MENU_NC}" "${width}"
+  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '-' "${width}")" "${MENU_NC}"
+}
+
+draw_menu_panel() {
+  local title="$1"
+  shift || true
+  local width=58 item item_len title_len
+  title_len="$(menu_visible_len "  ${title}")"
+  (( title_len > width )) && width="${title_len}"
+  for item in "$@"; do
+    item_len="$(menu_visible_len "  ${item}")"
+    (( item_len > width )) && width="${item_len}"
+  done
+  draw_menu_header "${title}" "${width}"
+  local item
+  for item in "$@"; do
+    menu_print_line "  ${MENU_WHITE}${item}${MENU_NC}" "${width}"
+  done
+  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' "${width}")" "${MENU_NC}"
 }
 
 draw_main_options() {
   printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
-  menu_print_line "  ${MENU_AQUA}${MENU_BOLD}MAIN CONTROL${MENU_NC}"
-  menu_print_line "  ${MENU_AQUA}1${MENU_NC}.${MENU_WHITE} MENU AKUN          ${MENU_AQUA}5${MENU_NC}.${MENU_WHITE} MONITOR USER LOCK${MENU_NC}"
-  menu_print_line "  ${MENU_AQUA}2${MENU_NC}.${MENU_WHITE} SERVICE MENU       ${MENU_AQUA}6${MENU_NC}.${MENU_WHITE} MONITOR USER LOGIN${MENU_NC}"
-  menu_print_line "  ${MENU_AQUA}3${MENU_NC}.${MENU_WHITE} BACKUP/RESTORE     ${MENU_AQUA}7${MENU_NC}.${MENU_WHITE} TOOLS${MENU_NC}"
-  menu_print_line "  ${MENU_AQUA}4${MENU_NC}.${MENU_WHITE} CHANGE DOMAIN      ${MENU_AQUA}m${MENU_NC}.${MENU_WHITE} MENU UTAMA${MENU_NC}"
-  menu_print_line "  ${MENU_AQUA}x${MENU_NC}.${MENU_WHITE} EXIT${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}1.) > MENU AKUN         5.) > MONITOR USER LOCK${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}2.) > SERVICE MENU      6.) > MONITOR USER LOGIN${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}3.) > BACKUP/RESTORE    7.) > TOOLS${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}4.) > CHANGE DOMAIN${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}m.) > MENU UTAMA${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}x.) > EXIT${MENU_NC}"
   printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
 }
 

@@ -3169,16 +3169,30 @@ const server = net.createServer((client) => {
   };
 
   const startWsSshTunnel = (leftover) => {
+    const cleaned = stripPayloadJunk(leftover);
     startPipeTo(
       SSH_HOST,
       SSH_PORT,
-      leftover,
+      cleaned,
       'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'
     );
   };
 
   const startHttpProxy = (firstPayload) => {
     startPipeTo(HTTP_BACKEND_HOST, HTTP_BACKEND_PORT, firstPayload, null);
+  };
+
+  const stripPayloadJunk = (buf) => {
+    let out = Buffer.isBuffer(buf) ? buf : Buffer.alloc(0);
+    for (let i = 0; i < 2 && out.length > 0; i += 1) {
+      const s = out.slice(0, Math.min(out.length, 32)).toString('utf8').trimStart().toLowerCase();
+      const junk = s.startsWith('http/') || /^(get|post|head|options|patch|put|delete)\s/.test(s);
+      if (!junk) break;
+      const idx = out.indexOf('\r\n\r\n');
+      if (idx < 0) return Buffer.alloc(0);
+      out = out.slice(idx + 4);
+    }
+    return out;
   };
 
   const handleHttpLike = (chunk) => {
@@ -3404,6 +3418,67 @@ func readHttpHeader(reader *bufio.Reader, maxHeaderBytes int) ([]byte, string, s
 	return raw.Bytes(), first, header, nil
 }
 
+func isHttpMethodLine(first string) bool {
+	return strings.HasPrefix(first, "get ") ||
+		strings.HasPrefix(first, "post ") ||
+		strings.HasPrefix(first, "head ") ||
+		strings.HasPrefix(first, "options ") ||
+		strings.HasPrefix(first, "patch ") ||
+		strings.HasPrefix(first, "put ") ||
+		strings.HasPrefix(first, "delete ") ||
+		strings.HasPrefix(first, "trace ")
+}
+
+func isKnownHttpJunkPrefix(prefix string) bool {
+	p := strings.ToLower(strings.TrimSpace(prefix))
+	return strings.HasPrefix(p, "http/") || strings.HasPrefix(p, "get ") ||
+		strings.HasPrefix(p, "post ") || strings.HasPrefix(p, "head ") ||
+		strings.HasPrefix(p, "options ") || strings.HasPrefix(p, "patch ") ||
+		strings.HasPrefix(p, "put ") || strings.HasPrefix(p, "delete ")
+}
+
+func flushClientPreludeAfterUpgrade(client net.Conn, reader *bufio.Reader, sshUp net.Conn, maxHeaderBytes int) error {
+	// Some HC payloads append fake HTTP fragments after [split], for example
+	// "HTTP/ 1\r\n\r\n". Drop those before handing bytes to Dropbear.
+	for i := 0; i < 2; i++ {
+		if reader.Buffered() <= 0 {
+			_ = client.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+			_, err := reader.Peek(1)
+			_ = client.SetReadDeadline(time.Time{})
+			if err != nil {
+				return nil
+			}
+		}
+		n := reader.Buffered()
+		if n <= 0 {
+			return nil
+		}
+		peekLen := n
+		if peekLen > 16 {
+			peekLen = 16
+		}
+		peek, err := reader.Peek(peekLen)
+		if err != nil {
+			return nil
+		}
+		prefix := string(peek)
+		if strings.HasPrefix(prefix, "SSH-") {
+			return flushReaderBufferedTo(reader, sshUp)
+		}
+		if isKnownHttpJunkPrefix(prefix) {
+			_ = client.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
+			_, _, _, err := readHttpHeader(reader, maxHeaderBytes)
+			_ = client.SetReadDeadline(time.Time{})
+			if err != nil {
+				return nil
+			}
+			continue
+		}
+		return flushReaderBufferedTo(reader, sshUp)
+	}
+	return flushReaderBufferedTo(reader, sshUp)
+}
+
 func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, handshakeTimeoutSec int, maxHeaderBytes int, maxPreludeRequests int) {
 	defer client.Close()
 	_ = client.SetReadDeadline(time.Now().Add(time.Duration(handshakeTimeoutSec) * time.Second))
@@ -3441,12 +3516,12 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			if err != nil {
 				return
 			}
-			_ = client.SetReadDeadline(time.Time{})
 			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
-			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+			if err := flushClientPreludeAfterUpgrade(client, reader, sshUp, maxHeaderBytes); err != nil {
 				_ = sshUp.Close()
 				return
 			}
+			_ = client.SetReadDeadline(time.Time{})
 			tunnelBoth(client, sshUp)
 			return
 		}
@@ -3470,13 +3545,13 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			return
 		}
 
-		// For non-upgrade HTTP prelude, close early to avoid clients
-		// getting stuck at 200 OK loops.
-		if strings.HasPrefix(first, "get ") || strings.HasPrefix(first, "post ") ||
-			strings.HasPrefix(first, "head ") || strings.HasPrefix(first, "options ") ||
-			strings.HasPrefix(first, "patch ") || strings.HasPrefix(first, "put ") ||
-			strings.HasPrefix(first, "delete ") {
-			return
+		// Payload apps often send one or more HTTP preludes before the real
+		// WebSocket upgrade. Acknowledge and continue, but stop after the
+		// bounded maxPreludeRequests loop to avoid reconnect storms becoming
+		// long-lived local loops.
+		if isHttpMethodLine(first) {
+			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
+			continue
 		}
 
 		// fallback to raw SSH.

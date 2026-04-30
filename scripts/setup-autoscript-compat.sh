@@ -3159,12 +3159,20 @@ const server = net.createServer((client) => {
       return;
     }
 
-    if (head.includes('upgrade: websocket') || (head.includes('upgrade:') && head.includes('host:'))) {
+    if (head.includes('upgrade: websocket')) {
       startWsSshTunnel(rest);
       return;
     }
 
-    if (method && (method.startsWith('get') || method.startsWith('post') || method.startsWith('head') || method.startsWith('options'))) {
+    if (method && (
+      method.startsWith('get') ||
+      method.startsWith('post') ||
+      method.startsWith('head') ||
+      method.startsWith('options') ||
+      method.startsWith('put') ||
+      method.startsWith('patch') ||
+      method.startsWith('delete')
+    )) {
       client.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
       stage = 'wait-upgrade';
       if (rest.length > 0) handleHttpLike(rest);
@@ -3395,84 +3403,114 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 	}
 
 	var raw bytes.Buffer
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			return
-		}
-		raw.Write(line)
-		if raw.Len() > 128*1024 {
-			return
-		}
-		if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
-			break
-		}
-	}
-
-	header := strings.ToLower(raw.String())
-	first := strings.ToLower(strings.TrimSpace(strings.SplitN(raw.String(), "\r\n", 2)[0]))
-
-	// CONNECT mode from payload apps.
-	if strings.HasPrefix(first, "connect ") {
-		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	for req := 0; req < 8; req++ {
 		raw.Reset()
-
-		// CONNECT clients may still send HTTP payload lines before SSH banner.
-		// Discard those lines until we see SSH- and then start raw SSH tunnel.
-		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
-		for i := 0; i < 64; i++ {
-			nextPeek, nextErr := reader.Peek(4)
-			if nextErr != nil {
-				_ = client.SetReadDeadline(time.Time{})
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
 				return
 			}
-			if string(nextPeek) == "SSH-" {
-				_ = client.SetReadDeadline(time.Time{})
-				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-				if err != nil {
+			raw.Write(line)
+			if raw.Len() > 128*1024 {
+				return
+			}
+			if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
+				break
+			}
+		}
+
+		header := strings.ToLower(raw.String())
+		first := strings.ToLower(strings.TrimSpace(strings.SplitN(raw.String(), "\r\n", 2)[0]))
+
+		// CONNECT mode from payload apps.
+		if strings.HasPrefix(first, "connect ") {
+			_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			raw.Reset()
+
+			// CONNECT clients may still send HTTP payload lines before SSH banner.
+			// Discard those lines until we see SSH- and then start raw SSH tunnel.
+			_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+			for i := 0; i < 64; i++ {
+				nextPeek, nextErr := reader.Peek(4)
+				if nextErr != nil {
+					_ = client.SetReadDeadline(time.Time{})
 					return
 				}
-				if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-					_ = sshUp.Close()
+				if string(nextPeek) == "SSH-" {
+					_ = client.SetReadDeadline(time.Time{})
+					sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+					if err != nil {
+						return
+					}
+					if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+						_ = sshUp.Close()
+						return
+					}
+					tunnelBoth(client, sshUp)
 					return
 				}
-				tunnelBoth(client, sshUp)
+				// Drop one line of HTTP payload and keep scanning.
+				if _, err := reader.ReadBytes('\n'); err != nil {
+					_ = client.SetReadDeadline(time.Time{})
+					return
+				}
+			}
+			_ = client.SetReadDeadline(time.Time{})
+			return
+		}
+
+		// keep API and xray ws paths reachable through the same mux.
+		if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") || strings.Contains(first, " /yourbug") {
+			httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
+			if err != nil {
 				return
 			}
-			// Drop one line of HTTP payload and keep scanning.
-			if _, err := reader.ReadBytes('\n'); err != nil {
-				_ = client.SetReadDeadline(time.Time{})
+			if err := writeAll(httpUp, raw.Bytes()); err != nil {
+				_ = httpUp.Close()
 				return
 			}
+			if err := flushReaderBufferedTo(reader, httpUp); err != nil {
+				_ = httpUp.Close()
+				return
+			}
+			tunnelBoth(client, httpUp)
+			return
 		}
-		_ = client.SetReadDeadline(time.Time{})
-		return
-	}
 
-	// keep API and xray ws paths reachable through the same mux.
-	if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") || strings.Contains(first, " /yourbug") {
-		httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
-		if err != nil {
+		// websocket upgrade to SSH tunnel.
+		if strings.Contains(header, "upgrade: websocket") {
+			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+			if err != nil {
+				return
+			}
+			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+				_ = sshUp.Close()
+				return
+			}
+			tunnelBoth(client, sshUp)
 			return
 		}
-		if err := writeAll(httpUp, raw.Bytes()); err != nil {
-			_ = httpUp.Close()
-			return
-		}
-		if err := flushReaderBufferedTo(reader, httpUp); err != nil {
-			_ = httpUp.Close()
-			return
-		}
-		tunnelBoth(client, httpUp)
-		return
-	}
 
-	if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+		// For dummy HTTP preface payloads, acknowledge and keep waiting for next request
+		// instead of forwarding garbage to SSH backend.
+		if strings.HasPrefix(first, "get ") || strings.HasPrefix(first, "post ") ||
+			strings.HasPrefix(first, "head ") || strings.HasPrefix(first, "options ") ||
+			strings.HasPrefix(first, "put ") || strings.HasPrefix(first, "patch ") ||
+			strings.HasPrefix(first, "delete ") {
+			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
+			continue
+		}
+
+		// fallback to raw SSH.
 		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
 		if err != nil {
 			return
 		}
-		_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+		if err := writeAll(sshUp, raw.Bytes()); err != nil {
+			_ = sshUp.Close()
+			return
+		}
 		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 			_ = sshUp.Close()
 			return
@@ -3480,21 +3518,6 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		tunnelBoth(client, sshUp)
 		return
 	}
-
-	// fallback to raw SSH.
-	sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-	if err != nil {
-		return
-	}
-	if err := writeAll(sshUp, raw.Bytes()); err != nil {
-		_ = sshUp.Close()
-		return
-	}
-	if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-		_ = sshUp.Close()
-		return
-	}
-	tunnelBoth(client, sshUp)
 }
 
 func main() {

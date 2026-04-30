@@ -135,6 +135,11 @@ IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
 IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
+SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-1}"
+SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-80,443,109,143}"
+SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-8/second}"
+SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-16}"
+SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-12}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
@@ -1482,6 +1487,60 @@ fw_persist_rules() {
     nft list ruleset >/etc/nftables.conf 2>/dev/null || true
   fi
   return 0
+}
+
+apply_sshws_loop_guard_rules() {
+  local enabled ports rate burst connlimit
+  enabled="$(echo "${SSHWS_LOOP_GUARD_ENABLE:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${enabled}" in
+    1|true|yes|on) ;;
+    *)
+      log "SSHWS loop guard nonaktif (SSHWS_LOOP_GUARD_ENABLE=${SSHWS_LOOP_GUARD_ENABLE:-0})."
+      return 0
+      ;;
+  esac
+
+  if ! command -v iptables >/dev/null 2>&1; then
+    log "iptables tidak tersedia, skip SSHWS loop guard."
+    return 0
+  fi
+
+  ports="$(echo "${SSHWS_LOOP_GUARD_PORTS:-80,443,109,143}" | tr -cd '0-9,')"
+  [[ -z "${ports}" ]] && ports="80,443,109,143"
+
+  rate="$(echo "${SSHWS_LOOP_GUARD_NEW_ABOVE:-8/second}" | tr -d '[:space:]')"
+  if ! [[ "${rate}" =~ ^[0-9]+/(second|minute|hour|day)$ ]]; then
+    rate="8/second"
+  fi
+
+  burst="$(echo "${SSHWS_LOOP_GUARD_BURST:-16}" | tr -cd '0-9')"
+  [[ -z "${burst}" || "${burst}" -lt 1 ]] && burst="16"
+
+  connlimit="$(echo "${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-12}" | tr -cd '0-9')"
+  [[ -z "${connlimit}" || "${connlimit}" -lt 1 ]] && connlimit="12"
+
+  # Rule 1: drop NEW connection spikes per source IP.
+  if ! iptables -w 10 -C INPUT -p tcp -m multiport --dports "${ports}" -m conntrack --ctstate NEW \
+    -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-above "${rate}" --hashlimit-burst "${burst}" \
+    --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; then
+    iptables -w 10 -I INPUT -p tcp -m multiport --dports "${ports}" -m conntrack --ctstate NEW \
+      -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-above "${rate}" --hashlimit-burst "${burst}" \
+      --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP
+  fi
+
+  # Rule 2: cap concurrent TCP sessions per source IP.
+  if ! iptables -w 10 -C INPUT -p tcp -m multiport --dports "${ports}" \
+    -m connlimit --connlimit-above "${connlimit}" --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; then
+    iptables -w 10 -I INPUT -p tcp -m multiport --dports "${ports}" \
+      -m connlimit --connlimit-above "${connlimit}" --connlimit-mask 32 -j REJECT --reject-with tcp-reset
+  fi
+
+  if ! command -v netfilter-persistent >/dev/null 2>&1; then
+    log "Install netfilter-persistent agar rule SSHWS loop guard tidak hilang saat reboot..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+  fi
+  fw_persist_rules
+  log "SSHWS loop guard aktif: ports=${ports}, new_above=${rate}, burst=${burst}, connlimit_above=${connlimit}"
 }
 
 setup_zivpn_udp_nat_rules() {
@@ -6640,6 +6699,11 @@ XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
+SSHWS_LOOP_GUARD_ENABLE=${SSHWS_LOOP_GUARD_ENABLE}
+SSHWS_LOOP_GUARD_PORTS=${SSHWS_LOOP_GUARD_PORTS}
+SSHWS_LOOP_GUARD_NEW_ABOVE=${SSHWS_LOOP_GUARD_NEW_ABOVE}
+SSHWS_LOOP_GUARD_BURST=${SSHWS_LOOP_GUARD_BURST}
+SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE=${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
@@ -10367,6 +10431,11 @@ Time     : $(date '+%F %T')"
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \
     XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
     XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN}" \
+    SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE}" \
+    SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS}" \
+    SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE}" \
+    SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST}" \
+    SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE}" \
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
     AUTO_INSTALL_SUMMARY_API="0" \
@@ -11151,6 +11220,7 @@ main() {
   setup_auto_menu_login
   write_version_marker
   sync_zivpn_auth_token_with_api_runtime
+  apply_sshws_loop_guard_rules
   apply_final_service_restart_chain
   post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."

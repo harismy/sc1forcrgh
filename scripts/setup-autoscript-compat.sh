@@ -3242,8 +3242,9 @@ const server = net.createServer((client) => {
       return;
     }
 
-    if (method && (method.startsWith('get') || method.startsWith('post') || method.startsWith('head') || method.startsWith('options'))) {
-      client.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
+    if (method && /^(get|post|head|options|patch|put|delete|trace)$/.test(method)) {
+      // Ignore HTTP preludes and wait for the real WebSocket upgrade.
+      // Extra 200 OK responses can make payload apps reconnect in a loop.
       stage = 'wait-upgrade';
       if (rest.length > 0) handleHttpLike(rest);
       return;
@@ -3554,11 +3555,11 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		}
 
 		// Payload apps often send one or more HTTP preludes before the real
-		// WebSocket upgrade. Acknowledge and continue, but stop after the
-		// bounded maxPreludeRequests loop to avoid reconnect storms becoming
-		// long-lived local loops.
+		// WebSocket upgrade. Ignore them and continue; sending extra 200 OK
+		// responses before 101 can make HC read the handshake out of order and
+		// reconnect repeatedly. The bounded loop still prevents long-lived local
+		// loops from malformed clients.
 		if isHttpMethodLine(first) {
-			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
 			continue
 		}
 

@@ -1669,10 +1669,10 @@ ZIVPN_ACTIVE_WINDOW_SECONDS=${ZIVPN_ACTIVE_WINDOW_SECONDS}
 ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 SSH_WS_PORT=2082
 SSH_WS_TARGET_PORT=${ssh_ws_target_port}
-SSH_WS_MAX_CONNS=2048
-SSH_WS_HANDSHAKE_TIMEOUT_SECONDS=12
-SSH_WS_MAX_HEADER_BYTES=131072
-SSH_WS_MAX_PRELUDE_REQUESTS=8
+SSH_WS_MAX_CONNS=auto
+SSH_WS_HANDSHAKE_TIMEOUT_SECONDS=auto
+SSH_WS_MAX_HEADER_BYTES=auto
+SSH_WS_MAX_PRELUDE_REQUESTS=auto
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 DROPBEAR_PORT=${DROPBEAR_PORT}
@@ -3233,6 +3233,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -3252,11 +3253,35 @@ func envInt(key string, fallback int) int {
 	if raw == "" {
 		return fallback
 	}
+	if strings.EqualFold(raw, "auto") {
+		return fallback
+	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
 		return fallback
 	}
 	return n
+}
+
+func readMemGiB() int {
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	re := regexp.MustCompile(`(?m)^MemTotal:\s+([0-9]+)\s+kB$`)
+	m := re.FindStringSubmatch(string(b))
+	if len(m) != 2 {
+		return 0
+	}
+	kb, err := strconv.Atoi(m[1])
+	if err != nil || kb <= 0 {
+		return 0
+	}
+	gib := kb / (1024 * 1024)
+	if gib < 1 {
+		gib = 1
+	}
+	return gib
 }
 
 func writeAll(conn net.Conn, data []byte) error {
@@ -3426,16 +3451,34 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 	}
 }
 
-func defaultMaxConns() int {
+type autoProfile struct {
+	maxConns            int
+	handshakeTimeoutSec int
+	maxHeaderBytes      int
+	maxPreludeRequests  int
+}
+
+func pickAutoProfile() autoProfile {
 	cpu := runtime.NumCPU()
 	if cpu < 1 {
 		cpu = 1
 	}
-	max := cpu * 384
-	if max < 256 {
-		max = 256
+
+	memGiB := readMemGiB()
+	switch {
+	case cpu <= 1 || (memGiB > 0 && memGiB <= 1):
+		return autoProfile{maxConns: 384, handshakeTimeoutSec: 15, maxHeaderBytes: 131072, maxPreludeRequests: 10}
+	case cpu <= 2 || (memGiB > 0 && memGiB <= 2):
+		return autoProfile{maxConns: 768, handshakeTimeoutSec: 12, maxHeaderBytes: 131072, maxPreludeRequests: 8}
+	case cpu >= 4 && memGiB >= 6:
+		return autoProfile{maxConns: 1536, handshakeTimeoutSec: 10, maxHeaderBytes: 131072, maxPreludeRequests: 8}
+	default:
+		max := cpu * 384
+		if max < 512 {
+			max = 512
+		}
+		return autoProfile{maxConns: max, handshakeTimeoutSec: 12, maxHeaderBytes: 131072, maxPreludeRequests: 8}
 	}
-	return max
 }
 
 func main() {
@@ -3444,10 +3487,11 @@ func main() {
 	sshPort := envInt("SSH_WS_TARGET_PORT", 109)
 	httpHost := envOr("SSH_HTTP_BACKEND_HOST", "127.0.0.1")
 	httpPort := envInt("SSH_HTTP_BACKEND_PORT", 80)
-	maxConns := envInt("SSH_WS_MAX_CONNS", defaultMaxConns())
-	handshakeTimeoutSec := envInt("SSH_WS_HANDSHAKE_TIMEOUT_SECONDS", 12)
-	maxHeaderBytes := envInt("SSH_WS_MAX_HEADER_BYTES", 131072)
-	maxPreludeRequests := envInt("SSH_WS_MAX_PRELUDE_REQUESTS", 8)
+	profile := pickAutoProfile()
+	maxConns := envInt("SSH_WS_MAX_CONNS", profile.maxConns)
+	handshakeTimeoutSec := envInt("SSH_WS_HANDSHAKE_TIMEOUT_SECONDS", profile.handshakeTimeoutSec)
+	maxHeaderBytes := envInt("SSH_WS_MAX_HEADER_BYTES", profile.maxHeaderBytes)
+	maxPreludeRequests := envInt("SSH_WS_MAX_PRELUDE_REQUESTS", profile.maxPreludeRequests)
 	if maxConns < 32 {
 		maxConns = 32
 	}
@@ -3467,7 +3511,7 @@ func main() {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d (max_conns=%d, hs_timeout=%ds)\n", port, sshHost, sshPort, httpHost, httpPort, maxConns, handshakeTimeoutSec)
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d (max_conns=%d, hs_timeout=%ds, max_header=%d, prelude=%d)\n", port, sshHost, sshPort, httpHost, httpPort, maxConns, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests)
 
 	for {
 		conn, err := ln.Accept()

@@ -6121,17 +6121,66 @@ refresh_zivpn_live_from_api_log() {
     done
 }
 
-ssh_users="$(who 2>/dev/null \
-  | awk '{print tolower($1)}' \
-  | awk '
-      NF {
-        u=$1
-        if (u == "root") next
-        if (u !~ /^[a-z0-9._-]+$/) next
-        c[u]++
+ssh_users="$(
+  tmp_ss_pid_ip="$(mktemp)"
+  tmp_pid_user="$(mktemp)"
+  tmp_pair="$(mktemp)"
+  trap 'rm -f "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}"' RETURN
+
+  ss -Htnp state established 2>/dev/null | awk '
+    {
+      l=$4
+      r=$5
+      if (l ~ /:22$/) {
+        ip=r
+        gsub(/^\[/, "", ip)
+        gsub(/\]$/, "", ip)
+        sub(/:[0-9]+$/, "", ip)
+        if (ip == "") next
+        s=$0
+        while (match(s, /pid=[0-9]+/)) {
+          pid=substr(s, RSTART + 4, RLENGTH - 4)
+          if (pid ~ /^[0-9]+$/) print pid, ip
+          s=substr(s, RSTART + RLENGTH)
+        }
       }
-      END { for (u in c) printf "%s(%d)\n", u, c[u] }
-    ' | sort || true)"
+    }' | sort -u > "${tmp_ss_pid_ip}" || true
+
+  if [[ -s "${tmp_ss_pid_ip}" ]]; then
+    pid_csv="$(awk '{print $1}' "${tmp_ss_pid_ip}" | sort -u | paste -sd, -)"
+    if [[ -n "${pid_csv}" ]]; then
+      ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
+        {
+          pid=$1
+          $1=""
+          sub(/^[[:space:]]+/, "", $0)
+          u=""
+          if ($0 ~ /^sshd:/) {
+            u=$0
+            sub(/^sshd:[[:space:]]*/, "", u)
+            sub(/[[:space:]].*$/, "", u)
+            sub(/@.*$/, "", u)
+            sub(/\[.*$/, "", u)
+          } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+            u=$0
+            sub(/^.*\[/, "", u)
+            sub(/\].*$/, "", u)
+          } else next
+          u=tolower(u)
+          if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") print pid, u
+        }' > "${tmp_pid_user}" || true
+
+      awk '
+        NR==FNR { u[$1]=$2; next }
+        {
+          pid=$1; ip=$2
+          if ((pid in u) && ip != "") print u[pid], ip
+        }' "${tmp_pid_user}" "${tmp_ss_pid_ip}" | sort -u > "${tmp_pair}" || true
+    fi
+  fi
+
+  awk '{ if ($1 ~ /^[a-z0-9._-]+$/) c[$1]++ } END { for (u in c) printf "%s(%d)\n", u, c[u] }' "${tmp_pair}" | sort || true
+)"
 ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
 
 xray_users=""
@@ -6139,22 +6188,28 @@ xray_cnt=0
 if [[ -f /var/log/xray/access.log ]]; then
   xray_cutoff="$(date -d "-${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} seconds" '+%Y/%m/%d %H:%M:%S' 2>/dev/null || true)"
   [[ -z "${xray_cutoff}" ]] && xray_cutoff="1970/01/01 00:00:00"
-  xray_users="$(tail -n 12000 /var/log/xray/access.log 2>/dev/null \
+  xray_users="$(tail -n 25000 /var/log/xray/access.log 2>/dev/null \
     | awk -v cutoff="${xray_cutoff}" '
+      function clean(v) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        return v
+      }
       {
         ts = substr($0, 1, 19)
         if (ts == "" || ts < cutoff) next
         u=""
-        if (match($0, /email":"[^"]+"/)) {
+        if (match($0, /"email":"[^"]+"/)) {
+          u=substr($0, RSTART+9, RLENGTH-10)
+        } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
           u=substr($0, RSTART, RLENGTH)
-          sub(/^email":"/, "", u)
-          sub(/"$/, "", u)
-        } else if (match($0, /user":"[^"]+"/)) {
+          sub(/^email:[[:space:]]*/, "", u)
+        } else if (match($0, /"user":"[^"]+"/)) {
+          u=substr($0, RSTART+8, RLENGTH-9)
+        } else if (match($0, /user:[[:space:]]*[^[:space:]]+/)) {
           u=substr($0, RSTART, RLENGTH)
-          sub(/^user":"/, "", u)
-          sub(/"$/, "", u)
+          sub(/^user:[[:space:]]*/, "", u)
         }
-        u=tolower(u)
+        u=clean(tolower(u))
         if (u ~ /^[a-z0-9._-]+$/) c[u]++
       }
       END { for (u in c) printf "%s(%d)\n", u, c[u] }

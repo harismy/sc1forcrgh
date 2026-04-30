@@ -140,6 +140,10 @@ SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-109,143}"
 SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-30/second}"
 SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-60}"
 SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-64}"
+SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
+SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
+SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
+SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
@@ -982,7 +986,30 @@ EOF
 setup_nginx_and_cert() {
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
+  local sshws_nginx_limit_conf sshws_nginx_limit_rules
+  sshws_nginx_limit_conf=""
+  sshws_nginx_limit_rules=""
+  if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
+    sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
+map \$http_cf_connecting_ip \$sc_sshws_limit_key {
+    "" \$binary_remote_addr;
+    default \$http_cf_connecting_ip;
+}
+limit_req_zone \$sc_sshws_limit_key zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
+limit_conn_zone \$sc_sshws_limit_key zone=sc_sshws_conn:10m;
+
+EOF_LIMIT
+)
+    sshws_nginx_limit_rules=$(cat <<EOF_LIMIT
+        limit_req zone=sc_sshws_req burst=${SSHWS_NGINX_LIMIT_BURST} nodelay;
+        limit_conn sc_sshws_conn ${SSHWS_NGINX_LIMIT_CONN};
+        limit_req_status 429;
+        limit_conn_status 429;
+EOF_LIMIT
+)
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
+${sshws_nginx_limit_conf}
 server {
     listen 80;
     listen [::]:80;
@@ -1100,6 +1127,7 @@ server {
 
     location ~ ^/(ssh-ws|ws|ws-ssh|ssh)$ {
         access_log off;
+${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -1115,6 +1143,7 @@ server {
 
     location / {
         access_log off;
+${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -8222,7 +8251,30 @@ change_domain_menu() {
   EMAIL="${email}"
 
   mkdir -p /var/www/html
+  local sshws_nginx_limit_conf sshws_nginx_limit_rules
+  sshws_nginx_limit_conf=""
+  sshws_nginx_limit_rules=""
+  if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
+    sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
+map \$http_cf_connecting_ip \$sc_sshws_limit_key {
+    "" \$binary_remote_addr;
+    default \$http_cf_connecting_ip;
+}
+limit_req_zone \$sc_sshws_limit_key zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
+limit_conn_zone \$sc_sshws_limit_key zone=sc_sshws_conn:10m;
+
+EOF_LIMIT
+)
+    sshws_nginx_limit_rules=$(cat <<EOF_LIMIT
+        limit_req zone=sc_sshws_req burst=${SSHWS_NGINX_LIMIT_BURST} nodelay;
+        limit_conn sc_sshws_conn ${SSHWS_NGINX_LIMIT_CONN};
+        limit_req_status 429;
+        limit_conn_status 429;
+EOF_LIMIT
+)
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
+${sshws_nginx_limit_conf}
 server {
     listen 80;
     listen [::]:80;
@@ -8340,6 +8392,7 @@ server {
 
     location ~ ^/(ssh-ws|ws|ws-ssh|ssh)$ {
         access_log off;
+${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -8355,6 +8408,7 @@ server {
 
     location / {
         access_log off;
+${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;

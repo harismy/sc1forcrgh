@@ -435,6 +435,16 @@ get_total_ram_mib() {
   echo "$((kib / 1024))"
 }
 
+ram_mib_to_nominal_gb() {
+  local mib="${1:-0}" gb
+  if [[ -z "${mib}" || ! "${mib}" =~ ^[0-9]+$ ]]; then
+    mib="1024"
+  fi
+  gb="$(( (mib + 512) / 1024 ))"
+  (( gb < 1 )) && gb=1
+  echo "${gb}"
+}
+
 get_cpu_cores() {
   local cores
   cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
@@ -459,8 +469,7 @@ auto_tune_iplimit_vars() {
     local ram_mib ram_gb cores tier
     ram_mib="$(get_total_ram_mib)"
     cores="$(get_cpu_cores)"
-    ram_gb=$((ram_mib / 1024))
-    (( ram_gb < 1 )) && ram_gb=1
+    ram_gb="$(ram_mib_to_nominal_gb "${ram_mib}")"
 
     # Tier konservatif: ambil bottleneck antara RAM dan vCPU.
     tier="${ram_gb}"
@@ -8777,7 +8786,7 @@ get_server_capacity_profile() {
     ram_mb="$((ram_kib / 1024))"
   fi
   (( ram_mb < 256 )) && ram_mb=1024
-  ram_gb="$((ram_mb / 1024))"
+  ram_gb="$(( (ram_mb + 512) / 1024 ))"
   (( ram_gb < 1 )) && ram_gb=1
 
   cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
@@ -8865,23 +8874,16 @@ draw_dashboard() {
   local RED="${ESC}[0;31m"
   local GREEN="${ESC}[0;32m"
   local YELLOW="${ESC}[0;33m"
-  local BLUE="${ESC}[0;34m"
-  local MAGENTA="${ESC}[0;35m"
-  local CYAN="${ESC}[0;36m"
+  local AQUA="${ESC}[38;5;51m"
+  local AQUA2="${ESC}[38;5;45m"
+  local PURPLE="${ESC}[38;5;141m"
+  local VIOLET="${ESC}[38;5;99m"
+  local WHITE="${ESC}[38;5;255m"
+  local DIM="${ESC}[2m"
   local BOLD="${ESC}[1m"
   local NC="${ESC}[0m"
 
-  local BOX_W=66
-
-  repeat_char() {
-    local char="$1"
-    local count="$2"
-    local out=""
-    while [ "${#out}" -lt "$count" ]; do
-      out="${out}${char}"
-    done
-    printf '%s' "${out:0:$count}"
-  }
+  local BOX_W=72
 
   strip_ansi() {
     sed -r 's/\x1B\[[0-9;]*[mK]//g'
@@ -8902,23 +8904,40 @@ draw_dashboard() {
     printf '%s%*s' "$text" "$pad" ""
   }
 
+  gradient_fill() {
+    local char="$1"
+    local count="$2"
+    local i color
+    for ((i=0; i<count; i++)); do
+      if (( i < count / 3 )); then
+        color="${AQUA}"
+      elif (( i < (count * 2) / 3 )); then
+        color="${AQUA2}"
+      else
+        color="${PURPLE}"
+      fi
+      printf '%s%s' "${color}" "${char}"
+    done
+    printf '%s' "${NC}"
+  }
+
   print_top() {
-    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
+    printf '%s+%s+%s\n' "${AQUA}" "$(gradient_fill '=' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_mid() {
-    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
+    printf '%s+%s+%s\n' "${VIOLET}" "$(gradient_fill '-' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_bottom() {
-    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
+    printf '%s+%s+%s\n' "${PURPLE}" "$(gradient_fill '=' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_line() {
     local text="$1"
     local padded
     padded="$(pad_right "$text" "$BOX_W")"
-    printf '| %s |\n' "$padded"
+    printf '%s|%s %s %s|%s\n' "${AQUA}" "${NC}" "$padded" "${PURPLE}" "${NC}"
   }
 
   print_center() {
@@ -8931,13 +8950,18 @@ draw_dashboard() {
     fi
     left=$(( (BOX_W - vlen) / 2 ))
     right=$(( BOX_W - vlen - left ))
-    printf '| %*s%s%*s |\n' "$left" "" "$text" "$right" ""
+    printf '%s|%s %*s%s%*s %s|%s\n' "${AQUA}" "${NC}" "$left" "" "$text" "$right" "" "${PURPLE}" "${NC}"
   }
 
   kv_line() {
     local key="$1"
     local value="$2"
-    print_line "  $(printf '%-13s' "$key") : $value"
+    print_line "  ${DIM}$(printf '%-13s' "$key")${NC} ${PURPLE}:${NC} ${WHITE}$value${NC}"
+  }
+
+  section_title() {
+    local title="$1"
+    print_line " ${PURPLE}${BOLD}<>${NC} ${AQUA}${BOLD}${title}${NC} ${PURPLE}${BOLD}<>${NC}"
   }
 
   read_license_value() {
@@ -9151,10 +9175,10 @@ EOF
 
   clear
   print_top
-  print_center "${CYAN}${BOLD}SC 1FORCR NEXUS DASHBOARD${NC}"
+  print_center "${AQUA}${BOLD}SC 1FORCR${NC} ${PURPLE}${BOLD}NEXUS${NC} ${WHITE}${BOLD}DASHBOARD${NC}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* SYSTEM & NETWORK${NC}"
+  section_title "SYSTEM & NETWORK"
   kv_line "OS"  "${os_name}"
   kv_line "RAM"  "${ram_mb:-"-"} | SWAP : ${swap_mb:-"-"}"
   kv_line "UPTIME"  "${uptime_h}h ${uptime_m}m"
@@ -9163,14 +9187,14 @@ EOF
   kv_line "Estimasi akun"  "sekitar ${cap_est} user"
   print_mid
 
-  print_line "${CYAN}${BOLD}* LOCATION & ISP${NC}"
+  section_title "LOCATION & ISP"
   kv_line "IP" "${ip}"
   kv_line "CITY" "${city}"
   kv_line "ISP" "${isp}"
   kv_line "DOMAIN" "${DOMAIN:-"-"}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* TRAFFIC STATS${NC}"
+  section_title "TRAFFIC STATS"
   kv_line "MONTH" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
   kv_line "RX" "${VNSTAT_MONTH_RX}"
   kv_line "TX" "${VNSTAT_MONTH_TX}"
@@ -9180,18 +9204,18 @@ EOF
   kv_line "CURRENT" "${VNSTAT_RATE}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* SERVICES STATUS${NC}"
-  print_line "  XRAY    : ${xray_color}   | SSH-WS : ${ws_color}   | LOADBLC : ${lb_color}"
-  print_line "  ZIVPN   : ${zivpn_color}   | UDPHC  : ${udphc_color}  | SSH     : ${ssh_color}"
-  print_line "  HEALTH  : ${health_display}"
+  section_title "SERVICES STATUS"
+  print_line "  ${DIM}XRAY   ${NC} ${PURPLE}:${NC} ${xray_color}   ${VIOLET}|${NC} ${DIM}SSH-WS${NC} ${PURPLE}:${NC} ${ws_color}   ${VIOLET}|${NC} ${DIM}LOADBLC${NC} ${PURPLE}:${NC} ${lb_color}"
+  print_line "  ${DIM}ZIVPN  ${NC} ${PURPLE}:${NC} ${zivpn_color}   ${VIOLET}|${NC} ${DIM}UDPHC ${NC} ${PURPLE}:${NC} ${udphc_color}  ${VIOLET}|${NC} ${DIM}SSH    ${NC} ${PURPLE}:${NC} ${ssh_color}"
+  print_line "  ${DIM}HEALTH ${NC} ${PURPLE}:${NC} ${health_display}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* ACCOUNT SUMMARY${NC}"
-  print_line "  SSH/OpenVPN : ${c_ssh}  | VMESS  : ${c_vmess}"
-  print_line "  VLESS       : ${c_vless}   | TROJAN : ${c_trojan}"
+  section_title "ACCOUNT SUMMARY"
+  print_line "  ${DIM}SSH/OpenVPN${NC} ${PURPLE}:${NC} ${WHITE}${c_ssh}${NC}  ${VIOLET}|${NC} ${DIM}VMESS ${NC} ${PURPLE}:${NC} ${WHITE}${c_vmess}${NC}"
+  print_line "  ${DIM}VLESS      ${NC} ${PURPLE}:${NC} ${WHITE}${c_vless}${NC}  ${VIOLET}|${NC} ${DIM}TROJAN${NC} ${PURPLE}:${NC} ${WHITE}${c_trojan}${NC}"
   print_mid
 
-  print_line "${BLUE}${BOLD}* VERSION & CLIENT${NC}"
+  section_title "VERSION & CLIENT"
   kv_line "Version" "${SCRIPT_VERSION:-unknown}"
   kv_line "Distribusi" "${license_distribution}"
   kv_line "Client Name" "${license_client_name}"
@@ -9201,9 +9225,9 @@ EOF
   print_bottom
 
   printf '\n'
-  printf ' %s\n' "$(repeat_char '-' 30)"
-  printf " ${BOLD}to access use 'menu' command${NC}\n"
-  printf ' %s\n' "$(repeat_char '-' 30)"
+  printf ' %s+%s+%s\n' "${AQUA}" "$(gradient_fill '-' 36)" "${NC}"
+  printf " ${AQUA}|${NC} ${BOLD}${WHITE}to access use${NC} ${AQUA}'menu'${NC} ${BOLD}${WHITE}command${NC}      ${PURPLE}|${NC}\n"
+  printf ' %s+%s+%s\n' "${PURPLE}" "$(gradient_fill '-' 36)" "${NC}"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
@@ -10809,6 +10833,68 @@ monitor_online_menu() {
 }
 
 SHOW_FULL_MENU=1
+MENU_ESC=$'\033'
+MENU_AQUA="${MENU_ESC}[38;5;51m"
+MENU_AQUA2="${MENU_ESC}[38;5;45m"
+MENU_PURPLE="${MENU_ESC}[38;5;141m"
+MENU_WHITE="${MENU_ESC}[38;5;255m"
+MENU_DIM="${MENU_ESC}[2m"
+MENU_BOLD="${MENU_ESC}[1m"
+MENU_NC="${MENU_ESC}[0m"
+
+menu_gradient_line() {
+  local char="${1:-=}"
+  local count="${2:-62}"
+  local i color
+  for ((i=0; i<count; i++)); do
+    if (( i < count / 3 )); then
+      color="${MENU_AQUA}"
+    elif (( i < (count * 2) / 3 )); then
+      color="${MENU_AQUA2}"
+    else
+      color="${MENU_PURPLE}"
+    fi
+    printf '%s%s' "${color}" "${char}"
+  done
+  printf '%s' "${MENU_NC}"
+}
+
+menu_strip_ansi() {
+  sed -r 's/\x1B\[[0-9;]*[mK]//g'
+}
+
+menu_visible_len() {
+  local text="$1"
+  printf '%s' "${text}" | menu_strip_ansi | awk '{ print length }'
+}
+
+menu_pad_right() {
+  local text="$1"
+  local width="$2"
+  local vlen pad
+  vlen="$(menu_visible_len "${text}")"
+  pad=$((width - vlen))
+  (( pad < 0 )) && pad=0
+  printf '%s%*s' "${text}" "${pad}" ""
+}
+
+menu_print_line() {
+  local text="$1"
+  local padded
+  padded="$(menu_pad_right "${text}" 58)"
+  printf ' %s|%s%s%s|%s\n' "${MENU_AQUA}" "${MENU_NC}" "${padded}" "${MENU_PURPLE}" "${MENU_NC}"
+}
+
+draw_main_options() {
+  printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
+  menu_print_line "  ${MENU_AQUA}${MENU_BOLD}MAIN CONTROL${MENU_NC}"
+  menu_print_line "  ${MENU_AQUA}1${MENU_NC}.${MENU_WHITE} MENU AKUN          ${MENU_AQUA}5${MENU_NC}.${MENU_WHITE} MONITOR USER LOCK${MENU_NC}"
+  menu_print_line "  ${MENU_AQUA}2${MENU_NC}.${MENU_WHITE} SERVICE MENU       ${MENU_AQUA}6${MENU_NC}.${MENU_WHITE} MONITOR USER LOGIN${MENU_NC}"
+  menu_print_line "  ${MENU_AQUA}3${MENU_NC}.${MENU_WHITE} BACKUP/RESTORE     ${MENU_AQUA}7${MENU_NC}.${MENU_WHITE} TOOLS${MENU_NC}"
+  menu_print_line "  ${MENU_AQUA}4${MENU_NC}.${MENU_WHITE} CHANGE DOMAIN      ${MENU_AQUA}m${MENU_NC}.${MENU_WHITE} MENU UTAMA${MENU_NC}"
+  menu_print_line "  ${MENU_AQUA}x${MENU_NC}.${MENU_WHITE} EXIT${MENU_NC}"
+  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
+}
 
 while true; do
   if ! enforce_menu_license_access; then
@@ -10820,17 +10906,7 @@ while true; do
     echo
   fi
 
-  echo " +-------------------------------------------------"
-  echo " |  1.) > MENU AKUN         5.) > MONITOR USER LOCK"
-  echo " |  2.) > SERVICE MENU      6.) > MONITOR USER LOGIN"
-  echo " |  3.) > BACKUP/RESTORE    7.) > TOOLS"
-  echo " |  4.) > CHANGE DOMAIN"
-  echo " |  m.) > MENU UTAMA"
-  echo " |  x.) > EXIT"
-  echo " +-------------------------------------------------"
-  if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
-    echo " -------------------------------------------------"
-  fi
+  draw_main_options
   echo
   if ! prompt_input m "Select From Options [1-7, m, x] : "; then
     SHOW_FULL_MENU=0

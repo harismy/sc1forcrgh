@@ -3794,6 +3794,9 @@ async function notifyAccountBotMultiLogin(event) {
 async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null) {
   try {
     const list = Array.isArray(ips) ? ips.filter(Boolean).slice(0, 8) : [];
+    const ownerIdNum = Number(ownerId || 0);
+    const ownerChatIdNum = Number(ownerChatId || 0);
+    const hasOwnerTarget = ownerIdNum > 0 || ownerChatIdNum > 0;
     const event = {
       event: 'MULTI_LOGIN',
       action: 'LOCK_TMP',
@@ -3803,11 +3806,13 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       detected: Number(detected || 0),
       ips: list,
       unlock_minutes: Number(LOCK_MINUTES || 15),
-      owner_telegram_id: ownerId || null,
-      owner_telegram_chat_id: ownerChatId || ownerId || null,
+      owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
+      owner_telegram_chat_id: ownerChatIdNum > 0 ? ownerChatIdNum : (ownerIdNum > 0 ? ownerIdNum : null),
       occurred_at: new Date().toISOString()
     };
-    await notifyAccountBotMultiLogin(event);
+    if (hasOwnerTarget) {
+      await notifyAccountBotMultiLogin(event);
+    }
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const msg =
       `SC 1FORCR NOTIF\n` +
@@ -8135,9 +8140,10 @@ tools_menu() {
       "6) Setting Checker IP Limit" \
       "7) Setting Notif Akun Online BOT" \
       "8) Kirim Notif Online Sekarang ke BOT" \
+      "9) Setting Token Webhook BotVPN" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-8]: "; then
+    if ! prompt_input tm "Pilih menu [0-9]: "; then
       return
     fi
     clear
@@ -8150,6 +8156,7 @@ tools_menu() {
       6) set_iplimit_checker_config_menu ;;
       7) set_online_notify_config_menu ;;
       8) trigger_online_notify_now ;;
+      9) set_account_event_webhook_config ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -10870,6 +10877,45 @@ Time     : $(date '+%F %T')"
       fi
     fi
   fi
+}
+
+set_account_event_webhook_config() {
+  local webhook_url webhook_token
+  draw_menu_header "SETTING WEBHOOK BOT AKUN (MULTI-LOGIN)"
+  echo "Webhook URL   : ${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-"-"}"
+  echo "Webhook Token : $(mask_secret "${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}")"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+  echo "Contoh URL: http://IP_BOTVPN:PORT/sc1forcr/events/multi-login"
+
+  if ! prompt_input webhook_url "BOT_ACCOUNT_EVENT_WEBHOOK_URL: "; then
+    return
+  fi
+  [[ "${webhook_url,,}" == "batal" ]] && return
+
+  if ! prompt_input webhook_token "BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN: "; then
+    return
+  fi
+  [[ "${webhook_token,,}" == "batal" ]] && return
+
+  if [[ -n "${webhook_url}" ]]; then
+    BOT_ACCOUNT_EVENT_WEBHOOK_URL="${webhook_url}"
+    update_sc_env_var "BOT_ACCOUNT_EVENT_WEBHOOK_URL" "${BOT_ACCOUNT_EVENT_WEBHOOK_URL}"
+    update_app_env_var "BOT_ACCOUNT_EVENT_WEBHOOK_URL" "${BOT_ACCOUNT_EVENT_WEBHOOK_URL}"
+  fi
+  if [[ -n "${webhook_token}" ]]; then
+    BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${webhook_token}"
+    update_sc_env_var "BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN" "${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}"
+    update_app_env_var "BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN" "${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}"
+  fi
+
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+
+  echo "Konfigurasi webhook bot akun tersimpan."
+  echo "Webhook URL   : ${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-"-"}"
+  echo "Webhook Token : $(mask_secret "${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}")"
 }
 
 install_summary_api_1forcr() {

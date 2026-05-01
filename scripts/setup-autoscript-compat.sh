@@ -7481,6 +7481,186 @@ EOT_RENEW
   telegram_notify_action "RENEW" "${type}" "${username}"
 }
 
+sync_xray_from_summary_api() {
+  local type="$1" body resp ok msg
+  if [[ -z "${type}" ]]; then
+    echo "sync xray skip: type kosong"
+    return 1
+  fi
+  body="$(jq -nc --arg t "${type}" '{type:$t,restart:false}')"
+  resp="$(curl -sS -X POST "http://127.0.0.1:8789/internal/sync-xray-from-db" \
+    -H "x-sync-token: ${AUTH_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "${body}" 2>/dev/null || true)"
+  ok="$(echo "${resp}" | jq -r '.ok // false' 2>/dev/null || echo "false")"
+  if [[ "${ok}" != "true" ]]; then
+    msg="$(echo "${resp}" | jq -r '.message // "gagal sync xray"' 2>/dev/null || echo "gagal sync xray")"
+    echo "XRAY sync ${type^^} gagal: ${msg}"
+    return 1
+  fi
+  return 0
+}
+
+apply_xray_restart_from_summary_api() {
+  local resp ok msg
+  resp="$(curl -sS -X POST "http://127.0.0.1:8789/internal/apply-xray-restart" \
+    -H "x-sync-token: ${AUTH_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{}' 2>/dev/null || true)"
+  ok="$(echo "${resp}" | jq -r '.ok // false' 2>/dev/null || echo "false")"
+  if [[ "${ok}" != "true" ]]; then
+    msg="$(echo "${resp}" | jq -r '.message // "gagal restart xray"' 2>/dev/null || echo "gagal restart xray")"
+    echo "XRAY restart gagal via Summary API: ${msg}"
+    return 1
+  fi
+  return 0
+}
+
+extend_expired_all_accounts() {
+  local days ans changed_ssh changed_vmess changed_vless changed_trojan
+  local total_changed sync_ok
+  echo "TAMBAH MASA AKTIF SEMUA AKUN (SSH/VMESS/VLESS/TROJAN)"
+  prompt_input days "Tambah masa aktif (hari) [30]: " || return
+  days="${days:-30}"
+  if [[ ! "${days}" =~ ^[0-9]+$ || "${days}" -lt 1 || "${days}" -gt 3650 ]]; then
+    echo "Jumlah hari tidak valid. Gunakan angka 1-3650."
+    return
+  fi
+  if ! prompt_input ans "Lanjutkan tambah masa aktif ${days} hari untuk semua akun? [y/N]: "; then
+    return
+  fi
+  ans="$(echo "${ans}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  [[ "${ans}" != "y" && "${ans}" != "yes" ]] && { echo "Dibatalkan."; return; }
+
+  sqlite3 "${DB_PATH}" "BEGIN IMMEDIATE;" >/dev/null 2>&1 || { echo "Gagal lock database."; return; }
+  if ! sqlite3 "${DB_PATH}" "
+UPDATE account_sshs
+SET date_exp = CASE
+  WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
+    THEN date('now','localtime','+${days} day')
+  ELSE date(date_exp,'+${days} day')
+END;
+SELECT changes();
+UPDATE account_vmesses
+SET date_exp = CASE
+  WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
+    THEN date('now','localtime','+${days} day')
+  ELSE date(date_exp,'+${days} day')
+END;
+SELECT changes();
+UPDATE account_vlesses
+SET date_exp = CASE
+  WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
+    THEN date('now','localtime','+${days} day')
+  ELSE date(date_exp,'+${days} day')
+END;
+SELECT changes();
+UPDATE account_trojans
+SET date_exp = CASE
+  WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
+    THEN date('now','localtime','+${days} day')
+  ELSE date(date_exp,'+${days} day')
+END;
+SELECT changes();
+COMMIT;
+" > /tmp/sc_extend_all_changes.$$ 2>/tmp/sc_extend_all_err.$$; then
+    sqlite3 "${DB_PATH}" "ROLLBACK;" >/dev/null 2>&1 || true
+    echo "Gagal update masa aktif semua akun."
+    cat /tmp/sc_extend_all_err.$$ 2>/dev/null || true
+    rm -f /tmp/sc_extend_all_changes.$$ /tmp/sc_extend_all_err.$$
+    return
+  fi
+
+  mapfile -t __chg < /tmp/sc_extend_all_changes.$$ || true
+  changed_ssh="${__chg[0]:-0}"
+  changed_vmess="${__chg[1]:-0}"
+  changed_vless="${__chg[2]:-0}"
+  changed_trojan="${__chg[3]:-0}"
+  rm -f /tmp/sc_extend_all_changes.$$ /tmp/sc_extend_all_err.$$
+
+  [[ "${changed_ssh}" =~ ^[0-9]+$ ]] || changed_ssh="0"
+  [[ "${changed_vmess}" =~ ^[0-9]+$ ]] || changed_vmess="0"
+  [[ "${changed_vless}" =~ ^[0-9]+$ ]] || changed_vless="0"
+  [[ "${changed_trojan}" =~ ^[0-9]+$ ]] || changed_trojan="0"
+  total_changed=$((changed_ssh + changed_vmess + changed_vless + changed_trojan))
+
+  sync_ok=1
+  if ! sync_xray_from_summary_api "vmess"; then sync_ok=0; fi
+  if ! sync_xray_from_summary_api "vless"; then sync_ok=0; fi
+  if ! sync_xray_from_summary_api "trojan"; then sync_ok=0; fi
+  if [[ "${sync_ok}" -eq 1 ]]; then
+    apply_xray_restart_from_summary_api || sync_ok=0
+  fi
+
+  echo "Berhasil tambah masa aktif ${days} hari untuk semua akun."
+  echo "- SSH    : ${changed_ssh} akun"
+  echo "- VMESS  : ${changed_vmess} akun"
+  echo "- VLESS  : ${changed_vless} akun"
+  echo "- TROJAN : ${changed_trojan} akun"
+  echo "Total    : ${total_changed} akun"
+  if [[ "${sync_ok}" -eq 1 ]]; then
+    echo "XRAY sync+restart: OK"
+  else
+    echo "XRAY sync+restart: ada yang gagal (cek log di atas)."
+  fi
+}
+
+edit_uuid_xray_account() {
+  local type username username_sql new_uuid row old_uuid
+  echo "EDIT UUID XRAY (VMESS/VLESS)"
+  draw_menu_panel "Pilih tipe Xray:" \
+    "1) VMESS" \
+    "2) VLESS" \
+    "0) Kembali"
+  if ! prompt_input type "Input [0-2]: "; then
+    return
+  fi
+  case "${type}" in
+    0) return ;;
+    1) type="vmess" ;;
+    2) type="vless" ;;
+    *) echo "Pilihan tidak valid."; return ;;
+  esac
+
+  username="$(pick_existing_username "${type}")" || return
+  username_sql="${username//\'/''}"
+  if [[ "${type}" == "vmess" ]]; then
+    row="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT uuid FROM account_vmesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+  else
+    row="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT uuid FROM account_vlesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+  fi
+  old_uuid="$(echo "${row}" | head -n1 | xargs)"
+  echo "Username : ${username}"
+  echo "UUID lama: ${old_uuid:--}"
+  prompt_input new_uuid "UUID baru: " || return
+  new_uuid="$(echo "${new_uuid}" | tr -d '[:space:]')"
+  if [[ ! "${new_uuid}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "Format UUID tidak valid."
+    return
+  fi
+
+  if [[ "${type}" == "vmess" ]]; then
+    sqlite3 "${DB_PATH}" "UPDATE account_vmesses SET uuid='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+      echo "Gagal update UUID VMESS."
+      return
+    }
+  else
+    sqlite3 "${DB_PATH}" "UPDATE account_vlesses SET uuid='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+      echo "Gagal update UUID VLESS."
+      return
+    }
+  fi
+
+  if sync_xray_from_summary_api "${type}" && apply_xray_restart_from_summary_api; then
+    echo "Berhasil edit UUID ${type^^}."
+    echo "Username : ${username}"
+    echo "UUID baru: ${new_uuid}"
+  else
+    echo "UUID tersimpan di DB, tapi sync/restart Xray gagal."
+    echo "Coba jalankan lagi saat Summary API aktif."
+  fi
+}
+
 delete_account() {
   local type ep username resp code message
   type="$(pick_type)"
@@ -7767,9 +7947,11 @@ akun_menu() {
       "8) Unlock Semua Akun" \
       "9) Lihat Detail Account" \
       "10) Edit Limit IP Semua Akun" \
+      "11) Tambah Masa Aktif Semua Akun" \
+      "12) Edit UUID Xray" \
       "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-10]: "; then
+    if ! prompt_input am "Pilih menu [0-12]: "; then
       return
     fi
     clear
@@ -7784,6 +7966,8 @@ akun_menu() {
       8) unlock_all_accounts ;;
       9) show_account_detail ;;
       10) edit_limit_ip_all_accounts ;;
+      11) extend_expired_all_accounts ;;
+      12) edit_uuid_xray_account ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

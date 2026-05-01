@@ -7532,8 +7532,8 @@ extend_expired_all_accounts() {
   ans="$(echo "${ans}" | tr '[:upper:]' '[:lower:]' | xargs)"
   [[ "${ans}" != "y" && "${ans}" != "yes" ]] && { echo "Dibatalkan."; return; }
 
-  sqlite3 "${DB_PATH}" "BEGIN IMMEDIATE;" >/dev/null 2>&1 || { echo "Gagal lock database."; return; }
   if ! sqlite3 "${DB_PATH}" "
+BEGIN IMMEDIATE;
 UPDATE account_sshs
 SET date_exp = CASE
   WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
@@ -7564,7 +7564,6 @@ END;
 SELECT changes();
 COMMIT;
 " > /tmp/sc_extend_all_changes.$$ 2>/tmp/sc_extend_all_err.$$; then
-    sqlite3 "${DB_PATH}" "ROLLBACK;" >/dev/null 2>&1 || true
     echo "Gagal update masa aktif semua akun."
     cat /tmp/sc_extend_all_err.$$ 2>/dev/null || true
     rm -f /tmp/sc_extend_all_changes.$$ /tmp/sc_extend_all_err.$$

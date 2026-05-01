@@ -471,6 +471,69 @@ function normalizeXrayClientsForType(type, rows, templateClient) {
   return out;
 }
 
+function getXrayConfigCandidates() {
+  const base = String(XRAY_CONFIG_FILE || '').trim();
+  const list = [base, '/usr/local/etc/xray/config.json', '/etc/xray/config.json']
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  return list.filter((v, i) => list.indexOf(v) === i);
+}
+
+function resolveReadableXrayConfigPath() {
+  const candidates = getXrayConfigCandidates();
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const raw = fs.readFileSync(p, 'utf8');
+      JSON.parse(raw);
+      return p;
+    } catch (_) {}
+  }
+  return candidates[0] || XRAY_CONFIG_FILE;
+}
+
+function buildDefaultXrayInbound(type) {
+  if (type === 'vmess') {
+    return {
+      port: 10001, listen: '127.0.0.1', protocol: 'vmess',
+      settings: { clients: [], alterId: 0 },
+      streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
+    };
+  }
+  if (type === 'vless') {
+    return {
+      port: 10002, listen: '127.0.0.1', protocol: 'vless',
+      settings: { clients: [], decryption: 'none' },
+      streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
+    };
+  }
+  if (type === 'trojan') {
+    return {
+      port: 10003, listen: '127.0.0.1', protocol: 'trojan',
+      settings: { clients: [] },
+      streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
+    };
+  }
+  return null;
+}
+
+function writeXrayConfigToCandidates(cfgObj, primaryPath) {
+  const content = JSON.stringify(cfgObj, null, 2);
+  const candidates = getXrayConfigCandidates();
+  const ordered = [String(primaryPath || '').trim(), ...candidates].filter(Boolean).filter((v, i, arr) => arr.indexOf(v) === i);
+  let wrote = false;
+  for (const p of ordered) {
+    try {
+      fs.mkdirSync(require('path').dirname(p), { recursive: true });
+      const tmp = `${p}.tmp-${Date.now()}`;
+      fs.writeFileSync(tmp, content, 'utf8');
+      fs.renameSync(tmp, p);
+      wrote = true;
+    } catch (_) {}
+  }
+  return wrote;
+}
+
 function restartXrayService() {
   try {
     execFileSync('systemctl', ['restart', 'xray'], { stdio: 'ignore' });
@@ -495,8 +558,9 @@ function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
     if (!table) {
       return resolve({ ok: false, statusCode: 400, message: 'table type tidak valid' });
     }
-    if (!fs.existsSync(XRAY_CONFIG_FILE)) {
-      return resolve({ ok: false, statusCode: 500, message: `config xray tidak ditemukan: ${XRAY_CONFIG_FILE}` });
+    const cfgPath = resolveReadableXrayConfigPath();
+    if (!fs.existsSync(cfgPath)) {
+      return resolve({ ok: false, statusCode: 500, message: `config xray tidak ditemukan: ${cfgPath}` });
     }
 
     const cfgDb = new sqlite3.Database(DB);
@@ -511,16 +575,22 @@ function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
 
         let parsed;
         try {
-          const raw = fs.readFileSync(XRAY_CONFIG_FILE, 'utf8');
+          const raw = fs.readFileSync(cfgPath, 'utf8');
           parsed = JSON.parse(raw);
         } catch (err) {
           return resolve({ ok: false, statusCode: 500, message: `gagal baca config xray: ${err.message}` });
         }
 
-        const inbounds = Array.isArray(parsed?.inbounds) ? parsed.inbounds : [];
-        const targetInbounds = inbounds.filter((ib) => String(ib?.protocol || '').trim().toLowerCase() === type);
+        if (!Array.isArray(parsed?.inbounds)) parsed.inbounds = [];
+        const inbounds = parsed.inbounds;
+        let targetInbounds = inbounds.filter((ib) => String(ib?.protocol || '').trim().toLowerCase() === type);
         if (!targetInbounds.length) {
-          return resolve({ ok: false, statusCode: 400, message: `inbound ${type} tidak ditemukan di config xray` });
+          const createdInbound = buildDefaultXrayInbound(type);
+          if (!createdInbound) {
+            return resolve({ ok: false, statusCode: 400, message: `inbound ${type} tidak ditemukan di config xray` });
+          }
+          inbounds.push(createdInbound);
+          targetInbounds = [createdInbound];
         }
 
         const firstTemplate = Array.isArray(targetInbounds[0]?.settings?.clients) && targetInbounds[0].settings.clients[0]
@@ -534,9 +604,10 @@ function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
         }
 
         try {
-          const tmp = `${XRAY_CONFIG_FILE}.tmp-${Date.now()}`;
-          fs.writeFileSync(tmp, JSON.stringify(parsed, null, 2), 'utf8');
-          fs.renameSync(tmp, XRAY_CONFIG_FILE);
+          const wrote = writeXrayConfigToCandidates(parsed, cfgPath);
+          if (!wrote) {
+            return resolve({ ok: false, statusCode: 500, message: 'gagal tulis config xray ke semua candidate path' });
+          }
         } catch (writeErr) {
           return resolve({ ok: false, statusCode: 500, message: `gagal tulis config xray: ${writeErr.message}` });
         }

@@ -1233,7 +1233,9 @@ frontend ft_443
 
 backend bk_mux
     mode tcp
-    server mux_local 127.0.0.1:2082 check
+    # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
+    # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
+    server nginx_local 127.0.0.1:80 check
 EOF
 
   haproxy -c -f /etc/haproxy/haproxy.cfg
@@ -8598,7 +8600,9 @@ frontend ft_443
 
 backend bk_mux
     mode tcp
-    server mux_local 127.0.0.1:2082 check
+    # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
+    # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
+    server nginx_local 127.0.0.1:80 check
 EOHAP
 
   haproxy -c -f /etc/haproxy/haproxy.cfg || {

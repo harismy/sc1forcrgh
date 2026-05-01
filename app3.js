@@ -1683,7 +1683,7 @@ async function buildInstallerQuickCopyText() {
     };
   }
   const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
-  const cmd = `apt-get update -y && apt-get upgrade -y && bash -c "$(curl -fsSL ${installerUrl})"`;
+  const cmd = `apt-get update -y && apt-get upgrade -y && apt-get install -y curl ca-certificates && bash -c "$(curl -fsSL ${installerUrl})"`;
   const safeUrl = escapeHtml(installerUrl);
   const safeCmd = escapeHtml(cmd);
   return {

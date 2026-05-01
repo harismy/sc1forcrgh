@@ -966,6 +966,25 @@ async function isRegisteredHost(userId, host) {
   return !!row;
 }
 
+async function isAnyRegisteredHost(host) {
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [Date.now(), Date.now()]
+  ).catch(() => {});
+  const row = await dbGet(
+    "SELECT 1 AS ok FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    [host, Date.now()]
+  );
+  return !!row;
+}
+
+async function canAccessHostForScOps(userId, host) {
+  const normalizedHost = normalizeHost(host);
+  if (!isIpv4(normalizedHost)) return false;
+  if (isAdmin(userId)) return isAnyRegisteredHost(normalizedHost);
+  return isRegisteredHost(userId, normalizedHost);
+}
+
 async function getUserRegistration(userId, ip) {
   return dbGet(
     'SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1',
@@ -3409,8 +3428,8 @@ bot.on('text', async (ctx) => {
     if (state.step === 'backup_host') {
       const host = normalizeHost(text);
       if (!isIpv4(host)) return ctx.reply('IP VPS harus valid.');
-      if (!(await isRegisteredHost(ctx.from.id, host))) {
-        return ctx.reply('IP belum terdaftar di akun kamu. Registrasi dulu di menu Registrasi SC.');
+      if (!(await canAccessHostForScOps(ctx.from.id, host))) {
+        return ctx.reply('IP belum terdaftar aktif atau kamu tidak punya akses ke IP ini.');
       }
       state.host = host;
       state.step = 'backup_key';
@@ -3487,8 +3506,8 @@ bot.on('text', async (ctx) => {
     if (state.step === 'restore_host') {
       const host = normalizeHost(text);
       if (!isIpv4(host)) return ctx.reply('IP VPS harus valid.');
-      if (!(await isRegisteredHost(ctx.from.id, host))) {
-        return ctx.reply('IP belum terdaftar di akun kamu. Registrasi dulu di menu Registrasi SC.');
+      if (!(await canAccessHostForScOps(ctx.from.id, host))) {
+        return ctx.reply('IP belum terdaftar aktif atau kamu tidak punya akses ke IP ini.');
       }
       state.host = host;
       state.step = 'restore_key';
@@ -3611,9 +3630,9 @@ bot.on('document', async (ctx) => {
   if (state.step !== 'restore_wait_file') return;
 
   try {
-    if (!(await isRegisteredHost(ctx.from.id, state.host))) {
+    if (!(await canAccessHostForScOps(ctx.from.id, state.host))) {
       userState.delete(ctx.chat.id);
-      return ctx.reply('Akses restore ditolak karena host belum terdaftar aktif di akun kamu.', mainMenu());
+      return ctx.reply('Akses restore ditolak: IP belum terdaftar aktif atau kamu tidak punya akses.', mainMenu());
     }
 
     const doc = ctx.message.document;

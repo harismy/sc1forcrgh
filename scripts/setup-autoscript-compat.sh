@@ -10150,11 +10150,14 @@ xray_log_snapshot() {
       sub(/:[0-9]+$/, "", v);
       return v;
     }
-    function ts_from_line(line, a, ts) {
-      if (match(line, /^([0-9]{4})\/([0-9]{2})\/([0-9]{2})[[:space:]]+([0-9]{2}):([0-9]{2}):([0-9]{2})/, a)) {
-        ts = mktime(a[1] " " a[2] " " a[3] " " a[4] " " a[5] " " a[6]);
-        if (ts > 0) return ts;
-      }
+    function ts_from_line(line, stamp, ts) {
+      if (line !~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return 0;
+      stamp = substr(line, 1, 19);
+      gsub(/\//, " ", stamp);
+      gsub(/:/, " ", stamp);
+      gsub(/[[:space:]]+/, " ", stamp);
+      ts = mktime(stamp);
+      if (ts > 0) return ts;
       return 0;
     }
     {

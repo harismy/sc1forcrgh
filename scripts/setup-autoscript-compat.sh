@@ -1228,8 +1228,8 @@ defaults
     timeout server  2m
 
 frontend ft_443
-    # Paksa ALPN ke HTTP/1.1 agar WebSocket (SSHWS/Xray WS) stabil di TLS 443.
-    bind *:443 ssl crt ${pem} alpn http/1.1
+    # Paksa ALPN ke HTTP/1.1 dan TLSv1.2-only agar HC SSL-only lebih stabil.
+    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.2 ssl-max-ver TLSv1.2
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
@@ -8798,8 +8798,8 @@ defaults
     timeout server  2m
 
 frontend ft_443
-    # Paksa ALPN ke HTTP/1.1 agar WebSocket (SSHWS/Xray WS) stabil di TLS 443.
-    bind *:443 ssl crt ${pem} alpn http/1.1
+    # Paksa ALPN ke HTTP/1.1 dan TLSv1.2-only agar HC SSL-only lebih stabil.
+    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.2 ssl-max-ver TLSv1.2
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END

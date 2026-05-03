@@ -1237,11 +1237,14 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
-    acl is_xray_vmess req.payload(0,128) -m sub GET\ /vmess
-    acl is_xray_vless req.payload(0,128) -m sub GET\ /vless
-    acl is_xray_trojan req.payload(0,128) -m sub GET\ /trojan
+    acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
+    acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
+    acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
+    acl is_xray_vless_bug req.payload(0,256),lower -m sub "get /yourbug/vless"
+    acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
+    acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
     acl is_hc_connect req.payload(0,7) -m str CONNECT
-    use_backend bk_mux if is_xray_vmess || is_xray_vless || is_xray_trojan
+    use_backend bk_mux if is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
     # Default ke sshws mux agar klien SSL-only HTTP Custom yang variatif tetap ter-handle.
     # Jalur WS Xray (/vmess,/vless,/trojan) tetap diteruskan mux ke nginx:80.
@@ -8843,11 +8846,14 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
-    acl is_xray_vmess req.payload(0,128) -m sub GET\ /vmess
-    acl is_xray_vless req.payload(0,128) -m sub GET\ /vless
-    acl is_xray_trojan req.payload(0,128) -m sub GET\ /trojan
+    acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
+    acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
+    acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
+    acl is_xray_vless_bug req.payload(0,256),lower -m sub "get /yourbug/vless"
+    acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
+    acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
     acl is_hc_connect req.payload(0,7) -m str CONNECT
-    use_backend bk_mux if is_xray_vmess || is_xray_vless || is_xray_trojan
+    use_backend bk_mux if is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
     # Default ke sshws mux agar klien SSL-only HTTP Custom yang variatif tetap ter-handle.
     # Jalur WS Xray (/vmess,/vless,/trojan) tetap diteruskan mux ke nginx:80.

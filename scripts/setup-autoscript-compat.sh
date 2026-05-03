@@ -1031,6 +1031,12 @@ server {
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
+    location = /__routecheck {
+        access_log off;
+        default_type text/plain;
+        return 200 "ROUTE_OK_BK_MUX\n";
+    }
+
     location = /cdn-cgi/trace {
         access_log off;
 ${sshws_nginx_limit_rules}
@@ -1237,6 +1243,7 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
+    acl is_routecheck req.payload(0,256),lower -m sub "get /__routecheck"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
     acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
@@ -1244,7 +1251,7 @@ frontend ft_443
     acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
     acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
     acl is_hc_connect req.payload(0,7) -m str CONNECT
-    use_backend bk_mux if is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
+    use_backend bk_mux if is_routecheck || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
     # XRAY path tetap diarahkan ke bk_mux oleh ACL di atas.
     # Fallback default ke sshws untuk kompatibilitas SSL-only HTTP Custom.
@@ -6940,12 +6947,14 @@ api_call() {
 }
 
 telegram_notify() {
-  local text="$1"
-  [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
-  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  local text="$1" resp
+  [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" || -z "${text:-}" ]] && return 1
+  resp="$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${TELEGRAM_CHAT_ID}" \
     -d "disable_web_page_preview=true" \
-    --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+    --data-urlencode "text=${text}" 2>/dev/null || true)"
+  [[ -z "${resp}" ]] && return 1
+  echo "${resp}" | jq -e '.ok == true' >/dev/null 2>&1
 }
 
 telegram_notify_action() {
@@ -8647,6 +8656,12 @@ server {
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
+    location = /__routecheck {
+        access_log off;
+        default_type text/plain;
+        return 200 "ROUTE_OK_BK_MUX\n";
+    }
+
     location = /cdn-cgi/trace {
         access_log off;
 ${sshws_nginx_limit_rules}
@@ -8849,6 +8864,7 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
+    acl is_routecheck req.payload(0,256),lower -m sub "get /__routecheck"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
     acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
@@ -8856,7 +8872,7 @@ frontend ft_443
     acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
     acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
     acl is_hc_connect req.payload(0,7) -m str CONNECT
-    use_backend bk_mux if is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
+    use_backend bk_mux if is_routecheck || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
     # XRAY path tetap diarahkan ke bk_mux oleh ACL di atas.
     # Fallback default ke sshws untuk kompatibilitas SSL-only HTTP Custom.
@@ -9075,7 +9091,22 @@ enforce_menu_license_access() {
     lock_reason="$(sed -n 's/^reason=//p' "${lock_file}" | head -n1)"
     [[ -z "${lock_reason}" ]] && lock_reason="locked_by_admin"
     clear
-    cat <<EOF
+    if [[ "${lock_reason}" == "natural_expired" ]]; then
+      cat <<EOF
+============================================================
+               SC 1FORCR NEXUS - AKSES DITOLAK            
+============================================================
+
+Script 1FORCRNEXUS anda sudah expired untuk IP (${ip_text}).
+
+Silahkan perpanjang melalui bot resmi:
+https://t.me/sc1forcrnexusbot
+
+Setelah perpanjang berhasil, silakan ulangi install/update.
+============================================================
+EOF
+    else
+      cat <<EOF
 ============================================================
                SC 1FORCR NEXUS - AKSES DITOLAK            
 ============================================================
@@ -9088,6 +9119,7 @@ Aksi   : SC harus diperpanjang terlebih dahulu.
 Hubungi admin untuk membuka akses kembali setelah perpanjang.
 ============================================================
 EOF
+    fi
     return 1
   fi
   enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
@@ -10948,11 +10980,14 @@ set_telegram_notif_config() {
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
     if prompt_input ans "Kirim pesan test sekarang? [y/N]: "; then
       if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
-        telegram_notify "SC 1FORCR NOTIF
+        if telegram_notify "SC 1FORCR NOTIF
 Event    : TEST_NOTIF
 Domain   : ${DOMAIN}
-Time     : $(date '+%F %T')"
-        echo "Pesan test dikirim (cek chat Telegram)."
+Time     : $(date '+%F %T')"; then
+          echo "Pesan test dikirim (cek chat Telegram)."
+        else
+          echo "Gagal kirim pesan test Telegram (token/chat_id/bot permission kemungkinan belum benar)."
+        fi
       fi
     fi
   fi

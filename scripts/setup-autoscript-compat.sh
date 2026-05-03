@@ -1228,8 +1228,8 @@ defaults
     timeout server  2m
 
 frontend ft_443
-    # Paksa ALPN ke HTTP/1.1 dan TLSv1.2-only agar HC SSL-only lebih stabil.
-    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.2 ssl-max-ver TLSv1.2
+    # Mode kompatibilitas maksimum untuk SSL-only HC (security lebih lemah).
+    bind *:443 ssl crt ${pem} alpn h2,http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
@@ -8798,8 +8798,8 @@ defaults
     timeout server  2m
 
 frontend ft_443
-    # Paksa ALPN ke HTTP/1.1 dan TLSv1.2-only agar HC SSL-only lebih stabil.
-    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.2 ssl-max-ver TLSv1.2
+    # Mode kompatibilitas maksimum untuk SSL-only HC (security lebih lemah).
+    bind *:443 ssl crt ${pem} alpn h2,http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
@@ -11262,6 +11262,12 @@ draw_main_options() {
   printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
 }
 
+if [[ "${1:-}" == "update" ]]; then
+  clear
+  update_script_from_repo
+  exit $?
+fi
+
 while true; do
   if ! enforce_menu_license_access; then
     exit 1
@@ -11309,6 +11315,13 @@ exec "${menu_runtime}" "\$@"
 EOF
   chmod +x /usr/local/sbin/menu-sc-1forcr
   ln -sf /usr/local/sbin/menu-sc-1forcr /usr/local/sbin/menu
+
+  cat > /usr/local/sbin/update <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/local/sbin/menu-sc-1forcr update "$@"
+EOF
+  chmod +x /usr/local/sbin/update
 
   cat > /usr/local/sbin/uninstall-sc-1forcr <<'EOF'
 #!/usr/bin/env bash
@@ -11386,6 +11399,7 @@ rm -f /etc/potato-compat.env
 rm -f /usr/local/sbin/menu-sc-1forcr
 rm -f /usr/local/sbin/menu-potato
 rm -f /usr/local/sbin/menu
+rm -f /usr/local/sbin/update
 rm -f /usr/local/sbin/uninstall-sc-1forcr
 rm -f /usr/local/sbin/uninstall-potato-compat
 rm -f /usr/local/sbin/sc-1forcr-safe-reboot

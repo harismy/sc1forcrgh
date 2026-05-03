@@ -1231,7 +1231,9 @@ frontend ft_443
     # Paksa ALPN ke HTTP/1.1 agar WebSocket (SSHWS/Xray WS) stabil di TLS 443.
     bind *:443 ssl crt ${pem} alpn http/1.1
     tcp-request inspect-delay 5s
-    acl is_hc_connect req.payload(0,8) -m str CONNECT
+    tcp-request content accept if HTTP
+    tcp-request content accept if WAIT_END
+    acl is_hc_connect req.payload(0,7) -m str CONNECT
     use_backend bk_sshws_tls if is_hc_connect
     default_backend bk_mux
 
@@ -8797,7 +8799,9 @@ frontend ft_443
     # Paksa ALPN ke HTTP/1.1 agar WebSocket (SSHWS/Xray WS) stabil di TLS 443.
     bind *:443 ssl crt ${pem} alpn http/1.1
     tcp-request inspect-delay 5s
-    acl is_hc_connect req.payload(0,8) -m str CONNECT
+    tcp-request content accept if HTTP
+    tcp-request content accept if WAIT_END
+    acl is_hc_connect req.payload(0,7) -m str CONNECT
     use_backend bk_sshws_tls if is_hc_connect
     default_backend bk_mux
 

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
@@ -1031,11 +1031,6 @@ server {
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
-    location = /__routecheck {
-        access_log off;
-        default_type text/plain;
-        return 200 "ROUTE_OK_BK_MUX\n";
-    }
 
     location = /cdn-cgi/trace {
         access_log off;
@@ -1243,7 +1238,7 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
-    acl is_routecheck req.payload(0,256),lower -m sub "get /__routecheck"
+    acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
     acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
@@ -1251,7 +1246,7 @@ frontend ft_443
     acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
     acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
     acl is_hc_connect req.payload(0,7) -m str CONNECT
-    use_backend bk_mux if is_routecheck || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
+    use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
     # XRAY path tetap diarahkan ke bk_mux oleh ACL di atas.
     # Fallback default ke sshws untuk kompatibilitas SSL-only HTTP Custom.
@@ -8656,11 +8651,6 @@ server {
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
-    location = /__routecheck {
-        access_log off;
-        default_type text/plain;
-        return 200 "ROUTE_OK_BK_MUX\n";
-    }
 
     location = /cdn-cgi/trace {
         access_log off;
@@ -8864,7 +8854,7 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
-    acl is_routecheck req.payload(0,256),lower -m sub "get /__routecheck"
+    acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
     acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
@@ -8872,7 +8862,7 @@ frontend ft_443
     acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
     acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
     acl is_hc_connect req.payload(0,7) -m str CONNECT
-    use_backend bk_mux if is_routecheck || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
+    use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
     # XRAY path tetap diarahkan ke bk_mux oleh ACL di atas.
     # Fallback default ke sshws untuk kompatibilitas SSL-only HTTP Custom.

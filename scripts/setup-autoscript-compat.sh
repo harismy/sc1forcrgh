@@ -10152,7 +10152,7 @@ show_ssh_online_history() {
 show_ssh_only_online() {
   local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge hc_auth_lookback_h
   local dropbear_main_port dropbear_alt_port
-  local source_mode
+  local source_mode allow_fallback
   tmp_status="$(mktemp)"
   tmp_ss_pid_ip="$(mktemp)"
   tmp_pid_user="$(mktemp)"
@@ -10168,6 +10168,7 @@ show_ssh_only_online() {
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
   hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
   source_mode="REALTIME_SOCKET"
+  allow_fallback="$(echo "${SSH_MONITOR_ALLOW_FALLBACK:-0}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
 
@@ -10253,7 +10254,7 @@ show_ssh_only_online() {
     }
     END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
-  if [[ -s "${tmp_db_ports}" ]]; then
+  if [[ "${allow_fallback}" == "1" && -s "${tmp_db_ports}" ]]; then
     journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
       function norm_ip(v) {
@@ -10397,14 +10398,14 @@ show_ssh_only_online() {
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_db_recent_loose}" || true
 
-  if [[ ! -s "${tmp_ip_count}" ]]; then
+  if [[ "${allow_fallback}" == "1" && ! -s "${tmp_ip_count}" ]]; then
     cp -f "${tmp_db_recent_loose}" "${tmp_ip_count}" >/dev/null 2>&1 || true
     [[ -s "${tmp_ip_count}" ]] && source_mode="FALLBACK_AUTH_2MIN"
   fi
 
   # Fallback terakhir (lebih longgar):
   # jika masih kosong, ambil user dari auth sukses dropbear 5 menit terakhir tanpa syarat port aktif.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
+  if [[ "${allow_fallback}" == "1" && ! -s "${tmp_ip_count}" ]]; then
     journalctl -u dropbear --since "-5 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
       {
         l=tolower($0);

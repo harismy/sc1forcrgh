@@ -10169,7 +10169,7 @@ show_ssh_only_online() {
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
   db_log_max="$(echo "${DROPBEAR_LOG_MAX_LINES:-20000}" | tr -cd '0-9')"
   db_recent_log_max="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
-  source_mode="REALTIME_SOCKET"
+  source_mode="REALTIME_LASTSEEN_60S"
   allow_fallback="$(echo "${SSH_MONITOR_ALLOW_FALLBACK:-0}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
@@ -10181,10 +10181,40 @@ show_ssh_only_online() {
   [[ -z "${hc_auth_lookback_h}" ]] && hc_auth_lookback_h="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-6}" | tr -cd '0-9')"
   [[ -z "${hc_auth_lookback_h}" || "${hc_auth_lookback_h}" -lt 1 || "${hc_auth_lookback_h}" -gt 48 ]] && hc_auth_lookback_h="6"
 
-  # Sumber utama realtime: socket established (SSH + Dropbear), map PID -> user, lalu hitung unik user+ip.
-  : > "${tmp_pair}"
+  # Sumber utama realtime (stabil untuk HC/SSHWS):
+  # Hitung auth sukses 60 detik terakhir per user+port.
   : > "${tmp_ip_count}"
-  ss -Htnp state established 2>/dev/null | awk '
+  journalctl -u dropbear --since "-60 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+    /auth succeeded for /{
+      u=$0;
+      sub(/^.*auth succeeded for /,"",u);
+      sub(/^'\''/,"",u); sub(/^"/,"",u);
+      sub(/'\''.*/,"",u); sub(/".*/,"",u);
+      sub(/[[:space:]].*$/,"",u);
+      u=tolower(u);
+      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+
+      src=$0;
+      sub(/^.* from /, "", src);
+      gsub(/[[:space:]]+$/, "", src);
+      port=src;
+      sub(/^.*:/, "", port);
+      if (port !~ /^[0-9]{1,5}$/) next;
+      seen[u "|" port]=1;
+    }
+    END{
+      for (k in seen) {
+        split(k, a, /\|/);
+        cnt[a[1]]++;
+      }
+      for (u in cnt) print u, cnt[u];
+    }' > "${tmp_ip_count}" || true
+
+  # Fallback realtime socket established (SSH + Dropbear), map PID -> user, lalu hitung unik user+ip.
+  : > "${tmp_pair}"
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    source_mode="REALTIME_SOCKET"
+    ss -Htnp state established 2>/dev/null | awk '
     {
       l=$4;
       r=$5;
@@ -10203,7 +10233,9 @@ show_ssh_only_online() {
       }
     }' | sort -u > "${tmp_ss_pid_ip}" || true
 
-  if [[ -s "${tmp_ss_pid_ip}" ]]; then
+  fi
+
+  if [[ ! -s "${tmp_ip_count}" && -s "${tmp_ss_pid_ip}" ]]; then
     local pid_csv
     pid_csv="$(awk '{print $1}' "${tmp_ss_pid_ip}" | sort -u | paste -sd, -)"
     ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
@@ -10238,7 +10270,9 @@ show_ssh_only_online() {
       }' "${tmp_pid_user}" "${tmp_ss_pid_ip}" | sort -u > "${tmp_pair}" || true
   fi
 
-  awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_pair}" > "${tmp_ip_count}" || true
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_pair}" > "${tmp_ip_count}" || true
+  fi
 
   # Tambahan untuk jalur SSH-WS/HC:
   # Ambil user dari log auth dropbear, tapi hanya untuk client-port yang masih aktif saat ini.
@@ -10769,32 +10803,7 @@ show_ssh_only_online() {
   # Hitung auth sukses 60 detik terakhir per user+port. Ini tetap realtime
   # dan tahan terhadap pola reconnect cepat HC/SSHWS.
   if [[ ! -s "${tmp_ip_count}" ]]; then
-    journalctl -u dropbear --since "-60 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
-      /auth succeeded for /{
-        u=$0;
-        sub(/^.*auth succeeded for /,"",u);
-        sub(/^'\''/,"",u); sub(/^"/,"",u);
-        sub(/'\''.*/,"",u); sub(/".*/,"",u);
-        sub(/[[:space:]].*$/,"",u);
-        u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-
-        src=$0;
-        sub(/^.* from /, "", src);
-        gsub(/[[:space:]]+$/, "", src);
-        port=src;
-        sub(/^.*:/, "", port);
-        if (port !~ /^[0-9]{1,5}$/) next;
-        seen[u "|" port]=1;
-      }
-      END{
-        for (k in seen) {
-          split(k, a, /\|/);
-          cnt[a[1]]++;
-        }
-        for (u in cnt) print u, cnt[u];
-      }' > "${tmp_ip_count}" || true
-    [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_LASTSEEN_60S"
+    [[ -n "${source_mode}" ]] || source_mode="REALTIME_LASTSEEN_60S"
   fi
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true

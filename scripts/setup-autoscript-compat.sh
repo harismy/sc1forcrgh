@@ -6466,6 +6466,31 @@ ssh_users="$(
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/) c[$1]++ } END { for (u in c) printf "%s(%d)\n", u, c[u] }' "${tmp_pair}" | sort || true
 )"
 ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
+if [[ "${ssh_cnt}" -eq 0 ]]; then
+  ssh_users="$(
+    journalctl -u dropbear --since "-${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} seconds" -n "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" --no-pager 2>/dev/null | awk '
+      {
+        l=tolower($0)
+        u=""
+        if (match(l, /password auth succeeded for '\''[a-z0-9._-]+'\''/)) {
+          t=substr(l, RSTART, RLENGTH)
+          gsub(/^.*for '\''/, "", t); gsub(/'\''$/, "", t)
+          u=t
+        } else if (match(l, /pubkey auth succeeded for '\''[a-z0-9._-]+'\''/)) {
+          t=substr(l, RSTART, RLENGTH)
+          gsub(/^.*for '\''/, "", t); gsub(/'\''$/, "", t)
+          u=t
+        } else if (match($0, /^.*dropbear[^[]*\[[^]]+\]/)) {
+          t=substr($0, RSTART, RLENGTH)
+          sub(/^.*\[/, "", t); sub(/\].*$/, "", t)
+          u=tolower(t)
+        }
+        if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") print u
+      }
+    ' | awk '{c[$1]++} END{for (u in c) printf "%s(%d)\n", u, c[u]}' | sort
+  )"
+  ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
+fi
 
 xray_users=""
 xray_cnt=0

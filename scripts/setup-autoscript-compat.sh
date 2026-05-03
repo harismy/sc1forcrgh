@@ -10391,6 +10391,73 @@ show_ssh_only_online() {
     fi
   fi
 
+  # Realtime window auth:
+  # Saat sesi HC sering rehandshake cepat, pakai jendela auth pendek dan buang sesi yang sudah Exit.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    journalctl -u dropbear --since "-90 sec" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
+      function norm_ip(v) {
+        gsub(/[[:space:]]/, "", v);
+        gsub(/^\[/, "", v);
+        gsub(/\]/, "", v);
+        sub(/:[0-9]+$/, "", v);
+        return v;
+      }
+      function is_loopback_ip(v,   t) {
+        t=tolower(v);
+        return (t=="127.0.0.1" || t=="::1" || t=="localhost");
+      }
+      function sess_key(u, ip, port) {
+        if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
+        return u "|ip:" ip;
+      }
+      function parse_pid(line,   p) {
+        if (match(line, /\[[0-9]+\]/)) {
+          p=substr(line, RSTART+1, RLENGTH-2);
+          if (p ~ /^[0-9]+$/) return p;
+        }
+        return "";
+      }
+      /auth succeeded for /{
+        pid=parse_pid($0);
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+
+        src=$0;
+        sub(/^.* from /, "", src);
+        gsub(/[[:space:]]+$/, "", src);
+        ip=norm_ip(src);
+        port=src;
+        sub(/^.*:/, "", port);
+        if (ip == "") next;
+        if (port !~ /^[0-9]{1,5}$/) next;
+        k=sess_key(u, ip, port);
+        if (pid != "") auth_by_pid[pid]=k; else auth_no_pid[k]=1;
+        next;
+      }
+      /Exit \(|Exit before auth:/{
+        pid=parse_pid($0);
+        if (pid != "") closed_pid[pid]=1;
+      }
+      END{
+        for (pid in auth_by_pid) {
+          if (pid in closed_pid) continue;
+          seen[auth_by_pid[pid]]=1;
+        }
+        for (k in auth_no_pid) seen[k]=1;
+        for (k in seen) {
+          split(k, a, /\|/);
+          cnt[a[1]]++;
+        }
+        for (u in cnt) print u, cnt[u];
+      }' > "${tmp_ip_count}" || true
+    [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_AUTH_WINDOW"
+  fi
+
   # Fallback longgar untuk HTTP Custom:
   # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
   journalctl -u dropbear --since "-2 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '

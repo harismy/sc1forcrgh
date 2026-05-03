@@ -10167,7 +10167,6 @@ show_ssh_only_online() {
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
-  hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
   db_log_max="$(echo "${DROPBEAR_LOG_MAX_LINES:-20000}" | tr -cd '0-9')"
   db_recent_log_max="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
   source_mode="REALTIME_SOCKET"

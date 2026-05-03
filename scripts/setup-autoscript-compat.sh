@@ -10617,6 +10617,58 @@ show_ssh_only_online() {
     [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_AUTH_WINDOW"
   fi
 
+  # Realtime mux-live:
+  # Ambil port aktif dari ssh-mux -> dropbear, lalu pilih auth sukses terbaru per-port.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    : > "${tmp_db_ports}"
+    ss -Htnp state established 2>/dev/null | awk '
+      function p(v,   s,n,a,port) {
+        s=v;
+        gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+        n=split(s, a, ":");
+        port=a[n];
+        if (port ~ /^[0-9]{1,5}$/) return port;
+        return "";
+      }
+      {
+        if ($0 !~ /ssh-mux/) next;
+        lp=p($4); rp=p($5);
+        if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
+          if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
+        } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
+          if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
+        }
+      }
+      END { for (k in act) print k; }' > "${tmp_db_ports}" || true
+
+    if [[ -s "${tmp_db_ports}" ]]; then
+      journalctl -u dropbear --since "-30 min" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
+        NR==FNR { ap[$1]=1; next }
+        /auth succeeded for /{
+          u=$0;
+          sub(/^.*auth succeeded for /,"",u);
+          sub(/^'\''/,"",u); sub(/^"/,"",u);
+          sub(/'\''.*/,"",u); sub(/".*/,"",u);
+          sub(/[[:space:]].*$/,"",u);
+          u=tolower(u);
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+
+          src=$0;
+          sub(/^.* from /, "", src);
+          gsub(/[[:space:]]+$/, "", src);
+          port=src;
+          sub(/^.*:/, "", port);
+          if (!(port in ap)) next;
+          last_user[port]=u;
+        }
+        END {
+          for (p in last_user) cnt[last_user[p]]++;
+          for (u in cnt) print u, cnt[u];
+        }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
+      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_MUX_LIVE"
+    fi
+  fi
+
   # Fallback longgar untuk HTTP Custom:
   # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
   journalctl -u dropbear --since "-2 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '

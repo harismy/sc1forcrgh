@@ -10152,7 +10152,7 @@ show_ssh_online_history() {
 show_ssh_only_online() {
   local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge tmp_db_pids hc_auth_lookback_h
   local dropbear_main_port dropbear_alt_port
-  local source_mode allow_fallback
+  local source_mode allow_fallback db_log_max db_recent_log_max
   tmp_status="$(mktemp)"
   tmp_ss_pid_ip="$(mktemp)"
   tmp_pid_user="$(mktemp)"
@@ -10168,10 +10168,14 @@ show_ssh_only_online() {
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
   hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
+  db_log_max="$(echo "${DROPBEAR_LOG_MAX_LINES:-20000}" | tr -cd '0-9')"
+  db_recent_log_max="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
   source_mode="REALTIME_SOCKET"
   allow_fallback="$(echo "${SSH_MONITOR_ALLOW_FALLBACK:-0}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
+  [[ -z "${db_log_max}" ]] && db_log_max="20000"
+  [[ -z "${db_recent_log_max}" ]] && db_recent_log_max="5000"
 
   # Sumber utama realtime: socket established (SSH + Dropbear), map PID -> user, lalu hitung unik user+ip.
   : > "${tmp_pair}"
@@ -10256,7 +10260,7 @@ show_ssh_only_online() {
     END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
   if [[ -s "${tmp_db_ports}" ]]; then
-    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
+    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
       function norm_ip(v) {
         gsub(/[[:space:]]/, "", v);
@@ -10349,7 +10353,7 @@ show_ssh_only_online() {
     ' | sort -u > "${tmp_db_pids}" || true
 
     if [[ -s "${tmp_db_pids}" ]]; then
-      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
+      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
         NR==FNR { active[$1]=1; next }
         function parse_pid(line,   p) {
           if (match(line, /\[[0-9]+\]/)) {
@@ -10394,7 +10398,7 @@ show_ssh_only_online() {
   # Realtime window auth:
   # Saat sesi HC sering rehandshake cepat, pakai jendela auth pendek dan buang sesi yang sudah Exit.
   if [[ ! -s "${tmp_ip_count}" ]]; then
-    journalctl -u dropbear --since "-90 sec" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
+    journalctl -u dropbear --since "-90 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
       function norm_ip(v) {
         gsub(/[[:space:]]/, "", v);
         gsub(/^\[/, "", v);
@@ -10460,7 +10464,7 @@ show_ssh_only_online() {
 
   # Fallback longgar untuk HTTP Custom:
   # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
-  journalctl -u dropbear --since "-2 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
+  journalctl -u dropbear --since "-2 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
     function norm_ip(v) {
       gsub(/[[:space:]]/, "", v);
       gsub(/^\[/, "", v);
@@ -10534,7 +10538,7 @@ show_ssh_only_online() {
   # Fallback terakhir (lebih longgar):
   # jika masih kosong, ambil user dari auth sukses dropbear 5 menit terakhir tanpa syarat port aktif.
   if [[ "${allow_fallback}" == "1" && ! -s "${tmp_ip_count}" ]]; then
-    journalctl -u dropbear --since "-5 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
+    journalctl -u dropbear --since "-5 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
       {
         l=tolower($0);
         u="";

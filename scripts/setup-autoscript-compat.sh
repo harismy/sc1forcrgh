@@ -10152,6 +10152,7 @@ show_ssh_online_history() {
 show_ssh_only_online() {
   local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge hc_auth_lookback_h
   local dropbear_main_port dropbear_alt_port
+  local source_mode
   tmp_status="$(mktemp)"
   tmp_ss_pid_ip="$(mktemp)"
   tmp_pid_user="$(mktemp)"
@@ -10166,6 +10167,7 @@ show_ssh_only_online() {
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
   hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
+  source_mode="REALTIME_SOCKET"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
 
@@ -10321,18 +10323,10 @@ show_ssh_only_online() {
         for (u in cnt) print u, cnt[u];
       }' "${tmp_db_ports}" - > "${tmp_db_recent}" || true
 
-    awk '
-      NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-      { b[$1]=$2+0; seen[$1]=1; }
-      END {
-        for (u in seen) {
-          x=(u in a ? a[u] : 0);
-          y=(u in b ? b[u] : 0);
-          n=(x > y ? x : y);
-          if (n > 0) print u, n;
-        }
-      }' "${tmp_ip_count}" "${tmp_db_recent}" > "${tmp_merge}" || true
-    mv -f "${tmp_merge}" "${tmp_ip_count}"
+    if [[ ! -s "${tmp_ip_count}" ]]; then
+      cp -f "${tmp_db_recent}" "${tmp_ip_count}" >/dev/null 2>&1 || true
+      [[ -s "${tmp_ip_count}" ]] && source_mode="FALLBACK_PORT_PID"
+    fi
   fi
 
   # Fallback longgar untuk HTTP Custom:
@@ -10403,22 +10397,37 @@ show_ssh_only_online() {
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_db_recent_loose}" || true
 
-  awk '
-    NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-    { b[$1]=$2+0; seen[$1]=1; }
-    END {
-      for (u in seen) {
-        x=(u in a ? a[u] : 0);
-        y=(u in b ? b[u] : 0);
-        n=(x > y ? x : y);
-        if (n > 0) print u, n;
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    cp -f "${tmp_db_recent_loose}" "${tmp_ip_count}" >/dev/null 2>&1 || true
+    [[ -s "${tmp_ip_count}" ]] && source_mode="FALLBACK_AUTH_2MIN"
+  fi
+
+  # Fallback terakhir (lebih longgar):
+  # jika masih kosong, ambil user dari auth sukses dropbear 5 menit terakhir tanpa syarat port aktif.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    journalctl -u dropbear --since "-5 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
+      {
+        l=tolower($0);
+        u="";
+        if (match(l, /auth succeeded for '\''[a-z0-9._-]+'\''/)) {
+          t=substr(l, RSTART, RLENGTH);
+          gsub(/^.*for '\''/, "", t); gsub(/'\''$/, "", t);
+          u=t;
+        } else if (match($0, /^.*dropbear[^[]*\[[^]]+\]/)) {
+          t=substr($0, RSTART, RLENGTH);
+          sub(/^.*\[/, "", t); sub(/\].*$/, "", t);
+          u=tolower(t);
+        }
+        if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") cnt[u]++;
       }
-    }' "${tmp_ip_count}" "${tmp_db_recent_loose}" > "${tmp_merge}" || true
-  mv -f "${tmp_merge}" "${tmp_ip_count}"
+      END { for (u in cnt) print u, cnt[u]; }
+    ' > "${tmp_ip_count}" || true
+    [[ -s "${tmp_ip_count}" ]] && source_mode="FALLBACK_AUTH_5MIN"
+  fi
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
-  echo "LIST USER LOGIN SSH (REALTIME SOCKET)"
+  echo "LIST USER LOGIN SSH (${source_mode})"
   if [[ ! -s "${tmp_ip_count}" ]]; then
     echo "Tidak ada user SSH yang sedang online."
     echo

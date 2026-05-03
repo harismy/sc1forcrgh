@@ -1232,8 +1232,8 @@ defaults
     timeout server  2m
 
 frontend ft_443
-    # Mode kompatibilitas maksimum untuk SSL-only HC (security lebih lemah).
-    bind *:443 ssl crt ${pem} alpn h2,http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
+    # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
+    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
@@ -8834,8 +8834,8 @@ defaults
     timeout server  2m
 
 frontend ft_443
-    # Mode kompatibilitas maksimum untuk SSL-only HC (security lebih lemah).
-    bind *:443 ssl crt ${pem} alpn h2,http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
+    # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
+    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END

@@ -10765,6 +10765,38 @@ show_ssh_only_online() {
     [[ -s "${tmp_ip_count}" ]] && source_mode="FALLBACK_AUTH_5MIN"
   fi
 
+  # Realtime last-seen (final guard):
+  # Hitung auth sukses 60 detik terakhir per user+port. Ini tetap realtime
+  # dan tahan terhadap pola reconnect cepat HC/SSHWS.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    journalctl -u dropbear --since "-60 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+      /auth succeeded for /{
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+
+        src=$0;
+        sub(/^.* from /, "", src);
+        gsub(/[[:space:]]+$/, "", src);
+        port=src;
+        sub(/^.*:/, "", port);
+        if (port !~ /^[0-9]{1,5}$/) next;
+        seen[u "|" port]=1;
+      }
+      END{
+        for (k in seen) {
+          split(k, a, /\|/);
+          cnt[a[1]]++;
+        }
+        for (u in cnt) print u, cnt[u];
+      }' > "${tmp_ip_count}" || true
+    [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_LASTSEEN_60S"
+  fi
+
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
   echo "LIST USER LOGIN SSH (${source_mode})"

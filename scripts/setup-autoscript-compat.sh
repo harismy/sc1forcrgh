@@ -10355,9 +10355,9 @@ show_ssh_only_online() {
           if (match(line, /\[[0-9]+\]/)) {
             p=substr(line, RSTART+1, RLENGTH-2);
             if (p ~ /^[0-9]+$/) return p;
+          }
+          return "";
         }
-        return "";
-      }
       /auth succeeded for /{
         pid=parse_pid($0);
         if (pid=="" || !(pid in active)) next;

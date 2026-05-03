@@ -7681,10 +7681,10 @@ edit_uuid_xray_account() {
   old_uuid="$(echo "${row}" | head -n1 | xargs)"
   echo "Username : ${username}"
   echo "UUID lama: ${old_uuid:--}"
-  prompt_input new_uuid "UUID baru: " || return
-  new_uuid="$(echo "${new_uuid}" | tr -d '[:space:]')"
-  if [[ ! "${new_uuid}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-    echo "Format UUID tidak valid."
+  prompt_input new_uuid "ID baru (min 3 huruf/angka): " || return
+  new_uuid="$(echo "${new_uuid}" | tr -d '\r' | xargs)"
+  if [[ ! "${new_uuid}" =~ ^[A-Za-z0-9]{3,}$ ]]; then
+    echo "Format tidak valid. Gunakan minimal 3 karakter huruf/angka."
     return
   fi
 

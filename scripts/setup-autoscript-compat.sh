@@ -10355,33 +10355,37 @@ show_ssh_only_online() {
           if (match(line, /\[[0-9]+\]/)) {
             p=substr(line, RSTART+1, RLENGTH-2);
             if (p ~ /^[0-9]+$/) return p;
-          }
-          return "";
         }
-        /auth succeeded for /{
-          pid=parse_pid($0);
-          if (pid=="" || !(pid in active)) next;
-          u=$0;
-          sub(/^.*auth succeeded for /,"",u);
-          sub(/^'\''/,"",u); sub(/^"/,"",u);
-          sub(/'\''.*/,"",u); sub(/".*/,"",u);
-          sub(/[[:space:]].*$/,"",u);
-          u=tolower(u);
-          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-          auth_by_pid[pid]=u;
-          next;
+        return "";
+      }
+      /auth succeeded for /{
+        pid=parse_pid($0);
+        if (pid=="" || !(pid in active)) next;
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+        state[pid]="auth";
+        user_by_pid[pid]=u;
+        next;
+      }
+      /Exit \(|Exit before auth:/{
+        pid=parse_pid($0);
+        if (pid!="" && (pid in active)) state[pid]="exit";
+      }
+      END {
+        for (pid in active) {
+          if (!(pid in state)) continue;
+          if (state[pid] != "auth") continue;
+          u=user_by_pid[pid];
+          if (u == "") continue;
+          cnt[u]++;
         }
-        /Exit \(|Exit before auth:/{
-          pid=parse_pid($0);
-          if (pid != "") closed[pid]=1;
-        }
-        END {
-          for (pid in auth_by_pid) {
-            if (pid in closed) continue;
-            cnt[auth_by_pid[pid]]++;
-          }
-          for (u in cnt) print u, cnt[u];
-        }
+        for (u in cnt) print u, cnt[u];
+      }
       ' "${tmp_db_pids}" - > "${tmp_ip_count}" || true
       [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_DROPBEAR_PID"
     fi

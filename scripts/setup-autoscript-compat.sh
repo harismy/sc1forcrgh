@@ -6541,7 +6541,7 @@ if [[ -f /var/log/xray/access.log ]]; then
       }
       END {
         for (k in seen) {
-          split(k, a, "|")
+          split(k, a, /\|/)
           user=a[1]
           ipcnt[user]++
         }
@@ -6592,7 +6592,7 @@ udphc_users="$(journalctl -u "${udphc_service}" -n 12000 -o short-unix --no-page
     END {
       for (k in ses) {
         if ((now - seen[k]) > win) continue
-        split(k, a, "|")
+        split(k, a, /\|/)
         if (a[1] != "") c[a[1]]++
       }
       for (u in c) printf "%s(%d)\n", u, c[u]
@@ -10106,7 +10106,7 @@ show_combined_online() {
   awk '
     BEGIN { OFS="|" }
     NR==FNR {
-      split($0, a, "|");
+      split($0, a, /\|/);
       st[a[1]]=a[2];
       lim[a[1]]=a[3] + 0;
       next
@@ -10328,7 +10328,7 @@ show_ssh_only_online() {
         }
         for (k in auth_no_pid) seen[k]=1;
         for (k in seen) {
-          split(k,a,"|");
+          split(k,a,/\|/);
           cnt[a[1]]++;
         }
         for (u in cnt) print u, cnt[u];
@@ -10466,7 +10466,7 @@ show_ssh_only_online() {
           }
           for (k in auth_no_pid) seen[k]=1;
           for (k in seen) {
-            split(k,a,"|");
+            split(k,a,/\|/);
             cnt[a[1]]++;
           }
           for (u in cnt) print u, cnt[u];
@@ -10653,7 +10653,7 @@ show_ssh_only_online() {
   printf "%-24s %-12s %-10s %-13s\n" "------------------------" "------------" "----------" "-------------"
   awk '
     NR==FNR {
-      split($0,a,"|");
+      split($0,a,/\|/);
       st[a[1]]=a[2];
       lim[a[1]]=(a[3] ~ /^[0-9]+$/ ? a[3] + 0 : 0);
       next

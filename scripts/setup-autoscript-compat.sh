@@ -1230,6 +1230,9 @@ defaults
 frontend ft_443
     # Paksa ALPN ke HTTP/1.1 agar WebSocket (SSHWS/Xray WS) stabil di TLS 443.
     bind *:443 ssl crt ${pem} alpn http/1.1
+    tcp-request inspect-delay 5s
+    acl is_hc_connect req.payload(0,8) -m str CONNECT
+    use_backend bk_sshws_tls if is_hc_connect
     default_backend bk_mux
 
 backend bk_mux
@@ -1237,6 +1240,11 @@ backend bk_mux
     # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
     # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
     server nginx_local 127.0.0.1:80 check
+
+backend bk_sshws_tls
+    mode tcp
+    # Jalur khusus HTTP Custom SSL-only (payload CONNECT) langsung ke sshws mux.
+    server sshws_local 127.0.0.1:2082 check
 EOF
 
   haproxy -c -f /etc/haproxy/haproxy.cfg
@@ -8788,6 +8796,9 @@ defaults
 frontend ft_443
     # Paksa ALPN ke HTTP/1.1 agar WebSocket (SSHWS/Xray WS) stabil di TLS 443.
     bind *:443 ssl crt ${pem} alpn http/1.1
+    tcp-request inspect-delay 5s
+    acl is_hc_connect req.payload(0,8) -m str CONNECT
+    use_backend bk_sshws_tls if is_hc_connect
     default_backend bk_mux
 
 backend bk_mux
@@ -8795,6 +8806,11 @@ backend bk_mux
     # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
     # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
     server nginx_local 127.0.0.1:80 check
+
+backend bk_sshws_tls
+    mode tcp
+    # Jalur khusus HTTP Custom SSL-only (payload CONNECT) langsung ke sshws mux.
+    server sshws_local 127.0.0.1:2082 check
 EOHAP
 
   haproxy -c -f /etc/haproxy/haproxy.cfg || {

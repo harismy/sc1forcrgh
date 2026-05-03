@@ -2638,7 +2638,10 @@ function vmessLink(host, id, tls) {
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
 function vlessLink(host, id, tls) {
-  return `vless://${id}@${host}:${tls ? '443' : '80'}?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=${tls ? 'tls' : 'none'}&sni=${host}#vless-${host}`;
+  if (tls) {
+    return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${host}&host=${host}&encryption=none#vless-${host}`;
+  }
+  return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#vless-${host}`;
 }
 function trojanLink(host, pass, tls) {
   return `trojan://${pass}@${host}:${tls ? '443' : '80'}?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=${tls ? 'tls' : 'none'}&sni=${host}#trojan-${host}`;
@@ -7946,8 +7949,8 @@ Status       : ${d_status}
 Quota        : ${d_quota}
 Limit IP     : ${d_limit}
 Host         : ${DOMAIN}
-Link TLS     : vless://${d_uuid}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls&sni=${DOMAIN}#${d_user}
-Link NON TLS : vless://${d_uuid}@${DOMAIN}:80?type=ws&path=%2Fvless&security=none&sni=${DOMAIN}#${d_user}
+Link TLS     : vless://${d_uuid}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls&sni=${DOMAIN}&host=${DOMAIN}&encryption=none#${d_user}
+Link NON TLS : vless://${d_uuid}@${DOMAIN}:80?type=ws&path=%2Fvless&security=none&host=${DOMAIN}&encryption=none#${d_user}
 EOT_VLESS_DETAIL
       ;;
     trojan)

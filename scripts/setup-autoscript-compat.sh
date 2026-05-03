@@ -10254,7 +10254,7 @@ show_ssh_only_online() {
     }
     END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
-  if [[ "${allow_fallback}" == "1" && -s "${tmp_db_ports}" ]]; then
+  if [[ -s "${tmp_db_ports}" ]]; then
     journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
       function norm_ip(v) {
@@ -10326,7 +10326,7 @@ show_ssh_only_online() {
 
     if [[ ! -s "${tmp_ip_count}" ]]; then
       cp -f "${tmp_db_recent}" "${tmp_ip_count}" >/dev/null 2>&1 || true
-      [[ -s "${tmp_ip_count}" ]] && source_mode="FALLBACK_PORT_PID"
+      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_PORT_PID"
     fi
   fi
 

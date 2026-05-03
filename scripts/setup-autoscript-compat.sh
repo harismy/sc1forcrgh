@@ -10176,6 +10176,11 @@ show_ssh_only_online() {
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
   [[ -z "${db_log_max}" ]] && db_log_max="20000"
   [[ -z "${db_recent_log_max}" ]] && db_recent_log_max="5000"
+  if command -v get_hc_auth_lookback_hours >/dev/null 2>&1; then
+    hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
+  fi
+  [[ -z "${hc_auth_lookback_h}" ]] && hc_auth_lookback_h="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-6}" | tr -cd '0-9')"
+  [[ -z "${hc_auth_lookback_h}" || "${hc_auth_lookback_h}" -lt 1 || "${hc_auth_lookback_h}" -gt 48 ]] && hc_auth_lookback_h="6"
 
   # Sumber utama realtime: socket established (SSH + Dropbear), map PID -> user, lalu hitung unik user+ip.
   : > "${tmp_pair}"
@@ -10392,6 +10397,81 @@ show_ssh_only_online() {
       }
       ' "${tmp_db_pids}" - > "${tmp_ip_count}" || true
       [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_DROPBEAR_PID"
+    fi
+  fi
+
+  # Realtime active-port map:
+  # Untuk SSHWS/HC, koneksi aktif sering menempel di parent dropbear PID.
+  # Jalur ini map user dari auth log berdasarkan client-port loopback yang benar-benar sedang aktif.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    : > "${tmp_db_ports}"
+    ss -Htnp state established 2>/dev/null | awk '
+      function p(v,   s,n,a,port) {
+        s=v;
+        gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+        n=split(s, a, ":");
+        port=a[n];
+        if (port ~ /^[0-9]{1,5}$/) return port;
+        return "";
+      }
+      {
+        lp=p($4); rp=p($5);
+        if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
+          if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
+        } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
+          if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
+        }
+      }
+      END { for (k in act) print k; }' > "${tmp_db_ports}" || true
+
+    if [[ -s "${tmp_db_ports}" ]]; then
+      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
+        NR==FNR { ap[$1]=1; next }
+        function parse_pid(line,   p) {
+          if (match(line, /\[[0-9]+\]/)) {
+            p=substr(line, RSTART+1, RLENGTH-2);
+            if (p ~ /^[0-9]+$/) return p;
+          }
+          return "";
+        }
+        /auth succeeded for /{
+          pid=parse_pid($0);
+          u=$0;
+          sub(/^.*auth succeeded for /,"",u);
+          sub(/^'\''/,"",u); sub(/^"/,"",u);
+          sub(/'\''.*/,"",u); sub(/".*/,"",u);
+          sub(/[[:space:]].*$/,"",u);
+          u=tolower(u);
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+
+          src=$0;
+          sub(/^.* from /, "", src);
+          gsub(/[[:space:]]+$/, "", src);
+          port=src;
+          sub(/^.*:/, "", port);
+          if (port !~ /^[0-9]{1,5}$/) next;
+          if (!(port in ap)) next;
+          key=u "|port:" port;
+          if (pid != "") auth_by_pid[pid]=key; else auth_no_pid[key]=1;
+          next;
+        }
+        /Exit \(|Exit before auth:/{
+          pid=parse_pid($0);
+          if (pid != "") closed_pid[pid]=1;
+        }
+        END{
+          for (pid in auth_by_pid) {
+            if (pid in closed_pid) continue;
+            seen[auth_by_pid[pid]]=1;
+          }
+          for (k in auth_no_pid) seen[k]=1;
+          for (k in seen) {
+            split(k,a,"|");
+            cnt[a[1]]++;
+          }
+          for (u in cnt) print u, cnt[u];
+        }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
+      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_ACTIVE_PORT"
     fi
   fi
 

@@ -10150,7 +10150,7 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge hc_auth_lookback_h
+  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge tmp_db_pids hc_auth_lookback_h
   local dropbear_main_port dropbear_alt_port
   local source_mode allow_fallback
   tmp_status="$(mktemp)"
@@ -10162,7 +10162,8 @@ show_ssh_only_online() {
   tmp_db_recent="$(mktemp)"
   tmp_db_recent_loose="$(mktemp)"
   tmp_merge="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}" "${tmp_db_recent:-}" "${tmp_db_recent_loose:-}" "${tmp_merge:-}"' RETURN
+  tmp_db_pids="$(mktemp)"
+  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}" "${tmp_db_recent:-}" "${tmp_db_recent_loose:-}" "${tmp_merge:-}" "${tmp_db_pids:-}"' RETURN
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
@@ -10327,6 +10328,62 @@ show_ssh_only_online() {
     if [[ ! -s "${tmp_ip_count}" ]]; then
       cp -f "${tmp_db_recent}" "${tmp_ip_count}" >/dev/null 2>&1 || true
       [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_PORT_PID"
+    fi
+  fi
+
+  # Realtime fallback presisi:
+  # Ambil PID dropbear yang sedang ESTABLISHED, lalu map ke auth succeeded PID yang belum Exit.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    ss -Htnp state established 2>/dev/null | awk '
+      {
+        if ($0 !~ /dropbear/) next;
+        l=$4; r=$5;
+        if (l !~ /:'"${dropbear_main_port}"'$/ && l !~ /:'"${dropbear_alt_port}"'$/ && r !~ /:'"${dropbear_main_port}"'$/ && r !~ /:'"${dropbear_alt_port}"'$/) next;
+        s=$0;
+        while (match(s, /pid=[0-9]+/)) {
+          pid=substr(s, RSTART+4, RLENGTH-4);
+          if (pid ~ /^[0-9]+$/) print pid;
+          s=substr(s, RSTART+RLENGTH);
+        }
+      }
+    ' | sort -u > "${tmp_db_pids}" || true
+
+    if [[ -s "${tmp_db_pids}" ]]; then
+      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
+        NR==FNR { active[$1]=1; next }
+        function parse_pid(line,   p) {
+          if (match(line, /\[[0-9]+\]/)) {
+            p=substr(line, RSTART+1, RLENGTH-2);
+            if (p ~ /^[0-9]+$/) return p;
+          }
+          return "";
+        }
+        /auth succeeded for /{
+          pid=parse_pid($0);
+          if (pid=="" || !(pid in active)) next;
+          u=$0;
+          sub(/^.*auth succeeded for /,"",u);
+          sub(/^'\''/,"",u); sub(/^"/,"",u);
+          sub(/'\''.*/,"",u); sub(/".*/,"",u);
+          sub(/[[:space:]].*$/,"",u);
+          u=tolower(u);
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+          auth_by_pid[pid]=u;
+          next;
+        }
+        /Exit \(|Exit before auth:/{
+          pid=parse_pid($0);
+          if (pid != "") closed[pid]=1;
+        }
+        END {
+          for (pid in auth_by_pid) {
+            if (pid in closed) continue;
+            cnt[auth_by_pid[pid]]++;
+          }
+          for (u in cnt) print u, cnt[u];
+        }
+      ' "${tmp_db_pids}" - > "${tmp_ip_count}" || true
+      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_DROPBEAR_PID"
     fi
   fi
 

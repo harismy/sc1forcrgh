@@ -10475,6 +10475,82 @@ show_ssh_only_online() {
     fi
   fi
 
+  # Realtime ssh-mux port map:
+  # Pada beberapa kondisi, sisi dropbear :109 bisa sangat singkat.
+  # Ambil port aktif dari proses ssh-mux lalu map ke auth dropbear.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    : > "${tmp_db_ports}"
+    ss -Htnp state established 2>/dev/null | awk '
+      function p(v,   s,n,a,port) {
+        s=v;
+        gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+        n=split(s, a, ":");
+        port=a[n];
+        if (port ~ /^[0-9]{1,5}$/) return port;
+        return "";
+      }
+      {
+        if ($0 !~ /ssh-mux/) next;
+        lp=p($4); rp=p($5);
+        if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
+          if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
+        } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
+          if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
+        }
+      }
+      END { for (k in act) print k; }' > "${tmp_db_ports}" || true
+
+    if [[ -s "${tmp_db_ports}" ]]; then
+      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
+        NR==FNR { ap[$1]=1; next }
+        function parse_pid(line,   p) {
+          if (match(line, /\[[0-9]+\]/)) {
+            p=substr(line, RSTART+1, RLENGTH-2);
+            if (p ~ /^[0-9]+$/) return p;
+          }
+          return "";
+        }
+        /auth succeeded for /{
+          pid=parse_pid($0);
+          u=$0;
+          sub(/^.*auth succeeded for /,"",u);
+          sub(/^'\''/,"",u); sub(/^"/,"",u);
+          sub(/'\''.*/,"",u); sub(/".*/,"",u);
+          sub(/[[:space:]].*$/,"",u);
+          u=tolower(u);
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+
+          src=$0;
+          sub(/^.* from /, "", src);
+          gsub(/[[:space:]]+$/, "", src);
+          port=src;
+          sub(/^.*:/, "", port);
+          if (port !~ /^[0-9]{1,5}$/) next;
+          if (!(port in ap)) next;
+          key=u "|port:" port;
+          if (pid != "") auth_by_pid[pid]=key; else auth_no_pid[key]=1;
+          next;
+        }
+        /Exit \(|Exit before auth:/{
+          pid=parse_pid($0);
+          if (pid != "") closed_pid[pid]=1;
+        }
+        END{
+          for (pid in auth_by_pid) {
+            if (pid in closed_pid) continue;
+            seen[auth_by_pid[pid]]=1;
+          }
+          for (k in auth_no_pid) seen[k]=1;
+          for (k in seen) {
+            split(k,a,/\|/);
+            cnt[a[1]]++;
+          }
+          for (u in cnt) print u, cnt[u];
+        }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
+      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_MUX_PORT"
+    fi
+  fi
+
   # Realtime window auth:
   # Saat sesi HC sering rehandshake cepat, pakai jendela auth pendek dan buang sesi yang sudah Exit.
   if [[ ! -s "${tmp_ip_count}" ]]; then

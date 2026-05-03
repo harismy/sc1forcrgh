@@ -1235,7 +1235,9 @@ frontend ft_443
     tcp-request content accept if WAIT_END
     acl is_hc_connect req.payload(0,7) -m str CONNECT
     use_backend bk_sshws_tls if is_hc_connect
-    default_backend bk_mux
+    # Default ke sshws mux agar klien SSL-only HTTP Custom yang variatif tetap ter-handle.
+    # Jalur WS Xray (/vmess,/vless,/trojan) tetap diteruskan mux ke nginx:80.
+    default_backend bk_sshws_tls
 
 backend bk_mux
     mode tcp
@@ -8803,7 +8805,9 @@ frontend ft_443
     tcp-request content accept if WAIT_END
     acl is_hc_connect req.payload(0,7) -m str CONNECT
     use_backend bk_sshws_tls if is_hc_connect
-    default_backend bk_mux
+    # Default ke sshws mux agar klien SSL-only HTTP Custom yang variatif tetap ter-handle.
+    # Jalur WS Xray (/vmess,/vless,/trojan) tetap diteruskan mux ke nginx:80.
+    default_backend bk_sshws_tls
 
 backend bk_mux
     mode tcp

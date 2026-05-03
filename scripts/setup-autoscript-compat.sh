@@ -10150,42 +10150,33 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge tmp_db_pids hc_auth_lookback_h
-  local dropbear_main_port dropbear_alt_port
-  local source_mode allow_fallback db_log_max db_recent_log_max
+  local tmp_status tmp_ip_count tmp_db_ports
+  local dropbear_main_port dropbear_alt_port db_recent_log_max source_mode
   tmp_status="$(mktemp)"
-  tmp_ss_pid_ip="$(mktemp)"
-  tmp_pid_user="$(mktemp)"
-  tmp_pair="$(mktemp)"
   tmp_ip_count="$(mktemp)"
   tmp_db_ports="$(mktemp)"
-  tmp_db_recent="$(mktemp)"
-  tmp_db_recent_loose="$(mktemp)"
-  tmp_merge="$(mktemp)"
-  tmp_db_pids="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}" "${tmp_db_recent:-}" "${tmp_db_recent_loose:-}" "${tmp_merge:-}" "${tmp_db_pids:-}"' RETURN
+  trap 'rm -f "${tmp_status:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}"' RETURN
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
-  db_log_max="$(echo "${DROPBEAR_LOG_MAX_LINES:-20000}" | tr -cd '0-9')"
   db_recent_log_max="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
-  source_mode="REALTIME_LASTSEEN_60S"
-  allow_fallback="$(echo "${SSH_MONITOR_ALLOW_FALLBACK:-0}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
-  [[ -z "${db_log_max}" ]] && db_log_max="20000"
-  [[ -z "${db_recent_log_max}" ]] && db_recent_log_max="5000"
-  if command -v get_hc_auth_lookback_hours >/dev/null 2>&1; then
-    hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
-  fi
-  [[ -z "${hc_auth_lookback_h}" ]] && hc_auth_lookback_h="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-6}" | tr -cd '0-9')"
-  [[ -z "${hc_auth_lookback_h}" || "${hc_auth_lookback_h}" -lt 1 || "${hc_auth_lookback_h}" -gt 48 ]] && hc_auth_lookback_h="6"
+  [[ -z "${db_recent_log_max}" || "${db_recent_log_max}" -lt 500 ]] && db_recent_log_max="5000"
+  source_mode="REALTIME_AUTH_120S"
 
-  # Sumber utama realtime (stabil untuk HC/SSHWS):
-  # Hitung auth sukses 60 detik terakhir per user+port.
   : > "${tmp_ip_count}"
-  journalctl -u dropbear --since "-60 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+  # Ambil user aktif dari auth sukses 120 detik terakhir, keluarkan sesi yang sudah Exit by PID.
+  journalctl -u dropbear --since "-120 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+    function parse_pid(line,   p) {
+      if (match(line, /\[[0-9]+\]/)) {
+        p=substr(line, RSTART+1, RLENGTH-2);
+        if (p ~ /^[0-9]+$/) return p;
+      }
+      return "";
+    }
     /auth succeeded for /{
+      pid=parse_pid($0);
       u=$0;
       sub(/^.*auth succeeded for /,"",u);
       sub(/^'\''/,"",u); sub(/^"/,"",u);
@@ -10200,9 +10191,21 @@ show_ssh_only_online() {
       port=src;
       sub(/^.*:/, "", port);
       if (port !~ /^[0-9]{1,5}$/) next;
-      seen[u "|" port]=1;
+
+      key=u "|" port;
+      if (pid != "") auth_by_pid[pid]=key; else auth_no_pid[key]=1;
+      next;
+    }
+    /Exit \(|Exit before auth:/{
+      pid=parse_pid($0);
+      if (pid != "") closed_pid[pid]=1;
     }
     END{
+      for (pid in auth_by_pid) {
+        if (pid in closed_pid) continue;
+        seen[auth_by_pid[pid]]=1;
+      }
+      for (k in auth_no_pid) seen[k]=1;
       for (k in seen) {
         split(k, a, /\|/);
         cnt[a[1]]++;
@@ -10210,308 +10213,9 @@ show_ssh_only_online() {
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_ip_count}" || true
 
-  # Fallback realtime socket established (SSH + Dropbear), map PID -> user, lalu hitung unik user+ip.
-  : > "${tmp_pair}"
+  # Fallback realtime berdasarkan port ssh-mux yang masih aktif ke dropbear.
   if [[ ! -s "${tmp_ip_count}" ]]; then
-    source_mode="REALTIME_SOCKET"
-    ss -Htnp state established 2>/dev/null | awk '
-    {
-      l=$4;
-      r=$5;
-      if (l ~ /:22$/ || l ~ /:'"${dropbear_main_port}"'$/ || l ~ /:'"${dropbear_alt_port}"'$/) {
-        ip=r;
-        gsub(/^\[/, "", ip);
-        gsub(/\]$/, "", ip);
-        sub(/:[0-9]+$/, "", ip);
-        if (ip == "") next;
-        s=$0;
-        while (match(s, /pid=[0-9]+/)) {
-          pid=substr(s, RSTART + 4, RLENGTH - 4);
-          if (pid ~ /^[0-9]+$/) print pid, ip;
-          s=substr(s, RSTART + RLENGTH);
-        }
-      }
-    }' | sort -u > "${tmp_ss_pid_ip}" || true
-
-  fi
-
-  if [[ ! -s "${tmp_ip_count}" && -s "${tmp_ss_pid_ip}" ]]; then
-    local pid_csv
-    pid_csv="$(awk '{print $1}' "${tmp_ss_pid_ip}" | sort -u | paste -sd, -)"
-    ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
-      {
-        pid=$1;
-        $1="";
-        sub(/^[[:space:]]+/, "", $0);
-        u="";
-        if ($0 ~ /^sshd:/) {
-          u=$0;
-          sub(/^sshd:[[:space:]]*/, "", u);
-          sub(/[[:space:]].*$/, "", u);
-          sub(/@.*$/, "", u);
-          sub(/\[.*$/, "", u);
-        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
-          u=$0;
-          if (u !~ /\[[^]]+\]/) next;
-          sub(/^.*\[/, "", u);
-          sub(/\].*$/, "", u);
-        } else next;
-        u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/) next;
-        if (u == "root" || u == "priv" || u == "net") next;
-        print pid, u;
-      }' > "${tmp_pid_user}" || true
-
-    awk '
-      NR==FNR { u[$1]=$2; next }
-      {
-        pid=$1; ip=$2; user=(pid in u ? u[pid] : "");
-        if (user != "" && ip != "") print user, ip;
-      }' "${tmp_pid_user}" "${tmp_ss_pid_ip}" | sort -u > "${tmp_pair}" || true
-  fi
-
-  if [[ ! -s "${tmp_ip_count}" ]]; then
-    awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_pair}" > "${tmp_ip_count}" || true
-  fi
-
-  # Tambahan untuk jalur SSH-WS/HC:
-  # Ambil user dari log auth dropbear, tapi hanya untuk client-port yang masih aktif saat ini.
-  : > "${tmp_db_ports}"
-  : > "${tmp_db_recent}"
-  ss -Htnp state established 2>/dev/null | awk '
-    function p(v,   s,n,a,port) {
-      s=v;
-      gsub(/^\[/, "", s); gsub(/\]$/, "", s);
-      n=split(s, a, ":");
-      port=a[n];
-      if (port ~ /^[0-9]{1,5}$/) return port;
-      return "";
-    }
-    {
-      lp=p($4); rp=p($5);
-      if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
-        if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
-      } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
-        if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
-      }
-    }
-    END { for (k in act) print k; }' > "${tmp_db_ports}" || true
-
-  if [[ -s "${tmp_db_ports}" ]]; then
-    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
-      NR==FNR { ap[$1]=1; next }
-      function norm_ip(v) {
-        gsub(/[[:space:]]/, "", v);
-        gsub(/^\[/, "", v);
-        gsub(/\]/, "", v);
-        sub(/:[0-9]+$/, "", v);
-        return v;
-      }
-      function is_loopback_ip(v,   t) {
-        t=tolower(v);
-        return (t=="127.0.0.1" || t=="::1" || t=="localhost");
-      }
-      function sess_key(u, ip, port) {
-        if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
-        return u "|ip:" ip;
-      }
-      function parse_pid(line,   p) {
-        if (match(line, /\[[0-9]+\]/)) {
-          p=substr(line, RSTART+1, RLENGTH-2);
-          if (p ~ /^[0-9]+$/) return p;
-        }
-        return "";
-      }
-      /auth succeeded for /{
-        pid=parse_pid($0);
-        u=$0;
-        sub(/^.*auth succeeded for /,"",u);
-        sub(/^'\''/,"",u); sub(/^"/,"",u);
-        sub(/'\''.*/,"",u); sub(/".*/,"",u);
-        sub(/[[:space:]].*$/,"",u);
-        u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-
-        src=$0;
-        sub(/^.* from /, "", src);
-        gsub(/[[:space:]]+$/, "", src);
-        ip=src;
-        port=src;
-        sub(/^.*:/, "", port);
-        ip=norm_ip(ip);
-        if (ip == "") next;
-        if (port !~ /^[0-9]{1,5}$/) next;
-        if (!(port in ap)) next;
-        k=sess_key(u, ip, port);
-        if (pid != "") {
-          auth_by_pid[pid]=k;
-        } else {
-          auth_no_pid[k]=1;
-        }
-        next;
-      }
-      /Exit \(|Exit before auth:/{
-        pid=parse_pid($0);
-        if (pid != "") closed_pid[pid]=1;
-      }
-      END{
-        for (pid in auth_by_pid) {
-          if (pid in closed_pid) continue;
-          seen[auth_by_pid[pid]]=1;
-        }
-        for (k in auth_no_pid) seen[k]=1;
-        for (k in seen) {
-          split(k,a,/\|/);
-          cnt[a[1]]++;
-        }
-        for (u in cnt) print u, cnt[u];
-      }' "${tmp_db_ports}" - > "${tmp_db_recent}" || true
-
-    if [[ ! -s "${tmp_ip_count}" ]]; then
-      cp -f "${tmp_db_recent}" "${tmp_ip_count}" >/dev/null 2>&1 || true
-      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_PORT_PID"
-    fi
-  fi
-
-  # Realtime fallback presisi:
-  # Ambil PID dropbear yang sedang ESTABLISHED, lalu map ke auth succeeded PID yang belum Exit.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
-    ss -Htnp state established 2>/dev/null | awk '
-      {
-        if ($0 !~ /dropbear/) next;
-        l=$4; r=$5;
-        if (l !~ /:'"${dropbear_main_port}"'$/ && l !~ /:'"${dropbear_alt_port}"'$/ && r !~ /:'"${dropbear_main_port}"'$/ && r !~ /:'"${dropbear_alt_port}"'$/) next;
-        s=$0;
-        while (match(s, /pid=[0-9]+/)) {
-          pid=substr(s, RSTART+4, RLENGTH-4);
-          if (pid ~ /^[0-9]+$/) print pid;
-          s=substr(s, RSTART+RLENGTH);
-        }
-      }
-    ' | sort -u > "${tmp_db_pids}" || true
-
-    if [[ -s "${tmp_db_pids}" ]]; then
-      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
-        NR==FNR { active[$1]=1; next }
-        function parse_pid(line,   p) {
-          if (match(line, /\[[0-9]+\]/)) {
-            p=substr(line, RSTART+1, RLENGTH-2);
-            if (p ~ /^[0-9]+$/) return p;
-          }
-          return "";
-        }
-      /auth succeeded for /{
-        pid=parse_pid($0);
-        if (pid=="" || !(pid in active)) next;
-        u=$0;
-        sub(/^.*auth succeeded for /,"",u);
-        sub(/^'\''/,"",u); sub(/^"/,"",u);
-        sub(/'\''.*/,"",u); sub(/".*/,"",u);
-        sub(/[[:space:]].*$/,"",u);
-        u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-        state[pid]="auth";
-        user_by_pid[pid]=u;
-        next;
-      }
-      /Exit \(|Exit before auth:/{
-        pid=parse_pid($0);
-        if (pid!="" && (pid in active)) state[pid]="exit";
-      }
-      END {
-        for (pid in active) {
-          if (!(pid in state)) continue;
-          if (state[pid] != "auth") continue;
-          u=user_by_pid[pid];
-          if (u == "") continue;
-          cnt[u]++;
-        }
-        for (u in cnt) print u, cnt[u];
-      }
-      ' "${tmp_db_pids}" - > "${tmp_ip_count}" || true
-      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_DROPBEAR_PID"
-    fi
-  fi
-
-  # Realtime active-port map:
-  # Untuk SSHWS/HC, koneksi aktif sering menempel di parent dropbear PID.
-  # Jalur ini map user dari auth log berdasarkan client-port loopback yang benar-benar sedang aktif.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
-    : > "${tmp_db_ports}"
-    ss -Htnp state established 2>/dev/null | awk '
-      function p(v,   s,n,a,port) {
-        s=v;
-        gsub(/^\[/, "", s); gsub(/\]$/, "", s);
-        n=split(s, a, ":");
-        port=a[n];
-        if (port ~ /^[0-9]{1,5}$/) return port;
-        return "";
-      }
-      {
-        lp=p($4); rp=p($5);
-        if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
-          if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
-        } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
-          if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
-        }
-      }
-      END { for (k in act) print k; }' > "${tmp_db_ports}" || true
-
-    if [[ -s "${tmp_db_ports}" ]]; then
-      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
-        NR==FNR { ap[$1]=1; next }
-        function parse_pid(line,   p) {
-          if (match(line, /\[[0-9]+\]/)) {
-            p=substr(line, RSTART+1, RLENGTH-2);
-            if (p ~ /^[0-9]+$/) return p;
-          }
-          return "";
-        }
-        /auth succeeded for /{
-          pid=parse_pid($0);
-          u=$0;
-          sub(/^.*auth succeeded for /,"",u);
-          sub(/^'\''/,"",u); sub(/^"/,"",u);
-          sub(/'\''.*/,"",u); sub(/".*/,"",u);
-          sub(/[[:space:]].*$/,"",u);
-          u=tolower(u);
-          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-
-          src=$0;
-          sub(/^.* from /, "", src);
-          gsub(/[[:space:]]+$/, "", src);
-          port=src;
-          sub(/^.*:/, "", port);
-          if (port !~ /^[0-9]{1,5}$/) next;
-          if (!(port in ap)) next;
-          key=u "|port:" port;
-          if (pid != "") auth_by_pid[pid]=key; else auth_no_pid[key]=1;
-          next;
-        }
-        /Exit \(|Exit before auth:/{
-          pid=parse_pid($0);
-          if (pid != "") closed_pid[pid]=1;
-        }
-        END{
-          for (pid in auth_by_pid) {
-            if (pid in closed_pid) continue;
-            seen[auth_by_pid[pid]]=1;
-          }
-          for (k in auth_no_pid) seen[k]=1;
-          for (k in seen) {
-            split(k,a,/\|/);
-            cnt[a[1]]++;
-          }
-          for (u in cnt) print u, cnt[u];
-        }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
-      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_ACTIVE_PORT"
-    fi
-  fi
-
-  # Realtime ssh-mux port map:
-  # Pada beberapa kondisi, sisi dropbear :109 bisa sangat singkat.
-  # Ambil port aktif dari proses ssh-mux lalu map ke auth dropbear.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
+    source_mode="REALTIME_MUX_PORT"
     : > "${tmp_db_ports}"
     ss -Htnp state established 2>/dev/null | awk '
       function p(v,   s,n,a,port) {
@@ -10534,149 +10238,7 @@ show_ssh_only_online() {
       END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
     if [[ -s "${tmp_db_ports}" ]]; then
-      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
-        NR==FNR { ap[$1]=1; next }
-        function parse_pid(line,   p) {
-          if (match(line, /\[[0-9]+\]/)) {
-            p=substr(line, RSTART+1, RLENGTH-2);
-            if (p ~ /^[0-9]+$/) return p;
-          }
-          return "";
-        }
-        /auth succeeded for /{
-          pid=parse_pid($0);
-          u=$0;
-          sub(/^.*auth succeeded for /,"",u);
-          sub(/^'\''/,"",u); sub(/^"/,"",u);
-          sub(/'\''.*/,"",u); sub(/".*/,"",u);
-          sub(/[[:space:]].*$/,"",u);
-          u=tolower(u);
-          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-
-          src=$0;
-          sub(/^.* from /, "", src);
-          gsub(/[[:space:]]+$/, "", src);
-          port=src;
-          sub(/^.*:/, "", port);
-          if (port !~ /^[0-9]{1,5}$/) next;
-          if (!(port in ap)) next;
-          key=u "|port:" port;
-          if (pid != "") auth_by_pid[pid]=key; else auth_no_pid[key]=1;
-          next;
-        }
-        /Exit \(|Exit before auth:/{
-          pid=parse_pid($0);
-          if (pid != "") closed_pid[pid]=1;
-        }
-        END{
-          for (pid in auth_by_pid) {
-            if (pid in closed_pid) continue;
-            seen[auth_by_pid[pid]]=1;
-          }
-          for (k in auth_no_pid) seen[k]=1;
-          for (k in seen) {
-            split(k,a,/\|/);
-            cnt[a[1]]++;
-          }
-          for (u in cnt) print u, cnt[u];
-        }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
-      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_MUX_PORT"
-    fi
-  fi
-
-  # Realtime window auth:
-  # Saat sesi HC sering rehandshake cepat, pakai jendela auth pendek dan buang sesi yang sudah Exit.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
-    journalctl -u dropbear --since "-90 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
-      function norm_ip(v) {
-        gsub(/[[:space:]]/, "", v);
-        gsub(/^\[/, "", v);
-        gsub(/\]/, "", v);
-        sub(/:[0-9]+$/, "", v);
-        return v;
-      }
-      function is_loopback_ip(v,   t) {
-        t=tolower(v);
-        return (t=="127.0.0.1" || t=="::1" || t=="localhost");
-      }
-      function sess_key(u, ip, port) {
-        if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
-        return u "|ip:" ip;
-      }
-      function parse_pid(line,   p) {
-        if (match(line, /\[[0-9]+\]/)) {
-          p=substr(line, RSTART+1, RLENGTH-2);
-          if (p ~ /^[0-9]+$/) return p;
-        }
-        return "";
-      }
-      /auth succeeded for /{
-        pid=parse_pid($0);
-        u=$0;
-        sub(/^.*auth succeeded for /,"",u);
-        sub(/^'\''/,"",u); sub(/^"/,"",u);
-        sub(/'\''.*/,"",u); sub(/".*/,"",u);
-        sub(/[[:space:]].*$/,"",u);
-        u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-
-        src=$0;
-        sub(/^.* from /, "", src);
-        gsub(/[[:space:]]+$/, "", src);
-        ip=norm_ip(src);
-        port=src;
-        sub(/^.*:/, "", port);
-        if (ip == "") next;
-        if (port !~ /^[0-9]{1,5}$/) next;
-        k=sess_key(u, ip, port);
-        if (pid != "") auth_by_pid[pid]=k; else auth_no_pid[k]=1;
-        next;
-      }
-      /Exit \(|Exit before auth:/{
-        pid=parse_pid($0);
-        if (pid != "") closed_pid[pid]=1;
-      }
-      END{
-        for (pid in auth_by_pid) {
-          if (pid in closed_pid) continue;
-          seen[auth_by_pid[pid]]=1;
-        }
-        for (k in auth_no_pid) seen[k]=1;
-        for (k in seen) {
-          split(k, a, /\|/);
-          cnt[a[1]]++;
-        }
-        for (u in cnt) print u, cnt[u];
-      }' > "${tmp_ip_count}" || true
-    [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_AUTH_WINDOW"
-  fi
-
-  # Realtime mux-live:
-  # Ambil port aktif dari ssh-mux -> dropbear, lalu pilih auth sukses terbaru per-port.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
-    : > "${tmp_db_ports}"
-    ss -Htnp state established 2>/dev/null | awk '
-      function p(v,   s,n,a,port) {
-        s=v;
-        gsub(/^\[/, "", s); gsub(/\]$/, "", s);
-        n=split(s, a, ":");
-        port=a[n];
-        if (port ~ /^[0-9]{1,5}$/) return port;
-        return "";
-      }
-      {
-        if ($0 !~ /ssh-mux/) next;
-        lp=p($4); rp=p($5);
-        if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
-          if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
-        } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
-          if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
-        }
-      }
-      END { for (k in act) print k; }' > "${tmp_db_ports}" || true
-
-    if [[ -s "${tmp_db_ports}" ]]; then
-      journalctl -u dropbear --since "-30 min" -n "${db_log_max}" --no-pager 2>/dev/null | awk '
+      journalctl -u dropbear --since "-30 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
         NR==FNR { ap[$1]=1; next }
         /auth succeeded for /{
           u=$0;
@@ -10699,111 +10261,7 @@ show_ssh_only_online() {
           for (p in last_user) cnt[last_user[p]]++;
           for (u in cnt) print u, cnt[u];
         }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
-      [[ -s "${tmp_ip_count}" ]] && source_mode="REALTIME_MUX_LIVE"
     fi
-  fi
-
-  # Fallback longgar untuk HTTP Custom:
-  # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
-  journalctl -u dropbear --since "-2 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
-    function norm_ip(v) {
-      gsub(/[[:space:]]/, "", v);
-      gsub(/^\[/, "", v);
-      gsub(/\]/, "", v);
-      sub(/:[0-9]+$/, "", v);
-      return v;
-    }
-    function is_loopback_ip(v,   t) {
-      t=tolower(v);
-      return (t=="127.0.0.1" || t=="::1" || t=="localhost");
-    }
-    function sess_key(u, ip, port) {
-      if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
-      return u "|ip:" ip;
-    }
-    function parse_pid(line,   p) {
-      if (match(line, /\[[0-9]+\]/)) {
-        p=substr(line, RSTART+1, RLENGTH-2);
-        if (p ~ /^[0-9]+$/) return p;
-      }
-      return "";
-    }
-    /auth succeeded for /{
-      pid=parse_pid($0);
-      u=$0;
-      sub(/^.*auth succeeded for /,"",u);
-      sub(/^'\''/,"",u); sub(/^"/,"",u);
-      sub(/'\''.*/,"",u); sub(/".*/,"",u);
-      sub(/[[:space:]].*$/,"",u);
-      u=tolower(u);
-      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-
-      src=$0;
-      sub(/^.* from /, "", src);
-      gsub(/[[:space:]]+$/, "", src);
-      ip=norm_ip(src);
-      port=src;
-      sub(/^.*:/, "", port);
-      if (ip == "") next;
-      if (port !~ /^[0-9]{1,5}$/) next;
-      k=sess_key(u, ip, port);
-      if (pid != "") {
-        auth_by_pid[pid]=k;
-      } else {
-        auth_no_pid[k]=1;
-      }
-      next;
-    }
-    /Exit \(|Exit before auth:/{
-      pid=parse_pid($0);
-      if (pid != "") closed_pid[pid]=1;
-    }
-    END{
-      for (pid in auth_by_pid) {
-        if (pid in closed_pid) continue;
-        seen[auth_by_pid[pid]]=1;
-      }
-      for (k in auth_no_pid) seen[k]=1;
-      for (k in seen) {
-        split(k, a, /\|/);
-        cnt[a[1]]++;
-      }
-      for (u in cnt) print u, cnt[u];
-    }' > "${tmp_db_recent_loose}" || true
-
-  if [[ "${allow_fallback}" == "1" && ! -s "${tmp_ip_count}" ]]; then
-    cp -f "${tmp_db_recent_loose}" "${tmp_ip_count}" >/dev/null 2>&1 || true
-    [[ -s "${tmp_ip_count}" ]] && source_mode="FALLBACK_AUTH_2MIN"
-  fi
-
-  # Fallback terakhir (lebih longgar):
-  # jika masih kosong, ambil user dari auth sukses dropbear 5 menit terakhir tanpa syarat port aktif.
-  if [[ "${allow_fallback}" == "1" && ! -s "${tmp_ip_count}" ]]; then
-    journalctl -u dropbear --since "-5 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
-      {
-        l=tolower($0);
-        u="";
-        if (match(l, /auth succeeded for '\''[a-z0-9._-]+'\''/)) {
-          t=substr(l, RSTART, RLENGTH);
-          gsub(/^.*for '\''/, "", t); gsub(/'\''$/, "", t);
-          u=t;
-        } else if (match($0, /^.*dropbear[^[]*\[[^]]+\]/)) {
-          t=substr($0, RSTART, RLENGTH);
-          sub(/^.*\[/, "", t); sub(/\].*$/, "", t);
-          u=tolower(t);
-        }
-        if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") cnt[u]++;
-      }
-      END { for (u in cnt) print u, cnt[u]; }
-    ' > "${tmp_ip_count}" || true
-    [[ -s "${tmp_ip_count}" ]] && source_mode="FALLBACK_AUTH_5MIN"
-  fi
-
-  # Realtime last-seen (final guard):
-  # Hitung auth sukses 60 detik terakhir per user+port. Ini tetap realtime
-  # dan tahan terhadap pola reconnect cepat HC/SSHWS.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
-    [[ -n "${source_mode}" ]] || source_mode="REALTIME_LASTSEEN_60S"
   fi
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true

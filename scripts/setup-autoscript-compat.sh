@@ -1246,9 +1246,9 @@ frontend ft_443
     acl is_hc_connect req.payload(0,7) -m str CONNECT
     use_backend bk_mux if is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
-    # Default ke sshws mux agar klien SSL-only HTTP Custom yang variatif tetap ter-handle.
-    # Jalur WS Xray (/vmess,/vless,/trojan) tetap diteruskan mux ke nginx:80.
-    default_backend bk_sshws_tls
+    # Default ke nginx/xray path agar VMESS/VLESS/TROJAN WS 443 stabil.
+    # Jalur SSH SSL-only tetap masuk ke bk_sshws_tls via method CONNECT.
+    default_backend bk_mux
 
 backend bk_mux
     mode tcp
@@ -8858,9 +8858,9 @@ frontend ft_443
     acl is_hc_connect req.payload(0,7) -m str CONNECT
     use_backend bk_mux if is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
-    # Default ke sshws mux agar klien SSL-only HTTP Custom yang variatif tetap ter-handle.
-    # Jalur WS Xray (/vmess,/vless,/trojan) tetap diteruskan mux ke nginx:80.
-    default_backend bk_sshws_tls
+    # Default ke nginx/xray path agar VMESS/VLESS/TROJAN WS 443 stabil.
+    # Jalur SSH SSL-only tetap masuk ke bk_sshws_tls via method CONNECT.
+    default_backend bk_mux
 
 backend bk_mux
     mode tcp

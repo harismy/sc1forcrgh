@@ -1228,7 +1228,8 @@ defaults
     timeout server  2m
 
 frontend ft_443
-    bind *:443 ssl crt ${pem} alpn h2,http/1.1
+    # Paksa ALPN ke HTTP/1.1 agar WebSocket (SSHWS/Xray WS) stabil di TLS 443.
+    bind *:443 ssl crt ${pem} alpn http/1.1
     default_backend bk_mux
 
 backend bk_mux
@@ -8785,7 +8786,8 @@ defaults
     timeout server  2m
 
 frontend ft_443
-    bind *:443 ssl crt ${pem} alpn h2,http/1.1
+    # Paksa ALPN ke HTTP/1.1 agar WebSocket (SSHWS/Xray WS) stabil di TLS 443.
+    bind *:443 ssl crt ${pem} alpn http/1.1
     default_backend bk_mux
 
 backend bk_mux

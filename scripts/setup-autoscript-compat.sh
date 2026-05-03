@@ -1217,6 +1217,10 @@ global
     daemon
     maxconn 20000
     nbthread 1
+    # Kompatibilitas TLS maksimum (security lebih lemah) untuk klien lawas/HC.
+    ssl-default-bind-ciphers DEFAULT:@SECLEVEL=0
+    ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
+    ssl-default-bind-options no-sslv3
 
 defaults
     log global
@@ -1600,6 +1604,13 @@ apply_sshws_loop_guard_rules() {
   while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
     -m connlimit --connlimit-above 12 --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
 
+  # Bypass aman agar trafik valid tidak ikut ke-drop oleh guard.
+  iptables -w 10 -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || iptables -w 10 -I INPUT -i lo -j ACCEPT
+  iptables -w 10 -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -w 10 -C INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT
+
   # Rule 1: drop NEW connection spikes per source IP.
   if ! iptables -w 10 -C INPUT -p tcp -m multiport --dports "${ports}" -m conntrack --ctstate NEW \
     -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-above "${rate}" --hashlimit-burst "${burst}" \
@@ -1622,6 +1633,17 @@ apply_sshws_loop_guard_rules() {
   fi
   fw_persist_rules
   log "SSHWS loop guard aktif: ports=${ports}, new_above=${rate}, burst=${burst}, connlimit_above=${connlimit}"
+}
+
+ensure_sshws_firewall_allow_rules() {
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -w 10 -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || iptables -w 10 -I INPUT -i lo -j ACCEPT
+    iptables -w 10 -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -w 10 -C INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT
+  fi
+  fw_persist_rules
 }
 
 setup_zivpn_udp_nat_rules() {
@@ -8362,8 +8384,18 @@ restart_active_udp_backend() {
 }
 
 restart_all_services() {
+  local haproxy_ok="0"
+  if haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1; then
+    haproxy_ok="1"
+  else
+    echo "Peringatan: config haproxy invalid, restart haproxy dilewati."
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl restart ssh dropbear nginx haproxy xray sc-1forcr-api sc-1forcr-sshws >/dev/null 2>&1 || true
+  ensure_sshws_firewall_allow_rules
+  systemctl restart ssh dropbear sc-1forcr-api sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
+  if [[ "${haproxy_ok}" == "1" ]]; then
+    systemctl restart haproxy >/dev/null 2>&1 || true
+  fi
   systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
@@ -8787,6 +8819,10 @@ global
     daemon
     maxconn 20000
     nbthread 1
+    # Kompatibilitas TLS maksimum (security lebih lemah) untuk klien lawas/HC.
+    ssl-default-bind-ciphers DEFAULT:@SECLEVEL=0
+    ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
+    ssl-default-bind-options no-sslv3
 
 defaults
     log global

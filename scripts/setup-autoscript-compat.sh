@@ -5233,7 +5233,12 @@ async function lockIfExceeded(nowTs) {
     // recent sudah dedup berdasarkan source IP, jadi tidak overcount karena port reconnect.
     const cntProcHint = Math.min(Math.max(cntProc, 0), 3);
     const cntRecentHint = Math.min(Math.max(cntRecent, 0), 3);
-    const cnt = Math.max(cntActive, cntProcHint, cntRecentHint);
+    // Untuk mode ZIVPN HTTP, hitung final diprioritaskan dari sesi aktif realtime
+    // agar mobile handoff 1 HP (IP cepat berganti) tidak false multi-login karena hint historis.
+    const cntHint = Math.max(cntProcHint, cntRecentHint);
+    const cnt = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
+      ? cntActive
+      : Math.max(cntActive, cntHint);
     if (IPLIMIT_DEBUG) {
       console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
     }

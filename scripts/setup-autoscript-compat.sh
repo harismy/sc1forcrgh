@@ -6892,6 +6892,38 @@ xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
+
+# Compatibility helpers for older runtime files on upgraded VPS.
+fw_persist_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+    return 0
+  fi
+  if command -v nft >/dev/null 2>&1 && systemctl is-enabled --quiet nftables 2>/dev/null; then
+    nft list ruleset >/etc/nftables.conf 2>/dev/null || true
+  fi
+  return 0
+}
+
+ensure_sshws_firewall_allow_rules() {
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -w 10 -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || iptables -w 10 -I INPUT -i lo -j ACCEPT
+    iptables -w 10 -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -w 10 -C INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT
+  fi
+  fw_persist_rules
+}
+
+get_hc_auth_lookback_hours() {
+  local v
+  v="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-6}" | tr -cd '0-9')"
+  [[ -z "${v}" || "${v}" -lt 1 || "${v}" -gt 48 ]] && v="6"
+  echo "${v}"
+}
+
 normalize_xray_paths_csv() {
   local raw fallback p normalized out
   raw="${1:-}"

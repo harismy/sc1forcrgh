@@ -3843,12 +3843,15 @@ async function notifyAccountBotMultiLogin(event) {
   }
 }
 
-async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null) {
+async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null, extra = null) {
   try {
     const list = Array.isArray(ips) ? ips.filter(Boolean).slice(0, 8) : [];
     const ownerIdNum = Number(ownerId || 0);
     const ownerChatIdNum = Number(ownerChatId || 0);
     const hasOwnerTarget = ownerIdNum > 0 || ownerChatIdNum > 0;
+    const rawDetected = Number(extra?.detected_raw || 0);
+    const effectiveDetected = Number(extra?.detected_effective || Number(detected || 0));
+    const deviceDetectedLabel = String(extra?.device_detected_label || '').trim();
     const event = {
       event: 'MULTI_LOGIN',
       action: 'LOCK_TMP',
@@ -3856,6 +3859,9 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       username: String(username || '-'),
       limitip: Number(limitip || 0),
       detected: Number(detected || 0),
+      detected_raw: rawDetected > 0 ? rawDetected : null,
+      detected_effective: effectiveDetected > 0 ? effectiveDetected : Number(detected || 0),
+      device_detected_label: deviceDetectedLabel || null,
       ips: list,
       unlock_minutes: Number(LOCK_MINUTES || 15),
       owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
@@ -3874,6 +3880,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       `Username : ${String(username || '-')}\n` +
       `Limit IP : ${Number(limitip || 0)}\n` +
       `Detected : ${Number(detected || 0)}\n` +
+      `${deviceDetectedLabel ? `Info     : ${deviceDetectedLabel}\n` : ''}` +
       `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
       `Unlock   : ${Number(LOCK_MINUTES || 15)} menit\n` +
       `TG User  : ${ownerId || '-'}\n` +
@@ -5221,9 +5228,19 @@ async function lockIfExceeded(nowTs) {
     const cntZivpnLive = setMaxSize(sshZivpnLiveSessionMap);
     const cntZivpnLiveIp = setMaxSize(sshZivpnLiveIpMap);
     const hasLiveZivpn = cntZivpnLive > 0 || cntZivpnLiveIp > 0;
-    const cntZivpnEffective = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
+    const cntZivpnRaw = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
       ? Math.max(cntZivpnLive, cntZivpnLiveIp)
       : Math.max(cntZivpn, cntZivpnIp, cntZivpnLive, cntZivpnLiveIp);
+    // Normalisasi khusus ZIVPN (permintaan operasional):
+    // 1-2 IP aktif => hitung 1
+    // 3-4 IP aktif => hitung 2
+    // >=5 IP aktif => hitung normal
+    let cntZivpnEffective = cntZivpnRaw;
+    if (cntZivpnRaw > 0 && cntZivpnRaw <= 2) {
+      cntZivpnEffective = 1;
+    } else if (cntZivpnRaw >= 3 && cntZivpnRaw <= 4) {
+      cntZivpnEffective = 2;
+    }
     // Sumber realtime utama:
     // - ipMap/sessionMap untuk SSH normal
     // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
@@ -5240,7 +5257,7 @@ async function lockIfExceeded(nowTs) {
       ? cntActive
       : Math.max(cntActive, cntHint);
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
     }
     if (cnt <= lim) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;
@@ -5287,6 +5304,10 @@ async function lockIfExceeded(nowTs) {
     if (udphcSecretChanged) udpcustomChanged = true;
     await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + LOCK_SECONDS, removed]).catch(() => {});
+    let zivpnNotifyLabel = '';
+    if (ZIVPN_AUTH_MODE === 'http' && lim === 1 && cntZivpnRaw >= 4 && cntZivpnEffective === 2) {
+      zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
+    }
     await notifyMultiLoginLock(
       'ssh/zivpn',
       user,
@@ -5294,7 +5315,12 @@ async function lockIfExceeded(nowTs) {
       cnt,
       lockIps,
       Number(r.owner_telegram_id || 0) || null,
-      Number(r.owner_telegram_chat_id || 0) || null
+      Number(r.owner_telegram_chat_id || 0) || null,
+      {
+        detected_raw: cntZivpnRaw,
+        detected_effective: cntZivpnEffective,
+        device_detected_label: zivpnNotifyLabel
+      }
     );
   }
 

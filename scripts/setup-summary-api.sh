@@ -1048,7 +1048,27 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
       return res.status(500).json({ ok: false, message: `kolom username tidak ada di ${table}` });
     }
 
-    const insertCols = columns.filter((col) => accounts.some((row) => Object.prototype.hasOwnProperty.call(row || {}, col)));
+    const importRows = (Array.isArray(accounts) ? accounts : []).map((raw) => ({ ...(raw || {}) }));
+
+    // Kompatibilitas backup lintas script:
+    // - Beberapa backup (mis. potato) mengirim trojan credential di field "uuid"
+    // - DB 1FORCR menyimpan trojan credential di kolom "password"
+    if (type === 'trojan') {
+      for (const r of importRows) {
+        const pass = String(r.password || '').trim();
+        const uid = String(r.uuid || r.id || r.secret || '').trim();
+        if (!pass && uid) r.password = uid;
+      }
+    }
+
+    // Kompatibilitas nama field limit IP lintas source.
+    for (const r of importRows) {
+      if ((r.limitip === undefined || r.limitip === null || r.limitip === '') && r.limit_ip !== undefined && r.limit_ip !== null) {
+        r.limitip = r.limit_ip;
+      }
+    }
+
+    const insertCols = columns.filter((col) => importRows.some((row) => Object.prototype.hasOwnProperty.call(row || {}, col)));
     if (!insertCols.includes('username')) insertCols.unshift('username');
 
     const placeholders = insertCols.map(() => '?').join(',');
@@ -1138,7 +1158,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
         return res.status(500).json({ ok: false, message: beginErr.message });
       }
 
-      for (const row of accounts) {
+      for (const row of importRows) {
         const username = String(row?.username || '').trim();
         if (!username) {
           skipped += 1;

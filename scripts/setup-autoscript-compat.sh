@@ -8548,6 +8548,31 @@ repair_udp_backends() {
   diagnose_udp_backends
 }
 
+heal_sshws_xray_rules() {
+  echo "Heal firewall rule SSHWS+XRAY..."
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "iptables tidak tersedia."
+    return 1
+  fi
+
+  # Hapus rule legacy ketat yang sering ganggu HC/SSHWS.
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
+    -m connlimit --connlimit-above 12 --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
+    -m conntrack --ctstate NEW -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-above 8/second \
+    --hashlimit-burst 16 --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+
+  if declare -F ensure_sshws_firewall_allow_rules >/dev/null 2>&1; then
+    ensure_sshws_firewall_allow_rules
+  fi
+  if declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+    apply_sshws_loop_guard_rules
+  fi
+
+  fw_persist_rules
+  echo "Heal rule SSHWS+XRAY selesai."
+}
+
 service_menu() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
@@ -8559,8 +8584,9 @@ service_menu() {
     "4) aktifkan ZIVPN (matikan UDPHC)" \
     "5) aktifkan UDPHC (matikan ZIVPN)" \
     "6) status backend UDP" \
-    "7) diagnose + auto-repair UDP backend"
-  prompt_input s "Pilih [0-7]: " || return
+    "7) diagnose + auto-repair UDP backend" \
+    "8) heal rule SSHWS+XRAY"
+  prompt_input s "Pilih [0-8]: " || return
   clear
   case "$s" in
     0)
@@ -8587,6 +8613,9 @@ service_menu() {
       ;;
     7)
       repair_udp_backends
+      ;;
+    8)
+      heal_sshws_xray_rules
       ;;
     *)
       echo "Pilihan tidak valid."

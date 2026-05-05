@@ -2001,7 +2001,12 @@ function fail(res, code, message) {
   return res.status(code).json({ meta: { code, message }, message });
 }
 function auth(req, res, next) {
-  const token = String(req.headers.authorization || '').trim();
+  const rawAuth = String(req.headers.authorization || '').trim();
+  const bearer = rawAuth.toLowerCase().startsWith('bearer ') ? rawAuth.slice(7).trim() : '';
+  const token = bearer ||
+    String(req.headers['x-sc-event-token'] || '').trim() ||
+    String(req.headers['x-webhook-token'] || '').trim() ||
+    rawAuth;
   if (!token || token !== AUTH_TOKEN) return fail(res, 401, 'unauthorized');
   next();
 }

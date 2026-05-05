@@ -6894,6 +6894,63 @@ xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
 
 # Compatibility helpers for older runtime files on upgraded VPS.
+flag_enabled() {
+  case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+tls_cert_domain() {
+  if flag_enabled "${WILDCARD_ENABLE:-0}" && [[ -n "${WILDCARD_BASE_DOMAIN:-}" ]]; then
+    echo "${WILDCARD_BASE_DOMAIN}"
+  else
+    echo "${DOMAIN}"
+  fi
+}
+
+issue_letsencrypt_cert() {
+  local certbot_email_arg cert_domain
+  cert_domain="$(tls_cert_domain)"
+  if [[ -z "${cert_domain}" ]]; then
+    echo "Domain sertifikat TLS kosong. Skip issue cert."
+    return 1
+  fi
+
+  if [[ -z "${EMAIL:-}" || "${EMAIL:-}" == "admin@example.com" || "${EMAIL:-}" == *"@example.com" ]]; then
+    certbot_email_arg="--register-unsafely-without-email"
+  else
+    certbot_email_arg="-m ${EMAIL}"
+  fi
+
+  if flag_enabled "${WILDCARD_ENABLE:-0}"; then
+    if [[ -z "${WILDCARD_BASE_DOMAIN:-}" || -z "${WILDCARD_CF_API_TOKEN:-}" ]]; then
+      echo "Wildcard aktif tapi WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN belum valid."
+      return 1
+    fi
+    if ! certbot --help plugins 2>/dev/null | grep -qi 'dns-cloudflare'; then
+      echo "Plugin certbot dns-cloudflare belum tersedia."
+      return 1
+    fi
+    mkdir -p /root/.secrets/certbot
+    cat > /root/.secrets/certbot/cloudflare.ini <<EOF
+dns_cloudflare_api_token = ${WILDCARD_CF_API_TOKEN}
+EOF
+    chmod 600 /root/.secrets/certbot/cloudflare.ini
+    certbot certonly \
+      --dns-cloudflare \
+      --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
+      --dns-cloudflare-propagation-seconds 30 \
+      --cert-name "${WILDCARD_BASE_DOMAIN}" \
+      -d "${WILDCARD_BASE_DOMAIN}" \
+      -d "*.${WILDCARD_BASE_DOMAIN}" \
+      --non-interactive --agree-tos ${certbot_email_arg}
+    return $?
+  fi
+
+  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}
+}
+
 fw_persist_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -7717,18 +7774,20 @@ COMMIT;
 
 edit_uuid_xray_account() {
   local type username username_sql new_uuid row old_uuid
-  echo "EDIT UUID XRAY (VMESS/VLESS)"
+  echo "EDIT ID XRAY (VMESS/VLESS/TROJAN)"
   draw_menu_panel "Pilih tipe Xray:" \
     "1) VMESS" \
     "2) VLESS" \
+    "3) TROJAN" \
     "0) Kembali"
-  if ! prompt_input type "Input [0-2]: "; then
+  if ! prompt_input type "Input [0-3]: "; then
     return
   fi
   case "${type}" in
     0) return ;;
     1) type="vmess" ;;
     2) type="vless" ;;
+    3) type="trojan" ;;
     *) echo "Pilihan tidak valid."; return ;;
   esac
 
@@ -7736,12 +7795,18 @@ edit_uuid_xray_account() {
   username_sql="${username//\'/''}"
   if [[ "${type}" == "vmess" ]]; then
     row="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT uuid FROM account_vmesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
-  else
+  elif [[ "${type}" == "vless" ]]; then
     row="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT uuid FROM account_vlesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+  else
+    row="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT password FROM account_trojans WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
   fi
   old_uuid="$(echo "${row}" | head -n1 | xargs)"
   echo "Username : ${username}"
-  echo "UUID lama: ${old_uuid:--}"
+  if [[ "${type}" == "trojan" ]]; then
+    echo "Password lama: ${old_uuid:--}"
+  else
+    echo "UUID lama: ${old_uuid:--}"
+  fi
   prompt_input new_uuid "ID baru (min 3 huruf/angka): " || return
   new_uuid="$(echo "${new_uuid}" | tr -d '\r' | xargs)"
   if [[ ! "${new_uuid}" =~ ^[A-Za-z0-9]{3,}$ ]]; then
@@ -7754,19 +7819,28 @@ edit_uuid_xray_account() {
       echo "Gagal update UUID VMESS."
       return
     }
-  else
+  elif [[ "${type}" == "vless" ]]; then
     sqlite3 "${DB_PATH}" "UPDATE account_vlesses SET uuid='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
       echo "Gagal update UUID VLESS."
+      return
+    }
+  else
+    sqlite3 "${DB_PATH}" "UPDATE account_trojans SET password='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+      echo "Gagal update password TROJAN."
       return
     }
   fi
 
   if sync_xray_from_summary_api "${type}" && apply_xray_restart_from_summary_api; then
-    echo "Berhasil edit UUID ${type^^}."
+    echo "Berhasil edit ID ${type^^}."
     echo "Username : ${username}"
-    echo "UUID baru: ${new_uuid}"
+    if [[ "${type}" == "trojan" ]]; then
+      echo "Password baru: ${new_uuid}"
+    else
+      echo "UUID baru: ${new_uuid}"
+    fi
   else
-    echo "UUID tersimpan di DB, tapi sync/restart Xray gagal."
+    echo "ID tersimpan di DB, tapi sync/restart Xray gagal."
     echo "Coba jalankan lagi saat Summary API aktif."
   fi
 }

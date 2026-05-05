@@ -4449,11 +4449,14 @@ async function readZivpnLiveMap(nowTs) {
     const handoffGrace = Math.max(3, Number(ZIVPN_HANDOFF_GRACE_SECONDS || 90));
     for (const [user, list] of byUser.entries()) {
       if (!Array.isArray(list) || list.length === 0) continue;
-      let maxLastSeen = 0;
+      let latest = null;
       for (const item of list) {
         const ls = Number(item?.lastSeen || 0);
-        if (ls > maxLastSeen) maxLastSeen = ls;
+        if (!latest || ls > Number(latest?.lastSeen || 0)) latest = item;
       }
+      if (!latest) continue;
+      const maxLastSeen = Number(latest.lastSeen || 0);
+      const latestFirstSeen = Number(latest.firstSeen || 0);
       for (const item of list) {
         const ip = String(item?.ip || '').trim();
         const ls = Number(item?.lastSeen || 0);
@@ -4463,6 +4466,9 @@ async function readZivpnLiveMap(nowTs) {
         // Hanya IP yang "masih sempat aktif" dekat dengan IP terbaru yang dihitung.
         const ageFromLatest = maxLastSeen - ls;
         if (ageFromLatest > handoffGrace) continue;
+        // Jika bukan IP terbaru, hanya dihitung bila overlap dengan periode aktif IP terbaru.
+        // Ini mencegah 1 HP dihitung 2 saat handoff operator (IP lama -> IP baru).
+        if (ip !== String(latest.ip || '') && ls < latestFirstSeen) continue;
         addIpToUserMap(ipMap, user, ip);
         addSessionKeyToUserMap(sessionMap, user, `zivpn-live:${ip}`);
       }
@@ -10717,19 +10723,25 @@ show_zivpn_online() {
 
   sqlite3 -header -column "${DB_PATH}" "
     WITH active AS (
-      SELECT LOWER(username) AS username, ip, last_seen
+      SELECT LOWER(username) AS username, ip, first_seen, last_seen
       FROM zivpn_live_sessions
       WHERE last_seen >= (strftime('%s','now') - ${win})
     ),
-    active_filtered AS (
-      SELECT a.username, a.ip, a.last_seen
+    latest AS (
+      SELECT a.username, a.ip AS latest_ip, a.first_seen AS latest_first_seen, a.last_seen AS latest_last_seen
       FROM active a
       JOIN (
         SELECT username, MAX(last_seen) AS max_last_seen
         FROM active
         GROUP BY username
-      ) m ON m.username = a.username
-      WHERE (m.max_last_seen - a.last_seen) <= ${handoff_grace}
+      ) m ON m.username = a.username AND m.max_last_seen = a.last_seen
+    ),
+    active_filtered AS (
+      SELECT a.username, a.ip, a.last_seen
+      FROM active a
+      JOIN latest l ON l.username = a.username
+      WHERE (l.latest_last_seen - a.last_seen) <= ${handoff_grace}
+        AND (a.ip = l.latest_ip OR a.last_seen >= l.latest_first_seen)
     ),
     agg AS (
       SELECT
@@ -10759,19 +10771,25 @@ show_zivpn_online() {
   echo
   sqlite3 -noheader "${DB_PATH}" "
     WITH active AS (
-      SELECT LOWER(username) AS username, ip, last_seen
+      SELECT LOWER(username) AS username, ip, first_seen, last_seen
       FROM zivpn_live_sessions
       WHERE last_seen >= (strftime('%s','now') - ${win})
     ),
-    active_filtered AS (
-      SELECT a.username, a.ip
+    latest AS (
+      SELECT a.username, a.ip AS latest_ip, a.first_seen AS latest_first_seen, a.last_seen AS latest_last_seen
       FROM active a
       JOIN (
         SELECT username, MAX(last_seen) AS max_last_seen
         FROM active
         GROUP BY username
-      ) m ON m.username = a.username
-      WHERE (m.max_last_seen - a.last_seen) <= ${handoff_grace}
+      ) m ON m.username = a.username AND m.max_last_seen = a.last_seen
+    ),
+    active_filtered AS (
+      SELECT a.username, a.ip
+      FROM active a
+      JOIN latest l ON l.username = a.username
+      WHERE (l.latest_last_seen - a.last_seen) <= ${handoff_grace}
+        AND (a.ip = l.latest_ip OR a.last_seen >= l.latest_first_seen)
     )
     SELECT
       'Total User Aktif : ' || COUNT(DISTINCT username) || char(10) ||

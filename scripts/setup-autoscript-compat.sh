@@ -4425,6 +4425,8 @@ function parseSshAndUdpUsage() {
 async function readZivpnLiveMap(nowTs) {
   const ipMap = new Map();
   const sessionMap = new Map();
+  const zivpnLatestOnly = String(process.env.ZIVPN_HTTP_LATEST_ONLY || '1').trim().toLowerCase();
+  const useLatestOnly = (ZIVPN_AUTH_MODE === 'http') && (zivpnLatestOnly === '1' || zivpnLatestOnly === 'true' || zivpnLatestOnly === 'yes' || zivpnLatestOnly === 'on');
   try {
     const cutoff = Number(nowTs || Math.floor(Date.now() / 1000)) - Math.max(20, Number(ZIVPN_ACTIVE_WINDOW_SECONDS || 90));
     await run("DELETE FROM zivpn_live_sessions WHERE last_seen < ?", [cutoff]).catch(() => {});
@@ -4457,6 +4459,7 @@ async function readZivpnLiveMap(nowTs) {
       if (!latest) continue;
       const maxLastSeen = Number(latest.lastSeen || 0);
       const latestFirstSeen = Number(latest.firstSeen || 0);
+      const candidates = [];
       for (const item of list) {
         const ip = String(item?.ip || '').trim();
         const ls = Number(item?.lastSeen || 0);
@@ -4469,8 +4472,22 @@ async function readZivpnLiveMap(nowTs) {
         // Jika bukan IP terbaru, hanya dihitung bila overlap dengan periode aktif IP terbaru.
         // Ini mencegah 1 HP dihitung 2 saat handoff operator (IP lama -> IP baru).
         if (ip !== String(latest.ip || '') && ls < latestFirstSeen) continue;
-        addIpToUserMap(ipMap, user, ip);
-        addSessionKeyToUserMap(sessionMap, user, `zivpn-live:${ip}`);
+        candidates.push({ ip, lastSeen: ls });
+      }
+      if (useLatestOnly) {
+        let chosen = null;
+        for (const c of candidates) {
+          if (!chosen || Number(c.lastSeen || 0) > Number(chosen.lastSeen || 0)) chosen = c;
+        }
+        if (chosen && chosen.ip) {
+          addIpToUserMap(ipMap, user, chosen.ip);
+          addSessionKeyToUserMap(sessionMap, user, `zivpn-live:${chosen.ip}`);
+        }
+      } else {
+        for (const c of candidates) {
+          addIpToUserMap(ipMap, user, c.ip);
+          addSessionKeyToUserMap(sessionMap, user, `zivpn-live:${c.ip}`);
+        }
       }
     }
   } catch (_) {}
@@ -10697,13 +10714,14 @@ refresh_zivpn_live_from_api_log_menu() {
 }
 
 show_zivpn_online() {
-  local win handoff_grace has_live_table
+  local win handoff_grace has_live_table latest_only
   win="$(echo "${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}" | tr -cd '0-9')"
   [[ -z "${win}" || "${win}" -lt 20 ]] && win="90"
   [[ "${win}" -gt 1800 ]] && win="1800"
   handoff_grace="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
   [[ -z "${handoff_grace}" || "${handoff_grace}" -lt 3 ]] && handoff_grace="20"
   [[ "${handoff_grace}" -gt 120 ]] && handoff_grace="120"
+  latest_only="$(echo "${ZIVPN_HTTP_LATEST_ONLY:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 
   draw_menu_header "ZIVPN ONLINE (LIVE DB)"
   echo "Jendela aktif: ${win} detik"
@@ -10743,13 +10761,28 @@ show_zivpn_online() {
       WHERE (l.latest_last_seen - a.last_seen) <= ${handoff_grace}
         AND (a.ip = l.latest_ip OR a.last_seen >= l.latest_first_seen)
     ),
+    picked AS (
+      SELECT af.username, af.ip, af.last_seen
+      FROM active_filtered af
+      JOIN (
+        SELECT username, MAX(last_seen) AS max_last_seen
+        FROM active_filtered
+        GROUP BY username
+      ) m ON m.username=af.username
+      WHERE
+        CASE
+          WHEN LOWER('${ZIVPN_AUTH_MODE:-http}')='http' AND '${latest_only}' IN ('1','true','yes','on')
+          THEN af.last_seen = m.max_last_seen
+          ELSE 1
+        END
+    ),
     agg AS (
       SELECT
         username,
         COUNT(DISTINCT ip) AS connected_ip,
         MAX(last_seen) AS last_seen,
         GROUP_CONCAT(ip, ', ') AS ip_list
-      FROM active_filtered
+      FROM picked
       GROUP BY username
     )
     SELECT
@@ -10790,11 +10823,27 @@ show_zivpn_online() {
       JOIN latest l ON l.username = a.username
       WHERE (l.latest_last_seen - a.last_seen) <= ${handoff_grace}
         AND (a.ip = l.latest_ip OR a.last_seen >= l.latest_first_seen)
+    ),
+    picked AS (
+      SELECT af.username, af.ip
+      FROM active_filtered af
+      JOIN (
+        SELECT username, MAX(last_seen) AS max_last_seen
+        FROM active
+        GROUP BY username
+      ) m ON m.username=af.username
+      LEFT JOIN active a ON a.username=af.username AND a.ip=af.ip
+      WHERE
+        CASE
+          WHEN LOWER('${ZIVPN_AUTH_MODE:-http}')='http' AND '${latest_only}' IN ('1','true','yes','on')
+          THEN COALESCE(a.last_seen,0) = m.max_last_seen
+          ELSE 1
+        END
     )
     SELECT
       'Total User Aktif : ' || COUNT(DISTINCT username) || char(10) ||
       'Total IP Aktif   : ' || COUNT(DISTINCT ip)
-    FROM active_filtered af
+    FROM picked af
     JOIN account_sshs s ON LOWER(s.username)=af.username
     WHERE UPPER(TRIM(COALESCE(s.status,'')))='AKTIF';
   " 2>/dev/null || true

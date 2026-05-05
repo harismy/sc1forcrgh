@@ -6096,6 +6096,9 @@ def to_int(v, d=0):
     except Exception:
         return d
 
+def pick_limitip(r):
+    return to_int((r or {}).get("limitip", (r or {}).get("limit_ip", 0)), 0)
+
 def restored_status(_raw):
     # Restore akun dipaksa aktif agar langsung usable setelah import.
     return "AKTIF"
@@ -6124,7 +6127,7 @@ def upsert_ssh(rows):
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
-                to_int((r or {}).get("limitip", 0)),
+                pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
@@ -6154,7 +6157,7 @@ def upsert_uuid(table, rows):
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
-                to_int((r or {}).get("limitip", 0)),
+                pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
@@ -6171,6 +6174,10 @@ def upsert_trojan(rows):
         trojan_secret = str((r or {}).get("password", "")).strip()
         if not trojan_secret:
             trojan_secret = str((r or {}).get("uuid", "")).strip()
+        if not trojan_secret:
+            trojan_secret = str((r or {}).get("id", "")).strip()
+        if not trojan_secret:
+            trojan_secret = str((r or {}).get("secret", "")).strip()
         cur.execute(
             """
             INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id)
@@ -6190,7 +6197,7 @@ def upsert_trojan(rows):
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
-                to_int((r or {}).get("limitip", 0)),
+                pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),

@@ -141,9 +141,9 @@ IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
 IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
 SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-1}"
 SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-109,143}"
-SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-30/second}"
-SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-60}"
-SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-64}"
+SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-80/second}"
+SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-200}"
+SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-200}"
 SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
 SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
 SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
@@ -1594,16 +1594,16 @@ apply_sshws_loop_guard_rules() {
   ports="$(echo "${SSHWS_LOOP_GUARD_PORTS:-109,143}" | tr -cd '0-9,')"
   [[ -z "${ports}" ]] && ports="109,143"
 
-  rate="$(echo "${SSHWS_LOOP_GUARD_NEW_ABOVE:-30/second}" | tr -d '[:space:]')"
+  rate="$(echo "${SSHWS_LOOP_GUARD_NEW_ABOVE:-80/second}" | tr -d '[:space:]')"
   if ! [[ "${rate}" =~ ^[0-9]+/(second|minute|hour|day)$ ]]; then
-    rate="30/second"
+    rate="80/second"
   fi
 
-  burst="$(echo "${SSHWS_LOOP_GUARD_BURST:-60}" | tr -cd '0-9')"
-  [[ -z "${burst}" || "${burst}" -lt 1 ]] && burst="60"
+  burst="$(echo "${SSHWS_LOOP_GUARD_BURST:-200}" | tr -cd '0-9')"
+  [[ -z "${burst}" || "${burst}" -lt 1 ]] && burst="200"
 
-  connlimit="$(echo "${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-64}" | tr -cd '0-9')"
-  [[ -z "${connlimit}" || "${connlimit}" -lt 1 ]] && connlimit="64"
+  connlimit="$(echo "${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-200}" | tr -cd '0-9')"
+  [[ -z "${connlimit}" || "${connlimit}" -lt 1 ]] && connlimit="200"
 
   # Cleanup legacy aggressive guards that included 80/443 and caused HC/CDN
   # reconnect storms to be rejected before nginx/ssh-ws could handle them.
@@ -8432,8 +8432,10 @@ restart_all_services() {
   systemctl daemon-reload >/dev/null 2>&1 || true
   if declare -F ensure_sshws_firewall_allow_rules >/dev/null 2>&1; then
     ensure_sshws_firewall_allow_rules
+  elif declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+    apply_sshws_loop_guard_rules
   else
-    echo "Peringatan: ensure_sshws_firewall_allow_rules tidak ditemukan, lanjut restart tanpa update firewall allow-rules."
+    echo "Peringatan: helper firewall SSHWS tidak ditemukan, lanjut restart tanpa update firewall allow-rules."
   fi
   systemctl restart ssh dropbear sc-1forcr-api sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
   if [[ "${haproxy_ok}" == "1" ]]; then

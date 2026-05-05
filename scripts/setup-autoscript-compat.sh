@@ -5930,6 +5930,17 @@ for item in payload["data"]["ssh"]:
     ssh_users.append(u)
 payload["data"]["zivpn_auth"] = ssh_users
 
+# Kompatibilitas lintas script:
+# - SC 1FORCR menyimpan kredensial trojan di field "password"
+# - beberapa script lain memakai field "uuid"
+# Saat export backup, kirim keduanya agar restore silang mulus.
+for item in payload["data"].get("trojan", []):
+    if not isinstance(item, dict):
+        continue
+    trojan_secret = str(item.get("password", "") or "").strip()
+    if trojan_secret and not str(item.get("uuid", "") or "").strip():
+        item["uuid"] = trojan_secret
+
 try:
     with open("/etc/sc-1forcr/banner.html", "r", encoding="utf-8") as f:
         payload["data"]["banner_html"] = f.read()
@@ -6154,6 +6165,12 @@ def upsert_trojan(rows):
         u = str((r or {}).get("username", "")).strip()
         if not u:
             continue
+        # Kompatibilitas:
+        # - backup native: pakai "password"
+        # - backup script lain: pakai "uuid"
+        trojan_secret = str((r or {}).get("password", "")).strip()
+        if not trojan_secret:
+            trojan_secret = str((r or {}).get("uuid", "")).strip()
         cur.execute(
             """
             INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id)
@@ -6169,7 +6186,7 @@ def upsert_trojan(rows):
             """,
             (
                 u,
-                str((r or {}).get("password", "")),
+                trojan_secret,
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),

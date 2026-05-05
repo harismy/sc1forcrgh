@@ -8430,7 +8430,11 @@ restart_all_services() {
     echo "Peringatan: config haproxy invalid, restart haproxy dilewati."
   fi
   systemctl daemon-reload >/dev/null 2>&1 || true
-  ensure_sshws_firewall_allow_rules
+  if declare -F ensure_sshws_firewall_allow_rules >/dev/null 2>&1; then
+    ensure_sshws_firewall_allow_rules
+  else
+    echo "Peringatan: ensure_sshws_firewall_allow_rules tidak ditemukan, lanjut restart tanpa update firewall allow-rules."
+  fi
   systemctl restart ssh dropbear sc-1forcr-api sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
   if [[ "${haproxy_ok}" == "1" ]]; then
     systemctl restart haproxy >/dev/null 2>&1 || true

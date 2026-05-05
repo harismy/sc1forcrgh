@@ -10760,26 +10760,39 @@ show_zivpn_online() {
     agg AS (
       SELECT
         username,
-        COUNT(DISTINCT ip) AS connected_ip,
+        COUNT(DISTINCT ip) AS connected_ip_raw,
         MAX(last_seen) AS last_seen,
         GROUP_CONCAT(ip, ', ') AS ip_list
       FROM active_filtered
       GROUP BY username
+    ),
+    normalized AS (
+      SELECT
+        username,
+        CASE
+          WHEN connected_ip_raw BETWEEN 1 AND 2 THEN 1
+          WHEN connected_ip_raw BETWEEN 3 AND 4 THEN 2
+          ELSE connected_ip_raw
+        END AS connected_ip,
+        connected_ip_raw,
+        last_seen,
+        ip_list
+      FROM agg
     )
     SELECT
-      a.username AS username,
+      n.username AS username,
       CASE
-        WHEN CAST(COALESCE(s.limitip,0) AS INTEGER) > 0 AND a.connected_ip > CAST(COALESCE(s.limitip,0) AS INTEGER) THEN 'MULTI_LOGIN'
+        WHEN CAST(COALESCE(s.limitip,0) AS INTEGER) > 0 AND n.connected_ip > CAST(COALESCE(s.limitip,0) AS INTEGER) THEN 'MULTI_LOGIN'
         ELSE 'AMAN'
       END AS status,
       CAST(COALESCE(s.limitip,0) AS INTEGER) AS limit_ip,
-      a.connected_ip AS terhubung_ip,
-      datetime(a.last_seen, 'unixepoch', 'localtime') AS last_seen,
-      COALESCE(a.ip_list, '-') AS ip_list
-    FROM agg a
-    JOIN account_sshs s ON LOWER(s.username) = a.username
+      n.connected_ip AS terhubung_ip,
+      datetime(n.last_seen, 'unixepoch', 'localtime') AS last_seen,
+      COALESCE(n.ip_list, '-') AS ip_list
+    FROM normalized n
+    JOIN account_sshs s ON LOWER(s.username) = n.username
     WHERE UPPER(TRIM(COALESCE(s.status,'')))='AKTIF'
-    ORDER BY a.last_seen DESC, a.username ASC;
+    ORDER BY n.last_seen DESC, n.username ASC;
   " || true
 
   echo

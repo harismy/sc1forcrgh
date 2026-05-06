@@ -156,7 +156,7 @@ UDPHC_LOG_LINES_CHECKER="${UDPHC_LOG_LINES_CHECKER:-}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
-XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-1}"
+XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
@@ -7017,9 +7017,9 @@ DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" |
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_CHECKER="$(echo "${UDPHC_LOG_LINES_CHECKER:-6000}" | tr -cd '0-9')"
-xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-60}" | tr -cd '0-9')"
-xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-600}" | tr -cd '0-9')"
-xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
+  xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
+  xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
+  xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
 xray_monitor_active_window_sec="$(echo "${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-15}" | tr -cd '0-9')"
 xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
@@ -7027,9 +7027,9 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
 [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
 [[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
 [[ -z "${UDPHC_LOG_LINES_CHECKER}" || "${UDPHC_LOG_LINES_CHECKER}" -lt 1000 ]] && UDPHC_LOG_LINES_CHECKER="6000"
-[[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="60"
-[[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="600"
-[[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="1"
+  [[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="5"
+  [[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="60"
+  [[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="2"
 [[ -z "${xray_monitor_active_window_sec}" || "${xray_monitor_active_window_sec}" -lt 5 || "${xray_monitor_active_window_sec}" -gt 120 ]] && xray_monitor_active_window_sec="15"
 [[ -z "${xray_monitor_recent_window_min}" || "${xray_monitor_recent_window_min}" -lt 1 || "${xray_monitor_recent_window_min}" -gt 60 ]] && xray_monitor_recent_window_min="5"
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
@@ -8357,6 +8357,150 @@ set_iplimit_checker_config_menu() {
   echo "- Durasi unlock    : ${IPLIMIT_LOCK_MINUTES} menit"
 }
 
+set_autolock_realtime_tuning_menu() {
+  local cur_interval cur_lock cur_xray_recent cur_xray_active cur_xray_hits cur_zivpn_active cur_zivpn_handoff
+  local in_interval in_lock in_xray_recent in_xray_active in_xray_hits in_zivpn_active in_zivpn_handoff
+
+  cur_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}" | tr -cd '0-9')"
+  cur_lock="$(echo "${IPLIMIT_LOCK_MINUTES:-15}" | tr -cd '0-9')"
+  cur_xray_recent="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
+  cur_xray_active="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
+  cur_xray_hits="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
+  cur_zivpn_active="$(echo "${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}" | tr -cd '0-9')"
+  cur_zivpn_handoff="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
+
+  [[ -z "${cur_interval}" ]] && cur_interval="1"
+  [[ -z "${cur_lock}" ]] && cur_lock="15"
+  [[ -z "${cur_xray_recent}" ]] && cur_xray_recent="5"
+  [[ -z "${cur_xray_active}" ]] && cur_xray_active="60"
+  [[ -z "${cur_xray_hits}" ]] && cur_xray_hits="2"
+  [[ -z "${cur_zivpn_active}" ]] && cur_zivpn_active="90"
+  [[ -z "${cur_zivpn_handoff}" ]] && cur_zivpn_handoff="90"
+
+  draw_menu_header "SETTING AUTO LOCK REALTIME"
+  echo "Nilai saat ini:"
+  echo "- Interval checker (menit)   : ${cur_interval}"
+  echo "- Durasi unlock lock tmp (m) : ${cur_lock}"
+  echo "- XRAY recent window (menit) : ${cur_xray_recent}"
+  echo "- XRAY active window (detik) : ${cur_xray_active}"
+  echo "- XRAY min hits per IP       : ${cur_xray_hits}"
+  echo "- ZIVPN active window (detik): ${cur_zivpn_active}"
+  echo "- ZIVPN handoff grace (detik): ${cur_zivpn_handoff}"
+  echo
+  echo "Fungsi parameter:"
+  echo "- Interval checker: seberapa sering auto-lock dieksekusi (timer)."
+  echo "- Durasi unlock lock tmp: lama akun berada di status LOCK_TMP sebelum auto unlock."
+  echo "- XRAY recent window: jangkauan log XRAY yang discan."
+  echo "- XRAY active window: batas umur aktivitas untuk dianggap masih online."
+  echo "- XRAY min hits per IP: minimal jumlah hit log agar IP dihitung valid."
+  echo "- ZIVPN active window: batas umur sesi live ZIVPN yang masih dihitung aktif."
+  echo "- ZIVPN handoff grace: toleransi perpindahan IP mobile agar tidak false multi-login."
+  echo
+  echo "Rekomendasi:"
+  echo "- Aman umum (disarankan): interval=1, lock=15, xray_recent=5, xray_active=60, xray_hits=2, zivpn_active=90, handoff=90"
+  echo "- Agresif: interval=1, xray_active=30, xray_hits=1 (resiko false-positive naik)."
+  echo "- Stabil tinggi trafik: interval=2, xray_active=90, xray_hits=2."
+  echo
+  echo "Kosongkan input untuk pertahankan nilai lama. Ketik 'batal' untuk keluar."
+
+  if ! prompt_input in_interval "Interval checker (menit) [${cur_interval}]: "; then return; fi
+  [[ "${in_interval,,}" == "batal" ]] && return
+  in_interval="${in_interval:-${cur_interval}}"
+  if [[ ! "${in_interval}" =~ ^[0-9]+$ || "${in_interval}" -lt 1 || "${in_interval}" -gt 1440 ]]; then
+    echo "Interval checker harus angka 1-1440 menit."
+    return
+  fi
+
+  if ! prompt_input in_lock "Durasi unlock lock tmp (menit) [${cur_lock}]: "; then return; fi
+  [[ "${in_lock,,}" == "batal" ]] && return
+  in_lock="${in_lock:-${cur_lock}}"
+  if [[ ! "${in_lock}" =~ ^[0-9]+$ || "${in_lock}" -lt 1 || "${in_lock}" -gt 10080 ]]; then
+    echo "Durasi unlock harus angka 1-10080 menit."
+    return
+  fi
+
+  if ! prompt_input in_xray_recent "XRAY recent window (menit) [${cur_xray_recent}]: "; then return; fi
+  [[ "${in_xray_recent,,}" == "batal" ]] && return
+  in_xray_recent="${in_xray_recent:-${cur_xray_recent}}"
+  if [[ ! "${in_xray_recent}" =~ ^[0-9]+$ || "${in_xray_recent}" -lt 5 || "${in_xray_recent}" -gt 1440 ]]; then
+    echo "XRAY recent window harus angka 5-1440 menit."
+    return
+  fi
+
+  if ! prompt_input in_xray_active "XRAY active window (detik) [${cur_xray_active}]: "; then return; fi
+  [[ "${in_xray_active,,}" == "batal" ]] && return
+  in_xray_active="${in_xray_active:-${cur_xray_active}}"
+  if [[ ! "${in_xray_active}" =~ ^[0-9]+$ || "${in_xray_active}" -lt 30 || "${in_xray_active}" -gt 1800 ]]; then
+    echo "XRAY active window harus angka 30-1800 detik."
+    return
+  fi
+
+  if ! prompt_input in_xray_hits "XRAY min hits per IP [${cur_xray_hits}]: "; then return; fi
+  [[ "${in_xray_hits,,}" == "batal" ]] && return
+  in_xray_hits="${in_xray_hits:-${cur_xray_hits}}"
+  if [[ ! "${in_xray_hits}" =~ ^[0-9]+$ || "${in_xray_hits}" -lt 1 || "${in_xray_hits}" -gt 20 ]]; then
+    echo "XRAY min hits per IP harus angka 1-20."
+    return
+  fi
+
+  if ! prompt_input in_zivpn_active "ZIVPN active window (detik) [${cur_zivpn_active}]: "; then return; fi
+  [[ "${in_zivpn_active,,}" == "batal" ]] && return
+  in_zivpn_active="${in_zivpn_active:-${cur_zivpn_active}}"
+  if [[ ! "${in_zivpn_active}" =~ ^[0-9]+$ || "${in_zivpn_active}" -lt 20 || "${in_zivpn_active}" -gt 1800 ]]; then
+    echo "ZIVPN active window harus angka 20-1800 detik."
+    return
+  fi
+
+  if ! prompt_input in_zivpn_handoff "ZIVPN handoff grace (detik) [${cur_zivpn_handoff}]: "; then return; fi
+  [[ "${in_zivpn_handoff,,}" == "batal" ]] && return
+  in_zivpn_handoff="${in_zivpn_handoff:-${cur_zivpn_handoff}}"
+  if [[ ! "${in_zivpn_handoff}" =~ ^[0-9]+$ || "${in_zivpn_handoff}" -lt 3 || "${in_zivpn_handoff}" -gt 120 ]]; then
+    echo "ZIVPN handoff grace harus angka 3-120 detik."
+    return
+  fi
+
+  IPLIMIT_CHECK_INTERVAL_MINUTES="${in_interval}"
+  IPLIMIT_LOCK_MINUTES="${in_lock}"
+  XRAY_RECENT_WINDOW_MINUTES="${in_xray_recent}"
+  XRAY_ACTIVE_WINDOW_SECONDS="${in_xray_active}"
+  XRAY_MIN_HITS_PER_IP="${in_xray_hits}"
+  ZIVPN_ACTIVE_WINDOW_SECONDS="${in_zivpn_active}"
+  ZIVPN_HANDOFF_GRACE_SECONDS="${in_zivpn_handoff}"
+
+  update_sc_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  update_sc_env_var "IPLIMIT_LOCK_MINUTES" "${IPLIMIT_LOCK_MINUTES}"
+  update_sc_env_var "XRAY_RECENT_WINDOW_MINUTES" "${XRAY_RECENT_WINDOW_MINUTES}"
+  update_sc_env_var "XRAY_ACTIVE_WINDOW_SECONDS" "${XRAY_ACTIVE_WINDOW_SECONDS}"
+  update_sc_env_var "XRAY_MIN_HITS_PER_IP" "${XRAY_MIN_HITS_PER_IP}"
+  update_sc_env_var "ZIVPN_ACTIVE_WINDOW_SECONDS" "${ZIVPN_ACTIVE_WINDOW_SECONDS}"
+  update_sc_env_var "ZIVPN_HANDOFF_GRACE_SECONDS" "${ZIVPN_HANDOFF_GRACE_SECONDS}"
+
+  update_app_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  update_app_env_var "IPLIMIT_LOCK_MINUTES" "${IPLIMIT_LOCK_MINUTES}"
+  update_app_env_var "XRAY_RECENT_WINDOW_MINUTES" "${XRAY_RECENT_WINDOW_MINUTES}"
+  update_app_env_var "XRAY_ACTIVE_WINDOW_SECONDS" "${XRAY_ACTIVE_WINDOW_SECONDS}"
+  update_app_env_var "XRAY_MIN_HITS_PER_IP" "${XRAY_MIN_HITS_PER_IP}"
+  update_app_env_var "ZIVPN_ACTIVE_WINDOW_SECONDS" "${ZIVPN_ACTIVE_WINDOW_SECONDS}"
+  update_app_env_var "ZIVPN_HANDOFF_GRACE_SECONDS" "${ZIVPN_HANDOFF_GRACE_SECONDS}"
+
+  write_iplimit_timer_unit "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+
+  echo
+  echo "Berhasil update tuning auto-lock:"
+  echo "- Interval checker            : ${IPLIMIT_CHECK_INTERVAL_MINUTES} menit"
+  echo "- Durasi unlock lock tmp      : ${IPLIMIT_LOCK_MINUTES} menit"
+  echo "- XRAY recent window          : ${XRAY_RECENT_WINDOW_MINUTES} menit"
+  echo "- XRAY active window          : ${XRAY_ACTIVE_WINDOW_SECONDS} detik"
+  echo "- XRAY min hits per IP        : ${XRAY_MIN_HITS_PER_IP}"
+  echo "- ZIVPN active window         : ${ZIVPN_ACTIVE_WINDOW_SECONDS} detik"
+  echo "- ZIVPN handoff grace         : ${ZIVPN_HANDOFF_GRACE_SECONDS} detik"
+}
+
 set_online_notify_config_menu() {
   local current_enable current_interval current_window enable_in interval_in window_in
   current_enable="${ONLINE_NOTIFY_ENABLE:-1}"
@@ -8461,12 +8605,13 @@ tools_menu() {
       "4) Update Script" \
       "5) Setting BOT Telegram" \
       "6) Setting Checker IP Limit" \
-      "7) Setting Notif Akun Online BOT" \
-      "8) Kirim Notif Online Sekarang ke BOT" \
-      "9) Setting Token Webhook BotVPN" \
+      "7) Setting Auto-Lock Realtime" \
+      "8) Setting Notif Akun Online BOT" \
+      "9) Kirim Notif Online Sekarang ke BOT" \
+      "10) Setting Token Webhook BotVPN" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-9]: "; then
+    if ! prompt_input tm "Pilih menu [0-10]: "; then
       return
     fi
     clear
@@ -8477,9 +8622,10 @@ tools_menu() {
       4) update_script_from_repo ;;
       5) set_telegram_notif_config ;;
       6) set_iplimit_checker_config_menu ;;
-      7) set_online_notify_config_menu ;;
-      8) trigger_online_notify_now ;;
-      9) set_account_event_webhook_config ;;
+      7) set_autolock_realtime_tuning_menu ;;
+      8) set_online_notify_config_menu ;;
+      9) trigger_online_notify_now ;;
+      10) set_account_event_webhook_config ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

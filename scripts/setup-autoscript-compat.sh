@@ -2062,6 +2062,15 @@ const XRAY_PATHS_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/tro
 const XRAY_PATH_VMESS = XRAY_PATHS_VMESS[0];
 const XRAY_PATH_VLESS = XRAY_PATHS_VLESS[0];
 const XRAY_PATH_TROJAN = XRAY_PATHS_TROJAN[0];
+const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
+  .split(',')
+  .map((v) => Number(String(v || '').trim()))
+  .filter((n) => Number.isInteger(n) && n > 0 && n <= 65535);
+const CHECK_INTERVAL_MINUTES_RAW = Number(process.env.IPLIMIT_CHECK_INTERVAL_MINUTES || 10);
+const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CHECK_INTERVAL_MINUTES_RAW > 0
+  ? Math.floor(CHECK_INTERVAL_MINUTES_RAW)
+  : 10;
+const LOCK_RECHECK_GRACE_SECONDS = Math.max(180, CHECK_INTERVAL_MINUTES * 120);
 
 function ok(res, data, message = 'success') {
   return res.json({ meta: { code: 200, message }, data });

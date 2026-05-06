@@ -2709,6 +2709,38 @@ async function renderAndReloadXray() {
   writeXrayConfigAndReload(cfg);
 }
 
+let xrayDbSyncBusy = false;
+let xrayDbSyncLastHash = '';
+async function computeActiveXrayHash() {
+  const vmessRows = await all("SELECT LOWER(username) AS u, COALESCE(uuid,'') AS s FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
+  const vlessRows = await all("SELECT LOWER(username) AS u, COALESCE(uuid,'') AS s FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
+  const trojanRows = await all("SELECT LOWER(username) AS u, COALESCE(password,'') AS s FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
+  const payload = JSON.stringify({
+    vmess: vmessRows.map((r) => `${String(r.u || '')}:${String(r.s || '')}`),
+    vless: vlessRows.map((r) => `${String(r.u || '')}:${String(r.s || '')}`),
+    trojan: trojanRows.map((r) => `${String(r.u || '')}:${String(r.s || '')}`)
+  });
+  return crypto.createHash('sha1').update(payload).digest('hex');
+}
+
+async function syncXrayFromDbIfChanged(force = false) {
+  if (xrayDbSyncBusy) return false;
+  xrayDbSyncBusy = true;
+  try {
+    const nowHash = await computeActiveXrayHash();
+    if (!force && xrayDbSyncLastHash && nowHash === xrayDbSyncLastHash) {
+      return false;
+    }
+    await renderAndReloadXray();
+    xrayDbSyncLastHash = nowHash;
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    xrayDbSyncBusy = false;
+  }
+}
+
 function isExpiredDateValue(v) {
   const s = String(v || '').trim();
   if (!s) return false;
@@ -3257,6 +3289,8 @@ app.listen(PORT, '127.0.0.1', () => {
   setInterval(() => { cleanupZivpnLiveSessions().catch(() => {}); }, 60 * 1000);
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
+  syncXrayFromDbIfChanged(true).catch(() => {});
+  setInterval(() => { syncXrayFromDbIfChanged(false).catch(() => {}); }, 60 * 1000);
   cleanupExpiredXrayAccounts().catch(() => {});
   setInterval(() => { cleanupExpiredXrayAccounts().catch(() => {}); }, 60 * 1000);
   console.log(`sc-1forcr-api on 127.0.0.1:${PORT}`);

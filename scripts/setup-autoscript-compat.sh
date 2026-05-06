@@ -565,17 +565,44 @@ check_supported_os() {
 install_optional_pkg_if_available() {
   local pkg="$1"
   if apt-cache show "${pkg}" >/dev/null 2>&1; then
-    apt-get install -y "${pkg}"
+    apt_get_safe install -y "${pkg}"
     return 0
   fi
   log "Paket opsional '${pkg}' tidak tersedia di repo, skip."
   return 1
 }
 
+wait_for_apt_locks() {
+  local waited=0 max_wait=900
+  while true; do
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+       fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+       fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+       fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
+      if (( waited == 0 )); then
+        log "Menunggu lock apt/dpkg dilepas (apt/unattended-upgrades sedang jalan)..."
+      fi
+      sleep 5
+      waited=$((waited + 5))
+      if (( waited >= max_wait )); then
+        log "Timeout menunggu lock apt/dpkg (${max_wait}s)."
+        return 1
+      fi
+      continue
+    fi
+    return 0
+  done
+}
+
+apt_get_safe() {
+  wait_for_apt_locks || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get "$@"
+}
+
 install_base_packages() {
   log "Install paket dasar..."
-  apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  apt_get_safe update -y
+  apt_get_safe install -y \
     curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
     gnupg lsb-release socat cron unzip \
     haproxy \
@@ -598,17 +625,17 @@ install_node_if_missing() {
     return
   fi
   log "Install Node.js (prioritas 20, fallback 18)..."
-  apt-get update -y
-  apt-get install -y curl ca-certificates gnupg
-  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs; then
+  apt_get_safe update -y
+  apt_get_safe install -y curl ca-certificates gnupg
+  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt_get_safe install -y nodejs; then
     log "Node terpasang: $(node -v)"
     return
   fi
 
   log "Node 20 gagal/kurang kompatibel, fallback ke Node 18..."
-  apt-get purge -y nodejs >/dev/null 2>&1 || true
+  apt_get_safe purge -y nodejs >/dev/null 2>&1 || true
   rm -f /etc/apt/sources.list.d/nodesource.list
-  if curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt-get install -y nodejs; then
+  if curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt_get_safe install -y nodejs; then
     log "Node terpasang: $(node -v)"
     return
   fi
@@ -623,8 +650,8 @@ install_go_if_missing() {
     return
   fi
   log "Install Go..."
-  apt-get update -y
-  apt-get install -y golang-go
+  apt_get_safe update -y
+  apt_get_safe install -y golang-go
   log "Go installed: $(go version)"
 }
 
@@ -810,8 +837,13 @@ EOF
 init_db() {
   log "Inisialisasi DB: ${DB_PATH}"
   mkdir -p "$(dirname "${DB_PATH}")"
-
-  sqlite3 "${DB_PATH}" <<SQL
+  local sql_err try db_init_ok
+  sql_err="$(mktemp)"
+  trap 'rm -f "${sql_err:-}"' RETURN
+  db_init_ok="0"
+  for try in {1..20}; do
+    if sqlite3 "${DB_PATH}" 2>"${sql_err}" <<SQL
+PRAGMA busy_timeout=10000;
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS servers (
@@ -874,6 +906,24 @@ CREATE TABLE IF NOT EXISTS temp_ip_locks (
 
 INSERT OR IGNORE INTO servers("key") VALUES('${API_AUTH_TOKEN}');
 SQL
+    then
+      db_init_ok="1"
+      break
+    fi
+    if grep -qi "database is locked" "${sql_err}"; then
+      if [[ "${try}" -eq 1 ]]; then
+        log "DB sedang terkunci, menunggu lock sqlite dilepas..."
+      fi
+      sleep 2
+      continue
+    fi
+    cat "${sql_err}" >&2 || true
+    return 1
+  done
+  if [[ "${db_init_ok}" != "1" ]]; then
+    log "Gagal inisialisasi DB: sqlite lock tidak lepas."
+    return 1
+  fi
 
   # Backward-compatible migration for older DB schema.
   local t

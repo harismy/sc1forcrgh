@@ -5009,6 +5009,34 @@ function listCurrentTcpDropRuleIps(port, ipv6 = false) {
   return set;
 }
 
+function listCurrentTcpDropRuleIpsNft(port, ipv6 = false) {
+  const set = new Set();
+  if (!safeExec('nft', ['list', 'ruleset'])) return set;
+  const candidates = [
+    ['inet', 'filter', 'input'],
+    ['ip', 'filter', 'input']
+  ];
+  const dport = String(port);
+  const familyToken = ipv6 ? 'ip6 saddr' : 'ip saddr';
+  for (const chain of candidates) {
+    const out = readExec('nft', ['list', 'chain', ...chain]);
+    if (!out) continue;
+    for (const lineRaw of String(out).split('\n')) {
+      const line = String(lineRaw || '').trim();
+      if (!line || !line.includes(familyToken)) continue;
+      if (!line.includes(' tcp ')) continue;
+      if (!line.includes(` dport ${dport} `)) continue;
+      if (!line.includes(' drop')) continue;
+      const re = ipv6 ? /ip6 saddr\s+([0-9a-fA-F:]+)/ : /ip saddr\s+([0-9.]+)/;
+      const m = line.match(re);
+      const src = normalizeRuleSource(m?.[1] || '');
+      if (!src) continue;
+      set.add(src);
+    }
+  }
+  return set;
+}
+
 async function cleanupOrphanXrayDropRules() {
   const expectedRows = await all(
     "SELECT DISTINCT ip FROM temp_ip_lock_ips WHERE account_type IN ('vmess','vless','trojan')"
@@ -5021,13 +5049,19 @@ async function cleanupOrphanXrayDropRules() {
 
   let removed = 0;
   for (const p of XRAY_BLOCK_TCP_PORTS) {
-    const ipv4Set = listCurrentTcpDropRuleIps(p, false);
+    const ipv4Set = new Set([
+      ...Array.from(listCurrentTcpDropRuleIps(p, false)),
+      ...Array.from(listCurrentTcpDropRuleIpsNft(p, false))
+    ]);
     for (const ip of ipv4Set) {
       if (expected.has(ip)) continue;
       removeTcpDropRule(ip, p);
       removed += 1;
     }
-    const ipv6Set = listCurrentTcpDropRuleIps(p, true);
+    const ipv6Set = new Set([
+      ...Array.from(listCurrentTcpDropRuleIps(p, true)),
+      ...Array.from(listCurrentTcpDropRuleIpsNft(p, true))
+    ]);
     for (const ip of ipv6Set) {
       if (expected.has(ip)) continue;
       removeTcpDropRule(ip, p);
@@ -8488,6 +8522,7 @@ EOT_TROJAN_DETAIL
 }
 
 akun_menu() {
+  local skip_post_pause
   while true; do
     clear
     draw_menu_panel "MENU AKUN" \
@@ -8509,6 +8544,7 @@ akun_menu() {
       return
     fi
     clear
+    skip_post_pause=0
     case "${am}" in
       1) create_account ;;
       2) create_trial_account ;;
@@ -8516,8 +8552,14 @@ akun_menu() {
       4) edit_limit_ip_account ;;
       5) delete_account ;;
       6) list_accounts ;;
-      7) unlock_account ;;
-      8) unlock_all_accounts ;;
+      7)
+        unlock_account
+        skip_post_pause=1
+        ;;
+      8)
+        unlock_all_accounts
+        skip_post_pause=1
+        ;;
       9) show_account_detail ;;
       10) edit_limit_ip_all_accounts ;;
       11) extend_expired_all_accounts ;;
@@ -8525,6 +8567,11 @@ akun_menu() {
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
+    if [[ "${skip_post_pause}" == "1" ]]; then
+      echo
+      read -rp "Enter untuk kembali ke menu sebelumnya..." _ || true
+      continue
+    fi
     echo
     read -rp "Enter untuk lanjut..." _ || true
   done

@@ -10810,6 +10810,27 @@ show_ssh_only_online() {
     fi
   fi
 
+  # Fallback paling longgar: auth sukses dropbear terbaru tanpa syarat PID aktif.
+  # Berguna untuk pola koneksi HTTP Custom yang sangat cepat reconnect sehingga
+  # snapshot socket aktif sering miss di saat monitor dibuka.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    source_mode="REALTIME_RECENT_AUTH"
+    journalctl -u dropbear --since "-5 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+      /auth succeeded for /{
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+        seen[u]=1;
+      }
+      END {
+        for (u in seen) print u, 1;
+      }' > "${tmp_ip_count}" || true
+  fi
+
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
   echo "LIST USER LOGIN SSH (${source_mode})"

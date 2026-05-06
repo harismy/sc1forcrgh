@@ -3353,22 +3353,34 @@ async function releaseTempLockNow(accountType, username) {
 }
 
 app.patch('/vps/unlockvmess/:username', async (req, res) => {
-  const username = String(req.params.username || '').trim();
-  const out = await setStatusXray('account_vmesses', username, 'AKTIF');
-  await releaseTempLockNow('vmess', username);
-  return ok(res, out);
+  try {
+    const username = String(req.params.username || '').trim();
+    const out = await setStatusXray('account_vmesses', username, 'AKTIF');
+    await releaseTempLockNow('vmess', username);
+    return ok(res, out);
+  } catch (e) {
+    return fail(res, 500, e?.message || 'unlock vmess failed');
+  }
 });
 app.patch('/vps/unlockvless/:username', async (req, res) => {
-  const username = String(req.params.username || '').trim();
-  const out = await setStatusXray('account_vlesses', username, 'AKTIF');
-  await releaseTempLockNow('vless', username);
-  return ok(res, out);
+  try {
+    const username = String(req.params.username || '').trim();
+    const out = await setStatusXray('account_vlesses', username, 'AKTIF');
+    await releaseTempLockNow('vless', username);
+    return ok(res, out);
+  } catch (e) {
+    return fail(res, 500, e?.message || 'unlock vless failed');
+  }
 });
 app.patch('/vps/unlocktrojan/:username', async (req, res) => {
-  const username = String(req.params.username || '').trim();
-  const out = await setStatusXray('account_trojans', username, 'AKTIF');
-  await releaseTempLockNow('trojan', username);
-  return ok(res, out);
+  try {
+    const username = String(req.params.username || '').trim();
+    const out = await setStatusXray('account_trojans', username, 'AKTIF');
+    await releaseTempLockNow('trojan', username);
+    return ok(res, out);
+  } catch (e) {
+    return fail(res, 500, e?.message || 'unlock trojan failed');
+  }
 });
 
 // Endpoint untuk dipanggil bot setelah proses restore/import DB selesai.

@@ -7094,6 +7094,32 @@ EOF
   certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}
 }
 
+prepare_haproxy_pem() {
+  local cert_domain fullchain privkey pem
+  cert_domain="$(tls_cert_domain)"
+  fullchain="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
+  privkey="/etc/letsencrypt/live/${cert_domain}/privkey.pem"
+  pem="/etc/haproxy/certs/${cert_domain}.pem"
+
+  mkdir -p /etc/haproxy/certs
+  if [[ -s "${fullchain}" && -s "${privkey}" ]]; then
+    cat "${fullchain}" "${privkey}" > "${pem}" || return 1
+    chmod 600 "${pem}" || true
+    echo "${pem}"
+    return 0
+  fi
+
+  echo "Cert Let's Encrypt untuk ${cert_domain} belum ada. Pakai self-signed sementara agar 443 tetap aktif." >&2
+  openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3 \
+    -subj "/CN=${cert_domain}" \
+    -keyout "/etc/haproxy/certs/${cert_domain}.key" \
+    -out "/etc/haproxy/certs/${cert_domain}.crt" >/dev/null 2>&1 || return 1
+  cat "/etc/haproxy/certs/${cert_domain}.crt" "/etc/haproxy/certs/${cert_domain}.key" > "${pem}" || return 1
+  chmod 600 "${pem}" || true
+  echo "${pem}"
+  return 0
+}
+
 fw_persist_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true

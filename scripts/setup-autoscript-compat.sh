@@ -10619,12 +10619,13 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_ip_count tmp_db_ports
+  local tmp_status tmp_ip_count tmp_db_ports tmp_proc_count
   local dropbear_main_port dropbear_alt_port db_recent_log_max source_mode
   tmp_status="$(mktemp)"
   tmp_ip_count="$(mktemp)"
   tmp_db_ports="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}"' RETURN
+  tmp_proc_count="$(mktemp)"
+  trap 'rm -f "${tmp_status:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}" "${tmp_proc_count:-}"' RETURN
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
@@ -10729,6 +10730,36 @@ show_ssh_only_online() {
           for (p in last_user) cnt[last_user[p]]++;
           for (u in cnt) print u, cnt[u];
         }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
+    fi
+  fi
+
+  # Fallback terakhir: hitung sesi dari process list aktif.
+  # Ini menjaga monitor tetap tampil meski format log dropbear berbeda antar versi distro.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    source_mode="REALTIME_PROCESS"
+    ps -eo args= 2>/dev/null | awk '
+      {
+        u="";
+        if ($0 ~ /^sshd:[[:space:]]+/) {
+          if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/) next;
+          u=$0;
+          sub(/^sshd:[[:space:]]*/, "", u);
+          sub(/[[:space:]].*$/, "", u);
+          sub(/@.*$/, "", u);
+          sub(/\[.*$/, "", u);
+        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+          u=$0;
+          sub(/^.*\[/, "", u);
+          sub(/\].*$/, "", u);
+        } else next;
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/) next;
+        if (u=="root" || u=="priv" || u=="net") next;
+        cnt[u]++;
+      }
+      END { for (u in cnt) print u, cnt[u]; }' > "${tmp_proc_count}" || true
+    if [[ -s "${tmp_proc_count}" ]]; then
+      mv -f "${tmp_proc_count}" "${tmp_ip_count}"
     fi
   fi
 

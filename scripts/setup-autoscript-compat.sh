@@ -6542,7 +6542,10 @@ ssh_users="$(
   tmp_ss_pid_ip="$(mktemp)"
   tmp_pid_user="$(mktemp)"
   tmp_pair="$(mktemp)"
-  trap 'rm -f "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}"' RETURN
+  tmp_db_ports="$(mktemp)"
+  tmp_db_pids="$(mktemp)"
+  tmp_recent="$(mktemp)"
+  trap 'rm -f "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_db_ports:-}" "${tmp_db_pids:-}" "${tmp_recent:-}"' RETURN
 
   ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
     {
@@ -6596,31 +6599,98 @@ ssh_users="$(
     fi
   fi
 
+  # Fallback 1: active port -> map dari auth dropbear.
+  if [[ ! -s "${tmp_pair}" ]]; then
+    ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
+      function p(v,   s,n,a,port) {
+        s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+        n=split(s, a, ":"); port=a[n];
+        if (port ~ /^[0-9]{1,5}$/) return port;
+        return "";
+      }
+      {
+        lp=p($4); rp=p($5);
+        if (lp==p1 || lp==p2) { if (rp ~ /^[0-9]{1,5}$/) act[rp]=1; }
+        else if (rp==p1 || rp==p2) { if (lp ~ /^[0-9]{1,5}$/) act[lp]=1; }
+      }
+      END { for (k in act) print k; }' > "${tmp_db_ports}" || true
+    if [[ -s "${tmp_db_ports}" ]]; then
+      journalctl -u dropbear --since "-30 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" --no-pager 2>/dev/null | awk '
+        NR==FNR { ap[$1]=1; next }
+        /auth succeeded for /{
+          u=$0;
+          sub(/^.*auth succeeded for /,"",u);
+          sub(/^'\''/,"",u); sub(/^"/,"",u);
+          sub(/'\''.*/,"",u); sub(/".*/,"",u);
+          sub(/[[:space:]].*$/,"",u);
+          u=tolower(u);
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+          src=$0; sub(/^.* from /, "", src); gsub(/[[:space:]]+$/, "", src);
+          port=src; sub(/^.*:/, "", port);
+          if (!(port in ap)) next;
+          c[u]++;
+        }
+        END { for (u in c) print u, c[u]; }' "${tmp_db_ports}" - > "${tmp_recent}" || true
+      if [[ -s "${tmp_recent}" ]]; then
+        awk '{ printf "%s(%d)\n", $1, ($2+0) }' "${tmp_recent}" | sort
+        exit 0
+      fi
+    fi
+  fi
+
+  # Fallback 2: process list.
+  if [[ ! -s "${tmp_pair}" ]]; then
+    ps -eo args= 2>/dev/null | awk '
+      {
+        u="";
+        if ($0 ~ /^sshd:[[:space:]]+/) {
+          if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/) next;
+          u=$0; sub(/^sshd:[[:space:]]*/, "", u); sub(/[[:space:]].*$/, "", u); sub(/@.*$/, "", u); sub(/\[.*$/, "", u);
+        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+          u=$0; sub(/^.*\[/, "", u); sub(/\].*$/, "", u);
+        } else next;
+        u=tolower(u);
+        if (u ~ /^[a-z0-9._-]+$/ && u!="root" && u!="priv" && u!="net") c[u]++;
+      }
+      END { for (u in c) printf "%s(%d)\n", u, c[u]; }' | sort
+    exit 0
+  fi
+
+  # Primary
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/) c[$1]++ } END { for (u in c) printf "%s(%d)\n", u, c[u] }' "${tmp_pair}" | sort || true
 )"
 ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
 if [[ "${ssh_cnt}" -eq 0 ]]; then
   ssh_users="$(
-    journalctl -u dropbear --since "-${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} seconds" -n "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" --no-pager 2>/dev/null | awk '
-      {
-        l=tolower($0)
-        u=""
-        if (match(l, /password auth succeeded for '\''[a-z0-9._-]+'\''/)) {
-          t=substr(l, RSTART, RLENGTH)
-          gsub(/^.*for '\''/, "", t); gsub(/'\''$/, "", t)
-          u=t
-        } else if (match(l, /pubkey auth succeeded for '\''[a-z0-9._-]+'\''/)) {
-          t=substr(l, RSTART, RLENGTH)
-          gsub(/^.*for '\''/, "", t); gsub(/'\''$/, "", t)
-          u=t
-        } else if (match($0, /^.*dropbear[^[]*\[[^]]+\]/)) {
-          t=substr($0, RSTART, RLENGTH)
-          sub(/^.*\[/, "", t); sub(/\].*$/, "", t)
-          u=tolower(t)
+    journalctl -u dropbear --since "-3 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" --no-pager 2>/dev/null | awk '
+      function parse_pid(line,   p) {
+        if (match(line, /\[[0-9]+\]/)) {
+          p=substr(line, RSTART+1, RLENGTH-2);
+          if (p ~ /^[0-9]+$/) return p;
         }
-        if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") print u
+        return "";
       }
-    ' | awk '{c[$1]++} END{for (u in c) printf "%s(%d)\n", u, c[u]}' | sort
+      /auth succeeded for /{
+        pid=parse_pid($0);
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+        if (pid != "") auth_by_pid[pid]=u; else auth_no_pid[u]=1;
+        next;
+      }
+      /Exit \(|Exit before auth:/{
+        pid=parse_pid($0);
+        if (pid != "") closed_pid[pid]=1;
+      }
+      END{
+        for (pid in auth_by_pid) if (!(pid in closed_pid)) seen[auth_by_pid[pid]]++;
+        for (u in auth_no_pid) seen[u]++;
+        for (u in seen) printf "%s(%d)\n", u, seen[u];
+      }' | sort
   )"
   ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
 fi

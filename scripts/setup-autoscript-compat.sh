@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
@@ -202,7 +202,7 @@ if [[ -z "${ZIVPN_HTTP_AUTH_URL}" ]]; then
 fi
 
 log() {
-  echo "[autoscript-compat] $*"
+  echo "[autoscript-1FORCR-NEXUS] $*"
 }
 
 flag_enabled() {
@@ -7117,7 +7117,27 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-source /etc/sc-1forcr.env
+sanitize_env_file() {
+  local file="$1" tmp
+  [[ -f "${file}" ]] || return 0
+  tmp="$(mktemp)"
+  awk '
+    /^[[:space:]]*$/ { print; next }
+    /^[[:space:]]*#/ { print; next }
+    /^[A-Za-z_][A-Za-z0-9_]*=.*/ { print; next }
+    { next }
+  ' "${file}" > "${tmp}" && mv -f "${tmp}" "${file}"
+}
+
+safe_source_env_file() {
+  local file="$1"
+  [[ -f "${file}" ]] || return 0
+  sanitize_env_file "${file}"
+  # shellcheck disable=SC1090
+  source "${file}"
+}
+
+safe_source_env_file /etc/sc-1forcr.env
 AUTH_TOKEN="${AUTH_TOKEN:-${API_AUTH_TOKEN:-}}"
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
@@ -7395,6 +7415,7 @@ mask_secret() {
 
 update_sc_env_var() {
   local key="$1" value="$2" tmp
+  sanitize_env_file /etc/sc-1forcr.env
   tmp="$(mktemp)"
   awk -v k="${key}" -v v="${value}" '
     BEGIN { done=0 }
@@ -7414,6 +7435,7 @@ update_app_env_var() {
   if [[ ! -f "${app_env}" ]]; then
     return 0
   fi
+  sanitize_env_file "${app_env}"
   tmp="$(mktemp)"
   awk -v k="${key}" -v v="${value}" '
     BEGIN { done=0 }
@@ -12218,6 +12240,15 @@ apply_final_service_restart_chain() {
 update_sc_env_var() {
   local key="$1" value="$2" tmp
   [[ -z "${key}" ]] && return 0
+  if [[ -f /etc/sc-1forcr.env ]]; then
+    tmp="$(mktemp)"
+    awk '
+      /^[[:space:]]*$/ { print; next }
+      /^[[:space:]]*#/ { print; next }
+      /^[A-Za-z_][A-Za-z0-9_]*=.*/ { print; next }
+      { next }
+    ' /etc/sc-1forcr.env > "${tmp}" && mv -f "${tmp}" /etc/sc-1forcr.env
+  fi
   tmp="$(mktemp)"
   awk -v k="${key}" -v v="${value}" '
     BEGIN { done=0 }
@@ -12234,6 +12265,13 @@ update_app_env_var() {
   app_env="/opt/sc-1forcr/.env"
   [[ ! -f "${app_env}" ]] && app_env="/opt/potato-compat/.env"
   [[ ! -f "${app_env}" ]] && return 0
+  tmp="$(mktemp)"
+  awk '
+    /^[[:space:]]*$/ { print; next }
+    /^[[:space:]]*#/ { print; next }
+    /^[A-Za-z_][A-Za-z0-9_]*=.*/ { print; next }
+    { next }
+  ' "${app_env}" > "${tmp}" && mv -f "${tmp}" "${app_env}"
   tmp="$(mktemp)"
   awk -v k="${key}" -v v="${value}" '
     BEGIN { done=0 }

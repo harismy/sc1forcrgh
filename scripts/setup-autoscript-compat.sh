@@ -835,7 +835,7 @@ EOF
 }
 
 init_db() {
-  log "Inisialisasi DB: ${DB_PATH}"
+  log "Inisialisasi DB"
   mkdir -p "$(dirname "${DB_PATH}")"
   local sql_err try db_init_ok
   sql_err="$(mktemp)"

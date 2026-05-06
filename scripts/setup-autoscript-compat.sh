@@ -3338,18 +3338,38 @@ async function releaseTempLockNow(accountType, username) {
   const t = String(accountType || '').trim().toLowerCase();
   const u = String(username || '').trim();
   if (!t || !u) return;
+  const removeDropCompat = (proto, ip, port) => {
+    const p = String(proto || '').trim().toLowerCase();
+    const src = String(ip || '').trim();
+    const dport = String(port || '').trim();
+    if (!src || !dport || (p !== 'tcp' && p !== 'udp')) return;
+    const cmd = src.includes(':') ? 'ip6tables' : 'iptables';
+    const rule = ['INPUT', '-p', p, '-s', src, '--dport', dport, '-j', 'DROP'];
+    while (safeExec(cmd, ['-D', ...rule])) {}
+    // fallback nftables (jika rule dibuat via nft chain langsung)
+    const fam = src.includes(':') ? 'ip6' : 'ip';
+    const chainCandidates = [
+      ['inet', 'filter', 'input'],
+      ['ip', 'filter', 'input']
+    ];
+    for (const chain of chainCandidates) {
+      while (safeExec('nft', ['delete', 'rule', ...chain, fam, 'saddr', src, p, 'dport', dport, 'drop'])) {}
+    }
+  };
   const ipRows = await all("SELECT ip FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => []);
   if (t === 'ssh') {
     const udpLockPort = getActiveUdpLockPort();
     for (const item of ipRows) {
-      removeUdpDropRule(String(item?.ip || ''), udpLockPort);
+      const ip = String(item?.ip || '').trim();
+      if (!ip) continue;
+      removeDropCompat('udp', ip, udpLockPort);
     }
   } else if (t === 'vmess' || t === 'vless' || t === 'trojan') {
     for (const item of ipRows) {
       const ip = String(item?.ip || '').trim();
       if (!ip) continue;
       for (const p of XRAY_BLOCK_TCP_PORTS) {
-        removeTcpDropRule(ip, p);
+        removeDropCompat('tcp', ip, p);
       }
     }
   }

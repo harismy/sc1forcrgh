@@ -996,6 +996,32 @@ EOF
   certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}
 }
 
+prepare_haproxy_pem() {
+  local cert_domain fullchain privkey pem
+  cert_domain="$(tls_cert_domain)"
+  fullchain="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
+  privkey="/etc/letsencrypt/live/${cert_domain}/privkey.pem"
+  pem="/etc/haproxy/certs/${cert_domain}.pem"
+
+  mkdir -p /etc/haproxy/certs
+  if [[ -s "${fullchain}" && -s "${privkey}" ]]; then
+    cat "${fullchain}" "${privkey}" > "${pem}" || return 1
+    chmod 600 "${pem}" || true
+    echo "${pem}"
+    return 0
+  fi
+
+  log "Cert Let's Encrypt untuk ${cert_domain} belum ada. Pakai self-signed sementara agar 443 tetap aktif."
+  openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3 \
+    -subj "/CN=${cert_domain}" \
+    -keyout "/etc/haproxy/certs/${cert_domain}.key" \
+    -out "/etc/haproxy/certs/${cert_domain}.crt" >/dev/null 2>&1 || return 1
+  cat "/etc/haproxy/certs/${cert_domain}.crt" "/etc/haproxy/certs/${cert_domain}.key" > "${pem}" || return 1
+  chmod 600 "${pem}" || true
+  echo "${pem}"
+  return 0
+}
+
 setup_nginx_and_cert() {
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
@@ -1195,21 +1221,13 @@ EOF
 }
 
 setup_haproxy_tls_mux() {
-  local fullchain privkey pem cert_domain
-  cert_domain="$(tls_cert_domain)"
-  fullchain="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
-  privkey="/etc/letsencrypt/live/${cert_domain}/privkey.pem"
-  pem="/etc/haproxy/certs/${cert_domain}.pem"
-
-  if [[ ! -s "${fullchain}" || ! -s "${privkey}" ]]; then
-    log "Sertifikat tidak ditemukan untuk ${cert_domain}, skip setup haproxy 443."
-    return 0
-  fi
+  local pem
+  pem="$(prepare_haproxy_pem)" || {
+    log "Gagal menyiapkan sertifikat HAProxy."
+    return 1
+  }
 
   log "Setup HAProxy TLS mux di 443..."
-  mkdir -p /etc/haproxy/certs
-  cat "${fullchain}" "${privkey}" > "${pem}"
-  chmod 600 "${pem}"
 
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
@@ -9035,23 +9053,18 @@ EONGINX
   systemctl restart nginx || true
 
   if ! issue_letsencrypt_cert; then
-    echo "Gagal issue cert untuk domain ${new_domain}."
+    echo "Peringatan: issue cert Let's Encrypt untuk ${new_domain} gagal. Lanjut dengan cert sementara."
     if flag_enabled "${WILDCARD_ENABLE:-0}"; then
-      echo "Pastikan WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN valid, lalu ulangi."
+      echo "Cek WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN, lalu jalankan renew cert nanti."
     else
-      echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
+      echo "Cek A record domain ke VPS, lalu jalankan renew cert nanti."
     fi
-    return
   fi
 
-  cert_domain="$(tls_cert_domain)"
-  pem="/etc/haproxy/certs/${cert_domain}.pem"
-  mkdir -p /etc/haproxy/certs
-  cat "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" "/etc/letsencrypt/live/${cert_domain}/privkey.pem" > "${pem}" || {
+  pem="$(prepare_haproxy_pem)" || {
     echo "Gagal menyiapkan sertifikat HAProxy."
     return
   }
-  chmod 600 "${pem}"
 
   cat > /etc/haproxy/haproxy.cfg <<EOHAP
 global
@@ -9112,11 +9125,10 @@ EOHAP
   }
   systemctl restart haproxy || true
 
-  pem="/etc/haproxy/certs/${cert_domain}.pem"
   if [[ ! -s "${pem}" ]]; then
-    echo "Gagal issue cert untuk domain ${new_domain}."
+    echo "Gagal menyiapkan sertifikat HAProxy untuk domain ${new_domain}."
     if flag_enabled "${WILDCARD_ENABLE:-0}"; then
-      echo "Pastikan wildcard cert berhasil terbit untuk ${cert_domain}."
+      echo "Pastikan wildcard cert berhasil terbit untuk domain kamu."
     else
       echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
     fi

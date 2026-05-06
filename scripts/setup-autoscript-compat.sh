@@ -8360,6 +8360,16 @@ set_iplimit_checker_config_menu() {
 set_autolock_realtime_tuning_menu() {
   local cur_interval cur_lock cur_xray_recent cur_xray_active cur_xray_hits cur_zivpn_active cur_zivpn_handoff
   local in_interval in_lock in_xray_recent in_xray_active in_xray_hits in_zivpn_active in_zivpn_handoff
+  local def_interval def_lock def_xray_recent def_xray_active def_xray_hits def_zivpn_active def_zivpn_handoff
+
+  # Default rekomendasi (balanced realtime + minim false-positive).
+  def_interval="1"
+  def_lock="15"
+  def_xray_recent="5"
+  def_xray_active="60"
+  def_xray_hits="2"
+  def_zivpn_active="90"
+  def_zivpn_handoff="90"
 
   cur_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}" | tr -cd '0-9')"
   cur_lock="$(echo "${IPLIMIT_LOCK_MINUTES:-15}" | tr -cd '0-9')"
@@ -8404,63 +8414,64 @@ set_autolock_realtime_tuning_menu() {
   echo "  dan/atau naikkan ZIVPN handoff grace."
   echo
   echo "Rekomendasi:"
-  echo "- Aman umum (disarankan): interval=1, lock=15, xray_recent=5, xray_active=60, xray_hits=2, zivpn_active=90, handoff=90"
+  echo "- Aman umum (disarankan): interval=${def_interval}, lock=${def_lock}, xray_recent=${def_xray_recent}, xray_active=${def_xray_active}, xray_hits=${def_xray_hits}, zivpn_active=${def_zivpn_active}, handoff=${def_zivpn_handoff}"
   echo "- Agresif: interval=1, xray_active=30, xray_hits=1 (resiko false-positive naik)."
   echo "- Stabil tinggi trafik: interval=2, xray_active=90, xray_hits=2."
   echo
-  echo "Kosongkan input untuk pertahankan nilai lama. Ketik 'batal' untuk keluar."
+  echo "Kosongkan input (Enter) untuk pakai DEFAULT REKOMENDASI."
+  echo "Ketik 'batal' untuk keluar."
 
-  if ! prompt_input in_interval "Interval checker (menit) [${cur_interval}]: "; then return; fi
+  if ! prompt_input in_interval "Interval checker (menit) [${def_interval}]: "; then return; fi
   [[ "${in_interval,,}" == "batal" ]] && return
-  in_interval="${in_interval:-${cur_interval}}"
+  in_interval="${in_interval:-${def_interval}}"
   if [[ ! "${in_interval}" =~ ^[0-9]+$ || "${in_interval}" -lt 1 || "${in_interval}" -gt 1440 ]]; then
     echo "Interval checker harus angka 1-1440 menit."
     return
   fi
 
-  if ! prompt_input in_lock "Durasi unlock lock tmp (menit) [${cur_lock}]: "; then return; fi
+  if ! prompt_input in_lock "Durasi unlock lock tmp (menit) [${def_lock}]: "; then return; fi
   [[ "${in_lock,,}" == "batal" ]] && return
-  in_lock="${in_lock:-${cur_lock}}"
+  in_lock="${in_lock:-${def_lock}}"
   if [[ ! "${in_lock}" =~ ^[0-9]+$ || "${in_lock}" -lt 1 || "${in_lock}" -gt 10080 ]]; then
     echo "Durasi unlock harus angka 1-10080 menit."
     return
   fi
 
-  if ! prompt_input in_xray_recent "XRAY recent window (menit) [${cur_xray_recent}]: "; then return; fi
+  if ! prompt_input in_xray_recent "XRAY recent window (menit) [${def_xray_recent}]: "; then return; fi
   [[ "${in_xray_recent,,}" == "batal" ]] && return
-  in_xray_recent="${in_xray_recent:-${cur_xray_recent}}"
+  in_xray_recent="${in_xray_recent:-${def_xray_recent}}"
   if [[ ! "${in_xray_recent}" =~ ^[0-9]+$ || "${in_xray_recent}" -lt 5 || "${in_xray_recent}" -gt 1440 ]]; then
     echo "XRAY recent window harus angka 5-1440 menit."
     return
   fi
 
-  if ! prompt_input in_xray_active "XRAY active window (detik) [${cur_xray_active}]: "; then return; fi
+  if ! prompt_input in_xray_active "XRAY active window (detik) [${def_xray_active}]: "; then return; fi
   [[ "${in_xray_active,,}" == "batal" ]] && return
-  in_xray_active="${in_xray_active:-${cur_xray_active}}"
+  in_xray_active="${in_xray_active:-${def_xray_active}}"
   if [[ ! "${in_xray_active}" =~ ^[0-9]+$ || "${in_xray_active}" -lt 30 || "${in_xray_active}" -gt 1800 ]]; then
     echo "XRAY active window harus angka 30-1800 detik."
     return
   fi
 
-  if ! prompt_input in_xray_hits "XRAY min hits per IP [${cur_xray_hits}]: "; then return; fi
+  if ! prompt_input in_xray_hits "XRAY min hits per IP [${def_xray_hits}]: "; then return; fi
   [[ "${in_xray_hits,,}" == "batal" ]] && return
-  in_xray_hits="${in_xray_hits:-${cur_xray_hits}}"
+  in_xray_hits="${in_xray_hits:-${def_xray_hits}}"
   if [[ ! "${in_xray_hits}" =~ ^[0-9]+$ || "${in_xray_hits}" -lt 1 || "${in_xray_hits}" -gt 20 ]]; then
     echo "XRAY min hits per IP harus angka 1-20."
     return
   fi
 
-  if ! prompt_input in_zivpn_active "ZIVPN active window (detik) [${cur_zivpn_active}]: "; then return; fi
+  if ! prompt_input in_zivpn_active "ZIVPN active window (detik) [${def_zivpn_active}]: "; then return; fi
   [[ "${in_zivpn_active,,}" == "batal" ]] && return
-  in_zivpn_active="${in_zivpn_active:-${cur_zivpn_active}}"
+  in_zivpn_active="${in_zivpn_active:-${def_zivpn_active}}"
   if [[ ! "${in_zivpn_active}" =~ ^[0-9]+$ || "${in_zivpn_active}" -lt 20 || "${in_zivpn_active}" -gt 1800 ]]; then
     echo "ZIVPN active window harus angka 20-1800 detik."
     return
   fi
 
-  if ! prompt_input in_zivpn_handoff "ZIVPN handoff grace (detik) [${cur_zivpn_handoff}]: "; then return; fi
+  if ! prompt_input in_zivpn_handoff "ZIVPN handoff grace (detik) [${def_zivpn_handoff}]: "; then return; fi
   [[ "${in_zivpn_handoff,,}" == "batal" ]] && return
-  in_zivpn_handoff="${in_zivpn_handoff:-${cur_zivpn_handoff}}"
+  in_zivpn_handoff="${in_zivpn_handoff:-${def_zivpn_handoff}}"
   if [[ ! "${in_zivpn_handoff}" =~ ^[0-9]+$ || "${in_zivpn_handoff}" -lt 3 || "${in_zivpn_handoff}" -gt 120 ]]; then
     echo "ZIVPN handoff grace harus angka 3-120 detik."
     return

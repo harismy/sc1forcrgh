@@ -134,7 +134,7 @@ ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-0}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-30}"
-IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
+IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
@@ -154,8 +154,8 @@ UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
 UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-}"
 UDPHC_LOG_LINES_CHECKER="${UDPHC_LOG_LINES_CHECKER:-}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
-XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-60}"
-XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-600}"
+XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
+XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
 XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-1}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
@@ -1011,7 +1011,7 @@ prepare_haproxy_pem() {
     return 0
   fi
 
-  log "Cert Let's Encrypt untuk ${cert_domain} belum ada. Pakai self-signed sementara agar 443 tetap aktif."
+  log "Cert Let's Encrypt untuk ${cert_domain} belum ada. Pakai self-signed sementara agar 443 tetap aktif." >&2
   openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3 \
     -subj "/CN=${cert_domain}" \
     -keyout "/etc/haproxy/certs/${cert_domain}.key" \
@@ -7003,6 +7003,12 @@ API_BASE="http://127.0.0.1:${API_PORT}/vps"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
+SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
+SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
+SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
+SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
+XRAY_MONITOR_ACTIVE_WINDOW_SECONDS="${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-15}"
+XRAY_MONITOR_RECENT_WINDOW_MINUTES="${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
@@ -7014,6 +7020,8 @@ UDPHC_LOG_LINES_CHECKER="$(echo "${UDPHC_LOG_LINES_CHECKER:-6000}" | tr -cd '0-9
 xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-60}" | tr -cd '0-9')"
 xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-600}" | tr -cd '0-9')"
 xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
+xray_monitor_active_window_sec="$(echo "${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-15}" | tr -cd '0-9')"
+xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
 [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
 [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
@@ -7022,6 +7030,8 @@ xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
 [[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="60"
 [[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="600"
 [[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="1"
+[[ -z "${xray_monitor_active_window_sec}" || "${xray_monitor_active_window_sec}" -lt 5 || "${xray_monitor_active_window_sec}" -gt 120 ]] && xray_monitor_active_window_sec="15"
+[[ -z "${xray_monitor_recent_window_min}" || "${xray_monitor_recent_window_min}" -lt 1 || "${xray_monitor_recent_window_min}" -gt 60 ]] && xray_monitor_recent_window_min="5"
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
@@ -10571,10 +10581,16 @@ show_ssh_only_online() {
 }
 
 xray_log_snapshot() {
-  local dst="$1"
-  local cutoff_ts active_cutoff_ts
-  cutoff_ts="$(( $(date +%s) - (xray_recent_window_min * 60) ))"
-  active_cutoff_ts="$(( $(date +%s) - xray_active_window_sec ))"
+  local dst="$1" mode="${2:-normal}"
+  local cutoff_ts active_cutoff_ts recent_min active_sec
+  recent_min="${xray_recent_window_min}"
+  active_sec="${xray_active_window_sec}"
+  if [[ "${mode}" == "realtime" ]]; then
+    recent_min="${xray_monitor_recent_window_min}"
+    active_sec="${xray_monitor_active_window_sec}"
+  fi
+  cutoff_ts="$(( $(date +%s) - (recent_min * 60) ))"
+  active_cutoff_ts="$(( $(date +%s) - active_sec ))"
   if [[ ! -f /var/log/xray/access.log ]]; then
     : > "${dst}"
     return
@@ -10646,7 +10662,7 @@ xray_log_snapshot() {
 }
 
 show_xray_online_by_table() {
-  local table="$1" label="$2"
+  local table="$1" label="$2" mode="${3:-normal}"
   local t_users t_seen
   t_users="$(mktemp)"
   t_seen="$(mktemp)"
@@ -10659,7 +10675,7 @@ show_xray_online_by_table() {
     return
   fi
 
-  xray_log_snapshot "${t_seen}"
+  xray_log_snapshot "${t_seen}" "${mode}"
 
   draw_menu_header "${label} USER LOGIN (berdasarkan log xray terbaru)"
   if [[ ! -s "${t_seen}" ]]; then
@@ -10697,6 +10713,21 @@ show_xray_online_by_table() {
       printf "Total User : %d\n", total_user + 0;
       printf "Total IP   : %d\n", total_ip + 0;
     }' "${t_users}" "${t_seen}"
+}
+
+show_xray_online_realtime_by_table() {
+  local table="$1" label="$2" key=""
+  while true; do
+    clear
+    show_xray_online_by_table "${table}" "${label}" "realtime"
+    echo
+    echo "Realtime refresh tiap 1 detik. Tekan q untuk keluar."
+    if read -r -s -n 1 -t 1 key; then
+      case "${key}" in
+        q|Q) break ;;
+      esac
+    fi
+  done
 }
 
 show_udpcustom_online() {
@@ -10887,6 +10918,21 @@ show_zivpn_online() {
     JOIN account_sshs s ON LOWER(s.username)=af.username
     WHERE UPPER(TRIM(COALESCE(s.status,'')))='AKTIF';
   " 2>/dev/null || true
+}
+
+show_zivpn_online_realtime() {
+  local key=""
+  while true; do
+    clear
+    show_zivpn_online
+    echo
+    echo "Realtime refresh tiap 1 detik. Tekan q untuk keluar."
+    if read -r -s -n 1 -t 1 key; then
+      case "${key}" in
+        q|Q) break ;;
+      esac
+    fi
+  done
 }
 
 update_script_from_repo() {
@@ -11389,10 +11435,10 @@ monitor_online_menu() {
     case "${o}" in
       1) show_ssh_only_online ;;
       2) show_ssh_online ;;
-      3) show_xray_online_by_table "account_vmesses" "VMESS" ;;
-      4) show_xray_online_by_table "account_vlesses" "VLESS" ;;
-      5) show_xray_online_by_table "account_trojans" "TROJAN" ;;
-      6) show_zivpn_online ;;
+      3) show_xray_online_realtime_by_table "account_vmesses" "VMESS" ;;
+      4) show_xray_online_realtime_by_table "account_vlesses" "VLESS" ;;
+      5) show_xray_online_realtime_by_table "account_trojans" "TROJAN" ;;
+      6) show_zivpn_online_realtime ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

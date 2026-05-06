@@ -10815,8 +10815,16 @@ show_ssh_only_online() {
   # snapshot socket aktif sering miss di saat monitor dibuka.
   if [[ ! -s "${tmp_ip_count}" ]]; then
     source_mode="REALTIME_RECENT_AUTH"
-    journalctl -u dropbear --since "-5 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+    journalctl -u dropbear --since "-3 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+      function parse_pid(line,   p) {
+        if (match(line, /\[[0-9]+\]/)) {
+          p=substr(line, RSTART+1, RLENGTH-2);
+          if (p ~ /^[0-9]+$/) return p;
+        }
+        return "";
+      }
       /auth succeeded for /{
+        pid=parse_pid($0);
         u=$0;
         sub(/^.*auth succeeded for /,"",u);
         sub(/^'\''/,"",u); sub(/^"/,"",u);
@@ -10824,9 +10832,23 @@ show_ssh_only_online() {
         sub(/[[:space:]].*$/,"",u);
         u=tolower(u);
         if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-        seen[u]=1;
+        if (pid != "") {
+          auth_by_pid[pid]=u;
+        } else {
+          auth_no_pid[u]=1;
+        }
+        next;
+      }
+      /Exit \(|Exit before auth:/{
+        pid=parse_pid($0);
+        if (pid != "") closed_pid[pid]=1;
       }
       END {
+        for (pid in auth_by_pid) {
+          if (pid in closed_pid) continue;
+          seen[auth_by_pid[pid]]=1;
+        }
+        for (u in auth_no_pid) seen[u]=1;
         for (u in seen) print u, 1;
       }' > "${tmp_ip_count}" || true
   fi

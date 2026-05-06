@@ -10684,7 +10684,7 @@ show_ssh_only_online() {
 
   # Fallback realtime berdasarkan port ssh-mux yang masih aktif ke dropbear.
   if [[ ! -s "${tmp_ip_count}" ]]; then
-    source_mode="REALTIME_MUX_PORT"
+    source_mode="REALTIME_ACTIVE_PORT"
     : > "${tmp_db_ports}"
     ss -Htnp state established 2>/dev/null | awk '
       function p(v,   s,n,a,port) {
@@ -10696,7 +10696,6 @@ show_ssh_only_online() {
         return "";
       }
       {
-        if ($0 !~ /ssh-mux/) next;
         lp=p($4); rp=p($5);
         if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
           if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;

@@ -3063,10 +3063,7 @@ app.patch('/vps/locksshvpn/:username', async (req, res) => {
 async function syncAfterManualSshUnlock(username) {
   const u = String(username || '').trim();
   if (!u) return;
-  await run(
-    "UPDATE temp_ip_locks SET locked_until=0 WHERE account_type='ssh' AND LOWER(username)=LOWER(?)",
-    [u]
-  ).catch(() => {});
+  await releaseTempLockNow('ssh', u).catch(() => {});
   safeExec('systemctl', ['start', 'sc-1forcr-iplimit.service']);
   safeExec('systemctl', ['restart', 'sc-1forcr-iplimit.timer']);
 }
@@ -3328,9 +3325,51 @@ app.delete('/vps/deletetrojan/:username', async (req, res) => ok(res, await delX
 app.patch('/vps/lockvmess/:username', async (req, res) => ok(res, await setStatusXray('account_vmesses', String(req.params.username || '').trim(), 'LOCK')));
 app.patch('/vps/lockvless/:username', async (req, res) => ok(res, await setStatusXray('account_vlesses', String(req.params.username || '').trim(), 'LOCK')));
 app.patch('/vps/locktrojan/:username', async (req, res) => ok(res, await setStatusXray('account_trojans', String(req.params.username || '').trim(), 'LOCK')));
-app.patch('/vps/unlockvmess/:username', async (req, res) => ok(res, await setStatusXray('account_vmesses', String(req.params.username || '').trim(), 'AKTIF')));
-app.patch('/vps/unlockvless/:username', async (req, res) => ok(res, await setStatusXray('account_vlesses', String(req.params.username || '').trim(), 'AKTIF')));
-app.patch('/vps/unlocktrojan/:username', async (req, res) => ok(res, await setStatusXray('account_trojans', String(req.params.username || '').trim(), 'AKTIF')));
+async function releaseTempLockNow(accountType, username) {
+  const t = String(accountType || '').trim().toLowerCase();
+  const u = String(username || '').trim();
+  if (!t || !u) return;
+  const ipRows = await all("SELECT ip FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => []);
+  if (t === 'ssh') {
+    const udpLockPort = getActiveUdpLockPort();
+    for (const item of ipRows) {
+      removeUdpDropRule(String(item?.ip || ''), udpLockPort);
+    }
+  } else if (t === 'vmess' || t === 'vless' || t === 'trojan') {
+    for (const item of ipRows) {
+      const ip = String(item?.ip || '').trim();
+      if (!ip) continue;
+      for (const p of XRAY_BLOCK_TCP_PORTS) {
+        removeTcpDropRule(ip, p);
+      }
+    }
+  }
+  await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+  await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+  await run(
+    "INSERT OR REPLACE INTO temp_ip_lock_grace(account_type, username, grace_until) VALUES(?, ?, strftime('%s','now') + ?)",
+    [t, u, LOCK_RECHECK_GRACE_SECONDS]
+  ).catch(() => {});
+}
+
+app.patch('/vps/unlockvmess/:username', async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  const out = await setStatusXray('account_vmesses', username, 'AKTIF');
+  await releaseTempLockNow('vmess', username);
+  return ok(res, out);
+});
+app.patch('/vps/unlockvless/:username', async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  const out = await setStatusXray('account_vlesses', username, 'AKTIF');
+  await releaseTempLockNow('vless', username);
+  return ok(res, out);
+});
+app.patch('/vps/unlocktrojan/:username', async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  const out = await setStatusXray('account_trojans', username, 'AKTIF');
+  await releaseTempLockNow('trojan', username);
+  return ok(res, out);
+});
 
 // Endpoint untuk dipanggil bot setelah proses restore/import DB selesai.
 // Auto-sync xray hanya on-demand (bukan berkala) agar ringan dan deterministik.
@@ -7845,7 +7884,11 @@ print_account_picker_table() {
   [[ -z "${table}" ]] && return 1
   where=""
   if [[ "${lock_only}" == "1" ]]; then
-    where="WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')"
+    where="WHERE LOWER(username) IN (
+      SELECT LOWER(username) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+      UNION
+      SELECT LOWER(username) FROM temp_ip_locks WHERE account_type='${type}' AND locked_until > strftime('%s','now')
+    )"
   fi
   rows="$(sqlite3 -separator '|' "$DB_PATH" \
     "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday(date('now','localtime'))) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
@@ -7899,9 +7942,17 @@ pick_locked_username() {
   table="$(account_table_by_type "${type}")"
   [[ -z "${table}" ]] && return 1
 
-  rows="$(sqlite3 "$DB_PATH" "SELECT username FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') ORDER BY username;" 2>/dev/null || true)"
+  rows="$(sqlite3 "$DB_PATH" "
+    SELECT username FROM (
+      SELECT username FROM ${table}
+      WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+      UNION
+      SELECT username FROM temp_ip_locks
+      WHERE account_type='${type}' AND locked_until > strftime('%s','now')
+    ) ORDER BY username;
+  " 2>/dev/null || true)"
   if [[ -z "${rows}" ]]; then
-    echo "Tidak ada akun ${type} dengan status LOCK/LOCK_TMP." >&2
+    echo "Tidak ada akun ${type} yang sedang lock." >&2
     return 1
   fi
 
@@ -8222,7 +8273,15 @@ unlock_all_accounts() {
     ep="$(endpoint_unlock "${type}")"
     [[ -z "${table}" || -z "${ep}" ]] && continue
 
-    rows="$(sqlite3 "${DB_PATH}" "SELECT username FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') ORDER BY username;" 2>/dev/null || true)"
+    rows="$(sqlite3 "${DB_PATH}" "
+      SELECT username FROM (
+        SELECT username FROM ${table}
+        WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+        UNION
+        SELECT username FROM temp_ip_locks
+        WHERE account_type='${type}' AND locked_until > strftime('%s','now')
+      ) ORDER BY username;
+    " 2>/dev/null || true)"
     [[ -z "${rows}" ]] && continue
 
     while IFS= read -r username; do

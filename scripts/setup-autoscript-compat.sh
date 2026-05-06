@@ -2665,12 +2665,15 @@ function vmessLink(host, id, tls) {
 }
 function vlessLink(host, id, tls) {
   if (tls) {
-    return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${host}&host=${host}&encryption=none#vless-${host}`;
+    return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1&encryption=none#vless-${host}`;
   }
   return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#vless-${host}`;
 }
 function trojanLink(host, pass, tls) {
-  return `trojan://${pass}@${host}:${tls ? '443' : '80'}?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=${tls ? 'tls' : 'none'}&sni=${host}#trojan-${host}`;
+  if (tls) {
+    return `trojan://${pass}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1#trojan-${host}`;
+  }
+  return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}#trojan-${host}`;
 }
 
 async function renderAndReloadXray() {
@@ -8186,8 +8189,8 @@ Status       : ${d_status}
 Quota        : ${d_quota}
 Limit IP     : ${d_limit}
 Host         : ${DOMAIN}
-Link TLS     : trojan://${d_pass}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls&sni=${DOMAIN}#${d_user}
-Link NON TLS : trojan://${d_pass}@${DOMAIN}:80?type=ws&path=%2Ftrojan&security=none&sni=${DOMAIN}#${d_user}
+Link TLS     : trojan://${d_pass}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls&sni=${DOMAIN}&host=${DOMAIN}&alpn=http%2F1.1#${d_user}
+Link NON TLS : trojan://${d_pass}@${DOMAIN}:80?type=ws&path=%2Ftrojan&security=none&host=${DOMAIN}#${d_user}
 EOT_TROJAN_DETAIL
       ;;
     *)

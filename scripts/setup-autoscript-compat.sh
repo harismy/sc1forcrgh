@@ -2741,6 +2741,15 @@ async function syncXrayFromDbIfChanged(force = false) {
   }
 }
 
+async function syncXrayFromDbAndRespond(res, force = false) {
+  const changed = await syncXrayFromDbIfChanged(force).catch(() => false);
+  return ok(res, {
+    synced: true,
+    changed,
+    at: nowTime()
+  });
+}
+
 function isExpiredDateValue(v) {
   const s = String(v || '').trim();
   if (!s) return false;
@@ -3273,6 +3282,15 @@ app.patch('/vps/unlockvmess/:username', async (req, res) => ok(res, await setSta
 app.patch('/vps/unlockvless/:username', async (req, res) => ok(res, await setStatusXray('account_vlesses', String(req.params.username || '').trim(), 'AKTIF')));
 app.patch('/vps/unlocktrojan/:username', async (req, res) => ok(res, await setStatusXray('account_trojans', String(req.params.username || '').trim(), 'AKTIF')));
 
+// Endpoint untuk dipanggil bot setelah proses restore/import DB selesai.
+// Auto-sync xray hanya on-demand (bukan berkala) agar ringan dan deterministik.
+app.post('/vps/sync-xray', async (_req, res) => {
+  return syncXrayFromDbAndRespond(res, true);
+});
+app.post('/vps/restore-finished', async (_req, res) => {
+  return syncXrayFromDbAndRespond(res, true);
+});
+
 app.use((err, _req, res, _next) => {
   return fail(res, 500, err?.message || 'internal error');
 });
@@ -3290,7 +3308,6 @@ app.listen(PORT, '127.0.0.1', () => {
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
   syncXrayFromDbIfChanged(true).catch(() => {});
-  setInterval(() => { syncXrayFromDbIfChanged(false).catch(() => {}); }, 60 * 1000);
   cleanupExpiredXrayAccounts().catch(() => {});
   setInterval(() => { cleanupExpiredXrayAccounts().catch(() => {}); }, 60 * 1000);
   console.log(`sc-1forcr-api on 127.0.0.1:${PORT}`);

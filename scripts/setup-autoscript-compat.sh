@@ -8396,6 +8396,13 @@ set_autolock_realtime_tuning_menu() {
   echo "- ZIVPN active window: batas umur sesi live ZIVPN yang masih dihitung aktif."
   echo "- ZIVPN handoff grace: toleransi perpindahan IP mobile agar tidak false multi-login."
   echo
+  echo "Catatan false positive:"
+  echo "- False positive = user normal terdeteksi melanggar padahal tidak."
+  echo "- Contoh: 1 HP ganti IP cepat (handoff), reconnect burst, atau jejak log lama"
+  echo "  masih terbaca di window aktif lalu dianggap multi-login."
+  echo "- Jika sering false positive: naikkan XRAY active window, naikkan XRAY min hits,"
+  echo "  dan/atau naikkan ZIVPN handoff grace."
+  echo
   echo "Rekomendasi:"
   echo "- Aman umum (disarankan): interval=1, lock=15, xray_recent=5, xray_active=60, xray_hits=2, zivpn_active=90, handoff=90"
   echo "- Agresif: interval=1, xray_active=30, xray_hits=1 (resiko false-positive naik)."

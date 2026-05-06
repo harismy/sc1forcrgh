@@ -6587,7 +6587,7 @@ ssh_users="$(
             sub(/\].*$/, "", u)
           } else next
           u=tolower(u)
-          if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") print pid, u
+          if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net" && u != "unknown") print pid, u
         }' > "${tmp_pid_user}" || true
 
       awk '
@@ -6624,7 +6624,7 @@ ssh_users="$(
           sub(/'\''.*/,"",u); sub(/".*/,"",u);
           sub(/[[:space:]].*$/,"",u);
           u=tolower(u);
-          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
           src=$0; sub(/^.* from /, "", src); gsub(/[[:space:]]+$/, "", src);
           port=src; sub(/^.*:/, "", port);
           if (!(port in ap)) next;
@@ -6650,7 +6650,7 @@ ssh_users="$(
           u=$0; sub(/^.*\[/, "", u); sub(/\].*$/, "", u);
         } else next;
         u=tolower(u);
-        if (u ~ /^[a-z0-9._-]+$/ && u!="root" && u!="priv" && u!="net") c[u]++;
+        if (u ~ /^[a-z0-9._-]+$/ && u!="root" && u!="priv" && u!="net" && u!="unknown") c[u]++;
       }
       END { for (u in c) printf "%s(%d)\n", u, c[u]; }' | sort
     exit 0
@@ -6678,7 +6678,7 @@ if [[ "${ssh_cnt}" -eq 0 ]]; then
         sub(/'\''.*/,"",u); sub(/".*/,"",u);
         sub(/[[:space:]].*$/,"",u);
         u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
         if (pid != "") auth_by_pid[pid]=u; else auth_no_pid[u]=1;
         next;
       }
@@ -10554,7 +10554,7 @@ show_combined_online() {
       sub(/'\''.*/,"",u); sub(/".*/,"",u);
       sub(/[[:space:]].*$/,"",u);
       u=tolower(u);
-      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
 
       src=$0;
       sub(/^.* from /, "", src);
@@ -10787,7 +10787,7 @@ show_ssh_only_online() {
           sub(/'\''.*/,"",u); sub(/".*/,"",u);
           sub(/[[:space:]].*$/,"",u);
           u=tolower(u);
-          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
 
           src=$0;
           sub(/^.* from /, "", src);
@@ -10825,7 +10825,7 @@ show_ssh_only_online() {
         } else next;
         u=tolower(u);
         if (u !~ /^[a-z0-9._-]+$/) next;
-        if (u=="root" || u=="priv" || u=="net") next;
+        if (u=="root" || u=="priv" || u=="net" || u=="unknown") next;
         cnt[u]++;
       }
       END { for (u in cnt) print u, cnt[u]; }' > "${tmp_proc_count}" || true
@@ -10870,7 +10870,7 @@ show_ssh_only_online() {
           sub(/'\''.*/,"",u); sub(/".*/,"",u);
           sub(/[[:space:]].*$/,"",u);
           u=tolower(u);
-          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
           last_user[pid]=u;
         }
         END {
@@ -10901,7 +10901,7 @@ show_ssh_only_online() {
         sub(/'\''.*/,"",u); sub(/".*/,"",u);
         sub(/[[:space:]].*$/,"",u);
         u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
         if (pid != "") {
           auth_by_pid[pid]=u;
         } else {

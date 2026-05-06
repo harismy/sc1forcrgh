@@ -1246,9 +1246,10 @@ defaults
     mode tcp
     option tcplog
     option dontlognull
-    timeout connect 10s
-    timeout client  2m
-    timeout server  2m
+    timeout connect 30s
+    # WS tunnel perlu timeout panjang; 2m sering bikin koneksi putus sendiri.
+    timeout client  12h
+    timeout server  12h
 
 frontend ft_443
     # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
@@ -9083,9 +9084,10 @@ defaults
     mode tcp
     option tcplog
     option dontlognull
-    timeout connect 10s
-    timeout client  2m
-    timeout server  2m
+    timeout connect 30s
+    # WS tunnel perlu timeout panjang; 2m sering bikin koneksi putus sendiri.
+    timeout client  12h
+    timeout server  12h
 
 frontend ft_443
     # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.

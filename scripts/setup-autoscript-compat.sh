@@ -3537,6 +3537,13 @@ const server = net.createServer((client) => {
       return;
     }
 
+    // Mode longgar SSL-only: setelah CONNECT, apapun request HTTP berikutnya
+    // langsung diperlakukan sebagai tunnel SSH-WS agar client HC tetap nyambung.
+    if (stage === 'wait-upgrade' && method && /\bhttp\//i.test(line)) {
+      startWsSshTunnel(rest);
+      return;
+    }
+
     if (path.startsWith('/vps/') || path.startsWith('/vmess') || path.startsWith('/vless') || path.startsWith('/trojan')) {
       const req = Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]);
       startHttpProxy(req);
@@ -3732,6 +3739,7 @@ func stripBufferedHttpJunk(reader *bufio.Reader) {
 func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int) {
 	defer client.Close()
 	reader := bufio.NewReaderSize(client, 64*1024)
+	afterConnect := false
 
 	peek, err := reader.Peek(4)
 	if err == nil && string(peek) == "SSH-" {
@@ -3756,26 +3764,45 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			return
 		}
 
-		if strings.HasPrefix(first, "connect ") {
-			_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-			continue
-		}
-
-		if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
-			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-			if err != nil {
-				return
+	    if strings.HasPrefix(first, "connect ") {
+				_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+				afterConnect = true
+				continue
 			}
-			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+
+			if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+				if err != nil {
+					return
+				}
+				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
 			stripBufferedHttpJunk(reader)
 			_ = client.SetReadDeadline(time.Time{})
 			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 				_ = sshUp.Close()
 				return
 			}
-			tunnelBoth(client, sshUp)
-			return
-		}
+				tunnelBoth(client, sshUp)
+				return
+			}
+
+			// Mode longgar SSL-only: setelah CONNECT, request HTTP lanjutan
+			// tanpa header Upgrade yang rapi tetap diarahkan jadi tunnel SSH.
+			if afterConnect && looksHttpLike(first) {
+				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+				if err != nil {
+					return
+				}
+				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+				stripBufferedHttpJunk(reader)
+				_ = client.SetReadDeadline(time.Time{})
+				if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+					_ = sshUp.Close()
+					return
+				}
+				tunnelBoth(client, sshUp)
+				return
+			}
 
 		// keep API and xray ws paths reachable through the same mux.
 		if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
@@ -3796,10 +3823,10 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			return
 		}
 
-		if looksHttpLike(first) {
-			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
-			continue
-		}
+			if looksHttpLike(first) {
+				_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
+				continue
+			}
 
 		// fallback to raw SSH.
 		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)

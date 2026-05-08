@@ -49,6 +49,7 @@ const DYNAMIC_SETTING_KEYS = [
   'TOPUP_EXPIRE_MS',
   'TOPUP_SUCCESS_NOTIFY_ENABLE',
   'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS',
+  'RESELLER_ADMIN_WA',
   'AUTO_PROVISION_DOMAIN',
   'CERTBOT_EMAIL',
   'SC_INSTALLER_LOCAL_PATH'
@@ -62,6 +63,7 @@ const SETTING_LABELS = {
   TOPUP_EXPIRE_MS: 'Masa Aktif QR Top Up',
   TOPUP_SUCCESS_NOTIFY_ENABLE: 'Notif TopUp Sukses',
   TOPUP_SUCCESS_NOTIFY_ADMIN_IDS: 'Admin ID Notif TopUp',
+  RESELLER_ADMIN_WA: 'Nomor WA Admin Reseller',
   AUTO_PROVISION_DOMAIN: 'Auto Setup Domain',
   CERTBOT_EMAIL: 'Email Certbot',
   SC_INSTALLER_LOCAL_PATH: 'Path Script Installer'
@@ -221,6 +223,7 @@ async function seedDefaultSettings() {
     TOPUP_EXPIRE_MS: String(DEFAULT_TOPUP_EXPIRE_MS),
     TOPUP_SUCCESS_NOTIFY_ENABLE: '1',
     TOPUP_SUCCESS_NOTIFY_ADMIN_IDS: ADMIN_IDS.join(','),
+    RESELLER_ADMIN_WA: '089612745096',
     AUTO_PROVISION_DOMAIN: DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0',
     CERTBOT_EMAIL: DEFAULT_CERTBOT_EMAIL,
     SC_INSTALLER_LOCAL_PATH: DEFAULT_SC_INSTALLER_LOCAL_PATH
@@ -338,6 +341,32 @@ async function getTopupSuccessNotifyAdminIds() {
     .map((v) => Number(String(v || '').trim()))
     .filter((n) => Number.isInteger(n) && n > 0);
   return ids.length ? ids : ADMIN_IDS;
+}
+
+function normalizeWaNumber(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('62')) return digits;
+  if (digits.startsWith('0')) return `62${digits.slice(1)}`;
+  return digits;
+}
+
+async function getResellerAdminWaNumber() {
+  const raw = await getDynamicSetting('RESELLER_ADMIN_WA', '089612745096');
+  return normalizeWaNumber(raw);
+}
+
+function buildResellerWaUrl(waNumber, user) {
+  const userId = Number(user?.id || 0);
+  const username = String(user?.username || '').trim();
+  const fullName = [String(user?.first_name || '').trim(), String(user?.last_name || '').trim()].filter(Boolean).join(' ').trim();
+  const text =
+    `Halo Admin, saya mau daftar reseller SC.\n` +
+    `ID Telegram: ${userId || '-'}\n` +
+    `Username: ${username ? `@${username}` : '-'}\n` +
+    `Nama: ${fullName || '-'}\n` +
+    `Mohon info syarat dan prosesnya.`;
+  return `https://wa.me/${waNumber}?text=${encodeURIComponent(text)}`;
 }
 
 async function notifyAdminsTopupSuccess(row) {
@@ -462,18 +491,13 @@ function parseRenewErr(err) {
 function uiBox(title, lines = []) {
   const body = Array.isArray(lines) ? lines.map((x) => String(x ?? '')) : [String(lines || '')];
   const titleText = String(title || '').trim();
-  const contentWidth = Math.max(
+  const width = Math.max(
     titleText.length,
     ...body.map((line) => String(line || '').length),
-    18
+    24
   );
-  const top = `╔${'═'.repeat(contentWidth + 2)}╗`;
-  const bottom = `╚${'═'.repeat(contentWidth + 2)}╝`;
-  const pad = (text = '') => {
-    const t = String(text ?? '');
-    return `║ ${t}${' '.repeat(Math.max(0, contentWidth - t.length))} ║`;
-  };
-  return [top, pad(titleText), pad(''), ...body.map((line) => pad(line)), bottom].join('\n');
+  const sep = '─'.repeat(Math.min(width, 64));
+  return [sep, titleText, '', ...body, sep].join('\n');
 }
 
 function normalizeScriptLineEndings(input) {
@@ -1456,6 +1480,7 @@ async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('SC Saya', 'm_my_sc')],
+    [Markup.button.callback('Jadi Reseller', 'm_become_reseller')],
     [Markup.button.callback('Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
     [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
     [Markup.button.callback('Cek Saldo', 'm_cek_saldo'), Markup.button.callback('Cadangkan SC', 'm_backup_now')],
@@ -1508,6 +1533,7 @@ async function registerScMenu() {
     [Markup.button.callback('Registrasi Baru', 'm_register_sc_new')],
     [Markup.button.callback('Perpanjang SC', 'm_register_sc_extend')],
     [Markup.button.callback(`SC Unlimited (Rp ${Number(unlimitedPrice).toLocaleString('id-ID')})`, 'm_register_sc_unlimited')],
+    [Markup.button.callback('Jadi Reseller', 'm_become_reseller')],
     [Markup.button.callback('Kembali', 'm_register_sc_back')]
   ]);
 }
@@ -1515,7 +1541,8 @@ async function registerScMenu() {
 function adminMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
-    [Markup.button.callback('Aktifkan Reseller', 'm_admin_reseller_enable'), Markup.button.callback('Nonaktifkan Reseller', 'm_admin_reseller_disable')],
+    [Markup.button.callback('Set User Jadi Reseller', 'm_admin_reseller_enable'), Markup.button.callback('Nonaktifkan User Reseller', 'm_admin_reseller_disable')],
+    [Markup.button.callback('Set WA Admin Reseller', 'm_admin_set_reseller_wa')],
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
@@ -1618,6 +1645,8 @@ function envKeyInputHint(key) {
       return 'Isi: 1 atau 0 (1=aktif, 0=nonaktif).';
     case 'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS':
       return 'Contoh: 123456789,987654321 (pisah koma).';
+    case 'RESELLER_ADMIN_WA':
+      return 'Contoh: 089612745096 atau 6289612745096.';
     case 'AUTO_PROVISION_DOMAIN':
       return 'Isi: 1 atau 0 (1=aktif, 0=nonaktif).';
     case 'CERTBOT_EMAIL':
@@ -2159,6 +2188,7 @@ bot.start(async (ctx) => {
       `Saldo Kamu       : Rp ${Number(saldo).toLocaleString('id-ID')}`,
       `IP Terdaftar     : ${regs.length}`,
       `Harga SC / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}${isReseller ? ' (RESELLER)' : ''}`,
+      `Status Reseller  : ${isReseller ? 'RESELLER' : 'NON-RESELLER'}`,
       `Minimal Hari     : ${minDays} hari`,
       '',
       'Alur Cepat:',
@@ -2169,6 +2199,27 @@ bot.start(async (ctx) => {
       isAdmin(ctx.from.id) ? 'Admin: gunakan /admin untuk kelola layanan.' : ''
     ]),
     mainMenu()
+  );
+});
+
+bot.action('m_become_reseller', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const wa = await getResellerAdminWaNumber();
+  if (!wa) {
+    return ctx.reply('Nomor WA admin reseller belum diset. Hubungi admin bot.');
+  }
+  const waUrl = buildResellerWaUrl(wa, ctx.from || {});
+  return ctx.reply(
+    uiBox('DAFTAR RESELLER', [
+      'Untuk jadi reseller SC, silakan hubungi admin via WhatsApp:',
+      `wa.me/${wa}`,
+      '',
+      'Template pesan sudah disiapkan dan memuat ID Telegram kamu.'
+    ]),
+    Markup.inlineKeyboard([
+      [Markup.button.url('Hubungi Admin WA', waUrl)],
+      [Markup.button.callback('Kembali', 'm_register_sc_back')]
+    ])
   );
 });
 
@@ -2384,6 +2435,13 @@ bot.action('m_admin_reseller_disable', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_reseller_disable_user' });
   return ctx.reply('Masukkan Telegram User ID yang akan dinonaktifkan reseller.');
+});
+
+bot.action('m_admin_set_reseller_wa', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_set_reseller_wa' });
+  return ctx.reply('Masukkan nomor WA admin reseller. Contoh: 089612745096 atau 6289612745096');
 });
 
 bot.action('m_admin_env_show', async (ctx) => {
@@ -3154,6 +3212,18 @@ bot.on('text', async (ctx) => {
       );
     }
 
+    if (state.step === 'admin_set_reseller_wa') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const wa = normalizeWaNumber(text);
+      if (!wa || wa.length < 9) return ctx.reply('Nomor WA tidak valid.');
+      await setDynamicSetting('RESELLER_ADMIN_WA', wa, ctx.from.id);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Nomor WA admin reseller disimpan: ${wa}`, adminMenu());
+    }
+
     if (state.step === 'admin_set_env_value') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
@@ -3203,6 +3273,10 @@ bot.on('text', async (ctx) => {
           .filter((n) => Number.isInteger(n) && n > 0);
         if (!ids.length) return ctx.reply('Isi minimal 1 Telegram ID admin. Contoh: 12345,67890');
         value = ids.join(',');
+      } else if (key === 'RESELLER_ADMIN_WA') {
+        const wa = normalizeWaNumber(value);
+        if (!wa || wa.length < 9) return ctx.reply('Nomor WA tidak valid.');
+        value = wa;
       } else if (key === 'AUTO_PROVISION_DOMAIN') {
         const s = value.toLowerCase();
         if (!['0', '1', 'true', 'false', 'yes', 'no', 'on', 'off'].includes(s)) {

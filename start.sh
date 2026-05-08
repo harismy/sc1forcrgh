@@ -72,6 +72,8 @@ prompt_default "PAYMENT_GATEWAY_MODE (orderkuota|gopay|both)" "both" PAYMENT_GAT
 prompt_default "PAYMENT_GATEWAY_BASE_URL" "https://api.rajaserver.web.id/orderkuota/createpayment" PAYMENT_GATEWAY_BASE_URL
 prompt_required "RAJASERVER_API_KEY" RAJASERVER_API_KEY
 prompt_required "DATA_QRIS (string QRIS OrderKuota)" DATA_QRIS
+prompt_required "ORKUT_USERNAME" ORKUT_USERNAME
+prompt_required "ORKUT_TOKEN" ORKUT_TOKEN
 prompt_default "ORDERKUOTA_MIN_TOPUP" "2000" ORDERKUOTA_MIN_TOPUP
 prompt_default "GOPAY_API_BASE_URL" "https://api-gopay.sawargipay.cloud" GOPAY_API_BASE_URL
 prompt_required "GOPAY_API_KEY" GOPAY_API_KEY
@@ -100,6 +102,8 @@ cat > .vars.json <<EOF
   "PAYMENT_GATEWAY_BASE_URL": "${PAYMENT_GATEWAY_BASE_URL}",
   "RAJASERVER_API_KEY": "${RAJASERVER_API_KEY}",
   "DATA_QRIS": "${DATA_QRIS}",
+  "ORKUT_USERNAME": "${ORKUT_USERNAME}",
+  "ORKUT_TOKEN": "${ORKUT_TOKEN}",
   "ORDERKUOTA_MIN_TOPUP": ${ORDERKUOTA_MIN_TOPUP},
   "GOPAY_API_BASE_URL": "${GOPAY_API_BASE_URL}",
   "GOPAY_API_KEY": "${GOPAY_API_KEY}",

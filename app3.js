@@ -5,6 +5,7 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
+const { buildPayload, headers, API_URL } = require('./api-cekpayment-orkut');
 
 const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
 if (!BOT_TOKEN) {
@@ -500,6 +501,65 @@ function paymentGatewayModeLabel(mode) {
   if (m === 'gopay') return 'GoPay saja';
   if (m === 'both') return 'OrderKuota + GoPay';
   return m || '-';
+}
+
+function parseCurrencyNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? Math.floor(value) : NaN;
+  const text = String(value || '').trim();
+  if (!text) return NaN;
+  const cleaned = text.replace(/[^\d.,-]/g, '');
+  if (!cleaned) return NaN;
+  const normalized = cleaned.includes(',')
+    ? cleaned.replace(/\./g, '').replace(',', '.')
+    : cleaned.replace(/\./g, '');
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? Math.floor(parsed) : NaN;
+}
+
+function parseOrderKuotaMutations(responseData) {
+  const mutations = [];
+  const seen = new Set();
+  const pushAmount = (amount, raw) => {
+    const parsed = parseCurrencyNumber(amount);
+    if (!Number.isFinite(parsed) || parsed <= 0) return;
+    const key = `${parsed}:${String(raw || '').slice(0, 80)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    mutations.push({ amount: parsed, raw: String(raw || '').slice(0, 200) });
+  };
+  const scanText = (text) => {
+    const value = String(text || '');
+    if (!value) return;
+    const kreditRegex = /(?:Kredit|Credit|Masuk|Nominal|Amount|Jumlah|Total)\s*[:=]\s*(?:Rp\s*)?([\d.,]+)/gi;
+    let match;
+    while ((match = kreditRegex.exec(value)) !== null) pushAmount(match[1], match[0]);
+  };
+  const scanObject = (value) => {
+    if (Array.isArray(value)) return value.forEach(scanObject);
+    if (!value || typeof value !== 'object') return;
+    for (const [key, item] of Object.entries(value)) {
+      const lowerKey = key.toLowerCase();
+      if (/kredit|credit|amount|nominal|jumlah|total|nilai|mutasi/.test(lowerKey)) pushAmount(item, JSON.stringify(value));
+      if (item && typeof item === 'object') scanObject(item);
+      else if (typeof item === 'string' && /kredit|credit|nominal|amount|jumlah|masuk/i.test(item)) scanText(item);
+    }
+  };
+  if (typeof responseData === 'string') {
+    scanText(responseData);
+    try { scanObject(JSON.parse(responseData)); } catch (_) {}
+  } else {
+    scanObject(responseData);
+    scanText(JSON.stringify(responseData || {}));
+  }
+  return mutations;
+}
+
+async function checkOrderKuotaPaidByAmount(expectedAmount) {
+  const data = buildPayload();
+  const resultcek = await axios.post(API_URL, data, { headers, timeout: 10000 });
+  const muts = parseOrderKuotaMutations(resultcek?.data);
+  const target = Math.floor(Number(expectedAmount || 0));
+  return muts.some((m) => Number(m.amount) === target);
 }
 
 function getGopayConfig() {
@@ -1275,6 +1335,8 @@ function adminPaymentGatewayOrderKuotaMenu() {
     [Markup.button.callback('Set Gateway URL', 'm_pg_set_orderkuota_url')],
     [Markup.button.callback('Set RajaServer API Key', 'm_pg_set_orderkuota_api_key')],
     [Markup.button.callback('Set DATA_QRIS String', 'm_pg_set_orderkuota_qris')],
+    [Markup.button.callback('Set ORKUT Username', 'm_pg_set_orkut_username')],
+    [Markup.button.callback('Set ORKUT Token', 'm_pg_set_orkut_token')],
     [Markup.button.callback('Set Minimal TopUp', 'm_pg_set_orderkuota_min_topup')],
     [Markup.button.callback('Kembali', 'm_admin_payment_gateway_menu')]
   ]);
@@ -1950,6 +2012,8 @@ bot.action('m_pg_menu_orderkuota', async (ctx) => {
       `Gateway URL: ${cfg.orderkuotaBaseUrl || '-'}`,
       `API Key: ${cfg.orderkuotaApiKey ? 'Tersimpan' : 'Belum diisi'}`,
       `DATA_QRIS: ${cfg.qrisString ? 'Tersimpan' : 'Belum diisi'}`,
+      `ORKUT Username: ${String(loadVars().ORKUT_USERNAME || '').trim() ? 'Tersimpan' : 'Belum diisi'}`,
+      `ORKUT Token: ${String(loadVars().ORKUT_TOKEN || '').trim() ? 'Tersimpan' : 'Belum diisi'}`,
       `Minimal TopUp: Rp ${Math.max(1000, Number(loadVars().ORDERKUOTA_MIN_TOPUP || 2000) || 2000).toLocaleString('id-ID')}`
     ]),
     adminPaymentGatewayOrderKuotaMenu()
@@ -1993,6 +2057,18 @@ bot.action('m_pg_set_orderkuota_min_topup', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_min_topup' });
   return ctx.reply('Kirim minimal topup OrderKuota (angka rupiah). Contoh: 2000');
+});
+bot.action('m_pg_set_orkut_username', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_orkut_username' });
+  return ctx.reply('Kirim ORKUT_USERNAME baru.');
+});
+bot.action('m_pg_set_orkut_token', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_orkut_token' });
+  return ctx.reply('Kirim ORKUT_TOKEN baru.');
 });
 bot.action('m_pg_set_gopay_base_url', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
@@ -2416,7 +2492,17 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
 
   const provider = String(row.gateway_provider || 'gopay').toLowerCase();
   if (provider !== 'gopay') {
-    return ctx.reply('Gateway OrderKuota tidak butuh cek tombol di bot ini. Tunggu mutasi/konfirmasi sistem.');
+    const paid = await checkOrderKuotaPaidByAmount(Number(row.amount || 0)).catch((e) => ({ err: e }));
+    if (paid && paid.err) return ctx.reply(`Gagal cek status: ${String(paid.err?.message || paid.err)}`);
+    if (paid === true) {
+      const credited = await markPendingPaid(row);
+      const saldoNow = await getSaldo(ctx.from.id).catch(() => 0);
+      if (credited) {
+        return ctx.reply(`Top Up Saldo berhasil. Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`, mainMenu());
+      }
+      return ctx.reply('Top Up Saldo sudah diproses sebelumnya.');
+    }
+    return ctx.reply('Top Up Saldo masih menunggu. Status gateway: pending');
   }
   const st = await checkGoPayStatus(String(row.provider_tx_id || '')).catch((e) => ({ error: e.message }));
   if (st?.error) return ctx.reply(`Gagal cek status: ${st.error}`);
@@ -2897,6 +2983,32 @@ bot.on('text', async (ctx) => {
       saveVars(v);
       userState.delete(ctx.chat.id);
       return ctx.reply(`Minimal TopUp OrderKuota disimpan: Rp ${Math.floor(amount).toLocaleString('id-ID')}`, adminPaymentGatewayOrderKuotaMenu());
+    }
+
+    if (state.step === 'pg_set_orkut_username') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      if (text.length < 3) return ctx.reply('ORKUT_USERNAME terlalu pendek.');
+      const v = loadVars();
+      v.ORKUT_USERNAME = text;
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply('ORKUT_USERNAME berhasil disimpan.', adminPaymentGatewayOrderKuotaMenu());
+    }
+
+    if (state.step === 'pg_set_orkut_token') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      if (text.length < 8) return ctx.reply('ORKUT_TOKEN terlalu pendek.');
+      const v = loadVars();
+      v.ORKUT_TOKEN = text;
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply('ORKUT_TOKEN berhasil disimpan.', adminPaymentGatewayOrderKuotaMenu());
     }
 
     if (state.step === 'pg_set_gopay_base_url') {

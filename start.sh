@@ -68,9 +68,14 @@ prompt_required "LICENSE_API_TOKEN (token rahasia verifikasi lisensi)" LICENSE_A
 
 echo
 echo "Isi variabel .vars.json (payment gateway)"
-prompt_default "PAYMENT_GATEWAY_MODE (gopay|both)" "gopay" PAYMENT_GATEWAY_MODE
+prompt_default "PAYMENT_GATEWAY_MODE (orderkuota|gopay|both)" "both" PAYMENT_GATEWAY_MODE
+prompt_default "PAYMENT_GATEWAY_BASE_URL" "https://api.rajaserver.web.id/orderkuota/createpayment" PAYMENT_GATEWAY_BASE_URL
+prompt_required "RAJASERVER_API_KEY" RAJASERVER_API_KEY
+prompt_required "DATA_QRIS (string QRIS OrderKuota)" DATA_QRIS
+prompt_default "ORDERKUOTA_MIN_TOPUP" "2000" ORDERKUOTA_MIN_TOPUP
 prompt_default "GOPAY_API_BASE_URL" "https://api-gopay.sawargipay.cloud" GOPAY_API_BASE_URL
 prompt_required "GOPAY_API_KEY" GOPAY_API_KEY
+prompt_default "GOPAY_MIN_TOPUP" "2000" GOPAY_MIN_TOPUP
 
 cat > .env <<EOF
 BOT_TOKEN=${BOT_TOKEN}
@@ -92,8 +97,13 @@ EOF
 cat > .vars.json <<EOF
 {
   "PAYMENT_GATEWAY_MODE": "${PAYMENT_GATEWAY_MODE}",
+  "PAYMENT_GATEWAY_BASE_URL": "${PAYMENT_GATEWAY_BASE_URL}",
+  "RAJASERVER_API_KEY": "${RAJASERVER_API_KEY}",
+  "DATA_QRIS": "${DATA_QRIS}",
+  "ORDERKUOTA_MIN_TOPUP": ${ORDERKUOTA_MIN_TOPUP},
   "GOPAY_API_BASE_URL": "${GOPAY_API_BASE_URL}",
-  "GOPAY_API_KEY": "${GOPAY_API_KEY}"
+  "GOPAY_API_KEY": "${GOPAY_API_KEY}",
+  "GOPAY_MIN_TOPUP": ${GOPAY_MIN_TOPUP}
 }
 EOF
 

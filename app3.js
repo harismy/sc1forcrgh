@@ -154,6 +154,7 @@ async function initDb() {
   )`);
   await ensureScRegistrationSchema();
   await ensurePendingDepositSchema();
+  await ensureOrderKuotaAmountLockSchema();
   await seedDefaultSettings();
   await autoMigrateLegacyInstallerPathSetting();
 }
@@ -173,9 +174,25 @@ async function ensureScRegistrationSchema() {
 async function ensurePendingDepositSchema() {
   const cols = await dbAll('PRAGMA table_info(pending_deposits_app3)');
   const hasGatewayProvider = cols.some((c) => String(c?.name || '').toLowerCase() === 'gateway_provider');
+  const hasOriginalAmount = cols.some((c) => String(c?.name || '').toLowerCase() === 'original_amount');
+  const hasAdminFee = cols.some((c) => String(c?.name || '').toLowerCase() === 'admin_fee');
   if (!hasGatewayProvider) {
     await dbRun("ALTER TABLE pending_deposits_app3 ADD COLUMN gateway_provider TEXT DEFAULT 'gopay'");
   }
+  if (!hasOriginalAmount) {
+    await dbRun('ALTER TABLE pending_deposits_app3 ADD COLUMN original_amount INTEGER');
+  }
+  if (!hasAdminFee) {
+    await dbRun('ALTER TABLE pending_deposits_app3 ADD COLUMN admin_fee INTEGER DEFAULT 0');
+  }
+}
+
+async function ensureOrderKuotaAmountLockSchema() {
+  await dbRun(`CREATE TABLE IF NOT EXISTS orderkuota_amount_locks (
+    amount INTEGER PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL
+  )`);
 }
 
 async function seedDefaultSettings() {
@@ -559,7 +576,51 @@ async function checkOrderKuotaPaidByAmount(expectedAmount) {
   const resultcek = await axios.post(API_URL, data, { headers, timeout: 10000 });
   const muts = parseOrderKuotaMutations(resultcek?.data);
   const target = Math.floor(Number(expectedAmount || 0));
-  return muts.some((m) => Number(m.amount) === target);
+  const amounts = new Set(muts.map((m) => Math.floor(Number(m.amount || 0))).filter((n) => Number.isFinite(n) && n > 0));
+  return { paid: amounts.has(target), amounts };
+}
+
+async function syncOrderKuotaAmountLocks(currentAmountsSet) {
+  const now = Date.now();
+  const rows = await dbAll('SELECT amount FROM orderkuota_amount_locks');
+  for (const row of rows) {
+    const amt = Math.floor(Number(row?.amount || 0));
+    if (!amt) continue;
+    if (!currentAmountsSet.has(amt)) {
+      await dbRun('DELETE FROM orderkuota_amount_locks WHERE amount = ?', [amt]);
+    } else {
+      await dbRun('UPDATE orderkuota_amount_locks SET last_seen_at = ? WHERE amount = ?', [now, amt]);
+    }
+  }
+}
+
+async function lockOrderKuotaAmount(amount) {
+  const amt = Math.floor(Number(amount || 0));
+  if (!Number.isFinite(amt) || amt <= 0) return;
+  const now = Date.now();
+  await dbRun(
+    `INSERT INTO orderkuota_amount_locks (amount, created_at, last_seen_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(amount) DO UPDATE SET last_seen_at = excluded.last_seen_at`,
+    [amt, now, now]
+  );
+}
+
+async function getReservedOrderKuotaAmounts() {
+  const reserved = new Set();
+  const pendingRows = await dbAll(
+    "SELECT amount FROM pending_deposits_app3 WHERE status = 'pending' AND LOWER(COALESCE(gateway_provider,'')) = 'orderkuota'"
+  ).catch(() => []);
+  for (const row of pendingRows) {
+    const amt = Math.floor(Number(row?.amount || 0));
+    if (Number.isFinite(amt) && amt > 0) reserved.add(amt);
+  }
+  const lockRows = await dbAll('SELECT amount FROM orderkuota_amount_locks').catch(() => []);
+  for (const row of lockRows) {
+    const amt = Math.floor(Number(row?.amount || 0));
+    if (Number.isFinite(amt) && amt > 0) reserved.add(amt);
+  }
+  return reserved;
 }
 
 function getGopayConfig() {
@@ -591,7 +652,10 @@ async function createGoPayQr(amount) {
   return {
     provider: 'gopay',
     providerTxId: String(body.data.transaction_id),
-    qrUrl: String(body.data.qr_url)
+    qrUrl: String(body.data.qr_url),
+    billedAmount: Number(amount),
+    originalAmount: Number(amount),
+    adminFee: 0
   };
 }
 
@@ -617,16 +681,67 @@ async function createOrderKuotaQr(amount, referenceId) {
   return {
     provider: 'orderkuota',
     providerTxId: String(bayar?.data?.result?.reference || referenceId || ''),
-    qrUrl
+    qrUrl,
+    billedAmount: Number(amount),
+    originalAmount: Number(amount),
+    adminFee: 0
   };
+}
+
+function randomOrderKuotaFee() {
+  return Math.floor(Math.random() * 200) + 1;
 }
 
 async function createPaymentQrByMode(amount, referenceId) {
   const cfg = getPaymentConfig();
-  if (cfg.mode === 'orderkuota') return createOrderKuotaQr(amount, referenceId);
+  if (cfg.mode === 'orderkuota') {
+    const reserved = await getReservedOrderKuotaAmounts();
+    let fee = randomOrderKuotaFee();
+    let billedAmount = Number(amount) + fee;
+    for (let i = 0; i < 300 && reserved.has(billedAmount); i++) {
+      fee = randomOrderKuotaFee();
+      billedAmount = Number(amount) + fee;
+    }
+    if (reserved.has(billedAmount)) {
+      for (let f = 1; f <= 200; f++) {
+        const candidate = Number(amount) + f;
+        if (!reserved.has(candidate)) {
+          fee = f;
+          billedAmount = candidate;
+          break;
+        }
+      }
+    }
+    if (reserved.has(billedAmount)) {
+      throw new Error('Tidak ada nominal unik OrderKuota tersedia (range fee 1-200 penuh).');
+    }
+    const out = await createOrderKuotaQr(billedAmount, referenceId);
+    return { ...out, billedAmount, originalAmount: Number(amount), adminFee: fee };
+  }
   if (cfg.mode === 'gopay') return createGoPayQr(amount);
   try {
-    return await createOrderKuotaQr(amount, referenceId);
+    const reserved = await getReservedOrderKuotaAmounts();
+    let fee = randomOrderKuotaFee();
+    let billedAmount = Number(amount) + fee;
+    for (let i = 0; i < 300 && reserved.has(billedAmount); i++) {
+      fee = randomOrderKuotaFee();
+      billedAmount = Number(amount) + fee;
+    }
+    if (reserved.has(billedAmount)) {
+      for (let f = 1; f <= 200; f++) {
+        const candidate = Number(amount) + f;
+        if (!reserved.has(candidate)) {
+          fee = f;
+          billedAmount = candidate;
+          break;
+        }
+      }
+    }
+    if (reserved.has(billedAmount)) {
+      throw new Error('Tidak ada nominal unik OrderKuota tersedia (range fee 1-200 penuh).');
+    }
+    const out = await createOrderKuotaQr(billedAmount, referenceId);
+    return { ...out, billedAmount, originalAmount: Number(amount), adminFee: fee };
   } catch (_) {
     return createGoPayQr(amount);
   }
@@ -1884,9 +1999,10 @@ async function markPendingPaid(row) {
       await dbRun('ROLLBACK');
       return false;
     }
-    await addSaldo(row.user_id, Number(row.amount || 0));
+    const creditAmount = Number(row.original_amount || row.amount || 0);
+    await addSaldo(row.user_id, creditAmount);
     await dbRun("UPDATE pending_deposits_app3 SET status='paid' WHERE unique_code = ?", [row.unique_code]);
-    await saveTransaction(row.user_id, Number(row.amount || 0), 'deposit', String(row.reference_id || row.unique_code));
+    await saveTransaction(row.user_id, creditAmount, 'deposit', String(row.reference_id || row.unique_code));
     await dbRun('COMMIT');
     return true;
   } catch (e) {
@@ -2492,9 +2608,13 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
 
   const provider = String(row.gateway_provider || 'gopay').toLowerCase();
   if (provider !== 'gopay') {
-    const paid = await checkOrderKuotaPaidByAmount(Number(row.amount || 0)).catch((e) => ({ err: e }));
-    if (paid && paid.err) return ctx.reply(`Gagal cek status: ${String(paid.err?.message || paid.err)}`);
-    if (paid === true) {
+    const check = await checkOrderKuotaPaidByAmount(Number(row.amount || 0)).catch((e) => ({ err: e }));
+    if (check && check.err) return ctx.reply(`Gagal cek status: ${String(check.err?.message || check.err)}`);
+    if (check && check.amounts instanceof Set) {
+      await syncOrderKuotaAmountLocks(check.amounts).catch(() => {});
+    }
+    if (check && check.paid === true) {
+      await lockOrderKuotaAmount(Number(row.amount || 0)).catch(() => {});
       const credited = await markPendingPaid(row);
       const saldoNow = await getSaldo(ctx.from.id).catch(() => 0);
       if (credited) {
@@ -3735,18 +3855,23 @@ bot.on('text', async (ctx) => {
       const ref = `TOPUP_APP3_${ctx.from.id}_${now}`;
       const qr = await createPaymentQrByMode(amount, ref);
       const gatewayProvider = String(qr.provider || 'gopay').toLowerCase();
+      const billedAmount = Number(qr.billedAmount || amount || 0);
+      const originalAmount = Number(qr.originalAmount || amount || 0);
+      const adminFee = Number(qr.adminFee || 0);
 
       await dbRun(
         `INSERT INTO pending_deposits_app3
-         (unique_code, user_id, amount, status, provider_tx_id, qr_url, reference_id, created_at, expires_at, gateway_provider)
-         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
-        [code, ctx.from.id, amount, qr.providerTxId, qr.qrUrl, ref, now, expires, gatewayProvider]
+         (unique_code, user_id, amount, original_amount, admin_fee, status, provider_tx_id, qr_url, reference_id, created_at, expires_at, gateway_provider)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+        [code, ctx.from.id, billedAmount, originalAmount, adminFee, qr.providerTxId, qr.qrUrl, ref, now, expires, gatewayProvider]
       );
 
       userState.delete(ctx.chat.id);
       const caption =
         `Top Up Saldo dibuat.\n` +
-        `Nominal: Rp ${amount.toLocaleString('id-ID')}\n` +
+        `Saldo Masuk: Rp ${originalAmount.toLocaleString('id-ID')}\n` +
+        `${adminFee > 0 ? `Fee Unik: Rp ${adminFee.toLocaleString('id-ID')}\n` : ''}` +
+        `Total Transfer: Rp ${billedAmount.toLocaleString('id-ID')}\n` +
         `Gateway: ${gatewayProvider.toUpperCase()}\n` +
         `Ref: ${ref}\n` +
         `Expired: ${Math.floor(topupExpireMs / 60000)} menit`;

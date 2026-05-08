@@ -467,6 +467,12 @@ function loadVars() {
   }
 }
 
+function saveVars(nextVars) {
+  const file = path.join(__dirname, '.vars.json');
+  const payload = { ...(nextVars || {}) };
+  fs.writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+}
+
 function normalizeHttpUrl(urlLike) {
   const raw = String(urlLike || '').trim();
   if (!raw) return '';
@@ -486,6 +492,14 @@ function getPaymentConfig() {
     gopayBaseUrl: normalizeHttpUrl(vars.GOPAY_API_BASE_URL || 'https://api-gopay.sawargipay.cloud'),
     gopayApiKey: String(vars.GOPAY_API_KEY || '').trim()
   };
+}
+
+function paymentGatewayModeLabel(mode) {
+  const m = String(mode || '').toLowerCase();
+  if (m === 'orderkuota') return 'OrderKuota saja';
+  if (m === 'gopay') return 'GoPay saja';
+  if (m === 'both') return 'OrderKuota + GoPay';
+  return m || '-';
 }
 
 function getGopayConfig() {
@@ -1237,9 +1251,41 @@ function adminMenu() {
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
     [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
+    [Markup.button.callback('Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
     [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
+  ]);
+}
+
+function adminPaymentGatewayMainMenu() {
+  const cfg = getPaymentConfig();
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Mode: OrderKuota saja', 'm_pg_mode_orderkuota')],
+    [Markup.button.callback('Mode: GoPay saja', 'm_pg_mode_gopay')],
+    [Markup.button.callback('Mode: Keduanya (fallback)', 'm_pg_mode_both')],
+    [Markup.button.callback('Setting OrderKuota', 'm_pg_menu_orderkuota')],
+    [Markup.button.callback('Setting GoPay', 'm_pg_menu_gopay')],
+    [Markup.button.callback('Kembali', 'm_admin_menu')]
+  ]);
+}
+
+function adminPaymentGatewayOrderKuotaMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Set Gateway URL', 'm_pg_set_orderkuota_url')],
+    [Markup.button.callback('Set RajaServer API Key', 'm_pg_set_orderkuota_api_key')],
+    [Markup.button.callback('Set DATA_QRIS String', 'm_pg_set_orderkuota_qris')],
+    [Markup.button.callback('Set Minimal TopUp', 'm_pg_set_orderkuota_min_topup')],
+    [Markup.button.callback('Kembali', 'm_admin_payment_gateway_menu')]
+  ]);
+}
+
+function adminPaymentGatewayGoPayMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Set GoPay API Base URL', 'm_pg_set_gopay_base_url')],
+    [Markup.button.callback('Set GoPay API Key', 'm_pg_set_gopay_api_key')],
+    [Markup.button.callback('Set Minimal TopUp', 'm_pg_set_gopay_min_topup')],
+    [Markup.button.callback('Kembali', 'm_admin_payment_gateway_menu')]
   ]);
 }
 
@@ -1865,6 +1911,106 @@ bot.action('m_admin_menu', async (ctx) => {
 bot.action('m_admin_back', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await ctx.reply('Kembali ke menu utama.', mainMenu());
+});
+
+bot.action('m_admin_payment_gateway_menu', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const cfg = getPaymentConfig();
+  return ctx.reply(
+    uiBox('SETTING PAYMENT GATEWAY', [
+      `Mode aktif: ${paymentGatewayModeLabel(cfg.mode)}`,
+      '',
+      'Pilih mode atau masuk ke submenu provider.'
+    ]),
+    adminPaymentGatewayMainMenu()
+  );
+});
+
+async function setPaymentMode(ctx, mode) {
+  const m = String(mode || '').toLowerCase();
+  if (!['orderkuota', 'gopay', 'both'].includes(m)) return ctx.reply('Mode gateway tidak valid.');
+  const v = loadVars();
+  v.PAYMENT_GATEWAY_MODE = m;
+  saveVars(v);
+  await ctx.answerCbQuery('Mode gateway tersimpan.').catch(() => {});
+  return ctx.reply(`Mode gateway aktif: ${paymentGatewayModeLabel(m)}`, adminPaymentGatewayMainMenu());
+}
+
+bot.action('m_pg_mode_orderkuota', async (ctx) => setPaymentMode(ctx, 'orderkuota'));
+bot.action('m_pg_mode_gopay', async (ctx) => setPaymentMode(ctx, 'gopay'));
+bot.action('m_pg_mode_both', async (ctx) => setPaymentMode(ctx, 'both'));
+
+bot.action('m_pg_menu_orderkuota', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const cfg = getPaymentConfig();
+  return ctx.reply(
+    uiBox('SETTING ORDERKUOTA', [
+      `Gateway URL: ${cfg.orderkuotaBaseUrl || '-'}`,
+      `API Key: ${cfg.orderkuotaApiKey ? 'Tersimpan' : 'Belum diisi'}`,
+      `DATA_QRIS: ${cfg.qrisString ? 'Tersimpan' : 'Belum diisi'}`,
+      `Minimal TopUp: Rp ${Math.max(1000, Number(loadVars().ORDERKUOTA_MIN_TOPUP || 2000) || 2000).toLocaleString('id-ID')}`
+    ]),
+    adminPaymentGatewayOrderKuotaMenu()
+  );
+});
+
+bot.action('m_pg_menu_gopay', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const cfg = getPaymentConfig();
+  return ctx.reply(
+    uiBox('SETTING GOPAY', [
+      `Base URL: ${cfg.gopayBaseUrl || '-'}`,
+      `API Key: ${cfg.gopayApiKey ? 'Tersimpan' : 'Belum diisi'}`,
+      `Minimal TopUp: Rp ${Math.max(1000, Number(loadVars().GOPAY_MIN_TOPUP || 2000) || 2000).toLocaleString('id-ID')}`
+    ]),
+    adminPaymentGatewayGoPayMenu()
+  );
+});
+
+bot.action('m_pg_set_orderkuota_url', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_url' });
+  return ctx.reply('Kirim Gateway URL OrderKuota. Contoh: https://api.rajaserver.web.id/orderkuota/createpayment');
+});
+bot.action('m_pg_set_orderkuota_api_key', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_api_key' });
+  return ctx.reply('Kirim RAJASERVER_API_KEY baru.');
+});
+bot.action('m_pg_set_orderkuota_qris', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_qris' });
+  return ctx.reply('Kirim DATA_QRIS string baru.');
+});
+bot.action('m_pg_set_orderkuota_min_topup', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_min_topup' });
+  return ctx.reply('Kirim minimal topup OrderKuota (angka rupiah). Contoh: 2000');
+});
+bot.action('m_pg_set_gopay_base_url', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_gopay_base_url' });
+  return ctx.reply('Kirim GoPay API Base URL. Contoh: https://api-gopay.sawargipay.cloud');
+});
+bot.action('m_pg_set_gopay_api_key', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_gopay_api_key' });
+  return ctx.reply('Kirim GoPay API Key baru.');
+});
+bot.action('m_pg_set_gopay_min_topup', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_gopay_min_topup' });
+  return ctx.reply('Kirim minimal topup GoPay (angka rupiah). Contoh: 2000');
 });
 
 bot.action('m_admin_add_domain', async (ctx) => {
@@ -2697,6 +2843,101 @@ bot.on('text', async (ctx) => {
       await setDynamicSetting(key, value, ctx.from.id);
       userState.delete(ctx.chat.id);
       return ctx.reply(`Berhasil update "${getSettingLabel(key)}" menjadi: ${value}`, adminEnvMenu());
+    }
+
+    if (state.step === 'pg_set_orderkuota_url') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const normalized = normalizeHttpUrl(text);
+      if (!normalized) return ctx.reply('URL tidak valid.');
+      const v = loadVars();
+      v.PAYMENT_GATEWAY_BASE_URL = normalized;
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Gateway URL OrderKuota disimpan:\n${normalized}`, adminPaymentGatewayOrderKuotaMenu());
+    }
+
+    if (state.step === 'pg_set_orderkuota_api_key') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      if (text.length < 6) return ctx.reply('API Key terlalu pendek.');
+      const v = loadVars();
+      v.RAJASERVER_API_KEY = text;
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply('RAJASERVER_API_KEY berhasil disimpan.', adminPaymentGatewayOrderKuotaMenu());
+    }
+
+    if (state.step === 'pg_set_orderkuota_qris') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      if (text.length < 8) return ctx.reply('DATA_QRIS terlalu pendek.');
+      const v = loadVars();
+      v.DATA_QRIS = text;
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply('DATA_QRIS berhasil disimpan.', adminPaymentGatewayOrderKuotaMenu());
+    }
+
+    if (state.step === 'pg_set_orderkuota_min_topup') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const amount = Number(String(text).replace(/[^0-9]/g, ''));
+      if (!Number.isFinite(amount) || amount < 1000) return ctx.reply('Minimal topup harus angka, minimal 1000.');
+      const v = loadVars();
+      v.ORDERKUOTA_MIN_TOPUP = Math.floor(amount);
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Minimal TopUp OrderKuota disimpan: Rp ${Math.floor(amount).toLocaleString('id-ID')}`, adminPaymentGatewayOrderKuotaMenu());
+    }
+
+    if (state.step === 'pg_set_gopay_base_url') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const normalized = normalizeHttpUrl(text);
+      if (!normalized) return ctx.reply('URL GoPay tidak valid.');
+      const v = loadVars();
+      v.GOPAY_API_BASE_URL = normalized;
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`GoPay API Base URL disimpan:\n${normalized}`, adminPaymentGatewayGoPayMenu());
+    }
+
+    if (state.step === 'pg_set_gopay_api_key') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      if (text.length < 8) return ctx.reply('GoPay API key terlalu pendek.');
+      const v = loadVars();
+      v.GOPAY_API_KEY = text;
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply('GoPay API Key berhasil disimpan.', adminPaymentGatewayGoPayMenu());
+    }
+
+    if (state.step === 'pg_set_gopay_min_topup') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const amount = Number(String(text).replace(/[^0-9]/g, ''));
+      if (!Number.isFinite(amount) || amount < 1000) return ctx.reply('Minimal topup harus angka, minimal 1000.');
+      const v = loadVars();
+      v.GOPAY_MIN_TOPUP = Math.floor(amount);
+      saveVars(v);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Minimal TopUp GoPay disimpan: Rp ${Math.floor(amount).toLocaleString('id-ID')}`, adminPaymentGatewayGoPayMenu());
     }
 
     if (state.step === 'admin_add_domain') {

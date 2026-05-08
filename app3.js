@@ -750,11 +750,19 @@ async function createPaymentQrByMode(amount, referenceId) {
 function getGatewayMinTopup() {
   const cfg = getPaymentConfig();
   const vars = loadVars();
-  const okMin = Math.max(1000, Number(vars.ORDERKUOTA_MIN_TOPUP || 2000) || 2000);
-  const gopayMin = Math.max(1000, Number(vars.GOPAY_MIN_TOPUP || 2000) || 2000);
+  const okRaw = Number(vars.ORDERKUOTA_MIN_TOPUP || 0);
+  const gopayRaw = Number(vars.GOPAY_MIN_TOPUP || 0);
+  const okMin = Number.isFinite(okRaw) && okRaw >= 1000 ? Math.floor(okRaw) : 0;
+  const gopayMin = Number.isFinite(gopayRaw) && gopayRaw >= 1000 ? Math.floor(gopayRaw) : 0;
   if (cfg.mode === 'orderkuota') return okMin;
-  if (cfg.mode === 'both') return Math.max(okMin, gopayMin);
+  if (cfg.mode === 'both') return Math.max(okMin || 0, gopayMin || 0);
   return gopayMin;
+}
+
+async function getEffectiveTopupMin() {
+  const gatewayMin = Number(getGatewayMinTopup() || 0);
+  if (gatewayMin >= 1000) return gatewayMin;
+  return getTopupMin();
 }
 
 async function checkGoPayStatus(transactionId) {
@@ -2580,7 +2588,7 @@ bot.action('m_register_sc_back', async (ctx) => {
 
 bot.action('m_topup_saldo', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const minTopup = Math.max(await getTopupMin(), getGatewayMinTopup());
+  const minTopup = await getEffectiveTopupMin();
   userState.set(ctx.chat.id, { step: 'topup_amount' });
   await ctx.reply(
     uiBox('TOP UP SALDO', [
@@ -3841,7 +3849,7 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.step === 'topup_amount') {
-      const minTopup = Math.max(await getTopupMin(), getGatewayMinTopup());
+      const minTopup = await getEffectiveTopupMin();
       const topupExpireMs = await getTopupExpireMs();
       const amount = Number(String(text).replace(/[^0-9]/g, ''));
       if (!Number.isFinite(amount) || amount < minTopup) {

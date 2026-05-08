@@ -42,20 +42,26 @@ const userState = new Map();
 const db = new sqlite3.Database(DB_PATH);
 const DYNAMIC_SETTING_KEYS = [
   'SC_REGISTRATION_PRICE_PER_DAY',
+  'SC_RESELLER_PRICE_PER_DAY',
   'SC_UNLIMITED_PRICE',
   'SC_REGISTRATION_MIN_DAYS',
   'TOPUP_MIN',
   'TOPUP_EXPIRE_MS',
+  'TOPUP_SUCCESS_NOTIFY_ENABLE',
+  'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS',
   'AUTO_PROVISION_DOMAIN',
   'CERTBOT_EMAIL',
   'SC_INSTALLER_LOCAL_PATH'
 ];
 const SETTING_LABELS = {
   SC_REGISTRATION_PRICE_PER_DAY: 'Harga SC per Hari',
+  SC_RESELLER_PRICE_PER_DAY: 'Harga SC Reseller per Hari',
   SC_UNLIMITED_PRICE: 'Harga SC Unlimited',
   SC_REGISTRATION_MIN_DAYS: 'Minimal Hari Pembelian',
   TOPUP_MIN: 'Minimal Top Up Saldo',
   TOPUP_EXPIRE_MS: 'Masa Aktif QR Top Up',
+  TOPUP_SUCCESS_NOTIFY_ENABLE: 'Notif TopUp Sukses',
+  TOPUP_SUCCESS_NOTIFY_ADMIN_IDS: 'Admin ID Notif TopUp',
   AUTO_PROVISION_DOMAIN: 'Auto Setup Domain',
   CERTBOT_EMAIL: 'Email Certbot',
   SC_INSTALLER_LOCAL_PATH: 'Path Script Installer'
@@ -153,10 +159,19 @@ async function initDb() {
     PRIMARY KEY (user_id, vps_ip, event)
   )`);
   await ensureScRegistrationSchema();
+  await ensureUsersSchema();
   await ensurePendingDepositSchema();
   await ensureOrderKuotaAmountLockSchema();
   await seedDefaultSettings();
   await autoMigrateLegacyInstallerPathSetting();
+}
+
+async function ensureUsersSchema() {
+  const cols = await dbAll('PRAGMA table_info(users)');
+  const hasReseller = cols.some((c) => String(c?.name || '').toLowerCase() === 'is_reseller');
+  if (!hasReseller) {
+    await dbRun('ALTER TABLE users ADD COLUMN is_reseller INTEGER DEFAULT 0');
+  }
 }
 
 async function ensureScRegistrationSchema() {
@@ -199,10 +214,13 @@ async function seedDefaultSettings() {
   const now = Date.now();
   const defaults = {
     SC_REGISTRATION_PRICE_PER_DAY: String(DEFAULT_SC_REGISTRATION_PRICE_PER_DAY),
+    SC_RESELLER_PRICE_PER_DAY: String(DEFAULT_SC_REGISTRATION_PRICE_PER_DAY),
     SC_UNLIMITED_PRICE: String(SC_UNLIMITED_PRICE),
     SC_REGISTRATION_MIN_DAYS: String(DEFAULT_SC_REGISTRATION_MIN_DAYS),
     TOPUP_MIN: String(DEFAULT_TOPUP_MIN),
     TOPUP_EXPIRE_MS: String(DEFAULT_TOPUP_EXPIRE_MS),
+    TOPUP_SUCCESS_NOTIFY_ENABLE: '1',
+    TOPUP_SUCCESS_NOTIFY_ADMIN_IDS: ADMIN_IDS.join(','),
     AUTO_PROVISION_DOMAIN: DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0',
     CERTBOT_EMAIL: DEFAULT_CERTBOT_EMAIL,
     SC_INSTALLER_LOCAL_PATH: DEFAULT_SC_INSTALLER_LOCAL_PATH
@@ -275,6 +293,24 @@ async function getRegistrationPricePerDay() {
   return getSettingNumber('SC_REGISTRATION_FEE', DEFAULT_SC_REGISTRATION_PRICE_PER_DAY, 0, 1000000000);
 }
 
+async function isResellerUser(userId) {
+  const row = await dbGet('SELECT is_reseller FROM users WHERE user_id = ? LIMIT 1', [userId]);
+  return Number(row?.is_reseller || 0) === 1;
+}
+
+async function setResellerUser(userId, enabled) {
+  await ensureUser(userId);
+  await dbRun('UPDATE users SET is_reseller = ? WHERE user_id = ?', [enabled ? 1 : 0, userId]);
+}
+
+async function getRegistrationPricePerDayForUser(userId) {
+  const normalPrice = await getRegistrationPricePerDay();
+  const isReseller = await isResellerUser(userId);
+  if (!isReseller) return { pricePerDay: normalPrice, isReseller: false };
+  const resellerPrice = await getSettingNumber('SC_RESELLER_PRICE_PER_DAY', normalPrice, 0, 1000000000);
+  return { pricePerDay: resellerPrice, isReseller: true };
+}
+
 async function getRegistrationMinDays() {
   return getSettingNumber('SC_REGISTRATION_MIN_DAYS', DEFAULT_SC_REGISTRATION_MIN_DAYS, 1, 3650);
 }
@@ -289,6 +325,43 @@ async function getTopupMin() {
 
 async function getTopupExpireMs() {
   return getSettingNumber('TOPUP_EXPIRE_MS', DEFAULT_TOPUP_EXPIRE_MS, 60000, 86400000);
+}
+
+async function getTopupSuccessNotifyEnable() {
+  return getSettingBool('TOPUP_SUCCESS_NOTIFY_ENABLE', true);
+}
+
+async function getTopupSuccessNotifyAdminIds() {
+  const raw = await getDynamicSetting('TOPUP_SUCCESS_NOTIFY_ADMIN_IDS', ADMIN_IDS.join(','));
+  const ids = String(raw || '')
+    .split(',')
+    .map((v) => Number(String(v || '').trim()))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  return ids.length ? ids : ADMIN_IDS;
+}
+
+async function notifyAdminsTopupSuccess(row) {
+  const enabled = await getTopupSuccessNotifyEnable().catch(() => true);
+  if (!enabled) return;
+  const adminIds = await getTopupSuccessNotifyAdminIds().catch(() => ADMIN_IDS);
+  if (!Array.isArray(adminIds) || !adminIds.length) return;
+  const userId = Number(row?.user_id || 0);
+  const provider = String(row?.gateway_provider || 'gopay').toUpperCase();
+  const saldoMasuk = Number(row?.original_amount || row?.amount || 0);
+  const fee = Number(row?.admin_fee || 0);
+  const totalTransfer = Number(row?.amount || saldoMasuk || 0);
+  const ref = String(row?.reference_id || row?.unique_code || '-');
+  const message =
+    `TOPUP SUKSES\n` +
+    `User ID: ${userId}\n` +
+    `Gateway: ${provider}\n` +
+    `Saldo Masuk: Rp ${saldoMasuk.toLocaleString('id-ID')}\n` +
+    `Fee: Rp ${fee.toLocaleString('id-ID')}\n` +
+    `Total Transfer: Rp ${totalTransfer.toLocaleString('id-ID')}\n` +
+    `Ref: ${ref}`;
+  for (const aid of adminIds) {
+    await bot.telegram.sendMessage(aid, message).catch(() => {});
+  }
 }
 
 async function getAutoProvisionDomain() {
@@ -387,9 +460,20 @@ function parseRenewErr(err) {
 }
 
 function uiBox(title, lines = []) {
-  const sep = '============================================================';
   const body = Array.isArray(lines) ? lines.map((x) => String(x ?? '')) : [String(lines || '')];
-  return [sep, ` ${String(title || '').trim()}`, sep, '', ...body, sep].join('\n');
+  const titleText = String(title || '').trim();
+  const contentWidth = Math.max(
+    titleText.length,
+    ...body.map((line) => String(line || '').length),
+    18
+  );
+  const top = `╔${'═'.repeat(contentWidth + 2)}╗`;
+  const bottom = `╚${'═'.repeat(contentWidth + 2)}╝`;
+  const pad = (text = '') => {
+    const t = String(text ?? '');
+    return `║ ${t}${' '.repeat(Math.max(0, contentWidth - t.length))} ║`;
+  };
+  return [top, pad(titleText), pad(''), ...body.map((line) => pad(line)), bottom].join('\n');
 }
 
 function normalizeScriptLineEndings(input) {
@@ -1430,10 +1514,11 @@ async function registerScMenu() {
 
 function adminMenu() {
   return Markup.inlineKeyboard([
+    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
+    [Markup.button.callback('Aktifkan Reseller', 'm_admin_reseller_enable'), Markup.button.callback('Nonaktifkan Reseller', 'm_admin_reseller_disable')],
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
-    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
     [Markup.button.callback('Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
     [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
@@ -1489,10 +1574,13 @@ function adminEnvGroupMenu(group) {
   if (g === 'billing') {
     return Markup.inlineKeyboard([
       [Markup.button.callback(getSettingLabel('SC_REGISTRATION_PRICE_PER_DAY'), 'm_admin_env_pick_SC_REGISTRATION_PRICE_PER_DAY')],
+      [Markup.button.callback(getSettingLabel('SC_RESELLER_PRICE_PER_DAY'), 'm_admin_env_pick_SC_RESELLER_PRICE_PER_DAY')],
       [Markup.button.callback(getSettingLabel('SC_UNLIMITED_PRICE'), 'm_admin_env_pick_SC_UNLIMITED_PRICE')],
       [Markup.button.callback(getSettingLabel('SC_REGISTRATION_MIN_DAYS'), 'm_admin_env_pick_SC_REGISTRATION_MIN_DAYS')],
       [Markup.button.callback(getSettingLabel('TOPUP_MIN'), 'm_admin_env_pick_TOPUP_MIN')],
       [Markup.button.callback(getSettingLabel('TOPUP_EXPIRE_MS'), 'm_admin_env_pick_TOPUP_EXPIRE_MS')],
+      [Markup.button.callback(getSettingLabel('TOPUP_SUCCESS_NOTIFY_ENABLE'), 'm_admin_env_pick_TOPUP_SUCCESS_NOTIFY_ENABLE')],
+      [Markup.button.callback(getSettingLabel('TOPUP_SUCCESS_NOTIFY_ADMIN_IDS'), 'm_admin_env_pick_TOPUP_SUCCESS_NOTIFY_ADMIN_IDS')],
       [Markup.button.callback('Kembali', 'm_admin_env_set')]
     ]);
   }
@@ -1516,6 +1604,8 @@ function envKeyInputHint(key) {
   switch (String(key || '').toUpperCase()) {
     case 'SC_REGISTRATION_PRICE_PER_DAY':
       return 'Contoh: 25000 (rupiah per hari, angka bulat).';
+    case 'SC_RESELLER_PRICE_PER_DAY':
+      return 'Contoh: 15000 (rupiah per hari untuk reseller).';
     case 'SC_UNLIMITED_PRICE':
       return 'Contoh: 70000 (rupiah, angka bulat).';
     case 'SC_REGISTRATION_MIN_DAYS':
@@ -1524,6 +1614,10 @@ function envKeyInputHint(key) {
       return 'Contoh: 5000 (minimal top up saldo).';
     case 'TOPUP_EXPIRE_MS':
       return 'Contoh: 900000 untuk 15 menit.';
+    case 'TOPUP_SUCCESS_NOTIFY_ENABLE':
+      return 'Isi: 1 atau 0 (1=aktif, 0=nonaktif).';
+    case 'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS':
+      return 'Contoh: 123456789,987654321 (pisah koma).';
     case 'AUTO_PROVISION_DOMAIN':
       return 'Isi: 1 atau 0 (1=aktif, 0=nonaktif).';
     case 'CERTBOT_EMAIL':
@@ -2041,6 +2135,7 @@ async function pollPendingTopups() {
       if (st.settled) {
         const credited = await markPendingPaid(row);
         if (credited) {
+          await notifyAdminsTopupSuccess(row).catch(() => {});
           const saldoNow = await getSaldo(row.user_id).catch(() => 0);
           await bot.telegram.sendMessage(
             row.user_id,
@@ -2058,12 +2153,12 @@ bot.start(async (ctx) => {
   userState.delete(ctx.chat.id);
   const saldo = await getSaldo(ctx.from.id).catch(() => 0);
   const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
-  const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+  const [{ pricePerDay, isReseller }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
   await ctx.reply(
     uiBox('SC 1FORCR NEXUS - INFORMASI AKUN', [
       `Saldo Kamu       : Rp ${Number(saldo).toLocaleString('id-ID')}`,
       `IP Terdaftar     : ${regs.length}`,
-      `Harga SC / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
+      `Harga SC / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}${isReseller ? ' (RESELLER)' : ''}`,
       `Minimal Hari     : ${minDays} hari`,
       '',
       'Alur Cepat:',
@@ -2277,6 +2372,20 @@ bot.action('m_admin_add_saldo', async (ctx) => {
   );
 });
 
+bot.action('m_admin_reseller_enable', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_reseller_enable_user' });
+  return ctx.reply('Masukkan Telegram User ID yang akan dijadikan reseller.');
+});
+
+bot.action('m_admin_reseller_disable', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_reseller_disable_user' });
+  return ctx.reply('Masukkan Telegram User ID yang akan dinonaktifkan reseller.');
+});
+
 bot.action('m_admin_env_show', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
@@ -2285,6 +2394,7 @@ bot.action('m_admin_env_show', async (ctx) => {
   await ctx.reply(
     uiBox('PENGATURAN SAAT INI', [
       `${getSettingLabel('SC_REGISTRATION_PRICE_PER_DAY')} : Rp ${Number(snap.SC_REGISTRATION_PRICE_PER_DAY || 0).toLocaleString('id-ID')}`,
+      `${getSettingLabel('SC_RESELLER_PRICE_PER_DAY')} : Rp ${Number(snap.SC_RESELLER_PRICE_PER_DAY || 0).toLocaleString('id-ID')}`,
       `${getSettingLabel('SC_UNLIMITED_PRICE')} : Rp ${Number(snap.SC_UNLIMITED_PRICE || 0).toLocaleString('id-ID')}`,
       `${getSettingLabel('SC_REGISTRATION_MIN_DAYS')} : ${snap.SC_REGISTRATION_MIN_DAYS} hari`,
       `${getSettingLabel('TOPUP_MIN')} : Rp ${Number(snap.TOPUP_MIN || 0).toLocaleString('id-ID')}`,
@@ -2488,8 +2598,8 @@ bot.action('m_install_link', async (ctx) => {
 
 bot.action('m_register_sc', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const [pricePerDay, unlimitedPrice, minDays, regMenu] = await Promise.all([
-    getRegistrationPricePerDay(),
+  const [{ pricePerDay, isReseller }, unlimitedPrice, minDays, regMenu] = await Promise.all([
+    getRegistrationPricePerDayForUser(ctx.from.id),
     getUnlimitedPrice(),
     getRegistrationMinDays(),
     registerScMenu()
@@ -2501,7 +2611,7 @@ bot.action('m_register_sc', async (ctx) => {
       '- Perpanjang SC',
       '- SC Unlimited',
       '',
-      `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari`,
+      `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari${isReseller ? ' (RESELLER)' : ''}`,
       `Harga Unlimited : Rp ${Number(unlimitedPrice).toLocaleString('id-ID')} sekali bayar`,
       `Minimal Durasi  : ${minDays} hari`,
       '',
@@ -2514,14 +2624,14 @@ bot.action('m_register_sc', async (ctx) => {
 
 bot.action('m_register_sc_new', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+  const [{ pricePerDay, isReseller }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
   userState.set(ctx.chat.id, { step: 'register_sc_client_name' });
   await ctx.reply(
     uiBox('REGISTRASI BARU SC', [
       'Masukkan nama client.',
       'Contoh: Haris Premium 01',
       '',
-      `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari`,
+      `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari${isReseller ? ' (RESELLER)' : ''}`,
       `Minimal Durasi  : ${minDays} hari`,
       '',
       'Setelah input IP, bot akan minta key server VPS.',
@@ -2626,6 +2736,7 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
       const credited = await markPendingPaid(row);
       const saldoNow = await getSaldo(ctx.from.id).catch(() => 0);
       if (credited) {
+        await notifyAdminsTopupSuccess(row).catch(() => {});
         return ctx.reply(`Top Up Saldo berhasil. Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`, mainMenu());
       }
       return ctx.reply('Top Up Saldo sudah diproses sebelumnya.');
@@ -2638,6 +2749,7 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
     const credited = await markPendingPaid(row);
     const saldoNow = await getSaldo(ctx.from.id).catch(() => 0);
     if (credited) {
+      await notifyAdminsTopupSuccess(row).catch(() => {});
       return ctx.reply(`Top Up Saldo berhasil. Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`, mainMenu());
     }
     return ctx.reply('Top Up Saldo sudah diproses sebelumnya.');
@@ -3010,6 +3122,38 @@ bot.on('text', async (ctx) => {
       );
     }
 
+    if (state.step === 'admin_reseller_enable_user') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const targetUserId = Number(String(text || '').replace(/[^0-9]/g, ''));
+      if (!Number.isInteger(targetUserId) || targetUserId <= 0) return ctx.reply('User ID tidak valid. Contoh: 123456789');
+      await setResellerUser(targetUserId, true);
+      const cfg = await getRegistrationPricePerDayForUser(targetUserId);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Reseller AKTIF untuk user ${targetUserId}.\nHarga SC per hari user ini: Rp ${Number(cfg.pricePerDay || 0).toLocaleString('id-ID')}`,
+        adminMenu()
+      );
+    }
+
+    if (state.step === 'admin_reseller_disable_user') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const targetUserId = Number(String(text || '').replace(/[^0-9]/g, ''));
+      if (!Number.isInteger(targetUserId) || targetUserId <= 0) return ctx.reply('User ID tidak valid. Contoh: 123456789');
+      await setResellerUser(targetUserId, false);
+      const normalPrice = await getRegistrationPricePerDay();
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Reseller NONAKTIF untuk user ${targetUserId}.\nHarga SC per hari kembali normal: Rp ${Number(normalPrice || 0).toLocaleString('id-ID')}`,
+        adminMenu()
+      );
+    }
+
     if (state.step === 'admin_set_env_value') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
@@ -3023,6 +3167,10 @@ bot.on('text', async (ctx) => {
       }
 
       if (key === 'SC_REGISTRATION_PRICE_PER_DAY') {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 0) return ctx.reply('Harus angka >= 0.');
+        value = String(Math.floor(n));
+      } else if (key === 'SC_RESELLER_PRICE_PER_DAY') {
         const n = Number(value);
         if (!Number.isFinite(n) || n < 0) return ctx.reply('Harus angka >= 0.');
         value = String(Math.floor(n));
@@ -3042,6 +3190,19 @@ bot.on('text', async (ctx) => {
         const n = Number(value);
         if (!Number.isFinite(n) || n < 60000) return ctx.reply('Harus angka >= 60000 (1 menit).');
         value = String(Math.floor(n));
+      } else if (key === 'TOPUP_SUCCESS_NOTIFY_ENABLE') {
+        const s = value.toLowerCase();
+        if (!['0', '1', 'true', 'false', 'yes', 'no', 'on', 'off'].includes(s)) {
+          return ctx.reply('Isi 1/0 (atau true/false).');
+        }
+        value = parseBool01(s, true) ? '1' : '0';
+      } else if (key === 'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS') {
+        const ids = String(value || '')
+          .split(',')
+          .map((v) => Number(String(v || '').trim()))
+          .filter((n) => Number.isInteger(n) && n > 0);
+        if (!ids.length) return ctx.reply('Isi minimal 1 Telegram ID admin. Contoh: 12345,67890');
+        value = ids.join(',');
       } else if (key === 'AUTO_PROVISION_DOMAIN') {
         const s = value.toLowerCase();
         if (!['0', '1', 'true', 'false', 'yes', 'no', 'on', 'off'].includes(s)) {
@@ -3494,8 +3655,8 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(`IP ${ip} sudah terdaftar oleh user lain.`, mainMenu());
       }
-      const [pricePerDay, minDays, reg] = await Promise.all([
-        getRegistrationPricePerDay(),
+      const [{ pricePerDay }, minDays, reg] = await Promise.all([
+        getRegistrationPricePerDayForUser(ctx.from.id),
         getRegistrationMinDays(),
         getUserRegistration(ctx.from.id, ip)
       ]);
@@ -3530,7 +3691,7 @@ bot.on('text', async (ctx) => {
       if (serverKey.length < 8) {
         return ctx.reply('Key server tidak valid. Minimal 8 karakter.');
       }
-      const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+      const [{ pricePerDay }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
       state.serverKey = serverKey;
       state.step = 'register_sc_days';
       userState.set(ctx.chat.id, state);
@@ -3553,7 +3714,7 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('State registrasi tidak valid. Ulangi dari menu registrasi.', mainMenu());
       }
-      const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+      const [{ pricePerDay }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
       const days = Number(String(text).replace(/[^0-9]/g, ''));
       if (!Number.isFinite(days) || days < minDays) {
         return ctx.reply(`Jumlah hari tidak valid. Minimal ${minDays} hari.`);
@@ -3713,8 +3874,8 @@ bot.on('text', async (ctx) => {
         );
       }
 
-      const [pricePerDay, minDays, reg, ownedByOther] = await Promise.all([
-        getRegistrationPricePerDay(),
+      const [{ pricePerDay }, minDays, reg, ownedByOther] = await Promise.all([
+        getRegistrationPricePerDayForUser(ctx.from.id),
         getRegistrationMinDays(),
         getUserRegistration(ctx.from.id, ip),
         isIpOwnedByOther(ip, ctx.from.id)
@@ -3758,7 +3919,7 @@ bot.on('text', async (ctx) => {
       if (serverKey.length < 8) {
         return ctx.reply('Key server tidak valid. Minimal 8 karakter.');
       }
-      const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+      const [{ pricePerDay }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
       state.serverKey = serverKey;
       state.step = 'extend_sc_days';
       userState.set(ctx.chat.id, state);
@@ -3781,7 +3942,7 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('State perpanjangan tidak valid. Ulangi dari menu perpanjang.', mainMenu());
       }
-      const [pricePerDay, minDays] = await Promise.all([getRegistrationPricePerDay(), getRegistrationMinDays()]);
+      const [{ pricePerDay }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
       const days = Number(String(text).replace(/[^0-9]/g, ''));
       if (!Number.isFinite(days) || days < minDays) {
         return ctx.reply(`Jumlah hari tidak valid. Minimal ${minDays} hari.`);

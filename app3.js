@@ -214,6 +214,43 @@ async function ensureOrderKuotaAmountLockSchema() {
 
 async function seedDefaultSettings() {
   const now = Date.now();
+  const defaultScFeaturesText = [
+    'SERVICE DI SC (VPS):',
+    '- SSH/OpenSSH',
+    '- Dropbear',
+    '- Nginx',
+    '- HAProxy (TLS 443 mux)',
+    '- Xray',
+    '- SSH-WS bridge (sc-1forcr-sshws)',
+    '- UDP backend (ZIVPN/UDPHC tergantung mode)',
+    '',
+    'SUPPORT PROTOKOL/AKUN:',
+    '- SSH + SSHWS',
+    '- VMESS WS',
+    '- VLESS WS',
+    '- TROJAN WS',
+    '',
+    'PORT & PATH UMUM (DEFAULT):',
+    '- TLS/SSL: 443',
+    '- HTTP: 80',
+    '- Dropbear: 109 dan 143',
+    '- SSHWS path: /ssh-ws, /ws, /ws-ssh, /ssh',
+    '- Xray WS path: /vmess, /vless, /trojan',
+    '',
+    'MENU DI SC (VPS):',
+    '- Kelola akun SSH/VMESS/VLESS/TROJAN',
+    '- Monitor user online/lock',
+    '- Tools update script',
+    '- Change domain',
+    '- Backup/restore',
+    '',
+    'MENU DI BOT:',
+    '- Registrasi/Perpanjang/Unlimited SC',
+    '- Top Up Saldo + cek status',
+    '- Cek saldo, SC saya, cek expired',
+    '- Backup/restore akun, migrasi akun, hapus akun',
+    '- Fitur reseller dan admin panel'
+  ].join('\n');
   const defaults = {
     SC_REGISTRATION_PRICE_PER_DAY: String(DEFAULT_SC_REGISTRATION_PRICE_PER_DAY),
     SC_RESELLER_PRICE_PER_DAY: String(DEFAULT_SC_REGISTRATION_PRICE_PER_DAY),
@@ -224,6 +261,7 @@ async function seedDefaultSettings() {
     TOPUP_SUCCESS_NOTIFY_ENABLE: '1',
     TOPUP_SUCCESS_NOTIFY_ADMIN_IDS: ADMIN_IDS.join(','),
     RESELLER_ADMIN_WA: '089612745096',
+    SC_FEATURES_INFO_TEXT: defaultScFeaturesText,
     AUTO_PROVISION_DOMAIN: DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0',
     CERTBOT_EMAIL: DEFAULT_CERTBOT_EMAIL,
     SC_INSTALLER_LOCAL_PATH: DEFAULT_SC_INSTALLER_LOCAL_PATH
@@ -234,6 +272,11 @@ async function seedDefaultSettings() {
       [key, String(value), now, 0]
     );
   }
+}
+
+async function getScFeaturesInfoText() {
+  const fallback = 'Info fitur SC belum diisi admin.';
+  return getDynamicSetting('SC_FEATURES_INFO_TEXT', fallback);
 }
 
 function normalizeLegacyInstallerPathValue(rawValue) {
@@ -1480,6 +1523,7 @@ async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('SC Saya', 'm_my_sc')],
+    [Markup.button.callback('Fitur-Fitur SC 1FORCR NEXUS', 'm_sc_features')],
     [Markup.button.callback('Jadi Reseller', 'm_become_reseller')],
     [Markup.button.callback('Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
     [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
@@ -1543,6 +1587,7 @@ function adminMenu() {
     [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
     [Markup.button.callback('Set User Jadi Reseller', 'm_admin_reseller_enable'), Markup.button.callback('Nonaktifkan User Reseller', 'm_admin_reseller_disable')],
     [Markup.button.callback('Set WA Admin Reseller', 'm_admin_set_reseller_wa')],
+    [Markup.button.callback('Edit Info Fitur SC', 'm_admin_set_sc_features_info')],
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
@@ -2444,6 +2489,17 @@ bot.action('m_admin_set_reseller_wa', async (ctx) => {
   return ctx.reply('Masukkan nomor WA admin reseller. Contoh: 089612745096 atau 6289612745096');
 });
 
+bot.action('m_admin_set_sc_features_info', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_set_sc_features_info' });
+  return ctx.reply(
+    'Kirim isi "Info Fitur SC" versi terbaru.\n' +
+      'Boleh multi-baris langsung.\n' +
+      'Ketik "batal" untuk membatalkan.'
+  );
+});
+
 bot.action('m_admin_env_show', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
@@ -2587,6 +2643,15 @@ bot.action('m_cek_saldo', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const saldo = await getSaldo(ctx.from.id).catch(() => 0);
   await ctx.reply(`Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}`, mainMenu());
+});
+
+bot.action('m_sc_features', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const info = await getScFeaturesInfoText();
+  await ctx.reply(
+    uiBox('FITUR-FITUR SC 1FORCR NEXUS', String(info || '').split('\n')),
+    mainMenu()
+  );
 });
 
 bot.action('m_my_sc', async (ctx) => {
@@ -3222,6 +3287,18 @@ bot.on('text', async (ctx) => {
       await setDynamicSetting('RESELLER_ADMIN_WA', wa, ctx.from.id);
       userState.delete(ctx.chat.id);
       return ctx.reply(`Nomor WA admin reseller disimpan: ${wa}`, adminMenu());
+    }
+
+    if (state.step === 'admin_set_sc_features_info') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const payload = String(text || '').trim();
+      if (payload.length < 10) return ctx.reply('Isi fitur terlalu pendek.');
+      await setDynamicSetting('SC_FEATURES_INFO_TEXT', payload, ctx.from.id);
+      userState.delete(ctx.chat.id);
+      return ctx.reply('Info fitur SC berhasil diperbarui.', adminMenu());
     }
 
     if (state.step === 'admin_set_env_value') {

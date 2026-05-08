@@ -1314,14 +1314,15 @@ frontend ft_443
     acl is_xray_vless_bug req.payload(0,256),lower -m sub "get /yourbug/vless"
     acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
     acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
+    acl is_api_vps req.payload(0,256),lower -m sub " /vps/"
     # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
     # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
     acl is_hc_connect req.payload(0,512),lower -m sub "connect "
-    use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
+    use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
-    # Jalur HTTP/WS default di 443 diarahkan ke mux (nginx/xray) agar vless/trojan
-    # tidak salah jatuh ke backend sshws saat payload/ACL tidak persis terdeteksi.
-    default_backend bk_mux
+    # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
+    # Jalur xray (/vmess,/vless,/trojan) dan API (/vps/) tetap diprioritaskan ke mux.
+    default_backend bk_sshws_tls
 
 backend bk_mux
     mode tcp
@@ -9674,14 +9675,15 @@ frontend ft_443
     acl is_xray_vless_bug req.payload(0,256),lower -m sub "get /yourbug/vless"
     acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
     acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
+    acl is_api_vps req.payload(0,256),lower -m sub " /vps/"
     # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
     # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
     acl is_hc_connect req.payload(0,512),lower -m sub "connect "
-    use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
+    use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
-    # Jalur HTTP/WS default di 443 diarahkan ke mux (nginx/xray) agar vless/trojan
-    # tidak salah jatuh ke backend sshws saat payload/ACL tidak persis terdeteksi.
-    default_backend bk_mux
+    # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
+    # Jalur xray (/vmess,/vless,/trojan) dan API (/vps/) tetap diprioritaskan ke mux.
+    default_backend bk_sshws_tls
 
 backend bk_mux
     mode tcp

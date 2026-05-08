@@ -1314,9 +1314,9 @@ frontend ft_443
     acl is_xray_vless_bug req.payload(0,256),lower -m sub "get /yourbug/vless"
     acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
     acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
-    # Beberapa client HC mengirim method "connect" lowercase/mixed-case.
-    # Gunakan deteksi case-insensitive agar SSH SSL-only tetap terarah ke sshws.
-    acl is_hc_connect req.payload(0,32),lower -m beg "connect "
+    # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
+    # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
+    acl is_hc_connect req.payload(0,512),lower -m sub "connect "
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
     # Jalur HTTP/WS default di 443 diarahkan ke mux (nginx/xray) agar vless/trojan
@@ -9674,9 +9674,9 @@ frontend ft_443
     acl is_xray_vless_bug req.payload(0,256),lower -m sub "get /yourbug/vless"
     acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
     acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
-    # Beberapa client HC mengirim method "connect" lowercase/mixed-case.
-    # Gunakan deteksi case-insensitive agar SSH SSL-only tetap terarah ke sshws.
-    acl is_hc_connect req.payload(0,32),lower -m beg "connect "
+    # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
+    # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
+    acl is_hc_connect req.payload(0,512),lower -m sub "connect "
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug
     use_backend bk_sshws_tls if is_hc_connect
     # Jalur HTTP/WS default di 443 diarahkan ke mux (nginx/xray) agar vless/trojan

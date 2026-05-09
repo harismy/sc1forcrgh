@@ -1524,6 +1524,7 @@ function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('SC Saya', 'm_my_sc')],
     [Markup.button.callback('Fitur-Fitur SC 1FORCR NEXUS', 'm_sc_features')],
+    [Markup.button.callback('GRUP SC 1FORCR 1FORCR', 'm_group_sc_1forcr')],
     [Markup.button.callback('Jadi Reseller', 'm_become_reseller')],
     [Markup.button.callback('Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
     [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
@@ -2717,6 +2718,11 @@ bot.action('m_install_link', async (ctx) => {
     parse_mode: installerText.parse_mode,
     disable_web_page_preview: true
   });
+});
+
+bot.action('m_group_sc_1forcr', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  return ctx.reply('GRUP SC 1FORCR 1FORCR:\nhttps://t.me/Oneforcrnexus', mainMenu());
 });
 
 bot.action('m_register_sc', async (ctx) => {

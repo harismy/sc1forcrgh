@@ -1522,16 +1522,16 @@ async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
 
 function mainMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('SC Saya', 'm_my_sc')],
-    [Markup.button.callback('Fitur-Fitur SC 1FORCR NEXUS', 'm_sc_features')],
-    [Markup.button.callback('GRUP SC 1FORCR 1FORCR', 'm_group_sc_1forcr')],
-    [Markup.button.callback('Jadi Reseller', 'm_become_reseller')],
-    [Markup.button.callback('Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
-    [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Top Up Saldo', 'm_topup_saldo')],
-    [Markup.button.callback('Cek Saldo', 'm_cek_saldo'), Markup.button.callback('Cadangkan SC', 'm_backup_now')],
-    [Markup.button.callback('Pulihkan SC', 'm_restore_upload'), Markup.button.callback('Hapus Semua Akun', 'm_delete_all_accounts')],
-    [Markup.button.callback('Migrasi Akun', 'm_migrate_accounts')],
-    [Markup.button.callback('Menu Admin', 'm_admin_menu')]
+    [Markup.button.callback('🛒 Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('📦 SC Saya', 'm_my_sc')],
+    [Markup.button.callback('✨ Fitur SC 1FORCR NEXUS', 'm_sc_features')],
+    [Markup.button.callback('👥 Grup SC 1FORCR 1FORCR', 'm_group_sc_1forcr')],
+    [Markup.button.callback('💼 Jadi Reseller', 'm_become_reseller')],
+    [Markup.button.callback('⏳ Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
+    [Markup.button.callback('🔗 Link Instalasi', 'm_install_link'), Markup.button.callback('💳 Top Up Saldo', 'm_topup_saldo')],
+    [Markup.button.callback('💰 Cek Saldo', 'm_cek_saldo'), Markup.button.callback('🗂️ Cadangkan SC', 'm_backup_now')],
+    [Markup.button.callback('♻️ Pulihkan SC', 'm_restore_upload'), Markup.button.callback('🧹 Hapus Semua Akun', 'm_delete_all_accounts')],
+    [Markup.button.callback('🚚 Migrasi Akun', 'm_migrate_accounts')],
+    [Markup.button.callback('🛠️ Menu Admin', 'm_admin_menu')]
   ]);
 }
 

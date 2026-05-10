@@ -7341,6 +7341,7 @@ UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
+DROPBEAR_VERSION=${DROPBEAR_VERSION}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -9101,9 +9102,10 @@ tools_menu() {
       "8) Setting Notif Akun Online BOT" \
       "9) Kirim Notif Online Sekarang ke BOT" \
       "10) Setting Token Webhook BotVPN" \
+      "11) Upgrade/Downgrade Versi Dropbear" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-10]: "; then
+    if ! prompt_input tm "Pilih menu [0-11]: "; then
       return
     fi
     clear
@@ -9118,6 +9120,7 @@ tools_menu() {
       8) set_online_notify_config_menu ;;
       9) trigger_online_notify_now ;;
       10) set_account_event_webhook_config ;;
+      11) set_dropbear_version_menu ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -11823,6 +11826,7 @@ Time     : $(date '+%F %T')"
     UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
     DROPBEAR_PORT="${DROPBEAR_PORT}" \
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
+    DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
     IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
     IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
     XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS}" \
@@ -12138,6 +12142,151 @@ EOF
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl restart ssh >/dev/null 2>&1 || true
   systemctl restart dropbear >/dev/null 2>&1 || true
+}
+
+resolve_dropbear_release_from_menu() {
+  case "${1:-}" in
+    2018) echo "2018.76" ;;
+    2019) echo "2019.78" ;;
+    2020) echo "2020.81" ;;
+    2022) echo "2022.83" ;;
+    *) echo "" ;;
+  esac
+}
+
+apply_dropbear_version_with_lock() {
+  local major="$1" ver src_dir archive_url archive_path build_dir custom_bin main_port alt_port banner_file
+  ver="$(resolve_dropbear_release_from_menu "${major}")"
+  if [[ -z "${ver}" ]]; then
+    echo "Versi tidak didukung. Pilih: 2018, 2019, 2020, 2022."
+    return 1
+  fi
+
+  main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+  alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  [[ -z "${main_port}" ]] && main_port="109"
+  [[ -z "${alt_port}" ]] && alt_port="143"
+  if [[ "${main_port}" -lt 1 || "${main_port}" -gt 65535 ]]; then main_port="109"; fi
+  if [[ "${alt_port}" -lt 1 || "${alt_port}" -gt 65535 ]]; then alt_port="143"; fi
+
+  src_dir="/usr/local/src"
+  archive_url="https://matt.ucc.asn.au/dropbear/releases/dropbear-${ver}.tar.bz2"
+  archive_path="${src_dir}/dropbear-${ver}.tar.bz2"
+  build_dir="${src_dir}/dropbear-${ver}"
+  custom_bin="/usr/local/sbin/dropbear-${ver}"
+  banner_file="/etc/sc-1forcr/banner.html"
+  [[ -s "${banner_file}" ]] || banner_file=""
+
+  mkdir -p "${src_dir}"
+  rm -rf "${build_dir}"
+  echo "Download & build Dropbear ${ver}..."
+  if ! curl -fL --retry 5 --retry-delay 2 "${archive_url}" -o "${archive_path}"; then
+    echo "Gagal download source: ${archive_url}"
+    return 1
+  fi
+  if ! tar -xjf "${archive_path}" -C "${src_dir}"; then
+    echo "Gagal extract archive Dropbear ${ver}."
+    return 1
+  fi
+
+  (
+    cd "${build_dir}"
+    ./configure --prefix=/usr/local --sysconfdir=/etc/dropbear
+    make -j"$(nproc || echo 1)"
+    cp -f dropbear "${custom_bin}"
+    if [[ -x ./dropbearkey ]]; then
+      cp -f ./dropbearkey /usr/local/bin/dropbearkey-sc1
+    fi
+  )
+  chmod 755 "${custom_bin}"
+
+  mkdir -p /etc/dropbear
+  if [[ -x /usr/local/bin/dropbearkey-sc1 ]]; then
+    [[ -s /etc/dropbear/dropbear_rsa_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1 || true
+    [[ -s /etc/dropbear/dropbear_ecdsa_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key >/dev/null 2>&1 || true
+    [[ -s /etc/dropbear/dropbear_ed25519_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1 || true
+  fi
+
+  cat > /etc/default/dropbear <<EOF
+NO_START=0
+DROPBEAR_PORT=${main_port}
+DROPBEAR_EXTRA_ARGS="-p ${alt_port}"
+DROPBEAR_BANNER="${banner_file}"
+DROPBEAR_RECEIVE_WINDOW=65536
+EOF
+
+  mkdir -p /etc/systemd/system/dropbear.service.d
+  if [[ -n "${banner_file}" ]]; then
+    cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+[Service]
+Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
+ExecStart=
+ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
+EOF
+  else
+    cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+[Service]
+Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
+ExecStart=
+ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port}
+EOF
+  fi
+
+  update_sc_env_var "DROPBEAR_VERSION" "${ver}"
+  apt-mark hold dropbear dropbear-bin >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable dropbear >/dev/null 2>&1 || true
+  systemctl restart dropbear >/dev/null 2>&1 || true
+  systemctl restart ssh >/dev/null 2>&1 || true
+
+  echo "Dropbear aktif di versi ${ver} (locked)."
+  echo "Cek: ${custom_bin} -V"
+}
+
+set_dropbear_version_menu() {
+  while true; do
+    local cur="(tidak diketahui)"
+    local major_choice
+    if [[ -n "${DROPBEAR_VERSION:-}" ]]; then
+      cur="${DROPBEAR_VERSION}"
+    elif command -v dropbear >/dev/null 2>&1; then
+      cur="$(dropbear -V 2>&1 | head -n1 | sed 's/.*Dropbear v//; s/ .*//')"
+      [[ -z "${cur}" ]] && cur="(runtime)"
+    fi
+    clear
+    draw_menu_panel "SETTING VERSI DROPBEAR (CURRENT: ${cur})" \
+      "1) Pakai Dropbear 2018 (v2018.76)" \
+      "2) Pakai Dropbear 2019 (v2019.78)" \
+      "3) Pakai Dropbear 2020 (v2020.81)" \
+      "4) Pakai Dropbear 2022 (v2022.83)" \
+      "0) Kembali"
+    echo
+    if ! prompt_input dv "Pilih menu [0-4]: "; then
+      return
+    fi
+    case "${dv}" in
+      1) major_choice="2018" ;;
+      2) major_choice="2019" ;;
+      3) major_choice="2020" ;;
+      4) major_choice="2022" ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid."; read -rp "Enter untuk lanjut..." _ || true; continue ;;
+    esac
+    if apply_dropbear_version_with_lock "${major_choice}"; then
+      DROPBEAR_VERSION="$(resolve_dropbear_release_from_menu "${major_choice}")"
+      echo "Sukses. Versi Dropbear sudah dikunci agar aman saat reboot/update."
+    else
+      echo "Gagal set versi Dropbear ${major_choice}."
+    fi
+    echo
+    read -rp "Enter untuk lanjut..." _ || true
+  done
 }
 
 set_html_banner_menu() {

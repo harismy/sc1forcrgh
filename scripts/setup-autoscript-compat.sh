@@ -1321,6 +1321,39 @@ ${sshws_nginx_limit_rules}
         proxy_buffering off;
     }
 }
+
+server {
+    listen 127.0.0.1:8081 http2;
+    server_name _;
+
+    location /vmess-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11001;
+    }
+
+    location /vless-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11002;
+    }
+
+    location /trojan-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11003;
+    }
+
+    location / {
+        return 404;
+    }
+}
 EOF
 
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
@@ -1372,6 +1405,7 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
+    acl is_alpn_h2 ssl_fc_alpn -i h2
     acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
@@ -1383,6 +1417,7 @@ frontend ft_443
     # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
     # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
     acl is_hc_connect req.payload(0,512),lower -m sub "connect "
+    use_backend bk_grpc if is_alpn_h2
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
     # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
@@ -1394,6 +1429,11 @@ backend bk_mux
     # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
     # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
     server nginx_local 127.0.0.1:80 check
+
+backend bk_grpc
+    mode tcp
+    # Jalur khusus gRPC (HTTP/2) ke listener Nginx internal agar tidak mengganggu WS existing.
+    server nginx_grpc 127.0.0.1:8081 check
 
 backend bk_sshws_tls
     mode tcp
@@ -9775,6 +9815,39 @@ ${sshws_nginx_limit_rules}
         proxy_buffering off;
     }
 }
+
+server {
+    listen 127.0.0.1:8081 http2;
+    server_name _;
+
+    location /vmess-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11001;
+    }
+
+    location /vless-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11002;
+    }
+
+    location /trojan-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11003;
+    }
+
+    location / {
+        return 404;
+    }
+}
 EONGINX
 
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
@@ -9825,6 +9898,7 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
+    acl is_alpn_h2 ssl_fc_alpn -i h2
     acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
@@ -9836,6 +9910,7 @@ frontend ft_443
     # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
     # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
     acl is_hc_connect req.payload(0,512),lower -m sub "connect "
+    use_backend bk_grpc if is_alpn_h2
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
     # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
@@ -9847,6 +9922,11 @@ backend bk_mux
     # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
     # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
     server nginx_local 127.0.0.1:80 check
+
+backend bk_grpc
+    mode tcp
+    # Jalur khusus gRPC (HTTP/2) ke listener Nginx internal agar tidak mengganggu WS existing.
+    server nginx_grpc 127.0.0.1:8081 check
 
 backend bk_sshws_tls
     mode tcp

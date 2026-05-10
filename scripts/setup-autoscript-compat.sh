@@ -6574,6 +6574,7 @@ keep_days="$(echo "${AUTO_BACKUP_KEEP_DAYS}" | tr -cd '0-9')"
 find "${AUTO_BACKUP_DIR}" -maxdepth 1 -type f -name 'sc1forcr-accounts-*-WIB.json' -mtime +"${keep_days}" -delete >/dev/null 2>&1 || true
 
 if [[ -n "${TELEGRAM_BOT_TOKEN}" && -n "${TELEGRAM_CHAT_ID}" ]]; then
+  tg_err_log="/var/log/sc-1forcr-autobackup-telegram.err"
   TELEGRAM_BOT_TOKEN="$(echo "${TELEGRAM_BOT_TOKEN}" | tr -d '[:space:]')"
   TELEGRAM_CHAT_ID="$(echo "${TELEGRAM_CHAT_ID}" | tr -d '[:space:]')"
   host="$(hostname 2>/dev/null || echo vps)"
@@ -6593,16 +6594,20 @@ Akun     : SSH/ZIVPN=${ssh_count} VMESS=${vmess_count} VLESS=${vless_count} TROJ
 Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
 
   tg_api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-  if ! curl -fsS --retry 2 --retry-delay 1 --max-time 40 -X POST "${tg_api}/sendDocument" \
+  if ! curl -fsS --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 180 -X POST "${tg_api}/sendDocument" \
     -F "chat_id=${TELEGRAM_CHAT_ID}" \
     -F "disable_content_type_detection=true" \
     --form-string "caption=${caption}" \
-    -F "document=@${backup_json}" >/dev/null 2>&1; then
+    -F "document=@${backup_json}" >/dev/null 2>>"${tg_err_log}"; then
+    {
+      echo "[$(date '+%F %T')] sendDocument gagal untuk file: ${backup_json}"
+      tail -n 5 "${tg_err_log}" 2>/dev/null || true
+    } >> "${tg_err_log}"
     # Fallback: minimal kirim notifikasi teks jika upload dokumen gagal.
-    curl -fsS --retry 2 --retry-delay 1 --max-time 20 -X POST "${tg_api}/sendMessage" \
+    curl -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
       -d "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "text=${caption}
-Backup file tersimpan lokal: ${backup_json}" >/dev/null 2>&1 || true
+Backup file tersimpan lokal: ${backup_json}" >/dev/null 2>>"${tg_err_log}" || true
     logger -t sc-1forcr "Auto-backup Telegram sendDocument gagal, fallback sendMessage dipakai."
   fi
 fi

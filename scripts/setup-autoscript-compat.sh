@@ -6408,6 +6408,12 @@ setup_auto_backup_timer() {
     log "Setup auto backup berkala tiap ${AUTO_BACKUP_INTERVAL_MINUTES} menit..."
   fi
 
+  # Bersihkan trigger legacy agar tidak dobel jalan (mis. cron lama tiap 10 menit).
+  rm -f /etc/cron.d/sc-1forcr-autobackup /etc/cron.d/sc-autobackup /etc/cron.d/autobackup-sc-1forcr >/dev/null 2>&1 || true
+  if command -v crontab >/dev/null 2>&1; then
+    (crontab -l 2>/dev/null | grep -v 'sc-1forcr-auto-backup' | crontab -) >/dev/null 2>&1 || true
+  fi
+
   cat > /usr/local/sbin/sc-1forcr-auto-backup <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -6420,6 +6426,7 @@ DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+AUTO_BACKUP_INTERVAL_MINUTES="${AUTO_BACKUP_INTERVAL_MINUTES:-1440}"
 AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}"
 AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
@@ -6445,6 +6452,17 @@ if [[ "${mode}" == "scheduled" ]]; then
     last_date="$(cat "${stamp_file}" 2>/dev/null || true)"
     [[ "${wib_hour_now}" == "${target_wib_hour}" ]] || exit 0
     [[ "${last_date}" == "${wib_date}" ]] && exit 0
+  else
+    interval_min="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+    [[ -z "${interval_min}" || "${interval_min}" -lt 1 ]] && interval_min="1440"
+    interval_sec="$(( interval_min * 60 ))"
+    now_epoch="$(date +%s)"
+    epoch_file="/var/lib/sc-1forcr/last-auto-backup-epoch"
+    last_epoch="$(cat "${epoch_file}" 2>/dev/null || true)"
+    if [[ "${last_epoch}" =~ ^[0-9]+$ ]]; then
+      delta="$(( now_epoch - last_epoch ))"
+      [[ "${delta}" -lt "${interval_sec}" ]] && exit 0
+    fi
   fi
 fi
 
@@ -6544,6 +6562,7 @@ PY
 chmod 600 "${backup_json}" >/dev/null 2>&1 || true
 
 if [[ "${mode}" == "scheduled" ]]; then
+  date +%s > /var/lib/sc-1forcr/last-auto-backup-epoch
   sched_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   if [[ "${sched_mode}" == "daily" || "${sched_mode}" == "daily_wib" || "${sched_mode}" == "wib" ]]; then
     TZ=Asia/Jakarta date +%F > /var/lib/sc-1forcr/last-auto-backup-date
@@ -7593,6 +7612,40 @@ safe_source_env_file() {
 safe_source_env_file /etc/sc-1forcr.env
 AUTH_TOKEN="${AUTH_TOKEN:-${API_AUTH_TOKEN:-}}"
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
+PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
+
+resume_pending_operation_prompt() {
+  local ans cmd type note
+  [[ -t 0 && -t 1 ]] || return 0
+  [[ -f "${PENDING_OP_FILE}" ]] || return 0
+  [[ "${SC_PENDING_PROMPT_SHOWN:-0}" == "1" ]] && return 0
+  SC_PENDING_PROMPT_SHOWN=1
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  cmd="${PENDING_CMD:-}"
+  type="${PENDING_TYPE:-unknown}"
+  note="${PENDING_NOTE:-pending operation}"
+  [[ -z "${cmd}" ]] && return 0
+  echo
+  echo "Ada proses ${type} yang belum selesai."
+  echo "Info : ${note}"
+  echo "Cmd  : ${cmd}"
+  read -r -p "Tekan Enter untuk lanjutkan, atau ketik 'skip' untuk nanti: " ans || true
+  [[ "${ans,,}" == "skip" ]] && return 0
+  rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  if ! bash -lc "${cmd}"; then
+    mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+    cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+    chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+    echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
+  fi
+}
+
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
@@ -12252,6 +12305,7 @@ update_script_from_repo() {
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver
+  set_pending_operation "update" "/usr/local/sbin/menu-sc-1forcr update" "Update script terputus sebelum selesai"
   url="${UPDATE_SCRIPT_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
@@ -12443,6 +12497,7 @@ Online   : ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h win=${ONLINE
   telegram_notify "${update_note}"
 
   rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+  clear_pending_operation
 }
 
 show_sc_key_info() {
@@ -13014,6 +13069,7 @@ if [[ "${1:-}" == "update" ]]; then
 fi
 
 while true; do
+  resume_pending_operation_prompt
   if ! enforce_menu_license_access; then
     exit 1
   fi
@@ -13399,7 +13455,57 @@ open_menu_after_install() {
   fi
 }
 
+PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
+SCRIPT_SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+set_pending_operation() {
+  local type="$1" cmd="$2" note="$3"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+  chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+clear_pending_operation() {
+  rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+resume_pending_operation_prompt() {
+  local ans cmd type note
+  [[ -t 0 && -t 1 ]] || return 0
+  [[ -f "${PENDING_OP_FILE}" ]] || return 0
+  [[ "${SC_PENDING_PROMPT_SHOWN:-0}" == "1" ]] && return 0
+  SC_PENDING_PROMPT_SHOWN=1
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  cmd="${PENDING_CMD:-}"
+  type="${PENDING_TYPE:-unknown}"
+  note="${PENDING_NOTE:-pending operation}"
+  if [[ -z "${cmd}" ]]; then
+    clear_pending_operation
+    return 0
+  fi
+  echo
+  echo "Ada proses ${type} yang belum selesai."
+  echo "Info : ${note}"
+  echo "Cmd  : ${cmd}"
+  if ! prompt_input ans "Tekan Enter untuk lanjutkan, atau ketik 'skip' untuk nanti: "; then
+    return 0
+  fi
+  [[ "${ans,,}" == "skip" ]] && return 0
+  clear_pending_operation
+  if ! bash -lc "${cmd}"; then
+    set_pending_operation "${type}" "${cmd}" "${note}"
+    echo "Proses pending masih gagal. Akan ditawarkan lagi saat login/menu berikutnya."
+  fi
+}
+
 main() {
+  set_pending_operation "install" "bash ${SCRIPT_SELF_PATH}" "Install SC 1FORCR terputus sebelum selesai"
   show_install_banner
   show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
   enforce_install_license
@@ -13501,6 +13607,7 @@ Catatan:
 - Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap ${IPLIMIT_CHECK_INTERVAL_MINUTES} menit, lock sementara ${IPLIMIT_LOCK_MINUTES} menit)
 EOF
 
+  clear_pending_operation
   open_menu_after_install
 }
 

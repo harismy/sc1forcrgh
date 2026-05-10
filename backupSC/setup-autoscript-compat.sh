@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
@@ -129,6 +129,11 @@ BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+AUTO_BACKUP_INTERVAL_MINUTES="${AUTO_BACKUP_INTERVAL_MINUTES:-1440}"
+AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}"
+AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}"
+AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-1}"
+AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
@@ -148,6 +153,9 @@ SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
 SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
 SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
 SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
+NGINX_WORKER_CONNECTIONS="${NGINX_WORKER_CONNECTIONS:-8192}"
+NGINX_WORKER_RLIMIT_NOFILE="${NGINX_WORKER_RLIMIT_NOFILE:-200000}"
+NGINX_SERVICE_LIMIT_NOFILE="${NGINX_SERVICE_LIMIT_NOFILE:-200000}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
@@ -210,6 +218,43 @@ flag_enabled() {
     1|true|yes|on) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+tune_nginx_capacity() {
+  local nginx_conf wc rl nof
+  nginx_conf="/etc/nginx/nginx.conf"
+  [[ -f "${nginx_conf}" ]] || return 0
+
+  wc="$(echo "${NGINX_WORKER_CONNECTIONS:-8192}" | tr -cd '0-9')"
+  rl="$(echo "${NGINX_WORKER_RLIMIT_NOFILE:-200000}" | tr -cd '0-9')"
+  nof="$(echo "${NGINX_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
+  [[ -z "${wc}" || "${wc}" -lt 1024 ]] && wc="8192"
+  [[ -z "${rl}" || "${rl}" -lt 65536 ]] && rl="200000"
+  [[ -z "${nof}" || "${nof}" -lt 65536 ]] && nof="200000"
+
+  # Biar adaptif ke core CPU server.
+  sed -ri 's/^[[:space:]]*worker_processes[[:space:]]+[^;]+;/worker_processes auto;/' "${nginx_conf}" || true
+
+  if grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]+[0-9]+;' "${nginx_conf}"; then
+    sed -ri "s/^[[:space:]]*worker_rlimit_nofile[[:space:]]+[0-9]+;/worker_rlimit_nofile ${rl};/" "${nginx_conf}" || true
+  else
+    sed -ri "/^[[:space:]]*worker_processes[[:space:]]+auto;/a worker_rlimit_nofile ${rl};" "${nginx_conf}" || true
+  fi
+
+  sed -ri "0,/worker_connections[[:space:]]+[0-9]+[[:space:]]*;/{s/worker_connections[[:space:]]+[0-9]+[[:space:]]*;/worker_connections ${wc};/}" "${nginx_conf}" || true
+  if ! grep -qE '^[[:space:]]*multi_accept[[:space:]]+on;' "${nginx_conf}"; then
+    sed -ri "/worker_connections[[:space:]]+${wc}[[:space:]]*;/a\\    multi_accept on;" "${nginx_conf}" || true
+  fi
+  if ! grep -qE '^[[:space:]]*use[[:space:]]+epoll;' "${nginx_conf}"; then
+    sed -ri "/worker_connections[[:space:]]+${wc}[[:space:]]*;/a\\    use epoll;" "${nginx_conf}" || true
+  fi
+
+  mkdir -p /etc/systemd/system/nginx.service.d
+  cat > /etc/systemd/system/nginx.service.d/limits.conf <<EOF
+[Service]
+LimitNOFILE=${nof}
+EOF
+  systemctl daemon-reload || true
 }
 
 normalize_xray_paths_csv() {
@@ -1209,6 +1254,30 @@ ${sshws_nginx_limit_rules}
         proxy_buffering off;
     }
 
+    location /vmess-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11001;
+    }
+
+    location /vless-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11002;
+    }
+
+    location /trojan-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11003;
+    }
+
     location /yourbug/trojan {
         access_log off;
         proxy_redirect off;
@@ -1294,6 +1363,7 @@ EOF
 
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
+  tune_nginx_capacity
   nginx -t
   systemctl enable nginx
   systemctl restart nginx
@@ -1336,7 +1406,7 @@ defaults
 
 frontend ft_443
     # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
-    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
+    bind *:443 ssl crt ${pem} alpn h2,http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
@@ -2758,24 +2828,43 @@ async function syncSshBackendsFromDb() {
   }
 }
 
-function vmessLink(host, id, tls) {
+function vmessLink(host, id, tls, username = '') {
+  const remark = String(username || `vmess-${host}`).trim() || `vmess-${host}`;
   const payload = {
-    v: '2', ps: `vmess-${host}`, add: host, port: tls ? '443' : '80', id, aid: '0',
+    v: '2', ps: remark, add: host, port: tls ? '443' : '80', id, aid: '0',
     net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
-function vlessLink(host, id, tls) {
-  if (tls) {
-    return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1&encryption=none#vless-${host}`;
-  }
-  return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#vless-${host}`;
+function vmessGrpcLink(host, id, username = '') {
+  const remark = String(username || `vmess-grpc-${host}`).trim() || `vmess-grpc-${host}`;
+  const payload = {
+    v: '2', ps: remark, add: host, port: '443', id, aid: '0',
+    net: 'grpc', type: 'none', host, path: 'vmess-grpc', tls: 'tls', sni: host
+  };
+  return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
-function trojanLink(host, pass, tls) {
+function vlessLink(host, id, tls, username = '') {
+  const remark = encodeURIComponent(String(username || `vless-${host}`).trim() || `vless-${host}`);
   if (tls) {
-    return `trojan://${pass}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1#trojan-${host}`;
+    return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1&encryption=none#${remark}`;
   }
-  return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}#trojan-${host}`;
+  return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#${remark}`;
+}
+function vlessGrpcLink(host, id, username = '') {
+  const remark = encodeURIComponent(String(username || `vless-grpc-${host}`).trim() || `vless-grpc-${host}`);
+  return `vless://${id}@${host}:443?type=grpc&serviceName=vless-grpc&security=tls&sni=${host}&alpn=h2&encryption=none#${remark}`;
+}
+function trojanLink(host, pass, tls, username = '') {
+  const remark = encodeURIComponent(String(username || `trojan-${host}`).trim() || `trojan-${host}`);
+  if (tls) {
+    return `trojan://${pass}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1#${remark}`;
+  }
+  return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}#${remark}`;
+}
+function trojanGrpcLink(host, pass, username = '') {
+  const remark = encodeURIComponent(String(username || `trojan-grpc-${host}`).trim() || `trojan-grpc-${host}`);
+  return `trojan://${pass}@${host}:443?type=grpc&serviceName=trojan-grpc&security=tls&sni=${host}&alpn=h2#${remark}`;
 }
 
 async function renderAndReloadXray() {
@@ -2804,6 +2893,21 @@ async function renderAndReloadXray() {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
         streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+      },
+      {
+        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+      },
+      {
+        port: 11002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+      },
+      {
+        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -3164,7 +3268,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vmessLink(DOMAIN, uuid, true), none: vmessLink(DOMAIN, uuid, false), grpc: vmessLink(DOMAIN, uuid, true), uptls: vmessLink(DOMAIN, uuid, true), upntls: vmessLink(DOMAIN, uuid, false) }
+      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) }
     };
   } else if (protocol === 'vless') {
     await ensureUsernameNotExists('account_vlesses', finalUsername);
@@ -3181,7 +3285,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vless-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vlessLink(DOMAIN, uuid, true), none: vlessLink(DOMAIN, uuid, false), grpc: vlessLink(DOMAIN, uuid, true), uptls: vlessLink(DOMAIN, uuid, true), upntls: vlessLink(DOMAIN, uuid, false) }
+      link: { tls: vlessLink(DOMAIN, uuid, true, finalUsername), none: vlessLink(DOMAIN, uuid, false, finalUsername), grpc: vlessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vlessLink(DOMAIN, uuid, true, finalUsername), upntls: vlessLink(DOMAIN, uuid, false, finalUsername) }
     };
   } else if (protocol === 'trojan') {
     await ensureUsernameNotExists('account_trojans', finalUsername);
@@ -3198,7 +3302,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'trojan-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: trojanLink(DOMAIN, pass, true), none: trojanLink(DOMAIN, pass, false), grpc: trojanLink(DOMAIN, pass, true), uptls: trojanLink(DOMAIN, pass, true), upntls: trojanLink(DOMAIN, pass, false) }
+      link: { tls: trojanLink(DOMAIN, pass, true, finalUsername), none: trojanLink(DOMAIN, pass, false, finalUsername), grpc: trojanGrpcLink(DOMAIN, pass, finalUsername), uptls: trojanLink(DOMAIN, pass, true, finalUsername), upntls: trojanLink(DOMAIN, pass, false, finalUsername) }
     };
   }
   await renderAndReloadXray();
@@ -3348,6 +3452,21 @@ async function setStatusXray(table, username, status) {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
         streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+      },
+      {
+        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+      },
+      {
+        port: 11002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+      },
+      {
+        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -5779,6 +5898,21 @@ async function rebuildXrayFromDb() {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
         streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+      },
+      {
+        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+      },
+      {
+        port: 11002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+      },
+      {
+        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -6129,13 +6263,20 @@ EOF
 }
 
 setup_auto_reboot_timer() {
-  log "Setup auto reboot harian jam 03:00..."
+  local reboot_interval_min
+  reboot_interval_min="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  if [[ -z "${reboot_interval_min}" || "${reboot_interval_min}" -lt 30 || "${reboot_interval_min}" -gt 10080 ]]; then
+    reboot_interval_min="1440"
+  fi
+  AUTO_REBOOT_INTERVAL_MINUTES="${reboot_interval_min}"
+
+  log "Setup auto reboot berkala tiap ${AUTO_REBOOT_INTERVAL_MINUTES} menit..."
 
   cat > /usr/local/sbin/sc-1forcr-safe-reboot <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-logger -t sc-1forcr "Auto reboot timer triggered (03:00)."
+logger -t sc-1forcr "Auto reboot timer triggered."
 sync
 sleep 2
 /usr/bin/systemctl --force reboot
@@ -6155,12 +6296,13 @@ NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<'EOF'
+  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
 [Unit]
-Description=Run SC 1FORCR auto reboot at 03:00 daily
+Description=Run SC 1FORCR auto reboot every ${AUTO_REBOOT_INTERVAL_MINUTES} minutes
 
 [Timer]
-OnCalendar=*-*-* 03:00:00
+OnBootSec=10m
+OnUnitActiveSec=${AUTO_REBOOT_INTERVAL_MINUTES}min
 Persistent=true
 AccuracySec=1min
 Unit=sc-1forcr-autoreboot.service
@@ -6170,11 +6312,37 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now sc-1forcr-autoreboot.timer
+  if [[ "${AUTO_REBOOT_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autoreboot.timer
+  else
+    systemctl disable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  fi
 }
 
 setup_auto_backup_timer() {
-  log "Setup auto backup harian kirim Telegram jam 02:00 WIB..."
+  local backup_interval_min backup_mode backup_wib_hour
+  backup_interval_min="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  if [[ -z "${backup_interval_min}" || "${backup_interval_min}" -lt 1 || "${backup_interval_min}" -gt 10080 ]]; then
+    backup_interval_min="1440"
+  fi
+  AUTO_BACKUP_INTERVAL_MINUTES="${backup_interval_min}"
+  backup_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${backup_mode}" in
+    daily|daily_wib|wib) backup_mode="daily_wib" ;;
+    *) backup_mode="interval" ;;
+  esac
+  AUTO_BACKUP_SCHEDULE_MODE="${backup_mode}"
+  backup_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
+  if [[ -z "${backup_wib_hour}" || "${backup_wib_hour}" -gt 23 ]]; then
+    backup_wib_hour="2"
+  fi
+  AUTO_BACKUP_WIB_HOUR="${backup_wib_hour}"
+
+  if [[ "${AUTO_BACKUP_SCHEDULE_MODE}" == "daily_wib" ]]; then
+    log "Setup auto backup harian jam $(printf '%02d' "${AUTO_BACKUP_WIB_HOUR}"):00 WIB..."
+  else
+    log "Setup auto backup berkala tiap ${AUTO_BACKUP_INTERVAL_MINUTES} menit..."
+  fi
 
   cat > /usr/local/sbin/sc-1forcr-auto-backup <<'EOF'
 #!/usr/bin/env bash
@@ -6188,6 +6356,8 @@ DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}"
+AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
@@ -6200,13 +6370,20 @@ if [[ "${mode}" == "scheduled" && "${AUTO_BACKUP_ENABLE}" != "1" ]]; then
 fi
 
 if [[ "${mode}" == "scheduled" ]]; then
-  wib_hour="$(TZ=Asia/Jakarta date +%H)"
-  wib_date="$(TZ=Asia/Jakarta date +%F)"
-  stamp_file="/var/lib/sc-1forcr/last-auto-backup-date"
-  last_date="$(cat "${stamp_file}" 2>/dev/null || true)"
-  [[ "${wib_hour}" == "02" ]] || exit 0
-  [[ "${last_date}" == "${wib_date}" ]] && exit 0
+  sched_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${sched_mode}" == "daily" || "${sched_mode}" == "daily_wib" || "${sched_mode}" == "wib" ]]; then
+    wib_hour_now="$(TZ=Asia/Jakarta date +%H)"
+    wib_date="$(TZ=Asia/Jakarta date +%F)"
+    target_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
+    [[ -z "${target_wib_hour}" || "${target_wib_hour}" -gt 23 ]] && target_wib_hour="2"
+    target_wib_hour="$(printf "%02d" "${target_wib_hour}")"
+    stamp_file="/var/lib/sc-1forcr/last-auto-backup-date"
+    last_date="$(cat "${stamp_file}" 2>/dev/null || true)"
+    [[ "${wib_hour_now}" == "${target_wib_hour}" ]] || exit 0
+    [[ "${last_date}" == "${wib_date}" ]] && exit 0
+  fi
 fi
+
 
 ts_wib="$(TZ=Asia/Jakarta date +%Y%m%d-%H%M%S)"
 backup_json="${AUTO_BACKUP_DIR}/sc1forcr-accounts-${ts_wib}-WIB.json"
@@ -6303,7 +6480,10 @@ PY
 chmod 600 "${backup_json}" >/dev/null 2>&1 || true
 
 if [[ "${mode}" == "scheduled" ]]; then
-  TZ=Asia/Jakarta date +%F > /var/lib/sc-1forcr/last-auto-backup-date
+  sched_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${sched_mode}" == "daily" || "${sched_mode}" == "daily_wib" || "${sched_mode}" == "wib" ]]; then
+    TZ=Asia/Jakarta date +%F > /var/lib/sc-1forcr/last-auto-backup-date
+  fi
 fi
 
 keep_days="$(echo "${AUTO_BACKUP_KEEP_DAYS}" | tr -cd '0-9')"
@@ -6628,9 +6808,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-  cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<'EOF'
+  if [[ "${AUTO_BACKUP_SCHEDULE_MODE}" == "daily_wib" ]]; then
+    cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
 [Unit]
-Description=Run SC 1FORCR auto backup hourly (executes at 02:00 WIB)
+Description=Run SC 1FORCR auto backup daily at $(printf '%02d' "${AUTO_BACKUP_WIB_HOUR}"):00 WIB
 
 [Timer]
 OnCalendar=hourly
@@ -6641,6 +6822,23 @@ Unit=sc-1forcr-autobackup.service
 [Install]
 WantedBy=timers.target
 EOF
+  else
+    cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto backup every ${AUTO_BACKUP_INTERVAL_MINUTES} minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${AUTO_BACKUP_INTERVAL_MINUTES}min
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  fi
 
   systemctl daemon-reload
   systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
@@ -7252,6 +7450,7 @@ UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
+DROPBEAR_VERSION=${DROPBEAR_VERSION}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -7259,6 +7458,11 @@ BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
 AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
+AUTO_BACKUP_INTERVAL_MINUTES=${AUTO_BACKUP_INTERVAL_MINUTES}
+AUTO_BACKUP_SCHEDULE_MODE=${AUTO_BACKUP_SCHEDULE_MODE}
+AUTO_BACKUP_WIB_HOUR=${AUTO_BACKUP_WIB_HOUR}
+AUTO_REBOOT_ENABLE=${AUTO_REBOOT_ENABLE}
+AUTO_REBOOT_INTERVAL_MINUTES=${AUTO_REBOOT_INTERVAL_MINUTES}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
@@ -7665,6 +7869,306 @@ Unit=sc-1forcr-online-notify.service
 [Install]
 WantedBy=timers.target
 EOF
+}
+
+write_auto_backup_timer_unit() {
+  local mode_raw="$1"
+  local interval_min="$2"
+  local wib_hour="$3"
+  local mode
+  mode="$(echo "${mode_raw:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${mode}" == "daily" || "${mode}" == "wib" ]]; then
+    mode="daily_wib"
+  fi
+  if [[ "${mode}" != "daily_wib" ]]; then
+    mode="interval"
+  fi
+  interval_min="$(echo "${interval_min:-1440}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 1 || "${interval_min}" -gt 10080 ]] && interval_min="1440"
+  wib_hour="$(echo "${wib_hour:-2}" | tr -cd '0-9')"
+  [[ -z "${wib_hour}" || "${wib_hour}" -lt 0 || "${wib_hour}" -gt 23 ]] && wib_hour="2"
+
+  if [[ "${mode}" == "daily_wib" ]]; then
+    cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto backup daily at $(printf '%02d' "${wib_hour}"):00 WIB
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=1min
+Persistent=true
+RandomizedDelaySec=0
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    return
+  fi
+
+  cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto backup every ${interval_min} minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${interval_min}min
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+write_auto_reboot_timer_unit() {
+  local interval_min="$1"
+  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto reboot every ${interval_min} minutes
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=${interval_min}min
+Persistent=true
+AccuracySec=1min
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+set_auto_reboot_config_menu() {
+  local current_enable current_interval current_hours enable_in mode_in val_in interval_min
+  current_enable="${AUTO_REBOOT_ENABLE:-1}"
+  [[ "${current_enable}" != "0" ]] && current_enable="1"
+  current_interval="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" || "${current_interval}" -lt 30 || "${current_interval}" -gt 10080 ]] && current_interval="1440"
+  current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
+
+  draw_menu_header "SETTING AUTO REBOOT"
+  echo "Status saat ini   : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "Interval saat ini : ${current_interval} menit (~${current_hours} jam)"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input enable_in "Aktifkan auto reboot? (1=aktif,0=nonaktif) [${current_enable}]: "; then
+    return
+  fi
+  [[ "${enable_in,,}" == "batal" ]] && return
+  enable_in="${enable_in:-${current_enable}}"
+  case "${enable_in,,}" in
+    1|on|yes|y) enable_in="1" ;;
+    0|off|no|n) enable_in="0" ;;
+    *)
+      echo "Input status tidak valid. Gunakan 1 atau 0."
+      return
+      ;;
+  esac
+
+  if ! prompt_input mode_in "Set interval dalam (m=menit, h=jam) [m]: "; then
+    return
+  fi
+  [[ "${mode_in,,}" == "batal" ]] && return
+  mode_in="${mode_in:-m}"
+  case "${mode_in,,}" in
+    m|menit) mode_in="m" ;;
+    h|jam) mode_in="h" ;;
+    *)
+      echo "Mode interval tidak valid. Gunakan m atau h."
+      return
+      ;;
+  esac
+
+  if [[ "${mode_in}" == "m" ]]; then
+    if ! prompt_input val_in "Interval reboot (menit, min 30) [${current_interval}]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-${current_interval}}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 30 || "${val_in}" -gt 10080 ]]; then
+      echo "Interval menit harus angka 30-10080."
+      return
+    fi
+    interval_min="${val_in}"
+  else
+    if ! prompt_input val_in "Interval reboot (jam) [24]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-24}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 168 ]]; then
+      echo "Interval jam harus angka 1-168."
+      return
+    fi
+    interval_min="$(( val_in * 60 ))"
+  fi
+
+  AUTO_REBOOT_ENABLE="${enable_in}"
+  AUTO_REBOOT_INTERVAL_MINUTES="${interval_min}"
+  update_sc_env_var "AUTO_REBOOT_ENABLE" "${AUTO_REBOOT_ENABLE}"
+  update_sc_env_var "AUTO_REBOOT_INTERVAL_MINUTES" "${AUTO_REBOOT_INTERVAL_MINUTES}"
+  update_app_env_var "AUTO_REBOOT_ENABLE" "${AUTO_REBOOT_ENABLE}"
+  update_app_env_var "AUTO_REBOOT_INTERVAL_MINUTES" "${AUTO_REBOOT_INTERVAL_MINUTES}"
+
+  write_auto_reboot_timer_unit "${AUTO_REBOOT_INTERVAL_MINUTES}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${AUTO_REBOOT_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  fi
+
+  echo
+  echo "Berhasil update auto reboot:"
+  echo "- Status   : $([[ "${AUTO_REBOOT_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "- Interval : ${AUTO_REBOOT_INTERVAL_MINUTES} menit"
+}
+
+set_auto_backup_config_menu() {
+  local current_enable current_interval current_hours enable_in mode_in val_in interval_min
+  local current_sched current_wib_hour chosen_sched
+  current_enable="${AUTO_BACKUP_ENABLE:-1}"
+  [[ "${current_enable}" != "0" ]] && current_enable="1"
+  current_interval="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 10080 ]] && current_interval="1440"
+  current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
+  current_sched="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${current_sched}" == "daily" || "${current_sched}" == "wib" ]]; then
+    current_sched="daily_wib"
+  fi
+  [[ "${current_sched}" != "daily_wib" ]] && current_sched="interval"
+  current_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
+  [[ -z "${current_wib_hour}" || "${current_wib_hour}" -lt 0 || "${current_wib_hour}" -gt 23 ]] && current_wib_hour="2"
+
+  draw_menu_header "SETTING AUTO BACKUP"
+  echo "Status saat ini   : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  if [[ "${current_sched}" == "daily_wib" ]]; then
+    echo "Mode saat ini     : Harian WIB jam $(printf '%02d' "${current_wib_hour}"):00"
+  else
+    echo "Mode saat ini     : Interval"
+    echo "Interval saat ini : ${current_interval} menit (~${current_hours} jam)"
+  fi
+  echo "Retensi file      : ${AUTO_BACKUP_KEEP_DAYS:-7} hari"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input enable_in "Aktifkan auto backup? (1=aktif,0=nonaktif) [${current_enable}]: "; then
+    return
+  fi
+  [[ "${enable_in,,}" == "batal" ]] && return
+  enable_in="${enable_in:-${current_enable}}"
+  case "${enable_in,,}" in
+    1|on|yes|y) enable_in="1" ;;
+    0|off|no|n) enable_in="0" ;;
+    *)
+      echo "Input status tidak valid. Gunakan 1 atau 0."
+      return
+      ;;
+  esac
+
+  if ! prompt_input mode_in "Mode jadwal backup (1=interval,2=harian WIB) [$([[ "${current_sched}" == "daily_wib" ]] && echo 2 || echo 1)]: "; then
+    return
+  fi
+  [[ "${mode_in,,}" == "batal" ]] && return
+  mode_in="${mode_in:-$([[ "${current_sched}" == "daily_wib" ]] && echo 2 || echo 1)}"
+  case "${mode_in,,}" in
+    1|interval|m|menit|h|jam) chosen_sched="interval" ;;
+    2|harian|daily|wib) chosen_sched="daily_wib" ;;
+    *)
+      echo "Mode tidak valid. Gunakan 1 (interval) atau 2 (harian WIB)."
+      return
+      ;;
+  esac
+
+  if [[ "${chosen_sched}" == "daily_wib" ]]; then
+    if ! prompt_input val_in "Jam backup WIB (0-23) [${current_wib_hour}]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-${current_wib_hour}}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 0 || "${val_in}" -gt 23 ]]; then
+      echo "Jam WIB harus angka 0-23."
+      return
+    fi
+    AUTO_BACKUP_WIB_HOUR="${val_in}"
+    AUTO_BACKUP_INTERVAL_MINUTES="${current_interval}"
+  else
+    if ! prompt_input mode_in "Set interval dalam (m=menit, h=jam) [m]: "; then
+      return
+    fi
+    [[ "${mode_in,,}" == "batal" ]] && return
+    mode_in="${mode_in:-m}"
+    case "${mode_in,,}" in
+      m|menit) mode_in="m" ;;
+      h|jam) mode_in="h" ;;
+      *)
+        echo "Mode interval tidak valid. Gunakan m atau h."
+        return
+        ;;
+    esac
+    if [[ "${mode_in}" == "m" ]]; then
+      if ! prompt_input val_in "Interval backup (menit) [${current_interval}]: "; then
+        return
+      fi
+      [[ "${val_in,,}" == "batal" ]] && return
+      val_in="${val_in:-${current_interval}}"
+      if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 10080 ]]; then
+        echo "Interval menit harus angka 1-10080."
+        return
+      fi
+      interval_min="${val_in}"
+    else
+      if ! prompt_input val_in "Interval backup (jam) [24]: "; then
+        return
+      fi
+      [[ "${val_in,,}" == "batal" ]] && return
+      val_in="${val_in:-24}"
+      if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 168 ]]; then
+        echo "Interval jam harus angka 1-168."
+        return
+      fi
+      interval_min="$(( val_in * 60 ))"
+    fi
+    AUTO_BACKUP_INTERVAL_MINUTES="${interval_min}"
+    AUTO_BACKUP_WIB_HOUR="${current_wib_hour}"
+  fi
+
+  AUTO_BACKUP_ENABLE="${enable_in}"
+  AUTO_BACKUP_SCHEDULE_MODE="${chosen_sched}"
+  update_sc_env_var "AUTO_BACKUP_ENABLE" "${AUTO_BACKUP_ENABLE}"
+  update_sc_env_var "AUTO_BACKUP_INTERVAL_MINUTES" "${AUTO_BACKUP_INTERVAL_MINUTES}"
+  update_sc_env_var "AUTO_BACKUP_SCHEDULE_MODE" "${AUTO_BACKUP_SCHEDULE_MODE}"
+  update_sc_env_var "AUTO_BACKUP_WIB_HOUR" "${AUTO_BACKUP_WIB_HOUR}"
+  update_app_env_var "AUTO_BACKUP_ENABLE" "${AUTO_BACKUP_ENABLE}"
+  update_app_env_var "AUTO_BACKUP_INTERVAL_MINUTES" "${AUTO_BACKUP_INTERVAL_MINUTES}"
+  update_app_env_var "AUTO_BACKUP_SCHEDULE_MODE" "${AUTO_BACKUP_SCHEDULE_MODE}"
+  update_app_env_var "AUTO_BACKUP_WIB_HOUR" "${AUTO_BACKUP_WIB_HOUR}"
+
+  write_auto_backup_timer_unit "${AUTO_BACKUP_SCHEDULE_MODE}" "${AUTO_BACKUP_INTERVAL_MINUTES}" "${AUTO_BACKUP_WIB_HOUR}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${AUTO_BACKUP_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-autobackup.service >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  fi
+
+  echo
+  echo "Berhasil update auto backup:"
+  echo "- Status   : $([[ "${AUTO_BACKUP_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  if [[ "${AUTO_BACKUP_SCHEDULE_MODE}" == "daily_wib" ]]; then
+    echo "- Jadwal   : Harian WIB jam $(printf '%02d' "${AUTO_BACKUP_WIB_HOUR}"):00"
+  else
+    echo "- Interval : ${AUTO_BACKUP_INTERVAL_MINUTES} menit"
+  fi
 }
 
 pick_type() {
@@ -8657,24 +9161,24 @@ akun_menu() {
     clear
     skip_post_pause=0
     case "${am}" in
-      1) create_account ;;
-      2) create_trial_account ;;
-      3) renew_account ;;
-      4) edit_limit_ip_account ;;
-      5) delete_account ;;
-      6) list_accounts ;;
+      1) create_account || true ;;
+      2) create_trial_account || true ;;
+      3) renew_account || true ;;
+      4) edit_limit_ip_account || true ;;
+      5) delete_account || true ;;
+      6) list_accounts || true ;;
       7)
-        unlock_account
+        unlock_account || true
         skip_post_pause=1
         ;;
       8)
-        unlock_all_accounts
+        unlock_all_accounts || true
         skip_post_pause=1
         ;;
-      9) show_account_detail ;;
-      10) edit_limit_ip_all_accounts ;;
-      11) extend_expired_all_accounts ;;
-      12) edit_uuid_xray_account ;;
+      9) show_account_detail || true ;;
+      10) edit_limit_ip_all_accounts || true ;;
+      11) extend_expired_all_accounts || true ;;
+      12) edit_uuid_xray_account || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -9012,23 +9516,29 @@ tools_menu() {
       "8) Setting Notif Akun Online BOT" \
       "9) Kirim Notif Online Sekarang ke BOT" \
       "10) Setting Token Webhook BotVPN" \
+      "11) Upgrade/Downgrade Versi Dropbear" \
+      "12) Setting Interval Auto Backup" \
+      "13) Setting Interval Auto Reboot" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-10]: "; then
+    if ! prompt_input tm "Pilih menu [0-13]: "; then
       return
     fi
     clear
     case "${tm}" in
-      1) show_sc_key_info ;;
-      2) install_summary_api_1forcr ;;
-      3) set_html_banner_menu ;;
-      4) update_script_from_repo ;;
-      5) set_telegram_notif_config ;;
-      6) set_iplimit_checker_config_menu ;;
-      7) set_autolock_realtime_tuning_menu ;;
-      8) set_online_notify_config_menu ;;
-      9) trigger_online_notify_now ;;
-      10) set_account_event_webhook_config ;;
+      1) show_sc_key_info || true ;;
+      2) install_summary_api_1forcr || true ;;
+      3) set_html_banner_menu || true ;;
+      4) update_script_from_repo || true ;;
+      5) set_telegram_notif_config || true ;;
+      6) set_iplimit_checker_config_menu || true ;;
+      7) set_autolock_realtime_tuning_menu || true ;;
+      8) set_online_notify_config_menu || true ;;
+      9) trigger_online_notify_now || true ;;
+      10) set_account_event_webhook_config || true ;;
+      11) set_dropbear_version_menu || true ;;
+      12) set_auto_backup_config_menu || true ;;
+      13) set_auto_reboot_config_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -9611,6 +10121,30 @@ ${sshws_nginx_limit_rules}
         proxy_buffering off;
     }
 
+    location /vmess-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11001;
+    }
+
+    location /vless-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11002;
+    }
+
+    location /trojan-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11003;
+    }
+
     location /yourbug/trojan {
         access_log off;
         proxy_redirect off;
@@ -9696,6 +10230,7 @@ EONGINX
 
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
+  tune_nginx_capacity
   nginx -t || { echo "Konfigurasi nginx invalid."; return; }
   systemctl restart nginx || true
 
@@ -9737,7 +10272,7 @@ defaults
 
 frontend ft_443
     # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
-    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
+    bind *:443 ssl crt ${pem} alpn h2,http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
@@ -11749,6 +12284,7 @@ Time     : $(date '+%F %T')"
     UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
     DROPBEAR_PORT="${DROPBEAR_PORT}" \
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
+    DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
     IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
     IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
     XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS}" \
@@ -11771,6 +12307,11 @@ Time     : $(date '+%F %T')"
     AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
     AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR}" \
     AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS}" \
+    AUTO_BACKUP_INTERVAL_MINUTES="${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" \
+    AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}" \
+    AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}" \
+    AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-1}" \
+    AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" \
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
     ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
     ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" \
@@ -12066,6 +12607,151 @@ EOF
   systemctl restart dropbear >/dev/null 2>&1 || true
 }
 
+resolve_dropbear_release_from_menu() {
+  case "${1:-}" in
+    2018) echo "2018.76" ;;
+    2019) echo "2019.78" ;;
+    2020) echo "2020.81" ;;
+    2022) echo "2022.83" ;;
+    *) echo "" ;;
+  esac
+}
+
+apply_dropbear_version_with_lock() {
+  local major="$1" ver src_dir archive_url archive_path build_dir custom_bin main_port alt_port banner_file
+  ver="$(resolve_dropbear_release_from_menu "${major}")"
+  if [[ -z "${ver}" ]]; then
+    echo "Versi tidak didukung. Pilih: 2018, 2019, 2020, 2022."
+    return 1
+  fi
+
+  main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+  alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  [[ -z "${main_port}" ]] && main_port="109"
+  [[ -z "${alt_port}" ]] && alt_port="143"
+  if [[ "${main_port}" -lt 1 || "${main_port}" -gt 65535 ]]; then main_port="109"; fi
+  if [[ "${alt_port}" -lt 1 || "${alt_port}" -gt 65535 ]]; then alt_port="143"; fi
+
+  src_dir="/usr/local/src"
+  archive_url="https://matt.ucc.asn.au/dropbear/releases/dropbear-${ver}.tar.bz2"
+  archive_path="${src_dir}/dropbear-${ver}.tar.bz2"
+  build_dir="${src_dir}/dropbear-${ver}"
+  custom_bin="/usr/local/sbin/dropbear-${ver}"
+  banner_file="/etc/sc-1forcr/banner.html"
+  [[ -s "${banner_file}" ]] || banner_file=""
+
+  mkdir -p "${src_dir}"
+  rm -rf "${build_dir}"
+  echo "Download & build Dropbear ${ver}..."
+  if ! curl -fL --retry 5 --retry-delay 2 "${archive_url}" -o "${archive_path}"; then
+    echo "Gagal download source: ${archive_url}"
+    return 1
+  fi
+  if ! tar -xjf "${archive_path}" -C "${src_dir}"; then
+    echo "Gagal extract archive Dropbear ${ver}."
+    return 1
+  fi
+
+  (
+    cd "${build_dir}"
+    ./configure --prefix=/usr/local --sysconfdir=/etc/dropbear
+    make -j"$(nproc || echo 1)"
+    cp -f dropbear "${custom_bin}"
+    if [[ -x ./dropbearkey ]]; then
+      cp -f ./dropbearkey /usr/local/bin/dropbearkey-sc1
+    fi
+  )
+  chmod 755 "${custom_bin}"
+
+  mkdir -p /etc/dropbear
+  if [[ -x /usr/local/bin/dropbearkey-sc1 ]]; then
+    [[ -s /etc/dropbear/dropbear_rsa_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1 || true
+    [[ -s /etc/dropbear/dropbear_ecdsa_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key >/dev/null 2>&1 || true
+    [[ -s /etc/dropbear/dropbear_ed25519_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1 || true
+  fi
+
+  cat > /etc/default/dropbear <<EOF
+NO_START=0
+DROPBEAR_PORT=${main_port}
+DROPBEAR_EXTRA_ARGS="-p ${alt_port}"
+DROPBEAR_BANNER="${banner_file}"
+DROPBEAR_RECEIVE_WINDOW=65536
+EOF
+
+  mkdir -p /etc/systemd/system/dropbear.service.d
+  if [[ -n "${banner_file}" ]]; then
+    cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+[Service]
+Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
+ExecStart=
+ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
+EOF
+  else
+    cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+[Service]
+Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
+ExecStart=
+ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port}
+EOF
+  fi
+
+  update_sc_env_var "DROPBEAR_VERSION" "${ver}"
+  apt-mark hold dropbear dropbear-bin >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable dropbear >/dev/null 2>&1 || true
+  systemctl restart dropbear >/dev/null 2>&1 || true
+  systemctl restart ssh >/dev/null 2>&1 || true
+
+  echo "Dropbear aktif di versi ${ver} (locked)."
+  echo "Cek: ${custom_bin} -V"
+}
+
+set_dropbear_version_menu() {
+  while true; do
+    local cur="(tidak diketahui)"
+    local major_choice
+    if [[ -n "${DROPBEAR_VERSION:-}" ]]; then
+      cur="${DROPBEAR_VERSION}"
+    elif command -v dropbear >/dev/null 2>&1; then
+      cur="$(dropbear -V 2>&1 | head -n1 | sed 's/.*Dropbear v//; s/ .*//')"
+      [[ -z "${cur}" ]] && cur="(runtime)"
+    fi
+    clear
+    draw_menu_panel "SETTING VERSI DROPBEAR (CURRENT: ${cur})" \
+      "1) Pakai Dropbear 2018 (v2018.76)" \
+      "2) Pakai Dropbear 2019 (v2019.78)" \
+      "3) Pakai Dropbear 2020 (v2020.81)" \
+      "4) Pakai Dropbear 2022 (v2022.83)" \
+      "0) Kembali"
+    echo
+    if ! prompt_input dv "Pilih menu [0-4]: "; then
+      return
+    fi
+    case "${dv}" in
+      1) major_choice="2018" ;;
+      2) major_choice="2019" ;;
+      3) major_choice="2020" ;;
+      4) major_choice="2022" ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid."; read -rp "Enter untuk lanjut..." _ || true; continue ;;
+    esac
+    if apply_dropbear_version_with_lock "${major_choice}"; then
+      DROPBEAR_VERSION="$(resolve_dropbear_release_from_menu "${major_choice}")"
+      echo "Sukses. Versi Dropbear sudah dikunci agar aman saat reboot/update."
+    else
+      echo "Gagal set versi Dropbear ${major_choice}."
+    fi
+    echo
+    read -rp "Enter untuk lanjut..." _ || true
+  done
+}
+
 set_html_banner_menu() {
   local banner_file tmp line
   banner_file="/etc/sc-1forcr/banner.html"
@@ -12279,13 +12965,13 @@ while true; do
   fi
   clear
   case "$m" in
-    1) akun_menu ;;
-    2) service_menu ;;
-    3) backup_restore_menu ;;
-    4) change_domain_menu ;;
-    5) monitor_temp_lock_menu ;;
-    6) monitor_online_menu ;;
-    7) tools_menu ;;
+    1) akun_menu || true ;;
+    2) service_menu || true ;;
+    3) backup_restore_menu || true ;;
+    4) change_domain_menu || true ;;
+    5) monitor_temp_lock_menu || true ;;
+    6) monitor_online_menu || true ;;
+    7) tools_menu || true ;;
     m|M)
       SHOW_FULL_MENU=1
       continue
@@ -12736,9 +13422,9 @@ Catatan:
 - UDP Custom (UDPHC) default tanpa DNAT range; rule DNAT legacy ke port UDPHC akan dibersihkan otomatis.
 - Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
 - vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
-- Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.
+- Auto reboot aktif berkala sesuai interval AUTO_REBOOT_INTERVAL_MINUTES via systemd timer sc-1forcr-autoreboot.timer.
 - Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
-- Auto backup semua akun (JSON) dikirim ke Telegram setiap jam 02:00 WIB via sc-1forcr-autobackup.timer.
+- Auto backup semua akun (JSON) mendukung mode interval (AUTO_BACKUP_INTERVAL_MINUTES) atau jadwal harian WIB (AUTO_BACKUP_WIB_HOUR) via sc-1forcr-autobackup.timer.
 - Notifikasi akun online berkala ke Telegram aktif default tiap ${ONLINE_NOTIFY_INTERVAL_HOURS} jam via sc-1forcr-online-notify.timer.
 - Backup manual: /usr/local/sbin/sc-1forcr-auto-backup manual
 - Restore akun dari backup: /usr/local/sbin/sc-1forcr-restore-backup /path/file.json

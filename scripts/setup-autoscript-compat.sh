@@ -129,6 +129,11 @@ BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+AUTO_BACKUP_INTERVAL_MINUTES="${AUTO_BACKUP_INTERVAL_MINUTES:-1440}"
+AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}"
+AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}"
+AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-1}"
+AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
@@ -6258,13 +6263,20 @@ EOF
 }
 
 setup_auto_reboot_timer() {
-  log "Setup auto reboot harian jam 03:00..."
+  local reboot_interval_min
+  reboot_interval_min="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  if [[ -z "${reboot_interval_min}" || "${reboot_interval_min}" -lt 30 || "${reboot_interval_min}" -gt 10080 ]]; then
+    reboot_interval_min="1440"
+  fi
+  AUTO_REBOOT_INTERVAL_MINUTES="${reboot_interval_min}"
+
+  log "Setup auto reboot berkala tiap ${AUTO_REBOOT_INTERVAL_MINUTES} menit..."
 
   cat > /usr/local/sbin/sc-1forcr-safe-reboot <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-logger -t sc-1forcr "Auto reboot timer triggered (03:00)."
+logger -t sc-1forcr "Auto reboot timer triggered."
 sync
 sleep 2
 /usr/bin/systemctl --force reboot
@@ -6284,12 +6296,13 @@ NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<'EOF'
+  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
 [Unit]
-Description=Run SC 1FORCR auto reboot at 03:00 daily
+Description=Run SC 1FORCR auto reboot every ${AUTO_REBOOT_INTERVAL_MINUTES} minutes
 
 [Timer]
-OnCalendar=*-*-* 03:00:00
+OnBootSec=10m
+OnUnitActiveSec=${AUTO_REBOOT_INTERVAL_MINUTES}min
 Persistent=true
 AccuracySec=1min
 Unit=sc-1forcr-autoreboot.service
@@ -6299,11 +6312,37 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now sc-1forcr-autoreboot.timer
+  if [[ "${AUTO_REBOOT_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autoreboot.timer
+  else
+    systemctl disable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  fi
 }
 
 setup_auto_backup_timer() {
-  log "Setup auto backup harian kirim Telegram jam 02:00 WIB..."
+  local backup_interval_min backup_mode backup_wib_hour
+  backup_interval_min="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  if [[ -z "${backup_interval_min}" || "${backup_interval_min}" -lt 1 || "${backup_interval_min}" -gt 10080 ]]; then
+    backup_interval_min="1440"
+  fi
+  AUTO_BACKUP_INTERVAL_MINUTES="${backup_interval_min}"
+  backup_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${backup_mode}" in
+    daily|daily_wib|wib) backup_mode="daily_wib" ;;
+    *) backup_mode="interval" ;;
+  esac
+  AUTO_BACKUP_SCHEDULE_MODE="${backup_mode}"
+  backup_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
+  if [[ -z "${backup_wib_hour}" || "${backup_wib_hour}" -gt 23 ]]; then
+    backup_wib_hour="2"
+  fi
+  AUTO_BACKUP_WIB_HOUR="${backup_wib_hour}"
+
+  if [[ "${AUTO_BACKUP_SCHEDULE_MODE}" == "daily_wib" ]]; then
+    log "Setup auto backup harian jam $(printf '%02d' "${AUTO_BACKUP_WIB_HOUR}"):00 WIB..."
+  else
+    log "Setup auto backup berkala tiap ${AUTO_BACKUP_INTERVAL_MINUTES} menit..."
+  fi
 
   cat > /usr/local/sbin/sc-1forcr-auto-backup <<'EOF'
 #!/usr/bin/env bash
@@ -6317,6 +6356,8 @@ DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}"
+AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
@@ -6329,13 +6370,20 @@ if [[ "${mode}" == "scheduled" && "${AUTO_BACKUP_ENABLE}" != "1" ]]; then
 fi
 
 if [[ "${mode}" == "scheduled" ]]; then
-  wib_hour="$(TZ=Asia/Jakarta date +%H)"
-  wib_date="$(TZ=Asia/Jakarta date +%F)"
-  stamp_file="/var/lib/sc-1forcr/last-auto-backup-date"
-  last_date="$(cat "${stamp_file}" 2>/dev/null || true)"
-  [[ "${wib_hour}" == "02" ]] || exit 0
-  [[ "${last_date}" == "${wib_date}" ]] && exit 0
+  sched_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${sched_mode}" == "daily" || "${sched_mode}" == "daily_wib" || "${sched_mode}" == "wib" ]]; then
+    wib_hour_now="$(TZ=Asia/Jakarta date +%H)"
+    wib_date="$(TZ=Asia/Jakarta date +%F)"
+    target_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
+    [[ -z "${target_wib_hour}" || "${target_wib_hour}" -gt 23 ]] && target_wib_hour="2"
+    target_wib_hour="$(printf "%02d" "${target_wib_hour}")"
+    stamp_file="/var/lib/sc-1forcr/last-auto-backup-date"
+    last_date="$(cat "${stamp_file}" 2>/dev/null || true)"
+    [[ "${wib_hour_now}" == "${target_wib_hour}" ]] || exit 0
+    [[ "${last_date}" == "${wib_date}" ]] && exit 0
+  fi
 fi
+
 
 ts_wib="$(TZ=Asia/Jakarta date +%Y%m%d-%H%M%S)"
 backup_json="${AUTO_BACKUP_DIR}/sc1forcr-accounts-${ts_wib}-WIB.json"
@@ -6432,7 +6480,10 @@ PY
 chmod 600 "${backup_json}" >/dev/null 2>&1 || true
 
 if [[ "${mode}" == "scheduled" ]]; then
-  TZ=Asia/Jakarta date +%F > /var/lib/sc-1forcr/last-auto-backup-date
+  sched_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${sched_mode}" == "daily" || "${sched_mode}" == "daily_wib" || "${sched_mode}" == "wib" ]]; then
+    TZ=Asia/Jakarta date +%F > /var/lib/sc-1forcr/last-auto-backup-date
+  fi
 fi
 
 keep_days="$(echo "${AUTO_BACKUP_KEEP_DAYS}" | tr -cd '0-9')"
@@ -6757,9 +6808,10 @@ NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-  cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<'EOF'
+  if [[ "${AUTO_BACKUP_SCHEDULE_MODE}" == "daily_wib" ]]; then
+    cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
 [Unit]
-Description=Run SC 1FORCR auto backup hourly (executes at 02:00 WIB)
+Description=Run SC 1FORCR auto backup daily at $(printf '%02d' "${AUTO_BACKUP_WIB_HOUR}"):00 WIB
 
 [Timer]
 OnCalendar=hourly
@@ -6770,6 +6822,23 @@ Unit=sc-1forcr-autobackup.service
 [Install]
 WantedBy=timers.target
 EOF
+  else
+    cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto backup every ${AUTO_BACKUP_INTERVAL_MINUTES} minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${AUTO_BACKUP_INTERVAL_MINUTES}min
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  fi
 
   systemctl daemon-reload
   systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
@@ -7389,6 +7458,11 @@ BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
 AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
+AUTO_BACKUP_INTERVAL_MINUTES=${AUTO_BACKUP_INTERVAL_MINUTES}
+AUTO_BACKUP_SCHEDULE_MODE=${AUTO_BACKUP_SCHEDULE_MODE}
+AUTO_BACKUP_WIB_HOUR=${AUTO_BACKUP_WIB_HOUR}
+AUTO_REBOOT_ENABLE=${AUTO_REBOOT_ENABLE}
+AUTO_REBOOT_INTERVAL_MINUTES=${AUTO_REBOOT_INTERVAL_MINUTES}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
@@ -7795,6 +7869,306 @@ Unit=sc-1forcr-online-notify.service
 [Install]
 WantedBy=timers.target
 EOF
+}
+
+write_auto_backup_timer_unit() {
+  local mode_raw="$1"
+  local interval_min="$2"
+  local wib_hour="$3"
+  local mode
+  mode="$(echo "${mode_raw:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${mode}" == "daily" || "${mode}" == "wib" ]]; then
+    mode="daily_wib"
+  fi
+  if [[ "${mode}" != "daily_wib" ]]; then
+    mode="interval"
+  fi
+  interval_min="$(echo "${interval_min:-1440}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 1 || "${interval_min}" -gt 10080 ]] && interval_min="1440"
+  wib_hour="$(echo "${wib_hour:-2}" | tr -cd '0-9')"
+  [[ -z "${wib_hour}" || "${wib_hour}" -lt 0 || "${wib_hour}" -gt 23 ]] && wib_hour="2"
+
+  if [[ "${mode}" == "daily_wib" ]]; then
+    cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto backup daily at $(printf '%02d' "${wib_hour}"):00 WIB
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=1min
+Persistent=true
+RandomizedDelaySec=0
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    return
+  fi
+
+  cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto backup every ${interval_min} minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${interval_min}min
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+write_auto_reboot_timer_unit() {
+  local interval_min="$1"
+  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto reboot every ${interval_min} minutes
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=${interval_min}min
+Persistent=true
+AccuracySec=1min
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+set_auto_reboot_config_menu() {
+  local current_enable current_interval current_hours enable_in mode_in val_in interval_min
+  current_enable="${AUTO_REBOOT_ENABLE:-1}"
+  [[ "${current_enable}" != "0" ]] && current_enable="1"
+  current_interval="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" || "${current_interval}" -lt 30 || "${current_interval}" -gt 10080 ]] && current_interval="1440"
+  current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
+
+  draw_menu_header "SETTING AUTO REBOOT"
+  echo "Status saat ini   : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "Interval saat ini : ${current_interval} menit (~${current_hours} jam)"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input enable_in "Aktifkan auto reboot? (1=aktif,0=nonaktif) [${current_enable}]: "; then
+    return
+  fi
+  [[ "${enable_in,,}" == "batal" ]] && return
+  enable_in="${enable_in:-${current_enable}}"
+  case "${enable_in,,}" in
+    1|on|yes|y) enable_in="1" ;;
+    0|off|no|n) enable_in="0" ;;
+    *)
+      echo "Input status tidak valid. Gunakan 1 atau 0."
+      return
+      ;;
+  esac
+
+  if ! prompt_input mode_in "Set interval dalam (m=menit, h=jam) [m]: "; then
+    return
+  fi
+  [[ "${mode_in,,}" == "batal" ]] && return
+  mode_in="${mode_in:-m}"
+  case "${mode_in,,}" in
+    m|menit) mode_in="m" ;;
+    h|jam) mode_in="h" ;;
+    *)
+      echo "Mode interval tidak valid. Gunakan m atau h."
+      return
+      ;;
+  esac
+
+  if [[ "${mode_in}" == "m" ]]; then
+    if ! prompt_input val_in "Interval reboot (menit, min 30) [${current_interval}]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-${current_interval}}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 30 || "${val_in}" -gt 10080 ]]; then
+      echo "Interval menit harus angka 30-10080."
+      return
+    fi
+    interval_min="${val_in}"
+  else
+    if ! prompt_input val_in "Interval reboot (jam) [24]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-24}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 168 ]]; then
+      echo "Interval jam harus angka 1-168."
+      return
+    fi
+    interval_min="$(( val_in * 60 ))"
+  fi
+
+  AUTO_REBOOT_ENABLE="${enable_in}"
+  AUTO_REBOOT_INTERVAL_MINUTES="${interval_min}"
+  update_sc_env_var "AUTO_REBOOT_ENABLE" "${AUTO_REBOOT_ENABLE}"
+  update_sc_env_var "AUTO_REBOOT_INTERVAL_MINUTES" "${AUTO_REBOOT_INTERVAL_MINUTES}"
+  update_app_env_var "AUTO_REBOOT_ENABLE" "${AUTO_REBOOT_ENABLE}"
+  update_app_env_var "AUTO_REBOOT_INTERVAL_MINUTES" "${AUTO_REBOOT_INTERVAL_MINUTES}"
+
+  write_auto_reboot_timer_unit "${AUTO_REBOOT_INTERVAL_MINUTES}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${AUTO_REBOOT_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  fi
+
+  echo
+  echo "Berhasil update auto reboot:"
+  echo "- Status   : $([[ "${AUTO_REBOOT_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "- Interval : ${AUTO_REBOOT_INTERVAL_MINUTES} menit"
+}
+
+set_auto_backup_config_menu() {
+  local current_enable current_interval current_hours enable_in mode_in val_in interval_min
+  local current_sched current_wib_hour chosen_sched
+  current_enable="${AUTO_BACKUP_ENABLE:-1}"
+  [[ "${current_enable}" != "0" ]] && current_enable="1"
+  current_interval="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 10080 ]] && current_interval="1440"
+  current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
+  current_sched="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${current_sched}" == "daily" || "${current_sched}" == "wib" ]]; then
+    current_sched="daily_wib"
+  fi
+  [[ "${current_sched}" != "daily_wib" ]] && current_sched="interval"
+  current_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
+  [[ -z "${current_wib_hour}" || "${current_wib_hour}" -lt 0 || "${current_wib_hour}" -gt 23 ]] && current_wib_hour="2"
+
+  draw_menu_header "SETTING AUTO BACKUP"
+  echo "Status saat ini   : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  if [[ "${current_sched}" == "daily_wib" ]]; then
+    echo "Mode saat ini     : Harian WIB jam $(printf '%02d' "${current_wib_hour}"):00"
+  else
+    echo "Mode saat ini     : Interval"
+    echo "Interval saat ini : ${current_interval} menit (~${current_hours} jam)"
+  fi
+  echo "Retensi file      : ${AUTO_BACKUP_KEEP_DAYS:-7} hari"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input enable_in "Aktifkan auto backup? (1=aktif,0=nonaktif) [${current_enable}]: "; then
+    return
+  fi
+  [[ "${enable_in,,}" == "batal" ]] && return
+  enable_in="${enable_in:-${current_enable}}"
+  case "${enable_in,,}" in
+    1|on|yes|y) enable_in="1" ;;
+    0|off|no|n) enable_in="0" ;;
+    *)
+      echo "Input status tidak valid. Gunakan 1 atau 0."
+      return
+      ;;
+  esac
+
+  if ! prompt_input mode_in "Mode jadwal backup (1=interval,2=harian WIB) [$([[ "${current_sched}" == "daily_wib" ]] && echo 2 || echo 1)]: "; then
+    return
+  fi
+  [[ "${mode_in,,}" == "batal" ]] && return
+  mode_in="${mode_in:-$([[ "${current_sched}" == "daily_wib" ]] && echo 2 || echo 1)}"
+  case "${mode_in,,}" in
+    1|interval|m|menit|h|jam) chosen_sched="interval" ;;
+    2|harian|daily|wib) chosen_sched="daily_wib" ;;
+    *)
+      echo "Mode tidak valid. Gunakan 1 (interval) atau 2 (harian WIB)."
+      return
+      ;;
+  esac
+
+  if [[ "${chosen_sched}" == "daily_wib" ]]; then
+    if ! prompt_input val_in "Jam backup WIB (0-23) [${current_wib_hour}]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-${current_wib_hour}}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 0 || "${val_in}" -gt 23 ]]; then
+      echo "Jam WIB harus angka 0-23."
+      return
+    fi
+    AUTO_BACKUP_WIB_HOUR="${val_in}"
+    AUTO_BACKUP_INTERVAL_MINUTES="${current_interval}"
+  else
+    if ! prompt_input mode_in "Set interval dalam (m=menit, h=jam) [m]: "; then
+      return
+    fi
+    [[ "${mode_in,,}" == "batal" ]] && return
+    mode_in="${mode_in:-m}"
+    case "${mode_in,,}" in
+      m|menit) mode_in="m" ;;
+      h|jam) mode_in="h" ;;
+      *)
+        echo "Mode interval tidak valid. Gunakan m atau h."
+        return
+        ;;
+    esac
+    if [[ "${mode_in}" == "m" ]]; then
+      if ! prompt_input val_in "Interval backup (menit) [${current_interval}]: "; then
+        return
+      fi
+      [[ "${val_in,,}" == "batal" ]] && return
+      val_in="${val_in:-${current_interval}}"
+      if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 10080 ]]; then
+        echo "Interval menit harus angka 1-10080."
+        return
+      fi
+      interval_min="${val_in}"
+    else
+      if ! prompt_input val_in "Interval backup (jam) [24]: "; then
+        return
+      fi
+      [[ "${val_in,,}" == "batal" ]] && return
+      val_in="${val_in:-24}"
+      if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 168 ]]; then
+        echo "Interval jam harus angka 1-168."
+        return
+      fi
+      interval_min="$(( val_in * 60 ))"
+    fi
+    AUTO_BACKUP_INTERVAL_MINUTES="${interval_min}"
+    AUTO_BACKUP_WIB_HOUR="${current_wib_hour}"
+  fi
+
+  AUTO_BACKUP_ENABLE="${enable_in}"
+  AUTO_BACKUP_SCHEDULE_MODE="${chosen_sched}"
+  update_sc_env_var "AUTO_BACKUP_ENABLE" "${AUTO_BACKUP_ENABLE}"
+  update_sc_env_var "AUTO_BACKUP_INTERVAL_MINUTES" "${AUTO_BACKUP_INTERVAL_MINUTES}"
+  update_sc_env_var "AUTO_BACKUP_SCHEDULE_MODE" "${AUTO_BACKUP_SCHEDULE_MODE}"
+  update_sc_env_var "AUTO_BACKUP_WIB_HOUR" "${AUTO_BACKUP_WIB_HOUR}"
+  update_app_env_var "AUTO_BACKUP_ENABLE" "${AUTO_BACKUP_ENABLE}"
+  update_app_env_var "AUTO_BACKUP_INTERVAL_MINUTES" "${AUTO_BACKUP_INTERVAL_MINUTES}"
+  update_app_env_var "AUTO_BACKUP_SCHEDULE_MODE" "${AUTO_BACKUP_SCHEDULE_MODE}"
+  update_app_env_var "AUTO_BACKUP_WIB_HOUR" "${AUTO_BACKUP_WIB_HOUR}"
+
+  write_auto_backup_timer_unit "${AUTO_BACKUP_SCHEDULE_MODE}" "${AUTO_BACKUP_INTERVAL_MINUTES}" "${AUTO_BACKUP_WIB_HOUR}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${AUTO_BACKUP_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-autobackup.service >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  fi
+
+  echo
+  echo "Berhasil update auto backup:"
+  echo "- Status   : $([[ "${AUTO_BACKUP_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  if [[ "${AUTO_BACKUP_SCHEDULE_MODE}" == "daily_wib" ]]; then
+    echo "- Jadwal   : Harian WIB jam $(printf '%02d' "${AUTO_BACKUP_WIB_HOUR}"):00"
+  else
+    echo "- Interval : ${AUTO_BACKUP_INTERVAL_MINUTES} menit"
+  fi
 }
 
 pick_type() {
@@ -8787,24 +9161,24 @@ akun_menu() {
     clear
     skip_post_pause=0
     case "${am}" in
-      1) create_account ;;
-      2) create_trial_account ;;
-      3) renew_account ;;
-      4) edit_limit_ip_account ;;
-      5) delete_account ;;
-      6) list_accounts ;;
+      1) create_account || true ;;
+      2) create_trial_account || true ;;
+      3) renew_account || true ;;
+      4) edit_limit_ip_account || true ;;
+      5) delete_account || true ;;
+      6) list_accounts || true ;;
       7)
-        unlock_account
+        unlock_account || true
         skip_post_pause=1
         ;;
       8)
-        unlock_all_accounts
+        unlock_all_accounts || true
         skip_post_pause=1
         ;;
-      9) show_account_detail ;;
-      10) edit_limit_ip_all_accounts ;;
-      11) extend_expired_all_accounts ;;
-      12) edit_uuid_xray_account ;;
+      9) show_account_detail || true ;;
+      10) edit_limit_ip_all_accounts || true ;;
+      11) extend_expired_all_accounts || true ;;
+      12) edit_uuid_xray_account || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -9143,24 +9517,28 @@ tools_menu() {
       "9) Kirim Notif Online Sekarang ke BOT" \
       "10) Setting Token Webhook BotVPN" \
       "11) Upgrade/Downgrade Versi Dropbear" \
+      "12) Setting Interval Auto Backup" \
+      "13) Setting Interval Auto Reboot" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-11]: "; then
+    if ! prompt_input tm "Pilih menu [0-13]: "; then
       return
     fi
     clear
     case "${tm}" in
-      1) show_sc_key_info ;;
-      2) install_summary_api_1forcr ;;
-      3) set_html_banner_menu ;;
-      4) update_script_from_repo ;;
-      5) set_telegram_notif_config ;;
-      6) set_iplimit_checker_config_menu ;;
-      7) set_autolock_realtime_tuning_menu ;;
-      8) set_online_notify_config_menu ;;
-      9) trigger_online_notify_now ;;
-      10) set_account_event_webhook_config ;;
-      11) set_dropbear_version_menu ;;
+      1) show_sc_key_info || true ;;
+      2) install_summary_api_1forcr || true ;;
+      3) set_html_banner_menu || true ;;
+      4) update_script_from_repo || true ;;
+      5) set_telegram_notif_config || true ;;
+      6) set_iplimit_checker_config_menu || true ;;
+      7) set_autolock_realtime_tuning_menu || true ;;
+      8) set_online_notify_config_menu || true ;;
+      9) trigger_online_notify_now || true ;;
+      10) set_account_event_webhook_config || true ;;
+      11) set_dropbear_version_menu || true ;;
+      12) set_auto_backup_config_menu || true ;;
+      13) set_auto_reboot_config_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -11929,6 +12307,11 @@ Time     : $(date '+%F %T')"
     AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
     AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR}" \
     AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS}" \
+    AUTO_BACKUP_INTERVAL_MINUTES="${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" \
+    AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}" \
+    AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}" \
+    AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-1}" \
+    AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" \
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
     ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
     ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" \
@@ -12582,13 +12965,13 @@ while true; do
   fi
   clear
   case "$m" in
-    1) akun_menu ;;
-    2) service_menu ;;
-    3) backup_restore_menu ;;
-    4) change_domain_menu ;;
-    5) monitor_temp_lock_menu ;;
-    6) monitor_online_menu ;;
-    7) tools_menu ;;
+    1) akun_menu || true ;;
+    2) service_menu || true ;;
+    3) backup_restore_menu || true ;;
+    4) change_domain_menu || true ;;
+    5) monitor_temp_lock_menu || true ;;
+    6) monitor_online_menu || true ;;
+    7) tools_menu || true ;;
     m|M)
       SHOW_FULL_MENU=1
       continue
@@ -13039,9 +13422,9 @@ Catatan:
 - UDP Custom (UDPHC) default tanpa DNAT range; rule DNAT legacy ke port UDPHC akan dibersihkan otomatis.
 - Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
 - vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
-- Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.
+- Auto reboot aktif berkala sesuai interval AUTO_REBOOT_INTERVAL_MINUTES via systemd timer sc-1forcr-autoreboot.timer.
 - Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
-- Auto backup semua akun (JSON) dikirim ke Telegram setiap jam 02:00 WIB via sc-1forcr-autobackup.timer.
+- Auto backup semua akun (JSON) mendukung mode interval (AUTO_BACKUP_INTERVAL_MINUTES) atau jadwal harian WIB (AUTO_BACKUP_WIB_HOUR) via sc-1forcr-autobackup.timer.
 - Notifikasi akun online berkala ke Telegram aktif default tiap ${ONLINE_NOTIFY_INTERVAL_HOURS} jam via sc-1forcr-online-notify.timer.
 - Backup manual: /usr/local/sbin/sc-1forcr-auto-backup manual
 - Restore akun dari backup: /usr/local/sbin/sc-1forcr-restore-backup /path/file.json

@@ -7665,6 +7665,47 @@ EOF
   fi
 }
 
+has_pending_update_only() {
+  [[ -f "${PENDING_OP_FILE}" ]] || return 1
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || return 1
+  [[ "${PENDING_TYPE:-}" == "update" ]]
+}
+
+pending_update_gate_menu() {
+  local pu_ans
+  [[ -t 0 && -t 1 ]] || return 0
+  has_pending_update_only || return 0
+  while true; do
+    clear
+    draw_menu_panel "UPDATE PENDING" \
+      "1) Lanjutkan Update" \
+      "2) Tunda (masuk menu utama)" \
+      "3) Batalkan pending update" \
+      "0) Exit"
+    echo
+    if ! prompt_input pu_ans "Pilih menu [0-3]: "; then
+      exit 0
+    fi
+    case "${pu_ans}" in
+      1)
+        resume_pending_operation_prompt
+        has_pending_update_only || return 0
+        ;;
+      2) return 0 ;;
+      3)
+        rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+        return 0
+        ;;
+      0) exit 0 ;;
+      *)
+        echo "Pilihan tidak valid."
+        sleep 1
+        ;;
+    esac
+  done
+}
+
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
@@ -13088,6 +13129,7 @@ if [[ "${1:-}" == "update" ]]; then
 fi
 
 while true; do
+  pending_update_gate_menu
   resume_pending_operation_prompt
   if ! enforce_menu_license_access; then
     exit 1

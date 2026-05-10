@@ -13139,6 +13139,14 @@ EOF
   cat > /usr/local/sbin/update <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+cat > /var/lib/sc-1forcr/pending-op.env <<'EOP'
+PENDING_TYPE=update
+PENDING_CMD=/usr/local/sbin/menu-sc-1forcr update
+PENDING_NOTE=Update script terputus sebelum selesai
+PENDING_TIME=wrapper
+EOP
+chmod 600 /var/lib/sc-1forcr/pending-op.env >/dev/null 2>&1 || true
 exec /usr/local/sbin/menu-sc-1forcr update "$@"
 EOF
   chmod +x /usr/local/sbin/update

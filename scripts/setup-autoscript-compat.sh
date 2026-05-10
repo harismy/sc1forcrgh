@@ -7631,13 +7631,27 @@ resume_pending_operation_prompt() {
   type="${PENDING_TYPE:-unknown}"
   note="${PENDING_NOTE:-pending operation}"
   [[ -z "${cmd}" ]] && return 0
-  echo
-  echo "Ada proses ${type} yang belum selesai."
-  echo "Info : ${note}"
-  echo "Cmd  : ${cmd}"
-  read -r -p "Tekan Enter untuk lanjutkan, atau ketik 'skip' untuk nanti: " ans || true
+  printf '\nAda proses %s yang belum selesai.\n' "${type}" >/dev/tty
+  printf 'Info : %s\n' "${note}" >/dev/tty
+  printf 'Cmd  : %s\n' "${cmd}" >/dev/tty
+  printf 'Tekan Enter untuk lanjutkan, atau ketik '\''skip'\'' untuk nanti: ' >/dev/tty
+  read -r ans </dev/tty || true
   [[ "${ans,,}" == "skip" ]] && return 0
   rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  if [[ "${type}" == "update" ]]; then
+    if ! update_script_from_repo; then
+      mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+      cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+      chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+      echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
+    fi
+    return 0
+  fi
   if ! bash -lc "${cmd}"; then
     mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
     cat > "${PENDING_OP_FILE}" <<EOF

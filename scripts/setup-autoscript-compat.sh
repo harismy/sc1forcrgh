@@ -7619,6 +7619,22 @@ AUTH_TOKEN="${AUTH_TOKEN:-${API_AUTH_TOKEN:-}}"
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
 PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
 
+set_pending_operation() {
+  local type="$1" cmd="$2" note="$3"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+  chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+clear_pending_operation() {
+  rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
 resume_pending_operation_prompt() {
   local ans cmd type note
   [[ -t 0 && -t 1 ]] || return 0
@@ -7669,7 +7685,41 @@ has_pending_update_only() {
   [[ -f "${PENDING_OP_FILE}" ]] || return 1
   # shellcheck disable=SC1090
   source "${PENDING_OP_FILE}" >/dev/null 2>&1 || return 1
-  [[ "${PENDING_TYPE:-}" == "update" ]]
+  [[ -n "${PENDING_TYPE:-}" && -n "${PENDING_CMD:-}" ]]
+}
+
+is_sc_installed_runtime() {
+  systemctl list-unit-files 2>/dev/null | grep -q '^sc-1forcr-api\.service' && return 0
+  [[ -x /usr/local/sbin/menu-sc-1forcr ]] && [[ -f /etc/sc-1forcr.env ]] && return 0
+  return 1
+}
+
+normalize_pending_operation() {
+  [[ -f "${PENDING_OP_FILE}" ]] || return 0
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  local type cmd note
+  type="${PENDING_TYPE:-}"
+  cmd="${PENDING_CMD:-}"
+  note="${PENDING_NOTE:-}"
+  [[ -z "${type}" || -z "${cmd}" ]] && return 0
+
+  if [[ "${type}" == "install" && "${cmd}" == *"/tmp/setup-autoscript-compat.sh"* && ! -f /tmp/setup-autoscript-compat.sh ]]; then
+    if is_sc_installed_runtime; then
+      set_pending_operation "update" "/usr/local/sbin/menu-sc-1forcr update" "Pending install terdeteksi, service SC sudah ada. Dialihkan ke update."
+    fi
+    return 0
+  fi
+
+  if is_sc_installed_runtime; then
+    if [[ "${type}" == "install" ]]; then
+      set_pending_operation "update" "/usr/local/sbin/menu-sc-1forcr update" "Service SC sudah ada. Pending disesuaikan ke update."
+    fi
+  else
+    if [[ "${type}" == "update" ]]; then
+      set_pending_operation "install" "${cmd}" "${note:-Install SC 1FORCR terputus sebelum selesai}"
+    fi
+  fi
 }
 
 pending_update_gate_menu() {
@@ -7694,11 +7744,10 @@ pending_update_gate_menu() {
     clear
     draw_menu_panel "${gate_title}" \
       "1) ${opt1_label}" \
-      "2) Tunda (masuk menu utama)" \
-      "3) Batalkan pending" \
+      "2) Batalkan pending" \
       "0) Exit"
     echo
-    if ! prompt_input pu_ans "Pilih menu [0-3]: "; then
+    if ! prompt_input pu_ans "Pilih menu [0-2]: "; then
       exit 0
     fi
     case "${pu_ans}" in
@@ -7769,8 +7818,7 @@ EOF
           return 0
         fi
         ;;
-      2) return 2 ;;
-      3)
+      2)
         rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
         return 0
         ;;
@@ -13206,15 +13254,10 @@ if [[ "${1:-}" == "update" ]]; then
 fi
 
 while true; do
+  normalize_pending_operation
   if has_pending_update_only; then
-    if pending_update_gate_menu; then
-      :
-    else
-      gate_rc=$?
-      if [[ "${gate_rc}" -ne 2 ]]; then
-        continue
-      fi
-    fi
+    pending_update_gate_menu
+    continue
   else
     resume_pending_operation_prompt
   fi
@@ -13387,6 +13430,23 @@ if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; the
 fi
 EOF
   chmod 644 /etc/profile.d/sc-1forcr-auto-menu.sh
+
+  # Fallback for environments where /etc/profile.d is skipped/inconsistent.
+  if [[ -f /root/.bashrc ]]; then
+    sed -i '/# >>> sc-1forcr-auto-menu >>>/,/# <<< sc-1forcr-auto-menu <<</d' /root/.bashrc || true
+  fi
+  cat >> /root/.bashrc <<'EOF'
+# >>> sc-1forcr-auto-menu >>>
+if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; then
+  if [[ -n "${SSH_CONNECTION:-}" ]] && [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
+    if [[ -x /usr/local/sbin/menu ]]; then
+      export SC_MENU_AUTO_STARTED=1
+      /usr/local/sbin/menu || true
+    fi
+  fi
+fi
+# <<< sc-1forcr-auto-menu <<<
+EOF
 }
 
 write_version_marker() {
@@ -13613,6 +13673,7 @@ open_menu_after_install() {
 
 PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
 SCRIPT_SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+PENDING_INSTALL_SCRIPT="/var/lib/sc-1forcr/pending-install.sh"
 
 set_pending_operation() {
   local type="$1" cmd="$2" note="$3"
@@ -13661,7 +13722,16 @@ resume_pending_operation_prompt() {
 }
 
 main() {
-  set_pending_operation "install" "bash ${SCRIPT_SELF_PATH}" "Install SC 1FORCR terputus sebelum selesai"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  if [[ -f "${SCRIPT_SELF_PATH}" ]]; then
+    cp -f "${SCRIPT_SELF_PATH}" "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
+    chmod 700 "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
+  fi
+  if [[ -x "${PENDING_INSTALL_SCRIPT}" ]]; then
+    set_pending_operation "install" "bash ${PENDING_INSTALL_SCRIPT}" "Install SC 1FORCR terputus sebelum selesai"
+  else
+    set_pending_operation "install" "bash ${SCRIPT_SELF_PATH}" "Install SC 1FORCR terputus sebelum selesai"
+  fi
   show_install_banner
   show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
   enforce_install_license
@@ -13764,6 +13834,7 @@ Catatan:
 EOF
 
   clear_pending_operation
+  rm -f "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
   open_menu_after_install
 }
 

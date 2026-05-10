@@ -148,6 +148,9 @@ SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
 SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
 SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
 SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
+NGINX_WORKER_CONNECTIONS="${NGINX_WORKER_CONNECTIONS:-8192}"
+NGINX_WORKER_RLIMIT_NOFILE="${NGINX_WORKER_RLIMIT_NOFILE:-200000}"
+NGINX_SERVICE_LIMIT_NOFILE="${NGINX_SERVICE_LIMIT_NOFILE:-200000}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
@@ -210,6 +213,43 @@ flag_enabled() {
     1|true|yes|on) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+tune_nginx_capacity() {
+  local nginx_conf wc rl nof
+  nginx_conf="/etc/nginx/nginx.conf"
+  [[ -f "${nginx_conf}" ]] || return 0
+
+  wc="$(echo "${NGINX_WORKER_CONNECTIONS:-8192}" | tr -cd '0-9')"
+  rl="$(echo "${NGINX_WORKER_RLIMIT_NOFILE:-200000}" | tr -cd '0-9')"
+  nof="$(echo "${NGINX_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
+  [[ -z "${wc}" || "${wc}" -lt 1024 ]] && wc="8192"
+  [[ -z "${rl}" || "${rl}" -lt 65536 ]] && rl="200000"
+  [[ -z "${nof}" || "${nof}" -lt 65536 ]] && nof="200000"
+
+  # Biar adaptif ke core CPU server.
+  sed -ri 's/^[[:space:]]*worker_processes[[:space:]]+[^;]+;/worker_processes auto;/' "${nginx_conf}" || true
+
+  if grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]+[0-9]+;' "${nginx_conf}"; then
+    sed -ri "s/^[[:space:]]*worker_rlimit_nofile[[:space:]]+[0-9]+;/worker_rlimit_nofile ${rl};/" "${nginx_conf}" || true
+  else
+    sed -ri "/^[[:space:]]*worker_processes[[:space:]]+auto;/a worker_rlimit_nofile ${rl};" "${nginx_conf}" || true
+  fi
+
+  sed -ri "0,/worker_connections[[:space:]]+[0-9]+[[:space:]]*;/{s/worker_connections[[:space:]]+[0-9]+[[:space:]]*;/worker_connections ${wc};/}" "${nginx_conf}" || true
+  if ! grep -qE '^[[:space:]]*multi_accept[[:space:]]+on;' "${nginx_conf}"; then
+    sed -ri "/worker_connections[[:space:]]+${wc}[[:space:]]*;/a\\    multi_accept on;" "${nginx_conf}" || true
+  fi
+  if ! grep -qE '^[[:space:]]*use[[:space:]]+epoll;' "${nginx_conf}"; then
+    sed -ri "/worker_connections[[:space:]]+${wc}[[:space:]]*;/a\\    use epoll;" "${nginx_conf}" || true
+  fi
+
+  mkdir -p /etc/systemd/system/nginx.service.d
+  cat > /etc/systemd/system/nginx.service.d/limits.conf <<EOF
+[Service]
+LimitNOFILE=${nof}
+EOF
+  systemctl daemon-reload || true
 }
 
 normalize_xray_paths_csv() {
@@ -1261,6 +1301,7 @@ EOF
 
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
+  tune_nginx_capacity
   nginx -t
   systemctl enable nginx
   systemctl restart nginx
@@ -9623,6 +9664,7 @@ EONGINX
 
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
+  tune_nginx_capacity
   nginx -t || { echo "Konfigurasi nginx invalid."; return; }
   systemctl restart nginx || true
 

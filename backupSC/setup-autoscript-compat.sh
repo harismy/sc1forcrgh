@@ -51,6 +51,8 @@ set -euo pipefail
 #   DROPBEAR_VERSION=2019.78
 #   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
 #   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
+#   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
+#   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
 #   AUTO_PULL_UPDATE_ENABLE=0                    (opsional, default nonaktif; update manual via menu)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
@@ -122,6 +124,8 @@ DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}"
+BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
@@ -130,25 +134,29 @@ ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-0}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-30}"
-IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
+IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
 IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
 SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-1}"
-SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-80,443,109,143}"
-SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-8/second}"
-SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-16}"
-SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-12}"
+SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-109,143}"
+SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-80/second}"
+SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-200}"
+SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-200}"
+SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
+SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
+SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
+SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
 UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-}"
 UDPHC_LOG_LINES_CHECKER="${UDPHC_LOG_LINES_CHECKER:-}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
-XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-60}"
-XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-600}"
-XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-1}"
+XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
+XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
+XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
@@ -194,7 +202,7 @@ if [[ -z "${ZIVPN_HTTP_AUTH_URL}" ]]; then
 fi
 
 log() {
-  echo "[autoscript-compat] $*"
+  echo "[autoscript-1FORCR-NEXUS] $*"
 }
 
 flag_enabled() {
@@ -431,6 +439,16 @@ get_total_ram_mib() {
   echo "$((kib / 1024))"
 }
 
+ram_mib_to_nominal_gb() {
+  local mib="${1:-0}" gb
+  if [[ -z "${mib}" || ! "${mib}" =~ ^[0-9]+$ ]]; then
+    mib="1024"
+  fi
+  gb="$(( (mib + 512) / 1024 ))"
+  (( gb < 1 )) && gb=1
+  echo "${gb}"
+}
+
 get_cpu_cores() {
   local cores
   cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
@@ -455,8 +473,7 @@ auto_tune_iplimit_vars() {
     local ram_mib ram_gb cores tier
     ram_mib="$(get_total_ram_mib)"
     cores="$(get_cpu_cores)"
-    ram_gb=$((ram_mib / 1024))
-    (( ram_gb < 1 )) && ram_gb=1
+    ram_gb="$(ram_mib_to_nominal_gb "${ram_mib}")"
 
     # Tier konservatif: ambil bottleneck antara RAM dan vCPU.
     tier="${ram_gb}"
@@ -548,17 +565,44 @@ check_supported_os() {
 install_optional_pkg_if_available() {
   local pkg="$1"
   if apt-cache show "${pkg}" >/dev/null 2>&1; then
-    apt-get install -y "${pkg}"
+    apt_get_safe install -y "${pkg}"
     return 0
   fi
   log "Paket opsional '${pkg}' tidak tersedia di repo, skip."
   return 1
 }
 
+wait_for_apt_locks() {
+  local waited=0 max_wait=900
+  while true; do
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+       fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+       fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+       fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
+      if (( waited == 0 )); then
+        log "Menunggu lock apt/dpkg dilepas (apt/unattended-upgrades sedang jalan)..."
+      fi
+      sleep 5
+      waited=$((waited + 5))
+      if (( waited >= max_wait )); then
+        log "Timeout menunggu lock apt/dpkg (${max_wait}s)."
+        return 1
+      fi
+      continue
+    fi
+    return 0
+  done
+}
+
+apt_get_safe() {
+  wait_for_apt_locks || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get "$@"
+}
+
 install_base_packages() {
   log "Install paket dasar..."
-  apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  apt_get_safe update -y
+  apt_get_safe install -y \
     curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
     gnupg lsb-release socat cron unzip \
     haproxy \
@@ -581,17 +625,17 @@ install_node_if_missing() {
     return
   fi
   log "Install Node.js (prioritas 20, fallback 18)..."
-  apt-get update -y
-  apt-get install -y curl ca-certificates gnupg
-  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs; then
+  apt_get_safe update -y
+  apt_get_safe install -y curl ca-certificates gnupg
+  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt_get_safe install -y nodejs; then
     log "Node terpasang: $(node -v)"
     return
   fi
 
   log "Node 20 gagal/kurang kompatibel, fallback ke Node 18..."
-  apt-get purge -y nodejs >/dev/null 2>&1 || true
+  apt_get_safe purge -y nodejs >/dev/null 2>&1 || true
   rm -f /etc/apt/sources.list.d/nodesource.list
-  if curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt-get install -y nodejs; then
+  if curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt_get_safe install -y nodejs; then
     log "Node terpasang: $(node -v)"
     return
   fi
@@ -606,8 +650,8 @@ install_go_if_missing() {
     return
   fi
   log "Install Go..."
-  apt-get update -y
-  apt-get install -y golang-go
+  apt_get_safe update -y
+  apt_get_safe install -y golang-go
   log "Go installed: $(go version)"
 }
 
@@ -766,6 +810,9 @@ EOF
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
 Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
 ExecStart=
 ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
 EOF
@@ -773,6 +820,9 @@ EOF
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
 Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
 ExecStart=
 ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port}
 EOF
@@ -785,10 +835,15 @@ EOF
 }
 
 init_db() {
-  log "Inisialisasi DB: ${DB_PATH}"
+  log "Inisialisasi DB"
   mkdir -p "$(dirname "${DB_PATH}")"
-
-  sqlite3 "${DB_PATH}" <<SQL
+  local sql_err try db_init_ok
+  sql_err="$(mktemp)"
+  trap 'rm -f "${sql_err:-}"' RETURN
+  db_init_ok="0"
+  for try in {1..20}; do
+    if sqlite3 "${DB_PATH}" 2>"${sql_err}" <<SQL
+PRAGMA busy_timeout=10000;
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS servers (
@@ -851,6 +906,24 @@ CREATE TABLE IF NOT EXISTS temp_ip_locks (
 
 INSERT OR IGNORE INTO servers("key") VALUES('${API_AUTH_TOKEN}');
 SQL
+    then
+      db_init_ok="1"
+      break
+    fi
+    if grep -qi "database is locked" "${sql_err}"; then
+      if [[ "${try}" -eq 1 ]]; then
+        log "DB sedang terkunci, menunggu lock sqlite dilepas..."
+      fi
+      sleep 2
+      continue
+    fi
+    cat "${sql_err}" >&2 || true
+    return 1
+  done
+  if [[ "${db_init_ok}" != "1" ]]; then
+    log "Gagal inisialisasi DB: sqlite lock tidak lepas."
+    return 1
+  fi
 
   # Backward-compatible migration for older DB schema.
   local t
@@ -973,10 +1046,59 @@ EOF
   certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}
 }
 
+prepare_haproxy_pem() {
+  local cert_domain fullchain privkey pem
+  cert_domain="$(tls_cert_domain)"
+  fullchain="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
+  privkey="/etc/letsencrypt/live/${cert_domain}/privkey.pem"
+  pem="/etc/haproxy/certs/${cert_domain}.pem"
+
+  mkdir -p /etc/haproxy/certs
+  if [[ -s "${fullchain}" && -s "${privkey}" ]]; then
+    cat "${fullchain}" "${privkey}" > "${pem}" || return 1
+    chmod 600 "${pem}" || true
+    echo "${pem}"
+    return 0
+  fi
+
+  log "Cert Let's Encrypt untuk ${cert_domain} belum ada. Pakai self-signed sementara agar 443 tetap aktif." >&2
+  openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3 \
+    -subj "/CN=${cert_domain}" \
+    -keyout "/etc/haproxy/certs/${cert_domain}.key" \
+    -out "/etc/haproxy/certs/${cert_domain}.crt" >/dev/null 2>&1 || return 1
+  cat "/etc/haproxy/certs/${cert_domain}.crt" "/etc/haproxy/certs/${cert_domain}.key" > "${pem}" || return 1
+  chmod 600 "${pem}" || true
+  echo "${pem}"
+  return 0
+}
+
 setup_nginx_and_cert() {
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
+  local sshws_nginx_limit_conf sshws_nginx_limit_rules
+  sshws_nginx_limit_conf=""
+  sshws_nginx_limit_rules=""
+  if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
+    sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
+map \$http_cf_connecting_ip \$sc_sshws_limit_key {
+    "" \$binary_remote_addr;
+    default \$http_cf_connecting_ip;
+}
+limit_req_zone \$sc_sshws_limit_key zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
+limit_conn_zone \$sc_sshws_limit_key zone=sc_sshws_conn:10m;
+
+EOF_LIMIT
+)
+    sshws_nginx_limit_rules=$(cat <<EOF_LIMIT
+        limit_req zone=sc_sshws_req burst=${SSHWS_NGINX_LIMIT_BURST} nodelay;
+        limit_conn sc_sshws_conn ${SSHWS_NGINX_LIMIT_CONN};
+        limit_req_status 429;
+        limit_conn_status 429;
+EOF_LIMIT
+)
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
+${sshws_nginx_limit_conf}
 server {
     listen 80;
     listen [::]:80;
@@ -985,10 +1107,21 @@ server {
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
+
     location = /cdn-cgi/trace {
         access_log off;
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+${sshws_nginx_limit_rules}
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /vps/ {
@@ -1094,6 +1227,7 @@ server {
 
     location ~ ^/(ssh-ws|ws|ws-ssh|ssh)$ {
         access_log off;
+${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -1109,6 +1243,7 @@ server {
 
     location / {
         access_log off;
+${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -1136,21 +1271,13 @@ EOF
 }
 
 setup_haproxy_tls_mux() {
-  local fullchain privkey pem cert_domain
-  cert_domain="$(tls_cert_domain)"
-  fullchain="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
-  privkey="/etc/letsencrypt/live/${cert_domain}/privkey.pem"
-  pem="/etc/haproxy/certs/${cert_domain}.pem"
-
-  if [[ ! -s "${fullchain}" || ! -s "${privkey}" ]]; then
-    log "Sertifikat tidak ditemukan untuk ${cert_domain}, skip setup haproxy 443."
-    return 0
-  fi
+  local pem
+  pem="$(prepare_haproxy_pem)" || {
+    log "Gagal menyiapkan sertifikat HAProxy."
+    return 1
+  }
 
   log "Setup HAProxy TLS mux di 443..."
-  mkdir -p /etc/haproxy/certs
-  cat "${fullchain}" "${privkey}" > "${pem}"
-  chmod 600 "${pem}"
 
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
@@ -1159,25 +1286,54 @@ global
     daemon
     maxconn 20000
     nbthread 1
+    # Kompatibilitas TLS maksimum (security lebih lemah) untuk klien lawas/HC.
+    ssl-default-bind-ciphers DEFAULT:@SECLEVEL=0
+    ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
+    ssl-default-bind-options no-sslv3
 
 defaults
     log global
     mode tcp
     option tcplog
     option dontlognull
-    timeout connect 10s
-    timeout client  2m
-    timeout server  2m
+    timeout connect 30s
+    # WS tunnel perlu timeout panjang; 2m sering bikin koneksi putus sendiri.
+    timeout client  12h
+    timeout server  12h
 
 frontend ft_443
-    bind *:443 ssl crt ${pem} alpn h2,http/1.1
-    default_backend bk_mux
+    # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
+    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
+    tcp-request inspect-delay 5s
+    tcp-request content accept if HTTP
+    tcp-request content accept if WAIT_END
+    acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
+    acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
+    acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
+    acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
+    acl is_xray_vless_bug req.payload(0,256),lower -m sub "get /yourbug/vless"
+    acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
+    acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
+    acl is_api_vps req.payload(0,256),lower -m sub " /vps/"
+    # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
+    # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
+    acl is_hc_connect req.payload(0,512),lower -m sub "connect "
+    use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
+    use_backend bk_sshws_tls if is_hc_connect
+    # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
+    # Jalur xray (/vmess,/vless,/trojan) dan API (/vps/) tetap diprioritaskan ke mux.
+    default_backend bk_sshws_tls
 
 backend bk_mux
     mode tcp
     # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
     # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
     server nginx_local 127.0.0.1:80 check
+
+backend bk_sshws_tls
+    mode tcp
+    # Jalur khusus HTTP Custom SSL-only (payload CONNECT) langsung ke sshws mux.
+    server sshws_local 127.0.0.1:2082 check
 EOF
 
   haproxy -c -f /etc/haproxy/haproxy.cfg
@@ -1507,19 +1663,34 @@ apply_sshws_loop_guard_rules() {
     return 0
   fi
 
-  ports="$(echo "${SSHWS_LOOP_GUARD_PORTS:-80,443,109,143}" | tr -cd '0-9,')"
-  [[ -z "${ports}" ]] && ports="80,443,109,143"
+  ports="$(echo "${SSHWS_LOOP_GUARD_PORTS:-109,143}" | tr -cd '0-9,')"
+  [[ -z "${ports}" ]] && ports="109,143"
 
-  rate="$(echo "${SSHWS_LOOP_GUARD_NEW_ABOVE:-8/second}" | tr -d '[:space:]')"
+  rate="$(echo "${SSHWS_LOOP_GUARD_NEW_ABOVE:-80/second}" | tr -d '[:space:]')"
   if ! [[ "${rate}" =~ ^[0-9]+/(second|minute|hour|day)$ ]]; then
-    rate="8/second"
+    rate="80/second"
   fi
 
-  burst="$(echo "${SSHWS_LOOP_GUARD_BURST:-16}" | tr -cd '0-9')"
-  [[ -z "${burst}" || "${burst}" -lt 1 ]] && burst="16"
+  burst="$(echo "${SSHWS_LOOP_GUARD_BURST:-200}" | tr -cd '0-9')"
+  [[ -z "${burst}" || "${burst}" -lt 1 ]] && burst="200"
 
-  connlimit="$(echo "${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-12}" | tr -cd '0-9')"
-  [[ -z "${connlimit}" || "${connlimit}" -lt 1 ]] && connlimit="12"
+  connlimit="$(echo "${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-200}" | tr -cd '0-9')"
+  [[ -z "${connlimit}" || "${connlimit}" -lt 1 ]] && connlimit="200"
+
+  # Cleanup legacy aggressive guards that included 80/443 and caused HC/CDN
+  # reconnect storms to be rejected before nginx/ssh-ws could handle them.
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 -m conntrack --ctstate NEW \
+    -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-above 8/second --hashlimit-burst 16 \
+    --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
+    -m connlimit --connlimit-above 12 --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+
+  # Bypass aman agar trafik valid tidak ikut ke-drop oleh guard.
+  iptables -w 10 -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || iptables -w 10 -I INPUT -i lo -j ACCEPT
+  iptables -w 10 -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -w 10 -C INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT
 
   # Rule 1: drop NEW connection spikes per source IP.
   if ! iptables -w 10 -C INPUT -p tcp -m multiport --dports "${ports}" -m conntrack --ctstate NEW \
@@ -1543,6 +1714,17 @@ apply_sshws_loop_guard_rules() {
   fi
   fw_persist_rules
   log "SSHWS loop guard aktif: ports=${ports}, new_above=${rate}, burst=${burst}, connlimit_above=${connlimit}"
+}
+
+ensure_sshws_firewall_allow_rules() {
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -w 10 -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || iptables -w 10 -I INPUT -i lo -j ACCEPT
+    iptables -w 10 -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -w 10 -C INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT
+  fi
+  fw_persist_rules
 }
 
 setup_zivpn_udp_nat_rules() {
@@ -1730,10 +1912,6 @@ ZIVPN_ACTIVE_WINDOW_SECONDS=${ZIVPN_ACTIVE_WINDOW_SECONDS}
 ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 SSH_WS_PORT=2082
 SSH_WS_TARGET_PORT=${ssh_ws_target_port}
-SSH_WS_MAX_CONNS=auto
-SSH_WS_HANDSHAKE_TIMEOUT_SECONDS=auto
-SSH_WS_MAX_HEADER_BYTES=auto
-SSH_WS_MAX_PRELUDE_REQUESTS=auto
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 DROPBEAR_PORT=${DROPBEAR_PORT}
@@ -1762,6 +1940,8 @@ XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
+BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
@@ -1885,6 +2065,15 @@ const XRAY_PATHS_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/tro
 const XRAY_PATH_VMESS = XRAY_PATHS_VMESS[0];
 const XRAY_PATH_VLESS = XRAY_PATHS_VLESS[0];
 const XRAY_PATH_TROJAN = XRAY_PATHS_TROJAN[0];
+const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
+  .split(',')
+  .map((v) => Number(String(v || '').trim()))
+  .filter((n) => Number.isInteger(n) && n > 0 && n <= 65535);
+const CHECK_INTERVAL_MINUTES_RAW = Number(process.env.IPLIMIT_CHECK_INTERVAL_MINUTES || 10);
+const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CHECK_INTERVAL_MINUTES_RAW > 0
+  ? Math.floor(CHECK_INTERVAL_MINUTES_RAW)
+  : 10;
+const LOCK_RECHECK_GRACE_SECONDS = Math.max(180, CHECK_INTERVAL_MINUTES * 120);
 
 function ok(res, data, message = 'success') {
   return res.json({ meta: { code: 200, message }, data });
@@ -1893,7 +2082,12 @@ function fail(res, code, message) {
   return res.status(code).json({ meta: { code, message }, message });
 }
 function auth(req, res, next) {
-  const token = String(req.headers.authorization || '').trim();
+  const rawAuth = String(req.headers.authorization || '').trim();
+  const bearer = rawAuth.toLowerCase().startsWith('bearer ') ? rawAuth.slice(7).trim() : '';
+  const token = bearer ||
+    String(req.headers['x-sc-event-token'] || '').trim() ||
+    String(req.headers['x-webhook-token'] || '').trim() ||
+    rawAuth;
   if (!token || token !== AUTH_TOKEN) return fail(res, 401, 'unauthorized');
   next();
 }
@@ -2532,10 +2726,16 @@ function vmessLink(host, id, tls) {
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
 function vlessLink(host, id, tls) {
-  return `vless://${id}@${host}:${tls ? '443' : '80'}?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=${tls ? 'tls' : 'none'}&sni=${host}#vless-${host}`;
+  if (tls) {
+    return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1&encryption=none#vless-${host}`;
+  }
+  return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#vless-${host}`;
 }
 function trojanLink(host, pass, tls) {
-  return `trojan://${pass}@${host}:${tls ? '443' : '80'}?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=${tls ? 'tls' : 'none'}&sni=${host}#trojan-${host}`;
+  if (tls) {
+    return `trojan://${pass}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1#trojan-${host}`;
+  }
+  return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}#trojan-${host}`;
 }
 
 async function renderAndReloadXray() {
@@ -2569,6 +2769,47 @@ async function renderAndReloadXray() {
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
   };
   writeXrayConfigAndReload(cfg);
+}
+
+let xrayDbSyncBusy = false;
+let xrayDbSyncLastHash = '';
+async function computeActiveXrayHash() {
+  const vmessRows = await all("SELECT LOWER(username) AS u, COALESCE(uuid,'') AS s FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
+  const vlessRows = await all("SELECT LOWER(username) AS u, COALESCE(uuid,'') AS s FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
+  const trojanRows = await all("SELECT LOWER(username) AS u, COALESCE(password,'') AS s FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
+  const payload = JSON.stringify({
+    vmess: vmessRows.map((r) => `${String(r.u || '')}:${String(r.s || '')}`),
+    vless: vlessRows.map((r) => `${String(r.u || '')}:${String(r.s || '')}`),
+    trojan: trojanRows.map((r) => `${String(r.u || '')}:${String(r.s || '')}`)
+  });
+  return crypto.createHash('sha1').update(payload).digest('hex');
+}
+
+async function syncXrayFromDbIfChanged(force = false) {
+  if (xrayDbSyncBusy) return false;
+  xrayDbSyncBusy = true;
+  try {
+    const nowHash = await computeActiveXrayHash();
+    if (!force && xrayDbSyncLastHash && nowHash === xrayDbSyncLastHash) {
+      return false;
+    }
+    await renderAndReloadXray();
+    xrayDbSyncLastHash = nowHash;
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    xrayDbSyncBusy = false;
+  }
+}
+
+async function syncXrayFromDbAndRespond(res, force = false) {
+  const changed = await syncXrayFromDbIfChanged(force).catch(() => false);
+  return ok(res, {
+    synced: true,
+    changed,
+    at: nowTime()
+  });
 }
 
 function isExpiredDateValue(v) {
@@ -2834,10 +3075,7 @@ app.patch('/vps/locksshvpn/:username', async (req, res) => {
 async function syncAfterManualSshUnlock(username) {
   const u = String(username || '').trim();
   if (!u) return;
-  await run(
-    "UPDATE temp_ip_locks SET locked_until=0 WHERE account_type='ssh' AND LOWER(username)=LOWER(?)",
-    [u]
-  ).catch(() => {});
+  await releaseTempLockNow('ssh', u).catch(() => {});
   safeExec('systemctl', ['start', 'sc-1forcr-iplimit.service']);
   safeExec('systemctl', ['restart', 'sc-1forcr-iplimit.timer']);
 }
@@ -3099,9 +3337,92 @@ app.delete('/vps/deletetrojan/:username', async (req, res) => ok(res, await delX
 app.patch('/vps/lockvmess/:username', async (req, res) => ok(res, await setStatusXray('account_vmesses', String(req.params.username || '').trim(), 'LOCK')));
 app.patch('/vps/lockvless/:username', async (req, res) => ok(res, await setStatusXray('account_vlesses', String(req.params.username || '').trim(), 'LOCK')));
 app.patch('/vps/locktrojan/:username', async (req, res) => ok(res, await setStatusXray('account_trojans', String(req.params.username || '').trim(), 'LOCK')));
-app.patch('/vps/unlockvmess/:username', async (req, res) => ok(res, await setStatusXray('account_vmesses', String(req.params.username || '').trim(), 'AKTIF')));
-app.patch('/vps/unlockvless/:username', async (req, res) => ok(res, await setStatusXray('account_vlesses', String(req.params.username || '').trim(), 'AKTIF')));
-app.patch('/vps/unlocktrojan/:username', async (req, res) => ok(res, await setStatusXray('account_trojans', String(req.params.username || '').trim(), 'AKTIF')));
+async function releaseTempLockNow(accountType, username) {
+  const t = String(accountType || '').trim().toLowerCase();
+  const u = String(username || '').trim();
+  if (!t || !u) return;
+  const removeDropCompat = (proto, ip, port) => {
+    const p = String(proto || '').trim().toLowerCase();
+    const src = String(ip || '').trim();
+    const dport = String(port || '').trim();
+    if (!src || !dport || (p !== 'tcp' && p !== 'udp')) return;
+    const cmd = src.includes(':') ? 'ip6tables' : 'iptables';
+    const rule = ['INPUT', '-p', p, '-s', src, '--dport', dport, '-j', 'DROP'];
+    while (safeExec(cmd, ['-D', ...rule])) {}
+    // fallback nftables (jika rule dibuat via nft chain langsung)
+    const fam = src.includes(':') ? 'ip6' : 'ip';
+    const chainCandidates = [
+      ['inet', 'filter', 'input'],
+      ['ip', 'filter', 'input']
+    ];
+    for (const chain of chainCandidates) {
+      while (safeExec('nft', ['delete', 'rule', ...chain, fam, 'saddr', src, p, 'dport', dport, 'drop'])) {}
+    }
+  };
+  const ipRows = await all("SELECT ip FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => []);
+  if (t === 'ssh') {
+    const udpLockPort = getActiveUdpLockPort();
+    for (const item of ipRows) {
+      const ip = String(item?.ip || '').trim();
+      if (!ip) continue;
+      removeDropCompat('udp', ip, udpLockPort);
+    }
+  } else if (t === 'vmess' || t === 'vless' || t === 'trojan') {
+    for (const item of ipRows) {
+      const ip = String(item?.ip || '').trim();
+      if (!ip) continue;
+      for (const p of XRAY_BLOCK_TCP_PORTS) {
+        removeDropCompat('tcp', ip, p);
+      }
+    }
+  }
+  await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+  await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+  await run(
+    "INSERT OR REPLACE INTO temp_ip_lock_grace(account_type, username, grace_until) VALUES(?, ?, strftime('%s','now') + ?)",
+    [t, u, LOCK_RECHECK_GRACE_SECONDS]
+  ).catch(() => {});
+}
+
+app.patch('/vps/unlockvmess/:username', async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    const out = await setStatusXray('account_vmesses', username, 'AKTIF');
+    await releaseTempLockNow('vmess', username);
+    return ok(res, out);
+  } catch (e) {
+    return fail(res, 500, e?.message || 'unlock vmess failed');
+  }
+});
+app.patch('/vps/unlockvless/:username', async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    const out = await setStatusXray('account_vlesses', username, 'AKTIF');
+    await releaseTempLockNow('vless', username);
+    return ok(res, out);
+  } catch (e) {
+    return fail(res, 500, e?.message || 'unlock vless failed');
+  }
+});
+app.patch('/vps/unlocktrojan/:username', async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    const out = await setStatusXray('account_trojans', username, 'AKTIF');
+    await releaseTempLockNow('trojan', username);
+    return ok(res, out);
+  } catch (e) {
+    return fail(res, 500, e?.message || 'unlock trojan failed');
+  }
+});
+
+// Endpoint untuk dipanggil bot setelah proses restore/import DB selesai.
+// Auto-sync xray hanya on-demand (bukan berkala) agar ringan dan deterministik.
+app.post('/vps/sync-xray', async (_req, res) => {
+  return syncXrayFromDbAndRespond(res, true);
+});
+app.post('/vps/restore-finished', async (_req, res) => {
+  return syncXrayFromDbAndRespond(res, true);
+});
 
 app.use((err, _req, res, _next) => {
   return fail(res, 500, err?.message || 'internal error');
@@ -3119,6 +3440,7 @@ app.listen(PORT, '127.0.0.1', () => {
   setInterval(() => { cleanupZivpnLiveSessions().catch(() => {}); }, 60 * 1000);
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
+  syncXrayFromDbIfChanged(true).catch(() => {});
   cleanupExpiredXrayAccounts().catch(() => {});
   setInterval(() => { cleanupExpiredXrayAccounts().catch(() => {}); }, 60 * 1000);
   console.log(`sc-1forcr-api on 127.0.0.1:${PORT}`);
@@ -3216,13 +3538,20 @@ const server = net.createServer((client) => {
       return;
     }
 
+    // Mode longgar SSL-only: setelah CONNECT, apapun request HTTP berikutnya
+    // langsung diperlakukan sebagai tunnel SSH-WS agar client HC tetap nyambung.
+    if (stage === 'wait-upgrade' && method && /\bhttp\//i.test(line)) {
+      startWsSshTunnel(rest);
+      return;
+    }
+
     if (path.startsWith('/vps/') || path.startsWith('/vmess') || path.startsWith('/vless') || path.startsWith('/trojan')) {
       const req = Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]);
       startHttpProxy(req);
       return;
     }
 
-    if (method && (method.startsWith('get') || method.startsWith('post') || method.startsWith('head') || method.startsWith('options'))) {
+    if (method && /\bhttp\//i.test(line)) {
       client.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
       stage = 'wait-upgrade';
       if (rest.length > 0) handleHttpLike(rest);
@@ -3292,11 +3621,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
-	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -3315,35 +3641,11 @@ func envInt(key string, fallback int) int {
 	if raw == "" {
 		return fallback
 	}
-	if strings.EqualFold(raw, "auto") {
-		return fallback
-	}
 	n, err := strconv.Atoi(raw)
 	if err != nil || n <= 0 {
 		return fallback
 	}
 	return n
-}
-
-func readMemGiB() int {
-	b, err := ioutil.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0
-	}
-	re := regexp.MustCompile(`(?m)^MemTotal:\s+([0-9]+)\s+kB$`)
-	m := re.FindStringSubmatch(string(b))
-	if len(m) != 2 {
-		return 0
-	}
-	kb, err := strconv.Atoi(m[1])
-	if err != nil || kb <= 0 {
-		return 0
-	}
-	gib := kb / (1024 * 1024)
-	if gib < 1 {
-		gib = 1
-	}
-	return gib
 }
 
 func writeAll(conn net.Conn, data []byte) error {
@@ -3385,21 +3687,6 @@ func flushReaderBufferedTo(reader *bufio.Reader, dst net.Conn) error {
 	return writeAll(dst, buf)
 }
 
-func isLikelyHttpMethod(first string) bool {
-	switch {
-	case strings.HasPrefix(first, "get "),
-		strings.HasPrefix(first, "post "),
-		strings.HasPrefix(first, "head "),
-		strings.HasPrefix(first, "options "),
-		strings.HasPrefix(first, "patch "),
-		strings.HasPrefix(first, "put "),
-		strings.HasPrefix(first, "delete "):
-		return true
-	default:
-		return false
-	}
-}
-
 func readHttpHeader(reader *bufio.Reader, maxHeaderBytes int) ([]byte, string, string, error) {
 	var raw bytes.Buffer
 	for {
@@ -3421,10 +3708,39 @@ func readHttpHeader(reader *bufio.Reader, maxHeaderBytes int) ([]byte, string, s
 	return raw.Bytes(), first, header, nil
 }
 
-func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, handshakeTimeoutSec int, maxHeaderBytes int, maxPreludeRequests int) {
+func looksHttpLike(first string) bool {
+	parts := strings.Fields(strings.ToLower(strings.TrimSpace(first)))
+	if len(parts) < 2 {
+		return false
+	}
+	if !strings.Contains(parts[len(parts)-1], "http/") {
+		return false
+	}
+	return true
+}
+
+func stripBufferedHttpJunk(reader *bufio.Reader) {
+	for i := 0; i < 2 && reader.Buffered() > 0; i++ {
+		n := reader.Buffered()
+		if n > 24 {
+			n = 24
+		}
+		peek, err := reader.Peek(n)
+		if err != nil {
+			return
+		}
+		p := strings.ToLower(strings.TrimSpace(string(peek)))
+		if !(strings.HasPrefix(p, "http/") || looksHttpLike(p)) {
+			return
+		}
+		_, _, _, _ = readHttpHeader(reader, 8192)
+	}
+}
+
+func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int) {
 	defer client.Close()
-	_ = client.SetReadDeadline(time.Now().Add(time.Duration(handshakeTimeoutSec) * time.Second))
 	reader := bufio.NewReaderSize(client, 64*1024)
+	afterConnect := false
 
 	peek, err := reader.Peek(4)
 	if err == nil && string(peek) == "SSH-" {
@@ -3432,7 +3748,6 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		if err != nil {
 			return
 		}
-		_ = client.SetReadDeadline(time.Time{})
 		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 			_ = sshUp.Close()
 			return
@@ -3441,32 +3756,54 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		return
 	}
 
-	for i := 0; i < maxPreludeRequests; i++ {
-		rawHeader, first, header, err := readHttpHeader(reader, maxHeaderBytes)
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	defer client.SetReadDeadline(time.Time{})
+
+	for i := 0; i < 8; i++ {
+		rawHeader, first, header, err := readHttpHeader(reader, 128*1024)
 		if err != nil {
 			return
 		}
 
-		// CONNECT mode from payload apps.
-		if strings.HasPrefix(first, "connect ") {
-			_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-			continue
-		}
-
-		if strings.Contains(header, "upgrade: websocket") || (strings.Contains(header, "upgrade:") && strings.Contains(header, "host:")) {
-			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-			if err != nil {
-				return
+	    if strings.HasPrefix(first, "connect ") {
+				_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+				afterConnect = true
+				continue
 			}
+
+			if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+				if err != nil {
+					return
+				}
+				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+			stripBufferedHttpJunk(reader)
 			_ = client.SetReadDeadline(time.Time{})
-			_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
 			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 				_ = sshUp.Close()
 				return
 			}
-			tunnelBoth(client, sshUp)
-			return
-		}
+				tunnelBoth(client, sshUp)
+				return
+			}
+
+			// Mode longgar SSL-only: setelah CONNECT, request HTTP lanjutan
+			// tanpa header Upgrade yang rapi tetap diarahkan jadi tunnel SSH.
+			if afterConnect && looksHttpLike(first) {
+				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+				if err != nil {
+					return
+				}
+				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+				stripBufferedHttpJunk(reader)
+				_ = client.SetReadDeadline(time.Time{})
+				if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+					_ = sshUp.Close()
+					return
+				}
+				tunnelBoth(client, sshUp)
+				return
+			}
 
 		// keep API and xray ws paths reachable through the same mux.
 		if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
@@ -3487,12 +3824,10 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			return
 		}
 
-		// Keep-alive response for staged payloads like:
-		// GET / ... then PATCH / ... Upgrade: websocket.
-		if isLikelyHttpMethod(first) {
-			_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
-			continue
-		}
+			if looksHttpLike(first) {
+				_, _ = client.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"))
+				continue
+			}
 
 		// fallback to raw SSH.
 		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
@@ -3513,67 +3848,19 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 	}
 }
 
-type autoProfile struct {
-	maxConns            int
-	handshakeTimeoutSec int
-	maxHeaderBytes      int
-	maxPreludeRequests  int
-}
-
-func pickAutoProfile() autoProfile {
-	cpu := runtime.NumCPU()
-	if cpu < 1 {
-		cpu = 1
-	}
-
-	memGiB := readMemGiB()
-	switch {
-	case cpu <= 1 || (memGiB > 0 && memGiB <= 1):
-		return autoProfile{maxConns: 384, handshakeTimeoutSec: 15, maxHeaderBytes: 131072, maxPreludeRequests: 10}
-	case cpu <= 2 || (memGiB > 0 && memGiB <= 2):
-		return autoProfile{maxConns: 768, handshakeTimeoutSec: 12, maxHeaderBytes: 131072, maxPreludeRequests: 8}
-	case cpu >= 4 && memGiB >= 6:
-		return autoProfile{maxConns: 1536, handshakeTimeoutSec: 10, maxHeaderBytes: 131072, maxPreludeRequests: 8}
-	default:
-		max := cpu * 384
-		if max < 512 {
-			max = 512
-		}
-		return autoProfile{maxConns: max, handshakeTimeoutSec: 12, maxHeaderBytes: 131072, maxPreludeRequests: 8}
-	}
-}
-
 func main() {
 	port := envInt("SSH_WS_PORT", 2082)
 	sshHost := envOr("SSH_WS_TARGET_HOST", "127.0.0.1")
 	sshPort := envInt("SSH_WS_TARGET_PORT", 109)
 	httpHost := envOr("SSH_HTTP_BACKEND_HOST", "127.0.0.1")
 	httpPort := envInt("SSH_HTTP_BACKEND_PORT", 80)
-	profile := pickAutoProfile()
-	maxConns := envInt("SSH_WS_MAX_CONNS", profile.maxConns)
-	handshakeTimeoutSec := envInt("SSH_WS_HANDSHAKE_TIMEOUT_SECONDS", profile.handshakeTimeoutSec)
-	maxHeaderBytes := envInt("SSH_WS_MAX_HEADER_BYTES", profile.maxHeaderBytes)
-	maxPreludeRequests := envInt("SSH_WS_MAX_PRELUDE_REQUESTS", profile.maxPreludeRequests)
-	if maxConns < 32 {
-		maxConns = 32
-	}
-	if handshakeTimeoutSec < 3 {
-		handshakeTimeoutSec = 3
-	}
-	if maxHeaderBytes < 8192 {
-		maxHeaderBytes = 8192
-	}
-	if maxPreludeRequests < 2 {
-		maxPreludeRequests = 2
-	}
-	sem := make(chan struct{}, maxConns)
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d (max_conns=%d, hs_timeout=%ds, max_header=%d, prelude=%d)\n", port, sshHost, sshPort, httpHost, httpPort, maxConns, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests)
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d\n", port, sshHost, sshPort, httpHost, httpPort)
 
 	for {
 		conn, err := ln.Accept()
@@ -3581,15 +3868,7 @@ func main() {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		select {
-		case sem <- struct{}{}:
-			go func(c net.Conn) {
-				defer func() { <-sem }()
-				handleConn(c, sshHost, sshPort, httpHost, httpPort, handshakeTimeoutSec, maxHeaderBytes, maxPreludeRequests)
-			}(conn)
-		default:
-			_ = conn.Close()
-		}
+		go handleConn(conn, sshHost, sshPort, httpHost, httpPort)
 	}
 }
 EOF
@@ -3609,6 +3888,7 @@ write_iplimit_checker() {
   log "Menulis checker limit IP otomatis..."
   cat > "${APP_DIR}/iplimit-checker.js" <<'EOF'
 const fs = require('fs');
+const http = require('http');
 const https = require('https');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
@@ -3624,6 +3904,13 @@ const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
+const BOT_ACCOUNT_EVENT_WEBHOOK_URL = String(process.env.BOT_ACCOUNT_EVENT_WEBHOOK_URL || '').trim();
+const BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN = String(
+  process.env.BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN ||
+  process.env.AUTH_TOKEN ||
+  process.env.API_AUTH_TOKEN ||
+  ''
+).trim();
 const ACTIVE_UDP_BACKEND = String(process.env.ACTIVE_UDP_BACKEND || '').trim().toLowerCase();
 const CHECK_INTERVAL_MINUTES_RAW = Number(process.env.IPLIMIT_CHECK_INTERVAL_MINUTES || 10);
 const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CHECK_INTERVAL_MINUTES_RAW > 0
@@ -3739,10 +4026,85 @@ function telegramNotify(text) {
   });
 }
 
-async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null) {
+function postJson(urlRaw, payload, token = '') {
+  return new Promise((resolve) => {
+    if (!urlRaw || !payload) return resolve(false);
+    let url;
+    try {
+      url = new URL(urlRaw);
+    } catch (_) {
+      return resolve(false);
+    }
+    if (!['http:', 'https:'].includes(url.protocol)) return resolve(false);
+    const body = JSON.stringify(payload);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    };
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+      headers['X-SC-Event-Token'] = token;
+    }
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: `${url.pathname || '/'}${url.search || ''}`,
+      method: 'POST',
+      headers
+    }, (res) => {
+      res.on('data', () => {});
+      res.on('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300));
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(4500, () => {
+      try { req.destroy(); } catch (_) {}
+      resolve(false);
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function notifyAccountBotMultiLogin(event) {
   try {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    if (!BOT_ACCOUNT_EVENT_WEBHOOK_URL || !BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN) return false;
+    return await postJson(BOT_ACCOUNT_EVENT_WEBHOOK_URL, event, BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null, extra = null) {
+  try {
     const list = Array.isArray(ips) ? ips.filter(Boolean).slice(0, 8) : [];
+    const ownerIdNum = Number(ownerId || 0);
+    const ownerChatIdNum = Number(ownerChatId || 0);
+    const hasOwnerTarget = ownerIdNum > 0 || ownerChatIdNum > 0;
+    const rawDetected = Number(extra?.detected_raw || 0);
+    const effectiveDetected = Number(extra?.detected_effective || Number(detected || 0));
+    const deviceDetectedLabel = String(extra?.device_detected_label || '').trim();
+    const event = {
+      event: 'MULTI_LOGIN',
+      action: 'LOCK_TMP',
+      service: String(service || '-').toUpperCase(),
+      username: String(username || '-'),
+      limitip: Number(limitip || 0),
+      detected: Number(detected || 0),
+      detected_raw: rawDetected > 0 ? rawDetected : null,
+      detected_effective: effectiveDetected > 0 ? effectiveDetected : Number(detected || 0),
+      device_detected_label: deviceDetectedLabel || null,
+      ips: list,
+      unlock_minutes: Number(LOCK_MINUTES || 15),
+      owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
+      owner_telegram_chat_id: ownerChatIdNum > 0 ? ownerChatIdNum : (ownerIdNum > 0 ? ownerIdNum : null),
+      occurred_at: new Date().toISOString()
+    };
+    if (hasOwnerTarget) {
+      await notifyAccountBotMultiLogin(event);
+    }
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const msg =
       `SC 1FORCR NOTIF\n` +
       `Event    : MULTI_LOGIN\n` +
@@ -3751,6 +4113,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       `Username : ${String(username || '-')}\n` +
       `Limit IP : ${Number(limitip || 0)}\n` +
       `Detected : ${Number(detected || 0)}\n` +
+      `${deviceDetectedLabel ? `Info     : ${deviceDetectedLabel}\n` : ''}` +
       `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
       `Unlock   : ${Number(LOCK_MINUTES || 15)} menit\n` +
       `TG User  : ${ownerId || '-'}\n` +
@@ -4717,6 +5080,34 @@ function listCurrentTcpDropRuleIps(port, ipv6 = false) {
   return set;
 }
 
+function listCurrentTcpDropRuleIpsNft(port, ipv6 = false) {
+  const set = new Set();
+  if (!safeExec('nft', ['list', 'ruleset'])) return set;
+  const candidates = [
+    ['inet', 'filter', 'input'],
+    ['ip', 'filter', 'input']
+  ];
+  const dport = String(port);
+  const familyToken = ipv6 ? 'ip6 saddr' : 'ip saddr';
+  for (const chain of candidates) {
+    const out = readExec('nft', ['list', 'chain', ...chain]);
+    if (!out) continue;
+    for (const lineRaw of String(out).split('\n')) {
+      const line = String(lineRaw || '').trim();
+      if (!line || !line.includes(familyToken)) continue;
+      if (!line.includes(' tcp ')) continue;
+      if (!line.includes(` dport ${dport} `)) continue;
+      if (!line.includes(' drop')) continue;
+      const re = ipv6 ? /ip6 saddr\s+([0-9a-fA-F:]+)/ : /ip saddr\s+([0-9.]+)/;
+      const m = line.match(re);
+      const src = normalizeRuleSource(m?.[1] || '');
+      if (!src) continue;
+      set.add(src);
+    }
+  }
+  return set;
+}
+
 async function cleanupOrphanXrayDropRules() {
   const expectedRows = await all(
     "SELECT DISTINCT ip FROM temp_ip_lock_ips WHERE account_type IN ('vmess','vless','trojan')"
@@ -4729,13 +5120,19 @@ async function cleanupOrphanXrayDropRules() {
 
   let removed = 0;
   for (const p of XRAY_BLOCK_TCP_PORTS) {
-    const ipv4Set = listCurrentTcpDropRuleIps(p, false);
+    const ipv4Set = new Set([
+      ...Array.from(listCurrentTcpDropRuleIps(p, false)),
+      ...Array.from(listCurrentTcpDropRuleIpsNft(p, false))
+    ]);
     for (const ip of ipv4Set) {
       if (expected.has(ip)) continue;
       removeTcpDropRule(ip, p);
       removed += 1;
     }
-    const ipv6Set = listCurrentTcpDropRuleIps(p, true);
+    const ipv6Set = new Set([
+      ...Array.from(listCurrentTcpDropRuleIps(p, true)),
+      ...Array.from(listCurrentTcpDropRuleIpsNft(p, true))
+    ]);
     for (const ip of ipv6Set) {
       if (expected.has(ip)) continue;
       removeTcpDropRule(ip, p);
@@ -5098,9 +5495,19 @@ async function lockIfExceeded(nowTs) {
     const cntZivpnLive = setMaxSize(sshZivpnLiveSessionMap);
     const cntZivpnLiveIp = setMaxSize(sshZivpnLiveIpMap);
     const hasLiveZivpn = cntZivpnLive > 0 || cntZivpnLiveIp > 0;
-    const cntZivpnEffective = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
+    const cntZivpnRaw = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
       ? Math.max(cntZivpnLive, cntZivpnLiveIp)
       : Math.max(cntZivpn, cntZivpnIp, cntZivpnLive, cntZivpnLiveIp);
+    // Normalisasi khusus ZIVPN (permintaan operasional):
+    // 1-2 IP aktif => hitung 1
+    // 3-4 IP aktif => hitung 2
+    // >=5 IP aktif => hitung normal
+    let cntZivpnEffective = cntZivpnRaw;
+    if (cntZivpnRaw > 0 && cntZivpnRaw <= 2) {
+      cntZivpnEffective = 1;
+    } else if (cntZivpnRaw >= 3 && cntZivpnRaw <= 4) {
+      cntZivpnEffective = 2;
+    }
     // Sumber realtime utama:
     // - ipMap/sessionMap untuk SSH normal
     // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
@@ -5110,9 +5517,14 @@ async function lockIfExceeded(nowTs) {
     // recent sudah dedup berdasarkan source IP, jadi tidak overcount karena port reconnect.
     const cntProcHint = Math.min(Math.max(cntProc, 0), 3);
     const cntRecentHint = Math.min(Math.max(cntRecent, 0), 3);
-    const cnt = Math.max(cntActive, cntProcHint, cntRecentHint);
+    // Untuk mode ZIVPN HTTP, hitung final diprioritaskan dari sesi aktif realtime
+    // agar mobile handoff 1 HP (IP cepat berganti) tidak false multi-login karena hint historis.
+    const cntHint = Math.max(cntProcHint, cntRecentHint);
+    const cnt = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
+      ? cntActive
+      : Math.max(cntActive, cntHint);
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
     }
     if (cnt <= lim) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;
@@ -5159,6 +5571,10 @@ async function lockIfExceeded(nowTs) {
     if (udphcSecretChanged) udpcustomChanged = true;
     await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + LOCK_SECONDS, removed]).catch(() => {});
+    let zivpnNotifyLabel = '';
+    if (ZIVPN_AUTH_MODE === 'http' && lim === 1 && cntZivpnRaw >= 4 && cntZivpnEffective === 2) {
+      zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
+    }
     await notifyMultiLoginLock(
       'ssh/zivpn',
       user,
@@ -5166,7 +5582,12 @@ async function lockIfExceeded(nowTs) {
       cnt,
       lockIps,
       Number(r.owner_telegram_id || 0) || null,
-      Number(r.owner_telegram_chat_id || 0) || null
+      Number(r.owner_telegram_chat_id || 0) || null,
+      {
+        detected_raw: cntZivpnRaw,
+        detected_effective: cntZivpnEffective,
+        device_detected_label: zivpnNotifyLabel
+      }
     );
   }
 
@@ -5812,6 +6233,17 @@ for item in payload["data"]["ssh"]:
     ssh_users.append(u)
 payload["data"]["zivpn_auth"] = ssh_users
 
+# Kompatibilitas lintas script:
+# - SC 1FORCR menyimpan kredensial trojan di field "password"
+# - beberapa script lain memakai field "uuid"
+# Saat export backup, kirim keduanya agar restore silang mulus.
+for item in payload["data"].get("trojan", []):
+    if not isinstance(item, dict):
+        continue
+    trojan_secret = str(item.get("password", "") or "").strip()
+    if trojan_secret and not str(item.get("uuid", "") or "").strip():
+        item["uuid"] = trojan_secret
+
 try:
     with open("/etc/sc-1forcr/banner.html", "r", encoding="utf-8") as f:
         payload["data"]["banner_html"] = f.read()
@@ -5967,6 +6399,9 @@ def to_int(v, d=0):
     except Exception:
         return d
 
+def pick_limitip(r):
+    return to_int((r or {}).get("limitip", (r or {}).get("limit_ip", 0)), 0)
+
 def restored_status(_raw):
     # Restore akun dipaksa aktif agar langsung usable setelah import.
     return "AKTIF"
@@ -5995,7 +6430,7 @@ def upsert_ssh(rows):
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
-                to_int((r or {}).get("limitip", 0)),
+                pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
@@ -6025,7 +6460,7 @@ def upsert_uuid(table, rows):
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
-                to_int((r or {}).get("limitip", 0)),
+                pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
@@ -6036,6 +6471,16 @@ def upsert_trojan(rows):
         u = str((r or {}).get("username", "")).strip()
         if not u:
             continue
+        # Kompatibilitas:
+        # - backup native: pakai "password"
+        # - backup script lain: pakai "uuid"
+        trojan_secret = str((r or {}).get("password", "")).strip()
+        if not trojan_secret:
+            trojan_secret = str((r or {}).get("uuid", "")).strip()
+        if not trojan_secret:
+            trojan_secret = str((r or {}).get("id", "")).strip()
+        if not trojan_secret:
+            trojan_secret = str((r or {}).get("secret", "")).strip()
         cur.execute(
             """
             INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id)
@@ -6051,11 +6496,11 @@ def upsert_trojan(rows):
             """,
             (
                 u,
-                str((r or {}).get("password", "")),
+                trojan_secret,
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
-                to_int((r or {}).get("limitip", 0)),
+                pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
@@ -6291,7 +6736,10 @@ ssh_users="$(
   tmp_ss_pid_ip="$(mktemp)"
   tmp_pid_user="$(mktemp)"
   tmp_pair="$(mktemp)"
-  trap 'rm -f "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}"' RETURN
+  tmp_db_ports="$(mktemp)"
+  tmp_db_pids="$(mktemp)"
+  tmp_recent="$(mktemp)"
+  trap 'rm -f "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_db_ports:-}" "${tmp_db_pids:-}" "${tmp_recent:-}"' RETURN
 
   ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
     {
@@ -6333,7 +6781,7 @@ ssh_users="$(
             sub(/\].*$/, "", u)
           } else next
           u=tolower(u)
-          if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") print pid, u
+          if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net" && u != "unknown") print pid, u
         }' > "${tmp_pid_user}" || true
 
       awk '
@@ -6345,9 +6793,101 @@ ssh_users="$(
     fi
   fi
 
+  # Fallback 1: active port -> map dari auth dropbear.
+  if [[ ! -s "${tmp_pair}" ]]; then
+    ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
+      function p(v,   s,n,a,port) {
+        s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+        n=split(s, a, ":"); port=a[n];
+        if (port ~ /^[0-9]{1,5}$/) return port;
+        return "";
+      }
+      {
+        lp=p($4); rp=p($5);
+        if (lp==p1 || lp==p2) { if (rp ~ /^[0-9]{1,5}$/) act[rp]=1; }
+        else if (rp==p1 || rp==p2) { if (lp ~ /^[0-9]{1,5}$/) act[lp]=1; }
+      }
+      END { for (k in act) print k; }' > "${tmp_db_ports}" || true
+    if [[ -s "${tmp_db_ports}" ]]; then
+      journalctl -u dropbear --since "-30 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" --no-pager 2>/dev/null | awk '
+        NR==FNR { ap[$1]=1; next }
+        /auth succeeded for /{
+          u=$0;
+          sub(/^.*auth succeeded for /,"",u);
+          sub(/^'\''/,"",u); sub(/^"/,"",u);
+          sub(/'\''.*/,"",u); sub(/".*/,"",u);
+          sub(/[[:space:]].*$/,"",u);
+          u=tolower(u);
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
+          src=$0; sub(/^.* from /, "", src); gsub(/[[:space:]]+$/, "", src);
+          port=src; sub(/^.*:/, "", port);
+          if (!(port in ap)) next;
+          c[u]++;
+        }
+        END { for (u in c) print u, c[u]; }' "${tmp_db_ports}" - > "${tmp_recent}" || true
+      if [[ -s "${tmp_recent}" ]]; then
+        awk '{ printf "%s(%d)\n", $1, ($2+0) }' "${tmp_recent}" | sort
+        exit 0
+      fi
+    fi
+  fi
+
+  # Fallback 2: process list.
+  if [[ ! -s "${tmp_pair}" ]]; then
+    ps -eo args= 2>/dev/null | awk '
+      {
+        u="";
+        if ($0 ~ /^sshd:[[:space:]]+/) {
+          if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/) next;
+          u=$0; sub(/^sshd:[[:space:]]*/, "", u); sub(/[[:space:]].*$/, "", u); sub(/@.*$/, "", u); sub(/\[.*$/, "", u);
+        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+          u=$0; sub(/^.*\[/, "", u); sub(/\].*$/, "", u);
+        } else next;
+        u=tolower(u);
+        if (u ~ /^[a-z0-9._-]+$/ && u!="root" && u!="priv" && u!="net" && u!="unknown") c[u]++;
+      }
+      END { for (u in c) printf "%s(%d)\n", u, c[u]; }' | sort
+    exit 0
+  fi
+
+  # Primary
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/) c[$1]++ } END { for (u in c) printf "%s(%d)\n", u, c[u] }' "${tmp_pair}" | sort || true
 )"
 ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
+if [[ "${ssh_cnt}" -eq 0 ]]; then
+  ssh_users="$(
+    journalctl -u dropbear --since "-3 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" --no-pager 2>/dev/null | awk '
+      function parse_pid(line,   p) {
+        if (match(line, /\[[0-9]+\]/)) {
+          p=substr(line, RSTART+1, RLENGTH-2);
+          if (p ~ /^[0-9]+$/) return p;
+        }
+        return "";
+      }
+      /auth succeeded for /{
+        pid=parse_pid($0);
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
+        if (pid != "") auth_by_pid[pid]=u; else auth_no_pid[u]=1;
+        next;
+      }
+      /Exit \(|Exit before auth:/{
+        pid=parse_pid($0);
+        if (pid != "") closed_pid[pid]=1;
+      }
+      END{
+        for (pid in auth_by_pid) if (!(pid in closed_pid)) seen[auth_by_pid[pid]]++;
+        for (u in auth_no_pid) seen[u]++;
+        for (u in seen) printf "%s(%d)\n", u, seen[u];
+      }' | sort
+  )"
+  ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
+fi
 
 xray_users=""
 xray_cnt=0
@@ -6398,7 +6938,7 @@ if [[ -f /var/log/xray/access.log ]]; then
       }
       END {
         for (k in seen) {
-          split(k, a, "|")
+          split(k, a, /\|/)
           user=a[1]
           ipcnt[user]++
         }
@@ -6449,7 +6989,7 @@ udphc_users="$(journalctl -u "${udphc_service}" -n 12000 -o short-unix --no-page
     END {
       for (k in ses) {
         if ((now - seen[k]) > win) continue
-        split(k, a, "|")
+        split(k, a, /\|/)
         if (a[1] != "") c[a[1]]++
       }
       for (u in c) printf "%s(%d)\n", u, c[u]
@@ -6674,6 +7214,8 @@ DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
+BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
 AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
@@ -6719,12 +7261,38 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-source /etc/sc-1forcr.env
+sanitize_env_file() {
+  local file="$1" tmp
+  [[ -f "${file}" ]] || return 0
+  tmp="$(mktemp)"
+  awk '
+    /^[[:space:]]*$/ { print; next }
+    /^[[:space:]]*#/ { print; next }
+    /^[A-Za-z_][A-Za-z0-9_]*=.*/ { print; next }
+    { next }
+  ' "${file}" > "${tmp}" && mv -f "${tmp}" "${file}"
+}
+
+safe_source_env_file() {
+  local file="$1"
+  [[ -f "${file}" ]] || return 0
+  sanitize_env_file "${file}"
+  # shellcheck disable=SC1090
+  source "${file}"
+}
+
+safe_source_env_file /etc/sc-1forcr.env
 AUTH_TOKEN="${AUTH_TOKEN:-${API_AUTH_TOKEN:-}}"
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
+SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
+SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
+SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
+SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
+XRAY_MONITOR_ACTIVE_WINDOW_SECONDS="${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-15}"
+XRAY_MONITOR_RECENT_WINDOW_MINUTES="${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
@@ -6733,20 +7301,139 @@ DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" |
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_CHECKER="$(echo "${UDPHC_LOG_LINES_CHECKER:-6000}" | tr -cd '0-9')"
-xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-60}" | tr -cd '0-9')"
-xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-600}" | tr -cd '0-9')"
-xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
+  xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
+  xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
+  xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
+xray_monitor_active_window_sec="$(echo "${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-15}" | tr -cd '0-9')"
+xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
 [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
 [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
 [[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
 [[ -z "${UDPHC_LOG_LINES_CHECKER}" || "${UDPHC_LOG_LINES_CHECKER}" -lt 1000 ]] && UDPHC_LOG_LINES_CHECKER="6000"
-[[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="60"
-[[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="600"
-[[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="1"
+  [[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="5"
+  [[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="60"
+  [[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="2"
+[[ -z "${xray_monitor_active_window_sec}" || "${xray_monitor_active_window_sec}" -lt 5 || "${xray_monitor_active_window_sec}" -gt 120 ]] && xray_monitor_active_window_sec="15"
+[[ -z "${xray_monitor_recent_window_min}" || "${xray_monitor_recent_window_min}" -lt 1 || "${xray_monitor_recent_window_min}" -gt 60 ]] && xray_monitor_recent_window_min="5"
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
+
+# Compatibility helpers for older runtime files on upgraded VPS.
+flag_enabled() {
+  case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+tls_cert_domain() {
+  if flag_enabled "${WILDCARD_ENABLE:-0}" && [[ -n "${WILDCARD_BASE_DOMAIN:-}" ]]; then
+    echo "${WILDCARD_BASE_DOMAIN}"
+  else
+    echo "${DOMAIN}"
+  fi
+}
+
+issue_letsencrypt_cert() {
+  local certbot_email_arg cert_domain
+  cert_domain="$(tls_cert_domain)"
+  if [[ -z "${cert_domain}" ]]; then
+    echo "Domain sertifikat TLS kosong. Skip issue cert."
+    return 1
+  fi
+
+  if [[ -z "${EMAIL:-}" || "${EMAIL:-}" == "admin@example.com" || "${EMAIL:-}" == *"@example.com" ]]; then
+    certbot_email_arg="--register-unsafely-without-email"
+  else
+    certbot_email_arg="-m ${EMAIL}"
+  fi
+
+  if flag_enabled "${WILDCARD_ENABLE:-0}"; then
+    if [[ -z "${WILDCARD_BASE_DOMAIN:-}" || -z "${WILDCARD_CF_API_TOKEN:-}" ]]; then
+      echo "Wildcard aktif tapi WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN belum valid."
+      return 1
+    fi
+    if ! certbot --help plugins 2>/dev/null | grep -qi 'dns-cloudflare'; then
+      echo "Plugin certbot dns-cloudflare belum tersedia."
+      return 1
+    fi
+    mkdir -p /root/.secrets/certbot
+    cat > /root/.secrets/certbot/cloudflare.ini <<EOF
+dns_cloudflare_api_token = ${WILDCARD_CF_API_TOKEN}
+EOF
+    chmod 600 /root/.secrets/certbot/cloudflare.ini
+    certbot certonly \
+      --dns-cloudflare \
+      --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
+      --dns-cloudflare-propagation-seconds 30 \
+      --cert-name "${WILDCARD_BASE_DOMAIN}" \
+      -d "${WILDCARD_BASE_DOMAIN}" \
+      -d "*.${WILDCARD_BASE_DOMAIN}" \
+      --non-interactive --agree-tos ${certbot_email_arg}
+    return $?
+  fi
+
+  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}
+}
+
+prepare_haproxy_pem() {
+  local cert_domain fullchain privkey pem
+  cert_domain="$(tls_cert_domain)"
+  fullchain="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
+  privkey="/etc/letsencrypt/live/${cert_domain}/privkey.pem"
+  pem="/etc/haproxy/certs/${cert_domain}.pem"
+
+  mkdir -p /etc/haproxy/certs
+  if [[ -s "${fullchain}" && -s "${privkey}" ]]; then
+    cat "${fullchain}" "${privkey}" > "${pem}" || return 1
+    chmod 600 "${pem}" || true
+    echo "${pem}"
+    return 0
+  fi
+
+  echo "Cert Let's Encrypt untuk ${cert_domain} belum ada. Pakai self-signed sementara agar 443 tetap aktif." >&2
+  openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3 \
+    -subj "/CN=${cert_domain}" \
+    -keyout "/etc/haproxy/certs/${cert_domain}.key" \
+    -out "/etc/haproxy/certs/${cert_domain}.crt" >/dev/null 2>&1 || return 1
+  cat "/etc/haproxy/certs/${cert_domain}.crt" "/etc/haproxy/certs/${cert_domain}.key" > "${pem}" || return 1
+  chmod 600 "${pem}" || true
+  echo "${pem}"
+  return 0
+}
+
+fw_persist_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+    return 0
+  fi
+  if command -v nft >/dev/null 2>&1 && systemctl is-enabled --quiet nftables 2>/dev/null; then
+    nft list ruleset >/etc/nftables.conf 2>/dev/null || true
+  fi
+  return 0
+}
+
+ensure_sshws_firewall_allow_rules() {
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -w 10 -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || iptables -w 10 -I INPUT -i lo -j ACCEPT
+    iptables -w 10 -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -w 10 -C INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT
+  fi
+  fw_persist_rules
+}
+
+get_hc_auth_lookback_hours() {
+  local v
+  v="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-6}" | tr -cd '0-9')"
+  [[ -z "${v}" || "${v}" -lt 1 || "${v}" -gt 48 ]] && v="6"
+  echo "${v}"
+}
+
 normalize_xray_paths_csv() {
   local raw fallback p normalized out
   raw="${1:-}"
@@ -6822,12 +7509,14 @@ api_call() {
 }
 
 telegram_notify() {
-  local text="$1"
-  [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
-  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  local text="$1" resp
+  [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" || -z "${text:-}" ]] && return 1
+  resp="$(curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${TELEGRAM_CHAT_ID}" \
     -d "disable_web_page_preview=true" \
-    --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+    --data-urlencode "text=${text}" 2>/dev/null || true)"
+  [[ -z "${resp}" ]] && return 1
+  echo "${resp}" | jq -e '.ok == true' >/dev/null 2>&1
 }
 
 telegram_notify_action() {
@@ -6870,6 +7559,7 @@ mask_secret() {
 
 update_sc_env_var() {
   local key="$1" value="$2" tmp
+  sanitize_env_file /etc/sc-1forcr.env
   tmp="$(mktemp)"
   awk -v k="${key}" -v v="${value}" '
     BEGIN { done=0 }
@@ -6889,6 +7579,7 @@ update_app_env_var() {
   if [[ ! -f "${app_env}" ]]; then
     return 0
   fi
+  sanitize_env_file "${app_env}"
   tmp="$(mktemp)"
   awk -v k="${key}" -v v="${value}" '
     BEGIN { done=0 }
@@ -6937,13 +7628,13 @@ EOF
 }
 
 pick_type() {
-  echo "Pilih tipe:" >&2
-  echo "0) kembali" >&2
-  echo "1) ssh" >&2
-  echo "2) vmess" >&2
-  echo "3) vless" >&2
-  echo "4) trojan" >&2
-  echo "5) zivpn" >&2
+  draw_menu_panel "Pilih tipe:" \
+    "0) kembali" \
+    "1) ssh" \
+    "2) vmess" \
+    "3) vless" \
+    "4) trojan" \
+    "5) zivpn" >&2
   if ! prompt_input t "Input [0-5]: "; then
     echo ""
     return 0
@@ -7298,7 +7989,11 @@ print_account_picker_table() {
   [[ -z "${table}" ]] && return 1
   where=""
   if [[ "${lock_only}" == "1" ]]; then
-    where="WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')"
+    where="WHERE LOWER(username) IN (
+      SELECT LOWER(username) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+      UNION
+      SELECT LOWER(username) FROM temp_ip_locks WHERE account_type='${type}' AND locked_until > strftime('%s','now')
+    )"
   fi
   rows="$(sqlite3 -separator '|' "$DB_PATH" \
     "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday(date('now','localtime'))) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
@@ -7352,9 +8047,17 @@ pick_locked_username() {
   table="$(account_table_by_type "${type}")"
   [[ -z "${table}" ]] && return 1
 
-  rows="$(sqlite3 "$DB_PATH" "SELECT username FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') ORDER BY username;" 2>/dev/null || true)"
+  rows="$(sqlite3 "$DB_PATH" "
+    SELECT username FROM (
+      SELECT username FROM ${table}
+      WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+      UNION
+      SELECT username FROM temp_ip_locks
+      WHERE account_type='${type}' AND locked_until > strftime('%s','now')
+    ) ORDER BY username;
+  " 2>/dev/null || true)"
   if [[ -z "${rows}" ]]; then
-    echo "Tidak ada akun ${type} dengan status LOCK/LOCK_TMP." >&2
+    echo "Tidak ada akun ${type} yang sedang lock." >&2
     return 1
   fi
 
@@ -7411,6 +8114,202 @@ Quota        : ${quota}
 IP Limit     : ${limitip}
 EOT_RENEW
   telegram_notify_action "RENEW" "${type}" "${username}"
+}
+
+sync_xray_from_summary_api() {
+  local type="$1" body resp ok msg
+  if [[ -z "${type}" ]]; then
+    echo "sync xray skip: type kosong"
+    return 1
+  fi
+  body="$(jq -nc --arg t "${type}" '{type:$t,restart:false}')"
+  resp="$(curl -sS -X POST "http://127.0.0.1:8789/internal/sync-xray-from-db" \
+    -H "x-sync-token: ${AUTH_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "${body}" 2>/dev/null || true)"
+  ok="$(echo "${resp}" | jq -r '.ok // false' 2>/dev/null || echo "false")"
+  if [[ "${ok}" != "true" ]]; then
+    msg="$(echo "${resp}" | jq -r '.message // "gagal sync xray"' 2>/dev/null || echo "gagal sync xray")"
+    echo "XRAY sync ${type^^} gagal: ${msg}"
+    return 1
+  fi
+  return 0
+}
+
+apply_xray_restart_from_summary_api() {
+  local resp ok msg
+  resp="$(curl -sS -X POST "http://127.0.0.1:8789/internal/apply-xray-restart" \
+    -H "x-sync-token: ${AUTH_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{}' 2>/dev/null || true)"
+  ok="$(echo "${resp}" | jq -r '.ok // false' 2>/dev/null || echo "false")"
+  if [[ "${ok}" != "true" ]]; then
+    msg="$(echo "${resp}" | jq -r '.message // "gagal restart xray"' 2>/dev/null || echo "gagal restart xray")"
+    echo "XRAY restart gagal via Summary API: ${msg}"
+    return 1
+  fi
+  return 0
+}
+
+extend_expired_all_accounts() {
+  local days ans changed_ssh changed_vmess changed_vless changed_trojan
+  local total_changed sync_ok
+  echo "TAMBAH MASA AKTIF SEMUA AKUN (SSH/VMESS/VLESS/TROJAN)"
+  prompt_input days "Tambah masa aktif (hari) [30]: " || return
+  days="${days:-30}"
+  if [[ ! "${days}" =~ ^[0-9]+$ || "${days}" -lt 1 || "${days}" -gt 3650 ]]; then
+    echo "Jumlah hari tidak valid. Gunakan angka 1-3650."
+    return
+  fi
+  if ! prompt_input ans "Lanjutkan tambah masa aktif ${days} hari untuk semua akun? [y/N]: "; then
+    return
+  fi
+  ans="$(echo "${ans}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  [[ "${ans}" != "y" && "${ans}" != "yes" ]] && { echo "Dibatalkan."; return; }
+
+  if ! sqlite3 "${DB_PATH}" "
+BEGIN IMMEDIATE;
+UPDATE account_sshs
+SET date_exp = CASE
+  WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
+    THEN date('now','localtime','+${days} day')
+  ELSE date(date_exp,'+${days} day')
+END;
+SELECT changes();
+UPDATE account_vmesses
+SET date_exp = CASE
+  WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
+    THEN date('now','localtime','+${days} day')
+  ELSE date(date_exp,'+${days} day')
+END;
+SELECT changes();
+UPDATE account_vlesses
+SET date_exp = CASE
+  WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
+    THEN date('now','localtime','+${days} day')
+  ELSE date(date_exp,'+${days} day')
+END;
+SELECT changes();
+UPDATE account_trojans
+SET date_exp = CASE
+  WHEN date(COALESCE(date_exp,'')) IS NULL OR date(date_exp) < date('now','localtime')
+    THEN date('now','localtime','+${days} day')
+  ELSE date(date_exp,'+${days} day')
+END;
+SELECT changes();
+COMMIT;
+" > /tmp/sc_extend_all_changes.$$ 2>/tmp/sc_extend_all_err.$$; then
+    echo "Gagal update masa aktif semua akun."
+    cat /tmp/sc_extend_all_err.$$ 2>/dev/null || true
+    rm -f /tmp/sc_extend_all_changes.$$ /tmp/sc_extend_all_err.$$
+    return
+  fi
+
+  mapfile -t __chg < /tmp/sc_extend_all_changes.$$ || true
+  changed_ssh="${__chg[0]:-0}"
+  changed_vmess="${__chg[1]:-0}"
+  changed_vless="${__chg[2]:-0}"
+  changed_trojan="${__chg[3]:-0}"
+  rm -f /tmp/sc_extend_all_changes.$$ /tmp/sc_extend_all_err.$$
+
+  [[ "${changed_ssh}" =~ ^[0-9]+$ ]] || changed_ssh="0"
+  [[ "${changed_vmess}" =~ ^[0-9]+$ ]] || changed_vmess="0"
+  [[ "${changed_vless}" =~ ^[0-9]+$ ]] || changed_vless="0"
+  [[ "${changed_trojan}" =~ ^[0-9]+$ ]] || changed_trojan="0"
+  total_changed=$((changed_ssh + changed_vmess + changed_vless + changed_trojan))
+
+  sync_ok=1
+  if ! sync_xray_from_summary_api "vmess"; then sync_ok=0; fi
+  if ! sync_xray_from_summary_api "vless"; then sync_ok=0; fi
+  if ! sync_xray_from_summary_api "trojan"; then sync_ok=0; fi
+  if [[ "${sync_ok}" -eq 1 ]]; then
+    apply_xray_restart_from_summary_api || sync_ok=0
+  fi
+
+  echo "Berhasil tambah masa aktif ${days} hari untuk semua akun."
+  echo "- SSH    : ${changed_ssh} akun"
+  echo "- VMESS  : ${changed_vmess} akun"
+  echo "- VLESS  : ${changed_vless} akun"
+  echo "- TROJAN : ${changed_trojan} akun"
+  echo "Total    : ${total_changed} akun"
+  if [[ "${sync_ok}" -eq 1 ]]; then
+    echo "XRAY sync+restart: OK"
+  else
+    echo "XRAY sync+restart: ada yang gagal (cek log di atas)."
+  fi
+}
+
+edit_uuid_xray_account() {
+  local type username username_sql new_uuid row old_uuid
+  echo "EDIT ID XRAY (VMESS/VLESS/TROJAN)"
+  draw_menu_panel "Pilih tipe Xray:" \
+    "1) VMESS" \
+    "2) VLESS" \
+    "3) TROJAN" \
+    "0) Kembali"
+  if ! prompt_input type "Input [0-3]: "; then
+    return
+  fi
+  case "${type}" in
+    0) return ;;
+    1) type="vmess" ;;
+    2) type="vless" ;;
+    3) type="trojan" ;;
+    *) echo "Pilihan tidak valid."; return ;;
+  esac
+
+  username="$(pick_existing_username "${type}")" || return
+  username_sql="${username//\'/''}"
+  if [[ "${type}" == "vmess" ]]; then
+    row="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT uuid FROM account_vmesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+  elif [[ "${type}" == "vless" ]]; then
+    row="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT uuid FROM account_vlesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+  else
+    row="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT password FROM account_trojans WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+  fi
+  old_uuid="$(echo "${row}" | head -n1 | xargs)"
+  echo "Username : ${username}"
+  if [[ "${type}" == "trojan" ]]; then
+    echo "Password lama: ${old_uuid:--}"
+  else
+    echo "UUID lama: ${old_uuid:--}"
+  fi
+  prompt_input new_uuid "ID baru (min 3 huruf/angka): " || return
+  new_uuid="$(echo "${new_uuid}" | tr -d '\r' | xargs)"
+  if [[ ! "${new_uuid}" =~ ^[A-Za-z0-9]{3,}$ ]]; then
+    echo "Format tidak valid. Gunakan minimal 3 karakter huruf/angka."
+    return
+  fi
+
+  if [[ "${type}" == "vmess" ]]; then
+    sqlite3 "${DB_PATH}" "UPDATE account_vmesses SET uuid='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+      echo "Gagal update UUID VMESS."
+      return
+    }
+  elif [[ "${type}" == "vless" ]]; then
+    sqlite3 "${DB_PATH}" "UPDATE account_vlesses SET uuid='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+      echo "Gagal update UUID VLESS."
+      return
+    }
+  else
+    sqlite3 "${DB_PATH}" "UPDATE account_trojans SET password='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+      echo "Gagal update password TROJAN."
+      return
+    }
+  fi
+
+  if sync_xray_from_summary_api "${type}" && apply_xray_restart_from_summary_api; then
+    echo "Berhasil edit ID ${type^^}."
+    echo "Username : ${username}"
+    if [[ "${type}" == "trojan" ]]; then
+      echo "Password baru: ${new_uuid}"
+    else
+      echo "UUID baru: ${new_uuid}"
+    fi
+  else
+    echo "ID tersimpan di DB, tapi sync/restart Xray gagal."
+    echo "Coba jalankan lagi saat Summary API aktif."
+  fi
 }
 
 delete_account() {
@@ -7479,7 +8378,15 @@ unlock_all_accounts() {
     ep="$(endpoint_unlock "${type}")"
     [[ -z "${table}" || -z "${ep}" ]] && continue
 
-    rows="$(sqlite3 "${DB_PATH}" "SELECT username FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') ORDER BY username;" 2>/dev/null || true)"
+    rows="$(sqlite3 "${DB_PATH}" "
+      SELECT username FROM (
+        SELECT username FROM ${table}
+        WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+        UNION
+        SELECT username FROM temp_ip_locks
+        WHERE account_type='${type}' AND locked_until > strftime('%s','now')
+      ) ORDER BY username;
+    " 2>/dev/null || true)"
     [[ -z "${rows}" ]] && continue
 
     while IFS= read -r username; do
@@ -7538,13 +8445,13 @@ list_accounts() {
     done <<< "${rows}"
   }
 
-  echo "Pilih list akun:"
-  echo "1) SSH/ZIVPN/UDPHC"
-  echo "2) VMESS"
-  echo "3) VLESS"
-  echo "4) TROJAN"
-  echo "5) Semua"
-  echo "0) Kembali"
+  draw_menu_panel "Pilih list akun:" \
+    "1) SSH/ZIVPN/UDPHC" \
+    "2) VMESS" \
+    "3) VLESS" \
+    "4) TROJAN" \
+    "5) Semua" \
+    "0) Kembali"
   prompt_input l "Input [0-5]: " || return
   clear
 
@@ -7652,8 +8559,8 @@ Status       : ${d_status}
 Quota        : ${d_quota}
 Limit IP     : ${d_limit}
 Host         : ${DOMAIN}
-Link TLS     : vless://${d_uuid}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls&sni=${DOMAIN}#${d_user}
-Link NON TLS : vless://${d_uuid}@${DOMAIN}:80?type=ws&path=%2Fvless&security=none&sni=${DOMAIN}#${d_user}
+Link TLS     : vless://${d_uuid}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls&sni=${DOMAIN}&host=${DOMAIN}&encryption=none#${d_user}
+Link NON TLS : vless://${d_uuid}@${DOMAIN}:80?type=ws&path=%2Fvless&security=none&host=${DOMAIN}&encryption=none#${d_user}
 EOT_VLESS_DETAIL
       ;;
     trojan)
@@ -7675,8 +8582,8 @@ Status       : ${d_status}
 Quota        : ${d_quota}
 Limit IP     : ${d_limit}
 Host         : ${DOMAIN}
-Link TLS     : trojan://${d_pass}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls&sni=${DOMAIN}#${d_user}
-Link NON TLS : trojan://${d_pass}@${DOMAIN}:80?type=ws&path=%2Ftrojan&security=none&sni=${DOMAIN}#${d_user}
+Link TLS     : trojan://${d_pass}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls&sni=${DOMAIN}&host=${DOMAIN}&alpn=http%2F1.1#${d_user}
+Link NON TLS : trojan://${d_pass}@${DOMAIN}:80?type=ws&path=%2Ftrojan&security=none&host=${DOMAIN}#${d_user}
 EOT_TROJAN_DETAIL
       ;;
     *)
@@ -7686,27 +8593,29 @@ EOT_TROJAN_DETAIL
 }
 
 akun_menu() {
+  local skip_post_pause
   while true; do
     clear
-    echo "===================================="
-    echo "           MENU AKUN"
-    echo "===================================="
-    echo "1) Add Account"
-    echo "2) Trial Account (1 jam)"
-    echo "3) Renew Account"
-    echo "4) Edit Limit IP"
-    echo "5) Delete Account"
-    echo "6) List Account"
-    echo "7) Unlock Account"
-    echo "8) Unlock Semua Akun"
-    echo "9) Lihat Detail Account"
-    echo "10) Edit Limit IP Semua Akun"
-    echo "0) Kembali"
+    draw_menu_panel "MENU AKUN" \
+      "1) Add Account" \
+      "2) Trial Account (1 jam)" \
+      "3) Renew Account" \
+      "4) Edit Limit IP" \
+      "5) Delete Account" \
+      "6) List Account" \
+      "7) Unlock Account" \
+      "8) Unlock Semua Akun" \
+      "9) Lihat Detail Account" \
+      "10) Edit Limit IP Semua Akun" \
+      "11) Tambah Masa Aktif Semua Akun" \
+      "12) Edit UUID Xray" \
+      "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-10]: "; then
+    if ! prompt_input am "Pilih menu [0-12]: "; then
       return
     fi
     clear
+    skip_post_pause=0
     case "${am}" in
       1) create_account ;;
       2) create_trial_account ;;
@@ -7714,13 +8623,26 @@ akun_menu() {
       4) edit_limit_ip_account ;;
       5) delete_account ;;
       6) list_accounts ;;
-      7) unlock_account ;;
-      8) unlock_all_accounts ;;
+      7)
+        unlock_account
+        skip_post_pause=1
+        ;;
+      8)
+        unlock_all_accounts
+        skip_post_pause=1
+        ;;
       9) show_account_detail ;;
       10) edit_limit_ip_all_accounts ;;
+      11) extend_expired_all_accounts ;;
+      12) edit_uuid_xray_account ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
+    if [[ "${skip_post_pause}" == "1" ]]; then
+      echo
+      read -rp "Enter untuk kembali ke menu sebelumnya..." _ || true
+      continue
+    fi
     echo
     read -rp "Enter untuk lanjut..." _ || true
   done
@@ -7733,7 +8655,7 @@ set_iplimit_checker_config_menu() {
   [[ -z "${current_interval}" ]] && current_interval="10"
   [[ -z "${current_lock}" ]] && current_lock="15"
 
-  echo "=== SETTING IP LIMIT CHECKER ==="
+  draw_menu_header "SETTING IP LIMIT CHECKER"
   echo "Interval checker saat ini : ${current_interval} menit"
   echo "Durasi unlock (lock tmp)  : ${current_lock} menit"
   echo
@@ -7780,6 +8702,168 @@ set_iplimit_checker_config_menu() {
   echo "- Durasi unlock    : ${IPLIMIT_LOCK_MINUTES} menit"
 }
 
+set_autolock_realtime_tuning_menu() {
+  local cur_interval cur_lock cur_xray_recent cur_xray_active cur_xray_hits cur_zivpn_active cur_zivpn_handoff
+  local in_interval in_lock in_xray_recent in_xray_active in_xray_hits in_zivpn_active in_zivpn_handoff
+  local def_interval def_lock def_xray_recent def_xray_active def_xray_hits def_zivpn_active def_zivpn_handoff
+
+  # Default rekomendasi (balanced realtime + minim false-positive).
+  def_interval="1"
+  def_lock="15"
+  def_xray_recent="5"
+  def_xray_active="60"
+  def_xray_hits="2"
+  def_zivpn_active="90"
+  def_zivpn_handoff="90"
+
+  cur_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}" | tr -cd '0-9')"
+  cur_lock="$(echo "${IPLIMIT_LOCK_MINUTES:-15}" | tr -cd '0-9')"
+  cur_xray_recent="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
+  cur_xray_active="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
+  cur_xray_hits="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
+  cur_zivpn_active="$(echo "${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}" | tr -cd '0-9')"
+  cur_zivpn_handoff="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
+
+  [[ -z "${cur_interval}" ]] && cur_interval="1"
+  [[ -z "${cur_lock}" ]] && cur_lock="15"
+  [[ -z "${cur_xray_recent}" ]] && cur_xray_recent="5"
+  [[ -z "${cur_xray_active}" ]] && cur_xray_active="60"
+  [[ -z "${cur_xray_hits}" ]] && cur_xray_hits="2"
+  [[ -z "${cur_zivpn_active}" ]] && cur_zivpn_active="90"
+  [[ -z "${cur_zivpn_handoff}" ]] && cur_zivpn_handoff="90"
+
+  draw_menu_header "SETTING AUTO LOCK REALTIME"
+  echo "Nilai saat ini:"
+  echo "- Interval checker (menit)   : ${cur_interval}"
+  echo "- Durasi unlock lock tmp (m) : ${cur_lock}"
+  echo "- XRAY recent window (menit) : ${cur_xray_recent}"
+  echo "- XRAY active window (detik) : ${cur_xray_active}"
+  echo "- XRAY min hits per IP       : ${cur_xray_hits}"
+  echo "- ZIVPN active window (detik): ${cur_zivpn_active}"
+  echo "- ZIVPN handoff grace (detik): ${cur_zivpn_handoff}"
+  echo
+  echo "Fungsi parameter:"
+  echo "- Interval checker: seberapa sering auto-lock dieksekusi (timer)."
+  echo "- Durasi unlock lock tmp: lama akun berada di status LOCK_TMP sebelum auto unlock."
+  echo "- XRAY recent window: jangkauan log XRAY yang discan."
+  echo "- XRAY active window: batas umur aktivitas untuk dianggap masih online."
+  echo "- XRAY min hits per IP: minimal jumlah hit log agar IP dihitung valid."
+  echo "- ZIVPN active window: batas umur sesi live ZIVPN yang masih dihitung aktif."
+  echo "- ZIVPN handoff grace: toleransi perpindahan IP mobile agar tidak false multi-login."
+  echo
+  echo "Catatan false positive:"
+  echo "- False positive = user normal terdeteksi melanggar padahal tidak."
+  echo "- Contoh: 1 HP ganti IP cepat (handoff), reconnect burst, atau jejak log lama"
+  echo "  masih terbaca di window aktif lalu dianggap multi-login."
+  echo "- Jika sering false positive: naikkan XRAY active window, naikkan XRAY min hits,"
+  echo "  dan/atau naikkan ZIVPN handoff grace."
+  echo
+  echo "Rekomendasi:"
+  echo "- Aman umum (disarankan): interval=${def_interval}, lock=${def_lock}, xray_recent=${def_xray_recent}, xray_active=${def_xray_active}, xray_hits=${def_xray_hits}, zivpn_active=${def_zivpn_active}, handoff=${def_zivpn_handoff}"
+  echo "- Agresif: interval=1, xray_active=30, xray_hits=1 (resiko false-positive naik)."
+  echo "- Stabil tinggi trafik: interval=2, xray_active=90, xray_hits=2."
+  echo
+  echo "Kosongkan input (Enter) untuk pakai DEFAULT REKOMENDASI."
+  echo "Ketik 'batal' untuk keluar."
+
+  if ! prompt_input in_interval "Interval checker (menit) [${def_interval}]: "; then return; fi
+  [[ "${in_interval,,}" == "batal" ]] && return
+  in_interval="${in_interval:-${def_interval}}"
+  if [[ ! "${in_interval}" =~ ^[0-9]+$ || "${in_interval}" -lt 1 || "${in_interval}" -gt 1440 ]]; then
+    echo "Interval checker harus angka 1-1440 menit."
+    return
+  fi
+
+  if ! prompt_input in_lock "Durasi unlock lock tmp (menit) [${def_lock}]: "; then return; fi
+  [[ "${in_lock,,}" == "batal" ]] && return
+  in_lock="${in_lock:-${def_lock}}"
+  if [[ ! "${in_lock}" =~ ^[0-9]+$ || "${in_lock}" -lt 1 || "${in_lock}" -gt 10080 ]]; then
+    echo "Durasi unlock harus angka 1-10080 menit."
+    return
+  fi
+
+  if ! prompt_input in_xray_recent "XRAY recent window (menit) [${def_xray_recent}]: "; then return; fi
+  [[ "${in_xray_recent,,}" == "batal" ]] && return
+  in_xray_recent="${in_xray_recent:-${def_xray_recent}}"
+  if [[ ! "${in_xray_recent}" =~ ^[0-9]+$ || "${in_xray_recent}" -lt 5 || "${in_xray_recent}" -gt 1440 ]]; then
+    echo "XRAY recent window harus angka 5-1440 menit."
+    return
+  fi
+
+  if ! prompt_input in_xray_active "XRAY active window (detik) [${def_xray_active}]: "; then return; fi
+  [[ "${in_xray_active,,}" == "batal" ]] && return
+  in_xray_active="${in_xray_active:-${def_xray_active}}"
+  if [[ ! "${in_xray_active}" =~ ^[0-9]+$ || "${in_xray_active}" -lt 30 || "${in_xray_active}" -gt 1800 ]]; then
+    echo "XRAY active window harus angka 30-1800 detik."
+    return
+  fi
+
+  if ! prompt_input in_xray_hits "XRAY min hits per IP [${def_xray_hits}]: "; then return; fi
+  [[ "${in_xray_hits,,}" == "batal" ]] && return
+  in_xray_hits="${in_xray_hits:-${def_xray_hits}}"
+  if [[ ! "${in_xray_hits}" =~ ^[0-9]+$ || "${in_xray_hits}" -lt 1 || "${in_xray_hits}" -gt 20 ]]; then
+    echo "XRAY min hits per IP harus angka 1-20."
+    return
+  fi
+
+  if ! prompt_input in_zivpn_active "ZIVPN active window (detik) [${def_zivpn_active}]: "; then return; fi
+  [[ "${in_zivpn_active,,}" == "batal" ]] && return
+  in_zivpn_active="${in_zivpn_active:-${def_zivpn_active}}"
+  if [[ ! "${in_zivpn_active}" =~ ^[0-9]+$ || "${in_zivpn_active}" -lt 20 || "${in_zivpn_active}" -gt 1800 ]]; then
+    echo "ZIVPN active window harus angka 20-1800 detik."
+    return
+  fi
+
+  if ! prompt_input in_zivpn_handoff "ZIVPN handoff grace (detik) [${def_zivpn_handoff}]: "; then return; fi
+  [[ "${in_zivpn_handoff,,}" == "batal" ]] && return
+  in_zivpn_handoff="${in_zivpn_handoff:-${def_zivpn_handoff}}"
+  if [[ ! "${in_zivpn_handoff}" =~ ^[0-9]+$ || "${in_zivpn_handoff}" -lt 3 || "${in_zivpn_handoff}" -gt 120 ]]; then
+    echo "ZIVPN handoff grace harus angka 3-120 detik."
+    return
+  fi
+
+  IPLIMIT_CHECK_INTERVAL_MINUTES="${in_interval}"
+  IPLIMIT_LOCK_MINUTES="${in_lock}"
+  XRAY_RECENT_WINDOW_MINUTES="${in_xray_recent}"
+  XRAY_ACTIVE_WINDOW_SECONDS="${in_xray_active}"
+  XRAY_MIN_HITS_PER_IP="${in_xray_hits}"
+  ZIVPN_ACTIVE_WINDOW_SECONDS="${in_zivpn_active}"
+  ZIVPN_HANDOFF_GRACE_SECONDS="${in_zivpn_handoff}"
+
+  update_sc_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  update_sc_env_var "IPLIMIT_LOCK_MINUTES" "${IPLIMIT_LOCK_MINUTES}"
+  update_sc_env_var "XRAY_RECENT_WINDOW_MINUTES" "${XRAY_RECENT_WINDOW_MINUTES}"
+  update_sc_env_var "XRAY_ACTIVE_WINDOW_SECONDS" "${XRAY_ACTIVE_WINDOW_SECONDS}"
+  update_sc_env_var "XRAY_MIN_HITS_PER_IP" "${XRAY_MIN_HITS_PER_IP}"
+  update_sc_env_var "ZIVPN_ACTIVE_WINDOW_SECONDS" "${ZIVPN_ACTIVE_WINDOW_SECONDS}"
+  update_sc_env_var "ZIVPN_HANDOFF_GRACE_SECONDS" "${ZIVPN_HANDOFF_GRACE_SECONDS}"
+
+  update_app_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  update_app_env_var "IPLIMIT_LOCK_MINUTES" "${IPLIMIT_LOCK_MINUTES}"
+  update_app_env_var "XRAY_RECENT_WINDOW_MINUTES" "${XRAY_RECENT_WINDOW_MINUTES}"
+  update_app_env_var "XRAY_ACTIVE_WINDOW_SECONDS" "${XRAY_ACTIVE_WINDOW_SECONDS}"
+  update_app_env_var "XRAY_MIN_HITS_PER_IP" "${XRAY_MIN_HITS_PER_IP}"
+  update_app_env_var "ZIVPN_ACTIVE_WINDOW_SECONDS" "${ZIVPN_ACTIVE_WINDOW_SECONDS}"
+  update_app_env_var "ZIVPN_HANDOFF_GRACE_SECONDS" "${ZIVPN_HANDOFF_GRACE_SECONDS}"
+
+  write_iplimit_timer_unit "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+
+  echo
+  echo "Berhasil update tuning auto-lock:"
+  echo "- Interval checker            : ${IPLIMIT_CHECK_INTERVAL_MINUTES} menit"
+  echo "- Durasi unlock lock tmp      : ${IPLIMIT_LOCK_MINUTES} menit"
+  echo "- XRAY recent window          : ${XRAY_RECENT_WINDOW_MINUTES} menit"
+  echo "- XRAY active window          : ${XRAY_ACTIVE_WINDOW_SECONDS} detik"
+  echo "- XRAY min hits per IP        : ${XRAY_MIN_HITS_PER_IP}"
+  echo "- ZIVPN active window         : ${ZIVPN_ACTIVE_WINDOW_SECONDS} detik"
+  echo "- ZIVPN handoff grace         : ${ZIVPN_HANDOFF_GRACE_SECONDS} detik"
+}
+
 set_online_notify_config_menu() {
   local current_enable current_interval current_window enable_in interval_in window_in
   current_enable="${ONLINE_NOTIFY_ENABLE:-1}"
@@ -7789,7 +8873,7 @@ set_online_notify_config_menu() {
   [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 168 ]] && current_interval="3"
   [[ -z "${current_window}" || "${current_window}" -lt 60 || "${current_window}" -gt 86400 ]] && current_window="300"
 
-  echo "=== SETTING NOTIF AKUN ONLINE ==="
+  draw_menu_header "SETTING NOTIF AKUN ONLINE"
   echo "Status saat ini    : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "Interval saat ini  : ${current_interval} jam"
   echo "Window realtime    : ${current_window} detik (XRAY last seen)"
@@ -7877,20 +8961,20 @@ trigger_online_notify_now() {
 tools_menu() {
   while true; do
     clear
-    echo "===================================="
-    echo "          MENU TOOLS"
-    echo "===================================="
-    echo "1) Informasi Key Script"
-    echo "2) Install API 1FORCR"
-    echo "3) Setting Banner"
-    echo "4) Update Script"
-    echo "5) Setting BOT Telegram"
-    echo "6) Setting Checker IP Limit"
-    echo "7) Setting Notif Akun Online BOT"
-    echo "8) Kirim Notif Online Sekarang ke BOT"
-    echo "0) Kembali"
+    draw_menu_panel "MENU TOOLS" \
+      "1) Informasi Key Script" \
+      "2) Install API 1FORCR" \
+      "3) Setting Banner" \
+      "4) Update Script" \
+      "5) Setting BOT Telegram" \
+      "6) Setting Checker IP Limit" \
+      "7) Setting Auto-Lock Realtime" \
+      "8) Setting Notif Akun Online BOT" \
+      "9) Kirim Notif Online Sekarang ke BOT" \
+      "10) Setting Token Webhook BotVPN" \
+      "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-8]: "; then
+    if ! prompt_input tm "Pilih menu [0-10]: "; then
       return
     fi
     clear
@@ -7901,8 +8985,10 @@ tools_menu() {
       4) update_script_from_repo ;;
       5) set_telegram_notif_config ;;
       6) set_iplimit_checker_config_menu ;;
-      7) set_online_notify_config_menu ;;
-      8) trigger_online_notify_now ;;
+      7) set_autolock_realtime_tuning_menu ;;
+      8) set_online_notify_config_menu ;;
+      9) trigger_online_notify_now ;;
+      10) set_account_event_webhook_config ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -8095,8 +9181,24 @@ restart_active_udp_backend() {
 }
 
 restart_all_services() {
+  local haproxy_ok="0"
+  if haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1; then
+    haproxy_ok="1"
+  else
+    echo "Peringatan: config haproxy invalid, restart haproxy dilewati."
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl restart ssh dropbear nginx haproxy xray sc-1forcr-api sc-1forcr-sshws >/dev/null 2>&1 || true
+  if declare -F ensure_sshws_firewall_allow_rules >/dev/null 2>&1; then
+    ensure_sshws_firewall_allow_rules
+  elif declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+    apply_sshws_loop_guard_rules
+  else
+    echo "Peringatan: helper firewall SSHWS tidak ditemukan, lanjut restart tanpa update firewall allow-rules."
+  fi
+  systemctl restart ssh dropbear sc-1forcr-api sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
+  if [[ "${haproxy_ok}" == "1" ]]; then
+    systemctl restart haproxy >/dev/null 2>&1 || true
+  fi
   systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
@@ -8129,7 +9231,7 @@ diagnose_udp_backends() {
   zport="$(udp_port_from_config /etc/zivpn/config.json 5667)"
   uport="$(udp_port_from_config /root/udp/config.json 5667)"
 
-  echo "=== DIAGNOSE UDP BACKEND ==="
+  draw_menu_header "DIAGNOSE UDP BACKEND"
   echo "ZIVPN service   : ${ZIVPN_SERVICE} (${zstat:-unknown})"
   echo "UDPHC service   : ${udpcustom} (${ustat:-unknown})"
   echo "ZIVPN port      : ${zport} ($(is_udp_port_listening "${zport}" && echo LISTEN || echo NO-LISTEN))"
@@ -8204,18 +9306,45 @@ repair_udp_backends() {
   diagnose_udp_backends
 }
 
+heal_sshws_xray_rules() {
+  echo "Heal firewall rule SSHWS+XRAY..."
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "iptables tidak tersedia."
+    return 1
+  fi
+
+  # Hapus rule legacy ketat yang sering ganggu HC/SSHWS.
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
+    -m connlimit --connlimit-above 12 --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
+    -m conntrack --ctstate NEW -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-above 8/second \
+    --hashlimit-burst 16 --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+
+  if declare -F ensure_sshws_firewall_allow_rules >/dev/null 2>&1; then
+    ensure_sshws_firewall_allow_rules
+  fi
+  if declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+    apply_sshws_loop_guard_rules
+  fi
+
+  fw_persist_rules
+  echo "Heal rule SSHWS+XRAY selesai."
+}
+
 service_menu() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
-  echo "0) kembali"
-  echo "1) status semua"
-  echo "2) restart semua"
-  echo "3) restart backend UDP aktif"
-  echo "4) aktifkan ZIVPN (matikan UDPHC)"
-  echo "5) aktifkan UDPHC (matikan ZIVPN)"
-  echo "6) status backend UDP"
-  echo "7) diagnose + auto-repair UDP backend"
-  prompt_input s "Pilih [0-7]: " || return
+  draw_menu_panel "SERVICE MENU" \
+    "0) kembali" \
+    "1) status semua" \
+    "2) restart semua" \
+    "3) restart backend UDP aktif" \
+    "4) aktifkan ZIVPN (matikan UDPHC)" \
+    "5) aktifkan UDPHC (matikan ZIVPN)" \
+    "6) status backend UDP" \
+    "7) diagnose + auto-repair UDP backend" \
+    "8) heal rule SSHWS+XRAY"
+  prompt_input s "Pilih [0-8]: " || return
   clear
   case "$s" in
     0)
@@ -8243,6 +9372,9 @@ service_menu() {
     7)
       repair_udp_backends
       ;;
+    8)
+      heal_sshws_xray_rules
+      ;;
     *)
       echo "Pilihan tidak valid."
       ;;
@@ -8251,9 +9383,10 @@ service_menu() {
 
 backup_restore_menu() {
   local full_file
-  echo "0) Kembali"
-  echo "1) BACKUP AKUN + AUTH ZIVPN (1 file JSON) & kirim ke Telegram"
-  echo "2) Restore AKUN + AUTH ZIVPN (.json) dari path file"
+  draw_menu_panel "BACKUP/RESTORE" \
+    "0) Kembali" \
+    "1) BACKUP AKUN + AUTH ZIVPN (1 file JSON) & kirim ke Telegram" \
+    "2) Restore AKUN + AUTH ZIVPN (.json) dari path file"
   prompt_input b "Pilih [0-2]: " || return
   clear
   case "$b" in
@@ -8304,7 +9437,30 @@ change_domain_menu() {
   EMAIL="${email}"
 
   mkdir -p /var/www/html
+  local sshws_nginx_limit_conf sshws_nginx_limit_rules
+  sshws_nginx_limit_conf=""
+  sshws_nginx_limit_rules=""
+  if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
+    sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
+map \$http_cf_connecting_ip \$sc_sshws_limit_key {
+    "" \$binary_remote_addr;
+    default \$http_cf_connecting_ip;
+}
+limit_req_zone \$sc_sshws_limit_key zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
+limit_conn_zone \$sc_sshws_limit_key zone=sc_sshws_conn:10m;
+
+EOF_LIMIT
+)
+    sshws_nginx_limit_rules=$(cat <<EOF_LIMIT
+        limit_req zone=sc_sshws_req burst=${SSHWS_NGINX_LIMIT_BURST} nodelay;
+        limit_conn sc_sshws_conn ${SSHWS_NGINX_LIMIT_CONN};
+        limit_req_status 429;
+        limit_conn_status 429;
+EOF_LIMIT
+)
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
+${sshws_nginx_limit_conf}
 server {
     listen 80;
     listen [::]:80;
@@ -8313,10 +9469,21 @@ server {
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
+
     location = /cdn-cgi/trace {
         access_log off;
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+${sshws_nginx_limit_rules}
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 
     location /vps/ {
@@ -8422,6 +9589,7 @@ server {
 
     location ~ ^/(ssh-ws|ws|ws-ssh|ssh)$ {
         access_log off;
+${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -8437,6 +9605,7 @@ server {
 
     location / {
         access_log off;
+${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -8458,23 +9627,18 @@ EONGINX
   systemctl restart nginx || true
 
   if ! issue_letsencrypt_cert; then
-    echo "Gagal issue cert untuk domain ${new_domain}."
+    echo "Peringatan: issue cert Let's Encrypt untuk ${new_domain} gagal. Lanjut dengan cert sementara."
     if flag_enabled "${WILDCARD_ENABLE:-0}"; then
-      echo "Pastikan WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN valid, lalu ulangi."
+      echo "Cek WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN, lalu jalankan renew cert nanti."
     else
-      echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
+      echo "Cek A record domain ke VPS, lalu jalankan renew cert nanti."
     fi
-    return
   fi
 
-  cert_domain="$(tls_cert_domain)"
-  pem="/etc/haproxy/certs/${cert_domain}.pem"
-  mkdir -p /etc/haproxy/certs
-  cat "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" "/etc/letsencrypt/live/${cert_domain}/privkey.pem" > "${pem}" || {
+  pem="$(prepare_haproxy_pem)" || {
     echo "Gagal menyiapkan sertifikat HAProxy."
     return
   }
-  chmod 600 "${pem}"
 
   cat > /etc/haproxy/haproxy.cfg <<EOHAP
 global
@@ -8483,25 +9647,54 @@ global
     daemon
     maxconn 20000
     nbthread 1
+    # Kompatibilitas TLS maksimum (security lebih lemah) untuk klien lawas/HC.
+    ssl-default-bind-ciphers DEFAULT:@SECLEVEL=0
+    ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
+    ssl-default-bind-options no-sslv3
 
 defaults
     log global
     mode tcp
     option tcplog
     option dontlognull
-    timeout connect 10s
-    timeout client  2m
-    timeout server  2m
+    timeout connect 30s
+    # WS tunnel perlu timeout panjang; 2m sering bikin koneksi putus sendiri.
+    timeout client  12h
+    timeout server  12h
 
 frontend ft_443
-    bind *:443 ssl crt ${pem} alpn h2,http/1.1
-    default_backend bk_mux
+    # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
+    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
+    tcp-request inspect-delay 5s
+    tcp-request content accept if HTTP
+    tcp-request content accept if WAIT_END
+    acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
+    acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
+    acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
+    acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
+    acl is_xray_vless_bug req.payload(0,256),lower -m sub "get /yourbug/vless"
+    acl is_xray_trojan req.payload(0,256),lower -m sub "get /trojan"
+    acl is_xray_trojan_bug req.payload(0,256),lower -m sub "get /yourbug/trojan"
+    acl is_api_vps req.payload(0,256),lower -m sub " /vps/"
+    # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
+    # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
+    acl is_hc_connect req.payload(0,512),lower -m sub "connect "
+    use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
+    use_backend bk_sshws_tls if is_hc_connect
+    # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
+    # Jalur xray (/vmess,/vless,/trojan) dan API (/vps/) tetap diprioritaskan ke mux.
+    default_backend bk_sshws_tls
 
 backend bk_mux
     mode tcp
     # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
     # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
     server nginx_local 127.0.0.1:80 check
+
+backend bk_sshws_tls
+    mode tcp
+    # Jalur khusus HTTP Custom SSL-only (payload CONNECT) langsung ke sshws mux.
+    server sshws_local 127.0.0.1:2082 check
 EOHAP
 
   haproxy -c -f /etc/haproxy/haproxy.cfg || {
@@ -8510,11 +9703,10 @@ EOHAP
   }
   systemctl restart haproxy || true
 
-  pem="/etc/haproxy/certs/${cert_domain}.pem"
   if [[ ! -s "${pem}" ]]; then
-    echo "Gagal issue cert untuk domain ${new_domain}."
+    echo "Gagal menyiapkan sertifikat HAProxy untuk domain ${new_domain}."
     if flag_enabled "${WILDCARD_ENABLE:-0}"; then
-      echo "Pastikan wildcard cert berhasil terbit untuk ${cert_domain}."
+      echo "Pastikan wildcard cert berhasil terbit untuk domain kamu."
     else
       echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
     fi
@@ -8546,7 +9738,7 @@ EOHAP
 }
 
 monitor_temp_lock_menu() {
-  echo "=== AKUN LOCK SEMENTARA (IP LIMIT) ==="
+  draw_menu_header "AKUN LOCK SEMENTARA (IP LIMIT)"
   if [[ ! -f "${DB_PATH}" ]]; then
     echo "DB tidak ditemukan: ${DB_PATH}"
     return
@@ -8705,7 +9897,22 @@ enforce_menu_license_access() {
     lock_reason="$(sed -n 's/^reason=//p' "${lock_file}" | head -n1)"
     [[ -z "${lock_reason}" ]] && lock_reason="locked_by_admin"
     clear
-    cat <<EOF
+    if [[ "${lock_reason}" == "natural_expired" ]]; then
+      cat <<EOF
+============================================================
+               SC 1FORCR NEXUS - AKSES DITOLAK            
+============================================================
+
+Script 1FORCRNEXUS anda sudah expired untuk IP (${ip_text}).
+
+Silahkan perpanjang melalui bot resmi:
+https://t.me/sc1forcrnexusbot
+
+Setelah perpanjang berhasil, silakan ulangi install/update.
+============================================================
+EOF
+    else
+      cat <<EOF
 ============================================================
                SC 1FORCR NEXUS - AKSES DITOLAK            
 ============================================================
@@ -8718,6 +9925,7 @@ Aksi   : SC harus diperpanjang terlebih dahulu.
 Hubungi admin untuk membuka akses kembali setelah perpanjang.
 ============================================================
 EOF
+    fi
     return 1
   fi
   enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
@@ -8767,7 +9975,7 @@ get_server_capacity_profile() {
     ram_mb="$((ram_kib / 1024))"
   fi
   (( ram_mb < 256 )) && ram_mb=1024
-  ram_gb="$((ram_mb / 1024))"
+  ram_gb="$(( (ram_mb + 512) / 1024 ))"
   (( ram_gb < 1 )) && ram_gb=1
 
   cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
@@ -8855,23 +10063,16 @@ draw_dashboard() {
   local RED="${ESC}[0;31m"
   local GREEN="${ESC}[0;32m"
   local YELLOW="${ESC}[0;33m"
-  local BLUE="${ESC}[0;34m"
-  local MAGENTA="${ESC}[0;35m"
-  local CYAN="${ESC}[0;36m"
+  local AQUA="${ESC}[38;5;51m"
+  local AQUA2="${ESC}[38;5;45m"
+  local PURPLE="${ESC}[38;5;141m"
+  local VIOLET="${ESC}[38;5;99m"
+  local WHITE="${ESC}[38;5;255m"
+  local DIM="${ESC}[2m"
   local BOLD="${ESC}[1m"
   local NC="${ESC}[0m"
 
-  local BOX_W=66
-
-  repeat_char() {
-    local char="$1"
-    local count="$2"
-    local out=""
-    while [ "${#out}" -lt "$count" ]; do
-      out="${out}${char}"
-    done
-    printf '%s' "${out:0:$count}"
-  }
+  local BOX_W=72
 
   strip_ansi() {
     sed -r 's/\x1B\[[0-9;]*[mK]//g'
@@ -8892,23 +10093,40 @@ draw_dashboard() {
     printf '%s%*s' "$text" "$pad" ""
   }
 
+  gradient_fill() {
+    local char="$1"
+    local count="$2"
+    local i color
+    for ((i=0; i<count; i++)); do
+      if (( i < count / 3 )); then
+        color="${AQUA}"
+      elif (( i < (count * 2) / 3 )); then
+        color="${AQUA2}"
+      else
+        color="${PURPLE}"
+      fi
+      printf '%s%s' "${color}" "${char}"
+    done
+    printf '%s' "${NC}"
+  }
+
   print_top() {
-    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
+    printf '%s+%s+%s\n' "${AQUA}" "$(gradient_fill '=' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_mid() {
-    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
+    printf '%s+%s+%s\n' "${VIOLET}" "$(gradient_fill '-' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_bottom() {
-    printf '+%s+\n' "$(repeat_char '-' "$((BOX_W + 2))")"
+    printf '%s+%s+%s\n' "${PURPLE}" "$(gradient_fill '=' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_line() {
     local text="$1"
     local padded
     padded="$(pad_right "$text" "$BOX_W")"
-    printf '| %s |\n' "$padded"
+    printf '%s|%s %s %s|%s\n' "${AQUA}" "${NC}" "$padded" "${PURPLE}" "${NC}"
   }
 
   print_center() {
@@ -8921,13 +10139,18 @@ draw_dashboard() {
     fi
     left=$(( (BOX_W - vlen) / 2 ))
     right=$(( BOX_W - vlen - left ))
-    printf '| %*s%s%*s |\n' "$left" "" "$text" "$right" ""
+    printf '%s|%s %*s%s%*s %s|%s\n' "${AQUA}" "${NC}" "$left" "" "$text" "$right" "" "${PURPLE}" "${NC}"
   }
 
   kv_line() {
     local key="$1"
     local value="$2"
-    print_line "  $(printf '%-13s' "$key") : $value"
+    print_line "  ${DIM}$(printf '%-13s' "$key")${NC} ${PURPLE}:${NC} ${WHITE}$value${NC}"
+  }
+
+  section_title() {
+    local title="$1"
+    print_line " ${PURPLE}${BOLD}<>${NC} ${AQUA}${BOLD}${title}${NC} ${PURPLE}${BOLD}<>${NC}"
   }
 
   read_license_value() {
@@ -9141,10 +10364,10 @@ EOF
 
   clear
   print_top
-  print_center "${CYAN}${BOLD}SC 1FORCR NEXUS DASHBOARD${NC}"
+  print_center "${AQUA}${BOLD}SC 1FORCR${NC} ${PURPLE}${BOLD}NEXUS${NC} ${WHITE}${BOLD}DASHBOARD${NC}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* SYSTEM & NETWORK${NC}"
+  section_title "SYSTEM & NETWORK"
   kv_line "OS"  "${os_name}"
   kv_line "RAM"  "${ram_mb:-"-"} | SWAP : ${swap_mb:-"-"}"
   kv_line "UPTIME"  "${uptime_h}h ${uptime_m}m"
@@ -9153,14 +10376,14 @@ EOF
   kv_line "Estimasi akun"  "sekitar ${cap_est} user"
   print_mid
 
-  print_line "${CYAN}${BOLD}* LOCATION & ISP${NC}"
+  section_title "LOCATION & ISP"
   kv_line "IP" "${ip}"
   kv_line "CITY" "${city}"
   kv_line "ISP" "${isp}"
   kv_line "DOMAIN" "${DOMAIN:-"-"}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* TRAFFIC STATS${NC}"
+  section_title "TRAFFIC STATS"
   kv_line "MONTH" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
   kv_line "RX" "${VNSTAT_MONTH_RX}"
   kv_line "TX" "${VNSTAT_MONTH_TX}"
@@ -9170,18 +10393,18 @@ EOF
   kv_line "CURRENT" "${VNSTAT_RATE}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* SERVICES STATUS${NC}"
-  print_line "  XRAY    : ${xray_color}   | SSH-WS : ${ws_color}   | LOADBLC : ${lb_color}"
-  print_line "  ZIVPN   : ${zivpn_color}   | UDPHC  : ${udphc_color}  | SSH     : ${ssh_color}"
-  print_line "  HEALTH  : ${health_display}"
+  section_title "SERVICES STATUS"
+  print_line "  ${DIM}XRAY   ${NC} ${PURPLE}:${NC} ${xray_color}   ${VIOLET}|${NC} ${DIM}SSH-WS${NC} ${PURPLE}:${NC} ${ws_color}   ${VIOLET}|${NC} ${DIM}LOADBLC${NC} ${PURPLE}:${NC} ${lb_color}"
+  print_line "  ${DIM}ZIVPN  ${NC} ${PURPLE}:${NC} ${zivpn_color}   ${VIOLET}|${NC} ${DIM}UDPHC ${NC} ${PURPLE}:${NC} ${udphc_color}  ${VIOLET}|${NC} ${DIM}SSH    ${NC} ${PURPLE}:${NC} ${ssh_color}"
+  print_line "  ${DIM}HEALTH ${NC} ${PURPLE}:${NC} ${health_display}"
   print_mid
 
-  print_line "${CYAN}${BOLD}* ACCOUNT SUMMARY${NC}"
-  print_line "  SSH/OpenVPN : ${c_ssh}  | VMESS  : ${c_vmess}"
-  print_line "  VLESS       : ${c_vless}   | TROJAN : ${c_trojan}"
+  section_title "ACCOUNT SUMMARY"
+  print_line "  ${DIM}SSH/OpenVPN${NC} ${PURPLE}:${NC} ${WHITE}${c_ssh}${NC}  ${VIOLET}|${NC} ${DIM}VMESS ${NC} ${PURPLE}:${NC} ${WHITE}${c_vmess}${NC}"
+  print_line "  ${DIM}VLESS      ${NC} ${PURPLE}:${NC} ${WHITE}${c_vless}${NC}  ${VIOLET}|${NC} ${DIM}TROJAN${NC} ${PURPLE}:${NC} ${WHITE}${c_trojan}${NC}"
   print_mid
 
-  print_line "${BLUE}${BOLD}* VERSION & CLIENT${NC}"
+  section_title "VERSION & CLIENT"
   kv_line "Version" "${SCRIPT_VERSION:-unknown}"
   kv_line "Distribusi" "${license_distribution}"
   kv_line "Client Name" "${license_client_name}"
@@ -9191,9 +10414,9 @@ EOF
   print_bottom
 
   printf '\n'
-  printf ' %s\n' "$(repeat_char '-' 30)"
-  printf " ${BOLD}to access use 'menu' command${NC}\n"
-  printf ' %s\n' "$(repeat_char '-' 30)"
+  printf ' %s+%s+%s\n' "${AQUA}" "$(gradient_fill '-' 36)" "${NC}"
+  printf " ${AQUA}|${NC} ${BOLD}${WHITE}to access use${NC} ${AQUA}'menu'${NC} ${BOLD}${WHITE}command${NC}      ${PURPLE}|${NC}\n"
+  printf ' %s+%s+%s\n' "${PURPLE}" "$(gradient_fill '-' 36)" "${NC}"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
@@ -9583,7 +10806,7 @@ show_combined_online() {
       sub(/'\''.*/,"",u); sub(/".*/,"",u);
       sub(/[[:space:]].*$/,"",u);
       u=tolower(u);
-      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
 
       src=$0;
       sub(/^.* from /, "", src);
@@ -9674,7 +10897,7 @@ show_combined_online() {
   awk '
     BEGIN { OFS="|" }
     NR==FNR {
-      split($0, a, "|");
+      split($0, a, /\|/);
       st[a[1]]=a[2];
       lim[a[1]]=a[3] + 0;
       next
@@ -9718,209 +10941,26 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge hc_auth_lookback_h
-  local dropbear_main_port dropbear_alt_port
+  local tmp_status tmp_ip_count tmp_db_ports tmp_proc_count tmp_db_pids
+  local dropbear_main_port dropbear_alt_port db_recent_log_max source_mode
   tmp_status="$(mktemp)"
-  tmp_ss_pid_ip="$(mktemp)"
-  tmp_pid_user="$(mktemp)"
-  tmp_pair="$(mktemp)"
   tmp_ip_count="$(mktemp)"
   tmp_db_ports="$(mktemp)"
-  tmp_db_recent="$(mktemp)"
-  tmp_db_recent_loose="$(mktemp)"
-  tmp_merge="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}" "${tmp_db_recent:-}" "${tmp_db_recent_loose:-}" "${tmp_merge:-}"' RETURN
+  tmp_proc_count="$(mktemp)"
+  tmp_db_pids="$(mktemp)"
+  trap 'rm -f "${tmp_status:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}" "${tmp_proc_count:-}" "${tmp_db_pids:-}"' RETURN
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
-  hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
+  db_recent_log_max="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
+  [[ -z "${db_recent_log_max}" || "${db_recent_log_max}" -lt 500 ]] && db_recent_log_max="5000"
+  source_mode="REALTIME_AUTH_120S"
 
-  # Sumber utama realtime: socket established (SSH + Dropbear), map PID -> user, lalu hitung unik user+ip.
-  : > "${tmp_pair}"
   : > "${tmp_ip_count}"
-  ss -Htnp state established 2>/dev/null | awk '
-    {
-      l=$4;
-      r=$5;
-      if (l ~ /:22$/ || l ~ /:'"${dropbear_main_port}"'$/ || l ~ /:'"${dropbear_alt_port}"'$/) {
-        ip=r;
-        gsub(/^\[/, "", ip);
-        gsub(/\]$/, "", ip);
-        sub(/:[0-9]+$/, "", ip);
-        if (ip == "") next;
-        s=$0;
-        while (match(s, /pid=[0-9]+/)) {
-          pid=substr(s, RSTART + 4, RLENGTH - 4);
-          if (pid ~ /^[0-9]+$/) print pid, ip;
-          s=substr(s, RSTART + RLENGTH);
-        }
-      }
-    }' | sort -u > "${tmp_ss_pid_ip}" || true
-
-  if [[ -s "${tmp_ss_pid_ip}" ]]; then
-    local pid_csv
-    pid_csv="$(awk '{print $1}' "${tmp_ss_pid_ip}" | sort -u | paste -sd, -)"
-    ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
-      {
-        pid=$1;
-        $1="";
-        sub(/^[[:space:]]+/, "", $0);
-        u="";
-        if ($0 ~ /^sshd:/) {
-          u=$0;
-          sub(/^sshd:[[:space:]]*/, "", u);
-          sub(/[[:space:]].*$/, "", u);
-          sub(/@.*$/, "", u);
-          sub(/\[.*$/, "", u);
-        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
-          u=$0;
-          if (u !~ /\[[^]]+\]/) next;
-          sub(/^.*\[/, "", u);
-          sub(/\].*$/, "", u);
-        } else next;
-        u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/) next;
-        if (u == "root" || u == "priv" || u == "net") next;
-        print pid, u;
-      }' > "${tmp_pid_user}" || true
-
-    awk '
-      NR==FNR { u[$1]=$2; next }
-      {
-        pid=$1; ip=$2; user=(pid in u ? u[pid] : "");
-        if (user != "" && ip != "") print user, ip;
-      }' "${tmp_pid_user}" "${tmp_ss_pid_ip}" | sort -u > "${tmp_pair}" || true
-  fi
-
-  awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_pair}" > "${tmp_ip_count}" || true
-
-  # Tambahan untuk jalur SSH-WS/HC:
-  # Ambil user dari log auth dropbear, tapi hanya untuk client-port yang masih aktif saat ini.
-  : > "${tmp_db_ports}"
-  : > "${tmp_db_recent}"
-  ss -Htnp state established 2>/dev/null | awk '
-    function p(v,   s,n,a,port) {
-      s=v;
-      gsub(/^\[/, "", s); gsub(/\]$/, "", s);
-      n=split(s, a, ":");
-      port=a[n];
-      if (port ~ /^[0-9]{1,5}$/) return port;
-      return "";
-    }
-    {
-      lp=p($4); rp=p($5);
-      if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
-        if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
-      } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
-        if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
-      }
-    }
-    END { for (k in act) print k; }' > "${tmp_db_ports}" || true
-
-  if [[ -s "${tmp_db_ports}" ]]; then
-    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
-      NR==FNR { ap[$1]=1; next }
-      function norm_ip(v) {
-        gsub(/[[:space:]]/, "", v);
-        gsub(/^\[/, "", v);
-        gsub(/\]/, "", v);
-        sub(/:[0-9]+$/, "", v);
-        return v;
-      }
-      function is_loopback_ip(v,   t) {
-        t=tolower(v);
-        return (t=="127.0.0.1" || t=="::1" || t=="localhost");
-      }
-      function sess_key(u, ip, port) {
-        if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
-        return u "|ip:" ip;
-      }
-      function parse_pid(line,   p) {
-        if (match(line, /\[[0-9]+\]/)) {
-          p=substr(line, RSTART+1, RLENGTH-2);
-          if (p ~ /^[0-9]+$/) return p;
-        }
-        return "";
-      }
-      /auth succeeded for /{
-        pid=parse_pid($0);
-        u=$0;
-        sub(/^.*auth succeeded for /,"",u);
-        sub(/^'\''/,"",u); sub(/^"/,"",u);
-        sub(/'\''.*/,"",u); sub(/".*/,"",u);
-        sub(/[[:space:]].*$/,"",u);
-        u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-
-        src=$0;
-        sub(/^.* from /, "", src);
-        gsub(/[[:space:]]+$/, "", src);
-        ip=src;
-        port=src;
-        sub(/^.*:/, "", port);
-        ip=norm_ip(ip);
-        if (ip == "") next;
-        if (port !~ /^[0-9]{1,5}$/) next;
-        if (!(port in ap)) next;
-        k=sess_key(u, ip, port);
-        if (pid != "") {
-          auth_by_pid[pid]=k;
-        } else {
-          auth_no_pid[k]=1;
-        }
-        next;
-      }
-      /Exit \(|Exit before auth:/{
-        pid=parse_pid($0);
-        if (pid != "") closed_pid[pid]=1;
-      }
-      END{
-        for (pid in auth_by_pid) {
-          if (pid in closed_pid) continue;
-          seen[auth_by_pid[pid]]=1;
-        }
-        for (k in auth_no_pid) seen[k]=1;
-        for (k in seen) {
-          split(k,a,"|");
-          cnt[a[1]]++;
-        }
-        for (u in cnt) print u, cnt[u];
-      }' "${tmp_db_ports}" - > "${tmp_db_recent}" || true
-
-    awk '
-      NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-      { b[$1]=$2+0; seen[$1]=1; }
-      END {
-        for (u in seen) {
-          x=(u in a ? a[u] : 0);
-          y=(u in b ? b[u] : 0);
-          n=(x > y ? x : y);
-          if (n > 0) print u, n;
-        }
-      }' "${tmp_ip_count}" "${tmp_db_recent}" > "${tmp_merge}" || true
-    mv -f "${tmp_merge}" "${tmp_ip_count}"
-  fi
-
-  # Fallback longgar untuk HTTP Custom:
-  # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
-  journalctl -u dropbear --since "-2 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
-    function norm_ip(v) {
-      gsub(/[[:space:]]/, "", v);
-      gsub(/^\[/, "", v);
-      gsub(/\]/, "", v);
-      sub(/:[0-9]+$/, "", v);
-      return v;
-    }
-    function is_loopback_ip(v,   t) {
-      t=tolower(v);
-      return (t=="127.0.0.1" || t=="::1" || t=="localhost");
-    }
-    function sess_key(u, ip, port) {
-      if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
-      return u "|ip:" ip;
-    }
+  # Ambil user aktif dari auth sukses 120 detik terakhir, keluarkan sesi yang sudah Exit by PID.
+  journalctl -u dropbear --since "-120 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
     function parse_pid(line,   p) {
       if (match(line, /\[[0-9]+\]/)) {
         p=substr(line, RSTART+1, RLENGTH-2);
@@ -9941,17 +10981,12 @@ show_ssh_only_online() {
       src=$0;
       sub(/^.* from /, "", src);
       gsub(/[[:space:]]+$/, "", src);
-      ip=norm_ip(src);
       port=src;
       sub(/^.*:/, "", port);
-      if (ip == "") next;
       if (port !~ /^[0-9]{1,5}$/) next;
-      k=sess_key(u, ip, port);
-      if (pid != "") {
-        auth_by_pid[pid]=k;
-      } else {
-        auth_no_pid[k]=1;
-      }
+
+      key=u "|" port;
+      if (pid != "") auth_by_pid[pid]=key; else auth_no_pid[key]=1;
       next;
     }
     /Exit \(|Exit before auth:/{
@@ -9969,24 +11004,180 @@ show_ssh_only_online() {
         cnt[a[1]]++;
       }
       for (u in cnt) print u, cnt[u];
-    }' > "${tmp_db_recent_loose}" || true
+    }' > "${tmp_ip_count}" || true
 
-  awk '
-    NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-    { b[$1]=$2+0; seen[$1]=1; }
-    END {
-      for (u in seen) {
-        x=(u in a ? a[u] : 0);
-        y=(u in b ? b[u] : 0);
-        n=(x > y ? x : y);
-        if (n > 0) print u, n;
+  # Fallback realtime berdasarkan port ssh-mux yang masih aktif ke dropbear.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    source_mode="REALTIME_ACTIVE_PORT"
+    : > "${tmp_db_ports}"
+    ss -Htnp state established 2>/dev/null | awk '
+      function p(v,   s,n,a,port) {
+        s=v;
+        gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+        n=split(s, a, ":");
+        port=a[n];
+        if (port ~ /^[0-9]{1,5}$/) return port;
+        return "";
       }
-    }' "${tmp_ip_count}" "${tmp_db_recent_loose}" > "${tmp_merge}" || true
-  mv -f "${tmp_merge}" "${tmp_ip_count}"
+      {
+        lp=p($4); rp=p($5);
+        if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
+          if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
+        } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
+          if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
+        }
+      }
+      END { for (k in act) print k; }' > "${tmp_db_ports}" || true
+
+    if [[ -s "${tmp_db_ports}" ]]; then
+      journalctl -u dropbear --since "-30 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+        NR==FNR { ap[$1]=1; next }
+        /auth succeeded for /{
+          u=$0;
+          sub(/^.*auth succeeded for /,"",u);
+          sub(/^'\''/,"",u); sub(/^"/,"",u);
+          sub(/'\''.*/,"",u); sub(/".*/,"",u);
+          sub(/[[:space:]].*$/,"",u);
+          u=tolower(u);
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
+
+          src=$0;
+          sub(/^.* from /, "", src);
+          gsub(/[[:space:]]+$/, "", src);
+          port=src;
+          sub(/^.*:/, "", port);
+          if (!(port in ap)) next;
+          last_user[port]=u;
+        }
+        END {
+          for (p in last_user) cnt[last_user[p]]++;
+          for (u in cnt) print u, cnt[u];
+        }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
+    fi
+  fi
+
+  # Fallback terakhir: hitung sesi dari process list aktif.
+  # Ini menjaga monitor tetap tampil meski format log dropbear berbeda antar versi distro.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    source_mode="REALTIME_PROCESS"
+    ps -eo args= 2>/dev/null | awk '
+      {
+        u="";
+        if ($0 ~ /^sshd:[[:space:]]+/) {
+          if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/) next;
+          u=$0;
+          sub(/^sshd:[[:space:]]*/, "", u);
+          sub(/[[:space:]].*$/, "", u);
+          sub(/@.*$/, "", u);
+          sub(/\[.*$/, "", u);
+        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+          u=$0;
+          sub(/^.*\[/, "", u);
+          sub(/\].*$/, "", u);
+        } else next;
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/) next;
+        if (u=="root" || u=="priv" || u=="net" || u=="unknown") next;
+        cnt[u]++;
+      }
+      END { for (u in cnt) print u, cnt[u]; }' > "${tmp_proc_count}" || true
+    if [[ -s "${tmp_proc_count}" ]]; then
+      mv -f "${tmp_proc_count}" "${tmp_ip_count}"
+    fi
+  fi
+
+  # Fallback final: map PID dropbear aktif (dari socket established) ke username auth di log.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    source_mode="REALTIME_DROPBEAR_PID"
+    : > "${tmp_db_pids}"
+    ss -Htnp state established 2>/dev/null | awk '
+      {
+        lp=$4; rp=$5;
+        if (lp ~ /:109$/ || lp ~ /:143$/ || rp ~ /:109$/ || rp ~ /:143$/) {
+          s=$0;
+          while (match(s, /pid=[0-9]+/)) {
+            pid=substr(s, RSTART+4, RLENGTH-4);
+            if (pid ~ /^[0-9]+$/) print pid;
+            s=substr(s, RSTART+RLENGTH);
+          }
+        }
+      }' | sort -u > "${tmp_db_pids}" || true
+
+    if [[ -s "${tmp_db_pids}" ]]; then
+      journalctl -u dropbear --since "-30 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+        NR==FNR { ap[$1]=1; next }
+        function parse_pid(line,   p) {
+          if (match(line, /\[[0-9]+\]/)) {
+            p=substr(line, RSTART+1, RLENGTH-2);
+            if (p ~ /^[0-9]+$/) return p;
+          }
+          return "";
+        }
+        /auth succeeded for /{
+          pid=parse_pid($0);
+          if (!(pid in ap)) next;
+          u=$0;
+          sub(/^.*auth succeeded for /,"",u);
+          sub(/^'\''/,"",u); sub(/^"/,"",u);
+          sub(/'\''.*/,"",u); sub(/".*/,"",u);
+          sub(/[[:space:]].*$/,"",u);
+          u=tolower(u);
+          if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
+          last_user[pid]=u;
+        }
+        END {
+          for (p in last_user) cnt[last_user[p]]++;
+          for (u in cnt) print u, cnt[u];
+        }' "${tmp_db_pids}" - > "${tmp_ip_count}" || true
+    fi
+  fi
+
+  # Fallback paling longgar: auth sukses dropbear terbaru tanpa syarat PID aktif.
+  # Berguna untuk pola koneksi HTTP Custom yang sangat cepat reconnect sehingga
+  # snapshot socket aktif sering miss di saat monitor dibuka.
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    source_mode="REALTIME_RECENT_AUTH"
+    journalctl -u dropbear --since "-3 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+      function parse_pid(line,   p) {
+        if (match(line, /\[[0-9]+\]/)) {
+          p=substr(line, RSTART+1, RLENGTH-2);
+          if (p ~ /^[0-9]+$/) return p;
+        }
+        return "";
+      }
+      /auth succeeded for /{
+        pid=parse_pid($0);
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
+        if (pid != "") {
+          auth_by_pid[pid]=u;
+        } else {
+          auth_no_pid[u]=1;
+        }
+        next;
+      }
+      /Exit \(|Exit before auth:/{
+        pid=parse_pid($0);
+        if (pid != "") closed_pid[pid]=1;
+      }
+      END {
+        for (pid in auth_by_pid) {
+          if (pid in closed_pid) continue;
+          seen[auth_by_pid[pid]]=1;
+        }
+        for (u in auth_no_pid) seen[u]=1;
+        for (u in seen) print u, 1;
+      }' > "${tmp_ip_count}" || true
+  fi
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
-  echo "LIST USER LOGIN SSH (REALTIME SOCKET)"
+  echo "LIST USER LOGIN SSH (${source_mode})"
   if [[ ! -s "${tmp_ip_count}" ]]; then
     echo "Tidak ada user SSH yang sedang online."
     echo
@@ -9999,7 +11190,7 @@ show_ssh_only_online() {
   printf "%-24s %-12s %-10s %-13s\n" "------------------------" "------------" "----------" "-------------"
   awk '
     NR==FNR {
-      split($0,a,"|");
+      split($0,a,/\|/);
       st[a[1]]=a[2];
       lim[a[1]]=(a[3] ~ /^[0-9]+$/ ? a[3] + 0 : 0);
       next
@@ -10022,10 +11213,16 @@ show_ssh_only_online() {
 }
 
 xray_log_snapshot() {
-  local dst="$1"
-  local cutoff_ts active_cutoff_ts
-  cutoff_ts="$(( $(date +%s) - (xray_recent_window_min * 60) ))"
-  active_cutoff_ts="$(( $(date +%s) - xray_active_window_sec ))"
+  local dst="$1" mode="${2:-normal}"
+  local cutoff_ts active_cutoff_ts recent_min active_sec
+  recent_min="${xray_recent_window_min}"
+  active_sec="${xray_active_window_sec}"
+  if [[ "${mode}" == "realtime" ]]; then
+    recent_min="${xray_monitor_recent_window_min}"
+    active_sec="${xray_monitor_active_window_sec}"
+  fi
+  cutoff_ts="$(( $(date +%s) - (recent_min * 60) ))"
+  active_cutoff_ts="$(( $(date +%s) - active_sec ))"
   if [[ ! -f /var/log/xray/access.log ]]; then
     : > "${dst}"
     return
@@ -10097,7 +11294,7 @@ xray_log_snapshot() {
 }
 
 show_xray_online_by_table() {
-  local table="$1" label="$2"
+  local table="$1" label="$2" mode="${3:-normal}"
   local t_users t_seen
   t_users="$(mktemp)"
   t_seen="$(mktemp)"
@@ -10105,14 +11302,14 @@ show_xray_online_by_table() {
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY LOWER(username);" > "${t_users}" 2>/dev/null || true
   if [[ ! -s "${t_users}" ]]; then
-    echo "=== ${label} ONLINE ==="
+    draw_menu_header "${label} ONLINE"
     echo "Tidak ada akun ${label} di DB."
     return
   fi
 
-  xray_log_snapshot "${t_seen}"
+  xray_log_snapshot "${t_seen}" "${mode}"
 
-  echo "=== ${label} USER LOGIN (berdasarkan log xray terbaru) ==="
+  draw_menu_header "${label} USER LOGIN (berdasarkan log xray terbaru)"
   if [[ ! -s "${t_seen}" ]]; then
     echo "Tidak ada aktivitas terbaru."
     echo
@@ -10150,10 +11347,25 @@ show_xray_online_by_table() {
     }' "${t_users}" "${t_seen}"
 }
 
+show_xray_online_realtime_by_table() {
+  local table="$1" label="$2" key=""
+  while true; do
+    clear
+    show_xray_online_by_table "${table}" "${label}" "realtime"
+    echo
+    echo "Realtime refresh tiap 1 detik. Tekan q untuk keluar."
+    if read -r -s -n 1 -t 1 key; then
+      case "${key}" in
+        q|Q) break ;;
+      esac
+    fi
+  done
+}
+
 show_udpcustom_online() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
-  echo "=== UDP CUSTOM ONLINE (log terbaru) ==="
+  draw_menu_header "UDP CUSTOM ONLINE (log terbaru)"
   journalctl -u "${udpcustom}" -n 1200 --no-pager 2>/dev/null | \
     sed -nE '
       s/.*\[src:([^]]+)\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected.*/\2|\1/p;
@@ -10244,7 +11456,7 @@ show_zivpn_online() {
   [[ -z "${handoff_grace}" || "${handoff_grace}" -lt 3 ]] && handoff_grace="20"
   [[ "${handoff_grace}" -gt 120 ]] && handoff_grace="120"
 
-  echo "=== ZIVPN ONLINE (LIVE DB) ==="
+  draw_menu_header "ZIVPN ONLINE (LIVE DB)"
   echo "Jendela aktif: ${win} detik"
   echo "Toleransi handoff: ${handoff_grace} detik"
   if [[ ! -f "${DB_PATH}" ]]; then
@@ -10279,26 +11491,39 @@ show_zivpn_online() {
     agg AS (
       SELECT
         username,
-        COUNT(DISTINCT ip) AS connected_ip,
+        COUNT(DISTINCT ip) AS connected_ip_raw,
         MAX(last_seen) AS last_seen,
         GROUP_CONCAT(ip, ', ') AS ip_list
       FROM active_filtered
       GROUP BY username
+    ),
+    normalized AS (
+      SELECT
+        username,
+        CASE
+          WHEN connected_ip_raw BETWEEN 1 AND 2 THEN 1
+          WHEN connected_ip_raw BETWEEN 3 AND 4 THEN 2
+          ELSE connected_ip_raw
+        END AS connected_ip,
+        connected_ip_raw,
+        last_seen,
+        ip_list
+      FROM agg
     )
     SELECT
-      a.username AS username,
+      n.username AS username,
       CASE
-        WHEN CAST(COALESCE(s.limitip,0) AS INTEGER) > 0 AND a.connected_ip > CAST(COALESCE(s.limitip,0) AS INTEGER) THEN 'MULTI_LOGIN'
+        WHEN CAST(COALESCE(s.limitip,0) AS INTEGER) > 0 AND n.connected_ip > CAST(COALESCE(s.limitip,0) AS INTEGER) THEN 'MULTI_LOGIN'
         ELSE 'AMAN'
       END AS status,
       CAST(COALESCE(s.limitip,0) AS INTEGER) AS limit_ip,
-      a.connected_ip AS terhubung_ip,
-      datetime(a.last_seen, 'unixepoch', 'localtime') AS last_seen,
-      COALESCE(a.ip_list, '-') AS ip_list
-    FROM agg a
-    JOIN account_sshs s ON LOWER(s.username) = a.username
+      n.connected_ip AS terhubung_ip,
+      datetime(n.last_seen, 'unixepoch', 'localtime') AS last_seen,
+      COALESCE(n.ip_list, '-') AS ip_list
+    FROM normalized n
+    JOIN account_sshs s ON LOWER(s.username) = n.username
     WHERE UPPER(TRIM(COALESCE(s.status,'')))='AKTIF'
-    ORDER BY a.last_seen DESC, a.username ASC;
+    ORDER BY n.last_seen DESC, n.username ASC;
   " || true
 
   echo
@@ -10325,6 +11550,21 @@ show_zivpn_online() {
     JOIN account_sshs s ON LOWER(s.username)=af.username
     WHERE UPPER(TRIM(COALESCE(s.status,'')))='AKTIF';
   " 2>/dev/null || true
+}
+
+show_zivpn_online_realtime() {
+  local key=""
+  while true; do
+    clear
+    show_zivpn_online
+    echo
+    echo "Realtime refresh tiap 1 detik. Tekan q untuk keluar."
+    if read -r -s -n 1 -t 1 key; then
+      case "${key}" in
+        q|Q) break ;;
+      esac
+    fi
+  done
 }
 
 update_script_from_repo() {
@@ -10445,6 +11685,8 @@ Time     : $(date '+%F %T')"
     SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE}" \
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
+    BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
+    BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}" \
     AUTO_INSTALL_SUMMARY_API="0" \
     AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
     AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR}" \
@@ -10517,7 +11759,7 @@ Online   : ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h win=${ONLINE
 }
 
 show_sc_key_info() {
-  echo "=== INFORMASI KEY SC ==="
+  draw_menu_header "INFORMASI KEY SC"
   echo "Domain        : ${DOMAIN}"
   echo "API Base      : https://${DOMAIN}/vps"
   echo "Auth Token    : ${AUTH_TOKEN}"
@@ -10525,7 +11767,7 @@ show_sc_key_info() {
 
 set_telegram_notif_config() {
   local token chat send_test ans
-  echo "=== SETTING NOTIF TELEGRAM ==="
+  draw_menu_header "SETTING NOTIF TELEGRAM"
   echo "Bot Token     : $(mask_secret "${TELEGRAM_BOT_TOKEN:-}")"
   echo "Chat ID       : ${TELEGRAM_CHAT_ID:-"-"}"
   echo
@@ -10563,14 +11805,56 @@ set_telegram_notif_config() {
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
     if prompt_input ans "Kirim pesan test sekarang? [y/N]: "; then
       if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
-        telegram_notify "SC 1FORCR NOTIF
+        if telegram_notify "SC 1FORCR NOTIF
 Event    : TEST_NOTIF
 Domain   : ${DOMAIN}
-Time     : $(date '+%F %T')"
-        echo "Pesan test dikirim (cek chat Telegram)."
+Time     : $(date '+%F %T')"; then
+          echo "Pesan test dikirim (cek chat Telegram)."
+        else
+          echo "Gagal kirim pesan test Telegram (token/chat_id/bot permission kemungkinan belum benar)."
+        fi
       fi
     fi
   fi
+}
+
+set_account_event_webhook_config() {
+  local webhook_url webhook_token
+  draw_menu_header "SETTING WEBHOOK BOT AKUN (MULTI-LOGIN)"
+  echo "Webhook URL   : ${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-"-"}"
+  echo "Webhook Token : $(mask_secret "${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}")"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+  echo "Contoh URL: http://IP_BOTVPN:PORT/sc1forcr/events/multi-login"
+
+  if ! prompt_input webhook_url "BOT_ACCOUNT_EVENT_WEBHOOK_URL: "; then
+    return
+  fi
+  [[ "${webhook_url,,}" == "batal" ]] && return
+
+  if ! prompt_input webhook_token "BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN: "; then
+    return
+  fi
+  [[ "${webhook_token,,}" == "batal" ]] && return
+
+  if [[ -n "${webhook_url}" ]]; then
+    BOT_ACCOUNT_EVENT_WEBHOOK_URL="${webhook_url}"
+    update_sc_env_var "BOT_ACCOUNT_EVENT_WEBHOOK_URL" "${BOT_ACCOUNT_EVENT_WEBHOOK_URL}"
+    update_app_env_var "BOT_ACCOUNT_EVENT_WEBHOOK_URL" "${BOT_ACCOUNT_EVENT_WEBHOOK_URL}"
+  fi
+  if [[ -n "${webhook_token}" ]]; then
+    BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${webhook_token}"
+    update_sc_env_var "BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN" "${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}"
+    update_app_env_var "BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN" "${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}"
+  fi
+
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+
+  echo "Konfigurasi webhook bot akun tersimpan."
+  echo "Webhook URL   : ${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-"-"}"
+  echo "Webhook Token : $(mask_secret "${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}")"
 }
 
 install_summary_api_1forcr() {
@@ -10708,14 +11992,12 @@ set_html_banner_menu() {
   mkdir -p /etc/sc-1forcr
 
   while true; do
-    echo "===================================="
-    echo "        SETTING BANNER HTML"
-    echo "===================================="
-    echo "1) Set/Edit banner"
-    echo "2) Lihat banner aktif"
-    echo "3) Nonaktifkan banner"
-    echo "4) Pakai template default 1FORCR"
-    echo "0) Kembali"
+    draw_menu_panel "SETTING BANNER HTML" \
+      "1) Set/Edit banner" \
+      "2) Lihat banner aktif" \
+      "3) Nonaktifkan banner" \
+      "4) Pakai template default 1FORCR" \
+      "0) Kembali"
     echo
     if ! prompt_input bm "Pilih menu [0-4]: "; then
       return
@@ -10740,7 +12022,7 @@ set_html_banner_menu() {
         ;;
       2)
         if [[ -f "${banner_file}" ]]; then
-          echo "=== BANNER AKTIF (${banner_file}) ==="
+          draw_menu_header "BANNER AKTIF (${banner_file})"
           cat "${banner_file}"
         else
           echo "Belum ada banner aktif."
@@ -10771,16 +12053,14 @@ set_html_banner_menu() {
 monitor_online_menu() {
   while true; do
     clear
-    echo "===================================="
-    echo "      MONITOR USER ONLINE"
-    echo "===================================="
-    echo "1) SSH"
-    echo "2) SSH + UDP CUSTOM"
-    echo "3) VMESS"
-    echo "4) VLESS"
-    echo "5) TROJAN"
-    echo "6) ZIVPN"
-    echo "0) Kembali"
+    draw_menu_panel "MONITOR USER ONLINE" \
+      "1) SSH" \
+      "2) SSH + UDP CUSTOM" \
+      "3) VMESS" \
+      "4) VLESS" \
+      "5) TROJAN" \
+      "6) ZIVPN" \
+      "0) Kembali"
     echo
     if ! prompt_input o "Pilih menu [0-6]: "; then
       return
@@ -10789,10 +12069,10 @@ monitor_online_menu() {
     case "${o}" in
       1) show_ssh_only_online ;;
       2) show_ssh_online ;;
-      3) show_xray_online_by_table "account_vmesses" "VMESS" ;;
-      4) show_xray_online_by_table "account_vlesses" "VLESS" ;;
-      5) show_xray_online_by_table "account_trojans" "TROJAN" ;;
-      6) show_zivpn_online ;;
+      3) show_xray_online_realtime_by_table "account_vmesses" "VMESS" ;;
+      4) show_xray_online_realtime_by_table "account_vlesses" "VLESS" ;;
+      5) show_xray_online_realtime_by_table "account_trojans" "TROJAN" ;;
+      6) show_zivpn_online_realtime ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -10802,6 +12082,104 @@ monitor_online_menu() {
 }
 
 SHOW_FULL_MENU=1
+MENU_ESC=$'\033'
+MENU_AQUA="${MENU_ESC}[38;5;51m"
+MENU_AQUA2="${MENU_ESC}[38;5;45m"
+MENU_PURPLE="${MENU_ESC}[38;5;141m"
+MENU_WHITE="${MENU_ESC}[38;5;255m"
+MENU_DIM="${MENU_ESC}[2m"
+MENU_BOLD="${MENU_ESC}[1m"
+MENU_NC="${MENU_ESC}[0m"
+
+menu_gradient_line() {
+  local char="${1:-=}"
+  local count="${2:-62}"
+  local i color
+  for ((i=0; i<count; i++)); do
+    if (( i < count / 3 )); then
+      color="${MENU_AQUA}"
+    elif (( i < (count * 2) / 3 )); then
+      color="${MENU_AQUA2}"
+    else
+      color="${MENU_PURPLE}"
+    fi
+    printf '%s%s' "${color}" "${char}"
+  done
+  printf '%s' "${MENU_NC}"
+}
+
+menu_strip_ansi() {
+  sed -r 's/\x1B\[[0-9;]*[mK]//g'
+}
+
+menu_visible_len() {
+  local text="$1"
+  printf '%s' "${text}" | menu_strip_ansi | awk '{ print length }'
+}
+
+menu_pad_right() {
+  local text="$1"
+  local width="$2"
+  local vlen pad
+  vlen="$(menu_visible_len "${text}")"
+  pad=$((width - vlen))
+  (( pad < 0 )) && pad=0
+  printf '%s%*s' "${text}" "${pad}" ""
+}
+
+menu_print_line() {
+  local text="$1"
+  local width="${2:-58}"
+  local padded
+  padded="$(menu_pad_right "${text}" "${width}")"
+  printf ' %s|%s%s%s|%s\n' "${MENU_AQUA}" "${MENU_NC}" "${padded}" "${MENU_PURPLE}" "${MENU_NC}"
+}
+
+draw_menu_header() {
+  local title="$1"
+  local width="${2:-58}"
+  local title_len
+  title_len="$(menu_visible_len "  ${title}")"
+  (( title_len > width )) && width="${title_len}"
+  printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' "${width}")" "${MENU_NC}"
+  menu_print_line "  ${MENU_AQUA}${MENU_BOLD}${title}${MENU_NC}" "${width}"
+  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '-' "${width}")" "${MENU_NC}"
+}
+
+draw_menu_panel() {
+  local title="$1"
+  shift || true
+  local width=58 item item_len title_len
+  title_len="$(menu_visible_len "  ${title}")"
+  (( title_len > width )) && width="${title_len}"
+  for item in "$@"; do
+    item_len="$(menu_visible_len "  ${item}")"
+    (( item_len > width )) && width="${item_len}"
+  done
+  draw_menu_header "${title}" "${width}"
+  local item
+  for item in "$@"; do
+    menu_print_line "  ${MENU_WHITE}${item}${MENU_NC}" "${width}"
+  done
+  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' "${width}")" "${MENU_NC}"
+}
+
+draw_main_options() {
+  printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}1.) > MENU AKUN         5.) > MONITOR USER LOCK${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}2.) > SERVICE MENU      6.) > MONITOR USER LOGIN${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}3.) > BACKUP/RESTORE    7.) > TOOLS${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}4.) > CHANGE DOMAIN${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}m.) > MENU UTAMA${MENU_NC}"
+  menu_print_line "  ${MENU_WHITE}x.) > EXIT${MENU_NC}"
+  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
+}
+
+if [[ "${1:-}" == "update" ]]; then
+  clear
+  update_script_from_repo
+  exit $?
+fi
 
 while true; do
   if ! enforce_menu_license_access; then
@@ -10813,17 +12191,7 @@ while true; do
     echo
   fi
 
-  echo " +-------------------------------------------------"
-  echo " |  1.) > MENU AKUN         5.) > MONITOR USER LOCK"
-  echo " |  2.) > SERVICE MENU      6.) > MONITOR USER LOGIN"
-  echo " |  3.) > BACKUP/RESTORE    7.) > TOOLS"
-  echo " |  4.) > CHANGE DOMAIN"
-  echo " |  m.) > MENU UTAMA"
-  echo " |  x.) > EXIT"
-  echo " +-------------------------------------------------"
-  if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
-    echo " -------------------------------------------------"
-  fi
+  draw_main_options
   echo
   if ! prompt_input m "Select From Options [1-7, m, x] : "; then
     SHOW_FULL_MENU=0
@@ -10860,6 +12228,13 @@ exec "${menu_runtime}" "\$@"
 EOF
   chmod +x /usr/local/sbin/menu-sc-1forcr
   ln -sf /usr/local/sbin/menu-sc-1forcr /usr/local/sbin/menu
+
+  cat > /usr/local/sbin/update <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/local/sbin/menu-sc-1forcr update "$@"
+EOF
+  chmod +x /usr/local/sbin/update
 
   cat > /usr/local/sbin/uninstall-sc-1forcr <<'EOF'
 #!/usr/bin/env bash
@@ -10937,6 +12312,7 @@ rm -f /etc/potato-compat.env
 rm -f /usr/local/sbin/menu-sc-1forcr
 rm -f /usr/local/sbin/menu-potato
 rm -f /usr/local/sbin/menu
+rm -f /usr/local/sbin/update
 rm -f /usr/local/sbin/uninstall-sc-1forcr
 rm -f /usr/local/sbin/uninstall-potato-compat
 rm -f /usr/local/sbin/sc-1forcr-safe-reboot
@@ -11044,6 +12420,15 @@ apply_final_service_restart_chain() {
 update_sc_env_var() {
   local key="$1" value="$2" tmp
   [[ -z "${key}" ]] && return 0
+  if [[ -f /etc/sc-1forcr.env ]]; then
+    tmp="$(mktemp)"
+    awk '
+      /^[[:space:]]*$/ { print; next }
+      /^[[:space:]]*#/ { print; next }
+      /^[A-Za-z_][A-Za-z0-9_]*=.*/ { print; next }
+      { next }
+    ' /etc/sc-1forcr.env > "${tmp}" && mv -f "${tmp}" /etc/sc-1forcr.env
+  fi
   tmp="$(mktemp)"
   awk -v k="${key}" -v v="${value}" '
     BEGIN { done=0 }
@@ -11060,6 +12445,13 @@ update_app_env_var() {
   app_env="/opt/sc-1forcr/.env"
   [[ ! -f "${app_env}" ]] && app_env="/opt/potato-compat/.env"
   [[ ! -f "${app_env}" ]] && return 0
+  tmp="$(mktemp)"
+  awk '
+    /^[[:space:]]*$/ { print; next }
+    /^[[:space:]]*#/ { print; next }
+    /^[A-Za-z_][A-Za-z0-9_]*=.*/ { print; next }
+    { next }
+  ' "${app_env}" > "${tmp}" && mv -f "${tmp}" "${app_env}"
   tmp="$(mktemp)"
   awk -v k="${key}" -v v="${value}" '
     BEGIN { done=0 }

@@ -6076,7 +6076,38 @@ setup_udpgw_service_if_possible() {
   done
 
   if [[ -z "${udpgw_bin}" ]]; then
-    log "badvpn-udpgw tidak ditemukan. Skip setup UDPGW service."
+    log "badvpn-udpgw belum ada. Coba install paket 'badvpn'..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y badvpn >/dev/null 2>&1 || true
+    for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
+      if [[ -x "${p}" ]]; then
+        udpgw_bin="${p}"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "${udpgw_bin}" ]]; then
+    log "Paket badvpn tidak tersedia. Build badvpn-udpgw dari source..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake build-essential libssl-dev zlib1g-dev >/dev/null 2>&1 || true
+    (
+      set -e
+      cd /usr/local/src
+      rm -rf badvpn
+      git clone --depth 1 https://github.com/ambrop72/badvpn.git >/dev/null 2>&1
+      cd badvpn
+      mkdir -p build
+      cd build
+      cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null
+      make -j"$(nproc)" >/dev/null
+      install -m 755 udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
+    ) || true
+    if [[ -x /usr/local/bin/badvpn-udpgw ]]; then
+      udpgw_bin="/usr/local/bin/badvpn-udpgw"
+    fi
+  fi
+
+  if [[ -z "${udpgw_bin}" || ! -x "${udpgw_bin}" ]]; then
+    log "Gagal menyiapkan badvpn-udpgw. Skip setup UDPGW service."
     return 0
   fi
 

@@ -1249,6 +1249,30 @@ ${sshws_nginx_limit_rules}
         proxy_buffering off;
     }
 
+    location /vmess-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11001;
+    }
+
+    location /vless-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11002;
+    }
+
+    location /trojan-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11003;
+    }
+
     location /yourbug/trojan {
         access_log off;
         proxy_redirect off;
@@ -1344,7 +1368,7 @@ defaults
 
 frontend ft_443
     # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
-    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
+    bind *:443 ssl crt ${pem} alpn h2,http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
@@ -2759,24 +2783,43 @@ async function syncSshBackendsFromDb() {
   }
 }
 
-function vmessLink(host, id, tls) {
+function vmessLink(host, id, tls, username = '') {
+  const remark = String(username || `vmess-${host}`).trim() || `vmess-${host}`;
   const payload = {
-    v: '2', ps: `vmess-${host}`, add: host, port: tls ? '443' : '80', id, aid: '0',
+    v: '2', ps: remark, add: host, port: tls ? '443' : '80', id, aid: '0',
     net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
-function vlessLink(host, id, tls) {
-  if (tls) {
-    return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1&encryption=none#vless-${host}`;
-  }
-  return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#vless-${host}`;
+function vmessGrpcLink(host, id, username = '') {
+  const remark = String(username || `vmess-grpc-${host}`).trim() || `vmess-grpc-${host}`;
+  const payload = {
+    v: '2', ps: remark, add: host, port: '443', id, aid: '0',
+    net: 'grpc', type: 'none', host, path: 'vmess-grpc', tls: 'tls', sni: host
+  };
+  return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
-function trojanLink(host, pass, tls) {
+function vlessLink(host, id, tls, username = '') {
+  const remark = encodeURIComponent(String(username || `vless-${host}`).trim() || `vless-${host}`);
   if (tls) {
-    return `trojan://${pass}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1#trojan-${host}`;
+    return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1&encryption=none#${remark}`;
   }
-  return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}#trojan-${host}`;
+  return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#${remark}`;
+}
+function vlessGrpcLink(host, id, username = '') {
+  const remark = encodeURIComponent(String(username || `vless-grpc-${host}`).trim() || `vless-grpc-${host}`);
+  return `vless://${id}@${host}:443?type=grpc&serviceName=vless-grpc&security=tls&sni=${host}&alpn=h2&encryption=none#${remark}`;
+}
+function trojanLink(host, pass, tls, username = '') {
+  const remark = encodeURIComponent(String(username || `trojan-${host}`).trim() || `trojan-${host}`);
+  if (tls) {
+    return `trojan://${pass}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1#${remark}`;
+  }
+  return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}#${remark}`;
+}
+function trojanGrpcLink(host, pass, username = '') {
+  const remark = encodeURIComponent(String(username || `trojan-grpc-${host}`).trim() || `trojan-grpc-${host}`);
+  return `trojan://${pass}@${host}:443?type=grpc&serviceName=trojan-grpc&security=tls&sni=${host}&alpn=h2#${remark}`;
 }
 
 async function renderAndReloadXray() {
@@ -2805,6 +2848,21 @@ async function renderAndReloadXray() {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
         streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+      },
+      {
+        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+      },
+      {
+        port: 11002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+      },
+      {
+        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -3165,7 +3223,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vmessLink(DOMAIN, uuid, true), none: vmessLink(DOMAIN, uuid, false), grpc: vmessLink(DOMAIN, uuid, true), uptls: vmessLink(DOMAIN, uuid, true), upntls: vmessLink(DOMAIN, uuid, false) }
+      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) }
     };
   } else if (protocol === 'vless') {
     await ensureUsernameNotExists('account_vlesses', finalUsername);
@@ -3182,7 +3240,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vless-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vlessLink(DOMAIN, uuid, true), none: vlessLink(DOMAIN, uuid, false), grpc: vlessLink(DOMAIN, uuid, true), uptls: vlessLink(DOMAIN, uuid, true), upntls: vlessLink(DOMAIN, uuid, false) }
+      link: { tls: vlessLink(DOMAIN, uuid, true, finalUsername), none: vlessLink(DOMAIN, uuid, false, finalUsername), grpc: vlessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vlessLink(DOMAIN, uuid, true, finalUsername), upntls: vlessLink(DOMAIN, uuid, false, finalUsername) }
     };
   } else if (protocol === 'trojan') {
     await ensureUsernameNotExists('account_trojans', finalUsername);
@@ -3199,7 +3257,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'trojan-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: trojanLink(DOMAIN, pass, true), none: trojanLink(DOMAIN, pass, false), grpc: trojanLink(DOMAIN, pass, true), uptls: trojanLink(DOMAIN, pass, true), upntls: trojanLink(DOMAIN, pass, false) }
+      link: { tls: trojanLink(DOMAIN, pass, true, finalUsername), none: trojanLink(DOMAIN, pass, false, finalUsername), grpc: trojanGrpcLink(DOMAIN, pass, finalUsername), uptls: trojanLink(DOMAIN, pass, true, finalUsername), upntls: trojanLink(DOMAIN, pass, false, finalUsername) }
     };
   }
   await renderAndReloadXray();
@@ -3349,6 +3407,21 @@ async function setStatusXray(table, username, status) {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
         streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+      },
+      {
+        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+      },
+      {
+        port: 11002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+      },
+      {
+        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -5780,6 +5853,21 @@ async function rebuildXrayFromDb() {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
         streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+      },
+      {
+        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+      },
+      {
+        port: 11002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+      },
+      {
+        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
@@ -9612,6 +9700,30 @@ ${sshws_nginx_limit_rules}
         proxy_buffering off;
     }
 
+    location /vmess-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11001;
+    }
+
+    location /vless-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11002;
+    }
+
+    location /trojan-grpc {
+        access_log off;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:11003;
+    }
+
     location /yourbug/trojan {
         access_log off;
         proxy_redirect off;
@@ -9706,7 +9818,7 @@ defaults
 
 frontend ft_443
     # Tetap longgar TLS, tapi paksa HTTP/1.1 agar WS (sshws/v2ray ws) tidak negosiasi h2.
-    bind *:443 ssl crt ${pem} alpn http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
+    bind *:443 ssl crt ${pem} alpn h2,http/1.1 ssl-min-ver TLSv1.0 ssl-max-ver TLSv1.3
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END

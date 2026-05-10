@@ -7694,7 +7694,6 @@ pending_update_gate_menu() {
     fi
     case "${pu_ans}" in
       1)
-        rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
         if ! update_script_from_repo; then
           mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
           cat > "${PENDING_OP_FILE}" <<EOF
@@ -7711,7 +7710,7 @@ EOF
           return 0
         fi
         ;;
-      2) return 0 ;;
+      2) return 2 ;;
       3)
         rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
         return 0
@@ -13148,8 +13147,18 @@ if [[ "${1:-}" == "update" ]]; then
 fi
 
 while true; do
-  pending_update_gate_menu
-  resume_pending_operation_prompt
+  if has_pending_update_only; then
+    if pending_update_gate_menu; then
+      :
+    else
+      gate_rc=$?
+      if [[ "${gate_rc}" -ne 2 ]]; then
+        continue
+      fi
+    fi
+  else
+    resume_pending_operation_prompt
+  fi
   if ! enforce_menu_license_access; then
     exit 1
   fi

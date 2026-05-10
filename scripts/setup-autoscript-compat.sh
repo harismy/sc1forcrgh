@@ -7673,9 +7673,14 @@ has_pending_update_only() {
 }
 
 pending_update_gate_menu() {
-  local pu_ans
+  local pu_ans cmd type note
   [[ -t 0 && -t 1 ]] || return 0
   has_pending_update_only || return 0
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  cmd="${PENDING_CMD:-/usr/local/sbin/menu-sc-1forcr update}"
+  type="${PENDING_TYPE:-update}"
+  note="${PENDING_NOTE:-Update script terputus sebelum selesai}"
   while true; do
     clear
     draw_menu_panel "UPDATE PENDING" \
@@ -7689,8 +7694,22 @@ pending_update_gate_menu() {
     fi
     case "${pu_ans}" in
       1)
-        resume_pending_operation_prompt
-        has_pending_update_only || return 0
+        rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+        if ! update_script_from_repo; then
+          mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+          cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+          chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+          echo
+          echo "Update pending belum berhasil dilanjutkan."
+          read -rp "Enter untuk kembali ke menu pending..." _ || true
+        else
+          return 0
+        fi
         ;;
       2) return 0 ;;
       3)

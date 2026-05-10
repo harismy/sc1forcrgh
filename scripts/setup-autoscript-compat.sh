@@ -45,6 +45,7 @@ set -euo pipefail
 #   UDPCUSTOM_DNAT_RANGE=                        (opsional, default kosong = tanpa DNAT range untuk performa)
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
+#   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
 #   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
@@ -118,6 +119,7 @@ UDPCUSTOM_LISTEN_PORT="${UDPCUSTOM_LISTEN_PORT:-5667}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
+SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
 ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
@@ -2048,6 +2050,7 @@ XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
+SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -2088,6 +2091,11 @@ const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json'
 const UDPCUSTOM_SERVICE = process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
+const SSHWS_UDPGW_PORTS = String(process.env.SSHWS_UDPGW_PORTS || '7300,7200')
+  .split(',')
+  .map((v) => String(v || '').trim())
+  .filter((v) => /^[0-9]{1,5}$/.test(v))
+  .filter((v, i, arr) => arr.indexOf(v) === i);
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const LICENSE_ENFORCE = String(process.env.LICENSE_ENFORCE || '1').trim().toLowerCase();
@@ -3051,15 +3059,21 @@ app.get('/vps/my-accounts', async (req, res) => {
 });
 
 function sshPayload(username, password, expDate, limitip) {
+  const udpgwPorts = SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'];
   return {
     hostname: DOMAIN,
     username,
     password,
     exp: expDate,
     time: nowTime(),
-    port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpcustom: '1-65535' },
+    port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: udpgwPorts.join(',') },
     ws_path: '/ssh-ws',
     ws_alt_path: '/ws',
+    udpgw: {
+      mode: 'badvpn',
+      ports: udpgwPorts,
+      notes: 'Untuk VC/telp/game di SSH/SSHWS, set badvpn/udpgw ke salah satu port ini.'
+    },
     limitip: String(limitip || 0)
   };
 }
@@ -6052,7 +6066,7 @@ EOF
 }
 
 setup_udpgw_service_if_possible() {
-  local udpgw_bin
+  local udpgw_bin udpgw_ports_raw udpgw_ports p
   udpgw_bin=""
   for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
     if [[ -x "${p}" ]]; then
@@ -6066,15 +6080,20 @@ setup_udpgw_service_if_possible() {
     return 0
   fi
 
-  log "Setup service badvpn-udpgw (127.0.0.1:7300 & 127.0.0.1:7200)..."
+  udpgw_ports_raw="$(echo "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
+  [[ -z "${udpgw_ports_raw}" ]] && udpgw_ports_raw="7300,7200"
+  udpgw_ports="$(echo "${udpgw_ports_raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 {print $1}' | awk '!seen[$0]++')"
+  [[ -z "${udpgw_ports}" ]] && udpgw_ports="7300"$'\n'"7200"
+
+  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//')"
   cat > /etc/systemd/system/sc-1forcr-udpgw@.service <<EOF
 [Unit]
-Description=SC 1FORCR UDPGW on 127.0.0.1:%i
+Description=SC 1FORCR UDPGW on 0.0.0.0:%i
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=${udpgw_bin} --listen-addr 127.0.0.1:%i --max-clients 2048 --max-connections-for-client 256
+ExecStart=${udpgw_bin} --listen-addr 0.0.0.0:%i --max-clients 2048 --max-connections-for-client 256
 Restart=always
 RestartSec=1
 NoNewPrivileges=true
@@ -6085,8 +6104,22 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now sc-1forcr-udpgw@7300.service >/dev/null 2>&1 || true
-  systemctl enable --now sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
+  for p in ${udpgw_ports}; do
+    systemctl enable --now "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -w 10 -C INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w 10 -I INPUT -p tcp --dport "${p}" -j ACCEPT
+    elif command -v nft >/dev/null 2>&1; then
+      if nft list chain inet filter input >/dev/null 2>&1; then
+        nft list chain inet filter input | grep -F -- "tcp dport ${p} accept" >/dev/null 2>&1 || \
+          nft add rule inet filter input tcp dport "${p}" accept
+      elif nft list chain ip filter input >/dev/null 2>&1; then
+        nft list chain ip filter input | grep -F -- "tcp dport ${p} accept" >/dev/null 2>&1 || \
+          nft add rule ip filter input tcp dport "${p}" accept
+      fi
+    fi
+  done
+  fw_persist_rules
 }
 
 setup_udp_bootfix_service() {
@@ -7448,6 +7481,7 @@ ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 ZIVPN_DNAT_RANGE=${ZIVPN_DNAT_RANGE}
 UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
+SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 DROPBEAR_VERSION=${DROPBEAR_VERSION}
@@ -12282,6 +12316,7 @@ Time     : $(date '+%F %T')"
     ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE}" \
     UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
     UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
+    SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}" \
     DROPBEAR_PORT="${DROPBEAR_PORT}" \
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
     DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
@@ -13414,6 +13449,7 @@ Catatan:
 - Endpoint /vps/* sudah kompatibel pola bot 1FORCR (create/trial/renew/delete/lock/unlock).
 - WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
 - Dropbear aktif di port ${DROPBEAR_PORT} dan ${DROPBEAR_ALT_PORT}; ssh-ws bridge default ke ${DROPBEAR_PORT}
+- SSH/SSHWS UDPGW (VC/telp/game) aktif di port TCP: ${SSHWS_UDPGW_PORTS}
 - SSH mux runtime sudah pakai Go binary: ${APP_DIR}/bin/ssh-mux
 - Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.

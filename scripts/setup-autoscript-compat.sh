@@ -7681,11 +7681,11 @@ EOF
   fi
 }
 
-has_pending_update_only() {
+has_pending_install_only() {
   [[ -f "${PENDING_OP_FILE}" ]] || return 1
   # shellcheck disable=SC1090
   source "${PENDING_OP_FILE}" >/dev/null 2>&1 || return 1
-  [[ -n "${PENDING_TYPE:-}" && -n "${PENDING_CMD:-}" ]]
+  [[ "${PENDING_TYPE:-}" == "install" && -n "${PENDING_CMD:-}" ]]
 }
 
 is_sc_installed_runtime() {
@@ -7705,41 +7705,29 @@ normalize_pending_operation() {
   [[ -z "${type}" || -z "${cmd}" ]] && return 0
 
   if [[ "${type}" == "install" && "${cmd}" == *"/tmp/setup-autoscript-compat.sh"* && ! -f /tmp/setup-autoscript-compat.sh ]]; then
-    if is_sc_installed_runtime; then
-      set_pending_operation "update" "/usr/local/sbin/menu-sc-1forcr update" "Pending install terdeteksi, service SC sudah ada. Dialihkan ke update."
+    if [[ -x /var/lib/sc-1forcr/pending-install.sh ]]; then
+      set_pending_operation "install" "bash /var/lib/sc-1forcr/pending-install.sh" "Install SC 1FORCR terputus sebelum selesai"
     fi
     return 0
   fi
 
-  if is_sc_installed_runtime; then
-    if [[ "${type}" == "install" ]]; then
-      set_pending_operation "update" "/usr/local/sbin/menu-sc-1forcr update" "Service SC sudah ada. Pending disesuaikan ke update."
-    fi
-  else
-    if [[ "${type}" == "update" ]]; then
-      set_pending_operation "install" "${cmd}" "${note:-Install SC 1FORCR terputus sebelum selesai}"
-    fi
+  # Fokus hanya pending install: pending type lain dibersihkan agar tidak bentrok menu utama.
+  if [[ "${type}" != "install" ]]; then
+    clear_pending_operation
   fi
 }
 
-pending_update_gate_menu() {
+pending_install_gate_menu() {
   local pu_ans cmd type note gate_title opt1_label
   [[ -t 0 && -t 1 ]] || return 0
-  has_pending_update_only || return 0
+  has_pending_install_only || return 0
   # shellcheck disable=SC1090
   source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
-  cmd="${PENDING_CMD:-/usr/local/sbin/menu-sc-1forcr update}"
-  type="${PENDING_TYPE:-update}"
-  note="${PENDING_NOTE:-Update script terputus sebelum selesai}"
-  gate_title="PENDING OPERASI"
-  opt1_label="Lanjutkan Proses"
-  if [[ "${type}" == "update" ]]; then
-    gate_title="UPDATE PENDING"
-    opt1_label="Lanjutkan Update"
-  elif [[ "${type}" == "install" ]]; then
-    gate_title="INSTALL PENDING"
-    opt1_label="Lanjutkan Install"
-  fi
+  cmd="${PENDING_CMD:-bash /var/lib/sc-1forcr/pending-install.sh}"
+  type="${PENDING_TYPE:-install}"
+  note="${PENDING_NOTE:-Install SC 1FORCR terputus sebelum selesai}"
+  gate_title="INSTALL PENDING"
+  opt1_label="Lanjutkan Install"
   while true; do
     clear
     draw_menu_panel "${gate_title}" \
@@ -7752,57 +7740,7 @@ pending_update_gate_menu() {
     fi
     case "${pu_ans}" in
       1)
-        if [[ "${type}" == "update" ]]; then
-          if ! update_script_from_repo; then
-            mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-            cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-            chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
-            echo
-            echo "Update pending belum berhasil dilanjutkan."
-            read -rp "Enter untuk kembali ke menu pending..." _ || true
-          else
-            return 0
-          fi
-        elif [[ "${type}" == "install" ]]; then
-          # Install pending umumnya memakai script /tmp; jika file sudah hilang setelah reconnect,
-          # fallback aman ke flow update agar tidak loop di menu pending.
-          if [[ "${cmd}" == *"/tmp/setup-autoscript-compat.sh"* && ! -f /tmp/setup-autoscript-compat.sh ]]; then
-            if ! update_script_from_repo; then
-              mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-              cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-              chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
-              echo
-              echo "Install pending tidak bisa dilanjutkan (script /tmp hilang) dan fallback update gagal."
-              read -rp "Enter untuk kembali ke menu pending..." _ || true
-            else
-              return 0
-            fi
-          elif ! bash -lc "${cmd}"; then
-            mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-            cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-            chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
-            echo
-            echo "Install pending belum berhasil dilanjutkan."
-            read -rp "Enter untuk kembali ke menu pending..." _ || true
-          else
-            return 0
-          fi
-        elif ! bash -lc "${cmd}"; then
+        if ! bash -lc "${cmd}"; then
           mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
           cat > "${PENDING_OP_FILE}" <<EOF
 PENDING_TYPE=${type}
@@ -7812,7 +7750,7 @@ PENDING_TIME=$(date '+%F %T')
 EOF
           chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
           echo
-          echo "Pending belum berhasil dilanjutkan."
+          echo "Install pending belum berhasil dilanjutkan."
           read -rp "Enter untuk kembali ke menu pending..." _ || true
         else
           return 0
@@ -12490,7 +12428,6 @@ update_script_from_repo() {
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver
-  set_pending_operation "update" "/usr/local/sbin/menu-sc-1forcr update" "Update script terputus sebelum selesai"
   url="${UPDATE_SCRIPT_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
@@ -12682,7 +12619,6 @@ Online   : ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h win=${ONLINE
   telegram_notify "${update_note}"
 
   rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
-  clear_pending_operation
 }
 
 show_sc_key_info() {
@@ -13255,8 +13191,8 @@ fi
 
 while true; do
   normalize_pending_operation
-  if has_pending_update_only; then
-    pending_update_gate_menu
+  if has_pending_install_only; then
+    pending_install_gate_menu
     continue
   else
     resume_pending_operation_prompt
@@ -13311,17 +13247,27 @@ EOF
   cat > /usr/local/sbin/update <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-cat > /var/lib/sc-1forcr/pending-op.env <<'EOP'
-PENDING_TYPE=update
-PENDING_CMD=/usr/local/sbin/menu-sc-1forcr update
-PENDING_NOTE=Update script terputus sebelum selesai
-PENDING_TIME=wrapper
-EOP
-chmod 600 /var/lib/sc-1forcr/pending-op.env >/dev/null 2>&1 || true
 exec /usr/local/sbin/menu-sc-1forcr update "$@"
 EOF
   chmod +x /usr/local/sbin/update
+
+  cat > /usr/local/sbin/lanjut-install <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -x /var/lib/sc-1forcr/pending-install.sh ]]; then
+  exec bash /var/lib/sc-1forcr/pending-install.sh "$@"
+fi
+if [[ -f /var/lib/sc-1forcr/pending-op.env ]]; then
+  # shellcheck disable=SC1091
+  source /var/lib/sc-1forcr/pending-op.env >/dev/null 2>&1 || true
+  if [[ "${PENDING_TYPE:-}" == "install" && -n "${PENDING_CMD:-}" ]]; then
+    exec bash -lc "${PENDING_CMD}" "$@"
+  fi
+fi
+echo "Tidak ada pending install yang bisa dilanjutkan."
+exit 1
+EOF
+  chmod +x /usr/local/sbin/lanjut-install
 
   cat > /usr/local/sbin/uninstall-sc-1forcr <<'EOF'
 #!/usr/bin/env bash
@@ -13400,6 +13346,7 @@ rm -f /usr/local/sbin/menu-sc-1forcr
 rm -f /usr/local/sbin/menu-potato
 rm -f /usr/local/sbin/menu
 rm -f /usr/local/sbin/update
+rm -f /usr/local/sbin/lanjut-install
 rm -f /usr/local/sbin/uninstall-sc-1forcr
 rm -f /usr/local/sbin/uninstall-potato-compat
 rm -f /usr/local/sbin/sc-1forcr-safe-reboot
@@ -13446,6 +13393,24 @@ if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; the
   fi
 fi
 # <<< sc-1forcr-auto-menu <<<
+EOF
+
+  # Login-shell fallback (PuTTY/OpenSSH root login) to ensure menu always appears after reconnect.
+  touch /root/.bash_profile
+  sed -i '/# >>> sc-1forcr-auto-menu-login >>>/,/# <<< sc-1forcr-auto-menu-login <<</d' /root/.bash_profile || true
+  cat >> /root/.bash_profile <<'EOF'
+# >>> sc-1forcr-auto-menu-login >>>
+if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; then
+  if [[ -n "${SSH_CONNECTION:-}" ]] && [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
+    if [[ -x /usr/local/sbin/menu ]]; then
+      export SC_MENU_AUTO_STARTED=1
+      /usr/local/sbin/menu
+      return 0 2>/dev/null || true
+      exit 0
+    fi
+  fi
+fi
+# <<< sc-1forcr-auto-menu-login <<<
 EOF
 }
 

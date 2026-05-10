@@ -7673,7 +7673,7 @@ has_pending_update_only() {
 }
 
 pending_update_gate_menu() {
-  local pu_ans cmd type note
+  local pu_ans cmd type note gate_title opt1_label
   [[ -t 0 && -t 1 ]] || return 0
   has_pending_update_only || return 0
   # shellcheck disable=SC1090
@@ -7681,12 +7681,21 @@ pending_update_gate_menu() {
   cmd="${PENDING_CMD:-/usr/local/sbin/menu-sc-1forcr update}"
   type="${PENDING_TYPE:-update}"
   note="${PENDING_NOTE:-Update script terputus sebelum selesai}"
+  gate_title="PENDING OPERASI"
+  opt1_label="Lanjutkan Proses"
+  if [[ "${type}" == "update" ]]; then
+    gate_title="UPDATE PENDING"
+    opt1_label="Lanjutkan Update"
+  elif [[ "${type}" == "install" ]]; then
+    gate_title="INSTALL PENDING"
+    opt1_label="Lanjutkan Install"
+  fi
   while true; do
     clear
-    draw_menu_panel "UPDATE PENDING" \
-      "1) Lanjutkan Update" \
+    draw_menu_panel "${gate_title}" \
+      "1) ${opt1_label}" \
       "2) Tunda (masuk menu utama)" \
-      "3) Batalkan pending update" \
+      "3) Batalkan pending" \
       "0) Exit"
     echo
     if ! prompt_input pu_ans "Pilih menu [0-3]: "; then
@@ -7694,7 +7703,57 @@ pending_update_gate_menu() {
     fi
     case "${pu_ans}" in
       1)
-        if ! update_script_from_repo; then
+        if [[ "${type}" == "update" ]]; then
+          if ! update_script_from_repo; then
+            mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+            cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+            chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+            echo
+            echo "Update pending belum berhasil dilanjutkan."
+            read -rp "Enter untuk kembali ke menu pending..." _ || true
+          else
+            return 0
+          fi
+        elif [[ "${type}" == "install" ]]; then
+          # Install pending umumnya memakai script /tmp; jika file sudah hilang setelah reconnect,
+          # fallback aman ke flow update agar tidak loop di menu pending.
+          if [[ "${cmd}" == *"/tmp/setup-autoscript-compat.sh"* && ! -f /tmp/setup-autoscript-compat.sh ]]; then
+            if ! update_script_from_repo; then
+              mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+              cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+              chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+              echo
+              echo "Install pending tidak bisa dilanjutkan (script /tmp hilang) dan fallback update gagal."
+              read -rp "Enter untuk kembali ke menu pending..." _ || true
+            else
+              return 0
+            fi
+          elif ! bash -lc "${cmd}"; then
+            mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+            cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+            chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+            echo
+            echo "Install pending belum berhasil dilanjutkan."
+            read -rp "Enter untuk kembali ke menu pending..." _ || true
+          else
+            return 0
+          fi
+        elif ! bash -lc "${cmd}"; then
           mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
           cat > "${PENDING_OP_FILE}" <<EOF
 PENDING_TYPE=${type}
@@ -7704,7 +7763,7 @@ PENDING_TIME=$(date '+%F %T')
 EOF
           chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
           echo
-          echo "Update pending belum berhasil dilanjutkan."
+          echo "Pending belum berhasil dilanjutkan."
           read -rp "Enter untuk kembali ke menu pending..." _ || true
         else
           return 0

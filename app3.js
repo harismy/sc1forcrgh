@@ -2808,13 +2808,11 @@ bot.action('m_register_sc_new', async (ctx) => {
   userState.set(ctx.chat.id, { step: 'register_sc_ip' });
   await ctx.reply(
     uiBox('REGISTRASI BARU SC', [
-      'Masukkan IP VPS.',
-      'Contoh: 103.10.10.2',
       '',
       `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari${isReseller ? ' (RESELLER)' : ''}`,
       `Minimal Durasi  : ${minDays} hari`,
       '',
-      'Alur input: IP VPS -> Nama Client -> Masa Aktif Script',
+      'Masukkan IP VPS :',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -2827,14 +2825,12 @@ bot.action('m_register_sc_unlimited', async (ctx) => {
   userState.set(ctx.chat.id, { step: 'register_sc_unlimited_client_name' });
   await ctx.reply(
     uiBox('REGISTRASI SC UNLIMITED', [
-      'Masukkan nama client.',
-      'Contoh: Haris Unlimited 01',
       '',
       `Harga paket     : Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}`,
       'Masa aktif      : tanpa batas',
       '',
-      'Setelah input IP, bot akan minta key server VPS.',
-      '',
+      'Masukkan nama client: ',
+      'Contoh: Asep bedog Unlimited 01',
       'Ketik "batal" untuk membatalkan.'
     ])
   );

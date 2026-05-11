@@ -2567,6 +2567,10 @@ function parseDateExpToDate(v) {
     const d = new Date(iso);
     return Number.isFinite(d.getTime()) ? d : null;
   }
+  if (/^\d{4}-\d{2}-\d{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$/.test(s)) {
+    const d = new Date(s);
+    return Number.isFinite(d.getTime()) ? d : null;
+  }
   return null;
 }
 function ymdFromDateExp(v) {
@@ -5501,7 +5505,8 @@ function ymdLocalNow() {
 function isExpiredDate(dateExp, todayYmd = '') {
   const v = String(dateExp || '').trim();
   if (!v) return false;
-  if (/^\d{4}-\d{2}-\d{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$/.test(v)) {
+  if (/^\d{4}-\d{2}-\d{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$/.test(v) ||
+      /^\d{4}-\d{2}-\d{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) {
     const iso = v.includes('T') ? v : v.replace(' ', 'T');
     const ts = new Date(iso).getTime();
     if (!Number.isFinite(ts)) return false;
@@ -5564,9 +5569,7 @@ async function enforceExpiredAccounts() {
   const sshRows = await all(
     "SELECT username, password, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM account_sshs " +
     "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
-    "AND TRIM(COALESCE(date_exp,'')) <> '' " +
-    "AND ((LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(date_exp) <= datetime('now','localtime')) " +
-    "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) <= date('now','localtime')))"
+    "AND TRIM(COALESCE(date_exp,'')) <> ''"
   ).catch(() => []);
   for (const row of sshRows) {
     const user = String(row?.username || '').trim();
@@ -5606,9 +5609,7 @@ async function enforceExpiredAccounts() {
     const rows = await all(
       `SELECT username, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
-      "AND TRIM(COALESCE(date_exp,'')) <> '' " +
-      "AND ((LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(date_exp) <= datetime('now','localtime')) " +
-      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) <= date('now','localtime')))"
+      "AND TRIM(COALESCE(date_exp,'')) <> ''"
     ).catch(() => []);
     for (const row of rows) {
       const user = String(row?.username || '').trim();
@@ -8935,7 +8936,7 @@ print_account_picker_table() {
     )"
   fi
   rows="$(sqlite3 -separator '|' "$DB_PATH" \
-    "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday(date('now','localtime'))) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+    "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
   if [[ -z "${rows}" ]]; then
     return 1
   fi
@@ -9368,7 +9369,7 @@ list_accounts() {
   print_account_table() {
     local table="$1" title="$2" rows
     rows="$(sqlite3 -separator '|' "$DB_PATH" \
-      "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday(date('now','localtime'))) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
+      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
     echo "LIST AKUN ${title}"
     printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
     printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"

@@ -146,7 +146,7 @@ IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
 IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
-SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-1}"
+SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-0}"
 SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-109,143}"
 SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-80/second}"
 SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-200}"
@@ -1765,7 +1765,9 @@ apply_sshws_loop_guard_rules() {
   case "${enabled}" in
     1|true|yes|on) ;;
     *)
-      log "SSHWS loop guard nonaktif (SSHWS_LOOP_GUARD_ENABLE=${SSHWS_LOOP_GUARD_ENABLE:-0})."
+      clear_sshws_loop_guard_rules
+      fw_persist_rules
+      log "SSHWS loop guard nonaktif (SSHWS_LOOP_GUARD_ENABLE=${SSHWS_LOOP_GUARD_ENABLE:-0}), rule burst dibersihkan."
       return 0
       ;;
   esac
@@ -1826,6 +1828,37 @@ apply_sshws_loop_guard_rules() {
   fi
   fw_persist_rules
   log "SSHWS loop guard aktif: ports=${ports}, new_above=${rate}, burst=${burst}, connlimit_above=${connlimit}"
+}
+
+clear_sshws_loop_guard_rules() {
+  local ports p
+  if ! command -v iptables >/dev/null 2>&1; then
+    return 0
+  fi
+
+  ports="$(echo "${SSHWS_LOOP_GUARD_PORTS:-109,143}" | tr -cd '0-9,')"
+  [[ -z "${ports}" ]] && ports="109,143"
+
+  # Hapus rule burst/connlimit dengan dports gabungan.
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports "${ports}" -m conntrack --ctstate NEW \
+    -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports "${ports}" \
+    -m connlimit --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+
+  # Hapus legacy rule yang pernah menyentuh 80/443.
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 -m conntrack --ctstate NEW \
+    -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
+    -m connlimit --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+
+  # Hapus varian per-port.
+  for p in $(echo "${ports}" | tr ',' ' '); do
+    [[ -z "${p}" ]] && continue
+    while iptables -w 10 -D INPUT -p tcp --dport "${p}" -m conntrack --ctstate NEW \
+      -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+    while iptables -w 10 -D INPUT -p tcp --dport "${p}" \
+      -m connlimit --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+  done
 }
 
 ensure_sshws_firewall_allow_rules() {
@@ -12428,6 +12461,11 @@ update_script_from_repo() {
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver
+  # Undrop rule burst SSHWS lama saat update agar koneksi tidak nyangkut.
+  if declare -F clear_sshws_loop_guard_rules >/dev/null 2>&1; then
+    clear_sshws_loop_guard_rules
+    fw_persist_rules
+  fi
   url="${UPDATE_SCRIPT_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
@@ -12596,6 +12634,10 @@ Time     : $(date '+%F %T')"
     switch_udp_to_udpcustom || true
   else
     switch_udp_to_zivpn || true
+  fi
+  # Terapkan ulang kebijakan loop guard sesuai env terbaru (default nonaktif).
+  if declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+    apply_sshws_loop_guard_rules
   fi
   systemctl restart sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
   restart_all_services

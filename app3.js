@@ -2435,17 +2435,24 @@ bot.action('m_admin_remove_sc_ip', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_remove_sc_ip' });
-  const rows = await listActiveRegistrationsForAdmin(12).catch(() => []);
+  const rows = await listServerKeysForAdminPage(0, 12).catch(() => []);
   const preview = rows.length
-    ? rows.map((r, i) => `${i + 1}. ${r.vps_ip} (user ${r.user_id})`).join('\n')
-    : '(tidak ada registrasi aktif)';
+    ? rows
+        .map((r, i) => {
+          const ip = normalizeHost(r?.vps_ip || '-');
+          const uid = Number(r?.user_id || 0);
+          return `${i + 1}. ${ip} (user ${uid})`;
+        })
+        .join('\n')
+    : '(belum ada data IP+KEY tersimpan)';
   await ctx.reply(
     uiBox('HAPUS IP VPS TERDAFTAR', [
       'Masukkan IP VPS yang ingin dihapus dari registrasi aktif.',
       'Contoh: 103.10.10.2',
+      'Preview memakai sumber data yang sama dengan menu "Daftar IP + KEY + ID".',
       'Bot akan coba ambil key server otomatis dari database key tersimpan.',
       '',
-      'Preview IP aktif:',
+      'Preview IP:',
       preview,
       '',
       'Ketik "batal" untuk membatalkan.'

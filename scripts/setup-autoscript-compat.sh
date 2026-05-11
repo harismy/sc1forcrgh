@@ -7081,6 +7081,7 @@ ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
 ZIVPN_HANDOFF_GRACE_SECONDS="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
+ONLINE_NOTIFY_STATE_FILE="/var/lib/sc-1forcr/online-notify.last"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
 [[ -z "${ZIVPN_HANDOFF_GRACE_SECONDS}" || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -lt 3 || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -gt 120 ]] && ZIVPN_HANDOFF_GRACE_SECONDS="90"
@@ -7100,6 +7101,31 @@ send_tg() {
     -d "parse_mode=HTML" \
     -d "disable_web_page_preview=true" \
     --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+}
+
+should_send_online_report() {
+  local now_ts last_ts interval_sec
+  now_ts="$(date +%s 2>/dev/null || echo 0)"
+  [[ -z "${now_ts}" || ! "${now_ts}" =~ ^[0-9]+$ ]] && now_ts=0
+  interval_sec=$(( ONLINE_NOTIFY_INTERVAL_HOURS * 3600 ))
+  [[ "${interval_sec}" -lt 3600 ]] && interval_sec=3600
+  last_ts=0
+  if [[ -f "${ONLINE_NOTIFY_STATE_FILE}" ]]; then
+    last_ts="$(tr -cd '0-9' < "${ONLINE_NOTIFY_STATE_FILE}" 2>/dev/null || echo 0)"
+    [[ -z "${last_ts}" || ! "${last_ts}" =~ ^[0-9]+$ ]] && last_ts=0
+  fi
+  if [[ "${last_ts}" -gt 0 && "${now_ts}" -gt 0 && $(( now_ts - last_ts )) -lt "${interval_sec}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+mark_online_report_sent() {
+  local now_ts
+  now_ts="$(date +%s 2>/dev/null || echo 0)"
+  [[ -z "${now_ts}" || ! "${now_ts}" =~ ^[0-9]+$ ]] && return 0
+  mkdir -p "$(dirname "${ONLINE_NOTIFY_STATE_FILE}")" >/dev/null 2>&1 || true
+  printf '%s\n' "${now_ts}" > "${ONLINE_NOTIFY_STATE_FILE}" 2>/dev/null || true
 }
 
 detect_udphc_service() {
@@ -7582,7 +7608,10 @@ $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}")
 </pre>
 "
 
-send_tg "${msg}"
+if should_send_online_report; then
+  send_tg "${msg}"
+  mark_online_report_sent
+fi
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-online-notify
 

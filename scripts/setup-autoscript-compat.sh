@@ -8923,6 +8923,28 @@ prompt_new_username() {
   done
 }
 
+format_remaining_from_minutes() {
+  local mins="${1:-0}" d h m
+  mins="$(echo "${mins}" | tr -cd '0-9')"
+  [[ -z "${mins}" ]] && mins=0
+  if [[ "${mins}" -le 0 ]]; then
+    echo "0m"
+    return
+  fi
+  d=$(( mins / 1440 ))
+  h=$(( (mins % 1440) / 60 ))
+  m=$(( mins % 60 ))
+  if [[ "${d}" -gt 0 ]]; then
+    echo "${d}d ${h}h"
+    return
+  fi
+  if [[ "${h}" -gt 0 ]]; then
+    echo "${h}h ${m}m"
+    return
+  fi
+  echo "${m}m"
+}
+
 print_account_picker_table() {
   local type="$1" lock_only="${2:-0}" table where rows
   table="$(account_table_by_type "${type}")"
@@ -8936,17 +8958,18 @@ print_account_picker_table() {
     )"
   fi
   rows="$(sqlite3 -separator '|' "$DB_PATH" \
-    "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+    "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
   if [[ -z "${rows}" ]]; then
     return 1
   fi
   printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
   printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"
-  local i=0 u sisa st lim
+  local i=0 u sisa st lim sisa_human
   while IFS='|' read -r u sisa st lim; do
     [[ -z "${u}" ]] && continue
     i=$((i + 1))
-    printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h" "${lim:-0}"
+    sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
+    printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa_human}" "${lim:-0}"
   done <<< "${rows}"
   return 0
 }
@@ -9369,7 +9392,7 @@ list_accounts() {
   print_account_table() {
     local table="$1" title="$2" rows
     rows="$(sqlite3 -separator '|' "$DB_PATH" \
-      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
+      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
     echo "LIST AKUN ${title}"
     printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
     printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"
@@ -9377,11 +9400,12 @@ list_accounts() {
       echo "(kosong)"
       return
     fi
-    local i=0 u sisa st lim
+    local i=0 u sisa st lim sisa_human
     while IFS='|' read -r u sisa st lim; do
       [[ -z "${u}" ]] && continue
       i=$((i + 1))
-      printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h" "${lim:-0}"
+      sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
+      printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa_human}" "${lim:-0}"
     done <<< "${rows}"
   }
 

@@ -78,6 +78,10 @@ set -euo pipefail
 #   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_VLESS=/vless                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
+#   VMESS_BUG_PROFILE_ADDRESS=                   (opsional, contoh: nusa-stb1.retrivip.xyz)
+#   VMESS_BUG_PROFILE_SNI=                       (opsional, contoh: dfsuporte.garena.com)
+#   VMESS_BUG_PROFILE_HOST=                      (opsional, default mengikuti ADDRESS)
+#   VMESS_BUG_PROFILE_ALLOW_INSECURE=1           (opsional, 1=true 0=false)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -170,6 +174,10 @@ XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
+VMESS_BUG_PROFILE_ADDRESS="${VMESS_BUG_PROFILE_ADDRESS:-}"
+VMESS_BUG_PROFILE_SNI="${VMESS_BUG_PROFILE_SNI:-}"
+VMESS_BUG_PROFILE_HOST="${VMESS_BUG_PROFILE_HOST:-}"
+VMESS_BUG_PROFILE_ALLOW_INSECURE="${VMESS_BUG_PROFILE_ALLOW_INSECURE:-1}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
@@ -2082,6 +2090,10 @@ XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
+VMESS_BUG_PROFILE_ADDRESS=${VMESS_BUG_PROFILE_ADDRESS}
+VMESS_BUG_PROFILE_SNI=${VMESS_BUG_PROFILE_SNI}
+VMESS_BUG_PROFILE_HOST=${VMESS_BUG_PROFILE_HOST}
+VMESS_BUG_PROFILE_ALLOW_INSECURE=${VMESS_BUG_PROFILE_ALLOW_INSECURE}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -2216,6 +2228,10 @@ const XRAY_PATHS_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/tro
 const XRAY_PATH_VMESS = XRAY_PATHS_VMESS[0];
 const XRAY_PATH_VLESS = XRAY_PATHS_VLESS[0];
 const XRAY_PATH_TROJAN = XRAY_PATHS_TROJAN[0];
+const VMESS_BUG_PROFILE_ADDRESS = String(process.env.VMESS_BUG_PROFILE_ADDRESS || '').trim();
+const VMESS_BUG_PROFILE_SNI = String(process.env.VMESS_BUG_PROFILE_SNI || '').trim();
+const VMESS_BUG_PROFILE_HOST = String(process.env.VMESS_BUG_PROFILE_HOST || '').trim();
+const VMESS_BUG_PROFILE_ALLOW_INSECURE = String(process.env.VMESS_BUG_PROFILE_ALLOW_INSECURE || '1').trim() === '1';
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
   .split(',')
   .map((v) => Number(String(v || '').trim()))
@@ -2885,6 +2901,55 @@ function vmessGrpcLink(host, id, username = '') {
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
+function vmessBugProfile(id, opts = {}) {
+  const reqSni = String(opts?.sni || '').trim();
+  const reqAddress = String(opts?.address || '').trim();
+  const reqHost = String(opts?.host || '').trim();
+  const sni = reqSni || VMESS_BUG_PROFILE_SNI;
+  if (!sni) return null;
+  const address = reqAddress || VMESS_BUG_PROFILE_ADDRESS || DOMAIN;
+  if (!address) return null;
+  const wsHost = reqHost || VMESS_BUG_PROFILE_HOST || DOMAIN || address;
+  const cfg = {
+    inbounds: [],
+    outbounds: [
+      {
+        mux: { enabled: false },
+        protocol: 'vmess',
+        settings: {
+          vnext: [
+            {
+              address,
+              port: 443,
+              users: [
+                { alterId: 0, id, level: 8, security: 'auto' }
+              ]
+            }
+          ]
+        },
+        streamSettings: {
+          network: 'ws',
+          security: 'tls',
+          tlsSettings: {
+            allowInsecure: VMESS_BUG_PROFILE_ALLOW_INSECURE,
+            serverName: sni
+          },
+          wsSettings: {
+            headers: { Host: wsHost },
+            path: XRAY_PATH_VMESS
+          }
+        },
+        tag: 'VMESS'
+      }
+    ],
+    policy: {
+      levels: {
+        '8': { connIdle: 300, downlinkOnly: 1, handshake: 4, uplinkOnly: 1 }
+      }
+    }
+  };
+  return cfg;
+}
 function vlessLink(host, id, tls, username = '') {
   const remark = encodeURIComponent(String(username || `vless-${host}`).trim() || `vless-${host}`);
   if (tls) {
@@ -3307,6 +3372,31 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       "INSERT INTO account_vmesses(username,uuid,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
       [finalUsername, uuid, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
     );
+    const bugCfg = vmessBugProfile(uuid, {
+      sni: req?.body?.bug_sni,
+      address: req?.body?.bug_address,
+      host: req?.body?.bug_host
+    });
+    const bugVmess = bugCfg ? (() => {
+      const outbound = bugCfg?.outbounds?.[0] || {};
+      const vnext = outbound?.settings?.vnext?.[0] || {};
+      const user = (vnext?.users && vnext.users[0]) || {};
+      const payload = {
+        v: '2',
+        ps: finalUsername,
+        add: String(vnext.address || ''),
+        port: String(vnext.port || 443),
+        id: String(user.id || ''),
+        aid: '0',
+        net: 'ws',
+        type: 'none',
+        host: String(outbound?.streamSettings?.wsSettings?.headers?.Host || ''),
+        path: String(outbound?.streamSettings?.wsSettings?.path || XRAY_PATH_VMESS),
+        tls: 'tls',
+        sni: String(outbound?.streamSettings?.tlsSettings?.serverName || '')
+      };
+      return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+    })() : null;
     data = {
       hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
@@ -3315,7 +3405,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) }
+      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) },
+      bug_profile: bugCfg ? { config: bugCfg, vmess: bugVmess } : null
     };
   } else if (protocol === 'vless') {
     await ensureUsernameNotExists('account_vlesses', finalUsername);
@@ -6839,7 +6930,8 @@ def upsert_trojan(rows):
                 u,
                 trojan_secret,
                 str((r or {}).get("date_exp", "")),
-                restored_status((r or {}).get("status")),
+                restored_status((r or 
+                {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
                 pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,

@@ -2805,16 +2805,16 @@ bot.action('m_register_sc', async (ctx) => {
 bot.action('m_register_sc_new', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const [{ pricePerDay, isReseller }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
-  userState.set(ctx.chat.id, { step: 'register_sc_client_name' });
+  userState.set(ctx.chat.id, { step: 'register_sc_ip' });
   await ctx.reply(
     uiBox('REGISTRASI BARU SC', [
-      'Masukkan nama client.',
-      'Contoh: Haris Premium 01',
+      'Masukkan IP VPS.',
+      'Contoh: 103.10.10.2',
       '',
       `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari${isReseller ? ' (RESELLER)' : ''}`,
       `Minimal Durasi  : ${minDays} hari`,
       '',
-      'Setelah input IP, bot akan minta key server VPS.',
+      'Alur input: IP VPS -> Nama Client -> Masa Aktif Script',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -3863,28 +3863,50 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(`IP ${ip} sudah terdaftar oleh user lain.`, mainMenu());
       }
-      const [{ pricePerDay }, minDays, reg] = await Promise.all([
-        getRegistrationPricePerDayForUser(ctx.from.id),
-        getRegistrationMinDays(),
-        getUserRegistration(ctx.from.id, ip)
-      ]);
-      state.step = 'register_sc_key';
+      const reg = await getUserRegistration(ctx.from.id, ip);
+      state.step = 'register_sc_client_name_after_ip';
       state.ip = ip;
-      state.clientName = normalizeClientName(state.clientName || reg?.client_name || ctx.from.first_name || ip) || ip;
+      state.clientName = normalizeClientName(reg?.client_name || ctx.from.first_name || ip) || ip;
       userState.set(ctx.chat.id, state);
       return ctx.reply(
-        uiBox('KONFIRMASI DATA SC', [
-          `Nama Client   : ${state.clientName}`,
+        uiBox('INPUT NAMA CLIENT', [
           `IP VPS        : ${ip}`,
           reg ? `Expired Saat Ini : ${formatDateTime(reg.expires_at)}` : 'Status         : Belum terdaftar',
           '',
+          'Masukkan nama client.',
+          'Contoh: Haris Premium 01'
+        ])
+      );
+    }
+
+    if (state.step === 'register_sc_client_name_after_ip') {
+      const ip = String(state.ip || '').trim();
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State registrasi tidak valid. Ulangi dari menu registrasi.', mainMenu());
+      }
+      const clientName = normalizeClientName(text);
+      if (!clientName || clientName.length < 2) {
+        return ctx.reply(
+          uiBox('INPUT NAMA CLIENT', [
+            'Nama client minimal 2 karakter.',
+            'Contoh: Haris Premium 01'
+          ])
+        );
+      }
+      const [{ pricePerDay }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
+      state.clientName = clientName;
+      state.step = 'register_sc_days';
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('INPUT MASA AKTIF SCRIPT', [
+          `Nama Client   : ${clientName}`,
+          `IP VPS        : ${ip}`,
           `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
           `Minimal Hari  : ${minDays}`,
           `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
           '',
-          'Masukkan key server VPS terlebih dahulu.',
-          '',
-          'Contoh key: abcdefgh12345678'
+          'Masukkan jumlah hari sekarang.'
         ])
       );
     }
@@ -3929,7 +3951,6 @@ bot.on('text', async (ctx) => {
       }
       const totalFee = Math.floor(days) * pricePerDay;
       const clientName = normalizeClientName(state.clientName || ip) || ip;
-      const serverKey = String(state.serverKey || '').trim();
       const result = await registerScIp(ctx.from.id, ip, clientName, Math.floor(days), totalFee);
       if (result.insufficient) {
         const saldo = await getSaldo(ctx.from.id);
@@ -3965,12 +3986,8 @@ bot.on('text', async (ctx) => {
             : ''}`,
         mainMenu()
       );
-      if (serverKey.length >= 8) {
-        await saveServerKeyForHost(ctx.from.id, ip, serverKey);
-        await saveServerKeyForHostAllOwners(ip, serverKey, ctx.from.id);
-      }
       await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
-      const hostKeyReg = serverKey.length >= 8 ? serverKey : await getServerKeyForHost(ctx.from.id, ip);
+      const hostKeyReg = await getServerKeyForHost(ctx.from.id, ip);
       await syncScRegistrationMetaToHost(ip, hostKeyReg, {
         status: 'active',
         client_name: result.clientName || clientName,

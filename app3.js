@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const util = require('util');
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
@@ -511,6 +512,14 @@ function isIpv4(input) {
     const n = Number(p);
     return Number.isInteger(n) && n >= 0 && n <= 255;
   });
+}
+
+function extractIpv4(input) {
+  const text = String(input || '');
+  const found = text.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+  if (!found) return '';
+  const candidate = String(found[0] || '').trim();
+  return isIpv4(candidate) ? candidate : '';
 }
 
 function parseErr(err) {
@@ -1094,12 +1103,12 @@ async function getRegistrationStateByIp(userId, ip, adminMode = false) {
   if (!isIpv4(host)) return null;
   if (adminMode) {
     return dbGet(
-      "SELECT user_id, vps_ip, client_name, status, expires_at, updated_at FROM sc_registrations WHERE LOWER(TRIM(REPLACE(vps_ip, char(13), ''))) = LOWER(TRIM(?)) ORDER BY updated_at DESC LIMIT 1",
+      "SELECT user_id, vps_ip, client_name, status, expires_at, updated_at FROM sc_registrations WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) ORDER BY updated_at DESC LIMIT 1",
       [host]
     );
   }
   return dbGet(
-    "SELECT user_id, vps_ip, client_name, status, expires_at, updated_at FROM sc_registrations WHERE user_id = ? AND LOWER(TRIM(REPLACE(vps_ip, char(13), ''))) = LOWER(TRIM(?)) ORDER BY updated_at DESC LIMIT 1",
+    "SELECT user_id, vps_ip, client_name, status, expires_at, updated_at FROM sc_registrations WHERE user_id = ? AND LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) ORDER BY updated_at DESC LIMIT 1",
     [userId, host]
   );
 }
@@ -1141,7 +1150,7 @@ async function adminRemoveRegisteredIp(ip, adminId) {
   const now = Date.now();
   const rows = await dbAll(
     "SELECT id, user_id, vps_ip, client_name, expires_at FROM sc_registrations " +
-      "WHERE LOWER(TRIM(REPLACE(vps_ip, char(13), '')))=LOWER(TRIM(?)) AND status='active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
+      "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), '')))=LOWER(TRIM(?)) AND status='active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
     [ip, now]
   );
   if (!rows.length) {
@@ -1160,7 +1169,7 @@ async function adminRemoveRegisteredIp(ip, adminId) {
   const tx = await dbRun(
     `UPDATE sc_registrations
      SET status = 'deleted_by_admin', updated_at = ?, expires_at = ?
-     WHERE LOWER(TRIM(REPLACE(vps_ip, char(13), ''))) = LOWER(TRIM(?))
+     WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?))
        AND status='active'
        AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)`,
     [now, now, ip, now]
@@ -3536,7 +3545,7 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      const ip = normalizeHost(text);
+      const ip = extractIpv4(text) || normalizeHost(text);
       if (!isIpv4(ip)) {
         return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
       }
@@ -3600,7 +3609,7 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      const ip = normalizeHost(text);
+      const ip = extractIpv4(text) || normalizeHost(text);
       if (!isIpv4(ip)) {
         return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
       }
@@ -4603,7 +4612,9 @@ bot.on('document', async (ctx) => {
 });
 
 bot.catch((err, ctx) => {
-  console.error('app3 error:', err.message);
+  const msg = err?.message ? String(err.message) : util.inspect(err, { depth: 3 });
+  console.error('app3 error:', msg);
+  if (err?.stack) console.error(err.stack);
   if (ctx?.chat?.id) userState.delete(ctx.chat.id);
 });
 

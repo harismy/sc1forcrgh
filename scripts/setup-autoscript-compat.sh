@@ -78,6 +78,10 @@ set -euo pipefail
 #   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_VLESS=/vless                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
+#   VMESS_BUG_ADDRESS=                           (opsional, metode1: address custom vmess tls ws)
+#   VMESS_BUG_SNI=                               (opsional, metode1: serverName/SNI custom)
+#   VMESS_BUG_HOST=                              (opsional, metode1: header Host custom; default=DOMAIN server)
+#   VMESS_BUG_ALLOW_INSECURE=1                   (opsional, metode1: 1=true 0=false)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -170,6 +174,10 @@ XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
+VMESS_BUG_ADDRESS="${VMESS_BUG_ADDRESS:-}"
+VMESS_BUG_SNI="${VMESS_BUG_SNI:-}"
+VMESS_BUG_HOST="${VMESS_BUG_HOST:-}"
+VMESS_BUG_ALLOW_INSECURE="${VMESS_BUG_ALLOW_INSECURE:-1}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
@@ -2082,6 +2090,10 @@ XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
+VMESS_BUG_ADDRESS=${VMESS_BUG_ADDRESS}
+VMESS_BUG_SNI=${VMESS_BUG_SNI}
+VMESS_BUG_HOST=${VMESS_BUG_HOST}
+VMESS_BUG_ALLOW_INSECURE=${VMESS_BUG_ALLOW_INSECURE}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -2216,6 +2228,10 @@ const XRAY_PATHS_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/tro
 const XRAY_PATH_VMESS = XRAY_PATHS_VMESS[0];
 const XRAY_PATH_VLESS = XRAY_PATHS_VLESS[0];
 const XRAY_PATH_TROJAN = XRAY_PATHS_TROJAN[0];
+const VMESS_BUG_ADDRESS = String(process.env.VMESS_BUG_ADDRESS || '').trim();
+const VMESS_BUG_SNI = String(process.env.VMESS_BUG_SNI || '').trim();
+const VMESS_BUG_HOST = String(process.env.VMESS_BUG_HOST || '').trim();
+const VMESS_BUG_ALLOW_INSECURE = String(process.env.VMESS_BUG_ALLOW_INSECURE || '1').trim() === '1';
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
   .split(',')
   .map((v) => Number(String(v || '').trim()))
@@ -2871,9 +2887,10 @@ async function syncSshBackendsFromDb() {
 
 function vmessLink(host, id, tls, username = '') {
   const remark = String(username || `vmess-${host}`).trim() || `vmess-${host}`;
+  const tlsSni = tls && VMESS_BUG_SNI ? VMESS_BUG_SNI : host;
   const payload = {
     v: '2', ps: remark, add: host, port: tls ? '443' : '80', id, aid: '0',
-    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host
+    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: tlsSni
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
@@ -2884,6 +2901,80 @@ function vmessGrpcLink(host, id, username = '') {
     net: 'grpc', type: 'none', host, path: 'vmess-grpc', tls: 'tls', sni: host
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+}
+function vmessMethod1Payload(id, username = '') {
+  if (!VMESS_BUG_SNI) return null;
+  const address = String(VMESS_BUG_ADDRESS || DOMAIN || '').trim();
+  if (!address) return null;
+  const wsHost = String(VMESS_BUG_HOST || DOMAIN || address).trim() || address;
+  const remarkBase = address || 'server-domain';
+  const remark = String(username || `vmess-method1-${remarkBase}`).trim() || `vmess-method1-${remarkBase}`;
+  return {
+    v: '2',
+    ps: remark,
+    add: address,
+    port: '443',
+    id,
+    aid: '0',
+    net: 'ws',
+    type: 'none',
+    host: wsHost,
+    path: XRAY_PATH_VMESS,
+    tls: 'tls',
+    sni: VMESS_BUG_SNI
+  };
+}
+function vmessMethod1ClientConfig(id, username = '') {
+  const payload = vmessMethod1Payload(id, username);
+  if (!payload) return null;
+  return {
+    inbounds: [],
+    outbounds: [
+      {
+        mux: { enabled: false },
+        protocol: 'vmess',
+        settings: {
+          vnext: [
+            {
+              address: payload.add,
+              port: 443,
+              users: [
+                {
+                  alterId: 0,
+                  id: payload.id,
+                  level: 8,
+                  security: 'auto'
+                }
+              ]
+            }
+          ]
+        },
+        streamSettings: {
+          network: 'ws',
+          security: 'tls',
+          tlsSettings: {
+            allowInsecure: VMESS_BUG_ALLOW_INSECURE,
+            serverName: payload.sni
+          },
+          wsSettings: {
+            headers: { Host: payload.host },
+            path: payload.path
+          }
+        },
+        tag: 'VMESS'
+      }
+    ],
+    policy: {
+      levels: {
+        '8': {
+          connIdle: 300,
+          downlinkOnly: 1,
+          handshake: 4,
+          uplinkOnly: 1
+        }
+      }
+    }
+  };
 }
 function vlessLink(host, id, tls, username = '') {
   const remark = encodeURIComponent(String(username || `vless-${host}`).trim() || `vless-${host}`);
@@ -3307,6 +3398,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       "INSERT INTO account_vmesses(username,uuid,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
       [finalUsername, uuid, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
     );
+    const method1Payload = vmessMethod1Payload(uuid, finalUsername);
+    const method1Config = vmessMethod1ClientConfig(uuid, finalUsername);
     data = {
       hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
@@ -3315,7 +3408,15 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) }
+      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) },
+      method1: method1Payload ? {
+        address: method1Payload.add,
+        serverName: method1Payload.sni,
+        host: method1Payload.host,
+        allowInsecure: VMESS_BUG_ALLOW_INSECURE,
+        vmess: `vmess://${Buffer.from(JSON.stringify(method1Payload)).toString('base64')}`,
+        config: method1Config
+      } : null
     };
   } else if (protocol === 'vless') {
     await ensureUsernameNotExists('account_vlesses', finalUsername);

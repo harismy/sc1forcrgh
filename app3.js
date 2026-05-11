@@ -1728,6 +1728,53 @@ function adminIpKeyListKeyboard(page, totalPages) {
   return Markup.inlineKeyboard(rows);
 }
 
+function adminRemoveIpPreviewKeyboard(page, totalPages) {
+  const p = Math.max(0, Number(page) || 0);
+  const total = Math.max(1, Number(totalPages) || 1);
+  const rows = [];
+  if (total > 1) {
+    const nav = [];
+    if (p > 0) nav.push(Markup.button.callback('Prev', `m_admin_remove_sc_ip_page_${p - 1}`));
+    if (p < total - 1) nav.push(Markup.button.callback('Next', `m_admin_remove_sc_ip_page_${p + 1}`));
+    if (nav.length) rows.push(nav);
+  }
+  rows.push([Markup.button.callback('Refresh', `m_admin_remove_sc_ip_page_${p}`)]);
+  rows.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function buildAdminRemoveIpPreview(page = 0, pageSize = 20) {
+  const totalKeys = await countServerKeysForAdmin().catch(() => 0);
+  const size = Math.max(5, Math.min(20, Number(pageSize) || 20));
+  const totalPages = Math.max(1, Math.ceil(totalKeys / size));
+  const safePage = Math.min(Math.max(0, Number(page) || 0), totalPages - 1);
+  const rows = await listServerKeysForAdminPage(safePage, size).catch(() => []);
+  const startNo = safePage * size;
+  const preview = rows.length
+    ? rows
+        .map((r, i) => {
+          const no = startNo + i + 1;
+          const ip = normalizeHost(r?.vps_ip || '-');
+          const uid = Number(r?.user_id || 0);
+          return `${no}. ${ip} (user ${uid})`;
+        })
+        .join('\n')
+    : '(belum ada data IP+KEY tersimpan)';
+  const text = uiBox(`HAPUS IP VPS TERDAFTAR (PAGE ${safePage + 1}/${totalPages})`, [
+    'Masukkan IP VPS yang ingin dihapus dari registrasi aktif.',
+    'Contoh: 103.10.10.2',
+    'Preview memakai sumber data yang sama dengan menu "Daftar IP + KEY + ID".',
+    'Bot akan coba ambil key server otomatis dari database key tersimpan.',
+    `Menampilkan ${rows.length}${totalKeys > 0 ? ` dari ${totalKeys}` : ''} data.`,
+    '',
+    'Preview IP:',
+    preview,
+    '',
+    'Ketik "batal" untuk membatalkan.'
+  ]);
+  return { text, keyboard: adminRemoveIpPreviewKeyboard(safePage, totalPages) };
+}
+
 async function countServerKeysForAdmin() {
   const row = await dbGet('SELECT COUNT(*) AS c FROM sc_server_keys');
   return Number(row?.c || 0);
@@ -2435,29 +2482,17 @@ bot.action('m_admin_remove_sc_ip', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_remove_sc_ip' });
-  const rows = await listServerKeysForAdminPage(0, 12).catch(() => []);
-  const preview = rows.length
-    ? rows
-        .map((r, i) => {
-          const ip = normalizeHost(r?.vps_ip || '-');
-          const uid = Number(r?.user_id || 0);
-          return `${i + 1}. ${ip} (user ${uid})`;
-        })
-        .join('\n')
-    : '(belum ada data IP+KEY tersimpan)';
-  await ctx.reply(
-    uiBox('HAPUS IP VPS TERDAFTAR', [
-      'Masukkan IP VPS yang ingin dihapus dari registrasi aktif.',
-      'Contoh: 103.10.10.2',
-      'Preview memakai sumber data yang sama dengan menu "Daftar IP + KEY + ID".',
-      'Bot akan coba ambil key server otomatis dari database key tersimpan.',
-      '',
-      'Preview IP:',
-      preview,
-      '',
-      'Ketik "batal" untuk membatalkan.'
-    ])
-  );
+  const view = await buildAdminRemoveIpPreview(0, 20);
+  await ctx.reply(view.text, view.keyboard);
+});
+
+bot.action(/m_admin_remove_sc_ip_page_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_remove_sc_ip' });
+  const page = Math.max(0, Number(ctx.match?.[1] || 0));
+  const view = await buildAdminRemoveIpPreview(page, 20);
+  return ctx.reply(view.text, view.keyboard);
 });
 
 bot.action('m_admin_unlock_sc_access', async (ctx) => {

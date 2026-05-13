@@ -1433,9 +1433,9 @@ frontend ft_443
     use_backend bk_grpc if is_h2_preface
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
-    # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
-    # Jalur xray (/vmess,/vless,/trojan) dan API (/vps/) tetap diprioritaskan ke mux.
-    default_backend bk_sshws_tls
+    # Default 443 diarahkan ke mux agar VMESS/VLESS/TROJAN WS tidak nyasar ke sshws.
+    # SSH SSL-only tetap ditangani via route CONNECT (is_hc_connect) dan fallback nginx / -> 2082.
+    default_backend bk_mux
 
 backend bk_mux
     mode tcp
@@ -10715,9 +10715,9 @@ frontend ft_443
     use_backend bk_grpc if is_h2_preface
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
-    # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
-    # Jalur xray (/vmess,/vless,/trojan) dan API (/vps/) tetap diprioritaskan ke mux.
-    default_backend bk_sshws_tls
+    # Default 443 diarahkan ke mux agar VMESS/VLESS/TROJAN WS tidak nyasar ke sshws.
+    # SSH SSL-only tetap ditangani via route CONNECT (is_hc_connect) dan fallback nginx / -> 2082.
+    default_backend bk_mux
 
 backend bk_mux
     mode tcp

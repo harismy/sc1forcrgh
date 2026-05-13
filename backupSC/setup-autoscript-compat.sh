@@ -45,6 +45,7 @@ set -euo pipefail
 #   UDPCUSTOM_DNAT_RANGE=                        (opsional, default kosong = tanpa DNAT range untuk performa)
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
+#   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
 #   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
@@ -77,6 +78,10 @@ set -euo pipefail
 #   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_VLESS=/vless                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
+#   VMESS_BUG_PROFILE_ADDRESS=                   (opsional, contoh: nusa-stb1.retrivip.xyz)
+#   VMESS_BUG_PROFILE_SNI=                       (opsional, contoh: dfsuporte.garena.com)
+#   VMESS_BUG_PROFILE_HOST=                      (opsional, default mengikuti ADDRESS)
+#   VMESS_BUG_PROFILE_ALLOW_INSECURE=1           (opsional, 1=true 0=false)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -118,6 +123,7 @@ UDPCUSTOM_LISTEN_PORT="${UDPCUSTOM_LISTEN_PORT:-5667}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
+SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
 ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
@@ -144,15 +150,15 @@ IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
 IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
-SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-1}"
+SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-0}"
 SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-109,143}"
 SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-80/second}"
 SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-200}"
 SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-200}"
 SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
-SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
-SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
-SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
+SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-20r/s}"
+SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-40}"
+SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-50}"
 NGINX_WORKER_CONNECTIONS="${NGINX_WORKER_CONNECTIONS:-8192}"
 NGINX_WORKER_RLIMIT_NOFILE="${NGINX_WORKER_RLIMIT_NOFILE:-200000}"
 NGINX_SERVICE_LIMIT_NOFILE="${NGINX_SERVICE_LIMIT_NOFILE:-200000}"
@@ -168,6 +174,10 @@ XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
+VMESS_BUG_PROFILE_ADDRESS="${VMESS_BUG_PROFILE_ADDRESS:-}"
+VMESS_BUG_PROFILE_SNI="${VMESS_BUG_PROFILE_SNI:-}"
+VMESS_BUG_PROFILE_HOST="${VMESS_BUG_PROFILE_HOST:-}"
+VMESS_BUG_PROFILE_ALLOW_INSECURE="${VMESS_BUG_PROFILE_ALLOW_INSECURE:-1}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
@@ -1155,7 +1165,6 @@ server {
 
     location = /cdn-cgi/trace {
         access_log off;
-${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -1763,7 +1772,9 @@ apply_sshws_loop_guard_rules() {
   case "${enabled}" in
     1|true|yes|on) ;;
     *)
-      log "SSHWS loop guard nonaktif (SSHWS_LOOP_GUARD_ENABLE=${SSHWS_LOOP_GUARD_ENABLE:-0})."
+      clear_sshws_loop_guard_rules
+      fw_persist_rules
+      log "SSHWS loop guard nonaktif (SSHWS_LOOP_GUARD_ENABLE=${SSHWS_LOOP_GUARD_ENABLE:-0}), rule burst dibersihkan."
       return 0
       ;;
   esac
@@ -1824,6 +1835,37 @@ apply_sshws_loop_guard_rules() {
   fi
   fw_persist_rules
   log "SSHWS loop guard aktif: ports=${ports}, new_above=${rate}, burst=${burst}, connlimit_above=${connlimit}"
+}
+
+clear_sshws_loop_guard_rules() {
+  local ports p
+  if ! command -v iptables >/dev/null 2>&1; then
+    return 0
+  fi
+
+  ports="$(echo "${SSHWS_LOOP_GUARD_PORTS:-109,143}" | tr -cd '0-9,')"
+  [[ -z "${ports}" ]] && ports="109,143"
+
+  # Hapus rule burst/connlimit dengan dports gabungan.
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports "${ports}" -m conntrack --ctstate NEW \
+    -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports "${ports}" \
+    -m connlimit --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+
+  # Hapus legacy rule yang pernah menyentuh 80/443.
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 -m conntrack --ctstate NEW \
+    -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+  while iptables -w 10 -D INPUT -p tcp -m multiport --dports 80,443,109,143 \
+    -m connlimit --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+
+  # Hapus varian per-port.
+  for p in $(echo "${ports}" | tr ',' ' '); do
+    [[ -z "${p}" ]] && continue
+    while iptables -w 10 -D INPUT -p tcp --dport "${p}" -m conntrack --ctstate NEW \
+      -m hashlimit --hashlimit-name sc_sshws_new --hashlimit-mode srcip --hashlimit-srcmask 32 -j DROP >/dev/null 2>&1; do :; done
+    while iptables -w 10 -D INPUT -p tcp --dport "${p}" \
+      -m connlimit --connlimit-mask 32 -j REJECT --reject-with tcp-reset >/dev/null 2>&1; do :; done
+  done
 }
 
 ensure_sshws_firewall_allow_rules() {
@@ -2047,7 +2089,12 @@ XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
+VMESS_BUG_PROFILE_ADDRESS=${VMESS_BUG_PROFILE_ADDRESS}
+VMESS_BUG_PROFILE_SNI=${VMESS_BUG_PROFILE_SNI}
+VMESS_BUG_PROFILE_HOST=${VMESS_BUG_PROFILE_HOST}
+VMESS_BUG_PROFILE_ALLOW_INSECURE=${VMESS_BUG_PROFILE_ALLOW_INSECURE}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
+SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -2088,6 +2135,11 @@ const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json'
 const UDPCUSTOM_SERVICE = process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
+const SSHWS_UDPGW_PORTS = String(process.env.SSHWS_UDPGW_PORTS || '7300,7200')
+  .split(',')
+  .map((v) => String(v || '').trim())
+  .filter((v) => /^[0-9]{1,5}$/.test(v))
+  .filter((v, i, arr) => arr.indexOf(v) === i);
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const LICENSE_ENFORCE = String(process.env.LICENSE_ENFORCE || '1').trim().toLowerCase();
@@ -2175,6 +2227,10 @@ const XRAY_PATHS_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/tro
 const XRAY_PATH_VMESS = XRAY_PATHS_VMESS[0];
 const XRAY_PATH_VLESS = XRAY_PATHS_VLESS[0];
 const XRAY_PATH_TROJAN = XRAY_PATHS_TROJAN[0];
+const VMESS_BUG_PROFILE_ADDRESS = String(process.env.VMESS_BUG_PROFILE_ADDRESS || '').trim();
+const VMESS_BUG_PROFILE_SNI = String(process.env.VMESS_BUG_PROFILE_SNI || '').trim();
+const VMESS_BUG_PROFILE_HOST = String(process.env.VMESS_BUG_PROFILE_HOST || '').trim();
+const VMESS_BUG_PROFILE_ALLOW_INSECURE = String(process.env.VMESS_BUG_PROFILE_ALLOW_INSECURE || '1').trim() === '1';
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
   .split(',')
   .map((v) => Number(String(v || '').trim()))
@@ -2508,6 +2564,10 @@ function parseDateExpToDate(v) {
   if (/^\d{4}-\d{2}-\d{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$/.test(s)) {
     const iso = s.includes('T') ? s : s.replace(' ', 'T');
     const d = new Date(iso);
+    return Number.isFinite(d.getTime()) ? d : null;
+  }
+  if (/^\d{4}-\d{2}-\d{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$/.test(s)) {
+    const d = new Date(s);
     return Number.isFinite(d.getTime()) ? d : null;
   }
   return null;
@@ -2844,6 +2904,55 @@ function vmessGrpcLink(host, id, username = '') {
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
+function vmessBugProfile(id, opts = {}) {
+  const reqSni = String(opts?.sni || '').trim();
+  const reqAddress = String(opts?.address || '').trim();
+  const reqHost = String(opts?.host || '').trim();
+  const sni = reqSni || VMESS_BUG_PROFILE_SNI;
+  if (!sni) return null;
+  const address = reqAddress || VMESS_BUG_PROFILE_ADDRESS || DOMAIN;
+  if (!address) return null;
+  const wsHost = reqHost || VMESS_BUG_PROFILE_HOST || DOMAIN || address;
+  const cfg = {
+    inbounds: [],
+    outbounds: [
+      {
+        mux: { enabled: false },
+        protocol: 'vmess',
+        settings: {
+          vnext: [
+            {
+              address,
+              port: 443,
+              users: [
+                { alterId: 0, id, level: 8, security: 'auto' }
+              ]
+            }
+          ]
+        },
+        streamSettings: {
+          network: 'ws',
+          security: 'tls',
+          tlsSettings: {
+            allowInsecure: VMESS_BUG_PROFILE_ALLOW_INSECURE,
+            serverName: sni
+          },
+          wsSettings: {
+            headers: { Host: wsHost },
+            path: XRAY_PATH_VMESS
+          }
+        },
+        tag: 'VMESS'
+      }
+    ],
+    policy: {
+      levels: {
+        '8': { connIdle: 300, downlinkOnly: 1, handshake: 4, uplinkOnly: 1 }
+      }
+    }
+  };
+  return cfg;
+}
 function vlessLink(host, id, tls, username = '') {
   const remark = encodeURIComponent(String(username || `vless-${host}`).trim() || `vless-${host}`);
   if (tls) {
@@ -3051,15 +3160,21 @@ app.get('/vps/my-accounts', async (req, res) => {
 });
 
 function sshPayload(username, password, expDate, limitip) {
+  const udpgwPorts = SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'];
   return {
     hostname: DOMAIN,
     username,
     password,
     exp: expDate,
     time: nowTime(),
-    port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpcustom: '1-65535' },
+    port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: udpgwPorts.join(',') },
     ws_path: '/ssh-ws',
     ws_alt_path: '/ws',
+    udpgw: {
+      mode: 'badvpn',
+      ports: udpgwPorts,
+      notes: 'Untuk VC/telp/game di SSH/SSHWS, set badvpn/udpgw ke salah satu port ini.'
+    },
     limitip: String(limitip || 0)
   };
 }
@@ -3260,6 +3375,31 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       "INSERT INTO account_vmesses(username,uuid,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
       [finalUsername, uuid, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
     );
+    const bugCfg = vmessBugProfile(uuid, {
+      sni: req?.body?.bug_sni,
+      address: req?.body?.bug_address,
+      host: req?.body?.bug_host
+    });
+    const bugVmess = bugCfg ? (() => {
+      const outbound = bugCfg?.outbounds?.[0] || {};
+      const vnext = outbound?.settings?.vnext?.[0] || {};
+      const user = (vnext?.users && vnext.users[0]) || {};
+      const payload = {
+        v: '2',
+        ps: finalUsername,
+        add: String(vnext.address || ''),
+        port: String(vnext.port || 443),
+        id: String(user.id || ''),
+        aid: '0',
+        net: 'ws',
+        type: 'none',
+        host: String(outbound?.streamSettings?.wsSettings?.headers?.Host || ''),
+        path: String(outbound?.streamSettings?.wsSettings?.path || XRAY_PATH_VMESS),
+        tls: 'tls',
+        sni: String(outbound?.streamSettings?.tlsSettings?.serverName || '')
+      };
+      return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+    })() : null;
     data = {
       hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
@@ -3268,7 +3408,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) }
+      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) },
+      bug_profile: bugCfg ? { config: bugCfg, vmess: bugVmess } : null
     };
   } else if (protocol === 'vless') {
     await ensureUsernameNotExists('account_vlesses', finalUsername);
@@ -5363,7 +5504,8 @@ function ymdLocalNow() {
 function isExpiredDate(dateExp, todayYmd = '') {
   const v = String(dateExp || '').trim();
   if (!v) return false;
-  if (/^\d{4}-\d{2}-\d{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$/.test(v)) {
+  if (/^\d{4}-\d{2}-\d{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$/.test(v) ||
+      /^\d{4}-\d{2}-\d{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$/.test(v)) {
     const iso = v.includes('T') ? v : v.replace(' ', 'T');
     const ts = new Date(iso).getTime();
     if (!Number.isFinite(ts)) return false;
@@ -5426,9 +5568,7 @@ async function enforceExpiredAccounts() {
   const sshRows = await all(
     "SELECT username, password, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM account_sshs " +
     "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
-    "AND TRIM(COALESCE(date_exp,'')) <> '' " +
-    "AND ((LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(date_exp) <= datetime('now','localtime')) " +
-    "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) <= date('now','localtime')))"
+    "AND TRIM(COALESCE(date_exp,'')) <> ''"
   ).catch(() => []);
   for (const row of sshRows) {
     const user = String(row?.username || '').trim();
@@ -5468,9 +5608,7 @@ async function enforceExpiredAccounts() {
     const rows = await all(
       `SELECT username, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
-      "AND TRIM(COALESCE(date_exp,'')) <> '' " +
-      "AND ((LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(date_exp) <= datetime('now','localtime')) " +
-      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) <= date('now','localtime')))"
+      "AND TRIM(COALESCE(date_exp,'')) <> ''"
     ).catch(() => []);
     for (const row of rows) {
       const user = String(row?.username || '').trim();
@@ -6052,7 +6190,7 @@ EOF
 }
 
 setup_udpgw_service_if_possible() {
-  local udpgw_bin
+  local udpgw_bin udpgw_ports_raw udpgw_ports p
   udpgw_bin=""
   for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
     if [[ -x "${p}" ]]; then
@@ -6062,19 +6200,55 @@ setup_udpgw_service_if_possible() {
   done
 
   if [[ -z "${udpgw_bin}" ]]; then
-    log "badvpn-udpgw tidak ditemukan. Skip setup UDPGW service."
+    log "badvpn-udpgw belum ada. Coba install paket 'badvpn'..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y badvpn >/dev/null 2>&1 || true
+    for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
+      if [[ -x "${p}" ]]; then
+        udpgw_bin="${p}"
+        break
+      fi
+    done
+  fi
+
+  if [[ -z "${udpgw_bin}" ]]; then
+    log "Paket badvpn tidak tersedia. Build badvpn-udpgw dari source..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake build-essential libssl-dev zlib1g-dev >/dev/null 2>&1 || true
+    (
+      set -e
+      cd /usr/local/src
+      rm -rf badvpn
+      git clone --depth 1 https://github.com/ambrop72/badvpn.git >/dev/null 2>&1
+      cd badvpn
+      mkdir -p build
+      cd build
+      cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null
+      make -j"$(nproc)" >/dev/null
+      install -m 755 udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
+    ) || true
+    if [[ -x /usr/local/bin/badvpn-udpgw ]]; then
+      udpgw_bin="/usr/local/bin/badvpn-udpgw"
+    fi
+  fi
+
+  if [[ -z "${udpgw_bin}" || ! -x "${udpgw_bin}" ]]; then
+    log "Gagal menyiapkan badvpn-udpgw. Skip setup UDPGW service."
     return 0
   fi
 
-  log "Setup service badvpn-udpgw (127.0.0.1:7300 & 127.0.0.1:7200)..."
+  udpgw_ports_raw="$(echo "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
+  [[ -z "${udpgw_ports_raw}" ]] && udpgw_ports_raw="7300,7200"
+  udpgw_ports="$(echo "${udpgw_ports_raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 {print $1}' | awk '!seen[$0]++')"
+  [[ -z "${udpgw_ports}" ]] && udpgw_ports="7300"$'\n'"7200"
+
+  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//')"
   cat > /etc/systemd/system/sc-1forcr-udpgw@.service <<EOF
 [Unit]
-Description=SC 1FORCR UDPGW on 127.0.0.1:%i
+Description=SC 1FORCR UDPGW on 0.0.0.0:%i
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=${udpgw_bin} --listen-addr 127.0.0.1:%i --max-clients 2048 --max-connections-for-client 256
+ExecStart=${udpgw_bin} --listen-addr 0.0.0.0:%i --max-clients 2048 --max-connections-for-client 256
 Restart=always
 RestartSec=1
 NoNewPrivileges=true
@@ -6085,8 +6259,22 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now sc-1forcr-udpgw@7300.service >/dev/null 2>&1 || true
-  systemctl enable --now sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
+  for p in ${udpgw_ports}; do
+    systemctl enable --now "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -w 10 -C INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w 10 -I INPUT -p tcp --dport "${p}" -j ACCEPT
+    elif command -v nft >/dev/null 2>&1; then
+      if nft list chain inet filter input >/dev/null 2>&1; then
+        nft list chain inet filter input | grep -F -- "tcp dport ${p} accept" >/dev/null 2>&1 || \
+          nft add rule inet filter input tcp dport "${p}" accept
+      elif nft list chain ip filter input >/dev/null 2>&1; then
+        nft list chain ip filter input | grep -F -- "tcp dport ${p} accept" >/dev/null 2>&1 || \
+          nft add rule ip filter input tcp dport "${p}" accept
+      fi
+    fi
+  done
+  fw_persist_rules
 }
 
 setup_udp_bootfix_service() {
@@ -6344,6 +6532,12 @@ setup_auto_backup_timer() {
     log "Setup auto backup berkala tiap ${AUTO_BACKUP_INTERVAL_MINUTES} menit..."
   fi
 
+  # Bersihkan trigger legacy agar tidak dobel jalan (mis. cron lama tiap 10 menit).
+  rm -f /etc/cron.d/sc-1forcr-autobackup /etc/cron.d/sc-autobackup /etc/cron.d/autobackup-sc-1forcr >/dev/null 2>&1 || true
+  if command -v crontab >/dev/null 2>&1; then
+    (crontab -l 2>/dev/null | grep -v 'sc-1forcr-auto-backup' | crontab -) >/dev/null 2>&1 || true
+  fi
+
   cat > /usr/local/sbin/sc-1forcr-auto-backup <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -6356,6 +6550,7 @@ DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+AUTO_BACKUP_INTERVAL_MINUTES="${AUTO_BACKUP_INTERVAL_MINUTES:-1440}"
 AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}"
 AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
@@ -6381,6 +6576,17 @@ if [[ "${mode}" == "scheduled" ]]; then
     last_date="$(cat "${stamp_file}" 2>/dev/null || true)"
     [[ "${wib_hour_now}" == "${target_wib_hour}" ]] || exit 0
     [[ "${last_date}" == "${wib_date}" ]] && exit 0
+  else
+    interval_min="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+    [[ -z "${interval_min}" || "${interval_min}" -lt 1 ]] && interval_min="1440"
+    interval_sec="$(( interval_min * 60 ))"
+    now_epoch="$(date +%s)"
+    epoch_file="/var/lib/sc-1forcr/last-auto-backup-epoch"
+    last_epoch="$(cat "${epoch_file}" 2>/dev/null || true)"
+    if [[ "${last_epoch}" =~ ^[0-9]+$ ]]; then
+      delta="$(( now_epoch - last_epoch ))"
+      [[ "${delta}" -lt "${interval_sec}" ]] && exit 0
+    fi
   fi
 fi
 
@@ -6480,6 +6686,7 @@ PY
 chmod 600 "${backup_json}" >/dev/null 2>&1 || true
 
 if [[ "${mode}" == "scheduled" ]]; then
+  date +%s > /var/lib/sc-1forcr/last-auto-backup-epoch
   sched_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   if [[ "${sched_mode}" == "daily" || "${sched_mode}" == "daily_wib" || "${sched_mode}" == "wib" ]]; then
     TZ=Asia/Jakarta date +%F > /var/lib/sc-1forcr/last-auto-backup-date
@@ -6491,6 +6698,7 @@ keep_days="$(echo "${AUTO_BACKUP_KEEP_DAYS}" | tr -cd '0-9')"
 find "${AUTO_BACKUP_DIR}" -maxdepth 1 -type f -name 'sc1forcr-accounts-*-WIB.json' -mtime +"${keep_days}" -delete >/dev/null 2>&1 || true
 
 if [[ -n "${TELEGRAM_BOT_TOKEN}" && -n "${TELEGRAM_CHAT_ID}" ]]; then
+  tg_err_log="/var/log/sc-1forcr-autobackup-telegram.err"
   TELEGRAM_BOT_TOKEN="$(echo "${TELEGRAM_BOT_TOKEN}" | tr -d '[:space:]')"
   TELEGRAM_CHAT_ID="$(echo "${TELEGRAM_CHAT_ID}" | tr -d '[:space:]')"
   host="$(hostname 2>/dev/null || echo vps)"
@@ -6510,16 +6718,20 @@ Akun     : SSH/ZIVPN=${ssh_count} VMESS=${vmess_count} VLESS=${vless_count} TROJ
 Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
 
   tg_api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-  if ! curl -fsS --retry 2 --retry-delay 1 --max-time 40 -X POST "${tg_api}/sendDocument" \
+  if ! curl -fsS --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 180 -X POST "${tg_api}/sendDocument" \
     -F "chat_id=${TELEGRAM_CHAT_ID}" \
     -F "disable_content_type_detection=true" \
     --form-string "caption=${caption}" \
-    -F "document=@${backup_json}" >/dev/null 2>&1; then
+    -F "document=@${backup_json}" >/dev/null 2>>"${tg_err_log}"; then
+    {
+      echo "[$(date '+%F %T')] sendDocument gagal untuk file: ${backup_json}"
+      tail -n 5 "${tg_err_log}" 2>/dev/null || true
+    } >> "${tg_err_log}"
     # Fallback: minimal kirim notifikasi teks jika upload dokumen gagal.
-    curl -fsS --retry 2 --retry-delay 1 --max-time 20 -X POST "${tg_api}/sendMessage" \
+    curl -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
       -d "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "text=${caption}
-Backup file tersimpan lokal: ${backup_json}" >/dev/null 2>&1 || true
+Backup file tersimpan lokal: ${backup_json}" >/dev/null 2>>"${tg_err_log}" || true
     logger -t sc-1forcr "Auto-backup Telegram sendDocument gagal, fallback sendMessage dipakai."
   fi
 fi
@@ -6718,7 +6930,8 @@ def upsert_trojan(rows):
                 u,
                 trojan_secret,
                 str((r or {}).get("date_exp", "")),
-                restored_status((r or {}).get("status")),
+                restored_status((r or 
+                {}).get("status")),
                 to_int((r or {}).get("quota", 0)),
                 pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
@@ -6868,6 +7081,7 @@ ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
 ZIVPN_HANDOFF_GRACE_SECONDS="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
+ONLINE_NOTIFY_STATE_FILE="/var/lib/sc-1forcr/online-notify.last"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
 [[ -z "${ZIVPN_HANDOFF_GRACE_SECONDS}" || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -lt 3 || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -gt 120 ]] && ZIVPN_HANDOFF_GRACE_SECONDS="90"
@@ -6887,6 +7101,31 @@ send_tg() {
     -d "parse_mode=HTML" \
     -d "disable_web_page_preview=true" \
     --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+}
+
+should_send_online_report() {
+  local now_ts last_ts interval_sec
+  now_ts="$(date +%s 2>/dev/null || echo 0)"
+  [[ -z "${now_ts}" || ! "${now_ts}" =~ ^[0-9]+$ ]] && now_ts=0
+  interval_sec=$(( ONLINE_NOTIFY_INTERVAL_HOURS * 3600 ))
+  [[ "${interval_sec}" -lt 3600 ]] && interval_sec=3600
+  last_ts=0
+  if [[ -f "${ONLINE_NOTIFY_STATE_FILE}" ]]; then
+    last_ts="$(tr -cd '0-9' < "${ONLINE_NOTIFY_STATE_FILE}" 2>/dev/null || echo 0)"
+    [[ -z "${last_ts}" || ! "${last_ts}" =~ ^[0-9]+$ ]] && last_ts=0
+  fi
+  if [[ "${last_ts}" -gt 0 && "${now_ts}" -gt 0 && $(( now_ts - last_ts )) -lt "${interval_sec}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+mark_online_report_sent() {
+  local now_ts
+  now_ts="$(date +%s 2>/dev/null || echo 0)"
+  [[ -z "${now_ts}" || ! "${now_ts}" =~ ^[0-9]+$ ]] && return 0
+  mkdir -p "$(dirname "${ONLINE_NOTIFY_STATE_FILE}")" >/dev/null 2>&1 || true
+  printf '%s\n' "${now_ts}" > "${ONLINE_NOTIFY_STATE_FILE}" 2>/dev/null || true
 }
 
 detect_udphc_service() {
@@ -7369,7 +7608,10 @@ $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}")
 </pre>
 "
 
-send_tg "${msg}"
+if should_send_online_report; then
+  send_tg "${msg}"
+  mark_online_report_sent
+fi
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-online-notify
 
@@ -7448,6 +7690,7 @@ ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 ZIVPN_DNAT_RANGE=${ZIVPN_DNAT_RANGE}
 UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
+SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 DROPBEAR_VERSION=${DROPBEAR_VERSION}
@@ -7528,6 +7771,158 @@ safe_source_env_file() {
 safe_source_env_file /etc/sc-1forcr.env
 AUTH_TOKEN="${AUTH_TOKEN:-${API_AUTH_TOKEN:-}}"
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
+PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
+
+set_pending_operation() {
+  local type="$1" cmd="$2" note="$3"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+  chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+clear_pending_operation() {
+  rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+resume_pending_operation_prompt() {
+  local ans cmd type note
+  [[ -t 0 && -t 1 ]] || return 0
+  [[ -f "${PENDING_OP_FILE}" ]] || return 0
+  [[ "${SC_PENDING_PROMPT_SHOWN:-0}" == "1" ]] && return 0
+  SC_PENDING_PROMPT_SHOWN=1
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  cmd="${PENDING_CMD:-}"
+  type="${PENDING_TYPE:-unknown}"
+  note="${PENDING_NOTE:-pending operation}"
+  [[ -z "${cmd}" ]] && return 0
+  printf '\nAda proses %s yang belum selesai.\n' "${type}" >/dev/tty
+  printf 'Info : %s\n' "${note}" >/dev/tty
+  printf 'Cmd  : %s\n' "${cmd}" >/dev/tty
+  printf 'Tekan Enter untuk lanjutkan, atau ketik '\''skip'\'' untuk nanti: ' >/dev/tty
+  read -r ans </dev/tty || true
+  [[ "${ans,,}" == "skip" ]] && return 0
+  rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  if [[ "${type}" == "update" ]]; then
+    if ! update_script_from_repo; then
+      mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+      cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+      chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+      echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
+    fi
+    return 0
+  fi
+  if ! bash -lc "${cmd}"; then
+    mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+    cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+    chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+    echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
+  fi
+}
+
+has_pending_install_only() {
+  [[ -f "${PENDING_OP_FILE}" ]] || return 1
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || return 1
+  [[ "${PENDING_TYPE:-}" == "install" && -n "${PENDING_CMD:-}" ]]
+}
+
+is_sc_installed_runtime() {
+  systemctl list-unit-files 2>/dev/null | grep -q '^sc-1forcr-api\.service' && return 0
+  [[ -x /usr/local/sbin/menu-sc-1forcr ]] && [[ -f /etc/sc-1forcr.env ]] && return 0
+  return 1
+}
+
+normalize_pending_operation() {
+  [[ -f "${PENDING_OP_FILE}" ]] || return 0
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  local type cmd note
+  type="${PENDING_TYPE:-}"
+  cmd="${PENDING_CMD:-}"
+  note="${PENDING_NOTE:-}"
+  [[ -z "${type}" || -z "${cmd}" ]] && return 0
+
+  if [[ "${type}" == "install" && "${cmd}" == *"/tmp/setup-autoscript-compat.sh"* && ! -f /tmp/setup-autoscript-compat.sh ]]; then
+    if [[ -x /var/lib/sc-1forcr/pending-install.sh ]]; then
+      set_pending_operation "install" "bash /var/lib/sc-1forcr/pending-install.sh" "Install SC 1FORCR terputus sebelum selesai"
+    fi
+    return 0
+  fi
+
+  # Fokus hanya pending install: pending type lain dibersihkan agar tidak bentrok menu utama.
+  if [[ "${type}" != "install" ]]; then
+    clear_pending_operation
+  fi
+}
+
+pending_install_gate_menu() {
+  local pu_ans cmd type note gate_title opt1_label
+  [[ -t 0 && -t 1 ]] || return 0
+  has_pending_install_only || return 0
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  cmd="${PENDING_CMD:-bash /var/lib/sc-1forcr/pending-install.sh}"
+  type="${PENDING_TYPE:-install}"
+  note="${PENDING_NOTE:-Install SC 1FORCR terputus sebelum selesai}"
+  gate_title="INSTALL PENDING"
+  opt1_label="Lanjutkan Install"
+  while true; do
+    clear
+    draw_menu_panel "${gate_title}" \
+      "1) ${opt1_label}" \
+      "2) Batalkan pending" \
+      "0) Exit"
+    echo
+    if ! prompt_input pu_ans "Pilih menu [0-2]: "; then
+      exit 0
+    fi
+    case "${pu_ans}" in
+      1)
+        if ! bash -lc "${cmd}"; then
+          mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+          cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+          chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+          echo
+          echo "Install pending belum berhasil dilanjutkan."
+          read -rp "Enter untuk kembali ke menu pending..." _ || true
+        else
+          return 0
+        fi
+        ;;
+      2)
+        rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+        return 0
+        ;;
+      0) exit 0 ;;
+      *)
+        echo "Pilihan tidak valid."
+        sleep 1
+        ;;
+    esac
+  done
+}
+
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
@@ -8527,6 +8922,28 @@ prompt_new_username() {
   done
 }
 
+format_remaining_from_minutes() {
+  local mins="${1:-0}" d h m
+  mins="$(echo "${mins}" | tr -cd '0-9')"
+  [[ -z "${mins}" ]] && mins=0
+  if [[ "${mins}" -le 0 ]]; then
+    echo "0m"
+    return
+  fi
+  d=$(( mins / 1440 ))
+  h=$(( (mins % 1440) / 60 ))
+  m=$(( mins % 60 ))
+  if [[ "${d}" -gt 0 ]]; then
+    echo "${d}d ${h}h"
+    return
+  fi
+  if [[ "${h}" -gt 0 ]]; then
+    echo "${h}h ${m}m"
+    return
+  fi
+  echo "${m}m"
+}
+
 print_account_picker_table() {
   local type="$1" lock_only="${2:-0}" table where rows
   table="$(account_table_by_type "${type}")"
@@ -8540,17 +8957,18 @@ print_account_picker_table() {
     )"
   fi
   rows="$(sqlite3 -separator '|' "$DB_PATH" \
-    "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday(date('now','localtime'))) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+    "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
   if [[ -z "${rows}" ]]; then
     return 1
   fi
   printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
   printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"
-  local i=0 u sisa st lim
+  local i=0 u sisa st lim sisa_human
   while IFS='|' read -r u sisa st lim; do
     [[ -z "${u}" ]] && continue
     i=$((i + 1))
-    printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h" "${lim:-0}"
+    sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
+    printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa_human}" "${lim:-0}"
   done <<< "${rows}"
   return 0
 }
@@ -8973,7 +9391,7 @@ list_accounts() {
   print_account_table() {
     local table="$1" title="$2" rows
     rows="$(sqlite3 -separator '|' "$DB_PATH" \
-      "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday(date('now','localtime'))) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
+      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
     echo "LIST AKUN ${title}"
     printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
     printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"
@@ -8981,11 +9399,12 @@ list_accounts() {
       echo "(kosong)"
       return
     fi
-    local i=0 u sisa st lim
+    local i=0 u sisa st lim sisa_human
     while IFS='|' read -r u sisa st lim; do
       [[ -z "${u}" ]] && continue
       i=$((i + 1))
-      printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h" "${lim:-0}"
+      sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
+      printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa_human}" "${lim:-0}"
     done <<< "${rows}"
   }
 
@@ -10022,7 +10441,6 @@ server {
 
     location = /cdn-cgi/trace {
         access_log off;
-${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -12187,6 +12605,11 @@ update_script_from_repo() {
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver
+  # Undrop rule burst SSHWS lama saat update agar koneksi tidak nyangkut.
+  if declare -F clear_sshws_loop_guard_rules >/dev/null 2>&1; then
+    clear_sshws_loop_guard_rules
+    fw_persist_rules
+  fi
   url="${UPDATE_SCRIPT_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
@@ -12282,6 +12705,7 @@ Time     : $(date '+%F %T')"
     ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE}" \
     UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
     UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
+    SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}" \
     DROPBEAR_PORT="${DROPBEAR_PORT}" \
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
     DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
@@ -12354,6 +12778,10 @@ Time     : $(date '+%F %T')"
     switch_udp_to_udpcustom || true
   else
     switch_udp_to_zivpn || true
+  fi
+  # Terapkan ulang kebijakan loop guard sesuai env terbaru (default nonaktif).
+  if declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+    apply_sshws_loop_guard_rules
   fi
   systemctl restart sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
   restart_all_services
@@ -12948,6 +13376,13 @@ if [[ "${1:-}" == "update" ]]; then
 fi
 
 while true; do
+  normalize_pending_operation
+  if has_pending_install_only; then
+    pending_install_gate_menu
+    continue
+  else
+    resume_pending_operation_prompt
+  fi
   if ! enforce_menu_license_access; then
     exit 1
   fi
@@ -13001,6 +13436,24 @@ set -euo pipefail
 exec /usr/local/sbin/menu-sc-1forcr update "$@"
 EOF
   chmod +x /usr/local/sbin/update
+
+  cat > /usr/local/sbin/lanjut-install <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -x /var/lib/sc-1forcr/pending-install.sh ]]; then
+  exec bash /var/lib/sc-1forcr/pending-install.sh "$@"
+fi
+if [[ -f /var/lib/sc-1forcr/pending-op.env ]]; then
+  # shellcheck disable=SC1091
+  source /var/lib/sc-1forcr/pending-op.env >/dev/null 2>&1 || true
+  if [[ "${PENDING_TYPE:-}" == "install" && -n "${PENDING_CMD:-}" ]]; then
+    exec bash -lc "${PENDING_CMD}" "$@"
+  fi
+fi
+echo "Tidak ada pending install yang bisa dilanjutkan."
+exit 1
+EOF
+  chmod +x /usr/local/sbin/lanjut-install
 
   cat > /usr/local/sbin/uninstall-sc-1forcr <<'EOF'
 #!/usr/bin/env bash
@@ -13079,6 +13532,7 @@ rm -f /usr/local/sbin/menu-sc-1forcr
 rm -f /usr/local/sbin/menu-potato
 rm -f /usr/local/sbin/menu
 rm -f /usr/local/sbin/update
+rm -f /usr/local/sbin/lanjut-install
 rm -f /usr/local/sbin/uninstall-sc-1forcr
 rm -f /usr/local/sbin/uninstall-potato-compat
 rm -f /usr/local/sbin/sc-1forcr-safe-reboot
@@ -13109,6 +13563,41 @@ if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; the
 fi
 EOF
   chmod 644 /etc/profile.d/sc-1forcr-auto-menu.sh
+
+  # Fallback for environments where /etc/profile.d is skipped/inconsistent.
+  if [[ -f /root/.bashrc ]]; then
+    sed -i '/# >>> sc-1forcr-auto-menu >>>/,/# <<< sc-1forcr-auto-menu <<</d' /root/.bashrc || true
+  fi
+  cat >> /root/.bashrc <<'EOF'
+# >>> sc-1forcr-auto-menu >>>
+if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; then
+  if [[ -n "${SSH_CONNECTION:-}" ]] && [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
+    if [[ -x /usr/local/sbin/menu ]]; then
+      export SC_MENU_AUTO_STARTED=1
+      /usr/local/sbin/menu || true
+    fi
+  fi
+fi
+# <<< sc-1forcr-auto-menu <<<
+EOF
+
+  # Login-shell fallback (PuTTY/OpenSSH root login) to ensure menu always appears after reconnect.
+  touch /root/.bash_profile
+  sed -i '/# >>> sc-1forcr-auto-menu-login >>>/,/# <<< sc-1forcr-auto-menu-login <<</d' /root/.bash_profile || true
+  cat >> /root/.bash_profile <<'EOF'
+# >>> sc-1forcr-auto-menu-login >>>
+if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; then
+  if [[ -n "${SSH_CONNECTION:-}" ]] && [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
+    if [[ -x /usr/local/sbin/menu ]]; then
+      export SC_MENU_AUTO_STARTED=1
+      /usr/local/sbin/menu
+      return 0 2>/dev/null || true
+      exit 0
+    fi
+  fi
+fi
+# <<< sc-1forcr-auto-menu-login <<<
+EOF
 }
 
 write_version_marker() {
@@ -13333,7 +13822,67 @@ open_menu_after_install() {
   fi
 }
 
+PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
+SCRIPT_SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+PENDING_INSTALL_SCRIPT="/var/lib/sc-1forcr/pending-install.sh"
+
+set_pending_operation() {
+  local type="$1" cmd="$2" note="$3"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  cat > "${PENDING_OP_FILE}" <<EOF
+PENDING_TYPE=${type}
+PENDING_CMD=${cmd}
+PENDING_NOTE=${note}
+PENDING_TIME=$(date '+%F %T')
+EOF
+  chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+clear_pending_operation() {
+  rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+resume_pending_operation_prompt() {
+  local ans cmd type note
+  [[ -t 0 && -t 1 ]] || return 0
+  [[ -f "${PENDING_OP_FILE}" ]] || return 0
+  [[ "${SC_PENDING_PROMPT_SHOWN:-0}" == "1" ]] && return 0
+  SC_PENDING_PROMPT_SHOWN=1
+  # shellcheck disable=SC1090
+  source "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+  cmd="${PENDING_CMD:-}"
+  type="${PENDING_TYPE:-unknown}"
+  note="${PENDING_NOTE:-pending operation}"
+  if [[ -z "${cmd}" ]]; then
+    clear_pending_operation
+    return 0
+  fi
+  echo
+  echo "Ada proses ${type} yang belum selesai."
+  echo "Info : ${note}"
+  echo "Cmd  : ${cmd}"
+  if ! prompt_input ans "Tekan Enter untuk lanjutkan, atau ketik 'skip' untuk nanti: "; then
+    return 0
+  fi
+  [[ "${ans,,}" == "skip" ]] && return 0
+  clear_pending_operation
+  if ! bash -lc "${cmd}"; then
+    set_pending_operation "${type}" "${cmd}" "${note}"
+    echo "Proses pending masih gagal. Akan ditawarkan lagi saat login/menu berikutnya."
+  fi
+}
+
 main() {
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  if [[ -f "${SCRIPT_SELF_PATH}" ]]; then
+    cp -f "${SCRIPT_SELF_PATH}" "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
+    chmod 700 "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
+  fi
+  if [[ -x "${PENDING_INSTALL_SCRIPT}" ]]; then
+    set_pending_operation "install" "bash ${PENDING_INSTALL_SCRIPT}" "Install SC 1FORCR terputus sebelum selesai"
+  else
+    set_pending_operation "install" "bash ${SCRIPT_SELF_PATH}" "Install SC 1FORCR terputus sebelum selesai"
+  fi
   show_install_banner
   show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
   enforce_install_license
@@ -13414,6 +13963,7 @@ Catatan:
 - Endpoint /vps/* sudah kompatibel pola bot 1FORCR (create/trial/renew/delete/lock/unlock).
 - WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
 - Dropbear aktif di port ${DROPBEAR_PORT} dan ${DROPBEAR_ALT_PORT}; ssh-ws bridge default ke ${DROPBEAR_PORT}
+- SSH/SSHWS UDPGW (VC/telp/game) aktif di port TCP: ${SSHWS_UDPGW_PORTS}
 - SSH mux runtime sudah pakai Go binary: ${APP_DIR}/bin/ssh-mux
 - Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
@@ -13434,6 +13984,8 @@ Catatan:
 - Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap ${IPLIMIT_CHECK_INTERVAL_MINUTES} menit, lock sementara ${IPLIMIT_LOCK_MINUTES} menit)
 EOF
 
+  clear_pending_operation
+  rm -f "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
   open_menu_after_install
 }
 

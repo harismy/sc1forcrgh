@@ -2890,17 +2890,21 @@ async function syncSshBackendsFromDb() {
 
 function vmessLink(host, id, tls, username = '') {
   const remark = String(username || `vmess-${host}`).trim() || `vmess-${host}`;
+  const allowInsecure = VMESS_BUG_PROFILE_ALLOW_INSECURE ? '1' : '0';
   const payload = {
     v: '2', ps: remark, add: host, port: tls ? '443' : '80', id, aid: '0',
-    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host
+    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host,
+    allowInsecure
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
 function vmessGrpcLink(host, id, username = '') {
   const remark = String(username || `vmess-grpc-${host}`).trim() || `vmess-grpc-${host}`;
+  const allowInsecure = VMESS_BUG_PROFILE_ALLOW_INSECURE ? '1' : '0';
   const payload = {
     v: '2', ps: remark, add: host, port: '443', id, aid: '0',
-    net: 'grpc', type: 'none', host, path: 'vmess-grpc', tls: 'tls', sni: host
+    net: 'grpc', type: 'none', host, path: 'vmess-grpc', tls: 'tls', sni: host,
+    allowInsecure
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
@@ -3384,6 +3388,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       const outbound = bugCfg?.outbounds?.[0] || {};
       const vnext = outbound?.settings?.vnext?.[0] || {};
       const user = (vnext?.users && vnext.users[0]) || {};
+      const allowInsecure =
+        outbound?.streamSettings?.tlsSettings?.allowInsecure === true ? '1' : '0';
       const payload = {
         v: '2',
         ps: finalUsername,
@@ -3396,7 +3402,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
         host: String(outbound?.streamSettings?.wsSettings?.headers?.Host || ''),
         path: String(outbound?.streamSettings?.wsSettings?.path || XRAY_PATH_VMESS),
         tls: 'tls',
-        sni: String(outbound?.streamSettings?.tlsSettings?.serverName || '')
+        sni: String(outbound?.streamSettings?.tlsSettings?.serverName || ''),
+        allowInsecure
       };
       return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
     })() : null;

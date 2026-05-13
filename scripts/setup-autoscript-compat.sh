@@ -1419,7 +1419,6 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
-    acl is_alpn_h2 ssl_fc_alpn -i h2
     acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
@@ -1431,7 +1430,7 @@ frontend ft_443
     # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
     # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
     acl is_hc_connect req.payload(0,512),lower -m sub "connect "
-    use_backend bk_grpc if is_alpn_h2
+    use_backend bk_grpc if is_h2_preface
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
     # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
@@ -2894,7 +2893,7 @@ function vmessLink(host, id, tls, username = '') {
   const payload = {
     v: '2', ps: remark, add: host, port: tls ? '443' : '80', id, aid: '0',
     net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host,
-    allowInsecure
+    allowInsecure, alpn: 'http/1.1'
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
@@ -3403,7 +3402,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
         path: String(outbound?.streamSettings?.wsSettings?.path || XRAY_PATH_VMESS),
         tls: 'tls',
         sni: String(outbound?.streamSettings?.tlsSettings?.serverName || ''),
-        allowInsecure
+        allowInsecure,
+        alpn: 'http/1.1'
       };
       return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
     })() : null;
@@ -10701,7 +10701,6 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
-    acl is_alpn_h2 ssl_fc_alpn -i h2
     acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
@@ -10713,7 +10712,7 @@ frontend ft_443
     # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
     # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
     acl is_hc_connect req.payload(0,512),lower -m sub "connect "
-    use_backend bk_grpc if is_alpn_h2
+    use_backend bk_grpc if is_h2_preface
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
     # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.

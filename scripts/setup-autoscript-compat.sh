@@ -156,9 +156,9 @@ SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-80/second}"
 SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST:-200}"
 SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-200}"
 SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
-SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
-SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
-SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
+SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-20r/s}"
+SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-40}"
+SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-50}"
 NGINX_WORKER_CONNECTIONS="${NGINX_WORKER_CONNECTIONS:-8192}"
 NGINX_WORKER_RLIMIT_NOFILE="${NGINX_WORKER_RLIMIT_NOFILE:-200000}"
 NGINX_SERVICE_LIMIT_NOFILE="${NGINX_SERVICE_LIMIT_NOFILE:-200000}"
@@ -1165,7 +1165,6 @@ server {
 
     location = /cdn-cgi/trace {
         access_log off;
-${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -10442,7 +10441,6 @@ server {
 
     location = /cdn-cgi/trace {
         access_log off;
-${sshws_nginx_limit_rules}
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;

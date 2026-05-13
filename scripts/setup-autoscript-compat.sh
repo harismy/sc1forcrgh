@@ -1420,6 +1420,7 @@ frontend ft_443
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
     acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
+    acl is_ssh_banner req.payload(0,4) -m str "SSH-"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
     acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
@@ -1433,6 +1434,7 @@ frontend ft_443
     use_backend bk_grpc if is_h2_preface
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
+    use_backend bk_sshws_tls if is_ssh_banner
     # Default 443 diarahkan ke mux agar VMESS/VLESS/TROJAN WS tidak nyasar ke sshws.
     # SSH SSL-only tetap ditangani via route CONNECT (is_hc_connect) dan fallback nginx / -> 2082.
     default_backend bk_mux
@@ -10702,6 +10704,7 @@ frontend ft_443
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
     acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
+    acl is_ssh_banner req.payload(0,4) -m str "SSH-"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
     acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
@@ -10715,6 +10718,7 @@ frontend ft_443
     use_backend bk_grpc if is_h2_preface
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
+    use_backend bk_sshws_tls if is_ssh_banner
     # Default 443 diarahkan ke mux agar VMESS/VLESS/TROJAN WS tidak nyasar ke sshws.
     # SSH SSL-only tetap ditangani via route CONNECT (is_hc_connect) dan fallback nginx / -> 2082.
     default_backend bk_mux

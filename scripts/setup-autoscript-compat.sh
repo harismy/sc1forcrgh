@@ -6727,7 +6727,7 @@ Akun     : SSH/ZIVPN=${ssh_count} VMESS=${vmess_count} VLESS=${vless_count} TROJ
 Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
 
   tg_api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-  if ! curl -fsS --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 180 -X POST "${tg_api}/sendDocument" \
+  if ! curl --http1.1 -fsS --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 180 -X POST "${tg_api}/sendDocument" \
     -F "chat_id=${TELEGRAM_CHAT_ID}" \
     -F "disable_content_type_detection=true" \
     --form-string "caption=${caption}" \
@@ -6737,7 +6737,7 @@ Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
       tail -n 5 "${tg_err_log}" 2>/dev/null || true
     } >> "${tg_err_log}"
     # Fallback: minimal kirim notifikasi teks jika upload dokumen gagal.
-    curl -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
+    curl --http1.1 -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
       -d "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "text=${caption}
 Backup file tersimpan lokal: ${backup_json}" >/dev/null 2>>"${tg_err_log}" || true

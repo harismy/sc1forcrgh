@@ -1,6 +1,7 @@
 ﻿const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const crypto = require('crypto');
 const util = require('util');
 require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
@@ -1055,6 +1056,25 @@ async function syncKnownServerKeyAfterScRegistration(userId, host) {
   return { ok: true, saved: true };
 }
 
+function generateServerKey() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+async function ensureServerKeyForHost(userId, host, preferredKey = '') {
+  const uid = Number(userId || 0);
+  const ip = normalizeHost(host);
+  if (!uid || !isIpv4(ip)) return '';
+
+  let key = String(preferredKey || '').trim();
+  if (key.length < 8) key = await getServerKeyForHost(uid, ip);
+  if (key.length < 8) key = String(process.env.DEFAULT_SERVER_KEY || '').trim();
+  if (key.length < 8) key = generateServerKey();
+
+  await saveServerKeyForHost(uid, ip, key);
+  await saveServerKeyForHostAllOwners(ip, key, uid);
+  return key;
+}
+
 async function shouldSendScNotify(userId, host, event, intervalMs = SC_NOTIFY_INTERVAL_MS) {
   const uid = Number(userId || 0);
   const ip = normalizeHost(host);
@@ -1630,6 +1650,25 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
     throw e;
   }
 
+  let oldHostLock = { attempted: false, ok: false, message: 'key server lama belum tersimpan' };
+  if (String(srcKey || '').trim().length >= 8) {
+    oldHostLock.attempted = true;
+    try {
+      await syncScRegistrationMetaToHost(srcIp, srcKey, {
+        status: 'migrated_ip',
+        client_name: normalizeClientName(src.client_name || srcIp) || srcIp,
+        expires_at: Date.now()
+      }).catch(() => {});
+      await lockScAccessByHost(srcIp, srcKey, userId, 'migrate_ip_to_new_host');
+      oldHostLock.ok = true;
+      oldHostLock.message = 'host lama berhasil di-lock';
+    } catch (err) {
+      oldHostLock.ok = false;
+      oldHostLock.message = parseErr(err);
+    }
+    await unlockScAccessByHost(dstIp, srcKey, userId, 'activate_after_migrate_ip').catch(() => {});
+  }
+
   const usedAfter = used + 1;
   return {
     oldIp: srcIp,
@@ -1637,7 +1676,8 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
     remaining: Math.max(0, SC_IP_CHANGE_MAX - usedAfter),
     serverKey: srcKey || '',
     clientName: normalizeClientName(src.client_name || srcIp) || srcIp,
-    expiresAt: Number(src.expires_at || 0) || 0
+    expiresAt: Number(src.expires_at || 0) || 0,
+    oldHostLock
   };
 }
 
@@ -2304,7 +2344,7 @@ function escapeHtml(input) {
     .replace(/'/g, '&#39;');
 }
 
-async function buildInstallerQuickCopyText() {
+async function buildInstallerQuickCopyText(options = {}) {
   const domain = await getPrimaryApiDomain();
   if (!domain) {
     return {
@@ -2314,7 +2354,11 @@ async function buildInstallerQuickCopyText() {
     };
   }
   const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
-  const cmd = `apt-get update -y && apt-get upgrade -y && apt-get install -y curl ca-certificates htop && bash -c "$(curl -fsSL ${installerUrl})"`;
+  const serverKey = String(options?.serverKey || '').trim();
+  const keyEnv = serverKey.length >= 8
+    ? `API_AUTH_TOKEN=${JSON.stringify(serverKey)} AUTH_TOKEN=${JSON.stringify(serverKey)} ZIVPN_HTTP_AUTH_TOKEN=${JSON.stringify(serverKey)} `
+    : '';
+  const cmd = `apt-get update -y && apt-get upgrade -y && apt-get install -y curl ca-certificates htop && ${keyEnv}bash -c "$(curl -fsSL ${installerUrl})"`;
   const safeUrl = escapeHtml(installerUrl);
   const safeCmd = escapeHtml(cmd);
   return {
@@ -2877,7 +2921,15 @@ bot.action('m_check_sc_ip_expiry', async (ctx) => {
 bot.action('m_install_link', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
-  const installerText = await buildInstallerQuickCopyText();
+  let installerText;
+  const activeRegs = await getActiveRegistrations(ctx.from.id).catch(() => []);
+  const latestHost = String(activeRegs?.[0]?.vps_ip || '').trim();
+  if (isIpv4(normalizeHost(latestHost))) {
+    const k = await ensureServerKeyForHost(ctx.from.id, latestHost);
+    installerText = await buildInstallerQuickCopyText({ serverKey: k });
+  } else {
+    installerText = await buildInstallerQuickCopyText();
+  }
   if (!installerText.ok) {
     return ctx.reply(
       'Domain API installer belum diset admin.\nHubungi admin agar tambah domain via menu admin.',
@@ -3914,10 +3966,14 @@ bot.on('text', async (ctx) => {
         client_name: out.clientName,
         expires_at: Number(out.expiresAt || 0)
       }).catch(() => {});
+      const lockInfo = out.oldHostLock?.attempted
+        ? (out.oldHostLock?.ok ? 'berhasil' : `gagal (${out.oldHostLock?.message || 'unknown'})`)
+        : 'skip (key server lama belum tersimpan)';
       return ctx.reply(
         `Ganti IP VPS berhasil.\n` +
           `IP lama: ${out.oldIp}\n` +
           `IP baru: ${out.newIp}\n` +
+          `Lock host lama: ${lockInfo}\n` +
           `Sisa kuota ganti IP: ${out.remaining}x`,
         mainMenu()
       );
@@ -4033,7 +4089,8 @@ bot.on('text', async (ctx) => {
       }
 
       const saldoNow = await getSaldo(ctx.from.id);
-      const installerText = await buildInstallerQuickCopyText();
+      const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, serverKey);
+      const installerText = await buildInstallerQuickCopyText({ serverKey: activeServerKey });
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Registrasi SC Unlimited berhasil.\n` +
@@ -4044,10 +4101,7 @@ bot.on('text', async (ctx) => {
           `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
         mainMenu()
       );
-      await saveServerKeyForHost(ctx.from.id, ip, serverKey);
-      await saveServerKeyForHostAllOwners(ip, serverKey, ctx.from.id);
-      await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
-      await syncScRegistrationMetaToHost(ip, serverKey, {
+      await syncScRegistrationMetaToHost(ip, activeServerKey, {
         status: 'active',
         client_name: result.clientName || clientName,
         expires_at: 0
@@ -4181,7 +4235,8 @@ bot.on('text', async (ctx) => {
         );
       }
       const saldoNow = await getSaldo(ctx.from.id);
-      const installerText = await buildInstallerQuickCopyText();
+      const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, state.serverKey || '');
+      const installerText = await buildInstallerQuickCopyText({ serverKey: activeServerKey });
       let unlockResult = { attempted: false, ok: false, message: '' };
       if (result.reactivatedFromExpired) {
         unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'renew_after_natural_expired');
@@ -4200,9 +4255,7 @@ bot.on('text', async (ctx) => {
             : ''}`,
         mainMenu()
       );
-      await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
-      const hostKeyReg = await getServerKeyForHost(ctx.from.id, ip);
-      await syncScRegistrationMetaToHost(ip, hostKeyReg, {
+      await syncScRegistrationMetaToHost(ip, activeServerKey, {
         status: 'active',
         client_name: result.clientName || clientName,
         expires_at: Number(result.expiresAt || 0)
@@ -4407,7 +4460,8 @@ bot.on('text', async (ctx) => {
       }
 
       const saldoNow = await getSaldo(ctx.from.id);
-      const installerText = await buildInstallerQuickCopyText();
+      const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, serverKey);
+      const installerText = await buildInstallerQuickCopyText({ serverKey: activeServerKey });
       let unlockResult = { attempted: false, ok: false, message: '' };
       if (result.reactivatedFromExpired) {
         unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'renew_after_natural_expired');
@@ -4426,13 +4480,7 @@ bot.on('text', async (ctx) => {
             : ''}`,
         mainMenu()
       );
-      if (serverKey.length >= 8) {
-        await saveServerKeyForHost(ctx.from.id, ip, serverKey);
-        await saveServerKeyForHostAllOwners(ip, serverKey, ctx.from.id);
-      }
-      await syncKnownServerKeyAfterScRegistration(ctx.from.id, ip).catch(() => {});
-      const hostKeyExtend = await getServerKeyForHost(ctx.from.id, ip);
-      await syncScRegistrationMetaToHost(ip, hostKeyExtend, {
+      await syncScRegistrationMetaToHost(ip, activeServerKey, {
         status: 'active',
         client_name: result.clientName || clientName,
         expires_at: Number(result.expiresAt || 0)

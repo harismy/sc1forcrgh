@@ -552,13 +552,16 @@ function parseRenewErr(err) {
 function uiBox(title, lines = []) {
   const body = Array.isArray(lines) ? lines.map((x) => String(x ?? '')) : [String(lines || '')];
   const titleText = String(title || '').trim();
-  const width = Math.max(
-    titleText.length,
-    ...body.map((line) => String(line || '').length),
-    24
+  const contentWidth = Math.min(
+    Math.max(titleText.length, ...body.map((line) => String(line || '').length), 24),
+    64
   );
-  const sep = '-'.repeat(Math.min(width, 64));
-  return [sep, titleText, '', ...body, sep].join('\n');
+  const top = `┌${'─'.repeat(contentWidth + 2)}┐`;
+  const mid = `├${'─'.repeat(contentWidth + 2)}┤`;
+  const bottom = `└${'─'.repeat(contentWidth + 2)}┘`;
+  const row = (text = '') => `│ ${String(text || '').padEnd(contentWidth, ' ')} │`;
+  const bodyRows = body.map((line) => row(line));
+  return [top, row(titleText), mid, ...bodyRows, bottom].join('\n');
 }
 
 function normalizeScriptLineEndings(input) {
@@ -1107,6 +1110,51 @@ async function getActiveRegistrations(userId) {
     "SELECT vps_ip, client_name, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) ORDER BY updated_at DESC",
     [userId, Date.now()]
   );
+}
+
+async function getMainMenuStats() {
+  const now = Date.now();
+  const [usersRow, ipsRow] = await Promise.all([
+    dbGet('SELECT COUNT(1) AS total FROM users'),
+    dbGet("SELECT COUNT(DISTINCT vps_ip) AS total FROM sc_registrations WHERE status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)", [now])
+  ]);
+  return {
+    totalUsers: Number(usersRow?.total || 0),
+    totalRegisteredIps: Number(ipsRow?.total || 0)
+  };
+}
+
+async function buildMainMenuInfoLines(userId) {
+  const saldoPromise = getSaldo(userId).catch(() => 0);
+  const regsPromise = getActiveRegistrations(userId).catch(() => []);
+  const pricePromise = getRegistrationPricePerDayForUser(userId);
+  const minDaysPromise = getRegistrationMinDays();
+  const statsPromise = getMainMenuStats().catch(() => ({ totalUsers: 0, totalRegisteredIps: 0 }));
+
+  const [saldo, regs, { pricePerDay, isReseller }, minDays, stats] = await Promise.all([
+    saldoPromise,
+    regsPromise,
+    pricePromise,
+    minDaysPromise,
+    statsPromise
+  ]);
+
+  return [
+    `Saldo Kamu       : Rp ${Number(saldo).toLocaleString('id-ID')}`,
+    `IP Terdaftar     : ${regs.length}`,
+    `Total Pengguna   : ${Number(stats.totalUsers || 0)}`,
+    `Total IP VPS SC  : ${Number(stats.totalRegisteredIps || 0)}`,
+    `Harga SC / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}${isReseller ? ' (RESELLER)' : ''}`,
+    `Status Reseller  : ${isReseller ? 'RESELLER' : 'NON-RESELLER'}`,
+    `Minimal Hari     : ${minDays} hari`,
+    '',
+    'Alur Cepat:',
+    '1) Top Up Saldo',
+    '2) Daftar / Perpanjang SC',
+    '3) Gunakan fitur SC (backup/restore)',
+    isAdmin(userId) ? '' : '',
+    isAdmin(userId) ? 'Admin: gunakan /admin untuk kelola layanan.' : ''
+  ];
 }
 
 async function getLatestRegistrationState(userId) {
@@ -2457,24 +2505,9 @@ async function pollPendingTopups() {
 
 bot.start(async (ctx) => {
   userState.delete(ctx.chat.id);
-  const saldo = await getSaldo(ctx.from.id).catch(() => 0);
-  const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
-  const [{ pricePerDay, isReseller }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
+  const lines = await buildMainMenuInfoLines(ctx.from.id);
   await ctx.reply(
-    uiBox('SC 1FORCR NEXUS - INFORMASI AKUN', [
-      `Saldo Kamu       : Rp ${Number(saldo).toLocaleString('id-ID')}`,
-      `IP Terdaftar     : ${regs.length}`,
-      `Harga SC / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}${isReseller ? ' (RESELLER)' : ''}`,
-      `Status Reseller  : ${isReseller ? 'RESELLER' : 'NON-RESELLER'}`,
-      `Minimal Hari     : ${minDays} hari`,
-      '',
-      'Alur Cepat:',
-      '1) Top Up Saldo',
-      '2) Daftar / Perpanjang SC',
-      '3) Gunakan fitur SC (backup/restore)',
-      isAdmin(ctx.from.id) ? '' : '',
-      isAdmin(ctx.from.id) ? 'Admin: gunakan /admin untuk kelola layanan.' : ''
-    ]),
+    uiBox('SC 1FORCR NEXUS - INFORMASI AKUN', lines),
     mainMenu()
   );
 });
@@ -2502,7 +2535,8 @@ bot.action('m_become_reseller', async (ctx) => {
 
 bot.command('menu', async (ctx) => {
   userState.delete(ctx.chat.id);
-  await ctx.reply('Pilih menu:', mainMenu());
+  const lines = await buildMainMenuInfoLines(ctx.from.id);
+  await ctx.reply(uiBox('SC 1FORCR NEXUS - INFORMASI AKUN', lines), mainMenu());
 });
 
 bot.command('admin', async (ctx) => {

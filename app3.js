@@ -1,4 +1,4 @@
-const fs = require('fs');
+﻿const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const util = require('util');
@@ -556,7 +556,7 @@ function uiBox(title, lines = []) {
     ...body.map((line) => String(line || '').length),
     24
   );
-  const sep = '─'.repeat(Math.min(width, 64));
+  const sep = '-'.repeat(Math.min(width, 64));
   return [sep, titleText, '', ...body, sep].join('\n');
 }
 
@@ -1643,19 +1643,16 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
 
 function mainMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🛒 Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('📦 SC Saya', 'm_my_sc')],
-    [Markup.button.callback('✨ Fitur SC 1FORCR NEXUS', 'm_sc_features')],
-    [Markup.button.callback('👥 Grup SC 1FORCR 1FORCR', 'm_group_sc_1forcr')],
-    [Markup.button.callback('💼 Jadi Reseller', 'm_become_reseller')],
-    [Markup.button.callback('⏳ Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
-    [Markup.button.callback('🔗 Link Instalasi', 'm_install_link'), Markup.button.callback('💳 Top Up Saldo', 'm_topup_saldo')],
-    [Markup.button.callback('💰 Cek Saldo', 'm_cek_saldo'), Markup.button.callback('🗂️ Cadangkan SC', 'm_backup_now')],
-    [Markup.button.callback('♻️ Pulihkan SC', 'm_restore_upload'), Markup.button.callback('🧹 Hapus Semua Akun', 'm_delete_all_accounts')],
-    [Markup.button.callback('🚚 Migrasi Akun', 'm_migrate_accounts')],
+    [Markup.button.callback('🛒 Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('🔁 Ganti IP VPS', 'm_register_sc_change_ip')],
+    [Markup.button.callback('📦 SC Saya', 'm_my_sc'), Markup.button.callback('⏳ Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
+    [Markup.button.callback('💳 Top Up Saldo', 'm_topup_saldo'), Markup.button.callback('💰 Cek Saldo', 'm_cek_saldo')],
+    [Markup.button.callback('🔗 Link Instalasi', 'm_install_link'), Markup.button.callback('✨ Fitur SC 1FORCR NEXUS', 'm_sc_features')],
+    [Markup.button.callback('🚚 Migrasi Akun', 'm_migrate_accounts'), Markup.button.callback('🧹 Hapus Semua Akun', 'm_delete_all_accounts')],
+    [Markup.button.callback('🗂️ Cadangkan SC', 'm_backup_now'), Markup.button.callback('♻️ Pulihkan SC', 'm_restore_upload')],
+    [Markup.button.callback('💼 Jadi Reseller', 'm_become_reseller'), Markup.button.callback('👥 Grup SC 1FORCR', 'm_group_sc_1forcr')],
     [Markup.button.callback('🛠️ Menu Admin', 'm_admin_menu')]
   ]);
 }
-
 const ACCOUNT_PROTOCOLS = [
   { type: 'ssh', label: 'SSH (termasuk UDP/ZIVPN)' },
   { type: 'vmess', label: 'VMESS' },
@@ -4913,3 +4910,4 @@ bot.catch((err, ctx) => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
+

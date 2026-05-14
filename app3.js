@@ -556,10 +556,11 @@ function uiBox(title, lines = []) {
     Math.max(titleText.length, ...body.map((line) => String(line || '').length), 24),
     64
   );
-  const top = `┌${'─'.repeat(contentWidth + 2)}┐`;
-  const mid = `├${'─'.repeat(contentWidth + 2)}┤`;
-  const bottom = `└${'─'.repeat(contentWidth + 2)}┘`;
-  const row = (text = '') => `│ ${String(text || '').padEnd(contentWidth, ' ')} │`;
+  // Samakan style dengan main menu (garis tebal).
+  const top = `┏${'━'.repeat(contentWidth + 2)}┓`;
+  const mid = `┣${'━'.repeat(contentWidth + 2)}┫`;
+  const bottom = `┗${'━'.repeat(contentWidth + 2)}┛`;
+  const row = (text = '') => `┃ ${String(text || '').padEnd(contentWidth, ' ')} ┃`;
   const bodyRows = body.map((line) => row(line));
   return [top, row(titleText), mid, ...bodyRows, bottom].join('\n');
 }

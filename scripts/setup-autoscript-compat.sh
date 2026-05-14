@@ -11112,7 +11112,7 @@ draw_dashboard() {
   local BOLD="${ESC}[1m"
   local NC="${ESC}[0m"
 
-  local BOX_W=72
+  local BOX_W=58
 
   strip_ansi() {
     sed -r 's/\x1B\[[0-9;]*[mK]//g'

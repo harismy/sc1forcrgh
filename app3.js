@@ -203,6 +203,8 @@ async function ensurePendingDepositSchema() {
   const hasGatewayProvider = cols.some((c) => String(c?.name || '').toLowerCase() === 'gateway_provider');
   const hasOriginalAmount = cols.some((c) => String(c?.name || '').toLowerCase() === 'original_amount');
   const hasAdminFee = cols.some((c) => String(c?.name || '').toLowerCase() === 'admin_fee');
+  const hasQrMsgChatId = cols.some((c) => String(c?.name || '').toLowerCase() === 'qr_message_chat_id');
+  const hasQrMsgId = cols.some((c) => String(c?.name || '').toLowerCase() === 'qr_message_id');
   if (!hasGatewayProvider) {
     await dbRun("ALTER TABLE pending_deposits_app3 ADD COLUMN gateway_provider TEXT DEFAULT 'gopay'");
   }
@@ -211,6 +213,12 @@ async function ensurePendingDepositSchema() {
   }
   if (!hasAdminFee) {
     await dbRun('ALTER TABLE pending_deposits_app3 ADD COLUMN admin_fee INTEGER DEFAULT 0');
+  }
+  if (!hasQrMsgChatId) {
+    await dbRun('ALTER TABLE pending_deposits_app3 ADD COLUMN qr_message_chat_id INTEGER');
+  }
+  if (!hasQrMsgId) {
+    await dbRun('ALTER TABLE pending_deposits_app3 ADD COLUMN qr_message_id INTEGER');
   }
 }
 
@@ -2743,6 +2751,22 @@ async function markPendingPaid(row) {
   }
 }
 
+async function cleanupTopupQrMessage(row) {
+  const chatId = Number(row?.qr_message_chat_id || row?.user_id || 0);
+  const messageId = Number(row?.qr_message_id || 0);
+  if (!chatId || !messageId) return false;
+  try {
+    await bot.telegram.deleteMessage(chatId, messageId);
+  } catch (_) {
+    // ignore when message can't be deleted (too old/already removed)
+  }
+  await dbRun(
+    'UPDATE pending_deposits_app3 SET qr_message_chat_id = NULL, qr_message_id = NULL WHERE unique_code = ?',
+    [row?.unique_code]
+  ).catch(() => {});
+  return true;
+}
+
 async function pollPendingTopups() {
   try {
     const now = Date.now();
@@ -2751,6 +2775,7 @@ async function pollPendingTopups() {
       const expiresAt = Number(row.expires_at || 0);
       if (expiresAt > 0 && now > expiresAt) {
         await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ?", [row.unique_code]);
+        await cleanupTopupQrMessage(row).catch(() => {});
         await bot.telegram.sendMessage(
           row.user_id,
           `Top Up Saldo kedaluwarsa.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}`
@@ -2765,6 +2790,7 @@ async function pollPendingTopups() {
       if (st.settled) {
         const credited = await markPendingPaid(row);
         if (credited) {
+          await cleanupTopupQrMessage(row).catch(() => {});
           await notifyAdminsTopupSuccess(row).catch(() => {});
           const saldoNow = await getSaldo(row.user_id).catch(() => 0);
           await bot.telegram.sendMessage(
@@ -3447,6 +3473,7 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
   const now = Date.now();
   if (Number(row.expires_at || 0) > 0 && now > Number(row.expires_at || 0)) {
     await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ?", [row.unique_code]);
+    await cleanupTopupQrMessage(row).catch(() => {});
     return ctx.reply('Top Up Saldo sudah kedaluwarsa.');
   }
 
@@ -3462,6 +3489,7 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
       const credited = await markPendingPaid(row);
       const saldoNow = await getSaldo(ctx.from.id).catch(() => 0);
       if (credited) {
+        await cleanupTopupQrMessage(row).catch(() => {});
         await notifyAdminsTopupSuccess(row).catch(() => {});
         return ctx.reply(`Top Up Saldo berhasil. Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`, mainMenu());
       }
@@ -3475,6 +3503,7 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
     const credited = await markPendingPaid(row);
     const saldoNow = await getSaldo(ctx.from.id).catch(() => 0);
     if (credited) {
+      await cleanupTopupQrMessage(row).catch(() => {});
       await notifyAdminsTopupSuccess(row).catch(() => {});
       return ctx.reply(`Top Up Saldo berhasil. Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`, mainMenu());
     }
@@ -3491,6 +3520,7 @@ bot.action(/m_cancel_topup_(.+)/, async (ctx) => {
   if (!row) return ctx.reply('Transaksi Top Up Saldo tidak ditemukan.');
   if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${formatTopupStatus(row.status)}`);
   await dbRun("UPDATE pending_deposits_app3 SET status='cancelled' WHERE unique_code = ?", [code]);
+  await cleanupTopupQrMessage(row).catch(() => {});
   return ctx.reply('Top Up Saldo dibatalkan.');
 });
 
@@ -4999,21 +5029,29 @@ bot.on('text', async (ctx) => {
         `Expired: ${Math.floor(topupExpireMs / 60000)} menit`;
 
       try {
-        await ctx.replyWithPhoto(qr.qrUrl, {
+        const sent = await ctx.replyWithPhoto(qr.qrUrl, {
           caption,
           ...Markup.inlineKeyboard([
             [Markup.button.callback('Cek Status', `m_check_topup_${code}`)],
             [Markup.button.callback('Batalkan', `m_cancel_topup_${code}`)]
           ])
         });
+        await dbRun(
+          'UPDATE pending_deposits_app3 SET qr_message_chat_id = ?, qr_message_id = ? WHERE unique_code = ?',
+          [Number(ctx.chat?.id || 0), Number(sent?.message_id || 0), code]
+        ).catch(() => {});
       } catch (_) {
-        await ctx.reply(
+        const sent = await ctx.reply(
           `${caption}\nQR: ${qr.qrUrl}`,
           Markup.inlineKeyboard([
             [Markup.button.callback('Cek Status', `m_check_topup_${code}`)],
             [Markup.button.callback('Batalkan', `m_cancel_topup_${code}`)]
           ])
         );
+        await dbRun(
+          'UPDATE pending_deposits_app3 SET qr_message_chat_id = ?, qr_message_id = ? WHERE unique_code = ?',
+          [Number(ctx.chat?.id || 0), Number(sent?.message_id || 0), code]
+        ).catch(() => {});
       }
       return;
     }

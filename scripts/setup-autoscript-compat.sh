@@ -7116,6 +7116,9 @@ send_tg() {
 }
 
 should_send_online_report() {
+  if [[ "${FORCE_ONLINE_NOTIFY:-0}" == "1" ]]; then
+    return 0
+  fi
   local now_ts last_ts interval_sec
   now_ts="$(date +%s 2>/dev/null || echo 0)"
   [[ -z "${now_ts}" || ! "${now_ts}" =~ ^[0-9]+$ ]] && now_ts=0
@@ -9925,7 +9928,7 @@ trigger_online_notify_now() {
     echo "Script notifier tidak ditemukan: ${notify_bin}"
     return 1
   fi
-  if ONLINE_NOTIFY_ENABLE=1 "${notify_bin}"; then
+  if ONLINE_NOTIFY_ENABLE=1 FORCE_ONLINE_NOTIFY=1 "${notify_bin}"; then
     echo "Notifikasi online berhasil dikirim ke Telegram."
   else
     echo "Gagal mengirim notifikasi online manual."
@@ -13970,31 +13973,6 @@ curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
   -H "Content-Type: application/json" \\
   -d '{"username":"test123","password":"test123","expired":3,"limitip":"2","kuota":"0"}'
 
-Catatan:
-- Installer sekarang memakai gate lisensi berbasis IP VPS.
-- Wajib registrasi dan pembayaran lisensi terlebih dahulu sebelum install.
-- Endpoint /vps/* sudah kompatibel pola bot 1FORCR (create/trial/renew/delete/lock/unlock).
-- WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
-- Dropbear aktif di port ${DROPBEAR_PORT} dan ${DROPBEAR_ALT_PORT}; ssh-ws bridge default ke ${DROPBEAR_PORT}
-- SSH/SSHWS UDPGW (VC/telp/game) aktif di port TCP: ${SSHWS_UDPGW_PORTS}
-- SSH mux runtime sudah pakai Go binary: ${APP_DIR}/bin/ssh-mux
-- Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
-- Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
-- Rule UDP ZIVPN otomatis dipasang: INPUT udp ${ZIVPN_LISTEN_PORT}, DNAT ${ZIVPN_DNAT_RANGE} -> ${ZIVPN_LISTEN_PORT}.
-- UDP Custom juga otomatis disiapkan di service ${UDPCUSTOM_SERVICE_NAME} (config: /root/udp/config.json).
-- UDP Custom (UDPHC) default tanpa DNAT range; rule DNAT legacy ke port UDPHC akan dibersihkan otomatis.
-- Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
-- vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
-- Auto reboot aktif berkala sesuai interval AUTO_REBOOT_INTERVAL_MINUTES via systemd timer sc-1forcr-autoreboot.timer.
-- Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
-- Auto backup semua akun (JSON) mendukung mode interval (AUTO_BACKUP_INTERVAL_MINUTES) atau jadwal harian WIB (AUTO_BACKUP_WIB_HOUR) via sc-1forcr-autobackup.timer.
-- Notifikasi akun online berkala ke Telegram aktif default tiap ${ONLINE_NOTIFY_INTERVAL_HOURS} jam via sc-1forcr-online-notify.timer.
-- Backup manual: /usr/local/sbin/sc-1forcr-auto-backup manual
-- Restore akun dari backup: /usr/local/sbin/sc-1forcr-restore-backup /path/file.json
-- UDP boot-fix aktif via systemd sc-1forcr-udp-bootfix.service (re-apply backend/rule saat startup).
-- Menu VPS: jalankan perintah menu atau menu-sc-1forcr
-- Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu gunakan Tools -> Update Script
-- Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap ${IPLIMIT_CHECK_INTERVAL_MINUTES} menit, lock sementara ${IPLIMIT_LOCK_MINUTES} menit)
 EOF
 
   clear_pending_operation

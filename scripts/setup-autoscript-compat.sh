@@ -11162,22 +11162,22 @@ draw_dashboard() {
   }
 
   print_top() {
-    printf '%s+%s+%s\n' "${AQUA}" "$(gradient_fill '=' "$((BOX_W + 2))")" "${NC}"
+    printf '%s┏%s┓%s\n' "${AQUA}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_mid() {
-    printf '%s+%s+%s\n' "${VIOLET}" "$(gradient_fill '-' "$((BOX_W + 2))")" "${NC}"
+    printf '%s┣%s┫%s\n' "${VIOLET}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_bottom() {
-    printf '%s+%s+%s\n' "${PURPLE}" "$(gradient_fill '=' "$((BOX_W + 2))")" "${NC}"
+    printf '%s┗%s┛%s\n' "${PURPLE}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_line() {
     local text="$1"
     local padded
     padded="$(pad_right "$text" "$BOX_W")"
-    printf '%s|%s %s %s|%s\n' "${AQUA}" "${NC}" "$padded" "${PURPLE}" "${NC}"
+    printf '%s┃%s %s %s┃%s\n' "${AQUA}" "${NC}" "$padded" "${PURPLE}" "${NC}"
   }
 
   print_center() {
@@ -11190,7 +11190,7 @@ draw_dashboard() {
     fi
     left=$(( (BOX_W - vlen) / 2 ))
     right=$(( BOX_W - vlen - left ))
-    printf '%s|%s %*s%s%*s %s|%s\n' "${AQUA}" "${NC}" "$left" "" "$text" "$right" "" "${PURPLE}" "${NC}"
+    printf '%s┃%s %*s%s%*s %s┃%s\n' "${AQUA}" "${NC}" "$left" "" "$text" "$right" "" "${PURPLE}" "${NC}"
   }
 
   kv_line() {

@@ -10942,6 +10942,8 @@ EOF
 enforce_menu_license_access() {
   local enabled ip_text status expires_raw expires_epoch now_epoch lock_file lock_reason
   lock_file="/etc/sc-1forcr-access.lock"
+  ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ip_text="${ip_text:-unknown}"
   if [[ -f "${lock_file}" ]]; then
     lock_reason="$(sed -n 's/^reason=//p' "${lock_file}" | head -n1)"
     [[ -z "${lock_reason}" ]] && lock_reason="locked_by_admin"
@@ -10980,9 +10982,6 @@ EOF
   enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
   [[ "${enabled}" != "1" ]] && return 0
   refresh_license_cache_guard
-
-  ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
-  ip_text="${ip_text:-unknown}"
   status="$(echo "$(read_license_value_global "LICENSE_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
   expires_raw="$(read_license_value_global "LICENSE_EXPIRES_AT")"
   expires_epoch="$(parse_license_expire_epoch "${expires_raw}")"
@@ -13400,7 +13399,12 @@ while true; do
     resume_pending_operation_prompt
   fi
   if ! enforce_menu_license_access; then
-    exit 1
+    echo
+    echo "Status lisensi belum aktif. Tekan Enter untuk cek ulang atau ketik x untuk keluar."
+    read -r -p "> " _sc_expired_choice || true
+    [[ "${_sc_expired_choice:-}" =~ ^[xX]$ ]] && exit 0
+    SHOW_FULL_MENU=1
+    continue
   fi
   clear
   if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
@@ -13606,9 +13610,7 @@ if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; the
   if [[ -n "${SSH_CONNECTION:-}" ]] && [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
     if [[ -x /usr/local/sbin/menu ]]; then
       export SC_MENU_AUTO_STARTED=1
-      /usr/local/sbin/menu
-      return 0 2>/dev/null || true
-      exit 0
+      /usr/local/sbin/menu || true
     fi
   fi
 fi

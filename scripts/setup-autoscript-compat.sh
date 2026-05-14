@@ -13344,7 +13344,7 @@ menu_print_line() {
   local width="${2:-58}"
   local padded
   padded="$(menu_pad_right "${text}" "${width}")"
-  printf ' %s|%s%s%s|%s\n' "${MENU_AQUA}" "${MENU_NC}" "${padded}" "${MENU_PURPLE}" "${MENU_NC}"
+  printf ' %s┃%s%s%s┃%s\n' "${MENU_AQUA}" "${MENU_NC}" "${padded}" "${MENU_PURPLE}" "${MENU_NC}"
 }
 
 draw_menu_header() {
@@ -13353,9 +13353,9 @@ draw_menu_header() {
   local title_len
   title_len="$(menu_visible_len "  ${title}")"
   (( title_len > width )) && width="${title_len}"
-  printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' "${width}")" "${MENU_NC}"
+  printf ' %s┏%s┓%s\n' "${MENU_AQUA}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
   menu_print_line "  ${MENU_AQUA}${MENU_BOLD}${title}${MENU_NC}" "${width}"
-  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '-' "${width}")" "${MENU_NC}"
+  printf ' %s┣%s┫%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
 }
 
 draw_menu_panel() {
@@ -13373,18 +13373,18 @@ draw_menu_panel() {
   for item in "$@"; do
     menu_print_line "  ${MENU_WHITE}${item}${MENU_NC}" "${width}"
   done
-  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' "${width}")" "${MENU_NC}"
+  printf ' %s┗%s┛%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
 }
 
 draw_main_options() {
-  printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
+  printf ' %s┏%s┓%s\n' "${MENU_AQUA}" "$(menu_gradient_line '━' 58)" "${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}1.) > MENU AKUN         5.) > MONITOR USER LOCK${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}2.) > SERVICE MENU      6.) > MONITOR USER LOGIN${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}3.) > BACKUP/RESTORE    7.) > TOOLS${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}4.) > CHANGE DOMAIN${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}m.) > MENU UTAMA${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}x.) > EXIT${MENU_NC}"
-  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
+  printf ' %s┗%s┛%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' 58)" "${MENU_NC}"
 }
 
 if [[ "${1:-}" == "update" ]]; then

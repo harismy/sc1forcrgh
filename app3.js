@@ -1733,15 +1733,26 @@ async function getScIpChangeCount(userId) {
   return Math.max(0, Number(row?.total || 0));
 }
 
+async function getScIpChangeCountForSourceIp(userId, sourceIp) {
+  const uid = Number(userId || 0);
+  const ip = normalizeHost(sourceIp);
+  if (!uid || !isIpv4(ip)) return 0;
+  const row = await dbGet(
+    "SELECT COUNT(1) AS total FROM sc_ip_change_logs WHERE user_id = ? AND LOWER(TRIM(old_ip)) = LOWER(TRIM(?))",
+    [uid, ip]
+  );
+  return Math.max(0, Number(row?.total || 0));
+}
+
 async function replaceScRegisteredIp(userId, oldIp, newIp) {
   const srcIp = normalizeHost(oldIp);
   const dstIp = normalizeHost(newIp);
   if (!isIpv4(srcIp) || !isIpv4(dstIp)) throw new Error('Format IP tidak valid.');
   if (srcIp === dstIp) throw new Error('IP baru tidak boleh sama dengan IP lama.');
 
-  const used = await getScIpChangeCount(userId);
+  const used = await getScIpChangeCountForSourceIp(userId, srcIp);
   if (used >= SC_IP_CHANGE_MAX) {
-    throw new Error(`Batas ganti IP sudah habis (maksimal ${SC_IP_CHANGE_MAX}x).`);
+    throw new Error(`Batas ganti IP untuk ${srcIp} sudah habis (maksimal ${SC_IP_CHANGE_MAX}x per IP).`);
   }
 
   if (await isIpOwnedByOther(dstIp, userId)) {
@@ -3343,13 +3354,10 @@ bot.action('m_register_sc_extend', async (ctx) => {
 
 bot.action('m_register_sc_change_ip', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const used = await getScIpChangeCount(ctx.from.id);
-  const remain = Math.max(0, SC_IP_CHANGE_MAX - used);
   userState.set(ctx.chat.id, { step: 'register_sc_change_ip_old' });
   await ctx.reply(
     uiBox('GANTI IP VPS', [
-      `Batas ganti IP : maksimal ${SC_IP_CHANGE_MAX}x`,
-      `Sisa kuota     : ${remain}x`,
+      `Batas ganti IP : maksimal ${SC_IP_CHANGE_MAX}x per IP`,
       '',
       'Masukkan IP lama yang terdaftar.',
       '',
@@ -4354,10 +4362,10 @@ bot.on('text', async (ctx) => {
       if (!isMine) {
         return ctx.reply('IP lama tidak ditemukan / tidak aktif di akun kamu.');
       }
-      const used = await getScIpChangeCount(ctx.from.id);
+      const used = await getScIpChangeCountForSourceIp(ctx.from.id, oldIp);
       if (used >= SC_IP_CHANGE_MAX) {
         userState.delete(ctx.chat.id);
-        return ctx.reply(`Batas ganti IP sudah habis (maksimal ${SC_IP_CHANGE_MAX}x).`, mainMenu());
+        return ctx.reply(`Batas ganti IP untuk ${oldIp} sudah habis (maksimal ${SC_IP_CHANGE_MAX}x per IP).`, mainMenu());
       }
       state.step = 'register_sc_change_ip_new';
       state.oldIp = oldIp;

@@ -582,9 +582,9 @@ function buildMainMenuHtml(title, lines = []) {
   const safeLines = body.map((line) => escapeHtml(String(line ?? '')));
 
   // Ubah karakter garis di sini sesuai selera.
-  const LINE_TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━┓';
-  const LINE_MID = '┣━━━━━━━━━━━━━━━━━━━━━━━┫';
-  const LINE_BOTTOM = '┗━━━━━━━━━━━━━━━━━━━━━━┛';
+  const LINE_TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓';
+  const LINE_MID = '┣━━━━━━━━━━━━━━━━━━━━━━━━━━┫';
+  const LINE_BOTTOM = '┗━━━━━━━━━━━━━━━━━━━━━━━━━┛';
 
   const text = [
     LINE_TOP,

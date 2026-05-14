@@ -7565,11 +7565,11 @@ format_user_rows() {
       if (name == "") name = "-"
       users[++n] = name
       vals[n] = val
-      if (length(name) > maxw) maxw = length(name)
+      # fixed column width to keep "|" aligned across protocol blocks
     }
     BEGIN {
       n = 0
-      maxw = 14
+      maxw = 18
     }
     NF {
       parse_row($0)
@@ -11465,9 +11465,9 @@ EOF
   print_bottom
 
   printf '\n'
-  printf ' %s+%s+%s\n' "${AQUA}" "$(gradient_fill '-' 36)" "${NC}"
-  printf " ${AQUA}|${NC} ${BOLD}${WHITE}to access use${NC} ${AQUA}'menu'${NC} ${BOLD}${WHITE}command${NC}      ${PURPLE}|${NC}\n"
-  printf ' %s+%s+%s\n' "${PURPLE}" "$(gradient_fill '-' 36)" "${NC}"
+  printf ' %s┏%s┓%s\n' "${AQUA}" "$(gradient_fill '━' 36)" "${NC}"
+  printf " ${AQUA}┃${NC} ${BOLD}${WHITE}to access use${NC} ${AQUA}'menu'${NC} ${BOLD}${WHITE}command${NC}      ${PURPLE}┃${NC}\n"
+  printf ' %s┗%s┛%s\n' "${PURPLE}" "$(gradient_fill '━' 36)" "${NC}"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h

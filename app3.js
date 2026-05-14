@@ -563,9 +563,9 @@ function uiBox(title, lines = []) {
   // Style dibuat mengikuti pola buildMainMenuMessageHtml:
   // garis fixed + isi bebas (tanpa border kanan-kiri dinamis)
   // agar tidak pecah di Telegram karena lebar karakter non-monospace.
-  const TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓';
-  const MID = '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫';
-  const BOT = '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛';
+  const TOP = '┏━━━━━━━━━━━━━━━━━━━━━━┓';
+  const MID = '┣━━━━━━━━━━━━━━━━━━━━━━┫';
+  const BOT = '┗━━━━━━━━━━━━━━━━━━━━━━┛';
   const out = [
     TOP,
     titleText ? `┃ ${titleText}` : '┃',
@@ -582,9 +582,9 @@ function buildMainMenuHtml(title, lines = []) {
   const safeLines = body.map((line) => escapeHtml(String(line ?? '')));
 
   // Ubah karakter garis di sini sesuai selera.
-  const LINE_TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓';
-  const LINE_MID = '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫';
-  const LINE_BOTTOM = '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛';
+  const LINE_TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━┓';
+  const LINE_MID = '┣━━━━━━━━━━━━━━━━━━━━━━━┫';
+  const LINE_BOTTOM = '┗━━━━━━━━━━━━━━━━━━━━━━┛';
 
   const text = [
     LINE_TOP,
@@ -1222,9 +1222,9 @@ async function getMainMenuUsageStats(userId) {
 
 function buildMainMenuMessageHtml(data = {}) {
   // Template menu utama. Ubah garis/ornamen di sini sesuka kamu.
-  const TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓';
-  const MID = '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫';
-  const BOT = '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛';
+  const TOP = '┏━━━━━━━━━━━━━━━━━━━━━┓';
+  const MID = '┣━━━━━━━━━━━━━━━━━━━━━┫';
+  const BOT = '┗━━━━━━━━━━━━━━━━━━━━━┛';
   const e = (v) => escapeHtml(String(v ?? ''));
   const money = (n) => Number(n || 0).toLocaleString('id-ID');
 

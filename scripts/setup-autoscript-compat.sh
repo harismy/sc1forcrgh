@@ -7565,24 +7565,20 @@ format_user_rows() {
       if (name == "") name = "-"
       users[++n] = name
       vals[n] = val
-      # fixed column width to keep "|" aligned across protocol blocks
     }
     BEGIN {
       n = 0
-      maxw = 18
     }
     NF {
       parse_row($0)
     }
     END {
       if (n == 0) {
-        printf "  %-4s | %s\n", "Akun", "IP"
-        printf "  %-4s | %s\n", "-", "-"
+        printf "  - -\n"
         exit
       }
-      printf "  %-" maxw "s | %s\n", "Akun", "IP"
       for (i = 1; i <= n; i++) {
-        printf "  %-" maxw "s | %s\n", users[i], vals[i]
+        printf "  - %s (%s IP)\n", users[i], vals[i]
       }
     }
   '
@@ -7590,40 +7586,33 @@ format_user_rows() {
 
 format_protocol_block() {
   local proto="$1" cnt="$2" users="$3"
-  printf -- "- %-10s: %s\n" "${proto}" "${cnt}"
+  printf -- "\n[%s] %s akun\n" "${proto}" "${cnt}"
   if [[ -z "${cnt}" || ! "${cnt}" =~ ^[0-9]+$ || "${cnt}" -le 0 ]]; then
-    echo "  Akun : -"
+    echo "  - -"
     return
   fi
   format_user_rows "${users}"
 }
 
 msg="SC 1FORCR NOTIF
-Event    : ONLINE_REPORT
-Domain   : ${DOMAIN}
-Waktu    : $(date '+%F %T')
-Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
-Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik (XRAY last seen)
-Handoff  : ${ZIVPN_HANDOFF_GRACE_SECONDS} detik (ZIVPN)
+Event: ONLINE_REPORT
+Domain: ${DOMAIN}
+Waktu: $(date '+%F %T')
+Interval: ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
+Window XRAY: ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik
+Handoff ZIVPN: ${ZIVPN_HANDOFF_GRACE_SECONDS} detik
 
-RINGKASAN AKUN AKTIF 
-- SSH/UDPHC : ${acct_ssh}
-- VMESS     : ${acct_vmess}
-- VLESS     : ${acct_vless}
-- TROJAN    : ${acct_trojan}
+RINGKASAN AKUN AKTIF
+- SSH/UDPHC: ${acct_ssh}
+- VMESS: ${acct_vmess}
+- VLESS: ${acct_vless}
+- TROJAN: ${acct_trojan}
 
 ONLINE TERDETEKSI
-<pre>
-==============================================
 $(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}")
-----------------------------------------------
 $(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}")
-----------------------------------------------
 $(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}")
-----------------------------------------------
 $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}")
-==============================================
-</pre>
 "
 
 if should_send_online_report; then

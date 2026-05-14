@@ -1911,19 +1911,102 @@ async function registerScMenu() {
 
 function adminMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
-    [Markup.button.callback('Set User Jadi Reseller', 'm_admin_reseller_enable'), Markup.button.callback('Nonaktifkan User Reseller', 'm_admin_reseller_disable')],
-    [Markup.button.callback('Set WA Admin Reseller', 'm_admin_set_reseller_wa')],
-    [Markup.button.callback('Edit Info Fitur SC', 'm_admin_set_sc_features_info')],
-    [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
-    [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
-    [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
-    [Markup.button.callback('Set Masa Aktif IP (Jam)', 'm_admin_set_sc_expiry_ip'), Markup.button.callback('Info Detail IP VPS', 'm_admin_ip_info')],
-    [Markup.button.callback('Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
-    [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
-    [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
+    [Markup.button.callback('💳 Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('📜 Histori TopUp', 'm_admin_topup_history')],
+    [Markup.button.callback('📢 Broadcast Semua User', 'm_admin_broadcast'), Markup.button.callback('♾️ Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
+
+    [Markup.button.callback('👥 Jadikan Reseller', 'm_admin_reseller_enable'), Markup.button.callback('🚫 Nonaktifkan Reseller', 'm_admin_reseller_disable')],
+    [Markup.button.callback('📱 Set WA Admin Reseller', 'm_admin_set_reseller_wa'), Markup.button.callback('✨ Edit Info Fitur SC', 'm_admin_set_sc_features_info')],
+
+    [Markup.button.callback('🧾 Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0'), Markup.button.callback('🗑️ Hapus IP VPS', 'm_admin_remove_sc_ip')],
+    [Markup.button.callback('🔓 Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('ℹ️ Info Detail IP VPS', 'm_admin_ip_info')],
+    [Markup.button.callback('⏱️ Set Masa Aktif IP (Jam)', 'm_admin_set_sc_expiry_ip')],
+
+    [Markup.button.callback('🌐 Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('📚 Daftar Domain', 'm_admin_list_domains')],
+    [Markup.button.callback('❌ Hapus Domain', 'm_admin_remove_domain')],
+    [Markup.button.callback('⬆️ Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('⬆️ Unggah Script Summary API', 'm_admin_upload_summary_api')],
+
+    [Markup.button.callback('💸 Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
+    [Markup.button.callback('⚙️ Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('🛠️ Ubah Pengaturan', 'm_admin_env_set')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
+}
+
+async function listAllUserIds() {
+  const rows = await dbAll('SELECT user_id FROM users ORDER BY user_id ASC');
+  return rows.map((r) => Number(r?.user_id || 0)).filter((n) => Number.isInteger(n) && n > 0);
+}
+
+async function sendBroadcastToAllUsers(senderCtx, message) {
+  const text = String(message || '').trim();
+  if (!text) return { total: 0, ok: 0, fail: 0 };
+  const ids = await listAllUserIds();
+  let ok = 0;
+  let fail = 0;
+  for (const uid of ids) {
+    try {
+      await senderCtx.telegram.sendMessage(uid, text);
+      ok += 1;
+    } catch (_) {
+      fail += 1;
+    }
+  }
+  return { total: ids.length, ok, fail };
+}
+
+function getRangeStartEnd(period) {
+  const p = String(period || '').toLowerCase();
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startTomorrow = startToday + (24 * 60 * 60 * 1000);
+  if (p === 'today') return { start: startToday, end: startTomorrow, label: 'HARI INI' };
+  if (p === 'yesterday') return { start: startToday - (24 * 60 * 60 * 1000), end: startToday, label: 'HARI KEMARIN' };
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  return { start: monthStart, end: startTomorrow, label: 'BULAN INI' };
+}
+
+async function getTopupHistoryCount(period) {
+  const { start, end } = getRangeStartEnd(period);
+  const row = await dbGet(
+    'SELECT COUNT(1) AS total FROM pending_deposits_app3 WHERE created_at >= ? AND created_at < ?',
+    [start, end]
+  );
+  return Number(row?.total || 0);
+}
+
+async function getTopupHistoryPage(period, page = 0, pageSize = 10) {
+  const { start, end } = getRangeStartEnd(period);
+  const safePage = Math.max(0, Number(page) || 0);
+  const size = Math.max(1, Math.min(10, Number(pageSize) || 10));
+  const offset = safePage * size;
+  return dbAll(
+    `SELECT user_id, amount, original_amount, admin_fee, status, gateway_provider, reference_id, unique_code, created_at
+     FROM pending_deposits_app3
+     WHERE created_at >= ? AND created_at < ?
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`,
+    [start, end, size, offset]
+  );
+}
+
+function adminTopupHistoryPeriodKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Hari Ini', 'm_admin_topup_hist_today_0'), Markup.button.callback('Hari Kemarin', 'm_admin_topup_hist_yesterday_0')],
+    [Markup.button.callback('Bulan Ini', 'm_admin_topup_hist_month_0')],
+    [Markup.button.callback('Kembali', 'm_admin_menu')]
+  ]);
+}
+
+function adminTopupHistoryPageKeyboard(period, page, totalPages) {
+  const rows = [];
+  const nav = [];
+  const p = Math.max(0, Number(page) || 0);
+  const total = Math.max(1, Number(totalPages) || 1);
+  if (p > 0) nav.push(Markup.button.callback('Prev', `m_admin_topup_hist_${period}_${p - 1}`));
+  if (p < total - 1) nav.push(Markup.button.callback('Next', `m_admin_topup_hist_${period}_${p + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([Markup.button.callback('Pilih Periode', 'm_admin_topup_history')]);
+  rows.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
+  return Markup.inlineKeyboard(rows);
 }
 
 function adminPaymentGatewayMainMenu() {
@@ -2663,6 +2746,70 @@ bot.action('m_admin_menu', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   await ctx.reply('Menu admin SC1FORCR Nexus:', adminMenu());
+});
+
+bot.action('m_admin_broadcast', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_broadcast_message' });
+  return ctx.reply(
+    'Kirim pesan broadcast untuk semua user.\n' +
+    'Pesan akan dikirim apa adanya.\n' +
+    'Ketik "batal" untuk membatalkan.'
+  );
+});
+
+bot.command('broadcast', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const text = String(ctx.message?.text || '').replace(/^\/broadcast(@\w+)?/i, '').trim();
+  if (!text) {
+    return ctx.reply('Format: /broadcast isi pesan');
+  }
+  await ctx.reply('Broadcast sedang dikirim ke semua user...');
+  const result = await sendBroadcastToAllUsers(ctx, text);
+  return ctx.reply(
+    `Broadcast selesai.\nTotal user: ${result.total}\nBerhasil: ${result.ok}\nGagal: ${result.fail}`,
+    adminMenu()
+  );
+});
+
+bot.action('m_admin_topup_history', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  return ctx.reply('Pilih periode histori topup:', adminTopupHistoryPeriodKeyboard());
+});
+
+bot.action(/m_admin_topup_hist_(today|yesterday|month)_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const period = String(ctx.match?.[1] || 'today').toLowerCase();
+  const page = Math.max(0, Number(ctx.match?.[2] || 0));
+  const pageSize = 10;
+  const total = await getTopupHistoryCount(period).catch(() => 0);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(page, totalPages - 1);
+  const rows = await getTopupHistoryPage(period, safePage, pageSize).catch(() => []);
+  const meta = getRangeStartEnd(period);
+  const startNo = safePage * pageSize;
+  const lines = rows.map((r, i) => {
+    const no = startNo + i + 1;
+    const uid = Number(r?.user_id || 0);
+    const nominal = Number(r?.original_amount || r?.amount || 0);
+    const fee = Number(r?.admin_fee || 0);
+    const billed = Number(r?.amount || 0);
+    const status = formatTopupStatus(r?.status);
+    const provider = String(r?.gateway_provider || 'gopay').toUpperCase();
+    const ref = String(r?.reference_id || r?.unique_code || '-');
+    const at = formatDateTime(r?.created_at);
+    return `${no}. uid=${uid} | ${provider} | ${status}\nnominal=Rp ${nominal.toLocaleString('id-ID')} | fee=Rp ${fee.toLocaleString('id-ID')} | billed=Rp ${billed.toLocaleString('id-ID')}\nref=${ref}\n${at}`;
+  });
+  const text = uiBox(`HISTORI TOPUP ${meta.label} (PAGE ${safePage + 1}/${totalPages})`, [
+    `Total data: ${total}`,
+    'Maksimal 10 baris per halaman.',
+    '',
+    ...(lines.length ? lines : ['(kosong)'])
+  ]);
+  return ctx.reply(text, adminTopupHistoryPageKeyboard(period, safePage, totalPages));
 });
 
 bot.action('m_admin_back', async (ctx) => {
@@ -3596,6 +3743,22 @@ bot.on('text', async (ctx) => {
     return ctx.reply('Dibatalkan.', mainMenu());
   }
   try {
+    if (state.step === 'admin_broadcast_message') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const msg = String(text || '').trim();
+      if (msg.length < 1) return ctx.reply('Pesan broadcast tidak boleh kosong.');
+      await ctx.reply('Broadcast sedang dikirim ke semua user...');
+      const result = await sendBroadcastToAllUsers(ctx, msg);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Broadcast selesai.\nTotal user: ${result.total}\nBerhasil: ${result.ok}\nGagal: ${result.fail}`,
+        adminMenu()
+      );
+    }
+
     if (state.step === 'admin_set_env_key') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
@@ -5241,4 +5404,3 @@ bot.catch((err, ctx) => {
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
-

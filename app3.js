@@ -2921,15 +2921,7 @@ bot.action('m_check_sc_ip_expiry', async (ctx) => {
 bot.action('m_install_link', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
-  let installerText;
-  const activeRegs = await getActiveRegistrations(ctx.from.id).catch(() => []);
-  const latestHost = String(activeRegs?.[0]?.vps_ip || '').trim();
-  if (isIpv4(normalizeHost(latestHost))) {
-    const k = await ensureServerKeyForHost(ctx.from.id, latestHost);
-    installerText = await buildInstallerQuickCopyText({ serverKey: k });
-  } else {
-    installerText = await buildInstallerQuickCopyText();
-  }
+  const installerText = await buildInstallerQuickCopyText();
   if (!installerText.ok) {
     return ctx.reply(
       'Domain API installer belum diset admin.\nHubungi admin agar tambah domain via menu admin.',

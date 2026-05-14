@@ -552,17 +552,20 @@ function parseRenewErr(err) {
 function uiBox(title, lines = []) {
   const body = Array.isArray(lines) ? lines.map((x) => String(x ?? '')) : [String(lines || '')];
   const titleText = String(title || '').trim();
-  const contentWidth = Math.min(
-    Math.max(titleText.length, ...body.map((line) => String(line || '').length), 24),
-    64
-  );
-  // Samakan style dengan main menu (garis tebal).
-  const top = `┏${'━'.repeat(contentWidth + 2)}┓`;
-  const mid = `┣${'━'.repeat(contentWidth + 2)}┫`;
-  const bottom = `┗${'━'.repeat(contentWidth + 2)}┛`;
-  const row = (text = '') => `┃ ${String(text || '').padEnd(contentWidth, ' ')} ┃`;
-  const bodyRows = body.map((line) => row(line));
-  return [top, row(titleText), mid, ...bodyRows, bottom].join('\n');
+  // Style dibuat mengikuti pola buildMainMenuMessageHtml:
+  // garis fixed + isi bebas (tanpa border kanan-kiri dinamis)
+  // agar tidak pecah di Telegram karena lebar karakter non-monospace.
+  const TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓';
+  const MID = '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫';
+  const BOT = '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛';
+  const out = [
+    TOP,
+    titleText ? `┃ ${titleText}` : '┃',
+    MID,
+    ...body.map((line) => (String(line || '').trim() ? `• ${String(line)}` : '')),
+    BOT
+  ];
+  return out.join('\n');
 }
 
 function buildMainMenuHtml(title, lines = []) {

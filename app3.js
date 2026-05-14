@@ -564,6 +564,27 @@ function uiBox(title, lines = []) {
   return [top, row(titleText), mid, ...bodyRows, bottom].join('\n');
 }
 
+function buildMainMenuHtml(title, lines = []) {
+  const safeTitle = escapeHtml(String(title || '').trim());
+  const body = Array.isArray(lines) ? lines : [String(lines || '')];
+  const safeLines = body.map((line) => escapeHtml(String(line ?? '')));
+
+  // Ubah karakter garis di sini sesuai selera.
+  const LINE_TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓';
+  const LINE_MID = '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫';
+  const LINE_BOTTOM = '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛';
+
+  const text = [
+    LINE_TOP,
+    `┃ ${safeTitle}`,
+    LINE_MID,
+    ...safeLines.map((line) => `┃ ${line}`),
+    LINE_BOTTOM
+  ].join('\n');
+
+  return `<pre>${text}</pre>`;
+}
+
 function normalizeScriptLineEndings(input) {
   const s = String(input || '');
   return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -1155,6 +1176,120 @@ async function buildMainMenuInfoLines(userId) {
     isAdmin(userId) ? '' : '',
     isAdmin(userId) ? 'Admin: gunakan /admin untuk kelola layanan.' : ''
   ];
+}
+
+function getPeriodStartsMs() {
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const weekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay()).getTime();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  return { todayStart, weekStart, monthStart };
+}
+
+async function getMainMenuUsageStats(userId) {
+  const uid = Number(userId || 0);
+  if (!uid) return { userToday: 0, userWeek: 0, userMonth: 0, globalToday: 0, globalWeek: 0, globalMonth: 0 };
+  const { todayStart, weekStart, monthStart } = getPeriodStartsMs();
+  const [uToday, uWeek, uMonth, gToday, gWeek, gMonth] = await Promise.all([
+    dbGet("SELECT COUNT(1) AS total FROM sc_registrations WHERE user_id = ? AND created_at >= ?", [uid, todayStart]),
+    dbGet("SELECT COUNT(1) AS total FROM sc_registrations WHERE user_id = ? AND created_at >= ?", [uid, weekStart]),
+    dbGet("SELECT COUNT(1) AS total FROM sc_registrations WHERE user_id = ? AND created_at >= ?", [uid, monthStart]),
+    dbGet("SELECT COUNT(1) AS total FROM sc_registrations WHERE created_at >= ?", [todayStart]),
+    dbGet("SELECT COUNT(1) AS total FROM sc_registrations WHERE created_at >= ?", [weekStart]),
+    dbGet("SELECT COUNT(1) AS total FROM sc_registrations WHERE created_at >= ?", [monthStart])
+  ]);
+  return {
+    userToday: Number(uToday?.total || 0),
+    userWeek: Number(uWeek?.total || 0),
+    userMonth: Number(uMonth?.total || 0),
+    globalToday: Number(gToday?.total || 0),
+    globalWeek: Number(gWeek?.total || 0),
+    globalMonth: Number(gMonth?.total || 0)
+  };
+}
+
+function buildMainMenuMessageHtml(data = {}) {
+  // Template menu utama. Ubah garis/ornamen di sini sesuka kamu.
+  const TOP = '┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓';
+  const MID = '┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫';
+  const BOT = '┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛';
+  const e = (v) => escapeHtml(String(v ?? ''));
+  const money = (n) => Number(n || 0).toLocaleString('id-ID');
+
+  const line = (...parts) => parts.join('');
+  return [
+    `<code>${TOP}</code>`,
+    `<b>🚀 BOT SC 1FORCR NEXUS</b>`,
+    `<code>${BOT}</code>`,
+    '',
+    `<code>${TOP}</code>`,
+    `<b>👤 INFORMASI PENGGUNA</b>`,
+    `<code>${MID}</code>`,
+    line('• 👤 <b>Nama</b>    : ', e(data.userName || '-')),
+    line('• 🆔 <b>ID</b>      : <code>', e(data.userId || '-'), '</code>'),
+    line('• 💰 <b>Saldo</b>   : <code>Rp ', e(money(data.saldo)), '</code>'),
+    line('• 🏷️ <b>Status</b>  : ', e(data.statusReseller || 'NON-RESELLER')),
+    `<code>${BOT}</code>`,
+    '',
+    `<code>${TOP}</code>`,
+    `<b>📊 STATISTIK ANDA</b>`,
+    `<code>${MID}</code>`,
+    line('• 📅 <b>Hari Ini</b>   : ', e(data.userToday), ' akun'),
+    line('• 📆 <b>Minggu Ini</b> : ', e(data.userWeek), ' akun'),
+    line('• 🗓️ <b>Bulan Ini</b>  : ', e(data.userMonth), ' akun'),
+    `<code>${BOT}</code>`,
+    '',
+    `<code>${TOP}</code>`,
+    `<b>🌍 STATISTIK GLOBAL</b>`,
+    `<code>${MID}</code>`,
+    line('• 📅 <b>Hari Ini</b>   : ', e(data.globalToday), ' akun'),
+    line('• 📆 <b>Minggu Ini</b> : ', e(data.globalWeek), ' akun'),
+    line('• 🗓️ <b>Bulan Ini</b>  : ', e(data.globalMonth), ' akun'),
+    `<code>${BOT}</code>`,
+    '',
+    `<code>${TOP}</code>`,
+    `<b>📈 STATUS SISTEM</b>`,
+    `<code>${MID}</code>`,
+    line('• 👥 <b>Total Pengguna</b> : ', e(data.totalUsers)),
+    line('• 🛰️ <b>Total IP VPS SC</b> : ', e(data.totalRegisteredIps)),
+    line('• 💳 <b>Harga / Hari</b>    : Rp ', e(money(data.pricePerDay)), data.isReseller ? ' (RESELLER)' : ''),
+    line('• ⏳ <b>Minimal Hari</b>    : ', e(data.minDays), ' hari'),
+    `<code>${BOT}</code>`
+  ].join('\n');
+}
+
+async function sendMainMenu(ctx) {
+  const userId = Number(ctx?.from?.id || 0);
+  const userName = String(ctx?.from?.first_name || ctx?.from?.username || '-');
+  const [saldo, regs, pricing, minDays, mainStats, usageStats] = await Promise.all([
+    getSaldo(userId).catch(() => 0),
+    getActiveRegistrations(userId).catch(() => []),
+    getRegistrationPricePerDayForUser(userId).catch(() => ({ pricePerDay: 0, isReseller: false })),
+    getRegistrationMinDays().catch(() => 1),
+    getMainMenuStats().catch(() => ({ totalUsers: 0, totalRegisteredIps: 0 })),
+    getMainMenuUsageStats(userId).catch(() => ({ userToday: 0, userWeek: 0, userMonth: 0, globalToday: 0, globalWeek: 0, globalMonth: 0 }))
+  ]);
+
+  const html = buildMainMenuMessageHtml({
+    userId,
+    userName,
+    saldo,
+    statusReseller: pricing?.isReseller ? 'RESELLER' : 'NON-RESELLER',
+    pricePerDay: Number(pricing?.pricePerDay || 0),
+    isReseller: Boolean(pricing?.isReseller),
+    minDays: Number(minDays || 1),
+    totalUsers: Number(mainStats?.totalUsers || 0),
+    totalRegisteredIps: Number(mainStats?.totalRegisteredIps || 0),
+    userToday: Number(usageStats?.userToday || 0),
+    userWeek: Number(usageStats?.userWeek || 0),
+    userMonth: Number(usageStats?.userMonth || 0),
+    globalToday: Number(usageStats?.globalToday || 0),
+    globalWeek: Number(usageStats?.globalWeek || 0),
+    globalMonth: Number(usageStats?.globalMonth || 0),
+    activeIps: Array.isArray(regs) ? regs.length : 0
+  });
+
+  return ctx.replyWithHTML(html, mainMenu());
 }
 
 async function getLatestRegistrationState(userId) {
@@ -2505,11 +2640,7 @@ async function pollPendingTopups() {
 
 bot.start(async (ctx) => {
   userState.delete(ctx.chat.id);
-  const lines = await buildMainMenuInfoLines(ctx.from.id);
-  await ctx.reply(
-    uiBox('SC 1FORCR NEXUS - INFORMASI AKUN', lines),
-    mainMenu()
-  );
+  await sendMainMenu(ctx);
 });
 
 bot.action('m_become_reseller', async (ctx) => {
@@ -2535,8 +2666,7 @@ bot.action('m_become_reseller', async (ctx) => {
 
 bot.command('menu', async (ctx) => {
   userState.delete(ctx.chat.id);
-  const lines = await buildMainMenuInfoLines(ctx.from.id);
-  await ctx.reply(uiBox('SC 1FORCR NEXUS - INFORMASI AKUN', lines), mainMenu());
+  await sendMainMenu(ctx);
 });
 
 bot.command('admin', async (ctx) => {

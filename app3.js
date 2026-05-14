@@ -1751,6 +1751,7 @@ function adminMenu() {
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain'), Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0')],
+    [Markup.button.callback('Set Masa Aktif IP (Jam)', 'm_admin_set_sc_expiry_ip'), Markup.button.callback('Info Detail IP VPS', 'm_admin_ip_info')],
     [Markup.button.callback('Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
     [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
     [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
@@ -1939,6 +1940,25 @@ async function listServerKeysForAdminPage(page = 0, pageSize = 12) {
     'SELECT user_id, vps_ip, server_key, updated_at FROM sc_server_keys ORDER BY updated_at DESC LIMIT ? OFFSET ?',
     [size, offset]
   );
+}
+
+async function adminGetScIpDetails(ip) {
+  const host = normalizeHost(ip);
+  if (!isIpv4(host)) return null;
+  const rows = await dbAll(
+    "SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, last_used_at, expires_at " +
+      "FROM sc_registrations " +
+      "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      'ORDER BY updated_at DESC, id DESC LIMIT 20',
+    [host]
+  );
+  const keys = await dbAll(
+    "SELECT user_id, vps_ip, server_key, updated_at FROM sc_server_keys " +
+      "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      'ORDER BY updated_at DESC',
+    [host]
+  );
+  return { host, rows: rows || [], keys: keys || [] };
 }
 
 function getSettingLabel(key) {
@@ -2671,6 +2691,20 @@ bot.action('m_admin_unlock_sc_access', async (ctx) => {
       'Ketik "batal" untuk membatalkan.'
     ])
   );
+});
+
+bot.action('m_admin_set_sc_expiry_ip', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_set_sc_expiry_ip' });
+  await ctx.reply('Masukkan IP VPS yang mau diatur masa aktifnya.\nContoh: 103.10.10.2');
+});
+
+bot.action('m_admin_ip_info', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_ip_info' });
+  await ctx.reply('Masukkan IP VPS untuk lihat detail.\nContoh: 103.10.10.2');
 });
 
 bot.action('m_admin_add_saldo', async (ctx) => {
@@ -3875,6 +3909,115 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(`Gagal unlock akses SC VPS: ${parseErr(unlockErr)}`, adminMenu());
       }
+    }
+
+    if (state.step === 'admin_set_sc_expiry_ip') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = extractIpv4(text) || normalizeHost(text);
+      if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      const detail = await adminGetScIpDetails(ip);
+      if (!detail || !detail.rows.length) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`IP ${ip} tidak ditemukan di database registrasi.`, adminMenu());
+      }
+      state.step = 'admin_set_sc_expiry_hours';
+      state.targetIp = ip;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `IP target: ${ip}\n` +
+          'Masukkan sisa masa aktif baru dalam JAM.\n' +
+          'Contoh: 24 (1 hari), 336 (14 hari)'
+      );
+    }
+
+    if (state.step === 'admin_set_sc_expiry_hours') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = extractIpv4(state.targetIp) || normalizeHost(state.targetIp);
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State IP target tidak valid. Ulangi dari menu admin.', adminMenu());
+      }
+      const hours = Number(String(text || '').replace(',', '.').trim());
+      if (!Number.isFinite(hours) || hours <= 0) {
+        return ctx.reply('Jumlah jam tidak valid. Isi angka > 0. Contoh: 24');
+      }
+      const now = Date.now();
+      const newExpires = now + Math.floor(hours * 60 * 60 * 1000);
+      const latest = await dbGet(
+        "SELECT user_id, client_name FROM sc_registrations " +
+          "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+          'ORDER BY updated_at DESC, id DESC LIMIT 1',
+        [ip]
+      );
+      if (!latest) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`IP ${ip} tidak ditemukan di database registrasi.`, adminMenu());
+      }
+      await dbRun(
+        "UPDATE sc_registrations SET status='active', updated_at=?, expires_at=? WHERE user_id=? AND LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?))",
+        [now, newExpires, Number(latest.user_id || 0), ip]
+      );
+      const key = await ensureServerKeyForHost(Number(latest.user_id || 0), ip);
+      await syncScRegistrationMetaToHost(ip, key, {
+        status: 'active',
+        client_name: normalizeClientName(latest.client_name || ip) || ip,
+        expires_at: newExpires
+      }).catch(() => {});
+      await unlockScAccessByHost(ip, key, ctx.from.id, 'admin_set_sc_expiry_hours').catch(() => {});
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        `Berhasil set masa aktif baru.\n` +
+          `IP: ${ip}\n` +
+          `Sisa aktif: ${hours} jam\n` +
+          `Expired baru: ${formatDateTime(newExpires)}`,
+        adminMenu()
+      );
+    }
+
+    if (state.step === 'admin_ip_info') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = extractIpv4(text) || normalizeHost(text);
+      if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      const detail = await adminGetScIpDetails(ip);
+      userState.delete(ctx.chat.id);
+      if (!detail || !detail.rows.length) {
+        return ctx.reply(`IP ${ip} tidak ditemukan di database registrasi.`, adminMenu());
+      }
+      const regText = detail.rows
+        .map((r, i) =>
+          `${i + 1}. user_id=${Number(r.user_id || 0)}\n` +
+          `   client=${normalizeClientName(r.client_name) || '-'}\n` +
+          `   status=${String(r.status || '-').toLowerCase()}\n` +
+          `   created=${formatDateTime(r.created_at)}\n` +
+          `   updated=${formatDateTime(r.updated_at)}\n` +
+          `   last_used=${formatDateTime(r.last_used_at)}\n` +
+          `   expires=${formatDateTime(r.expires_at)}`
+        )
+        .join('\n');
+      const keyText = detail.keys.length
+        ? detail.keys
+            .map((k, i) => `${i + 1}. user_id=${Number(k.user_id || 0)} key=${String(k.server_key || '-')}\n   updated=${formatDateTime(k.updated_at)}`)
+            .join('\n')
+        : '(tidak ada key tersimpan)';
+      return ctx.reply(
+        uiBox(`DETAIL IP VPS ${detail.host}`, [
+          'REGISTRASI:',
+          regText,
+          '',
+          'KEY TERSIMPAN:',
+          keyText
+        ]),
+        adminMenu()
+      );
     }
 
     if (state.step === 'check_sc_ip_expiry') {

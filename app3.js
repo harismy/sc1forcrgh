@@ -2091,29 +2091,29 @@ function adminEnvGroupMenu(group) {
 function envKeyInputHint(key) {
   switch (String(key || '').toUpperCase()) {
     case 'SC_REGISTRATION_PRICE_PER_DAY':
-      return 'Contoh: 25000 (rupiah per hari, angka bulat).';
+      return;
     case 'SC_RESELLER_PRICE_PER_DAY':
-      return 'Contoh: 15000 (rupiah per hari untuk reseller).';
+      return;
     case 'SC_UNLIMITED_PRICE':
-      return 'Contoh: 70000 (rupiah, angka bulat).';
+      return;
     case 'SC_REGISTRATION_MIN_DAYS':
-      return 'Contoh: 1 (minimal hari pembelian user).';
+      return;
     case 'TOPUP_MIN':
-      return 'Contoh: 5000 (minimal top up saldo).';
+      return;
     case 'TOPUP_EXPIRE_MS':
-      return 'Contoh: 900000 untuk 15 menit.';
+      return;
     case 'TOPUP_SUCCESS_NOTIFY_ENABLE':
       return 'Isi: 1 atau 0 (1=aktif, 0=nonaktif).';
     case 'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS':
-      return 'Contoh: 123456789,987654321 (pisah koma).';
+      return;
     case 'RESELLER_ADMIN_WA':
-      return 'Contoh: 089612745096 atau 6289612745096.';
+      return;
     case 'AUTO_PROVISION_DOMAIN':
       return 'Isi: 1 atau 0 (1=aktif, 0=nonaktif).';
     case 'CERTBOT_EMAIL':
-      return 'Contoh: admin@domainkamu.com (boleh kosong).';
+      return;
     case 'SC_INSTALLER_LOCAL_PATH':
-      return 'Contoh: /root/botsc1forcrnexus/scripts/setup-autoscript-compat.sh';
+      return;
     default:
       return '';
   }
@@ -2168,7 +2168,6 @@ async function buildAdminRemoveIpPreview(page = 0, pageSize = 20) {
     : '(belum ada data IP+KEY tersimpan)';
   const text = uiBox(`HAPUS IP VPS TERDAFTAR (PAGE ${safePage + 1}/${totalPages})`, [
     'Masukkan IP VPS yang ingin dihapus dari registrasi aktif.',
-    'Contoh: 103.10.10.2',
     'Preview memakai sumber data yang sama dengan menu "Daftar IP + KEY + ID".',
     'Bot akan coba ambil key server otomatis dari database key tersimpan.',
     `Menampilkan ${rows.length}${totalKeys > 0 ? ` dari ${totalKeys}` : ''} data.`,
@@ -2767,7 +2766,7 @@ bot.command('broadcast', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   const text = String(ctx.message?.text || '').replace(/^\/broadcast(@\w+)?/i, '').trim();
   if (!text) {
-    return ctx.reply('Format: /broadcast isi pesan');
+    return ctx.reply('Gunakan /broadcast lalu isi pesan');
   }
   await ctx.reply('Broadcast sedang dikirim ke semua user...');
   const result = await sendBroadcastToAllUsers(ctx, text);
@@ -2887,7 +2886,7 @@ bot.action('m_pg_set_orderkuota_url', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_url' });
-  return ctx.reply('Kirim Gateway URL OrderKuota. Contoh: https://api.rajaserver.web.id/orderkuota/createpayment');
+  return ctx.reply('Kirim Gateway URL OrderKuota.');
 });
 bot.action('m_pg_set_orderkuota_api_key', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
@@ -2905,7 +2904,7 @@ bot.action('m_pg_set_orderkuota_min_topup', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_min_topup' });
-  return ctx.reply('Kirim minimal topup OrderKuota (angka rupiah). Contoh: 2000');
+  return ctx.reply('Kirim minimal topup OrderKuota (angka rupiah).');
 });
 bot.action('m_pg_set_orkut_username', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
@@ -2923,7 +2922,7 @@ bot.action('m_pg_set_gopay_base_url', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_gopay_base_url' });
-  return ctx.reply('Kirim GoPay API Base URL. Contoh: https://api-gopay.sawargipay.cloud');
+  return ctx.reply('Kirim GoPay API Base URL.');
 });
 bot.action('m_pg_set_gopay_api_key', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
@@ -2935,13 +2934,13 @@ bot.action('m_pg_set_gopay_min_topup', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_gopay_min_topup' });
-  return ctx.reply('Kirim minimal topup GoPay (angka rupiah). Contoh: 2000');
+  return ctx.reply('Kirim minimal topup GoPay (angka rupiah).');
 });
 bot.action('m_pg_set_qris_expire', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_qris_expire' });
-  return ctx.reply('Kirim masa aktif QRIS dalam menit. Contoh: 5');
+  return ctx.reply('Kirim masa aktif QRIS dalam menit.');
 });
 
 bot.action('m_admin_add_domain', async (ctx) => {
@@ -2949,7 +2948,7 @@ bot.action('m_admin_add_domain', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_add_domain' });
   await ctx.reply(
-    'Masukkan domain API installer (tanpa port). Contoh: installer.domainkamu.com\n' +
+    'Masukkan domain API installer (tanpa port).' +
       'Bot akan auto-setup nginx + SSL certbot di server ini.'
   );
 });
@@ -2985,7 +2984,6 @@ bot.action('m_admin_unlock_sc_access', async (ctx) => {
   await ctx.reply(
     uiBox('BUKA KUNCI AKSES SC VPS', [
       'Masukkan IP VPS yang ingin dibuka kunci akses menunya.',
-      'Contoh: 103.10.10.2',
       'Bot akan gunakan key tersimpan otomatis.',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -2996,14 +2994,14 @@ bot.action('m_admin_set_sc_expiry_ip', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_set_sc_expiry_ip' });
-  await ctx.reply('Masukkan IP VPS yang mau diatur masa aktifnya.\nContoh: 103.10.10.2');
+  await ctx.reply('Masukkan IP VPS yang mau diatur masa aktifnya.\n');
 });
 
 bot.action('m_admin_ip_info', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_ip_info' });
-  await ctx.reply('Masukkan IP VPS untuk lihat detail.\nContoh: 103.10.10.2');
+  await ctx.reply('Masukkan IP VPS untuk lihat detail.\n');
 });
 
 bot.action('m_admin_add_saldo', async (ctx) => {
@@ -3011,9 +3009,7 @@ bot.action('m_admin_add_saldo', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_add_saldo_user' });
   await ctx.reply(
-    'Masukkan Telegram User ID yang ingin ditambah saldo.\n' +
-      'Contoh: 123456789\n' +
-      'Ketik "batal" untuk batal.'
+    'Masukkan Telegram User ID yang ingin ditambah saldo.\n' + 'Ketik "batal" untuk batal.'
   );
 });
 
@@ -3035,7 +3031,7 @@ bot.action('m_admin_set_reseller_wa', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_set_reseller_wa' });
-  return ctx.reply('Masukkan nomor WA admin reseller. Contoh: 089612745096 atau 6289612745096');
+  return ctx.reply('Masukkan nomor WA admin reseller.');
 });
 
 bot.action('m_admin_set_sc_features_info', async (ctx) => {
@@ -3094,7 +3090,6 @@ bot.action('m_admin_env_manual', async (ctx) => {
       ...DYNAMIC_SETTING_KEYS.map((k, i) => `${i + 1}) ${getSettingLabel(k)}`),
       '',
       'Ketik nomor, nama pengaturan, atau kode asli.',
-      'Contoh: 1'
     ])
   );
 });
@@ -3244,7 +3239,6 @@ bot.action('m_check_sc_ip_expiry', async (ctx) => {
   return ctx.reply(
     uiBox('CEK EXPIRED IP VPS', [
       'Masukkan IP VPS yang ingin dicek.',
-      'Contoh: 103.10.10.2',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -3328,7 +3322,6 @@ bot.action('m_register_sc_unlimited', async (ctx) => {
       'Masa aktif      : tanpa batas',
       '',
       'Masukkan nama client: ',
-      'Contoh: Asep bedog Unlimited 01',
       'Ketik "batal" untuk membatalkan.'
     ])
   );
@@ -3340,7 +3333,6 @@ bot.action('m_register_sc_extend', async (ctx) => {
   await ctx.reply(
     uiBox('PERPANJANG SC', [
       'Masukkan IP VPS yang ingin diperpanjang.',
-      'Contoh: 103.10.10.2',
       '',
       'Setelah itu bot akan minta key server VPS.',
       '',
@@ -3360,7 +3352,6 @@ bot.action('m_register_sc_change_ip', async (ctx) => {
       `Sisa kuota     : ${remain}x`,
       '',
       'Masukkan IP lama yang terdaftar.',
-      'Contoh: 104.100.20.31',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -3374,7 +3365,6 @@ bot.action('m_admin_sc_unlimited', async (ctx) => {
   return ctx.reply(
     uiBox('ADMIN DAFTAR SC UNLIMITED', [
       'Masukkan Telegram User ID target.',
-      'Contoh: 123456789',
       '',
       'Paket ini manual oleh admin, tanpa potong saldo.',
       'Ketik "batal" untuk membatalkan.'
@@ -3468,7 +3458,6 @@ bot.action('m_delete_all_accounts', async (ctx) => {
     uiBox('HAPUS SEMUA AKUN', [
       'Masukkan IP VPS target.',
       'Aksi ini menghapus semua akun berdasarkan protokol yang nanti dipilih.',
-      'Contoh: 103.10.10.2',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -3582,7 +3571,6 @@ bot.action('m_migrate_accounts', async (ctx) => {
   await ctx.reply(
     uiBox('MIGRASI AKUN', [
       'Masukkan IP VPS sumber data akun.',
-      'Contoh: 103.10.10.2',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -3714,7 +3702,6 @@ bot.action('m_backup_now', async (ctx) => {
     uiBox('BACKUP SC', [
       'Masukkan IP VPS sumber backup.',
       'Syarat: IP harus sudah terdaftar di akun kamu.',
-      'Contoh: 103.10.10.2',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -3729,7 +3716,6 @@ bot.action('m_restore_upload', async (ctx) => {
     uiBox('RESTORE SC', [
       'Masukkan IP VPS tujuan restore.',
       'Syarat: IP harus sudah terdaftar di akun kamu.',
-      'Contoh: 103.10.10.2',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -3790,15 +3776,14 @@ bot.on('text', async (ctx) => {
       }
       const targetUserId = Number(String(text || '').replace(/[^0-9]/g, ''));
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
-        return ctx.reply('User ID tidak valid. Contoh: 123456789');
+        return ctx.reply('User ID tidak valid.');
       }
       state.step = 'admin_add_saldo_amount';
       state.targetUserId = targetUserId;
       userState.set(ctx.chat.id, state);
       return ctx.reply(
         `User ID: ${targetUserId}\n` +
-          'Masukkan nominal saldo yang ingin ditambahkan (rupiah).\n' +
-          'Contoh: 25000'
+          'Masukkan nominal saldo yang ingin ditambahkan (rupiah).\n' 
       );
     }
 
@@ -3836,7 +3821,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
       const targetUserId = Number(String(text || '').replace(/[^0-9]/g, ''));
-      if (!Number.isInteger(targetUserId) || targetUserId <= 0) return ctx.reply('User ID tidak valid. Contoh: 123456789');
+      if (!Number.isInteger(targetUserId) || targetUserId <= 0) return ctx.reply('User ID tidak valid.');
       await setResellerUser(targetUserId, true);
       const cfg = await getRegistrationPricePerDayForUser(targetUserId);
       userState.delete(ctx.chat.id);
@@ -3852,7 +3837,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
       const targetUserId = Number(String(text || '').replace(/[^0-9]/g, ''));
-      if (!Number.isInteger(targetUserId) || targetUserId <= 0) return ctx.reply('User ID tidak valid. Contoh: 123456789');
+      if (!Number.isInteger(targetUserId) || targetUserId <= 0) return ctx.reply('User ID tidak valid.');
       await setResellerUser(targetUserId, false);
       const normalPrice = await getRegistrationPricePerDay();
       userState.delete(ctx.chat.id);
@@ -3933,7 +3918,7 @@ bot.on('text', async (ctx) => {
           .split(',')
           .map((v) => Number(String(v || '').trim()))
           .filter((n) => Number.isInteger(n) && n > 0);
-        if (!ids.length) return ctx.reply('Isi minimal 1 Telegram ID admin. Contoh: 12345,67890');
+        if (!ids.length) return ctx.reply('Isi minimal 1 Telegram ID admin.');
         value = ids.join(',');
       } else if (key === 'RESELLER_ADMIN_WA') {
         const wa = normalizeWaNumber(value);
@@ -4099,7 +4084,7 @@ bot.on('text', async (ctx) => {
       }
       const domain = normalizeDomainWithoutPort(text);
       if (!isDomainLike(domain) || !isProvisionableDomain(domain)) {
-        return ctx.reply('Format domain tidak valid. Contoh: installer.domainkamu.com (tanpa port).');
+        return ctx.reply('Format domain tidak valid.');
       }
       await ctx.reply(`Proses auto-setup domain ${domain}...\n- set nginx vhost\n- issue SSL certbot`);
       try {
@@ -4132,7 +4117,7 @@ bot.on('text', async (ctx) => {
       }
       const ip = extractIpv4(text) || normalizeHost(text);
       if (!isIpv4(ip)) {
-        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+        return ctx.reply('Format IP tidak valid.');
       }
       const key = await getServerKeyForHost(ctx.from.id, ip);
       const result = await adminRemoveRegisteredIp(ip, ctx.from.id);
@@ -4196,7 +4181,7 @@ bot.on('text', async (ctx) => {
       }
       const ip = extractIpv4(text) || normalizeHost(text);
       if (!isIpv4(ip)) {
-        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+        return ctx.reply('Format IP tidak valid.');
       }
       const key = await getServerKeyForHost(ctx.from.id, ip);
       if (String(key || '').trim().length < 8) {
@@ -4232,7 +4217,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
       const ip = extractIpv4(text) || normalizeHost(text);
-      if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid.');
       const detail = await adminGetScIpDetails(ip);
       if (!detail || !detail.rows.length) {
         userState.delete(ctx.chat.id);
@@ -4243,8 +4228,7 @@ bot.on('text', async (ctx) => {
       userState.set(ctx.chat.id, state);
       return ctx.reply(
         `IP target: ${ip}\n` +
-          'Masukkan sisa masa aktif baru dalam JAM.\n' +
-          'Contoh: 24 (1 hari), 336 (14 hari)'
+          'Masukkan sisa masa aktif baru dalam JAM.\n' 
       );
     }
 
@@ -4260,7 +4244,7 @@ bot.on('text', async (ctx) => {
       }
       const hours = Number(String(text || '').replace(',', '.').trim());
       if (!Number.isFinite(hours) || hours <= 0) {
-        return ctx.reply('Jumlah jam tidak valid. Isi angka > 0. Contoh: 24');
+        return ctx.reply('Jumlah jam tidak valid. Isi angka > 0.');
       }
       const now = Date.now();
       const newExpires = now + Math.floor(hours * 60 * 60 * 1000);
@@ -4301,7 +4285,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
       const ip = extractIpv4(text) || normalizeHost(text);
-      if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+      if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid.');
       const detail = await adminGetScIpDetails(ip);
       userState.delete(ctx.chat.id);
       if (!detail || !detail.rows.length) {
@@ -4338,7 +4322,7 @@ bot.on('text', async (ctx) => {
     if (state.step === 'check_sc_ip_expiry') {
       const ip = normalizeHost(text);
       if (!isIpv4(ip)) {
-        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+        return ctx.reply('Format IP tidak valid.');
       }
       const row = await getRegistrationStateByIp(ctx.from.id, ip, isAdmin(ctx.from.id));
       userState.delete(ctx.chat.id);
@@ -4364,7 +4348,7 @@ bot.on('text', async (ctx) => {
     if (state.step === 'register_sc_change_ip_old') {
       const oldIp = normalizeHost(text);
       if (!isIpv4(oldIp)) {
-        return ctx.reply('Format IP lama tidak valid. Contoh: 104.100.20.31');
+        return ctx.reply('Format IP lama tidak valid.');
       }
       const isMine = await isRegisteredHost(ctx.from.id, oldIp);
       if (!isMine) {
@@ -4383,7 +4367,6 @@ bot.on('text', async (ctx) => {
           `IP Lama : ${oldIp}`,
           '',
           'Masukkan IP baru.',
-          'Contoh: 104.220.220.21'
         ])
       );
     }
@@ -4396,7 +4379,7 @@ bot.on('text', async (ctx) => {
         return ctx.reply('State ganti IP tidak valid. Ulangi dari menu registrasi.', mainMenu());
       }
       if (!isIpv4(newIp)) {
-        return ctx.reply('Format IP baru tidak valid. Contoh: 104.220.220.21');
+        return ctx.reply('Format IP baru tidak valid.');
       }
       let out;
       try {
@@ -4435,7 +4418,6 @@ bot.on('text', async (ctx) => {
         return ctx.reply(
           uiBox('INPUT NAMA CLIENT', [
             'Nama client minimal 2 karakter.',
-            'Contoh: Haris Premium 01'
           ])
         );
       }
@@ -4447,7 +4429,6 @@ bot.on('text', async (ctx) => {
           `Nama Client : ${clientName}`,
           '',
           'Masukkan IP VPS yang ingin didaftarkan.',
-          'Contoh: 103.10.10.2'
         ])
       );
     }
@@ -4458,7 +4439,6 @@ bot.on('text', async (ctx) => {
         return ctx.reply(
           uiBox('INPUT NAMA CLIENT', [
             'Nama client minimal 2 karakter.',
-            'Contoh: Haris Unlimited 01'
           ])
         );
       }
@@ -4470,7 +4450,6 @@ bot.on('text', async (ctx) => {
           `Nama Client : ${clientName}`,
           '',
           'Masukkan IP VPS yang ingin didaftarkan.',
-          'Contoh: 103.10.10.2'
         ])
       );
     }
@@ -4481,7 +4460,6 @@ bot.on('text', async (ctx) => {
         return ctx.reply(
           uiBox('INPUT IP VPS', [
             'Format IP tidak valid.',
-            'Contoh: 103.10.10.2'
           ])
         );
       }
@@ -4500,7 +4478,7 @@ bot.on('text', async (ctx) => {
           '',
           'Masukkan key server VPS.',
           '',
-          'Contoh key: abcdefgh12345678'
+          ''
         ])
       );
     }
@@ -4573,7 +4551,6 @@ bot.on('text', async (ctx) => {
         return ctx.reply(
           uiBox('INPUT IP VPS', [
             'Format IP tidak valid.',
-            'Contoh: 103.10.10.2'
           ])
         );
       }
@@ -4592,7 +4569,6 @@ bot.on('text', async (ctx) => {
           reg ? `Expired Saat Ini : ${formatDateTime(reg.expires_at)}` : 'Status         : Belum terdaftar',
           '',
           'Masukkan nama client.',
-          'Contoh: Haris Premium 01'
         ])
       );
     }
@@ -4608,7 +4584,6 @@ bot.on('text', async (ctx) => {
         return ctx.reply(
           uiBox('INPUT NAMA CLIENT', [
             'Nama client minimal 2 karakter.',
-            'Contoh: Haris Premium 01'
           ])
         );
       }
@@ -4728,15 +4703,14 @@ bot.on('text', async (ctx) => {
       }
       const targetUserId = Number(String(text || '').replace(/[^0-9]/g, ''));
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
-        return ctx.reply('User ID tidak valid. Contoh: 123456789');
+        return ctx.reply('User ID tidak valid.');
       }
       state.targetUserId = targetUserId;
       state.step = 'admin_sc_unlimited_client_name';
       userState.set(ctx.chat.id, state);
       return ctx.reply(
         `Target user ID: ${targetUserId}\n` +
-          'Masukkan nama client SC unlimited.\n' +
-          'Contoh: User Premium Unlimited'
+          'Masukkan nama client SC unlimited.\n' 
       );
     }
 
@@ -4754,8 +4728,7 @@ bot.on('text', async (ctx) => {
       userState.set(ctx.chat.id, state);
       return ctx.reply(
         `Nama client: ${clientName}\n` +
-          'Masukkan IP VPS target.\n' +
-          'Contoh: 103.10.10.2'
+          'Masukkan IP VPS target.\n' 
       );
     }
 
@@ -4766,7 +4739,7 @@ bot.on('text', async (ctx) => {
       }
       const ip = normalizeHost(text);
       if (!isIpv4(ip)) {
-        return ctx.reply('Format IP tidak valid. Contoh: 103.10.10.2');
+        return ctx.reply('Format IP tidak valid.');
       }
       const targetUserId = Number(state.targetUserId || 0);
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
@@ -4811,7 +4784,6 @@ bot.on('text', async (ctx) => {
         return ctx.reply(
           uiBox('INPUT IP VPS', [
             'Format IP tidak valid.',
-            'Contoh: 103.10.10.2'
           ])
         );
       }
@@ -4846,7 +4818,7 @@ bot.on('text', async (ctx) => {
           'Masukkan key server VPS terlebih dahulu.',
           'Key ini akan disimpan otomatis di database bot.',
           '',
-          'Contoh key: abcdefgh12345678'
+          ''
         ])
       );
     }

@@ -4203,6 +4203,7 @@ const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
 
 const DB_PATH = process.env.DB_PATH || '/usr/sbin/potatonc/potato.db';
+const DOMAIN = String(process.env.DOMAIN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
 const ZIVPN_AUTH_MODE = String(process.env.ZIVPN_AUTH_MODE || 'http').trim().toLowerCase();
@@ -4397,6 +4398,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
     const event = {
       event: 'MULTI_LOGIN',
       action: 'LOCK_TMP',
+      source_domain: DOMAIN || null,
       service: String(service || '-').toUpperCase(),
       username: String(username || '-'),
       limitip: Number(limitip || 0),
@@ -4418,6 +4420,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       `SC 1FORCR NOTIF\n` +
       `Event    : MULTI_LOGIN\n` +
       `Action   : LOCK_TMP\n` +
+      `Domain   : ${DOMAIN || '-'}\n` +
       `Layanan  : ${String(service || '-').toUpperCase()}\n` +
       `Username : ${String(username || '-')}\n` +
       `Limit IP : ${Number(limitip || 0)}\n` +

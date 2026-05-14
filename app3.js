@@ -2024,6 +2024,66 @@ function adminTopupHistoryPageKeyboard(period, page, totalPages) {
   return Markup.inlineKeyboard(rows);
 }
 
+function myScPageKeyboard(page, totalPages) {
+  const rows = [];
+  const nav = [];
+  const p = Math.max(0, Number(page) || 0);
+  const total = Math.max(1, Number(totalPages) || 1);
+  if (p > 0) nav.push(Markup.button.callback('Prev', `m_my_sc_page_${p - 1}`));
+  if (p < total - 1) nav.push(Markup.button.callback('Next', `m_my_sc_page_${p + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([Markup.button.callback('Refresh', `m_my_sc_page_${p}`)]);
+  rows.push([Markup.button.callback('Kembali', 'm_register_sc_back')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function sendMyScPage(ctx, page = 0) {
+  const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
+  if (regs.length === 0) {
+    const latest = await getLatestRegistrationState(ctx.from.id).catch(() => null);
+    if (latest) {
+      const st = String(latest.status || '').trim().toLowerCase();
+      if (st === 'expired') {
+        return ctx.reply(
+          `SC kamu saat ini expired.\n` +
+            `IP terakhir : ${latest.vps_ip || '-'}\n` +
+            `Expired     : ${formatDateTime(latest.expires_at)}\n\n` +
+            `Silakan perpanjang dari menu "Daftar / Perpanjang SC".`,
+          mainMenu()
+        );
+      }
+      if (st === 'deleted_by_admin') {
+        return ctx.reply(
+          `IP SC kamu telah dihapus admin.\n` +
+            `IP terakhir : ${latest.vps_ip || '-'}\n` +
+            `Status      : expired by admin\n\n` +
+            `Masa aktif sudah direset. Silakan registrasi ulang dari menu "Daftar / Perpanjang SC".`,
+          mainMenu()
+        );
+      }
+    }
+    return ctx.reply('Belum ada IP SC terdaftar.', mainMenu());
+  }
+
+  const pageSize = 10;
+  const total = regs.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(Math.max(0, Number(page) || 0), totalPages - 1);
+  const startNo = safePage * pageSize;
+  const chunk = regs.slice(startNo, startNo + pageSize);
+  const lines = chunk.map(
+    (r, i) =>
+      `${startNo + i + 1}. ${r.vps_ip}\n   Nama Client : ${normalizeClientName(r.client_name) || '-'}\n   Expired     : ${formatDateTime(r.expires_at)}\n   Status      : ${formatRemainingDays(r.expires_at)}`
+  );
+  const text = uiBox(`SC TERDAFTAR (PAGE ${safePage + 1}/${totalPages})`, [
+    `Total IP: ${total}`,
+    'Maksimal 10 data per halaman.',
+    '',
+    ...lines
+  ]);
+  return ctx.reply(text, myScPageKeyboard(safePage, totalPages));
+}
+
 function adminPaymentGatewayMainMenu() {
   const cfg = getPaymentConfig();
   return Markup.inlineKeyboard([
@@ -3211,37 +3271,13 @@ bot.action('m_sc_features', async (ctx) => {
 
 bot.action('m_my_sc', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
-  if (regs.length === 0) {
-    const latest = await getLatestRegistrationState(ctx.from.id).catch(() => null);
-    if (latest) {
-      const st = String(latest.status || '').trim().toLowerCase();
-      if (st === 'expired') {
-        return ctx.reply(
-          `SC kamu saat ini expired.\n` +
-            `IP terakhir : ${latest.vps_ip || '-'}\n` +
-            `Expired     : ${formatDateTime(latest.expires_at)}\n\n` +
-            `Silakan perpanjang dari menu "Daftar / Perpanjang SC".`,
-          mainMenu()
-        );
-      }
-      if (st === 'deleted_by_admin') {
-        return ctx.reply(
-          `IP SC kamu telah dihapus admin.\n` +
-            `IP terakhir : ${latest.vps_ip || '-'}\n` +
-            `Status      : expired by admin\n\n` +
-            `Masa aktif sudah direset. Silakan registrasi ulang dari menu "Daftar / Perpanjang SC".`,
-          mainMenu()
-        );
-      }
-    }
-    return ctx.reply('Belum ada IP SC terdaftar.', mainMenu());
-  }
-  const lines = regs.map(
-    (r, i) =>
-      `${i + 1}. ${r.vps_ip}\n   Nama Client : ${normalizeClientName(r.client_name) || '-'}\n   Expired     : ${formatDateTime(r.expires_at)}\n   Status      : ${formatRemainingDays(r.expires_at)}`
-  );
-  return ctx.reply(`IP SC terdaftar (${regs.length}):\n${lines.join('\n')}`, mainMenu());
+  return sendMyScPage(ctx, 0);
+});
+
+bot.action(/m_my_sc_page_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const page = Math.max(0, Number(ctx.match?.[1] || 0));
+  return sendMyScPage(ctx, page);
 });
 
 bot.action('m_check_sc_ip_expiry', async (ctx) => {

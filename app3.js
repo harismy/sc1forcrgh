@@ -72,6 +72,7 @@ const SETTING_LABELS = {
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SC_NOTIFY_INTERVAL_MS = 30 * 60 * 1000;
 const SC_H2_WINDOW_MS = 2 * DAY_MS;
+const SC_IP_CHANGE_MAX = 2;
 
 function dbRun(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -160,6 +161,13 @@ async function initDb() {
     event TEXT NOT NULL,
     last_sent_at INTEGER NOT NULL,
     PRIMARY KEY (user_id, vps_ip, event)
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS sc_ip_change_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    old_ip TEXT NOT NULL,
+    new_ip TEXT NOT NULL,
+    changed_at INTEGER NOT NULL
   )`);
   await ensureScRegistrationSchema();
   await ensureUsersSchema();
@@ -1529,6 +1537,110 @@ async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
   }
 }
 
+async function getScIpChangeCount(userId) {
+  const row = await dbGet('SELECT COUNT(1) AS total FROM sc_ip_change_logs WHERE user_id = ?', [userId]);
+  return Math.max(0, Number(row?.total || 0));
+}
+
+async function replaceScRegisteredIp(userId, oldIp, newIp) {
+  const srcIp = normalizeHost(oldIp);
+  const dstIp = normalizeHost(newIp);
+  if (!isIpv4(srcIp) || !isIpv4(dstIp)) throw new Error('Format IP tidak valid.');
+  if (srcIp === dstIp) throw new Error('IP baru tidak boleh sama dengan IP lama.');
+
+  const used = await getScIpChangeCount(userId);
+  if (used >= SC_IP_CHANGE_MAX) {
+    throw new Error(`Batas ganti IP sudah habis (maksimal ${SC_IP_CHANGE_MAX}x).`);
+  }
+
+  if (await isIpOwnedByOther(dstIp, userId)) {
+    throw new Error('IP baru sudah terdaftar oleh user lain.');
+  }
+
+  const now = Date.now();
+  const src = await dbGet(
+    "SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, last_used_at, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    [userId, srcIp, now]
+  );
+  if (!src) throw new Error('IP lama tidak ditemukan / tidak aktif di akun kamu.');
+
+  const dstActive = await dbGet(
+    "SELECT 1 AS ok FROM sc_registrations WHERE user_id = ? AND vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    [userId, dstIp, now]
+  );
+  if (dstActive) throw new Error('IP baru sudah aktif di akun kamu.');
+
+  const dstAny = await dbGet(
+    'SELECT id FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1',
+    [userId, dstIp]
+  );
+
+  const srcKey = await getServerKeyForHost(userId, srcIp);
+  await dbRun('BEGIN IMMEDIATE TRANSACTION');
+  try {
+    if (dstAny) {
+      await dbRun(
+        `UPDATE sc_registrations
+         SET client_name = ?, status = 'active', updated_at = ?, last_used_at = ?, expires_at = ?
+         WHERE user_id = ? AND vps_ip = ?`,
+        [src.client_name, now, Number(src.last_used_at || 0) || null, Number(src.expires_at || 0) || 0, userId, dstIp]
+      );
+    } else {
+      await dbRun(
+        `INSERT INTO sc_registrations
+         (user_id, vps_ip, client_name, status, created_at, updated_at, last_used_at, expires_at)
+         VALUES (?, ?, ?, 'active', ?, ?, ?, ?)`,
+        [
+          userId,
+          dstIp,
+          src.client_name,
+          Number(src.created_at || now) || now,
+          now,
+          Number(src.last_used_at || 0) || null,
+          Number(src.expires_at || 0) || 0
+        ]
+      );
+    }
+
+    await dbRun(
+      "UPDATE sc_registrations SET status = 'migrated_ip', updated_at = ? WHERE user_id = ? AND vps_ip = ?",
+      [now, userId, srcIp]
+    );
+
+    await dbRun(
+      'INSERT INTO sc_ip_change_logs (user_id, old_ip, new_ip, changed_at) VALUES (?, ?, ?, ?)',
+      [userId, srcIp, dstIp, now]
+    );
+
+    if (srcKey && srcKey.length >= 8) {
+      await dbRun(
+        `INSERT INTO sc_server_keys (user_id, vps_ip, server_key, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(user_id, vps_ip) DO UPDATE SET
+           server_key=excluded.server_key,
+           updated_at=excluded.updated_at`,
+        [userId, dstIp, srcKey, now]
+      );
+      await dbRun('DELETE FROM sc_server_keys WHERE user_id = ? AND vps_ip = ?', [userId, srcIp]);
+    }
+    await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [userId, srcIp]);
+    await dbRun('COMMIT');
+  } catch (e) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw e;
+  }
+
+  const usedAfter = used + 1;
+  return {
+    oldIp: srcIp,
+    newIp: dstIp,
+    remaining: Math.max(0, SC_IP_CHANGE_MAX - usedAfter),
+    serverKey: srcKey || '',
+    clientName: normalizeClientName(src.client_name || srcIp) || srcIp,
+    expiresAt: Number(src.expires_at || 0) || 0
+  };
+}
+
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('📦 SC Saya', 'm_my_sc')],
@@ -1586,6 +1698,7 @@ async function registerScMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Registrasi Baru', 'm_register_sc_new')],
     [Markup.button.callback('Perpanjang SC', 'm_register_sc_extend')],
+    [Markup.button.callback('Ganti IP VPS', 'm_register_sc_change_ip')],
     [Markup.button.callback(`SC Unlimited (Rp ${Number(unlimitedPrice).toLocaleString('id-ID')})`, 'm_register_sc_unlimited')],
     [Markup.button.callback('Jadi Reseller', 'm_become_reseller')],
     [Markup.button.callback('Kembali', 'm_register_sc_back')]
@@ -2799,6 +2912,7 @@ bot.action('m_register_sc', async (ctx) => {
       'Pilih jenis layanan:',
       '- Registrasi Baru',
       '- Perpanjang SC',
+      '- Ganti IP VPS (maks 2x)',
       '- SC Unlimited',
       '',
       `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari${isReseller ? ' (RESELLER)' : ''}`,
@@ -2855,6 +2969,24 @@ bot.action('m_register_sc_extend', async (ctx) => {
       'Contoh: 103.10.10.2',
       '',
       'Setelah itu bot akan minta key server VPS.',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action('m_register_sc_change_ip', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const used = await getScIpChangeCount(ctx.from.id);
+  const remain = Math.max(0, SC_IP_CHANGE_MAX - used);
+  userState.set(ctx.chat.id, { step: 'register_sc_change_ip_old' });
+  await ctx.reply(
+    uiBox('GANTI IP VPS', [
+      `Batas ganti IP : maksimal ${SC_IP_CHANGE_MAX}x`,
+      `Sisa kuota     : ${remain}x`,
+      '',
+      'Masukkan IP lama yang terdaftar.',
+      'Contoh: 104.100.20.31',
       '',
       'Ketik "batal" untuk membatalkan.'
     ])
@@ -3726,6 +3858,70 @@ bot.on('text', async (ctx) => {
           `Expired At  : ${formatDateTime(row.expires_at)}`,
           `Sisa Aktif  : ${statusText}`
         ]),
+        mainMenu()
+      );
+    }
+
+    if (state.step === 'register_sc_change_ip_old') {
+      const oldIp = normalizeHost(text);
+      if (!isIpv4(oldIp)) {
+        return ctx.reply('Format IP lama tidak valid. Contoh: 104.100.20.31');
+      }
+      const isMine = await isRegisteredHost(ctx.from.id, oldIp);
+      if (!isMine) {
+        return ctx.reply('IP lama tidak ditemukan / tidak aktif di akun kamu.');
+      }
+      const used = await getScIpChangeCount(ctx.from.id);
+      if (used >= SC_IP_CHANGE_MAX) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`Batas ganti IP sudah habis (maksimal ${SC_IP_CHANGE_MAX}x).`, mainMenu());
+      }
+      state.step = 'register_sc_change_ip_new';
+      state.oldIp = oldIp;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('GANTI IP VPS', [
+          `IP Lama : ${oldIp}`,
+          '',
+          'Masukkan IP baru.',
+          'Contoh: 104.220.220.21'
+        ])
+      );
+    }
+
+    if (state.step === 'register_sc_change_ip_new') {
+      const oldIp = normalizeHost(state.oldIp || '');
+      const newIp = normalizeHost(text);
+      if (!isIpv4(oldIp)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State ganti IP tidak valid. Ulangi dari menu registrasi.', mainMenu());
+      }
+      if (!isIpv4(newIp)) {
+        return ctx.reply('Format IP baru tidak valid. Contoh: 104.220.220.21');
+      }
+      let out;
+      try {
+        out = await replaceScRegisteredIp(ctx.from.id, oldIp, newIp);
+      } catch (e) {
+        const msg = String(e?.message || e || 'Gagal ganti IP.');
+        if (/batas ganti ip/i.test(msg)) {
+          userState.delete(ctx.chat.id);
+          return ctx.reply(msg, mainMenu());
+        }
+        return ctx.reply(msg);
+      }
+      userState.delete(ctx.chat.id);
+      await syncKnownServerKeyAfterScRegistration(ctx.from.id, out.newIp).catch(() => {});
+      await syncScRegistrationMetaToHost(out.newIp, out.serverKey, {
+        status: 'active',
+        client_name: out.clientName,
+        expires_at: Number(out.expiresAt || 0)
+      }).catch(() => {});
+      return ctx.reply(
+        `Ganti IP VPS berhasil.\n` +
+          `IP lama: ${out.oldIp}\n` +
+          `IP baru: ${out.newIp}\n` +
+          `Sisa kuota ganti IP: ${out.remaining}x`,
         mainMenu()
       );
     }

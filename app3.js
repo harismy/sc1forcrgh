@@ -1614,6 +1614,7 @@ function adminPaymentGatewayMainMenu() {
     [Markup.button.callback('Mode: OrderKuota saja', 'm_pg_mode_orderkuota')],
     [Markup.button.callback('Mode: GoPay saja', 'm_pg_mode_gopay')],
     [Markup.button.callback('Mode: Keduanya (fallback)', 'm_pg_mode_both')],
+    [Markup.button.callback('Set Masa Aktif QRIS', 'm_pg_set_qris_expire')],
     [Markup.button.callback('Setting OrderKuota', 'm_pg_menu_orderkuota')],
     [Markup.button.callback('Setting GoPay', 'm_pg_menu_gopay')],
     [Markup.button.callback('Kembali', 'm_admin_menu')]
@@ -2351,9 +2352,12 @@ bot.action('m_admin_payment_gateway_menu', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   const cfg = getPaymentConfig();
+  const expMs = await getTopupExpireMs();
+  const expMinute = Math.max(1, Math.floor(Number(expMs || 0) / 60000));
   return ctx.reply(
     uiBox('SETTING PAYMENT GATEWAY', [
       `Mode aktif: ${paymentGatewayModeLabel(cfg.mode)}`,
+      `Masa Aktif QRIS: ${expMinute} menit`,
       '',
       'Pilih mode atau masuk ke submenu provider.'
     ]),
@@ -2459,6 +2463,12 @@ bot.action('m_pg_set_gopay_min_topup', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_gopay_min_topup' });
   return ctx.reply('Kirim minimal topup GoPay (angka rupiah). Contoh: 2000');
+});
+bot.action('m_pg_set_qris_expire', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'pg_set_qris_expire' });
+  return ctx.reply('Kirim masa aktif QRIS dalam menit. Contoh: 5');
 });
 
 bot.action('m_admin_add_domain', async (ctx) => {
@@ -3543,6 +3553,21 @@ bot.on('text', async (ctx) => {
       saveVars(v);
       userState.delete(ctx.chat.id);
       return ctx.reply(`Minimal TopUp GoPay disimpan: Rp ${Math.floor(amount).toLocaleString('id-ID')}`, adminPaymentGatewayGoPayMenu());
+    }
+
+    if (state.step === 'pg_set_qris_expire') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const minutes = Number(String(text).replace(/[^0-9]/g, ''));
+      if (!Number.isFinite(minutes) || minutes < 1) {
+        return ctx.reply('Masa aktif QRIS harus angka menit, minimal 1.');
+      }
+      const valueMs = Math.floor(minutes) * 60000;
+      await setDynamicSetting('TOPUP_EXPIRE_MS', String(valueMs), ctx.from.id);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Masa aktif QRIS disimpan: ${Math.floor(minutes)} menit`, adminPaymentGatewayMainMenu());
     }
 
     if (state.step === 'admin_add_domain') {

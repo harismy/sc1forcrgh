@@ -7545,11 +7545,6 @@ count_lines() {
 format_user_rows() {
   local data="$1"
   echo "${data}" | awk '
-    function trunc_name(s, maxlen) {
-      maxlen = 14
-      if (length(s) <= maxlen) return s
-      return substr(s, 1, maxlen - 1) "…"
-    }
     function parse_row(raw, name, val, tmp) {
       name = raw
       val = "-"
@@ -7568,14 +7563,13 @@ format_user_rows() {
       }
       gsub(/[[:space:]]+$/, "", name)
       if (name == "") name = "-"
-      name = trunc_name(name)
       users[++n] = name
       vals[n] = val
       if (length(name) > maxw) maxw = length(name)
     }
     BEGIN {
       n = 0
-      maxw = 4
+      maxw = 14
     }
     NF {
       parse_row($0)
@@ -7587,12 +7581,8 @@ format_user_rows() {
         exit
       }
       printf "  %-" maxw "s | %s\n", "Akun", "IP"
-      limit = (n > 20 ? 20 : n)
-      for (i = 1; i <= limit; i++) {
+      for (i = 1; i <= n; i++) {
         printf "  %-" maxw "s | %s\n", users[i], vals[i]
-      }
-      if (n > limit) {
-        printf "  +%d akun lagi\n", (n - limit)
       }
     }
   '

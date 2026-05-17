@@ -46,6 +46,9 @@ set -euo pipefail
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
+#   SSH_TUNNEL_SHELL=/usr/sbin/nologin         (akun SSH/ZIVPN tunnel-only, tanpa shell VPS)
+#   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1            (blok akun tunnel konek keluar ke port SSH)
+#   SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=22,2222     (port keluar yang diblok untuk UID non-root)
 #   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
@@ -124,6 +127,9 @@ UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
 SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
+SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
+SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}"
+SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}"
 ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
@@ -889,6 +895,74 @@ EOF
   systemctl restart dropbear >/dev/null 2>&1 || true
 }
 
+resolve_tunnel_shell() {
+  local shell="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
+  if [[ -x "${shell}" ]]; then
+    printf '%s' "${shell}"
+    return
+  fi
+  if [[ -x /usr/sbin/nologin ]]; then
+    printf '%s' "/usr/sbin/nologin"
+  elif [[ -x /sbin/nologin ]]; then
+    printf '%s' "/sbin/nologin"
+  else
+    printf '%s' "/bin/false"
+  fi
+}
+
+ensure_tunnel_shell_allowed() {
+  local shell shells_file
+  shell="$(resolve_tunnel_shell)"
+  shells_file="/etc/shells"
+  touch "${shells_file}" >/dev/null 2>&1 || true
+  if [[ -f "${shells_file}" ]] && ! grep -Fxq "${shell}" "${shells_file}" 2>/dev/null; then
+    printf '%s\n' "${shell}" >> "${shells_file}" 2>/dev/null || true
+  fi
+  printf '%s' "${shell}"
+}
+
+harden_ssh_tunnel_shells() {
+  local shell user changed
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  [[ -s "${DB_PATH}" ]] || return 0
+  shell="$(ensure_tunnel_shell_allowed)"
+  changed=0
+  while IFS= read -r user; do
+    [[ -z "${user}" || "${user}" == "root" ]] && continue
+    if id "${user}" >/dev/null 2>&1; then
+      usermod -s "${shell}" "${user}" >/dev/null 2>&1 || true
+      changed=$((changed + 1))
+    fi
+  done < <(sqlite3 -noheader "${DB_PATH}" "SELECT username FROM account_sshs WHERE TRIM(COALESCE(username,'')) <> '';" 2>/dev/null || true)
+  log "Tunnel-only shell diterapkan ke ${changed} akun SSH/ZIVPN (${shell})."
+}
+
+apply_tunnel_outbound_guard_rules() {
+  local enabled ports
+  enabled="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${enabled}" != "1" && "${enabled}" != "true" && "${enabled}" != "yes" && "${enabled}" != "on" ]]; then
+    log "Outbound SSH guard nonaktif (SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0})."
+    return 0
+  fi
+  ports="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}" | tr -cd '0-9,')"
+  [[ -z "${ports}" ]] && ports="22"
+
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+      iptables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+        ip6tables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+    fi
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    fi
+    log "Outbound SSH guard aktif untuk UID non-root: tcp/${ports}."
+  else
+    log "iptables tidak tersedia, outbound SSH guard dilewati."
+  fi
+}
+
 init_db() {
   log "Inisialisasi DB"
   mkdir -p "$(dirname "${DB_PATH}")"
@@ -1419,8 +1493,8 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
-    acl is_alpn_h2 ssl_fc_alpn -i h2
     acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
+    acl is_ssh_banner req.payload(0,4) -m str "SSH-"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
     acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
@@ -1431,12 +1505,13 @@ frontend ft_443
     # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
     # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
     acl is_hc_connect req.payload(0,512),lower -m sub "connect "
-    use_backend bk_grpc if is_alpn_h2
+    use_backend bk_grpc if is_h2_preface
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
-    # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
-    # Jalur xray (/vmess,/vless,/trojan) dan API (/vps/) tetap diprioritaskan ke mux.
-    default_backend bk_sshws_tls
+    use_backend bk_sshws_tls if is_ssh_banner
+    # Default 443 diarahkan ke mux agar VMESS/VLESS/TROJAN WS tidak nyasar ke sshws.
+    # SSH SSL-only tetap ditangani via route CONNECT (is_hc_connect) dan fallback nginx / -> 2082.
+    default_backend bk_mux
 
 backend bk_mux
     mode tcp
@@ -2095,6 +2170,9 @@ VMESS_BUG_PROFILE_HOST=${VMESS_BUG_PROFILE_HOST}
 VMESS_BUG_PROFILE_ALLOW_INSECURE=${VMESS_BUG_PROFILE_ALLOW_INSECURE}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
+SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
+SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH}
+SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -2128,6 +2206,7 @@ const ZIVPN_LIVE_TTL_SECONDS_RAW = Number(process.env.ZIVPN_LIVE_TTL_SECONDS || 
 const ZIVPN_LIVE_TTL_SECONDS = Number.isFinite(ZIVPN_LIVE_TTL_SECONDS_RAW) && ZIVPN_LIVE_TTL_SECONDS_RAW >= 20
   ? Math.min(Math.floor(ZIVPN_LIVE_TTL_SECONDS_RAW), 1800)
   : 90;
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
 const ZIVPN_RELOAD_ON_AUTH_CHANGE = String(process.env.ZIVPN_RELOAD_ON_AUTH_CHANGE || '0').trim() === '1';
 const ZIVPN_AUTH_APPLY_MODE_RAW = String(process.env.ZIVPN_AUTH_APPLY_MODE || '').trim().toLowerCase();
 const ZIVPN_AUTH_APPLY_MODE = ZIVPN_AUTH_APPLY_MODE_RAW || (ZIVPN_RELOAD_ON_AUTH_CHANGE ? 'restart' : 'reload-restart');
@@ -2684,11 +2763,38 @@ function safeExec(cmd, args, input) {
   }
 }
 
+function resolveTunnelShell() {
+  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  for (const shell of choices) {
+    try {
+      if (fs.existsSync(shell)) return shell;
+    } catch (_) {}
+  }
+  return '/usr/sbin/nologin';
+}
+
+function ensureTunnelShellAllowed() {
+  const shell = resolveTunnelShell();
+  try {
+    const shellsFile = '/etc/shells';
+    const current = fs.existsSync(shellsFile) ? fs.readFileSync(shellsFile, 'utf8') : '';
+    const exists = current.split(/\r?\n/).map((line) => line.trim()).includes(shell);
+    if (!exists) {
+      const prefix = current && !current.endsWith('\n') ? '\n' : '';
+      fs.appendFileSync(shellsFile, `${prefix}${shell}\n`);
+    }
+  } catch (_) {}
+  return shell;
+}
+
 function ensureLinuxUser(username, password, expDate) {
+  const shell = ensureTunnelShellAllowed();
   const exists = safeExec('id', ['-u', username]);
-  if (!exists) safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', '/bin/bash', username]);
+  if (!exists) safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', shell, username]);
   safeExec('chpasswd', [], `${username}:${password}\n`);
-  safeExec('usermod', ['-s', '/bin/bash', username]);
+  safeExec('usermod', ['-d', `/home/${username}`, '-s', shell, username]);
   const linuxExpDate = ymdFromDateExp(expDate);
   if (linuxExpDate) safeExec('chage', ['-E', linuxExpDate, username]);
 }
@@ -2702,6 +2808,7 @@ function lockLinuxUser(username) {
 }
 
 function unlockLinuxUser(username) {
+  safeExec('usermod', ['-s', ensureTunnelShellAllowed(), username]);
   safeExec('passwd', ['-u', username]);
 }
 
@@ -2890,17 +2997,21 @@ async function syncSshBackendsFromDb() {
 
 function vmessLink(host, id, tls, username = '') {
   const remark = String(username || `vmess-${host}`).trim() || `vmess-${host}`;
+  const allowInsecure = VMESS_BUG_PROFILE_ALLOW_INSECURE ? '1' : '0';
   const payload = {
     v: '2', ps: remark, add: host, port: tls ? '443' : '80', id, aid: '0',
-    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host
+    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none', sni: host,
+    allowInsecure, alpn: 'http/1.1'
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
 function vmessGrpcLink(host, id, username = '') {
   const remark = String(username || `vmess-grpc-${host}`).trim() || `vmess-grpc-${host}`;
+  const allowInsecure = VMESS_BUG_PROFILE_ALLOW_INSECURE ? '1' : '0';
   const payload = {
     v: '2', ps: remark, add: host, port: '443', id, aid: '0',
-    net: 'grpc', type: 'none', host, path: 'vmess-grpc', tls: 'tls', sni: host
+    net: 'grpc', type: 'none', host, path: 'vmess-grpc', tls: 'tls', sni: host,
+    allowInsecure
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
@@ -3198,6 +3309,15 @@ async function generateTrialUsername(table, prefix = 'trial') {
   return `${cleanPrefix}${Date.now().toString().slice(-6)}`;
 }
 
+function randomAlnum(length = 8) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let out = '';
+  for (let i = 0; i < length; i += 1) {
+    out += alphabet[crypto.randomInt(0, alphabet.length)];
+  }
+  return out;
+}
+
 async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   const isTrial = forcedDays !== null;
   let username = String(body?.username || '').trim().toLowerCase();
@@ -3206,7 +3326,7 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   }
   const owner = getOwnerInfo(req, body || {});
   const requestedPassword = String(body?.password || '').trim();
-  const password = requestedPassword || (isTrial ? crypto.randomBytes(6).toString('hex') : username);
+  const password = requestedPassword || randomAlnum(8);
   const expDays = forcedDays === null ? Number(body?.expired || 30) : Number(forcedDays || 1);
   const quota = Number(body?.kuota || 0);
   const limitip = Number(body?.limitip || 0);
@@ -3384,6 +3504,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       const outbound = bugCfg?.outbounds?.[0] || {};
       const vnext = outbound?.settings?.vnext?.[0] || {};
       const user = (vnext?.users && vnext.users[0]) || {};
+      const allowInsecure =
+        outbound?.streamSettings?.tlsSettings?.allowInsecure === true ? '1' : '0';
       const payload = {
         v: '2',
         ps: finalUsername,
@@ -3396,7 +3518,9 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
         host: String(outbound?.streamSettings?.wsSettings?.headers?.Host || ''),
         path: String(outbound?.streamSettings?.wsSettings?.path || XRAY_PATH_VMESS),
         tls: 'tls',
-        sni: String(outbound?.streamSettings?.tlsSettings?.serverName || '')
+        sni: String(outbound?.streamSettings?.tlsSettings?.serverName || ''),
+        allowInsecure,
+        alpn: 'http/1.1'
       };
       return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
     })() : null;
@@ -4194,6 +4318,7 @@ const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
 
 const DB_PATH = process.env.DB_PATH || '/usr/sbin/potatonc/potato.db';
+const DOMAIN = String(process.env.DOMAIN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
 const ZIVPN_AUTH_MODE = String(process.env.ZIVPN_AUTH_MODE || 'http').trim().toLowerCase();
@@ -4202,6 +4327,7 @@ const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const BOT_ACCOUNT_EVENT_WEBHOOK_URL = String(process.env.BOT_ACCOUNT_EVENT_WEBHOOK_URL || '').trim();
@@ -4388,6 +4514,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
     const event = {
       event: 'MULTI_LOGIN',
       action: 'LOCK_TMP',
+      source_domain: DOMAIN || null,
       service: String(service || '-').toUpperCase(),
       username: String(username || '-'),
       limitip: Number(limitip || 0),
@@ -4409,6 +4536,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       `SC 1FORCR NOTIF\n` +
       `Event    : MULTI_LOGIN\n` +
       `Action   : LOCK_TMP\n` +
+      `Domain   : ${DOMAIN || '-'}\n` +
       `Layanan  : ${String(service || '-').toUpperCase()}\n` +
       `Username : ${String(username || '-')}\n` +
       `Limit IP : ${Number(limitip || 0)}\n` +
@@ -4493,6 +4621,33 @@ function safeExec(cmd, args, input) {
     return false;
   }
 }
+
+function resolveTunnelShell() {
+  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  for (const shell of choices) {
+    try {
+      if (fs.existsSync(shell)) return shell;
+    } catch (_) {}
+  }
+  return '/usr/sbin/nologin';
+}
+
+function ensureTunnelShellAllowed() {
+  const shell = resolveTunnelShell();
+  try {
+    const shellsFile = '/etc/shells';
+    const current = fs.existsSync(shellsFile) ? fs.readFileSync(shellsFile, 'utf8') : '';
+    const exists = current.split(/\r?\n/).map((line) => line.trim()).includes(shell);
+    if (!exists) {
+      const prefix = current && !current.endsWith('\n') ? '\n' : '';
+      fs.appendFileSync(shellsFile, `${prefix}${shell}\n`);
+    }
+  } catch (_) {}
+  return shell;
+}
+
 function readExec(cmd, args) {
   try {
     return execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
@@ -5666,7 +5821,7 @@ async function unlockExpired(nowTs) {
       if (pass) {
         safeExec('chpasswd', [], `${u}:${pass}\n`);
       }
-      safeExec('usermod', ['-s', '/bin/bash', u]);
+      safeExec('usermod', ['-s', ensureTunnelShellAllowed(), u]);
       if (/^\d{4}-\d{2}-\d{2}$/.test(expDate)) {
         safeExec('chage', ['-E', expDate, u]);
       }
@@ -6718,17 +6873,20 @@ Akun     : SSH/ZIVPN=${ssh_count} VMESS=${vmess_count} VLESS=${vless_count} TROJ
 Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
 
   tg_api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-  if ! curl -fsS --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 180 -X POST "${tg_api}/sendDocument" \
+  if curl --http1.1 -fsS --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 90 -X POST "${tg_api}/sendDocument" \
     -F "chat_id=${TELEGRAM_CHAT_ID}" \
-    -F "disable_content_type_detection=true" \
-    --form-string "caption=${caption}" \
     -F "document=@${backup_json}" >/dev/null 2>>"${tg_err_log}"; then
+    # Kirim ringkasan terpisah agar upload dokumen tetap kompatibel di jaringan yang sensitif multipart.
+    curl --http1.1 -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
+      -d "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=${caption}" >/dev/null 2>>"${tg_err_log}" || true
+  else
     {
       echo "[$(date '+%F %T')] sendDocument gagal untuk file: ${backup_json}"
       tail -n 5 "${tg_err_log}" 2>/dev/null || true
     } >> "${tg_err_log}"
     # Fallback: minimal kirim notifikasi teks jika upload dokumen gagal.
-    curl -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
+    curl --http1.1 -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
       -d "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "text=${caption}
 Backup file tersimpan lokal: ${backup_json}" >/dev/null 2>>"${tg_err_log}" || true
@@ -7104,6 +7262,9 @@ send_tg() {
 }
 
 should_send_online_report() {
+  if [[ "${FORCE_ONLINE_NOTIFY:-0}" == "1" ]]; then
+    return 0
+  fi
   local now_ts last_ts interval_sec
   now_ts="$(date +%s 2>/dev/null || echo 0)"
   [[ -z "${now_ts}" || ! "${now_ts}" =~ ^[0-9]+$ ]] && now_ts=0
@@ -7547,24 +7708,20 @@ format_user_rows() {
       if (name == "") name = "-"
       users[++n] = name
       vals[n] = val
-      if (length(name) > maxw) maxw = length(name)
     }
     BEGIN {
       n = 0
-      maxw = 4
     }
     NF {
       parse_row($0)
     }
     END {
       if (n == 0) {
-        printf "  %-4s | %s\n", "Akun", "IP"
-        printf "  %-4s | %s\n", "-", "-"
+        printf "  - -\n"
         exit
       }
-      printf "  %-" maxw "s | %s\n", "Akun", "IP"
       for (i = 1; i <= n; i++) {
-        printf "  %-" maxw "s | %s\n", users[i], vals[i]
+        printf "  - %s (%s IP)\n", users[i], vals[i]
       }
     }
   '
@@ -7572,40 +7729,33 @@ format_user_rows() {
 
 format_protocol_block() {
   local proto="$1" cnt="$2" users="$3"
-  printf -- "- %-10s: %s\n" "${proto}" "${cnt}"
+  printf -- "\n[%s] %s akun\n" "${proto}" "${cnt}"
   if [[ -z "${cnt}" || ! "${cnt}" =~ ^[0-9]+$ || "${cnt}" -le 0 ]]; then
-    echo "  Akun : -"
+    echo "  - -"
     return
   fi
   format_user_rows "${users}"
 }
 
 msg="SC 1FORCR NOTIF
-Event    : ONLINE_REPORT
-Domain   : ${DOMAIN}
-Waktu    : $(date '+%F %T')
-Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
-Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik (XRAY last seen)
-Handoff  : ${ZIVPN_HANDOFF_GRACE_SECONDS} detik (ZIVPN)
+Event: ONLINE_REPORT
+Domain: ${DOMAIN}
+Waktu: $(date '+%F %T')
+Interval: ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
+Window XRAY: ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik
+Handoff ZIVPN: ${ZIVPN_HANDOFF_GRACE_SECONDS} detik
 
-RINGKASAN AKUN AKTIF 
-- SSH/UDPHC : ${acct_ssh}
-- VMESS     : ${acct_vmess}
-- VLESS     : ${acct_vless}
-- TROJAN    : ${acct_trojan}
+RINGKASAN AKUN AKTIF
+- SSH/UDPHC: ${acct_ssh}
+- VMESS: ${acct_vmess}
+- VLESS: ${acct_vless}
+- TROJAN: ${acct_trojan}
 
 ONLINE TERDETEKSI
-<pre>
-==============================================
 $(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}")
-----------------------------------------------
 $(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}")
-----------------------------------------------
 $(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}")
-----------------------------------------------
 $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}")
-==============================================
-</pre>
 "
 
 if should_send_online_report; then
@@ -8721,6 +8871,18 @@ EOT_XRAY
   esac
 }
 
+random_alnum8() {
+  local value
+  value="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8 || true)"
+  if [[ "${#value}" -lt 8 ]]; then
+    value="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-8 || true)"
+  fi
+  if [[ "${#value}" -lt 8 ]]; then
+    value="$(date +%s%N | sha256sum | cut -c1-8)"
+  fi
+  printf '%s' "${value:0:8}"
+}
+
 create_account() {
   local type ep username password exp limitip quota payload resp code
   while true; do
@@ -8736,7 +8898,7 @@ create_account() {
       prompt_input limitip "Limit IP [2]: " || continue
       limitip="${limitip:-2}"
       quota="0"
-      password="${username}"
+      password="$(random_alnum8)"
     else
       prompt_input limitip "Limit IP [2]: " || continue
       limitip="${limitip:-2}"
@@ -8795,7 +8957,7 @@ create_trial_account() {
     username="$(prompt_new_username "${type}")" || continue
 
     if [[ "${type}" == "zivpn" ]]; then
-      password="${username}"
+      password="$(random_alnum8)"
       prompt_input limitip "Limit IP trial [1]: " || continue
       limitip="${limitip:-1}"
     elif [[ "${type}" == "ssh" ]]; then
@@ -9913,7 +10075,7 @@ trigger_online_notify_now() {
     echo "Script notifier tidak ditemukan: ${notify_bin}"
     return 1
   fi
-  if ONLINE_NOTIFY_ENABLE=1 "${notify_bin}"; then
+  if ONLINE_NOTIFY_ENABLE=1 FORCE_ONLINE_NOTIFY=1 "${notify_bin}"; then
     echo "Notifikasi online berhasil dikirim ke Telegram."
   else
     echo "Gagal mengirim notifikasi online manual."
@@ -10694,8 +10856,8 @@ frontend ft_443
     tcp-request inspect-delay 5s
     tcp-request content accept if HTTP
     tcp-request content accept if WAIT_END
-    acl is_alpn_h2 ssl_fc_alpn -i h2
     acl is_h2_preface req.payload(0,14) -m str "PRI * HTTP/2.0"
+    acl is_ssh_banner req.payload(0,4) -m str "SSH-"
     acl is_xray_vmess req.payload(0,256),lower -m sub "get /vmess"
     acl is_xray_vmess_bug req.payload(0,256),lower -m sub "get /yourbug"
     acl is_xray_vless req.payload(0,256),lower -m sub "get /vless"
@@ -10706,12 +10868,13 @@ frontend ft_443
     # Beberapa client HC mengirim baris CONNECT terfragmentasi / tidak persis di awal payload.
     # Gunakan deteksi lebih longgar agar SSL-only tetap masuk backend sshws.
     acl is_hc_connect req.payload(0,512),lower -m sub "connect "
-    use_backend bk_grpc if is_alpn_h2
+    use_backend bk_grpc if is_h2_preface
     use_backend bk_mux if is_h2_preface || is_xray_vmess || is_xray_vmess_bug || is_xray_vless || is_xray_vless_bug || is_xray_trojan || is_xray_trojan_bug || is_api_vps
     use_backend bk_sshws_tls if is_hc_connect
-    # Default 443 diarahkan ke sshws agar payload HC non-standar tetap bisa SSH SSL-only.
-    # Jalur xray (/vmess,/vless,/trojan) dan API (/vps/) tetap diprioritaskan ke mux.
-    default_backend bk_sshws_tls
+    use_backend bk_sshws_tls if is_ssh_banner
+    # Default 443 diarahkan ke mux agar VMESS/VLESS/TROJAN WS tidak nyasar ke sshws.
+    # SSH SSL-only tetap ditangani via route CONNECT (is_hc_connect) dan fallback nginx / -> 2082.
+    default_backend bk_mux
 
 backend bk_mux
     mode tcp
@@ -10926,6 +11089,8 @@ EOF
 enforce_menu_license_access() {
   local enabled ip_text status expires_raw expires_epoch now_epoch lock_file lock_reason
   lock_file="/etc/sc-1forcr-access.lock"
+  ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ip_text="${ip_text:-unknown}"
   if [[ -f "${lock_file}" ]]; then
     lock_reason="$(sed -n 's/^reason=//p' "${lock_file}" | head -n1)"
     [[ -z "${lock_reason}" ]] && lock_reason="locked_by_admin"
@@ -10964,9 +11129,6 @@ EOF
   enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
   [[ "${enabled}" != "1" ]] && return 0
   refresh_license_cache_guard
-
-  ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
-  ip_text="${ip_text:-unknown}"
   status="$(echo "$(read_license_value_global "LICENSE_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
   expires_raw="$(read_license_value_global "LICENSE_EXPIRES_AT")"
   expires_epoch="$(parse_license_expire_epoch "${expires_raw}")"
@@ -11105,7 +11267,7 @@ draw_dashboard() {
   local BOLD="${ESC}[1m"
   local NC="${ESC}[0m"
 
-  local BOX_W=72
+  local BOX_W=58
 
   strip_ansi() {
     sed -r 's/\x1B\[[0-9;]*[mK]//g'
@@ -11144,22 +11306,22 @@ draw_dashboard() {
   }
 
   print_top() {
-    printf '%s+%s+%s\n' "${AQUA}" "$(gradient_fill '=' "$((BOX_W + 2))")" "${NC}"
+    printf '%s┏%s┓%s\n' "${AQUA}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_mid() {
-    printf '%s+%s+%s\n' "${VIOLET}" "$(gradient_fill '-' "$((BOX_W + 2))")" "${NC}"
+    printf '%s┣%s┫%s\n' "${VIOLET}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_bottom() {
-    printf '%s+%s+%s\n' "${PURPLE}" "$(gradient_fill '=' "$((BOX_W + 2))")" "${NC}"
+    printf '%s┗%s┛%s\n' "${PURPLE}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
   }
 
   print_line() {
     local text="$1"
     local padded
     padded="$(pad_right "$text" "$BOX_W")"
-    printf '%s|%s %s %s|%s\n' "${AQUA}" "${NC}" "$padded" "${PURPLE}" "${NC}"
+    printf '%s┃%s %s %s┃%s\n' "${AQUA}" "${NC}" "$padded" "${PURPLE}" "${NC}"
   }
 
   print_center() {
@@ -11172,7 +11334,7 @@ draw_dashboard() {
     fi
     left=$(( (BOX_W - vlen) / 2 ))
     right=$(( BOX_W - vlen - left ))
-    printf '%s|%s %*s%s%*s %s|%s\n' "${AQUA}" "${NC}" "$left" "" "$text" "$right" "" "${PURPLE}" "${NC}"
+    printf '%s┃%s %*s%s%*s %s┃%s\n' "${AQUA}" "${NC}" "$left" "" "$text" "$right" "" "${PURPLE}" "${NC}"
   }
 
   kv_line() {
@@ -11447,9 +11609,9 @@ EOF
   print_bottom
 
   printf '\n'
-  printf ' %s+%s+%s\n' "${AQUA}" "$(gradient_fill '-' 36)" "${NC}"
-  printf " ${AQUA}|${NC} ${BOLD}${WHITE}to access use${NC} ${AQUA}'menu'${NC} ${BOLD}${WHITE}command${NC}      ${PURPLE}|${NC}\n"
-  printf ' %s+%s+%s\n' "${PURPLE}" "$(gradient_fill '-' 36)" "${NC}"
+  printf ' %s┏%s┓%s\n' "${AQUA}" "$(gradient_fill '━' 36)" "${NC}"
+  printf " ${AQUA}┃${NC} ${BOLD}${WHITE}to access use${NC} ${AQUA}'menu'${NC} ${BOLD}${WHITE}command${NC}      ${PURPLE}┃${NC}\n"
+  printf ' %s┗%s┛%s\n' "${PURPLE}" "$(gradient_fill '━' 36)" "${NC}"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
@@ -13326,7 +13488,7 @@ menu_print_line() {
   local width="${2:-58}"
   local padded
   padded="$(menu_pad_right "${text}" "${width}")"
-  printf ' %s|%s%s%s|%s\n' "${MENU_AQUA}" "${MENU_NC}" "${padded}" "${MENU_PURPLE}" "${MENU_NC}"
+  printf ' %s┃%s%s%s┃%s\n' "${MENU_AQUA}" "${MENU_NC}" "${padded}" "${MENU_PURPLE}" "${MENU_NC}"
 }
 
 draw_menu_header() {
@@ -13335,9 +13497,9 @@ draw_menu_header() {
   local title_len
   title_len="$(menu_visible_len "  ${title}")"
   (( title_len > width )) && width="${title_len}"
-  printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' "${width}")" "${MENU_NC}"
+  printf ' %s┏%s┓%s\n' "${MENU_AQUA}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
   menu_print_line "  ${MENU_AQUA}${MENU_BOLD}${title}${MENU_NC}" "${width}"
-  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '-' "${width}")" "${MENU_NC}"
+  printf ' %s┣%s┫%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
 }
 
 draw_menu_panel() {
@@ -13355,18 +13517,18 @@ draw_menu_panel() {
   for item in "$@"; do
     menu_print_line "  ${MENU_WHITE}${item}${MENU_NC}" "${width}"
   done
-  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' "${width}")" "${MENU_NC}"
+  printf ' %s┗%s┛%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
 }
 
 draw_main_options() {
-  printf ' %s+%s+%s\n' "${MENU_AQUA}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
+  printf ' %s┏%s┓%s\n' "${MENU_AQUA}" "$(menu_gradient_line '━' 58)" "${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}1.) > MENU AKUN         5.) > MONITOR USER LOCK${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}2.) > SERVICE MENU      6.) > MONITOR USER LOGIN${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}3.) > BACKUP/RESTORE    7.) > TOOLS${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}4.) > CHANGE DOMAIN${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}m.) > MENU UTAMA${MENU_NC}"
   menu_print_line "  ${MENU_WHITE}x.) > EXIT${MENU_NC}"
-  printf ' %s+%s+%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '=' 58)" "${MENU_NC}"
+  printf ' %s┗%s┛%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' 58)" "${MENU_NC}"
 }
 
 if [[ "${1:-}" == "update" ]]; then
@@ -13384,7 +13546,12 @@ while true; do
     resume_pending_operation_prompt
   fi
   if ! enforce_menu_license_access; then
-    exit 1
+    echo
+    echo "Status lisensi belum aktif. Tekan Enter untuk cek ulang atau ketik x untuk keluar."
+    read -r -p "> " _sc_expired_choice || true
+    [[ "${_sc_expired_choice:-}" =~ ^[xX]$ ]] && exit 0
+    SHOW_FULL_MENU=1
+    continue
   fi
   clear
   if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
@@ -13590,9 +13757,7 @@ if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; the
   if [[ -n "${SSH_CONNECTION:-}" ]] && [[ -z "${SSH_ORIGINAL_COMMAND:-}" ]] && [[ -z "${SC_MENU_AUTO_STARTED:-}" ]]; then
     if [[ -x /usr/local/sbin/menu ]]; then
       export SC_MENU_AUTO_STARTED=1
-      /usr/local/sbin/menu
-      return 0 2>/dev/null || true
-      exit 0
+      /usr/local/sbin/menu || true
     fi
   fi
 fi
@@ -13900,6 +14065,7 @@ main() {
   setup_default_banner_assets
   setup_dropbear
   init_db
+  harden_ssh_tunnel_shells
   setup_nginx_and_cert
   setup_haproxy_tls_mux
   setup_zivpn_service_if_possible
@@ -13935,6 +14101,7 @@ main() {
   write_version_marker
   sync_zivpn_auth_token_with_api_runtime
   apply_sshws_loop_guard_rules
+  apply_tunnel_outbound_guard_rules
   apply_final_service_restart_chain
   post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."
@@ -13957,31 +14124,6 @@ curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
   -H "Content-Type: application/json" \\
   -d '{"username":"test123","password":"test123","expired":3,"limitip":"2","kuota":"0"}'
 
-Catatan:
-- Installer sekarang memakai gate lisensi berbasis IP VPS.
-- Wajib registrasi dan pembayaran lisensi terlebih dahulu sebelum install.
-- Endpoint /vps/* sudah kompatibel pola bot 1FORCR (create/trial/renew/delete/lock/unlock).
-- WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
-- Dropbear aktif di port ${DROPBEAR_PORT} dan ${DROPBEAR_ALT_PORT}; ssh-ws bridge default ke ${DROPBEAR_PORT}
-- SSH/SSHWS UDPGW (VC/telp/game) aktif di port TCP: ${SSHWS_UDPGW_PORTS}
-- SSH mux runtime sudah pakai Go binary: ${APP_DIR}/bin/ssh-mux
-- Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
-- Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
-- Rule UDP ZIVPN otomatis dipasang: INPUT udp ${ZIVPN_LISTEN_PORT}, DNAT ${ZIVPN_DNAT_RANGE} -> ${ZIVPN_LISTEN_PORT}.
-- UDP Custom juga otomatis disiapkan di service ${UDPCUSTOM_SERVICE_NAME} (config: /root/udp/config.json).
-- UDP Custom (UDPHC) default tanpa DNAT range; rule DNAT legacy ke port UDPHC akan dibersihkan otomatis.
-- Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
-- vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
-- Auto reboot aktif berkala sesuai interval AUTO_REBOOT_INTERVAL_MINUTES via systemd timer sc-1forcr-autoreboot.timer.
-- Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
-- Auto backup semua akun (JSON) mendukung mode interval (AUTO_BACKUP_INTERVAL_MINUTES) atau jadwal harian WIB (AUTO_BACKUP_WIB_HOUR) via sc-1forcr-autobackup.timer.
-- Notifikasi akun online berkala ke Telegram aktif default tiap ${ONLINE_NOTIFY_INTERVAL_HOURS} jam via sc-1forcr-online-notify.timer.
-- Backup manual: /usr/local/sbin/sc-1forcr-auto-backup manual
-- Restore akun dari backup: /usr/local/sbin/sc-1forcr-restore-backup /path/file.json
-- UDP boot-fix aktif via systemd sc-1forcr-udp-bootfix.service (re-apply backend/rule saat startup).
-- Menu VPS: jalankan perintah menu atau menu-sc-1forcr
-- Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu gunakan Tools -> Update Script
-- Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap ${IPLIMIT_CHECK_INTERVAL_MINUTES} menit, lock sementara ${IPLIMIT_LOCK_MINUTES} menit)
 EOF
 
   clear_pending_operation

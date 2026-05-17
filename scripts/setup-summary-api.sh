@@ -5,6 +5,7 @@ APP_DIR="${APP_DIR:-/root/tunnel-sync}"
 APP_NAME="${APP_NAME:-tunnel-summary}"
 SUMMARY_PORT="${SUMMARY_PORT:-8789}"
 POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
+SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root (or use sudo)."
@@ -68,6 +69,7 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
 const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
 const STATIC_TOKEN = (process.env.SYNC_TOKEN || '').trim();
 const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/local/sbin/sc-1forcr-restore-backup').trim();
@@ -201,8 +203,35 @@ function isValidUnixUsername(username) {
   return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(String(username || '').trim());
 }
 
+function resolveTunnelShell() {
+  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  for (const shell of choices) {
+    try {
+      if (fs.existsSync(shell)) return shell;
+    } catch (_) {}
+  }
+  return '/usr/sbin/nologin';
+}
+
+function ensureTunnelShellAllowed() {
+  const shell = resolveTunnelShell();
+  try {
+    const shellsFile = '/etc/shells';
+    const current = fs.existsSync(shellsFile) ? fs.readFileSync(shellsFile, 'utf8') : '';
+    const exists = current.split(/\r?\n/).map((line) => line.trim()).includes(shell);
+    if (!exists) {
+      const prefix = current && !current.endsWith('\n') ? '\n' : '';
+      fs.appendFileSync(shellsFile, `${prefix}${shell}\n`);
+    }
+  } catch (_) {}
+  return shell;
+}
+
 function syncSshLinuxUsers(accounts) {
   const rows = Array.isArray(accounts) ? accounts : [];
+  const tunnelShell = ensureTunnelShellAllowed();
   let created = 0;
   let updated = 0;
   let skipped = 0;
@@ -229,7 +258,7 @@ function syncSshLinuxUsers(accounts) {
       }
 
       if (!exists) {
-        execFileSync('useradd', ['-m', '-d', homeDir, '-s', '/bin/bash', username], { stdio: 'ignore' });
+        execFileSync('useradd', ['-m', '-d', homeDir, '-s', tunnelShell, username], { stdio: 'ignore' });
         created += 1;
       } else {
         updated += 1;
@@ -237,7 +266,7 @@ function syncSshLinuxUsers(accounts) {
 
       try { fs.mkdirSync(homeDir, { recursive: true }); } catch (_) {}
       execFileSync('chown', ['-R', `${username}:${username}`, homeDir], { stdio: 'ignore' });
-      execFileSync('usermod', ['-d', homeDir, '-s', '/bin/bash', username], { stdio: 'ignore' });
+      execFileSync('usermod', ['-d', homeDir, '-s', tunnelShell, username], { stdio: 'ignore' });
       execFileSync('chpasswd', [], { input: `${username}:${password}\n` });
 
       if (/^\d{4}-\d{2}-\d{2}$/.test(dateExp)) {
@@ -2021,6 +2050,7 @@ JS
   cat > "${APP_DIR}/.env" <<EOF
 SUMMARY_PORT=${SUMMARY_PORT}
 POTATO_DB=${POTATO_DB}
+SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 USE_DB_AUTH=1
 SYNC_TOKEN=
 ZIVPN_CONFIG=/etc/zivpn/config.json

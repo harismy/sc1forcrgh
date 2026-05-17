@@ -46,6 +46,9 @@ set -euo pipefail
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
+#   SSH_TUNNEL_SHELL=/usr/sbin/nologin         (akun SSH/ZIVPN tunnel-only, tanpa shell VPS)
+#   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1            (blok akun tunnel konek keluar ke port SSH)
+#   SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=22,2222     (port keluar yang diblok untuk UID non-root)
 #   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
@@ -124,6 +127,9 @@ UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
 SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
+SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
+SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}"
+SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}"
 ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
@@ -887,6 +893,74 @@ EOF
   systemctl restart ssh >/dev/null 2>&1 || true
   systemctl enable dropbear >/dev/null 2>&1 || true
   systemctl restart dropbear >/dev/null 2>&1 || true
+}
+
+resolve_tunnel_shell() {
+  local shell="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
+  if [[ -x "${shell}" ]]; then
+    printf '%s' "${shell}"
+    return
+  fi
+  if [[ -x /usr/sbin/nologin ]]; then
+    printf '%s' "/usr/sbin/nologin"
+  elif [[ -x /sbin/nologin ]]; then
+    printf '%s' "/sbin/nologin"
+  else
+    printf '%s' "/bin/false"
+  fi
+}
+
+ensure_tunnel_shell_allowed() {
+  local shell shells_file
+  shell="$(resolve_tunnel_shell)"
+  shells_file="/etc/shells"
+  touch "${shells_file}" >/dev/null 2>&1 || true
+  if [[ -f "${shells_file}" ]] && ! grep -Fxq "${shell}" "${shells_file}" 2>/dev/null; then
+    printf '%s\n' "${shell}" >> "${shells_file}" 2>/dev/null || true
+  fi
+  printf '%s' "${shell}"
+}
+
+harden_ssh_tunnel_shells() {
+  local shell user changed
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  [[ -s "${DB_PATH}" ]] || return 0
+  shell="$(ensure_tunnel_shell_allowed)"
+  changed=0
+  while IFS= read -r user; do
+    [[ -z "${user}" || "${user}" == "root" ]] && continue
+    if id "${user}" >/dev/null 2>&1; then
+      usermod -s "${shell}" "${user}" >/dev/null 2>&1 || true
+      changed=$((changed + 1))
+    fi
+  done < <(sqlite3 -noheader "${DB_PATH}" "SELECT username FROM account_sshs WHERE TRIM(COALESCE(username,'')) <> '';" 2>/dev/null || true)
+  log "Tunnel-only shell diterapkan ke ${changed} akun SSH/ZIVPN (${shell})."
+}
+
+apply_tunnel_outbound_guard_rules() {
+  local enabled ports
+  enabled="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "${enabled}" != "1" && "${enabled}" != "true" && "${enabled}" != "yes" && "${enabled}" != "on" ]]; then
+    log "Outbound SSH guard nonaktif (SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0})."
+    return 0
+  fi
+  ports="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}" | tr -cd '0-9,')"
+  [[ -z "${ports}" ]] && ports="22"
+
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+      iptables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+        ip6tables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+    fi
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    fi
+    log "Outbound SSH guard aktif untuk UID non-root: tcp/${ports}."
+  else
+    log "iptables tidak tersedia, outbound SSH guard dilewati."
+  fi
 }
 
 init_db() {
@@ -2096,6 +2170,9 @@ VMESS_BUG_PROFILE_HOST=${VMESS_BUG_PROFILE_HOST}
 VMESS_BUG_PROFILE_ALLOW_INSECURE=${VMESS_BUG_PROFILE_ALLOW_INSECURE}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
+SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
+SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH}
+SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -2129,6 +2206,7 @@ const ZIVPN_LIVE_TTL_SECONDS_RAW = Number(process.env.ZIVPN_LIVE_TTL_SECONDS || 
 const ZIVPN_LIVE_TTL_SECONDS = Number.isFinite(ZIVPN_LIVE_TTL_SECONDS_RAW) && ZIVPN_LIVE_TTL_SECONDS_RAW >= 20
   ? Math.min(Math.floor(ZIVPN_LIVE_TTL_SECONDS_RAW), 1800)
   : 90;
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
 const ZIVPN_RELOAD_ON_AUTH_CHANGE = String(process.env.ZIVPN_RELOAD_ON_AUTH_CHANGE || '0').trim() === '1';
 const ZIVPN_AUTH_APPLY_MODE_RAW = String(process.env.ZIVPN_AUTH_APPLY_MODE || '').trim().toLowerCase();
 const ZIVPN_AUTH_APPLY_MODE = ZIVPN_AUTH_APPLY_MODE_RAW || (ZIVPN_RELOAD_ON_AUTH_CHANGE ? 'restart' : 'reload-restart');
@@ -2685,11 +2763,38 @@ function safeExec(cmd, args, input) {
   }
 }
 
+function resolveTunnelShell() {
+  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  for (const shell of choices) {
+    try {
+      if (fs.existsSync(shell)) return shell;
+    } catch (_) {}
+  }
+  return '/usr/sbin/nologin';
+}
+
+function ensureTunnelShellAllowed() {
+  const shell = resolveTunnelShell();
+  try {
+    const shellsFile = '/etc/shells';
+    const current = fs.existsSync(shellsFile) ? fs.readFileSync(shellsFile, 'utf8') : '';
+    const exists = current.split(/\r?\n/).map((line) => line.trim()).includes(shell);
+    if (!exists) {
+      const prefix = current && !current.endsWith('\n') ? '\n' : '';
+      fs.appendFileSync(shellsFile, `${prefix}${shell}\n`);
+    }
+  } catch (_) {}
+  return shell;
+}
+
 function ensureLinuxUser(username, password, expDate) {
+  const shell = ensureTunnelShellAllowed();
   const exists = safeExec('id', ['-u', username]);
-  if (!exists) safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', '/bin/bash', username]);
+  if (!exists) safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', shell, username]);
   safeExec('chpasswd', [], `${username}:${password}\n`);
-  safeExec('usermod', ['-s', '/bin/bash', username]);
+  safeExec('usermod', ['-d', `/home/${username}`, '-s', shell, username]);
   const linuxExpDate = ymdFromDateExp(expDate);
   if (linuxExpDate) safeExec('chage', ['-E', linuxExpDate, username]);
 }
@@ -2703,6 +2808,7 @@ function lockLinuxUser(username) {
 }
 
 function unlockLinuxUser(username) {
+  safeExec('usermod', ['-s', ensureTunnelShellAllowed(), username]);
   safeExec('passwd', ['-u', username]);
 }
 
@@ -3203,6 +3309,15 @@ async function generateTrialUsername(table, prefix = 'trial') {
   return `${cleanPrefix}${Date.now().toString().slice(-6)}`;
 }
 
+function randomAlnum(length = 8) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let out = '';
+  for (let i = 0; i < length; i += 1) {
+    out += alphabet[crypto.randomInt(0, alphabet.length)];
+  }
+  return out;
+}
+
 async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   const isTrial = forcedDays !== null;
   let username = String(body?.username || '').trim().toLowerCase();
@@ -3211,7 +3326,7 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   }
   const owner = getOwnerInfo(req, body || {});
   const requestedPassword = String(body?.password || '').trim();
-  const password = requestedPassword || (isTrial ? crypto.randomBytes(6).toString('hex') : username);
+  const password = requestedPassword || randomAlnum(8);
   const expDays = forcedDays === null ? Number(body?.expired || 30) : Number(forcedDays || 1);
   const quota = Number(body?.kuota || 0);
   const limitip = Number(body?.limitip || 0);
@@ -4212,6 +4327,7 @@ const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const BOT_ACCOUNT_EVENT_WEBHOOK_URL = String(process.env.BOT_ACCOUNT_EVENT_WEBHOOK_URL || '').trim();
@@ -4505,6 +4621,33 @@ function safeExec(cmd, args, input) {
     return false;
   }
 }
+
+function resolveTunnelShell() {
+  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+    .map((v) => String(v || '').trim())
+    .filter(Boolean);
+  for (const shell of choices) {
+    try {
+      if (fs.existsSync(shell)) return shell;
+    } catch (_) {}
+  }
+  return '/usr/sbin/nologin';
+}
+
+function ensureTunnelShellAllowed() {
+  const shell = resolveTunnelShell();
+  try {
+    const shellsFile = '/etc/shells';
+    const current = fs.existsSync(shellsFile) ? fs.readFileSync(shellsFile, 'utf8') : '';
+    const exists = current.split(/\r?\n/).map((line) => line.trim()).includes(shell);
+    if (!exists) {
+      const prefix = current && !current.endsWith('\n') ? '\n' : '';
+      fs.appendFileSync(shellsFile, `${prefix}${shell}\n`);
+    }
+  } catch (_) {}
+  return shell;
+}
+
 function readExec(cmd, args) {
   try {
     return execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
@@ -5678,7 +5821,7 @@ async function unlockExpired(nowTs) {
       if (pass) {
         safeExec('chpasswd', [], `${u}:${pass}\n`);
       }
-      safeExec('usermod', ['-s', '/bin/bash', u]);
+      safeExec('usermod', ['-s', ensureTunnelShellAllowed(), u]);
       if (/^\d{4}-\d{2}-\d{2}$/.test(expDate)) {
         safeExec('chage', ['-E', expDate, u]);
       }
@@ -8728,6 +8871,18 @@ EOT_XRAY
   esac
 }
 
+random_alnum8() {
+  local value
+  value="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8 || true)"
+  if [[ "${#value}" -lt 8 ]]; then
+    value="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-8 || true)"
+  fi
+  if [[ "${#value}" -lt 8 ]]; then
+    value="$(date +%s%N | sha256sum | cut -c1-8)"
+  fi
+  printf '%s' "${value:0:8}"
+}
+
 create_account() {
   local type ep username password exp limitip quota payload resp code
   while true; do
@@ -8743,7 +8898,7 @@ create_account() {
       prompt_input limitip "Limit IP [2]: " || continue
       limitip="${limitip:-2}"
       quota="0"
-      password="${username}"
+      password="$(random_alnum8)"
     else
       prompt_input limitip "Limit IP [2]: " || continue
       limitip="${limitip:-2}"
@@ -8802,7 +8957,7 @@ create_trial_account() {
     username="$(prompt_new_username "${type}")" || continue
 
     if [[ "${type}" == "zivpn" ]]; then
-      password="${username}"
+      password="$(random_alnum8)"
       prompt_input limitip "Limit IP trial [1]: " || continue
       limitip="${limitip:-1}"
     elif [[ "${type}" == "ssh" ]]; then
@@ -13910,6 +14065,7 @@ main() {
   setup_default_banner_assets
   setup_dropbear
   init_db
+  harden_ssh_tunnel_shells
   setup_nginx_and_cert
   setup_haproxy_tls_mux
   setup_zivpn_service_if_possible
@@ -13945,6 +14101,7 @@ main() {
   write_version_marker
   sync_zivpn_auth_token_with_api_runtime
   apply_sshws_loop_guard_rules
+  apply_tunnel_outbound_guard_rules
   apply_final_service_restart_chain
   post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."

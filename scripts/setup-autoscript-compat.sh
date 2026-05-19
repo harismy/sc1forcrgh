@@ -3221,7 +3221,7 @@ async function cleanupExpiredXrayAccounts() {
         date_exp: exp,
         limitip: String(row?.limitip ?? '0')
       });
-      await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
+      await run(`UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
       changed = true;
     }
   }
@@ -3391,6 +3391,10 @@ async function renewSsh(req, res) {
     const expDate = dateExpPlusDays(exp, baseExp);
     const linuxExpDate = ymdFromDateExp(expDate);
     if (!row) {
+      const recoverMissing = body?.recover_missing === true || String(body?.recover_missing || '').trim() === '1';
+      if (!recoverMissing || !bodyPass) {
+        return fail(res, 404, `account ${username} not found on server`);
+      }
       const pass = bodyPass || username;
       const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : 0;
       const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : 0;
@@ -3409,6 +3413,7 @@ async function renewSsh(req, res) {
         quota: String(nextQuota),
         limitip: String(nextLimitIp),
         created: true,
+        recovered: true,
         time: nowTime()
       });
     }
@@ -5749,7 +5754,7 @@ async function enforceExpiredAccounts() {
     if (removeUdpcustomUser(user)) udphcSecretChanged = true;
     if (udphcSecretChanged) udpcustomChanged = true;
 
-    await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
+    await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
   }
@@ -5774,7 +5779,7 @@ async function enforceExpiredAccounts() {
         exp,
         limitip: Number(row?.limitip || 0)
       });
-      await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
+      await run(`UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       xrayChanged = true;

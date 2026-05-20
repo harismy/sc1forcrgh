@@ -288,7 +288,17 @@ app.get('/sc1forcr/installer.sh', async (req, res) => {
 set -euo pipefail
 
 TMP_SC="/tmp/setup-autoscript-compat.sh"
-curl -fsSL "${sourceUrl}" -o "$TMP_SC"
+
+download_installer_payload() {
+  local url="$1"
+  local out="$2"
+  if curl -4fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "$url" -o "$out"; then
+    return 0
+  fi
+  curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "$url" -o "$out"
+}
+
+download_installer_payload "${sourceUrl}" "$TMP_SC"
 chmod +x "$TMP_SC"
 
 ${envLines.map((v) => `${v} \\`).join('\n')}

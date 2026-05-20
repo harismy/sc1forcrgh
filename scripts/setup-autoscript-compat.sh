@@ -417,6 +417,16 @@ enforce_install_license() {
 
   log "Validasi lisensi ke server..."
   resp="$(
+    curl -4fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
+      -X POST "${LICENSE_API_URL}" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Accept: application/json" \
+      --data-urlencode "license_key=${LICENSE_KEY}" \
+      --data-urlencode "ip=${vps_ip}" \
+      --data-urlencode "domain=${DOMAIN}" \
+      --data-urlencode "machine_id=${machine_id}" \
+      --data-urlencode "script_version=${SCRIPT_VERSION}" \
+      2>/dev/null ||
     curl -fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
       -X POST "${LICENSE_API_URL}" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
@@ -426,7 +436,8 @@ enforce_install_license() {
       --data-urlencode "domain=${DOMAIN}" \
       --data-urlencode "machine_id=${machine_id}" \
       --data-urlencode "script_version=${SCRIPT_VERSION}" \
-      2>/dev/null || true
+      2>/dev/null ||
+    true
   )"
   if [[ -z "${resp}" ]]; then
     echo "Install ditolak: server lisensi tidak merespon."
@@ -11056,15 +11067,22 @@ refresh_license_cache_guard() {
   fi
   printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
 
-  ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ip_text="$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip_text="${ip_text:-unknown}"
 
-  resp="$(curl -fsS --max-time 10 \
+  resp="$(curl -4fsS --connect-timeout 8 --max-time 20 \
     -X POST "${LICENSE_API_URL}" \
     -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "license_key=${LICENSE_KEY}" \
-    --data-urlencode "ip=${ip_text}" 2>/dev/null || true)"
+    --data-urlencode "ip=${ip_text}" 2>/dev/null ||
+  curl -fsS --connect-timeout 8 --max-time 20 \
+    -X POST "${LICENSE_API_URL}" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "license_key=${LICENSE_KEY}" \
+    --data-urlencode "ip=${ip_text}" 2>/dev/null ||
+  true)"
   [[ -z "${resp}" ]] && return 0
   echo "${resp}" | jq . >/dev/null 2>&1 || return 0
 
@@ -11450,12 +11468,19 @@ draw_dashboard() {
     fi
     printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
 
-    resp="$(curl -fsS --max-time 10 \
+    resp="$(curl -4fsS --connect-timeout 8 --max-time 20 \
       -X POST "${LICENSE_API_URL}" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
       -H "Content-Type: application/x-www-form-urlencoded" \
       --data-urlencode "license_key=${LICENSE_KEY}" \
-      --data-urlencode "ip=${ip}" 2>/dev/null || true)"
+      --data-urlencode "ip=${ip}" 2>/dev/null ||
+    curl -fsS --connect-timeout 8 --max-time 20 \
+      -X POST "${LICENSE_API_URL}" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "license_key=${LICENSE_KEY}" \
+      --data-urlencode "ip=${ip}" 2>/dev/null ||
+    true)"
     [[ -z "${resp}" ]] && return 0
     echo "${resp}" | jq . >/dev/null 2>&1 || return 0
 
@@ -12800,7 +12825,8 @@ update_script_from_repo() {
   had_banner_txt="0"
   downloaded_ok=0
   echo "Download update script dari: ${url}"
-  if curl -fsSL "${url}" -o "${tmp}"; then
+  if { curl -4fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
+       curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
     downloaded_ok=1
   fi
   if [[ "${downloaded_ok}" != "1" ]]; then
@@ -13092,7 +13118,8 @@ install_summary_api_1forcr() {
   fi
   tmp="/tmp/setup-summary-api.sh"
   echo "Install Summary API 1FORCR..."
-  if ! curl -fL --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; then
+  if ! { curl -4fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
+         curl -fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
     echo "Gagal download script summary API."
     return 1
   fi
@@ -13904,7 +13931,8 @@ install_summary_api_1forcr() {
   fi
   tmp="/tmp/setup-summary-api.sh"
   echo "Install Summary API 1FORCR..."
-  if ! curl -fL --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; then
+  if ! { curl -4fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
+         curl -fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
     echo "Gagal download script summary API."
     return 1
   fi

@@ -1096,6 +1096,11 @@ function generateServerKey() {
   return crypto.randomBytes(24).toString('hex');
 }
 
+function shouldSendInstallerAfterRegistration(result) {
+  const prevStatus = String(result?.prevStatus || '').trim().toLowerCase();
+  return prevStatus !== 'active' && prevStatus !== 'expired';
+}
+
 async function ensureServerKeyForHost(userId, host, preferredKey = '') {
   const uid = Number(userId || 0);
   const ip = normalizeHost(host);
@@ -2696,6 +2701,10 @@ function escapeHtml(input) {
     .replace(/'/g, '&#39;');
 }
 
+function shellQuote(input) {
+  return `'${String(input || '').replace(/'/g, `'\\''`)}'`;
+}
+
 async function buildInstallerQuickCopyText(options = {}) {
   const domain = await getPrimaryApiDomain();
   if (!domain) {
@@ -2708,9 +2717,10 @@ async function buildInstallerQuickCopyText(options = {}) {
   const installerUrl = `https://${domain}/sc1forcr/installer.sh`;
   const serverKey = String(options?.serverKey || '').trim();
   const keyEnv = serverKey.length >= 8
-    ? `API_AUTH_TOKEN=${JSON.stringify(serverKey)} AUTH_TOKEN=${JSON.stringify(serverKey)} ZIVPN_HTTP_AUTH_TOKEN=${JSON.stringify(serverKey)} `
+    ? `API_AUTH_TOKEN=${shellQuote(serverKey)} AUTH_TOKEN=${shellQuote(serverKey)} ZIVPN_HTTP_AUTH_TOKEN=${shellQuote(serverKey)} `
     : '';
-  const cmd = `apt-get update -y && apt-get upgrade -y && apt-get install -y curl ca-certificates htop && ${keyEnv}bash -c "$(curl -fsSL ${installerUrl})"`;
+  const curlArgs = `--connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 ${shellQuote(installerUrl)}`;
+  const cmd = `apt-get update -y && apt-get upgrade -y && apt-get install -y curl ca-certificates htop && TMP_INSTALLER=/tmp/sc1forcr-installer.sh && (curl -4fsSL ${curlArgs} -o "$TMP_INSTALLER" || curl -fsSL ${curlArgs} -o "$TMP_INSTALLER") && chmod +x "$TMP_INSTALLER" && ${keyEnv}bash "$TMP_INSTALLER"`;
   const safeUrl = escapeHtml(installerUrl);
   const safeCmd = escapeHtml(cmd);
   return {
@@ -3321,7 +3331,13 @@ bot.action('m_check_sc_ip_expiry', async (ctx) => {
 bot.action('m_install_link', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
-  const installerText = await buildInstallerQuickCopyText();
+  const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
+  const activeIp = normalizeHost(regs?.[0]?.vps_ip || '');
+  if (!isIpv4(activeIp)) {
+    return ctx.reply('IP SC aktif tidak ditemukan.', mainMenu());
+  }
+  const activeServerKey = await ensureServerKeyForHost(ctx.from.id, activeIp);
+  const installerText = await buildInstallerQuickCopyText({ serverKey: activeServerKey });
   if (!installerText.ok) {
     return ctx.reply(
       'Domain API installer belum diset admin.\nHubungi admin agar tambah domain via menu admin.',
@@ -4592,7 +4608,10 @@ bot.on('text', async (ctx) => {
 
       const saldoNow = await getSaldo(ctx.from.id);
       const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, serverKey);
-      const installerText = await buildInstallerQuickCopyText({ serverKey: activeServerKey });
+      const sendInstaller = shouldSendInstallerAfterRegistration(result);
+      const installerText = sendInstaller
+        ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
+        : null;
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Registrasi SC Unlimited berhasil.\n` +
@@ -4608,12 +4627,12 @@ bot.on('text', async (ctx) => {
         client_name: result.clientName || clientName,
         expires_at: 0
       }).catch(() => {});
-      if (installerText.ok) {
+      if (installerText?.ok) {
         await ctx.reply(installerText.text, {
           parse_mode: installerText.parse_mode,
           disable_web_page_preview: true
         });
-      } else {
+      } else if (installerText) {
         await ctx.reply(installerText.text);
       }
       return;
@@ -4735,7 +4754,10 @@ bot.on('text', async (ctx) => {
       }
       const saldoNow = await getSaldo(ctx.from.id);
       const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, state.serverKey || '');
-      const installerText = await buildInstallerQuickCopyText({ serverKey: activeServerKey });
+      const sendInstaller = shouldSendInstallerAfterRegistration(result);
+      const installerText = sendInstaller
+        ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
+        : null;
       let unlockResult = { attempted: false, ok: false, message: '' };
       if (result.reactivatedFromExpired) {
         unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'renew_after_natural_expired');
@@ -4759,12 +4781,12 @@ bot.on('text', async (ctx) => {
         client_name: result.clientName || clientName,
         expires_at: Number(result.expiresAt || 0)
       }).catch(() => {});
-      if (installerText.ok) {
+      if (installerText?.ok) {
         await ctx.reply(installerText.text, {
           parse_mode: installerText.parse_mode,
           disable_web_page_preview: true
         });
-      } else {
+      } else if (installerText) {
         await ctx.reply(installerText.text);
       }
       return;
@@ -4957,7 +4979,6 @@ bot.on('text', async (ctx) => {
 
       const saldoNow = await getSaldo(ctx.from.id);
       const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, serverKey);
-      const installerText = await buildInstallerQuickCopyText({ serverKey: activeServerKey });
       let unlockResult = { attempted: false, ok: false, message: '' };
       if (result.reactivatedFromExpired) {
         unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'renew_after_natural_expired');
@@ -4981,14 +5002,6 @@ bot.on('text', async (ctx) => {
         client_name: result.clientName || clientName,
         expires_at: Number(result.expiresAt || 0)
       }).catch(() => {});
-      if (installerText.ok) {
-        await ctx.reply(installerText.text, {
-          parse_mode: installerText.parse_mode,
-          disable_web_page_preview: true
-        });
-      } else {
-        await ctx.reply(installerText.text);
-      }
       return;
     }
 

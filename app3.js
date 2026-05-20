@@ -1101,6 +1101,15 @@ function shouldSendInstallerAfterRegistration(result) {
   return prevStatus !== 'active' && prevStatus !== 'expired';
 }
 
+async function issueRandomServerKeyForHost(userId, host) {
+  const uid = Number(userId || 0);
+  const ip = normalizeHost(host);
+  if (!uid || !isIpv4(ip)) return '';
+  const key = generateServerKey();
+  await saveServerKeyForHost(uid, ip, key);
+  return key;
+}
+
 async function ensureServerKeyForHost(userId, host, preferredKey = '') {
   const uid = Number(userId || 0);
   const ip = normalizeHost(host);
@@ -3331,13 +3340,7 @@ bot.action('m_check_sc_ip_expiry', async (ctx) => {
 bot.action('m_install_link', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
-  const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
-  const activeIp = normalizeHost(regs?.[0]?.vps_ip || '');
-  if (!isIpv4(activeIp)) {
-    return ctx.reply('IP SC aktif tidak ditemukan.', mainMenu());
-  }
-  const activeServerKey = await ensureServerKeyForHost(ctx.from.id, activeIp);
-  const installerText = await buildInstallerQuickCopyText({ serverKey: activeServerKey });
+  const installerText = await buildInstallerQuickCopyText();
   if (!installerText.ok) {
     return ctx.reply(
       'Domain API installer belum diset admin.\nHubungi admin agar tambah domain via menu admin.',
@@ -4557,32 +4560,6 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply(`IP ${ip} sudah terdaftar oleh user lain.`, mainMenu());
       }
-      state.step = 'register_sc_unlimited_key';
-      state.ip = ip;
-      state.clientName = normalizeClientName(state.clientName || ctx.from.first_name || ip) || ip;
-      userState.set(ctx.chat.id, state);
-      return ctx.reply(
-        uiBox('INPUT KEY UNTUK SERVER VPS', [
-          `Nama Client : ${state.clientName}`,
-          `IP VPS      : ${ip}`,
-          '',
-          'Masukkan key server VPS.',
-          '',
-          ''
-        ])
-      );
-    }
-
-    if (state.step === 'register_sc_unlimited_key') {
-      const ip = String(state.ip || '').trim();
-      if (!isIpv4(ip)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('State registrasi unlimited tidak valid. Ulangi dari menu registrasi.', mainMenu());
-      }
-      const serverKey = String(text || '').trim();
-      if (serverKey.length < 8) {
-        return ctx.reply('Key server tidak valid. Minimal 8 karakter.');
-      }
 
       const unlimitedPrice = await getUnlimitedPrice();
       const clientName = normalizeClientName(state.clientName || ctx.from.first_name || ip) || ip;
@@ -4607,8 +4584,10 @@ bot.on('text', async (ctx) => {
       }
 
       const saldoNow = await getSaldo(ctx.from.id);
-      const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, serverKey);
       const sendInstaller = shouldSendInstallerAfterRegistration(result);
+      const activeServerKey = sendInstaller
+        ? await issueRandomServerKeyForHost(ctx.from.id, ip)
+        : await ensureServerKeyForHost(ctx.from.id, ip);
       const installerText = sendInstaller
         ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
         : null;
@@ -4753,8 +4732,10 @@ bot.on('text', async (ctx) => {
         );
       }
       const saldoNow = await getSaldo(ctx.from.id);
-      const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, state.serverKey || '');
       const sendInstaller = shouldSendInstallerAfterRegistration(result);
+      const activeServerKey = sendInstaller
+        ? await issueRandomServerKeyForHost(ctx.from.id, ip)
+        : await ensureServerKeyForHost(ctx.from.id, ip, state.serverKey || '');
       const installerText = sendInstaller
         ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
         : null;

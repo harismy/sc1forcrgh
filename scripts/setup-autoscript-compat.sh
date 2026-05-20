@@ -7958,12 +7958,12 @@ PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
 set_pending_operation() {
   local type="$1" cmd="$2" note="$3"
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-  cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
+  {
+    printf 'PENDING_TYPE=%q\n' "${type}"
+    printf 'PENDING_CMD=%q\n' "${cmd}"
+    printf 'PENDING_NOTE=%q\n' "${note}"
+    printf 'PENDING_TIME=%q\n' "$(date '+%F %T')"
+  } > "${PENDING_OP_FILE}"
   chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
 }
 
@@ -7992,27 +7992,13 @@ resume_pending_operation_prompt() {
   rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
   if [[ "${type}" == "update" ]]; then
     if ! update_script_from_repo; then
-      mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-      cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-      chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+      set_pending_operation "${type}" "${cmd}" "${note}"
       echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
     fi
     return 0
   fi
   if ! bash -lc "${cmd}"; then
-    mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-    cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-    chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+    set_pending_operation "${type}" "${cmd}" "${note}"
     echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
   fi
 }
@@ -8054,7 +8040,7 @@ normalize_pending_operation() {
 }
 
 pending_install_gate_menu() {
-  local pu_ans cmd type note gate_title opt1_label
+  local pu_ans cmd type note gate_title opt1_label current_line
   [[ -t 0 && -t 1 ]] || return 0
   has_pending_install_only || return 0
   # shellcheck disable=SC1090
@@ -8065,8 +8051,15 @@ pending_install_gate_menu() {
   gate_title="INSTALL PENDING"
   opt1_label="Lanjutkan Install"
   while true; do
+    current_line="${note}"
+    if [[ -f /var/lib/sc-1forcr/install-current.env ]]; then
+      # shellcheck disable=SC1091
+      source /var/lib/sc-1forcr/install-current.env >/dev/null 2>&1 || true
+      current_line="Terakhir: ${STEP_MESSAGE:-unknown} (${STEP_PERCENT:-?}%)"
+    fi
     clear
     draw_menu_panel "${gate_title}" \
+      "${current_line}" \
       "1) ${opt1_label}" \
       "2) Batalkan pending" \
       "0) Exit"
@@ -8077,14 +8070,7 @@ pending_install_gate_menu() {
     case "${pu_ans}" in
       1)
         if ! bash -lc "${cmd}"; then
-          mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-          cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-          chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+          set_pending_operation "${type}" "${cmd}" "${note}"
           echo
           echo "Install pending belum berhasil dilanjutkan."
           read -rp "Enter untuk kembali ke menu pending..." _ || true
@@ -13661,6 +13647,12 @@ EOF
   cat > /usr/local/sbin/lanjut-install <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -f /var/lib/sc-1forcr/pending-install.env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /var/lib/sc-1forcr/pending-install.env
+  set +a
+fi
 if [[ -x /var/lib/sc-1forcr/pending-install.sh ]]; then
   exec bash /var/lib/sc-1forcr/pending-install.sh "$@"
 fi
@@ -13668,7 +13660,9 @@ if [[ -f /var/lib/sc-1forcr/pending-op.env ]]; then
   # shellcheck disable=SC1091
   source /var/lib/sc-1forcr/pending-op.env >/dev/null 2>&1 || true
   if [[ "${PENDING_TYPE:-}" == "install" && -n "${PENDING_CMD:-}" ]]; then
-    exec bash -lc "${PENDING_CMD}" "$@"
+    if [[ "${PENDING_CMD}" != "/usr/local/sbin/lanjut-install" ]]; then
+      exec bash -lc "${PENDING_CMD}" "$@"
+    fi
   fi
 fi
 echo "Tidak ada pending install yang bisa dilanjutkan."
@@ -14045,21 +14039,172 @@ open_menu_after_install() {
 PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
 SCRIPT_SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 PENDING_INSTALL_SCRIPT="/var/lib/sc-1forcr/pending-install.sh"
+PENDING_INSTALL_ENV="/var/lib/sc-1forcr/pending-install.env"
+INSTALL_STEP_FILE="/var/lib/sc-1forcr/install-steps.done"
+INSTALL_CURRENT_FILE="/var/lib/sc-1forcr/install-current.env"
+PENDING_INSTALL_PROFILE="/etc/profile.d/sc-1forcr-pending-install.sh"
 
 set_pending_operation() {
   local type="$1" cmd="$2" note="$3"
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-  cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
+  {
+    printf 'PENDING_TYPE=%q\n' "${type}"
+    printf 'PENDING_CMD=%q\n' "${cmd}"
+    printf 'PENDING_NOTE=%q\n' "${note}"
+    printf 'PENDING_TIME=%q\n' "$(date '+%F %T')"
+  } > "${PENDING_OP_FILE}"
   chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
 }
 
 clear_pending_operation() {
   rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+persist_pending_install_env() {
+  local vars key
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  vars=(
+    DOMAIN EMAIL API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH
+    LICENSE_ENFORCE LICENSE_API_URL LICENSE_API_TOKEN LICENSE_KEY
+    UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API SUMMARY_API_SETUP_URL
+    WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN
+    ZIVPN_BIN_URL ZIVPN_RELEASE_TAG ZIVPN_SERVICE_NAME ZIVPN_RELOAD_ON_AUTH_CHANGE
+    ZIVPN_AUTH_APPLY_MODE ZIVPN_AUTH_MODE ZIVPN_HTTP_AUTH_URL ZIVPN_HTTP_AUTH_TOKEN
+    ZIVPN_LIVE_TTL_SECONDS ZIVPN_ACTIVE_WINDOW_SECONDS ZIVPN_HANDOFF_GRACE_SECONDS
+    ZIVPN_LISTEN_PORT ZIVPN_DNAT_RANGE ZIVPN_DNAT_IFACE
+    UDPCUSTOM_BIN_URL UDPCUSTOM_SERVICE_NAME UDPCUSTOM_LISTEN_PORT
+    UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
+    SSHWS_UDPGW_PORTS SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
+    SSH_TUNNEL_BLOCK_OUTBOUND_PORTS ACTIVE_UDP_BACKEND
+    DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION
+    TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
+    AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
+    AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
+    AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES
+    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
+    SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
+    SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
+    NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE
+    DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
+    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP
+    XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
+    VMESS_BUG_PROFILE_ADDRESS VMESS_BUG_PROFILE_SNI VMESS_BUG_PROFILE_HOST VMESS_BUG_PROFILE_ALLOW_INSECURE
+    SSH_HC_AUTH_LOOKBACK_HOURS SCRIPT_VERSION
+  )
+  : > "${PENDING_INSTALL_ENV}"
+  for key in "${vars[@]}"; do
+    if [[ -v "${key}" ]]; then
+      printf '%s=%q\n' "${key}" "${!key}" >> "${PENDING_INSTALL_ENV}"
+    fi
+  done
+  chmod 600 "${PENDING_INSTALL_ENV}" >/dev/null 2>&1 || true
+}
+
+install_pending_resume_helper() {
+  cat > /usr/local/sbin/lanjut-install <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -f /var/lib/sc-1forcr/pending-install.env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /var/lib/sc-1forcr/pending-install.env
+  set +a
+fi
+if [[ -x /var/lib/sc-1forcr/pending-install.sh ]]; then
+  exec bash /var/lib/sc-1forcr/pending-install.sh "$@"
+fi
+if [[ -f /var/lib/sc-1forcr/pending-op.env ]]; then
+  # shellcheck disable=SC1091
+  source /var/lib/sc-1forcr/pending-op.env >/dev/null 2>&1 || true
+  if [[ "${PENDING_TYPE:-}" == "install" && -n "${PENDING_CMD:-}" ]]; then
+    if [[ "${PENDING_CMD}" != "/usr/local/sbin/lanjut-install" ]]; then
+      exec bash -lc "${PENDING_CMD}" "$@"
+    fi
+  fi
+fi
+echo "Tidak ada pending install yang bisa dilanjutkan."
+exit 1
+EOF
+  chmod +x /usr/local/sbin/lanjut-install
+}
+
+install_pending_login_prompt() {
+  cat > "${PENDING_INSTALL_PROFILE}" <<'EOF'
+#!/usr/bin/env bash
+if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; then
+  if [[ -f /var/lib/sc-1forcr/pending-op.env && -x /usr/local/sbin/lanjut-install && -z "${SC_PENDING_INSTALL_PROMPT_SHOWN:-}" ]]; then
+    if grep -q '^PENDING_TYPE=install$' /var/lib/sc-1forcr/pending-op.env 2>/dev/null; then
+      export SC_PENDING_INSTALL_PROMPT_SHOWN=1
+      echo
+      echo "Install SC 1FORCR sebelumnya belum selesai."
+      if [[ -f /var/lib/sc-1forcr/install-current.env ]]; then
+        # shellcheck disable=SC1091
+        source /var/lib/sc-1forcr/install-current.env >/dev/null 2>&1 || true
+        echo "Terakhir: ${STEP_MESSAGE:-unknown} (${STEP_PERCENT:-?}%)"
+      fi
+      echo "Tekan Enter untuk lanjutkan dari checkpoint terakhir, atau ketik skip untuk nanti."
+      printf "> "
+      read -r _sc_pending_ans || true
+      if [[ "${_sc_pending_ans,,}" != "skip" ]]; then
+        /usr/local/sbin/lanjut-install || true
+      else
+        echo "Pending install disimpan. Jalankan lanjut-install untuk melanjutkan."
+      fi
+    fi
+  fi
+fi
+EOF
+  chmod 644 "${PENDING_INSTALL_PROFILE}" >/dev/null 2>&1 || true
+}
+
+install_step_done() {
+  local id="$1"
+  [[ -f "${INSTALL_STEP_FILE}" ]] && grep -Fxq "${id}" "${INSTALL_STEP_FILE}" 2>/dev/null
+}
+
+mark_install_step_done() {
+  local id="$1"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  install_step_done "${id}" || printf '%s\n' "${id}" >> "${INSTALL_STEP_FILE}"
+}
+
+set_current_install_step() {
+  local id="$1" pct="$2" msg="$3"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  {
+    printf 'STEP_ID=%q\n' "${id}"
+    printf 'STEP_PERCENT=%q\n' "${pct}"
+    printf 'STEP_MESSAGE=%q\n' "${msg}"
+    printf 'STEP_TIME=%q\n' "$(date '+%F %T')"
+  } > "${INSTALL_CURRENT_FILE}"
+  chmod 600 "${INSTALL_CURRENT_FILE}" >/dev/null 2>&1 || true
+}
+
+run_install_step() {
+  local id="$1" pct="$2" msg="$3"
+  shift 3
+  if install_step_done "${id}"; then
+    show_install_progress "${pct}" "Skip: ${msg}"
+    return 0
+  fi
+  show_install_progress "${pct}" "${msg}"
+  set_current_install_step "${id}" "${pct}" "${msg}"
+  "$@"
+  mark_install_step_done "${id}"
+}
+
+install_summary_api_optional() {
+  if ! flag_enabled "${AUTO_INSTALL_SUMMARY_API}"; then
+    return 0
+  fi
+  if ! install_summary_api_1forcr; then
+    echo "Peringatan: auto-install Summary API gagal. Kamu masih bisa install manual dari menu Tools."
+  fi
+  return 0
+}
+
+clear_install_resume_state() {
+  rm -f "${INSTALL_STEP_FILE}" "${INSTALL_CURRENT_FILE}" "${PENDING_INSTALL_ENV}" "${PENDING_INSTALL_PROFILE}" >/dev/null 2>&1 || true
 }
 
 resume_pending_operation_prompt() {
@@ -14098,67 +14243,56 @@ main() {
     cp -f "${SCRIPT_SELF_PATH}" "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
     chmod 700 "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
   fi
-  if [[ -x "${PENDING_INSTALL_SCRIPT}" ]]; then
-    set_pending_operation "install" "bash ${PENDING_INSTALL_SCRIPT}" "Install SC 1FORCR terputus sebelum selesai"
-  else
-    set_pending_operation "install" "bash ${SCRIPT_SELF_PATH}" "Install SC 1FORCR terputus sebelum selesai"
-  fi
+  persist_pending_install_env
+  install_pending_resume_helper
+  install_pending_login_prompt
+  set_pending_operation "install" "/usr/local/sbin/lanjut-install" "Install SC 1FORCR terputus sebelum selesai"
   show_install_banner
   show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
-  enforce_install_license
 
-  check_supported_os
-  install_base_packages
-  setup_vnstat
-  apply_system_optimizations
-  setup_logrotate_optimizations
-  show_install_progress 20 "Tahan mas, baru setengah jalan awal..."
+  run_install_step "00_license" 2 "Validasi lisensi" enforce_install_license
+  run_install_step "01_check_os" 4 "Cek OS server" check_supported_os
+  run_install_step "02_base_packages" 8 "Install paket dasar" install_base_packages
+  run_install_step "03_vnstat" 12 "Setup vnStat" setup_vnstat
+  run_install_step "04_system_optimizations" 16 "Optimasi sistem" apply_system_optimizations
+  run_install_step "05_logrotate" 20 "Setup logrotate" setup_logrotate_optimizations
 
-  install_node_if_missing
-  install_go_if_missing
-  install_xray
-  setup_default_banner_assets
-  setup_dropbear
-  init_db
-  harden_ssh_tunnel_shells
-  setup_nginx_and_cert
-  setup_haproxy_tls_mux
-  setup_zivpn_service_if_possible
-  setup_zivpn_udp_nat_rules
-  setup_udpcustom_service_if_possible
-  setup_udpcustom_udp_nat_rules
-  setup_udpgw_service_if_possible
-  enforce_single_udp_backend
-  show_install_progress 70 "Hampir selesai mas, core service sudah kepasang..."
+  run_install_step "06_node" 24 "Install Node.js" install_node_if_missing
+  run_install_step "07_go" 28 "Install Go" install_go_if_missing
+  run_install_step "08_xray" 33 "Install Xray" install_xray
+  run_install_step "09_banner_assets" 36 "Setup banner default" setup_default_banner_assets
+  run_install_step "10_dropbear" 40 "Setup Dropbear" setup_dropbear
+  run_install_step "11_database" 44 "Inisialisasi database" init_db
+  run_install_step "12_harden_shells" 47 "Harden shell akun tunnel" harden_ssh_tunnel_shells
+  run_install_step "13_nginx_cert" 52 "Setup Nginx dan sertifikat" setup_nginx_and_cert
+  run_install_step "14_haproxy_mux" 56 "Setup HAProxy TLS mux" setup_haproxy_tls_mux
+  run_install_step "15_zivpn_service" 60 "Setup ZIVPN" setup_zivpn_service_if_possible
+  run_install_step "16_zivpn_nat" 62 "Setup NAT ZIVPN" setup_zivpn_udp_nat_rules
+  run_install_step "17_udpcustom_service" 64 "Setup UDP Custom" setup_udpcustom_service_if_possible
+  run_install_step "18_udpcustom_nat" 66 "Setup NAT UDP Custom" setup_udpcustom_udp_nat_rules
+  run_install_step "19_udpgw" 68 "Setup UDPGW" setup_udpgw_service_if_possible
+  run_install_step "20_udp_backend" 70 "Aktifkan backend UDP utama" enforce_single_udp_backend
 
-  write_api_files
-  write_go_mux_files
-  build_go_files
-  write_iplimit_checker
-  setup_services
-  setup_udp_bootfix_service
-  setup_auto_reboot_timer
-  setup_auto_backup_timer
-  setup_online_notify_timer
-  setup_auto_pull_update_timer
+  run_install_step "21_api_files" 73 "Tulis file API runtime" write_api_files
+  run_install_step "22_go_mux_files" 76 "Tulis file Go mux" write_go_mux_files
+  run_install_step "23_build_go" 79 "Build Go mux" build_go_files
+  run_install_step "24_iplimit_checker" 82 "Tulis checker limit IP" write_iplimit_checker
+  run_install_step "25_services" 85 "Setup service systemd" setup_services
+  run_install_step "26_udp_bootfix" 87 "Setup UDP bootfix" setup_udp_bootfix_service
+  run_install_step "27_auto_reboot" 88 "Setup auto reboot" setup_auto_reboot_timer
+  run_install_step "28_auto_backup" 89 "Setup auto backup" setup_auto_backup_timer
+  run_install_step "29_online_notify" 90 "Setup notifikasi online" setup_online_notify_timer
+  run_install_step "30_auto_update" 91 "Setup auto pull update" setup_auto_pull_update_timer
+  run_install_step "31_summary_api" 93 "Install Summary API 1FORCR" install_summary_api_optional
 
-  if flag_enabled "${AUTO_INSTALL_SUMMARY_API}"; then
-    show_install_progress 90 "Memasang Summary API 1FORCR..."
-    if ! install_summary_api_1forcr; then
-      echo "Peringatan: auto-install Summary API gagal. Kamu masih bisa install manual dari menu Tools."
-    fi
-  fi
-
-  show_install_progress 95 "Sedikit lagi, finishing konfigurasi..."
-
-  write_cli_menu
-  setup_auto_menu_login
-  write_version_marker
-  sync_zivpn_auth_token_with_api_runtime
-  apply_sshws_loop_guard_rules
-  apply_tunnel_outbound_guard_rules
-  apply_final_service_restart_chain
-  post_install_preflight
+  run_install_step "32_cli_menu" 95 "Tulis menu CLI" write_cli_menu
+  run_install_step "33_auto_menu" 96 "Setup auto menu login" setup_auto_menu_login
+  run_install_step "34_version_marker" 97 "Tulis marker versi" write_version_marker
+  run_install_step "35_sync_token" 98 "Sinkron token ZIVPN dan API" sync_zivpn_auth_token_with_api_runtime
+  run_install_step "36_sshws_guard" 98 "Terapkan guard SSHWS" apply_sshws_loop_guard_rules
+  run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
+  run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
+  run_install_step "39_preflight" 100 "Preflight akhir" post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."
 
   cat <<EOF
@@ -14182,6 +14316,7 @@ curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
 EOF
 
   clear_pending_operation
+  clear_install_resume_state
   rm -f "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
   open_menu_after_install
 }

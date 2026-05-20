@@ -5437,22 +5437,63 @@ bot.catch((err, ctx) => {
   if (ctx?.chat?.id) userState.delete(ctx.chat.id);
 });
 
+function waitMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatStartError(err) {
+  return err?.message ? String(err.message) : util.inspect(err, { depth: 2 });
+}
+
+async function launchBotWithRetry(maxAttempts = 6) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await bot.launch();
+      return;
+    } catch (err) {
+      lastErr = err;
+      const wait = Math.min(30000, 2000 * attempt);
+      console.error(`app3 launch attempt ${attempt}/${maxAttempts} failed: ${formatStartError(err)}`);
+      if (attempt >= maxAttempts) break;
+      console.error(`retry bot launch in ${Math.round(wait / 1000)}s...`);
+      await waitMs(wait);
+    }
+  }
+  throw lastErr || new Error('bot launch failed');
+}
+
+function startBackgroundJobs() {
+  setInterval(pollPendingTopups, 15000);
+  setInterval(() => {
+    runNaturalScExpiryJobs().catch((err) => {
+      console.error('natural expiry job failed:', formatStartError(err));
+    });
+  }, SC_NOTIFY_INTERVAL_MS);
+
+  pollPendingTopups().catch((err) => {
+    console.error('initial topup poll failed:', formatStartError(err));
+  });
+  runNaturalScExpiryJobs().catch((err) => {
+    console.error('initial natural expiry job failed:', formatStartError(err));
+  });
+}
+
 (async () => {
   try {
     await initDb();
-    setInterval(pollPendingTopups, 15000);
-    setInterval(() => {
-      runNaturalScExpiryJobs().catch(() => {});
-    }, SC_NOTIFY_INTERVAL_MS);
-    await pollPendingTopups();
-    await runNaturalScExpiryJobs().catch(() => {});
-    await bot.launch();
+    await launchBotWithRetry();
     console.log('app3 bot running...');
+    startBackgroundJobs();
   } catch (e) {
-    console.error('app3 start failed:', e.message);
+    console.error('app3 start failed:', formatStartError(e));
     process.exit(1);
   }
 })();
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => {
+  try { bot.stop('SIGINT'); } catch (_) {}
+});
+process.once('SIGTERM', () => {
+  try { bot.stop('SIGTERM'); } catch (_) {}
+});

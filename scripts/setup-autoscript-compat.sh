@@ -58,7 +58,7 @@ set -euo pipefail
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
-#   AUTO_PULL_UPDATE_ENABLE=0                    (opsional, default nonaktif; update manual via menu)
+#   AUTO_PULL_UPDATE_ENABLE=1                    (opsional, 1=cek trigger update dari bot)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
@@ -149,8 +149,8 @@ AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
-AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-0}"
-AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-30}"
+AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
@@ -680,7 +680,7 @@ install_base_packages() {
     haproxy \
     nginx certbot \
     openssh-server dropbear pwgen \
-    build-essential python3 make g++ gcc libc6-dev pkg-config bzip2 zlib1g-dev \
+    build-essential python3 make g++ gcc libc6-dev pkg-config libsqlite3-dev bzip2 zlib1g-dev \
     netfilter-persistent iptables-persistent
 
   # Paket opsional (beberapa distro/repo lama tidak selalu menyediakan).
@@ -4027,12 +4027,15 @@ EOF
   export npm_config_build_from_source=true
   export npm_config_fallback_to_build=true
   export npm_config_update_binary=false
+  npm config set fund false >/dev/null 2>&1 || true
+  npm config set audit false >/dev/null 2>&1 || true
 
   local need_npm_install="0"
+  local node_deps_check="require('sqlite3'); require('express'); require('dotenv'); require('ws');"
   if [[ ! -d node_modules ]]; then
     need_npm_install="1"
     log "node_modules belum ada, install dependency..."
-  elif ! node -e "require('sqlite3'); require('express'); require('dotenv'); require('ws')" >/dev/null 2>&1; then
+  elif ! node -e "${node_deps_check}" >/dev/null 2>&1; then
     need_npm_install="1"
     log "Dependency Node terdeteksi rusak/kurang, reinstall dependency..."
   else
@@ -4040,11 +4043,38 @@ EOF
   fi
 
   if [[ "${need_npm_install}" == "1" ]]; then
+    log "Menyiapkan paket build untuk sqlite3 native binding..."
+    if ! apt_get_safe install -y build-essential python3 make g++ gcc libc6-dev pkg-config libsqlite3-dev >/tmp/sc-1forcr-node-build-deps.log 2>&1; then
+      log "Install paket build sqlite3 gagal. Cek log: /tmp/sc-1forcr-node-build-deps.log"
+      tail -n 80 /tmp/sc-1forcr-node-build-deps.log || true
+      exit 1
+    fi
+
+    if [[ -d node_modules || -f package-lock.json ]]; then
+      log "Membersihkan dependency Node lama supaya binding sqlite3 dibuat ulang..."
+      rm -rf node_modules package-lock.json
+    fi
+
     if ! npm install --omit=dev --foreground-scripts >/tmp/sc-1forcr-npm-install.log 2>&1; then
       log "Install npm dependency gagal. Cek log: /tmp/sc-1forcr-npm-install.log"
       tail -n 80 /tmp/sc-1forcr-npm-install.log || true
       exit 1
     fi
+  fi
+
+  if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-node-deps-check.log 2>&1; then
+    log "sqlite3 belum bisa diload setelah npm install, coba rebuild native binding..."
+    if ! npm rebuild sqlite3 --build-from-source --foreground-scripts >/tmp/sc-1forcr-npm-rebuild.log 2>&1; then
+      log "Rebuild sqlite3 gagal. Cek log: /tmp/sc-1forcr-npm-rebuild.log"
+      tail -n 80 /tmp/sc-1forcr-npm-rebuild.log || true
+      exit 1
+    fi
+  fi
+
+  if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-node-deps-check.log 2>&1; then
+    log "Dependency Node masih gagal setelah rebuild. Cek log: /tmp/sc-1forcr-node-deps-check.log"
+    cat /tmp/sc-1forcr-node-deps-check.log || true
+    exit 1
   fi
 
   node -e "require('sqlite3'); console.log('sqlite3 load ok')"
@@ -6809,9 +6839,94 @@ def fetch(table, cols):
         out.append(item)
     return out
 
+SETTINGS_KEYS = [
+    "AUTO_BACKUP_ENABLE",
+    "AUTO_BACKUP_DIR",
+    "AUTO_BACKUP_KEEP_DAYS",
+    "AUTO_BACKUP_INTERVAL_MINUTES",
+    "AUTO_BACKUP_SCHEDULE_MODE",
+    "AUTO_BACKUP_WIB_HOUR",
+    "AUTO_REBOOT_ENABLE",
+    "AUTO_REBOOT_INTERVAL_MINUTES",
+    "AUTO_PULL_UPDATE_ENABLE",
+    "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
+    "ONLINE_NOTIFY_ENABLE",
+    "ONLINE_NOTIFY_INTERVAL_HOURS",
+    "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
+    "IPLIMIT_CHECK_INTERVAL_MINUTES",
+    "IPLIMIT_LOCK_MINUTES",
+    "IPLIMIT_AUTO_LOCK_ENABLE",
+    "IPLIMIT_AUTO_TUNE",
+    "IPLIMIT_DEBUG",
+    "DROPBEAR_LOG_MAX_LINES",
+    "DROPBEAR_RECENT_LOG_MAX_LINES",
+    "UDPHC_LOG_LINES_HISTORY",
+    "UDPHC_LOG_LINES_REALTIME",
+    "UDPHC_LOG_LINES_CHECKER",
+    "XRAY_BLOCK_TCP_PORTS",
+    "XRAY_RECENT_WINDOW_MINUTES",
+    "XRAY_ACTIVE_WINDOW_SECONDS",
+    "XRAY_MIN_HITS_PER_IP",
+    "XRAY_PATHS_VMESS",
+    "XRAY_PATHS_VLESS",
+    "XRAY_PATHS_TROJAN",
+    "VMESS_BUG_PROFILE_ADDRESS",
+    "VMESS_BUG_PROFILE_SNI",
+    "VMESS_BUG_PROFILE_HOST",
+    "VMESS_BUG_PROFILE_ALLOW_INSECURE",
+    "ZIVPN_ACTIVE_WINDOW_SECONDS",
+    "ZIVPN_HANDOFF_GRACE_SECONDS",
+    "ZIVPN_LIVE_TTL_SECONDS",
+    "ZIVPN_AUTH_APPLY_MODE",
+    "ZIVPN_AUTH_MODE",
+    "ZIVPN_RELOAD_ON_AUTH_CHANGE",
+    "ACTIVE_UDP_BACKEND",
+    "SSH_HC_AUTH_LOOKBACK_HOURS",
+    "SSHWS_UDPGW_PORTS",
+    "SSH_TUNNEL_SHELL",
+    "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
+    "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
+    "SSHWS_LOOP_GUARD_ENABLE",
+    "SSHWS_LOOP_GUARD_PORTS",
+    "SSHWS_LOOP_GUARD_NEW_ABOVE",
+    "SSHWS_LOOP_GUARD_BURST",
+    "SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE",
+    "SSHWS_NGINX_LIMIT_ENABLE",
+    "SSHWS_NGINX_LIMIT_RATE",
+    "SSHWS_NGINX_LIMIT_BURST",
+    "SSHWS_NGINX_LIMIT_CONN",
+    "NGINX_WORKER_CONNECTIONS",
+    "NGINX_WORKER_RLIMIT_NOFILE",
+    "NGINX_SERVICE_LIMIT_NOFILE",
+]
+SETTINGS_KEY_SET = set(SETTINGS_KEYS)
+
+def unquote_env_value(value):
+    value = str(value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return value
+
+def load_runtime_settings(paths=("/opt/sc-1forcr/.env", "/etc/sc-1forcr.env")):
+    settings = {}
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw or raw.startswith("#") or "=" not in raw:
+                        continue
+                    key, value = raw.split("=", 1)
+                    key = key.strip()
+                    if key in SETTINGS_KEY_SET:
+                        settings[key] = unquote_env_value(value)
+        except Exception:
+            pass
+    return settings
+
 payload = {
     "meta": {
-        "format": "sc1forcr-accounts-backup-v1",
+        "format": "sc1forcr-accounts-backup-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_domain": domain or "unknown",
     },
@@ -6823,6 +6938,7 @@ payload = {
         "zivpn_auth": [],
         "banner_html": "",
         "banner_txt": "",
+        "settings": load_runtime_settings(),
     },
 }
 
@@ -6994,10 +7110,183 @@ CREATE TABLE IF NOT EXISTS account_trojans (
 );
 SQL
 
+apply_restored_runtime_units() {
+  local iplimit_interval backup_enable backup_mode backup_interval backup_wib_hour
+  local auto_reboot_enable auto_reboot_interval pull_enable pull_interval notify_enable notify_interval
+
+  if [[ -f /etc/sc-1forcr.env ]]; then
+    # shellcheck disable=SC1091
+    source /etc/sc-1forcr.env || true
+  fi
+
+  iplimit_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}" | tr -cd '0-9')"
+  [[ -z "${iplimit_interval}" || "${iplimit_interval}" -lt 1 || "${iplimit_interval}" -gt 1440 ]] && iplimit_interval="1"
+  cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR IP Limit Checker every ${iplimit_interval} minutes
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=${iplimit_interval}min
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-iplimit.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+
+  backup_enable="${AUTO_BACKUP_ENABLE:-1}"
+  [[ "${backup_enable}" != "0" ]] && backup_enable="1"
+  backup_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${backup_mode}" in
+    daily|daily_wib|wib) backup_mode="daily_wib" ;;
+    *) backup_mode="interval" ;;
+  esac
+  backup_interval="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  [[ -z "${backup_interval}" || "${backup_interval}" -lt 1 || "${backup_interval}" -gt 10080 ]] && backup_interval="1440"
+  backup_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
+  [[ -z "${backup_wib_hour}" || "${backup_wib_hour}" -gt 23 ]] && backup_wib_hour="2"
+  if [[ -f /etc/systemd/system/sc-1forcr-autobackup.service ]]; then
+    if [[ "${backup_mode}" == "daily_wib" ]]; then
+      cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR auto backup daily at $(printf '%02d' "${backup_wib_hour}"):00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+    else
+      cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR auto backup every ${backup_interval} minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${backup_interval}min
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+    fi
+  fi
+
+  auto_reboot_enable="${AUTO_REBOOT_ENABLE:-1}"
+  [[ "${auto_reboot_enable}" != "0" ]] && auto_reboot_enable="1"
+  auto_reboot_interval="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  [[ -z "${auto_reboot_interval}" || "${auto_reboot_interval}" -lt 30 || "${auto_reboot_interval}" -gt 10080 ]] && auto_reboot_interval="1440"
+  if [[ -f /etc/systemd/system/sc-1forcr-autoreboot.service ]]; then
+    cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR auto reboot every ${auto_reboot_interval} minutes
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=${auto_reboot_interval}min
+Persistent=true
+AccuracySec=1min
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  fi
+
+  pull_enable="${AUTO_PULL_UPDATE_ENABLE:-1}"
+  [[ "${pull_enable}" != "0" ]] && pull_enable="1"
+  pull_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  [[ -z "${pull_interval}" || "${pull_interval}" -lt 1 || "${pull_interval}" -gt 1440 ]] && pull_interval="10"
+  if [[ -f /etc/systemd/system/sc-1forcr-pull-update.service ]]; then
+    cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF_TIMER
+[Unit]
+Description=Check SC 1FORCR update trigger every ${pull_interval} minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=${pull_interval}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-pull-update.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  fi
+
+  notify_enable="${ONLINE_NOTIFY_ENABLE:-1}"
+  [[ "${notify_enable}" != "0" ]] && notify_enable="1"
+  notify_interval="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+  [[ -z "${notify_interval}" || "${notify_interval}" -lt 1 || "${notify_interval}" -gt 168 ]] && notify_interval="3"
+  if [[ -f /etc/systemd/system/sc-1forcr-online-notify.service ]]; then
+    cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR online account notifier every ${notify_interval} hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${notify_interval}h
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-online-notify.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+
+  if [[ "${backup_enable}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${auto_reboot_enable}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${pull_enable}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${notify_enable}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  fi
+}
+
 python3 - "${backup_file}" "${DB_PATH}" <<'PY'
 import json
 import sqlite3
 import sys
+import os
+import shlex
 
 backup_path = sys.argv[1]
 db_path = sys.argv[2]
@@ -7123,10 +7412,131 @@ def upsert_trojan(rows):
             ),
         )
 
+SETTINGS_KEYS = [
+    "AUTO_BACKUP_ENABLE",
+    "AUTO_BACKUP_DIR",
+    "AUTO_BACKUP_KEEP_DAYS",
+    "AUTO_BACKUP_INTERVAL_MINUTES",
+    "AUTO_BACKUP_SCHEDULE_MODE",
+    "AUTO_BACKUP_WIB_HOUR",
+    "AUTO_REBOOT_ENABLE",
+    "AUTO_REBOOT_INTERVAL_MINUTES",
+    "AUTO_PULL_UPDATE_ENABLE",
+    "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
+    "ONLINE_NOTIFY_ENABLE",
+    "ONLINE_NOTIFY_INTERVAL_HOURS",
+    "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
+    "IPLIMIT_CHECK_INTERVAL_MINUTES",
+    "IPLIMIT_LOCK_MINUTES",
+    "IPLIMIT_AUTO_LOCK_ENABLE",
+    "IPLIMIT_AUTO_TUNE",
+    "IPLIMIT_DEBUG",
+    "DROPBEAR_LOG_MAX_LINES",
+    "DROPBEAR_RECENT_LOG_MAX_LINES",
+    "UDPHC_LOG_LINES_HISTORY",
+    "UDPHC_LOG_LINES_REALTIME",
+    "UDPHC_LOG_LINES_CHECKER",
+    "XRAY_BLOCK_TCP_PORTS",
+    "XRAY_RECENT_WINDOW_MINUTES",
+    "XRAY_ACTIVE_WINDOW_SECONDS",
+    "XRAY_MIN_HITS_PER_IP",
+    "XRAY_PATHS_VMESS",
+    "XRAY_PATHS_VLESS",
+    "XRAY_PATHS_TROJAN",
+    "VMESS_BUG_PROFILE_ADDRESS",
+    "VMESS_BUG_PROFILE_SNI",
+    "VMESS_BUG_PROFILE_HOST",
+    "VMESS_BUG_PROFILE_ALLOW_INSECURE",
+    "ZIVPN_ACTIVE_WINDOW_SECONDS",
+    "ZIVPN_HANDOFF_GRACE_SECONDS",
+    "ZIVPN_LIVE_TTL_SECONDS",
+    "ZIVPN_AUTH_APPLY_MODE",
+    "ZIVPN_AUTH_MODE",
+    "ZIVPN_RELOAD_ON_AUTH_CHANGE",
+    "ACTIVE_UDP_BACKEND",
+    "SSH_HC_AUTH_LOOKBACK_HOURS",
+    "SSHWS_UDPGW_PORTS",
+    "SSH_TUNNEL_SHELL",
+    "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
+    "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
+    "SSHWS_LOOP_GUARD_ENABLE",
+    "SSHWS_LOOP_GUARD_PORTS",
+    "SSHWS_LOOP_GUARD_NEW_ABOVE",
+    "SSHWS_LOOP_GUARD_BURST",
+    "SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE",
+    "SSHWS_NGINX_LIMIT_ENABLE",
+    "SSHWS_NGINX_LIMIT_RATE",
+    "SSHWS_NGINX_LIMIT_BURST",
+    "SSHWS_NGINX_LIMIT_CONN",
+    "NGINX_WORKER_CONNECTIONS",
+    "NGINX_WORKER_RLIMIT_NOFILE",
+    "NGINX_SERVICE_LIMIT_NOFILE",
+]
+SETTINGS_KEY_SET = set(SETTINGS_KEYS)
+APP_ENV_FILE = "/opt/sc-1forcr/.env"
+SC_ENV_FILE = "/etc/sc-1forcr.env"
+
+def clean_setting_value(value):
+    text = str(value if value is not None else "").strip()
+    text = text.replace("\r", "").replace("\n", "")
+    return text[:512]
+
+def read_env_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().splitlines()
+    except Exception:
+        return []
+
+def write_env_settings(path, settings):
+    if not settings:
+        return 0
+    lines = read_env_lines(path)
+    out = []
+    seen = set()
+    for line in lines:
+        if "=" not in line or line.lstrip().startswith("#"):
+            out.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in settings:
+            out.append(f"{key}={shlex.quote(settings[key])}")
+            seen.add(key)
+        else:
+            out.append(line)
+    for key in SETTINGS_KEYS:
+        if key in settings and key not in seen:
+            out.append(f"{key}={shlex.quote(settings[key])}")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out).rstrip() + "\n")
+        if path == SC_ENV_FILE:
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
+    return len(settings)
+
+def restore_runtime_settings(settings_input):
+    if not isinstance(settings_input, dict):
+        return 0
+    settings = {}
+    for key in SETTINGS_KEYS:
+        if key not in settings_input:
+            continue
+        settings[key] = clean_setting_value(settings_input.get(key))
+    if not settings:
+        return 0
+    write_env_settings(SC_ENV_FILE, settings)
+    if os.path.exists(APP_ENV_FILE):
+        write_env_settings(APP_ENV_FILE, settings)
+    return len(settings)
+
 upsert_ssh(data.get("ssh") or [])
 upsert_uuid("account_vmesses", data.get("vmess") or [])
 upsert_uuid("account_vlesses", data.get("vless") or [])
 upsert_trojan(data.get("trojan") or [])
+restored_settings = restore_runtime_settings(data.get("settings") or data.get("runtime_settings") or {})
 
 zivpn_auth = data.get("zivpn_auth") or []
 if not isinstance(zivpn_auth, list) or len(zivpn_auth) == 0:
@@ -7177,12 +7587,15 @@ except Exception:
 
 conn.commit()
 conn.close()
+if restored_settings:
+    print(f"Runtime settings restored: {restored_settings}", file=sys.stderr)
 PY
 
 chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
 chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
 chmod 644 /etc/sc-1forcr/banner.html >/dev/null 2>&1 || true
 chmod 644 /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
+apply_restored_runtime_units
 systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
 systemctl restart xray >/dev/null 2>&1 || true
 systemctl restart "${ZIVPN_SERVICE:-zivpn}" >/dev/null 2>&1 || true
@@ -7836,13 +8249,161 @@ EOF
 }
 
 setup_auto_pull_update_timer() {
-  # Auto pull update dimatikan secara default agar update hanya manual via menu.
-  systemctl stop sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
-  systemctl disable sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
-  systemctl stop sc-1forcr-pull-update.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/sc-1forcr-pull-update.timer
-  rm -f /etc/systemd/system/sc-1forcr-pull-update.service
+  local pull_interval_min
+  pull_interval_min="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  if [[ -z "${pull_interval_min}" || "${pull_interval_min}" -lt 1 || "${pull_interval_min}" -gt 1440 ]]; then
+    pull_interval_min="10"
+  fi
+  AUTO_PULL_UPDATE_INTERVAL_MINUTES="${pull_interval_min}"
+  [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" != "0" ]] && AUTO_PULL_UPDATE_ENABLE="1"
+
+  log "Setup auto pull update dari trigger bot tiap ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} menit..."
+
+  cat > /usr/local/sbin/sc-1forcr-pull-update <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/sc-1forcr.env"
+[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+
+AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+LICENSE_API_URL="${LICENSE_API_URL:-}"
+LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
+STATE_DIR="/var/lib/sc-1forcr"
+LAST_VERSION_FILE="${STATE_DIR}/last-pull-update.version"
+LOCK_FILE="/run/sc-1forcr-pull-update.lock"
+LOG_TAG="sc-1forcr-pull-update"
+
+log_msg() {
+  logger -t "${LOG_TAG}" "$*" >/dev/null 2>&1 || true
+  echo "$*"
+}
+
+json_escape() {
+  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${1:-}"
+}
+
+ack_update() {
+  local base_url="$1" version="$2" status="$3" message="$4"
+  [[ -z "${base_url}" || -z "${version}" ]] && return 0
+  local payload
+  payload="{\"version\":$(json_escape "${version}"),\"status\":$(json_escape "${status}"),\"message\":$(json_escape "${message}")}"
+  curl -4fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
+    -X POST "${base_url}/sc1forcr/update/ack" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "${payload}" >/dev/null 2>&1 || \
+  curl -fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
+    -X POST "${base_url}/sc1forcr/update/ack" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "${payload}" >/dev/null 2>&1 || true
+}
+
+main_pull_update() {
+  if [[ "${AUTO_PULL_UPDATE_ENABLE}" != "1" ]]; then
+    exit 0
+  fi
+  if [[ -z "${LICENSE_API_URL}" || -z "${LICENSE_API_TOKEN}" ]]; then
+    exit 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    log_msg "jq tidak tersedia, skip auto pull update."
+    exit 0
+  fi
+
+  mkdir -p "${STATE_DIR}"
+  local base_url current_version payload resp ok required version note msg
+  base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
+  if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
+    base_url="$(echo "${LICENSE_API_URL}" | sed 's|/license/activate$||')"
+  fi
+  [[ -z "${base_url}" || "${base_url}" == "${LICENSE_API_URL}" ]] && exit 0
+
+  current_version="$(cat "${LAST_VERSION_FILE}" 2>/dev/null || true)"
+  payload="{\"current_version\":$(json_escape "${current_version}"),\"script_version\":$(json_escape "${SCRIPT_VERSION:-}")}"
+
+  resp="$(
+    curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+      -X POST "${base_url}/sc1forcr/update/check" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "${payload}" 2>/dev/null ||
+    curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+      -X POST "${base_url}/sc1forcr/update/check" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "${payload}" 2>/dev/null || true
+  )"
+  [[ -n "${resp}" ]] || exit 0
+
+  ok="$(echo "${resp}" | jq -r 'if .ok == true then "1" else "0" end' 2>/dev/null || echo 0)"
+  [[ "${ok}" == "1" ]] || exit 0
+  required="$(echo "${resp}" | jq -r 'if .update_required == true then "1" else "0" end' 2>/dev/null || echo 0)"
+  [[ "${required}" == "1" ]] || exit 0
+  version="$(echo "${resp}" | jq -r '.version // empty' 2>/dev/null || true)"
+  [[ -n "${version}" ]] || exit 0
+  if [[ "${version}" == "${current_version}" ]]; then
+    exit 0
+  fi
+  note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
+
+  log_msg "Trigger update diterima dari bot: ${version}${note:+ (${note})}"
+  ack_update "${base_url}" "${version}" "running" "update mulai"
+  if /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
+    printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
+    ack_update "${base_url}" "${version}" "success" "update selesai"
+    log_msg "Update trigger ${version} selesai."
+  else
+    msg="$(tail -n 20 /var/log/sc-1forcr-pull-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-500)"
+    ack_update "${base_url}" "${version}" "failed" "${msg:-update gagal}"
+    log_msg "Update trigger ${version} gagal."
+    exit 1
+  fi
+}
+
+(
+  flock -n 9 || exit 0
+  main_pull_update "$@"
+) 9>"${LOCK_FILE}"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-pull-update
+
+  cat > /etc/systemd/system/sc-1forcr-pull-update.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Pull Update Trigger from Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-pull-update
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF
+[Unit]
+Description=Check SC 1FORCR update trigger every ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-pull-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  fi
 }
 
 write_cli_menu() {
@@ -8103,6 +8664,8 @@ XRAY_MONITOR_RECENT_WINDOW_MINUTES="${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
+AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+AUTO_PULL_UPDATE_INTERVAL_MINUTES="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
 DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
 DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
@@ -8126,6 +8689,8 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
+[[ "${AUTO_PULL_UPDATE_ENABLE}" != "0" ]] && AUTO_PULL_UPDATE_ENABLE="1"
+[[ -z "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -lt 1 || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -gt 1440 ]] && AUTO_PULL_UPDATE_INTERVAL_MINUTES="10"
 
 # Compatibility helpers for older runtime files on upgraded VPS.
 flag_enabled() {
@@ -8504,6 +9069,27 @@ WantedBy=timers.target
 EOF
 }
 
+write_pull_update_timer_unit() {
+  local interval_min="$1"
+  interval_min="$(echo "${interval_min:-10}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 1 || "${interval_min}" -gt 1440 ]] && interval_min="10"
+  cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF
+[Unit]
+Description=Check SC 1FORCR update trigger every ${interval_min} minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=${interval_min}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-pull-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 set_auto_reboot_config_menu() {
   local current_enable current_interval current_hours enable_in mode_in val_in interval_min
   current_enable="${AUTO_REBOOT_ENABLE:-1}"
@@ -8591,6 +9177,104 @@ set_auto_reboot_config_menu() {
   echo "Berhasil update auto reboot:"
   echo "- Status   : $([[ "${AUTO_REBOOT_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "- Interval : ${AUTO_REBOOT_INTERVAL_MINUTES} menit"
+}
+
+set_auto_pull_update_config_menu() {
+  local current_enable current_interval current_hours enable_in mode_in val_in interval_min
+  current_enable="${AUTO_PULL_UPDATE_ENABLE:-1}"
+  [[ "${current_enable}" != "0" ]] && current_enable="1"
+  current_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 1440 ]] && current_interval="10"
+  current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
+
+  draw_menu_header "SETTING AUTO UPDATE BOT"
+  echo "Status saat ini   : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "Interval saat ini : ${current_interval} menit (~${current_hours} jam)"
+  echo
+  echo "Jika NONAKTIF, VPS ini tidak akan menjalankan update saat admin trigger dari bot."
+  echo "Update manual dari menu tetap bisa dijalankan."
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input enable_in "Aktifkan auto update dari bot? (1=aktif,0=nonaktif) [${current_enable}]: "; then
+    return
+  fi
+  [[ "${enable_in,,}" == "batal" ]] && return
+  enable_in="${enable_in:-${current_enable}}"
+  case "${enable_in,,}" in
+    1|on|yes|y|aktif) enable_in="1" ;;
+    0|off|no|n|nonaktif) enable_in="0" ;;
+    *)
+      echo "Input status tidak valid. Gunakan 1 atau 0."
+      return
+      ;;
+  esac
+
+  if ! prompt_input mode_in "Set interval dalam (m=menit, h=jam) [m]: "; then
+    return
+  fi
+  [[ "${mode_in,,}" == "batal" ]] && return
+  mode_in="${mode_in:-m}"
+  case "${mode_in,,}" in
+    m|menit) mode_in="m" ;;
+    h|jam) mode_in="h" ;;
+    *)
+      echo "Mode interval tidak valid. Gunakan m atau h."
+      return
+      ;;
+  esac
+
+  if [[ "${mode_in}" == "m" ]]; then
+    if ! prompt_input val_in "Interval cek trigger (menit, 1-1440) [${current_interval}]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-${current_interval}}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 1440 ]]; then
+      echo "Interval menit harus angka 1-1440."
+      return
+    fi
+    interval_min="${val_in}"
+  else
+    if ! prompt_input val_in "Interval cek trigger (jam, 1-24) [1]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-1}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 24 ]]; then
+      echo "Interval jam harus angka 1-24."
+      return
+    fi
+    interval_min="$(( val_in * 60 ))"
+  fi
+
+  AUTO_PULL_UPDATE_ENABLE="${enable_in}"
+  AUTO_PULL_UPDATE_INTERVAL_MINUTES="${interval_min}"
+  update_sc_env_var "AUTO_PULL_UPDATE_ENABLE" "${AUTO_PULL_UPDATE_ENABLE}"
+  update_sc_env_var "AUTO_PULL_UPDATE_INTERVAL_MINUTES" "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
+  update_app_env_var "AUTO_PULL_UPDATE_ENABLE" "${AUTO_PULL_UPDATE_ENABLE}"
+  update_app_env_var "AUTO_PULL_UPDATE_INTERVAL_MINUTES" "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
+
+  if [[ -f /etc/systemd/system/sc-1forcr-pull-update.service ]]; then
+    write_pull_update_timer_unit "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
+      systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+      systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    else
+      systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+      systemctl stop sc-1forcr-pull-update.service >/dev/null 2>&1 || true
+    fi
+  else
+    echo
+    echo "Service sc-1forcr-pull-update belum tersedia. Jalankan update script terbaru dulu."
+  fi
+
+  echo
+  echo "Berhasil update auto update bot:"
+  echo "- Status   : $([[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "- Interval : ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} menit"
 }
 
 set_auto_backup_config_menu() {
@@ -10118,9 +10802,10 @@ tools_menu() {
       "11) Upgrade/Downgrade Versi Dropbear" \
       "12) Setting Interval Auto Backup" \
       "13) Setting Interval Auto Reboot" \
+      "14) Setting Auto Update Bot" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-13]: "; then
+    if ! prompt_input tm "Pilih menu [0-14]: "; then
       return
     fi
     clear
@@ -10138,6 +10823,7 @@ tools_menu() {
       11) set_dropbear_version_menu || true ;;
       12) set_auto_backup_config_menu || true ;;
       13) set_auto_reboot_config_menu || true ;;
+      14) set_auto_pull_update_config_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -12937,6 +13623,8 @@ Time     : $(date '+%F %T')"
     AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}" \
     AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-1}" \
     AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" \
+    AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}" \
+    AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" \
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
     ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
     ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" \
@@ -13572,7 +14260,7 @@ draw_main_options() {
 }
 
 if [[ "${1:-}" == "update" ]]; then
-  clear
+  clear >/dev/null 2>&1 || true
   update_script_from_repo
   exit $?
 fi

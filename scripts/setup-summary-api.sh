@@ -80,6 +80,68 @@ const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/
 const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
 const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
 const SC_REG_META_FILE = String(process.env.SC_REG_META_FILE || '/etc/sc-1forcr-registration.env').trim();
+const SC_APP_ENV_FILE = String(process.env.SC_APP_ENV_FILE || '/opt/sc-1forcr/.env').trim();
+const RUNTIME_SETTINGS_KEYS = Object.freeze([
+  'AUTO_BACKUP_ENABLE',
+  'AUTO_BACKUP_DIR',
+  'AUTO_BACKUP_KEEP_DAYS',
+  'AUTO_BACKUP_INTERVAL_MINUTES',
+  'AUTO_BACKUP_SCHEDULE_MODE',
+  'AUTO_BACKUP_WIB_HOUR',
+  'AUTO_REBOOT_ENABLE',
+  'AUTO_REBOOT_INTERVAL_MINUTES',
+  'AUTO_PULL_UPDATE_ENABLE',
+  'AUTO_PULL_UPDATE_INTERVAL_MINUTES',
+  'ONLINE_NOTIFY_ENABLE',
+  'ONLINE_NOTIFY_INTERVAL_HOURS',
+  'ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS',
+  'IPLIMIT_CHECK_INTERVAL_MINUTES',
+  'IPLIMIT_LOCK_MINUTES',
+  'IPLIMIT_AUTO_LOCK_ENABLE',
+  'IPLIMIT_AUTO_TUNE',
+  'IPLIMIT_DEBUG',
+  'DROPBEAR_LOG_MAX_LINES',
+  'DROPBEAR_RECENT_LOG_MAX_LINES',
+  'UDPHC_LOG_LINES_HISTORY',
+  'UDPHC_LOG_LINES_REALTIME',
+  'UDPHC_LOG_LINES_CHECKER',
+  'XRAY_BLOCK_TCP_PORTS',
+  'XRAY_RECENT_WINDOW_MINUTES',
+  'XRAY_ACTIVE_WINDOW_SECONDS',
+  'XRAY_MIN_HITS_PER_IP',
+  'XRAY_PATHS_VMESS',
+  'XRAY_PATHS_VLESS',
+  'XRAY_PATHS_TROJAN',
+  'VMESS_BUG_PROFILE_ADDRESS',
+  'VMESS_BUG_PROFILE_SNI',
+  'VMESS_BUG_PROFILE_HOST',
+  'VMESS_BUG_PROFILE_ALLOW_INSECURE',
+  'ZIVPN_ACTIVE_WINDOW_SECONDS',
+  'ZIVPN_HANDOFF_GRACE_SECONDS',
+  'ZIVPN_LIVE_TTL_SECONDS',
+  'ZIVPN_AUTH_APPLY_MODE',
+  'ZIVPN_AUTH_MODE',
+  'ZIVPN_RELOAD_ON_AUTH_CHANGE',
+  'ACTIVE_UDP_BACKEND',
+  'SSH_HC_AUTH_LOOKBACK_HOURS',
+  'SSHWS_UDPGW_PORTS',
+  'SSH_TUNNEL_SHELL',
+  'SSH_TUNNEL_BLOCK_OUTBOUND_SSH',
+  'SSH_TUNNEL_BLOCK_OUTBOUND_PORTS',
+  'SSHWS_LOOP_GUARD_ENABLE',
+  'SSHWS_LOOP_GUARD_PORTS',
+  'SSHWS_LOOP_GUARD_NEW_ABOVE',
+  'SSHWS_LOOP_GUARD_BURST',
+  'SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE',
+  'SSHWS_NGINX_LIMIT_ENABLE',
+  'SSHWS_NGINX_LIMIT_RATE',
+  'SSHWS_NGINX_LIMIT_BURST',
+  'SSHWS_NGINX_LIMIT_CONN',
+  'NGINX_WORKER_CONNECTIONS',
+  'NGINX_WORKER_RLIMIT_NOFILE',
+  'NGINX_SERVICE_LIMIT_NOFILE'
+]);
+const RUNTIME_SETTINGS_KEY_SET = new Set(RUNTIME_SETTINGS_KEYS);
 
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
@@ -1025,6 +1087,336 @@ function restoreBannerConfig(payload) {
   };
 }
 
+function unquoteEnvValue(valueInput) {
+  let value = String(valueInput || '').trim();
+  if (value.length >= 2 && value[0] === value[value.length - 1] && (value[0] === '"' || value[0] === "'")) {
+    value = value.slice(1, -1);
+  }
+  return value;
+}
+
+function readRuntimeSettingsFromFile(filePath) {
+  const settings = {};
+  if (!filePath) return settings;
+  try {
+    if (!fs.existsSync(filePath)) return settings;
+    const raw = fs.readFileSync(filePath, 'utf8');
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = String(line || '').trim();
+      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
+      const idx = trimmed.indexOf('=');
+      const key = trimmed.slice(0, idx).trim();
+      if (!RUNTIME_SETTINGS_KEY_SET.has(key)) continue;
+      settings[key] = unquoteEnvValue(trimmed.slice(idx + 1));
+    }
+  } catch (_) {}
+  return settings;
+}
+
+function readRuntimeSettings() {
+  return {
+    ...readRuntimeSettingsFromFile(SC_APP_ENV_FILE),
+    ...readRuntimeSettingsFromFile(SC_RUNTIME_ENV_FILE)
+  };
+}
+
+function cleanRuntimeSettingValue(valueInput) {
+  return String(valueInput ?? '').replace(/\r/g, '').replace(/\n/g, '').trim().slice(0, 512);
+}
+
+function filterRuntimeSettings(settingsInput) {
+  const input = settingsInput && typeof settingsInput === 'object' ? settingsInput : {};
+  const out = {};
+  for (const key of RUNTIME_SETTINGS_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(input, key)) continue;
+    out[key] = cleanRuntimeSettingValue(input[key]);
+  }
+  return out;
+}
+
+function quoteEnvValue(valueInput) {
+  const value = String(valueInput ?? '');
+  if (/^[A-Za-z0-9_@%+=:,./-]*$/.test(value)) return value || "''";
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+function writeRuntimeSettingsFile(filePath, settings) {
+  if (!filePath || !settings || typeof settings !== 'object') return 0;
+  const keys = Object.keys(settings).filter((key) => RUNTIME_SETTINGS_KEY_SET.has(key));
+  if (keys.length === 0) return 0;
+
+  let lines = [];
+  try {
+    if (fs.existsSync(filePath)) lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
+  } catch (_) {
+    lines = [];
+  }
+
+  const seen = new Set();
+  const out = [];
+  for (const line of lines) {
+    if (!line) continue;
+    const trimmed = String(line || '').trim();
+    if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) {
+      out.push(line);
+      continue;
+    }
+    const key = trimmed.slice(0, trimmed.indexOf('=')).trim();
+    if (RUNTIME_SETTINGS_KEY_SET.has(key) && Object.prototype.hasOwnProperty.call(settings, key)) {
+      out.push(`${key}=${quoteEnvValue(settings[key])}`);
+      seen.add(key);
+      continue;
+    }
+    out.push(line);
+  }
+
+  for (const key of RUNTIME_SETTINGS_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(settings, key) || seen.has(key)) continue;
+    out.push(`${key}=${quoteEnvValue(settings[key])}`);
+  }
+
+  try {
+    const dir = require('path').dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(filePath, `${out.join('\n').replace(/\n+$/g, '')}\n`, 'utf8');
+    if (filePath === SC_RUNTIME_ENV_FILE) {
+      try { fs.chmodSync(filePath, 0o600); } catch (_) {}
+    }
+  } catch (err) {
+    throw new Error(`gagal tulis ${filePath}: ${err.message}`);
+  }
+  return keys.length;
+}
+
+function intSetting(settings, key, fallback, min, max) {
+  const n = Number(String(settings?.[key] ?? '').replace(/[^0-9]/g, ''));
+  if (!Number.isFinite(n) || n < min || n > max) return fallback;
+  return Math.floor(n);
+}
+
+function enabledSetting(settings, key, fallback = '1') {
+  const value = String(settings?.[key] ?? fallback).trim().toLowerCase();
+  return /^(0|off|false|no|nonaktif)$/.test(value) ? '0' : '1';
+}
+
+function runSystemctl(args) {
+  try {
+    execFileSync('systemctl', args, { stdio: 'ignore' });
+    return { ok: true, command: `systemctl ${args.join(' ')}` };
+  } catch (err) {
+    return { ok: false, command: `systemctl ${args.join(' ')}`, message: err?.message || 'systemctl gagal' };
+  }
+}
+
+function writeIpLimitTimerUnit(intervalMinutes) {
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-iplimit.timer', `[Unit]
+Description=Run SC 1FORCR IP Limit Checker every ${intervalMinutes} minutes
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=${intervalMinutes}min
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-iplimit.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+}
+
+function writeAutoBackupTimerUnit(settings) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-autobackup.service')) return false;
+  const modeRaw = String(settings.AUTO_BACKUP_SCHEDULE_MODE || 'interval').trim().toLowerCase();
+  const mode = /^(daily|daily_wib|wib)$/.test(modeRaw) ? 'daily_wib' : 'interval';
+  const interval = intSetting(settings, 'AUTO_BACKUP_INTERVAL_MINUTES', 1440, 1, 10080);
+  const hour = intSetting(settings, 'AUTO_BACKUP_WIB_HOUR', 2, 0, 23);
+  if (mode === 'daily_wib') {
+    fs.writeFileSync('/etc/systemd/system/sc-1forcr-autobackup.timer', `[Unit]
+Description=Run SC 1FORCR auto backup daily at ${String(hour).padStart(2, '0')}:00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+    return true;
+  }
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-autobackup.timer', `[Unit]
+Description=Run SC 1FORCR auto backup every ${interval} minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${interval}min
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+  return true;
+}
+
+function writeAutoRebootTimerUnit(settings) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-autoreboot.service')) return false;
+  const interval = intSetting(settings, 'AUTO_REBOOT_INTERVAL_MINUTES', 1440, 30, 10080);
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-autoreboot.timer', `[Unit]
+Description=Run SC 1FORCR auto reboot every ${interval} minutes
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=${interval}min
+Persistent=true
+AccuracySec=1min
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+  return true;
+}
+
+function writePullUpdateTimerUnit(settings) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-pull-update.service')) return false;
+  const interval = intSetting(settings, 'AUTO_PULL_UPDATE_INTERVAL_MINUTES', 10, 1, 1440);
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-pull-update.timer', `[Unit]
+Description=Check SC 1FORCR update trigger every ${interval} minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=${interval}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-pull-update.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+  return true;
+}
+
+function writeOnlineNotifyTimerUnit(settings) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-online-notify.service')) return false;
+  const interval = intSetting(settings, 'ONLINE_NOTIFY_INTERVAL_HOURS', 3, 1, 168);
+  fs.writeFileSync('/etc/systemd/system/sc-1forcr-online-notify.timer', `[Unit]
+Description=Run SC 1FORCR online account notifier every ${interval} hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${interval}h
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-online-notify.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+  return true;
+}
+
+function applyRuntimeSettingsUnits(settings) {
+  const actions = [];
+  writeIpLimitTimerUnit(intSetting(settings, 'IPLIMIT_CHECK_INTERVAL_MINUTES', 1, 1, 1440));
+  const hasAutoBackupTimer = writeAutoBackupTimerUnit(settings);
+  const hasAutoRebootTimer = writeAutoRebootTimerUnit(settings);
+  const hasPullUpdateTimer = writePullUpdateTimerUnit(settings);
+  const hasOnlineNotifyTimer = writeOnlineNotifyTimerUnit(settings);
+
+  actions.push(runSystemctl(['daemon-reload']));
+  actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-iplimit.timer']));
+  actions.push(runSystemctl(['restart', 'sc-1forcr-iplimit.timer']));
+  actions.push(runSystemctl(['start', 'sc-1forcr-iplimit.service']));
+
+  if (hasAutoBackupTimer) {
+    if (enabledSetting(settings, 'AUTO_BACKUP_ENABLE', '1') === '1') {
+      actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-autobackup.timer']));
+      actions.push(runSystemctl(['restart', 'sc-1forcr-autobackup.timer']));
+    } else {
+      actions.push(runSystemctl(['disable', '--now', 'sc-1forcr-autobackup.timer']));
+    }
+  }
+
+  if (hasAutoRebootTimer) {
+    if (enabledSetting(settings, 'AUTO_REBOOT_ENABLE', '1') === '1') {
+      actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-autoreboot.timer']));
+      actions.push(runSystemctl(['restart', 'sc-1forcr-autoreboot.timer']));
+    } else {
+      actions.push(runSystemctl(['disable', '--now', 'sc-1forcr-autoreboot.timer']));
+    }
+  }
+
+  if (hasPullUpdateTimer) {
+    if (enabledSetting(settings, 'AUTO_PULL_UPDATE_ENABLE', '1') === '1') {
+      actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-pull-update.timer']));
+      actions.push(runSystemctl(['restart', 'sc-1forcr-pull-update.timer']));
+    } else {
+      actions.push(runSystemctl(['disable', '--now', 'sc-1forcr-pull-update.timer']));
+    }
+  }
+
+  if (hasOnlineNotifyTimer) {
+    if (enabledSetting(settings, 'ONLINE_NOTIFY_ENABLE', '1') === '1') {
+      actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-online-notify.timer']));
+      actions.push(runSystemctl(['restart', 'sc-1forcr-online-notify.timer']));
+    } else {
+      actions.push(runSystemctl(['disable', '--now', 'sc-1forcr-online-notify.timer']));
+    }
+  }
+
+  return actions;
+}
+
+function sendExportRuntimeSettings(res) {
+  try {
+    const settings = readRuntimeSettings();
+    return res.json({
+      ok: true,
+      settings,
+      total_settings: Object.keys(settings).length,
+      runtime_env_path: SC_RUNTIME_ENV_FILE,
+      app_env_path: SC_APP_ENV_FILE
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, message: `gagal export settings: ${err.message}` });
+  }
+}
+
+function restoreRuntimeSettings(settingsInput) {
+  const settings = filterRuntimeSettings(settingsInput);
+  const total = Object.keys(settings).length;
+  if (total === 0) {
+    return { ok: false, message: 'settings valid tidak ditemukan' };
+  }
+
+  writeRuntimeSettingsFile(SC_RUNTIME_ENV_FILE, settings);
+  if (fs.existsSync(SC_APP_ENV_FILE)) {
+    writeRuntimeSettingsFile(SC_APP_ENV_FILE, settings);
+  }
+
+  const effectiveSettings = {
+    ...readRuntimeSettings(),
+    ...settings
+  };
+  const unitActions = applyRuntimeSettingsUnits(effectiveSettings);
+  const apiRestart = runSystemctl(['restart', 'sc-1forcr-api']);
+
+  return {
+    ok: true,
+    restored_settings: total,
+    settings,
+    unit_actions: unitActions,
+    api_restart: apiRestart
+  };
+}
+
 function sendExportAccounts(db, res, rawType, rawLimit) {
   const type = String(rawType || '').trim().toLowerCase();
   const table = getAccountTableByType(type);
@@ -1829,6 +2221,13 @@ app.get('/internal/export-banner-config', (req, res) => {
   });
 });
 
+app.get('/internal/export-runtime-settings', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    return sendExportRuntimeSettings(res);
+  });
+});
+
 app.post('/internal/import-accounts', (req, res) => {
   const type = String(req.body?.type || '').trim();
   const accounts = req.body?.accounts;
@@ -1886,6 +2285,17 @@ app.post('/internal/restore-banner-config', (req, res) => {
   return authorizeAndRun(req, res, (db) => {
     db.close();
     const result = restoreBannerConfig(req.body || {});
+    if (!result.ok) {
+      return res.status(400).json({ ok: false, message: result.message });
+    }
+    return res.json(result);
+  });
+});
+
+app.post('/internal/restore-runtime-settings', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    const result = restoreRuntimeSettings(req.body?.settings || req.body || {});
     if (!result.ok) {
       return res.status(400).json({ ok: false, message: result.message });
     }

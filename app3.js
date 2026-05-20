@@ -170,6 +170,22 @@ async function initDb() {
     new_ip TEXT NOT NULL,
     changed_at INTEGER NOT NULL
   )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS sc_update_triggers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version TEXT NOT NULL UNIQUE,
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    triggered_by INTEGER,
+    status TEXT DEFAULT 'active'
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS sc_update_acks (
+    vps_ip TEXT NOT NULL,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (vps_ip, version)
+  )`);
   await ensureScRegistrationSchema();
   await ensureUsersSchema();
   await ensurePendingDepositSchema();
@@ -1367,6 +1383,55 @@ async function listActiveScHosts(limit = 1000) {
     .filter((ip) => isIpv4(ip));
 }
 
+async function countActiveScRegistrations() {
+  const now = Date.now();
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [now, now]
+  ).catch(() => {});
+  const row = await dbGet(
+    "SELECT COUNT(DISTINCT vps_ip) AS total FROM sc_registrations WHERE status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
+    [now]
+  );
+  return Number(row?.total || 0);
+}
+
+async function getLatestScUpdateTrigger() {
+  return dbGet(
+    "SELECT version, note, created_at, triggered_by, status FROM sc_update_triggers WHERE status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1"
+  );
+}
+
+async function createScUpdateTrigger(adminId, noteInput = '') {
+  const now = Date.now();
+  const version = `bot-${now}`;
+  const note = String(noteInput || '').replace(/\s+/g, ' ').trim().slice(0, 160) || 'manual bot trigger';
+  await dbRun(
+    'INSERT INTO sc_update_triggers (version, note, created_at, triggered_by, status) VALUES (?, ?, ?, ?, ?)',
+    [version, note, now, Number(adminId || 0) || null, 'active']
+  );
+  return { version, note, created_at: now };
+}
+
+async function getScUpdateTriggerAckSummary(version) {
+  const v = String(version || '').trim();
+  if (!v) return { success: 0, running: 0, failed: 0, total: 0 };
+  const rows = await dbAll(
+    "SELECT LOWER(TRIM(status)) AS status, COUNT(1) AS total FROM sc_update_acks WHERE version = ? GROUP BY LOWER(TRIM(status))",
+    [v]
+  );
+  const out = { success: 0, running: 0, failed: 0, total: 0 };
+  for (const row of rows) {
+    const st = String(row?.status || '').trim().toLowerCase();
+    const total = Number(row?.total || 0);
+    if (st === 'success') out.success += total;
+    else if (st === 'running') out.running += total;
+    else if (st === 'failed') out.failed += total;
+    out.total += total;
+  }
+  return out;
+}
+
 async function adminRemoveRegisteredIp(ip, adminId) {
   const now = Date.now();
   const rows = await dbAll(
@@ -1961,6 +2026,7 @@ function adminMenu() {
     [Markup.button.callback('🌐 Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('📚 Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('❌ Hapus Domain', 'm_admin_remove_domain')],
     [Markup.button.callback('⬆️ Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('⬆️ Unggah Script Summary API', 'm_admin_upload_summary_api')],
+    [Markup.button.callback('🚀 Trigger Update Semua SC', 'm_admin_trigger_sc_update')],
 
     [Markup.button.callback('💸 Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
     [Markup.button.callback('⚙️ Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('🛠️ Ubah Pengaturan', 'm_admin_env_set')],
@@ -3296,6 +3362,59 @@ bot.action('m_admin_upload_summary_api', async (ctx) => {
   await ctx.reply(
     'Upload file update Summary API (.sh) sebagai document.\n' +
       'File akan disimpan lokal di VPS bot ini sebagai sumber installer Summary API.'
+  );
+});
+
+bot.action('m_admin_trigger_sc_update', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const [activeCount, latest] = await Promise.all([
+    countActiveScRegistrations().catch(() => 0),
+    getLatestScUpdateTrigger().catch(() => null)
+  ]);
+  const ack = latest?.version ? await getScUpdateTriggerAckSummary(latest.version).catch(() => null) : null;
+  const installerPath = await getScInstallerLocalPath().catch(() => DEFAULT_SC_INSTALLER_LOCAL_PATH);
+  const hasInstaller = fs.existsSync(installerPath);
+  const lines = [
+    `Target aktif : ${activeCount} IP VPS`,
+    `Installer   : ${installerPath}`,
+    `File ada    : ${hasInstaller ? 'YA' : 'TIDAK'}`,
+    latest ? `Trigger terakhir: ${latest.version} (${formatDateTime(latest.created_at)})` : 'Trigger terakhir: belum ada',
+    ack ? `Ack terakhir: success=${ack.success} running=${ack.running} failed=${ack.failed}` : '',
+    '',
+    'VPS akan mengambil update via timer auto-pull tanpa perlu key tersimpan di bot.',
+    'Lanjut trigger update sekarang?'
+  ];
+  return ctx.reply(
+    uiBox('TRIGGER UPDATE SEMUA SC', lines),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Ya, trigger sekarang', 'm_admin_trigger_sc_update_confirm')],
+      [Markup.button.callback('Batal', 'm_admin_menu')]
+    ])
+  );
+});
+
+bot.action('m_admin_trigger_sc_update_confirm', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const installerPath = await getScInstallerLocalPath().catch(() => DEFAULT_SC_INSTALLER_LOCAL_PATH);
+  if (!fs.existsSync(installerPath)) {
+    return ctx.reply(`File installer belum ada: ${installerPath}\nUpload dulu dari menu admin.`, adminMenu());
+  }
+  const [activeCount, trigger] = await Promise.all([
+    countActiveScRegistrations().catch(() => 0),
+    createScUpdateTrigger(ctx.from.id, `manual trigger by ${ctx.from.id}`)
+  ]);
+  return ctx.reply(
+    uiBox('TRIGGER UPDATE DIKIRIM', [
+      `Version  : ${trigger.version}`,
+      `Target   : ${activeCount} IP VPS aktif`,
+      `Waktu    : ${formatDateTime(trigger.created_at)}`,
+      '',
+      'VPS yang sudah punya auto-pull akan update saat timer berikutnya.',
+      'Default interval installer baru: 10 menit.'
+    ]),
+    adminMenu()
   );
 });
 
@@ -5175,9 +5294,19 @@ bot.on('text', async (ctx) => {
         // optional endpoint
       }
 
+      let runtimeSettings = {};
+      try {
+        const scfg = await apiGet(state.host, key, '/internal/export-runtime-settings');
+        if (scfg?.settings && typeof scfg.settings === 'object' && !Array.isArray(scfg.settings)) {
+          runtimeSettings = scfg.settings;
+        }
+      } catch (_) {
+        // optional endpoint
+      }
+
       const backupPayload = {
         meta: {
-          format: 'sc1forcr-backup-v1',
+          format: 'sc1forcr-backup-v2',
           created_at: new Date().toISOString(),
           source_host: state.host,
           user_id: ctx.from.id
@@ -5189,7 +5318,8 @@ bot.on('text', async (ctx) => {
           trojan: Array.isArray(trojan.accounts) ? trojan.accounts : [],
           zivpn_auth: zivpnAuth,
           banner_html: bannerHtml,
-          banner_txt: bannerTxt
+          banner_txt: bannerTxt,
+          settings: runtimeSettings
         }
       };
 
@@ -5202,7 +5332,7 @@ bot.on('text', async (ctx) => {
       userState.delete(ctx.chat.id);
       await ctx.replyWithDocument(
         { source: content, filename },
-        { caption: `Backup selesai.\nIP VPS: ${state.host}\nSSH/ZIVPN: ${backupPayload.data.ssh.length}, VMESS: ${backupPayload.data.vmess.length}, VLESS: ${backupPayload.data.vless.length}, TROJAN: ${backupPayload.data.trojan.length}` }
+        { caption: `Backup selesai.\nIP VPS: ${state.host}\nSSH/ZIVPN: ${backupPayload.data.ssh.length}, VMESS: ${backupPayload.data.vmess.length}, VLESS: ${backupPayload.data.vless.length}, TROJAN: ${backupPayload.data.trojan.length}\nSettings: ${Object.keys(runtimeSettings).length}` }
       );
       return;
     }
@@ -5365,6 +5495,18 @@ bot.on('document', async (ctx) => {
     const backupData = parsed?.data || {};
     const types = ['ssh', 'vmess', 'vless', 'trojan'];
     const resultLines = [];
+
+    const runtimeSettings = backupData.settings || backupData.runtime_settings || null;
+    if (runtimeSettings && typeof runtimeSettings === 'object' && !Array.isArray(runtimeSettings) && Object.keys(runtimeSettings).length > 0) {
+      try {
+        const restoredSettings = await apiPost(state.host, state.key, '/internal/restore-runtime-settings', { settings: runtimeSettings });
+        resultLines.push(`Settings: restored ${Number(restoredSettings?.restored_settings || 0)}`);
+      } catch (sErr) {
+        resultLines.push(`Settings: gagal (${parseErr(sErr)})`);
+      }
+    } else {
+      resultLines.push('Settings: tidak ada di backup');
+    }
 
     const restoredAccountsByType = {};
     for (const type of types) {

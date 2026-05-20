@@ -5263,7 +5263,17 @@ function parseXrayRecentIpMap() {
         console.log(`[iplimit-debug][xray] mobile-handoff filtered user=${email} old_ip=${cur.ip} lag=${lagSec}s hits=${cur.hits}`);
       }
     }
-    map.set(email, chosen);
+    const chosenList = Array.from(chosen);
+    // Anti false-positive Xray mobile/dual-stack:
+    // 1 HP sering muncul sebagai 2 source IP (IPv4+IPv6/NAT handoff/proxy path).
+    // Samakan dengan normalisasi ZIVPN: 1-2 IP => 1 device, 3-4 IP => 2 device.
+    if (chosenList.length <= 2) {
+      map.set(email, new Set([latest.ip]));
+    } else if (chosenList.length <= 4) {
+      map.set(email, new Set(chosenList.slice(0, 2)));
+    } else {
+      map.set(email, chosen);
+    }
   }
   return map;
 }
@@ -7594,9 +7604,15 @@ if [[ -f /var/log/xray/access.log ]]; then
         for (k in seen) {
           split(k, a, /\|/)
           user=a[1]
-          ipcnt[user]++
+          ipcnt_raw[user]++
         }
-        for (u in ipcnt) printf "%s(%d)\n", u, ipcnt[u]
+        for (u in ipcnt_raw) {
+          raw=ipcnt_raw[u]
+          if (raw >= 1 && raw <= 2) cnt=1
+          else if (raw >= 3 && raw <= 4) cnt=2
+          else cnt=raw
+          printf "%s(%d)\n", u, cnt
+        }
       }
     ' | sort || true)"
   xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
@@ -12510,10 +12526,16 @@ xray_log_snapshot() {
         u=a[1]; ip=a[2];
         if (last_ts[k] < active_cutoff) continue;
         if (hits[k] < min_hits && lastip[u] != ip) continue;
-        cnt[u]++;
+        cnt_raw[u]++;
       }
       for (u in seen) {
-        printf "%s|%d|%s\n", u, (u in cnt ? cnt[u] : 0), (u in lastip ? lastip[u] : "-");
+        raw=(u in cnt_raw ? cnt_raw[u] : 0);
+        # Anti false-positive Xray mobile/dual-stack:
+        # 1-2 IP aktif cepat dihitung 1 device, 3-4 IP dihitung 2 device.
+        if (raw >= 1 && raw <= 2) cnt=1;
+        else if (raw >= 3 && raw <= 4) cnt=2;
+        else cnt=raw;
+        printf "%s|%d|%s\n", u, cnt, (u in lastip ? lastip[u] : "-");
       }
     }' > "${dst}"
 }

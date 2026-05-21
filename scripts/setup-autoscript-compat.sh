@@ -3357,6 +3357,67 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   return payload;
 }
 
+function validateSshPassword(password) {
+  const pass = String(password || '').trim();
+  if (!pass) throw new Error('password required');
+  if (/[\s:]/.test(pass)) throw new Error('password tidak boleh mengandung spasi, enter, atau titik dua');
+  if (pass.length > 128) throw new Error('password terlalu panjang');
+  return pass;
+}
+
+async function changeSshPassword(usernameRaw, passwordRaw) {
+  const username = String(usernameRaw || '').trim().toLowerCase();
+  const password = validateSshPassword(passwordRaw);
+  if (!username) throw new Error('username required');
+  const row = await get(
+    "SELECT username, password, date_exp, quota, limitip FROM account_sshs WHERE LOWER(username)=LOWER(?) LIMIT 1",
+    [username]
+  ).catch(() => null);
+  if (!row) {
+    const err = new Error(`account ${username} not found on server`);
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const realUsername = String(row?.username || username).trim();
+  const oldPassword = String(row?.password || '').trim();
+  const linuxExpDate = ymdFromDateExp(row?.date_exp);
+  ensureLinuxUser(realUsername, password, linuxExpDate);
+  await run("UPDATE account_sshs SET password=? WHERE LOWER(username)=LOWER(?)", [password, realUsername]);
+  syncZivpnUser(realUsername, true);
+  if (oldPassword && oldPassword !== password) syncUdpcustomUser(oldPassword, false);
+  syncUdpcustomUser(password, true);
+  return {
+    username: realUsername,
+    password,
+    exp: row?.date_exp || '',
+    quota: String(row?.quota ?? 0),
+    limitip: String(row?.limitip ?? 0),
+    time: nowTime()
+  };
+}
+
+async function changeAllSshPasswords(passwordRaw) {
+  const password = validateSshPassword(passwordRaw);
+  const rows = await all(
+    "SELECT username, password AS old_password, date_exp FROM account_sshs ORDER BY LOWER(username)"
+  ).catch(() => []);
+  let changed = 0;
+  for (const row of rows) {
+    const username = String(row?.username || '').trim();
+    if (!username) continue;
+    const oldPassword = String(row?.old_password || '').trim();
+    const linuxExpDate = ymdFromDateExp(row?.date_exp);
+    ensureLinuxUser(username, password, linuxExpDate);
+    await run("UPDATE account_sshs SET password=? WHERE LOWER(username)=LOWER(?)", [password, username]);
+    syncZivpnUser(username, true);
+    if (oldPassword && oldPassword !== password) syncUdpcustomUser(oldPassword, false);
+    syncUdpcustomUser(password, true);
+    changed += 1;
+  }
+  return { password, changed, total: rows.length, time: nowTime() };
+}
+
 app.post('/vps/sshvpn', async (req, res) => {
   try {
     return ok(res, await createOrUpdateSshFromBody(req, req.body, null));
@@ -3368,6 +3429,36 @@ app.post('/vps/sshvpn', async (req, res) => {
 app.post('/vps/trialsshvpn', async (req, res) => {
   try {
     return ok(res, await createOrUpdateSshFromBody(req, req.body, 1));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+
+app.patch('/vps/passwordsshvpn/:username', async (req, res) => {
+  try {
+    return ok(res, await changeSshPassword(req.params.username, req.body?.password));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+app.post('/vps/passwordsshvpn/:username', async (req, res) => {
+  try {
+    return ok(res, await changeSshPassword(req.params.username, req.body?.password));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+
+app.patch('/vps/passwordsshvpn-all', async (req, res) => {
+  try {
+    return ok(res, await changeAllSshPasswords(req.body?.password));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+app.post('/vps/passwordsshvpn-all', async (req, res) => {
+  try {
+    return ok(res, await changeAllSshPasswords(req.body?.password));
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
   }
@@ -9742,6 +9833,88 @@ edit_limit_ip_all_accounts() {
   echo "Total akun ter-update: ${changed}"
 }
 
+validate_ssh_password_cli() {
+  local password="$1"
+  if [[ -z "${password}" ]]; then
+    echo "Password tidak boleh kosong."
+    return 1
+  fi
+  if [[ "${password}" == *":"* || "${password}" =~ [[:space:]] ]]; then
+    echo "Password tidak boleh mengandung spasi, enter, atau titik dua."
+    return 1
+  fi
+  if [[ "${#password}" -gt 128 ]]; then
+    echo "Password terlalu panjang."
+    return 1
+  fi
+  return 0
+}
+
+change_ssh_password_account() {
+  local username password payload resp code message host exp limitip
+  echo "GANTI PASSWORD SSH/ZIVPN/UDPHC"
+  username="$(pick_existing_username "ssh")" || return
+  printf "%-12s : %s\n" "Username" "${username}"
+  prompt_input password "Password baru: " || return
+  password="$(echo "${password}" | tr -d '\r')"
+  validate_ssh_password_cli "${password}" || return
+
+  payload="$(jq -nc --arg p "${password}" '{password:$p}')"
+  resp="$(api_call "PATCH" "/passwordsshvpn/${username}" "${payload}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal ganti password SSH: ${message}"
+    return
+  fi
+
+  host="${DOMAIN}"
+  exp="$(echo "${resp}" | jq -r '.data.exp // "-"' 2>/dev/null || echo "-")"
+  limitip="$(echo "${resp}" | jq -r '.data.limitip // "0"' 2>/dev/null || echo "0")"
+  cat <<EOT_PASS_SSH
+=============================
+ PASSWORD SSH BERHASIL DIGANTI
+=============================
+Username     : ${username}
+Password     : ${password}
+Expired      : ${exp}
+IP Limit     : ${limitip}
+SSH WS       : ${host}:80@${username}:${password}
+SSH SSL      : ${host}:443@${username}:${password}
+EOT_PASS_SSH
+  telegram_notify_action "CHANGE_PASSWORD" "ssh" "${username}"
+}
+
+change_ssh_password_all_accounts() {
+  local password confirm payload resp code message changed total
+  echo "GANTI PASSWORD SEMUA AKUN SSH/ZIVPN/UDPHC"
+  echo "Semua akun di tabel SSH akan memakai password yang sama."
+  prompt_input password "Password baru untuk semua akun SSH: " || return
+  password="$(echo "${password}" | tr -d '\r')"
+  validate_ssh_password_cli "${password}" || return
+  prompt_input confirm "Ketik GANTI untuk lanjut: " || return
+  if [[ "${confirm}" != "GANTI" ]]; then
+    echo "Dibatalkan."
+    return
+  fi
+
+  payload="$(jq -nc --arg p "${password}" '{password:$p}')"
+  resp="$(api_call "PATCH" "/passwordsshvpn-all" "${payload}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal ganti password semua akun SSH: ${message}"
+    return
+  fi
+
+  changed="$(echo "${resp}" | jq -r '.data.changed // 0' 2>/dev/null || echo 0)"
+  total="$(echo "${resp}" | jq -r '.data.total // 0' 2>/dev/null || echo 0)"
+  echo "Password semua akun SSH berhasil diganti."
+  echo "Password baru : ${password}"
+  echo "Total akun    : ${total}"
+  echo "Ter-update    : ${changed}"
+}
+
 account_table_by_type() {
   case "$1" in
     ssh|zivpn) echo "account_sshs" ;;
@@ -10436,9 +10609,11 @@ akun_menu() {
       "10) Edit Limit IP Semua Akun" \
       "11) Tambah Masa Aktif Semua Akun" \
       "12) Edit UUID Xray" \
+      "13) Ganti Password SSH" \
+      "14) Ganti Password Semua SSH" \
       "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-12]: "; then
+    if ! prompt_input am "Pilih menu [0-14]: "; then
       return
     fi
     clear
@@ -10462,6 +10637,8 @@ akun_menu() {
       10) edit_limit_ip_all_accounts || true ;;
       11) extend_expired_all_accounts || true ;;
       12) edit_uuid_xray_account || true ;;
+      13) change_ssh_password_account || true ;;
+      14) change_ssh_password_all_accounts || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

@@ -58,7 +58,7 @@ set -euo pipefail
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
-#   AUTO_PULL_UPDATE_ENABLE=0                    (opsional, default nonaktif; update manual via menu)
+#   AUTO_PULL_UPDATE_ENABLE=1                    (opsional, 1=cek trigger update dari bot)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
@@ -149,8 +149,8 @@ AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
-AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-0}"
-AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-30}"
+AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
@@ -417,6 +417,16 @@ enforce_install_license() {
 
   log "Validasi lisensi ke server..."
   resp="$(
+    curl -4fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
+      -X POST "${LICENSE_API_URL}" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Accept: application/json" \
+      --data-urlencode "license_key=${LICENSE_KEY}" \
+      --data-urlencode "ip=${vps_ip}" \
+      --data-urlencode "domain=${DOMAIN}" \
+      --data-urlencode "machine_id=${machine_id}" \
+      --data-urlencode "script_version=${SCRIPT_VERSION}" \
+      2>/dev/null ||
     curl -fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
       -X POST "${LICENSE_API_URL}" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
@@ -426,7 +436,8 @@ enforce_install_license() {
       --data-urlencode "domain=${DOMAIN}" \
       --data-urlencode "machine_id=${machine_id}" \
       --data-urlencode "script_version=${SCRIPT_VERSION}" \
-      2>/dev/null || true
+      2>/dev/null ||
+    true
   )"
   if [[ -z "${resp}" ]]; then
     echo "Install ditolak: server lisensi tidak merespon."
@@ -669,7 +680,7 @@ install_base_packages() {
     haproxy \
     nginx certbot \
     openssh-server dropbear pwgen \
-    build-essential python3 make g++ gcc libc6-dev pkg-config bzip2 zlib1g-dev \
+    build-essential python3 make g++ gcc libc6-dev pkg-config libsqlite3-dev bzip2 zlib1g-dev \
     netfilter-persistent iptables-persistent
 
   # Paket opsional (beberapa distro/repo lama tidak selalu menyediakan).
@@ -3221,7 +3232,7 @@ async function cleanupExpiredXrayAccounts() {
         date_exp: exp,
         limitip: String(row?.limitip ?? '0')
       });
-      await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
+      await run(`UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
       changed = true;
     }
   }
@@ -3346,6 +3357,67 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   return payload;
 }
 
+function validateSshPassword(password) {
+  const pass = String(password || '').trim();
+  if (!pass) throw new Error('password required');
+  if (/[\s:]/.test(pass)) throw new Error('password tidak boleh mengandung spasi, enter, atau titik dua');
+  if (pass.length > 128) throw new Error('password terlalu panjang');
+  return pass;
+}
+
+async function changeSshPassword(usernameRaw, passwordRaw) {
+  const username = String(usernameRaw || '').trim().toLowerCase();
+  const password = validateSshPassword(passwordRaw);
+  if (!username) throw new Error('username required');
+  const row = await get(
+    "SELECT username, password, date_exp, quota, limitip FROM account_sshs WHERE LOWER(username)=LOWER(?) LIMIT 1",
+    [username]
+  ).catch(() => null);
+  if (!row) {
+    const err = new Error(`account ${username} not found on server`);
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const realUsername = String(row?.username || username).trim();
+  const oldPassword = String(row?.password || '').trim();
+  const linuxExpDate = ymdFromDateExp(row?.date_exp);
+  ensureLinuxUser(realUsername, password, linuxExpDate);
+  await run("UPDATE account_sshs SET password=? WHERE LOWER(username)=LOWER(?)", [password, realUsername]);
+  syncZivpnUser(realUsername, true);
+  if (oldPassword && oldPassword !== password) syncUdpcustomUser(oldPassword, false);
+  syncUdpcustomUser(password, true);
+  return {
+    username: realUsername,
+    password,
+    exp: row?.date_exp || '',
+    quota: String(row?.quota ?? 0),
+    limitip: String(row?.limitip ?? 0),
+    time: nowTime()
+  };
+}
+
+async function changeAllSshPasswords(passwordRaw) {
+  const password = validateSshPassword(passwordRaw);
+  const rows = await all(
+    "SELECT username, password AS old_password, date_exp FROM account_sshs ORDER BY LOWER(username)"
+  ).catch(() => []);
+  let changed = 0;
+  for (const row of rows) {
+    const username = String(row?.username || '').trim();
+    if (!username) continue;
+    const oldPassword = String(row?.old_password || '').trim();
+    const linuxExpDate = ymdFromDateExp(row?.date_exp);
+    ensureLinuxUser(username, password, linuxExpDate);
+    await run("UPDATE account_sshs SET password=? WHERE LOWER(username)=LOWER(?)", [password, username]);
+    syncZivpnUser(username, true);
+    if (oldPassword && oldPassword !== password) syncUdpcustomUser(oldPassword, false);
+    syncUdpcustomUser(password, true);
+    changed += 1;
+  }
+  return { password, changed, total: rows.length, time: nowTime() };
+}
+
 app.post('/vps/sshvpn', async (req, res) => {
   try {
     return ok(res, await createOrUpdateSshFromBody(req, req.body, null));
@@ -3357,6 +3429,36 @@ app.post('/vps/sshvpn', async (req, res) => {
 app.post('/vps/trialsshvpn', async (req, res) => {
   try {
     return ok(res, await createOrUpdateSshFromBody(req, req.body, 1));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+
+app.patch('/vps/passwordsshvpn/:username', async (req, res) => {
+  try {
+    return ok(res, await changeSshPassword(req.params.username, req.body?.password));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+app.post('/vps/passwordsshvpn/:username', async (req, res) => {
+  try {
+    return ok(res, await changeSshPassword(req.params.username, req.body?.password));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+
+app.patch('/vps/passwordsshvpn-all', async (req, res) => {
+  try {
+    return ok(res, await changeAllSshPasswords(req.body?.password));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+app.post('/vps/passwordsshvpn-all', async (req, res) => {
+  try {
+    return ok(res, await changeAllSshPasswords(req.body?.password));
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
   }
@@ -3391,6 +3493,10 @@ async function renewSsh(req, res) {
     const expDate = dateExpPlusDays(exp, baseExp);
     const linuxExpDate = ymdFromDateExp(expDate);
     if (!row) {
+      const recoverMissing = body?.recover_missing === true || String(body?.recover_missing || '').trim() === '1';
+      if (!recoverMissing || !bodyPass) {
+        return fail(res, 404, `account ${username} not found on server`);
+      }
       const pass = bodyPass || username;
       const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : 0;
       const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : 0;
@@ -3409,6 +3515,7 @@ async function renewSsh(req, res) {
         quota: String(nextQuota),
         limitip: String(nextLimitIp),
         created: true,
+        recovered: true,
         time: nowTime()
       });
     }
@@ -4011,12 +4118,15 @@ EOF
   export npm_config_build_from_source=true
   export npm_config_fallback_to_build=true
   export npm_config_update_binary=false
+  npm config set fund false >/dev/null 2>&1 || true
+  npm config set audit false >/dev/null 2>&1 || true
 
   local need_npm_install="0"
+  local node_deps_check="require('sqlite3'); require('express'); require('dotenv'); require('ws');"
   if [[ ! -d node_modules ]]; then
     need_npm_install="1"
     log "node_modules belum ada, install dependency..."
-  elif ! node -e "require('sqlite3'); require('express'); require('dotenv'); require('ws')" >/dev/null 2>&1; then
+  elif ! node -e "${node_deps_check}" >/dev/null 2>&1; then
     need_npm_install="1"
     log "Dependency Node terdeteksi rusak/kurang, reinstall dependency..."
   else
@@ -4024,11 +4134,38 @@ EOF
   fi
 
   if [[ "${need_npm_install}" == "1" ]]; then
+    log "Menyiapkan paket build untuk sqlite3 native binding..."
+    if ! apt_get_safe install -y build-essential python3 make g++ gcc libc6-dev pkg-config libsqlite3-dev >/tmp/sc-1forcr-node-build-deps.log 2>&1; then
+      log "Install paket build sqlite3 gagal. Cek log: /tmp/sc-1forcr-node-build-deps.log"
+      tail -n 80 /tmp/sc-1forcr-node-build-deps.log || true
+      exit 1
+    fi
+
+    if [[ -d node_modules || -f package-lock.json ]]; then
+      log "Membersihkan dependency Node lama supaya binding sqlite3 dibuat ulang..."
+      rm -rf node_modules package-lock.json
+    fi
+
     if ! npm install --omit=dev --foreground-scripts >/tmp/sc-1forcr-npm-install.log 2>&1; then
       log "Install npm dependency gagal. Cek log: /tmp/sc-1forcr-npm-install.log"
       tail -n 80 /tmp/sc-1forcr-npm-install.log || true
       exit 1
     fi
+  fi
+
+  if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-node-deps-check.log 2>&1; then
+    log "sqlite3 belum bisa diload setelah npm install, coba rebuild native binding..."
+    if ! npm rebuild sqlite3 --build-from-source --foreground-scripts >/tmp/sc-1forcr-npm-rebuild.log 2>&1; then
+      log "Rebuild sqlite3 gagal. Cek log: /tmp/sc-1forcr-npm-rebuild.log"
+      tail -n 80 /tmp/sc-1forcr-npm-rebuild.log || true
+      exit 1
+    fi
+  fi
+
+  if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-node-deps-check.log 2>&1; then
+    log "Dependency Node masih gagal setelah rebuild. Cek log: /tmp/sc-1forcr-node-deps-check.log"
+    cat /tmp/sc-1forcr-node-deps-check.log || true
+    exit 1
   fi
 
   node -e "require('sqlite3'); console.log('sqlite3 load ok')"
@@ -5247,7 +5384,17 @@ function parseXrayRecentIpMap() {
         console.log(`[iplimit-debug][xray] mobile-handoff filtered user=${email} old_ip=${cur.ip} lag=${lagSec}s hits=${cur.hits}`);
       }
     }
-    map.set(email, chosen);
+    const chosenList = Array.from(chosen);
+    // Anti false-positive Xray mobile/dual-stack:
+    // 1 HP sering muncul sebagai 2 source IP (IPv4+IPv6/NAT handoff/proxy path).
+    // Samakan dengan normalisasi ZIVPN: 1-2 IP => 1 device, 3-4 IP => 2 device.
+    if (chosenList.length <= 2) {
+      map.set(email, new Set([latest.ip]));
+    } else if (chosenList.length <= 4) {
+      map.set(email, new Set(chosenList.slice(0, 2)));
+    } else {
+      map.set(email, chosen);
+    }
   }
   return map;
 }
@@ -5749,7 +5896,7 @@ async function enforceExpiredAccounts() {
     if (removeUdpcustomUser(user)) udphcSecretChanged = true;
     if (udphcSecretChanged) udpcustomChanged = true;
 
-    await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
+    await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
   }
@@ -5774,7 +5921,7 @@ async function enforceExpiredAccounts() {
         exp,
         limitip: Number(row?.limitip || 0)
       });
-      await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
+      await run(`UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       xrayChanged = true;
@@ -6783,9 +6930,94 @@ def fetch(table, cols):
         out.append(item)
     return out
 
+SETTINGS_KEYS = [
+    "AUTO_BACKUP_ENABLE",
+    "AUTO_BACKUP_DIR",
+    "AUTO_BACKUP_KEEP_DAYS",
+    "AUTO_BACKUP_INTERVAL_MINUTES",
+    "AUTO_BACKUP_SCHEDULE_MODE",
+    "AUTO_BACKUP_WIB_HOUR",
+    "AUTO_REBOOT_ENABLE",
+    "AUTO_REBOOT_INTERVAL_MINUTES",
+    "AUTO_PULL_UPDATE_ENABLE",
+    "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
+    "ONLINE_NOTIFY_ENABLE",
+    "ONLINE_NOTIFY_INTERVAL_HOURS",
+    "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
+    "IPLIMIT_CHECK_INTERVAL_MINUTES",
+    "IPLIMIT_LOCK_MINUTES",
+    "IPLIMIT_AUTO_LOCK_ENABLE",
+    "IPLIMIT_AUTO_TUNE",
+    "IPLIMIT_DEBUG",
+    "DROPBEAR_LOG_MAX_LINES",
+    "DROPBEAR_RECENT_LOG_MAX_LINES",
+    "UDPHC_LOG_LINES_HISTORY",
+    "UDPHC_LOG_LINES_REALTIME",
+    "UDPHC_LOG_LINES_CHECKER",
+    "XRAY_BLOCK_TCP_PORTS",
+    "XRAY_RECENT_WINDOW_MINUTES",
+    "XRAY_ACTIVE_WINDOW_SECONDS",
+    "XRAY_MIN_HITS_PER_IP",
+    "XRAY_PATHS_VMESS",
+    "XRAY_PATHS_VLESS",
+    "XRAY_PATHS_TROJAN",
+    "VMESS_BUG_PROFILE_ADDRESS",
+    "VMESS_BUG_PROFILE_SNI",
+    "VMESS_BUG_PROFILE_HOST",
+    "VMESS_BUG_PROFILE_ALLOW_INSECURE",
+    "ZIVPN_ACTIVE_WINDOW_SECONDS",
+    "ZIVPN_HANDOFF_GRACE_SECONDS",
+    "ZIVPN_LIVE_TTL_SECONDS",
+    "ZIVPN_AUTH_APPLY_MODE",
+    "ZIVPN_AUTH_MODE",
+    "ZIVPN_RELOAD_ON_AUTH_CHANGE",
+    "ACTIVE_UDP_BACKEND",
+    "SSH_HC_AUTH_LOOKBACK_HOURS",
+    "SSHWS_UDPGW_PORTS",
+    "SSH_TUNNEL_SHELL",
+    "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
+    "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
+    "SSHWS_LOOP_GUARD_ENABLE",
+    "SSHWS_LOOP_GUARD_PORTS",
+    "SSHWS_LOOP_GUARD_NEW_ABOVE",
+    "SSHWS_LOOP_GUARD_BURST",
+    "SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE",
+    "SSHWS_NGINX_LIMIT_ENABLE",
+    "SSHWS_NGINX_LIMIT_RATE",
+    "SSHWS_NGINX_LIMIT_BURST",
+    "SSHWS_NGINX_LIMIT_CONN",
+    "NGINX_WORKER_CONNECTIONS",
+    "NGINX_WORKER_RLIMIT_NOFILE",
+    "NGINX_SERVICE_LIMIT_NOFILE",
+]
+SETTINGS_KEY_SET = set(SETTINGS_KEYS)
+
+def unquote_env_value(value):
+    value = str(value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return value
+
+def load_runtime_settings(paths=("/opt/sc-1forcr/.env", "/etc/sc-1forcr.env")):
+    settings = {}
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    raw = line.strip()
+                    if not raw or raw.startswith("#") or "=" not in raw:
+                        continue
+                    key, value = raw.split("=", 1)
+                    key = key.strip()
+                    if key in SETTINGS_KEY_SET:
+                        settings[key] = unquote_env_value(value)
+        except Exception:
+            pass
+    return settings
+
 payload = {
     "meta": {
-        "format": "sc1forcr-accounts-backup-v1",
+        "format": "sc1forcr-accounts-backup-v2",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_domain": domain or "unknown",
     },
@@ -6797,6 +7029,7 @@ payload = {
         "zivpn_auth": [],
         "banner_html": "",
         "banner_txt": "",
+        "settings": load_runtime_settings(),
     },
 }
 
@@ -6968,10 +7201,183 @@ CREATE TABLE IF NOT EXISTS account_trojans (
 );
 SQL
 
+apply_restored_runtime_units() {
+  local iplimit_interval backup_enable backup_mode backup_interval backup_wib_hour
+  local auto_reboot_enable auto_reboot_interval pull_enable pull_interval notify_enable notify_interval
+
+  if [[ -f /etc/sc-1forcr.env ]]; then
+    # shellcheck disable=SC1091
+    source /etc/sc-1forcr.env || true
+  fi
+
+  iplimit_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}" | tr -cd '0-9')"
+  [[ -z "${iplimit_interval}" || "${iplimit_interval}" -lt 1 || "${iplimit_interval}" -gt 1440 ]] && iplimit_interval="1"
+  cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR IP Limit Checker every ${iplimit_interval} minutes
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=${iplimit_interval}min
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-iplimit.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+
+  backup_enable="${AUTO_BACKUP_ENABLE:-1}"
+  [[ "${backup_enable}" != "0" ]] && backup_enable="1"
+  backup_mode="$(echo "${AUTO_BACKUP_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${backup_mode}" in
+    daily|daily_wib|wib) backup_mode="daily_wib" ;;
+    *) backup_mode="interval" ;;
+  esac
+  backup_interval="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  [[ -z "${backup_interval}" || "${backup_interval}" -lt 1 || "${backup_interval}" -gt 10080 ]] && backup_interval="1440"
+  backup_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
+  [[ -z "${backup_wib_hour}" || "${backup_wib_hour}" -gt 23 ]] && backup_wib_hour="2"
+  if [[ -f /etc/systemd/system/sc-1forcr-autobackup.service ]]; then
+    if [[ "${backup_mode}" == "daily_wib" ]]; then
+      cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR auto backup daily at $(printf '%02d' "${backup_wib_hour}"):00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+    else
+      cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR auto backup every ${backup_interval} minutes
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=${backup_interval}min
+AccuracySec=1s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+    fi
+  fi
+
+  auto_reboot_enable="${AUTO_REBOOT_ENABLE:-1}"
+  [[ "${auto_reboot_enable}" != "0" ]] && auto_reboot_enable="1"
+  auto_reboot_interval="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
+  [[ -z "${auto_reboot_interval}" || "${auto_reboot_interval}" -lt 30 || "${auto_reboot_interval}" -gt 10080 ]] && auto_reboot_interval="1440"
+  if [[ -f /etc/systemd/system/sc-1forcr-autoreboot.service ]]; then
+    cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR auto reboot every ${auto_reboot_interval} minutes
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=${auto_reboot_interval}min
+Persistent=true
+AccuracySec=1min
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  fi
+
+  pull_enable="${AUTO_PULL_UPDATE_ENABLE:-1}"
+  [[ "${pull_enable}" != "0" ]] && pull_enable="1"
+  pull_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  [[ -z "${pull_interval}" || "${pull_interval}" -lt 1 || "${pull_interval}" -gt 1440 ]] && pull_interval="10"
+  if [[ -f /etc/systemd/system/sc-1forcr-pull-update.service ]]; then
+    cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF_TIMER
+[Unit]
+Description=Check SC 1FORCR update trigger every ${pull_interval} minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=${pull_interval}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-pull-update.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  fi
+
+  notify_enable="${ONLINE_NOTIFY_ENABLE:-1}"
+  [[ "${notify_enable}" != "0" ]] && notify_enable="1"
+  notify_interval="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+  [[ -z "${notify_interval}" || "${notify_interval}" -lt 1 || "${notify_interval}" -gt 168 ]] && notify_interval="3"
+  if [[ -f /etc/systemd/system/sc-1forcr-online-notify.service ]]; then
+    cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR online account notifier every ${notify_interval} hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${notify_interval}h
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-online-notify.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+
+  if [[ "${backup_enable}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${auto_reboot_enable}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${pull_enable}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${notify_enable}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  fi
+}
+
 python3 - "${backup_file}" "${DB_PATH}" <<'PY'
 import json
 import sqlite3
 import sys
+import os
+import shlex
 
 backup_path = sys.argv[1]
 db_path = sys.argv[2]
@@ -7097,10 +7503,131 @@ def upsert_trojan(rows):
             ),
         )
 
+SETTINGS_KEYS = [
+    "AUTO_BACKUP_ENABLE",
+    "AUTO_BACKUP_DIR",
+    "AUTO_BACKUP_KEEP_DAYS",
+    "AUTO_BACKUP_INTERVAL_MINUTES",
+    "AUTO_BACKUP_SCHEDULE_MODE",
+    "AUTO_BACKUP_WIB_HOUR",
+    "AUTO_REBOOT_ENABLE",
+    "AUTO_REBOOT_INTERVAL_MINUTES",
+    "AUTO_PULL_UPDATE_ENABLE",
+    "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
+    "ONLINE_NOTIFY_ENABLE",
+    "ONLINE_NOTIFY_INTERVAL_HOURS",
+    "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
+    "IPLIMIT_CHECK_INTERVAL_MINUTES",
+    "IPLIMIT_LOCK_MINUTES",
+    "IPLIMIT_AUTO_LOCK_ENABLE",
+    "IPLIMIT_AUTO_TUNE",
+    "IPLIMIT_DEBUG",
+    "DROPBEAR_LOG_MAX_LINES",
+    "DROPBEAR_RECENT_LOG_MAX_LINES",
+    "UDPHC_LOG_LINES_HISTORY",
+    "UDPHC_LOG_LINES_REALTIME",
+    "UDPHC_LOG_LINES_CHECKER",
+    "XRAY_BLOCK_TCP_PORTS",
+    "XRAY_RECENT_WINDOW_MINUTES",
+    "XRAY_ACTIVE_WINDOW_SECONDS",
+    "XRAY_MIN_HITS_PER_IP",
+    "XRAY_PATHS_VMESS",
+    "XRAY_PATHS_VLESS",
+    "XRAY_PATHS_TROJAN",
+    "VMESS_BUG_PROFILE_ADDRESS",
+    "VMESS_BUG_PROFILE_SNI",
+    "VMESS_BUG_PROFILE_HOST",
+    "VMESS_BUG_PROFILE_ALLOW_INSECURE",
+    "ZIVPN_ACTIVE_WINDOW_SECONDS",
+    "ZIVPN_HANDOFF_GRACE_SECONDS",
+    "ZIVPN_LIVE_TTL_SECONDS",
+    "ZIVPN_AUTH_APPLY_MODE",
+    "ZIVPN_AUTH_MODE",
+    "ZIVPN_RELOAD_ON_AUTH_CHANGE",
+    "ACTIVE_UDP_BACKEND",
+    "SSH_HC_AUTH_LOOKBACK_HOURS",
+    "SSHWS_UDPGW_PORTS",
+    "SSH_TUNNEL_SHELL",
+    "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
+    "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
+    "SSHWS_LOOP_GUARD_ENABLE",
+    "SSHWS_LOOP_GUARD_PORTS",
+    "SSHWS_LOOP_GUARD_NEW_ABOVE",
+    "SSHWS_LOOP_GUARD_BURST",
+    "SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE",
+    "SSHWS_NGINX_LIMIT_ENABLE",
+    "SSHWS_NGINX_LIMIT_RATE",
+    "SSHWS_NGINX_LIMIT_BURST",
+    "SSHWS_NGINX_LIMIT_CONN",
+    "NGINX_WORKER_CONNECTIONS",
+    "NGINX_WORKER_RLIMIT_NOFILE",
+    "NGINX_SERVICE_LIMIT_NOFILE",
+]
+SETTINGS_KEY_SET = set(SETTINGS_KEYS)
+APP_ENV_FILE = "/opt/sc-1forcr/.env"
+SC_ENV_FILE = "/etc/sc-1forcr.env"
+
+def clean_setting_value(value):
+    text = str(value if value is not None else "").strip()
+    text = text.replace("\r", "").replace("\n", "")
+    return text[:512]
+
+def read_env_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().splitlines()
+    except Exception:
+        return []
+
+def write_env_settings(path, settings):
+    if not settings:
+        return 0
+    lines = read_env_lines(path)
+    out = []
+    seen = set()
+    for line in lines:
+        if "=" not in line or line.lstrip().startswith("#"):
+            out.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in settings:
+            out.append(f"{key}={shlex.quote(settings[key])}")
+            seen.add(key)
+        else:
+            out.append(line)
+    for key in SETTINGS_KEYS:
+        if key in settings and key not in seen:
+            out.append(f"{key}={shlex.quote(settings[key])}")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out).rstrip() + "\n")
+        if path == SC_ENV_FILE:
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
+    return len(settings)
+
+def restore_runtime_settings(settings_input):
+    if not isinstance(settings_input, dict):
+        return 0
+    settings = {}
+    for key in SETTINGS_KEYS:
+        if key not in settings_input:
+            continue
+        settings[key] = clean_setting_value(settings_input.get(key))
+    if not settings:
+        return 0
+    write_env_settings(SC_ENV_FILE, settings)
+    if os.path.exists(APP_ENV_FILE):
+        write_env_settings(APP_ENV_FILE, settings)
+    return len(settings)
+
 upsert_ssh(data.get("ssh") or [])
 upsert_uuid("account_vmesses", data.get("vmess") or [])
 upsert_uuid("account_vlesses", data.get("vless") or [])
 upsert_trojan(data.get("trojan") or [])
+restored_settings = restore_runtime_settings(data.get("settings") or data.get("runtime_settings") or {})
 
 zivpn_auth = data.get("zivpn_auth") or []
 if not isinstance(zivpn_auth, list) or len(zivpn_auth) == 0:
@@ -7151,12 +7678,15 @@ except Exception:
 
 conn.commit()
 conn.close()
+if restored_settings:
+    print(f"Runtime settings restored: {restored_settings}", file=sys.stderr)
 PY
 
 chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
 chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
 chmod 644 /etc/sc-1forcr/banner.html >/dev/null 2>&1 || true
 chmod 644 /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
+apply_restored_runtime_units
 systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
 systemctl restart xray >/dev/null 2>&1 || true
 systemctl restart "${ZIVPN_SERVICE:-zivpn}" >/dev/null 2>&1 || true
@@ -7578,9 +8108,15 @@ if [[ -f /var/log/xray/access.log ]]; then
         for (k in seen) {
           split(k, a, /\|/)
           user=a[1]
-          ipcnt[user]++
+          ipcnt_raw[user]++
         }
-        for (u in ipcnt) printf "%s(%d)\n", u, ipcnt[u]
+        for (u in ipcnt_raw) {
+          raw=ipcnt_raw[u]
+          if (raw >= 1 && raw <= 2) cnt=1
+          else if (raw >= 3 && raw <= 4) cnt=2
+          else cnt=raw
+          printf "%s(%d)\n", u, cnt
+        }
       }
     ' | sort || true)"
   xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
@@ -7804,13 +8340,161 @@ EOF
 }
 
 setup_auto_pull_update_timer() {
-  # Auto pull update dimatikan secara default agar update hanya manual via menu.
-  systemctl stop sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
-  systemctl disable sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
-  systemctl stop sc-1forcr-pull-update.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/sc-1forcr-pull-update.timer
-  rm -f /etc/systemd/system/sc-1forcr-pull-update.service
+  local pull_interval_min
+  pull_interval_min="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  if [[ -z "${pull_interval_min}" || "${pull_interval_min}" -lt 1 || "${pull_interval_min}" -gt 1440 ]]; then
+    pull_interval_min="10"
+  fi
+  AUTO_PULL_UPDATE_INTERVAL_MINUTES="${pull_interval_min}"
+  [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" != "0" ]] && AUTO_PULL_UPDATE_ENABLE="1"
+
+  log "Setup auto pull update dari trigger bot tiap ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} menit..."
+
+  cat > /usr/local/sbin/sc-1forcr-pull-update <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/sc-1forcr.env"
+[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+
+AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+LICENSE_API_URL="${LICENSE_API_URL:-}"
+LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
+STATE_DIR="/var/lib/sc-1forcr"
+LAST_VERSION_FILE="${STATE_DIR}/last-pull-update.version"
+LOCK_FILE="/run/sc-1forcr-pull-update.lock"
+LOG_TAG="sc-1forcr-pull-update"
+
+log_msg() {
+  logger -t "${LOG_TAG}" "$*" >/dev/null 2>&1 || true
+  echo "$*"
+}
+
+json_escape() {
+  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${1:-}"
+}
+
+ack_update() {
+  local base_url="$1" version="$2" status="$3" message="$4"
+  [[ -z "${base_url}" || -z "${version}" ]] && return 0
+  local payload
+  payload="{\"version\":$(json_escape "${version}"),\"status\":$(json_escape "${status}"),\"message\":$(json_escape "${message}")}"
+  curl -4fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
+    -X POST "${base_url}/sc1forcr/update/ack" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "${payload}" >/dev/null 2>&1 || \
+  curl -fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
+    -X POST "${base_url}/sc1forcr/update/ack" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "${payload}" >/dev/null 2>&1 || true
+}
+
+main_pull_update() {
+  if [[ "${AUTO_PULL_UPDATE_ENABLE}" != "1" ]]; then
+    exit 0
+  fi
+  if [[ -z "${LICENSE_API_URL}" || -z "${LICENSE_API_TOKEN}" ]]; then
+    exit 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    log_msg "jq tidak tersedia, skip auto pull update."
+    exit 0
+  fi
+
+  mkdir -p "${STATE_DIR}"
+  local base_url current_version payload resp ok required version note msg
+  base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
+  if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
+    base_url="$(echo "${LICENSE_API_URL}" | sed 's|/license/activate$||')"
+  fi
+  [[ -z "${base_url}" || "${base_url}" == "${LICENSE_API_URL}" ]] && exit 0
+
+  current_version="$(cat "${LAST_VERSION_FILE}" 2>/dev/null || true)"
+  payload="{\"current_version\":$(json_escape "${current_version}"),\"script_version\":$(json_escape "${SCRIPT_VERSION:-}")}"
+
+  resp="$(
+    curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+      -X POST "${base_url}/sc1forcr/update/check" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "${payload}" 2>/dev/null ||
+    curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+      -X POST "${base_url}/sc1forcr/update/check" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "${payload}" 2>/dev/null || true
+  )"
+  [[ -n "${resp}" ]] || exit 0
+
+  ok="$(echo "${resp}" | jq -r 'if .ok == true then "1" else "0" end' 2>/dev/null || echo 0)"
+  [[ "${ok}" == "1" ]] || exit 0
+  required="$(echo "${resp}" | jq -r 'if .update_required == true then "1" else "0" end' 2>/dev/null || echo 0)"
+  [[ "${required}" == "1" ]] || exit 0
+  version="$(echo "${resp}" | jq -r '.version // empty' 2>/dev/null || true)"
+  [[ -n "${version}" ]] || exit 0
+  if [[ "${version}" == "${current_version}" ]]; then
+    exit 0
+  fi
+  note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
+
+  log_msg "Trigger update diterima dari bot: ${version}${note:+ (${note})}"
+  ack_update "${base_url}" "${version}" "running" "update mulai"
+  if /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
+    printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
+    ack_update "${base_url}" "${version}" "success" "update selesai"
+    log_msg "Update trigger ${version} selesai."
+  else
+    msg="$(tail -n 20 /var/log/sc-1forcr-pull-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-500)"
+    ack_update "${base_url}" "${version}" "failed" "${msg:-update gagal}"
+    log_msg "Update trigger ${version} gagal."
+    exit 1
+  fi
+}
+
+(
+  flock -n 9 || exit 0
+  main_pull_update "$@"
+) 9>"${LOCK_FILE}"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-pull-update
+
+  cat > /etc/systemd/system/sc-1forcr-pull-update.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Pull Update Trigger from Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-pull-update
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF
+[Unit]
+Description=Check SC 1FORCR update trigger every ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-pull-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+  fi
 }
 
 write_cli_menu() {
@@ -7926,12 +8610,12 @@ PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
 set_pending_operation() {
   local type="$1" cmd="$2" note="$3"
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-  cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
+  {
+    printf 'PENDING_TYPE=%q\n' "${type}"
+    printf 'PENDING_CMD=%q\n' "${cmd}"
+    printf 'PENDING_NOTE=%q\n' "${note}"
+    printf 'PENDING_TIME=%q\n' "$(date '+%F %T')"
+  } > "${PENDING_OP_FILE}"
   chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
 }
 
@@ -7960,27 +8644,13 @@ resume_pending_operation_prompt() {
   rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
   if [[ "${type}" == "update" ]]; then
     if ! update_script_from_repo; then
-      mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-      cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-      chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+      set_pending_operation "${type}" "${cmd}" "${note}"
       echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
     fi
     return 0
   fi
   if ! bash -lc "${cmd}"; then
-    mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-    cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-    chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+    set_pending_operation "${type}" "${cmd}" "${note}"
     echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
   fi
 }
@@ -8022,7 +8692,7 @@ normalize_pending_operation() {
 }
 
 pending_install_gate_menu() {
-  local pu_ans cmd type note gate_title opt1_label
+  local pu_ans cmd type note gate_title opt1_label current_line
   [[ -t 0 && -t 1 ]] || return 0
   has_pending_install_only || return 0
   # shellcheck disable=SC1090
@@ -8033,8 +8703,15 @@ pending_install_gate_menu() {
   gate_title="INSTALL PENDING"
   opt1_label="Lanjutkan Install"
   while true; do
+    current_line="${note}"
+    if [[ -f /var/lib/sc-1forcr/install-current.env ]]; then
+      # shellcheck disable=SC1091
+      source /var/lib/sc-1forcr/install-current.env >/dev/null 2>&1 || true
+      current_line="Terakhir: ${STEP_MESSAGE:-unknown} (${STEP_PERCENT:-?}%)"
+    fi
     clear
     draw_menu_panel "${gate_title}" \
+      "${current_line}" \
       "1) ${opt1_label}" \
       "2) Batalkan pending" \
       "0) Exit"
@@ -8045,14 +8722,7 @@ pending_install_gate_menu() {
     case "${pu_ans}" in
       1)
         if ! bash -lc "${cmd}"; then
-          mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-          cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
-          chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+          set_pending_operation "${type}" "${cmd}" "${note}"
           echo
           echo "Install pending belum berhasil dilanjutkan."
           read -rp "Enter untuk kembali ke menu pending..." _ || true
@@ -8085,6 +8755,8 @@ XRAY_MONITOR_RECENT_WINDOW_MINUTES="${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
+AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+AUTO_PULL_UPDATE_INTERVAL_MINUTES="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
 DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
 DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
@@ -8108,6 +8780,8 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
+[[ "${AUTO_PULL_UPDATE_ENABLE}" != "0" ]] && AUTO_PULL_UPDATE_ENABLE="1"
+[[ -z "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -lt 1 || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -gt 1440 ]] && AUTO_PULL_UPDATE_INTERVAL_MINUTES="10"
 
 # Compatibility helpers for older runtime files on upgraded VPS.
 flag_enabled() {
@@ -8486,6 +9160,27 @@ WantedBy=timers.target
 EOF
 }
 
+write_pull_update_timer_unit() {
+  local interval_min="$1"
+  interval_min="$(echo "${interval_min:-10}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 1 || "${interval_min}" -gt 1440 ]] && interval_min="10"
+  cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF
+[Unit]
+Description=Check SC 1FORCR update trigger every ${interval_min} minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=${interval_min}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-pull-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 set_auto_reboot_config_menu() {
   local current_enable current_interval current_hours enable_in mode_in val_in interval_min
   current_enable="${AUTO_REBOOT_ENABLE:-1}"
@@ -8573,6 +9268,104 @@ set_auto_reboot_config_menu() {
   echo "Berhasil update auto reboot:"
   echo "- Status   : $([[ "${AUTO_REBOOT_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "- Interval : ${AUTO_REBOOT_INTERVAL_MINUTES} menit"
+}
+
+set_auto_pull_update_config_menu() {
+  local current_enable current_interval current_hours enable_in mode_in val_in interval_min
+  current_enable="${AUTO_PULL_UPDATE_ENABLE:-1}"
+  [[ "${current_enable}" != "0" ]] && current_enable="1"
+  current_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 1440 ]] && current_interval="10"
+  current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
+
+  draw_menu_header "SETTING AUTO UPDATE BOT"
+  echo "Status saat ini   : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "Interval saat ini : ${current_interval} menit (~${current_hours} jam)"
+  echo
+  echo "Jika NONAKTIF, VPS ini tidak akan menjalankan update saat admin trigger dari bot."
+  echo "Update manual dari menu tetap bisa dijalankan."
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input enable_in "Aktifkan auto update dari bot? (1=aktif,0=nonaktif) [${current_enable}]: "; then
+    return
+  fi
+  [[ "${enable_in,,}" == "batal" ]] && return
+  enable_in="${enable_in:-${current_enable}}"
+  case "${enable_in,,}" in
+    1|on|yes|y|aktif) enable_in="1" ;;
+    0|off|no|n|nonaktif) enable_in="0" ;;
+    *)
+      echo "Input status tidak valid. Gunakan 1 atau 0."
+      return
+      ;;
+  esac
+
+  if ! prompt_input mode_in "Set interval dalam (m=menit, h=jam) [m]: "; then
+    return
+  fi
+  [[ "${mode_in,,}" == "batal" ]] && return
+  mode_in="${mode_in:-m}"
+  case "${mode_in,,}" in
+    m|menit) mode_in="m" ;;
+    h|jam) mode_in="h" ;;
+    *)
+      echo "Mode interval tidak valid. Gunakan m atau h."
+      return
+      ;;
+  esac
+
+  if [[ "${mode_in}" == "m" ]]; then
+    if ! prompt_input val_in "Interval cek trigger (menit, 1-1440) [${current_interval}]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-${current_interval}}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 1440 ]]; then
+      echo "Interval menit harus angka 1-1440."
+      return
+    fi
+    interval_min="${val_in}"
+  else
+    if ! prompt_input val_in "Interval cek trigger (jam, 1-24) [1]: "; then
+      return
+    fi
+    [[ "${val_in,,}" == "batal" ]] && return
+    val_in="${val_in:-1}"
+    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 24 ]]; then
+      echo "Interval jam harus angka 1-24."
+      return
+    fi
+    interval_min="$(( val_in * 60 ))"
+  fi
+
+  AUTO_PULL_UPDATE_ENABLE="${enable_in}"
+  AUTO_PULL_UPDATE_INTERVAL_MINUTES="${interval_min}"
+  update_sc_env_var "AUTO_PULL_UPDATE_ENABLE" "${AUTO_PULL_UPDATE_ENABLE}"
+  update_sc_env_var "AUTO_PULL_UPDATE_INTERVAL_MINUTES" "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
+  update_app_env_var "AUTO_PULL_UPDATE_ENABLE" "${AUTO_PULL_UPDATE_ENABLE}"
+  update_app_env_var "AUTO_PULL_UPDATE_INTERVAL_MINUTES" "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
+
+  if [[ -f /etc/systemd/system/sc-1forcr-pull-update.service ]]; then
+    write_pull_update_timer_unit "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
+      systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+      systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    else
+      systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+      systemctl stop sc-1forcr-pull-update.service >/dev/null 2>&1 || true
+    fi
+  else
+    echo
+    echo "Service sc-1forcr-pull-update belum tersedia. Jalankan update script terbaru dulu."
+  fi
+
+  echo
+  echo "Berhasil update auto update bot:"
+  echo "- Status   : $([[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "- Interval : ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} menit"
 }
 
 set_auto_backup_config_menu() {
@@ -9038,6 +9831,88 @@ edit_limit_ip_all_accounts() {
 
   echo "Berhasil update limit IP semua akun ${title} jadi ${new_limit}."
   echo "Total akun ter-update: ${changed}"
+}
+
+validate_ssh_password_cli() {
+  local password="$1"
+  if [[ -z "${password}" ]]; then
+    echo "Password tidak boleh kosong."
+    return 1
+  fi
+  if [[ "${password}" == *":"* || "${password}" =~ [[:space:]] ]]; then
+    echo "Password tidak boleh mengandung spasi, enter, atau titik dua."
+    return 1
+  fi
+  if [[ "${#password}" -gt 128 ]]; then
+    echo "Password terlalu panjang."
+    return 1
+  fi
+  return 0
+}
+
+change_ssh_password_account() {
+  local username password payload resp code message host exp limitip
+  echo "GANTI PASSWORD SSH/ZIVPN/UDPHC"
+  username="$(pick_existing_username "ssh")" || return
+  printf "%-12s : %s\n" "Username" "${username}"
+  prompt_input password "Password baru: " || return
+  password="$(echo "${password}" | tr -d '\r')"
+  validate_ssh_password_cli "${password}" || return
+
+  payload="$(jq -nc --arg p "${password}" '{password:$p}')"
+  resp="$(api_call "PATCH" "/passwordsshvpn/${username}" "${payload}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal ganti password SSH: ${message}"
+    return
+  fi
+
+  host="${DOMAIN}"
+  exp="$(echo "${resp}" | jq -r '.data.exp // "-"' 2>/dev/null || echo "-")"
+  limitip="$(echo "${resp}" | jq -r '.data.limitip // "0"' 2>/dev/null || echo "0")"
+  cat <<EOT_PASS_SSH
+=============================
+ PASSWORD SSH BERHASIL DIGANTI
+=============================
+Username     : ${username}
+Password     : ${password}
+Expired      : ${exp}
+IP Limit     : ${limitip}
+SSH WS       : ${host}:80@${username}:${password}
+SSH SSL      : ${host}:443@${username}:${password}
+EOT_PASS_SSH
+  telegram_notify_action "CHANGE_PASSWORD" "ssh" "${username}"
+}
+
+change_ssh_password_all_accounts() {
+  local password confirm payload resp code message changed total
+  echo "GANTI PASSWORD SEMUA AKUN SSH/ZIVPN/UDPHC"
+  echo "Semua akun di tabel SSH akan memakai password yang sama."
+  prompt_input password "Password baru untuk semua akun SSH: " || return
+  password="$(echo "${password}" | tr -d '\r')"
+  validate_ssh_password_cli "${password}" || return
+  prompt_input confirm "Ketik GANTI untuk lanjut: " || return
+  if [[ "${confirm}" != "GANTI" ]]; then
+    echo "Dibatalkan."
+    return
+  fi
+
+  payload="$(jq -nc --arg p "${password}" '{password:$p}')"
+  resp="$(api_call "PATCH" "/passwordsshvpn-all" "${payload}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal ganti password semua akun SSH: ${message}"
+    return
+  fi
+
+  changed="$(echo "${resp}" | jq -r '.data.changed // 0' 2>/dev/null || echo 0)"
+  total="$(echo "${resp}" | jq -r '.data.total // 0' 2>/dev/null || echo 0)"
+  echo "Password semua akun SSH berhasil diganti."
+  echo "Password baru : ${password}"
+  echo "Total akun    : ${total}"
+  echo "Ter-update    : ${changed}"
 }
 
 account_table_by_type() {
@@ -9734,9 +10609,11 @@ akun_menu() {
       "10) Edit Limit IP Semua Akun" \
       "11) Tambah Masa Aktif Semua Akun" \
       "12) Edit UUID Xray" \
+      "13) Ganti Password SSH" \
+      "14) Ganti Password Semua SSH" \
       "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-12]: "; then
+    if ! prompt_input am "Pilih menu [0-14]: "; then
       return
     fi
     clear
@@ -9760,6 +10637,8 @@ akun_menu() {
       10) edit_limit_ip_all_accounts || true ;;
       11) extend_expired_all_accounts || true ;;
       12) edit_uuid_xray_account || true ;;
+      13) change_ssh_password_account || true ;;
+      14) change_ssh_password_all_accounts || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -10100,9 +10979,10 @@ tools_menu() {
       "11) Upgrade/Downgrade Versi Dropbear" \
       "12) Setting Interval Auto Backup" \
       "13) Setting Interval Auto Reboot" \
+      "14) Setting Auto Update Bot" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-13]: "; then
+    if ! prompt_input tm "Pilih menu [0-14]: "; then
       return
     fi
     clear
@@ -10120,6 +11000,7 @@ tools_menu() {
       11) set_dropbear_version_menu || true ;;
       12) set_auto_backup_config_menu || true ;;
       13) set_auto_reboot_config_menu || true ;;
+      14) set_auto_pull_update_config_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -11051,15 +11932,22 @@ refresh_license_cache_guard() {
   fi
   printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
 
-  ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ip_text="$(curl -4fsS --max-time 3 https://api.ipify.org 2>/dev/null || curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip_text="${ip_text:-unknown}"
 
-  resp="$(curl -fsS --max-time 10 \
+  resp="$(curl -4fsS --connect-timeout 8 --max-time 20 \
     -X POST "${LICENSE_API_URL}" \
     -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
     -H "Content-Type: application/x-www-form-urlencoded" \
     --data-urlencode "license_key=${LICENSE_KEY}" \
-    --data-urlencode "ip=${ip_text}" 2>/dev/null || true)"
+    --data-urlencode "ip=${ip_text}" 2>/dev/null ||
+  curl -fsS --connect-timeout 8 --max-time 20 \
+    -X POST "${LICENSE_API_URL}" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "license_key=${LICENSE_KEY}" \
+    --data-urlencode "ip=${ip_text}" 2>/dev/null ||
+  true)"
   [[ -z "${resp}" ]] && return 0
   echo "${resp}" | jq . >/dev/null 2>&1 || return 0
 
@@ -11445,12 +12333,19 @@ draw_dashboard() {
     fi
     printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
 
-    resp="$(curl -fsS --max-time 10 \
+    resp="$(curl -4fsS --connect-timeout 8 --max-time 20 \
       -X POST "${LICENSE_API_URL}" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
       -H "Content-Type: application/x-www-form-urlencoded" \
       --data-urlencode "license_key=${LICENSE_KEY}" \
-      --data-urlencode "ip=${ip}" 2>/dev/null || true)"
+      --data-urlencode "ip=${ip}" 2>/dev/null ||
+    curl -fsS --connect-timeout 8 --max-time 20 \
+      -X POST "${LICENSE_API_URL}" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      --data-urlencode "license_key=${LICENSE_KEY}" \
+      --data-urlencode "ip=${ip}" 2>/dev/null ||
+    true)"
     [[ -z "${resp}" ]] && return 0
     echo "${resp}" | jq . >/dev/null 2>&1 || return 0
 
@@ -12480,10 +13375,16 @@ xray_log_snapshot() {
         u=a[1]; ip=a[2];
         if (last_ts[k] < active_cutoff) continue;
         if (hits[k] < min_hits && lastip[u] != ip) continue;
-        cnt[u]++;
+        cnt_raw[u]++;
       }
       for (u in seen) {
-        printf "%s|%d|%s\n", u, (u in cnt ? cnt[u] : 0), (u in lastip ? lastip[u] : "-");
+        raw=(u in cnt_raw ? cnt_raw[u] : 0);
+        # Anti false-positive Xray mobile/dual-stack:
+        # 1-2 IP aktif cepat dihitung 1 device, 3-4 IP dihitung 2 device.
+        if (raw >= 1 && raw <= 2) cnt=1;
+        else if (raw >= 3 && raw <= 4) cnt=2;
+        else cnt=raw;
+        printf "%s|%d|%s\n", u, cnt, (u in lastip ? lastip[u] : "-");
       }
     }' > "${dst}"
 }
@@ -12795,7 +13696,8 @@ update_script_from_repo() {
   had_banner_txt="0"
   downloaded_ok=0
   echo "Download update script dari: ${url}"
-  if curl -fsSL "${url}" -o "${tmp}"; then
+  if { curl -4fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
+       curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
     downloaded_ok=1
   fi
   if [[ "${downloaded_ok}" != "1" ]]; then
@@ -12898,6 +13800,8 @@ Time     : $(date '+%F %T')"
     AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}" \
     AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-1}" \
     AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" \
+    AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}" \
+    AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" \
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
     ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
     ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" \
@@ -13087,7 +13991,8 @@ install_summary_api_1forcr() {
   fi
   tmp="/tmp/setup-summary-api.sh"
   echo "Install Summary API 1FORCR..."
-  if ! curl -fL --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; then
+  if ! { curl -4fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
+         curl -fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
     echo "Gagal download script summary API."
     return 1
   fi
@@ -13532,7 +14437,7 @@ draw_main_options() {
 }
 
 if [[ "${1:-}" == "update" ]]; then
-  clear
+  clear >/dev/null 2>&1 || true
   update_script_from_repo
   exit $?
 fi
@@ -13607,6 +14512,12 @@ EOF
   cat > /usr/local/sbin/lanjut-install <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -f /var/lib/sc-1forcr/pending-install.env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /var/lib/sc-1forcr/pending-install.env
+  set +a
+fi
 if [[ -x /var/lib/sc-1forcr/pending-install.sh ]]; then
   exec bash /var/lib/sc-1forcr/pending-install.sh "$@"
 fi
@@ -13614,7 +14525,9 @@ if [[ -f /var/lib/sc-1forcr/pending-op.env ]]; then
   # shellcheck disable=SC1091
   source /var/lib/sc-1forcr/pending-op.env >/dev/null 2>&1 || true
   if [[ "${PENDING_TYPE:-}" == "install" && -n "${PENDING_CMD:-}" ]]; then
-    exec bash -lc "${PENDING_CMD}" "$@"
+    if [[ "${PENDING_CMD}" != "/usr/local/sbin/lanjut-install" ]]; then
+      exec bash -lc "${PENDING_CMD}" "$@"
+    fi
   fi
 fi
 echo "Tidak ada pending install yang bisa dilanjutkan."
@@ -13899,7 +14812,8 @@ install_summary_api_1forcr() {
   fi
   tmp="/tmp/setup-summary-api.sh"
   echo "Install Summary API 1FORCR..."
-  if ! curl -fL --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; then
+  if ! { curl -4fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
+         curl -fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
     echo "Gagal download script summary API."
     return 1
   fi
@@ -13990,21 +14904,172 @@ open_menu_after_install() {
 PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
 SCRIPT_SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 PENDING_INSTALL_SCRIPT="/var/lib/sc-1forcr/pending-install.sh"
+PENDING_INSTALL_ENV="/var/lib/sc-1forcr/pending-install.env"
+INSTALL_STEP_FILE="/var/lib/sc-1forcr/install-steps.done"
+INSTALL_CURRENT_FILE="/var/lib/sc-1forcr/install-current.env"
+PENDING_INSTALL_PROFILE="/etc/profile.d/sc-1forcr-pending-install.sh"
 
 set_pending_operation() {
   local type="$1" cmd="$2" note="$3"
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
-  cat > "${PENDING_OP_FILE}" <<EOF
-PENDING_TYPE=${type}
-PENDING_CMD=${cmd}
-PENDING_NOTE=${note}
-PENDING_TIME=$(date '+%F %T')
-EOF
+  {
+    printf 'PENDING_TYPE=%q\n' "${type}"
+    printf 'PENDING_CMD=%q\n' "${cmd}"
+    printf 'PENDING_NOTE=%q\n' "${note}"
+    printf 'PENDING_TIME=%q\n' "$(date '+%F %T')"
+  } > "${PENDING_OP_FILE}"
   chmod 600 "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
 }
 
 clear_pending_operation() {
   rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
+}
+
+persist_pending_install_env() {
+  local vars key
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  vars=(
+    DOMAIN EMAIL API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH
+    LICENSE_ENFORCE LICENSE_API_URL LICENSE_API_TOKEN LICENSE_KEY
+    UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API SUMMARY_API_SETUP_URL
+    WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN
+    ZIVPN_BIN_URL ZIVPN_RELEASE_TAG ZIVPN_SERVICE_NAME ZIVPN_RELOAD_ON_AUTH_CHANGE
+    ZIVPN_AUTH_APPLY_MODE ZIVPN_AUTH_MODE ZIVPN_HTTP_AUTH_URL ZIVPN_HTTP_AUTH_TOKEN
+    ZIVPN_LIVE_TTL_SECONDS ZIVPN_ACTIVE_WINDOW_SECONDS ZIVPN_HANDOFF_GRACE_SECONDS
+    ZIVPN_LISTEN_PORT ZIVPN_DNAT_RANGE ZIVPN_DNAT_IFACE
+    UDPCUSTOM_BIN_URL UDPCUSTOM_SERVICE_NAME UDPCUSTOM_LISTEN_PORT
+    UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
+    SSHWS_UDPGW_PORTS SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
+    SSH_TUNNEL_BLOCK_OUTBOUND_PORTS ACTIVE_UDP_BACKEND
+    DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION
+    TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
+    AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
+    AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
+    AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES
+    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
+    SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
+    SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
+    NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE
+    DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
+    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP
+    XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
+    VMESS_BUG_PROFILE_ADDRESS VMESS_BUG_PROFILE_SNI VMESS_BUG_PROFILE_HOST VMESS_BUG_PROFILE_ALLOW_INSECURE
+    SSH_HC_AUTH_LOOKBACK_HOURS SCRIPT_VERSION
+  )
+  : > "${PENDING_INSTALL_ENV}"
+  for key in "${vars[@]}"; do
+    if [[ -v "${key}" ]]; then
+      printf '%s=%q\n' "${key}" "${!key}" >> "${PENDING_INSTALL_ENV}"
+    fi
+  done
+  chmod 600 "${PENDING_INSTALL_ENV}" >/dev/null 2>&1 || true
+}
+
+install_pending_resume_helper() {
+  cat > /usr/local/sbin/lanjut-install <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -f /var/lib/sc-1forcr/pending-install.env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /var/lib/sc-1forcr/pending-install.env
+  set +a
+fi
+if [[ -x /var/lib/sc-1forcr/pending-install.sh ]]; then
+  exec bash /var/lib/sc-1forcr/pending-install.sh "$@"
+fi
+if [[ -f /var/lib/sc-1forcr/pending-op.env ]]; then
+  # shellcheck disable=SC1091
+  source /var/lib/sc-1forcr/pending-op.env >/dev/null 2>&1 || true
+  if [[ "${PENDING_TYPE:-}" == "install" && -n "${PENDING_CMD:-}" ]]; then
+    if [[ "${PENDING_CMD}" != "/usr/local/sbin/lanjut-install" ]]; then
+      exec bash -lc "${PENDING_CMD}" "$@"
+    fi
+  fi
+fi
+echo "Tidak ada pending install yang bisa dilanjutkan."
+exit 1
+EOF
+  chmod +x /usr/local/sbin/lanjut-install
+}
+
+install_pending_login_prompt() {
+  cat > "${PENDING_INSTALL_PROFILE}" <<'EOF'
+#!/usr/bin/env bash
+if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; then
+  if [[ -f /var/lib/sc-1forcr/pending-op.env && -x /usr/local/sbin/lanjut-install && -z "${SC_PENDING_INSTALL_PROMPT_SHOWN:-}" ]]; then
+    if grep -q '^PENDING_TYPE=install$' /var/lib/sc-1forcr/pending-op.env 2>/dev/null; then
+      export SC_PENDING_INSTALL_PROMPT_SHOWN=1
+      echo
+      echo "Install SC 1FORCR sebelumnya belum selesai."
+      if [[ -f /var/lib/sc-1forcr/install-current.env ]]; then
+        # shellcheck disable=SC1091
+        source /var/lib/sc-1forcr/install-current.env >/dev/null 2>&1 || true
+        echo "Terakhir: ${STEP_MESSAGE:-unknown} (${STEP_PERCENT:-?}%)"
+      fi
+      echo "Tekan Enter untuk lanjutkan dari checkpoint terakhir, atau ketik skip untuk nanti."
+      printf "> "
+      read -r _sc_pending_ans || true
+      if [[ "${_sc_pending_ans,,}" != "skip" ]]; then
+        /usr/local/sbin/lanjut-install || true
+      else
+        echo "Pending install disimpan. Jalankan lanjut-install untuk melanjutkan."
+      fi
+    fi
+  fi
+fi
+EOF
+  chmod 644 "${PENDING_INSTALL_PROFILE}" >/dev/null 2>&1 || true
+}
+
+install_step_done() {
+  local id="$1"
+  [[ -f "${INSTALL_STEP_FILE}" ]] && grep -Fxq "${id}" "${INSTALL_STEP_FILE}" 2>/dev/null
+}
+
+mark_install_step_done() {
+  local id="$1"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  install_step_done "${id}" || printf '%s\n' "${id}" >> "${INSTALL_STEP_FILE}"
+}
+
+set_current_install_step() {
+  local id="$1" pct="$2" msg="$3"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  {
+    printf 'STEP_ID=%q\n' "${id}"
+    printf 'STEP_PERCENT=%q\n' "${pct}"
+    printf 'STEP_MESSAGE=%q\n' "${msg}"
+    printf 'STEP_TIME=%q\n' "$(date '+%F %T')"
+  } > "${INSTALL_CURRENT_FILE}"
+  chmod 600 "${INSTALL_CURRENT_FILE}" >/dev/null 2>&1 || true
+}
+
+run_install_step() {
+  local id="$1" pct="$2" msg="$3"
+  shift 3
+  if install_step_done "${id}"; then
+    show_install_progress "${pct}" "Skip: ${msg}"
+    return 0
+  fi
+  show_install_progress "${pct}" "${msg}"
+  set_current_install_step "${id}" "${pct}" "${msg}"
+  "$@"
+  mark_install_step_done "${id}"
+}
+
+install_summary_api_optional() {
+  if ! flag_enabled "${AUTO_INSTALL_SUMMARY_API}"; then
+    return 0
+  fi
+  if ! install_summary_api_1forcr; then
+    echo "Peringatan: auto-install Summary API gagal. Kamu masih bisa install manual dari menu Tools."
+  fi
+  return 0
+}
+
+clear_install_resume_state() {
+  rm -f "${INSTALL_STEP_FILE}" "${INSTALL_CURRENT_FILE}" "${PENDING_INSTALL_ENV}" "${PENDING_INSTALL_PROFILE}" >/dev/null 2>&1 || true
 }
 
 resume_pending_operation_prompt() {
@@ -14043,67 +15108,56 @@ main() {
     cp -f "${SCRIPT_SELF_PATH}" "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
     chmod 700 "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
   fi
-  if [[ -x "${PENDING_INSTALL_SCRIPT}" ]]; then
-    set_pending_operation "install" "bash ${PENDING_INSTALL_SCRIPT}" "Install SC 1FORCR terputus sebelum selesai"
-  else
-    set_pending_operation "install" "bash ${SCRIPT_SELF_PATH}" "Install SC 1FORCR terputus sebelum selesai"
-  fi
+  persist_pending_install_env
+  install_pending_resume_helper
+  install_pending_login_prompt
+  set_pending_operation "install" "/usr/local/sbin/lanjut-install" "Install SC 1FORCR terputus sebelum selesai"
   show_install_banner
   show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
-  enforce_install_license
 
-  check_supported_os
-  install_base_packages
-  setup_vnstat
-  apply_system_optimizations
-  setup_logrotate_optimizations
-  show_install_progress 20 "Tahan mas, baru setengah jalan awal..."
+  run_install_step "00_license" 2 "Validasi lisensi" enforce_install_license
+  run_install_step "01_check_os" 4 "Cek OS server" check_supported_os
+  run_install_step "02_base_packages" 8 "Install paket dasar" install_base_packages
+  run_install_step "03_vnstat" 12 "Setup vnStat" setup_vnstat
+  run_install_step "04_system_optimizations" 16 "Optimasi sistem" apply_system_optimizations
+  run_install_step "05_logrotate" 20 "Setup logrotate" setup_logrotate_optimizations
 
-  install_node_if_missing
-  install_go_if_missing
-  install_xray
-  setup_default_banner_assets
-  setup_dropbear
-  init_db
-  harden_ssh_tunnel_shells
-  setup_nginx_and_cert
-  setup_haproxy_tls_mux
-  setup_zivpn_service_if_possible
-  setup_zivpn_udp_nat_rules
-  setup_udpcustom_service_if_possible
-  setup_udpcustom_udp_nat_rules
-  setup_udpgw_service_if_possible
-  enforce_single_udp_backend
-  show_install_progress 70 "Hampir selesai mas, core service sudah kepasang..."
+  run_install_step "06_node" 24 "Install Node.js" install_node_if_missing
+  run_install_step "07_go" 28 "Install Go" install_go_if_missing
+  run_install_step "08_xray" 33 "Install Xray" install_xray
+  run_install_step "09_banner_assets" 36 "Setup banner default" setup_default_banner_assets
+  run_install_step "10_dropbear" 40 "Setup Dropbear" setup_dropbear
+  run_install_step "11_database" 44 "Inisialisasi database" init_db
+  run_install_step "12_harden_shells" 47 "Harden shell akun tunnel" harden_ssh_tunnel_shells
+  run_install_step "13_nginx_cert" 52 "Setup Nginx dan sertifikat" setup_nginx_and_cert
+  run_install_step "14_haproxy_mux" 56 "Setup HAProxy TLS mux" setup_haproxy_tls_mux
+  run_install_step "15_zivpn_service" 60 "Setup ZIVPN" setup_zivpn_service_if_possible
+  run_install_step "16_zivpn_nat" 62 "Setup NAT ZIVPN" setup_zivpn_udp_nat_rules
+  run_install_step "17_udpcustom_service" 64 "Setup UDP Custom" setup_udpcustom_service_if_possible
+  run_install_step "18_udpcustom_nat" 66 "Setup NAT UDP Custom" setup_udpcustom_udp_nat_rules
+  run_install_step "19_udpgw" 68 "Setup UDPGW" setup_udpgw_service_if_possible
+  run_install_step "20_udp_backend" 70 "Aktifkan backend UDP utama" enforce_single_udp_backend
 
-  write_api_files
-  write_go_mux_files
-  build_go_files
-  write_iplimit_checker
-  setup_services
-  setup_udp_bootfix_service
-  setup_auto_reboot_timer
-  setup_auto_backup_timer
-  setup_online_notify_timer
-  setup_auto_pull_update_timer
+  run_install_step "21_api_files" 73 "Tulis file API runtime" write_api_files
+  run_install_step "22_go_mux_files" 76 "Tulis file Go mux" write_go_mux_files
+  run_install_step "23_build_go" 79 "Build Go mux" build_go_files
+  run_install_step "24_iplimit_checker" 82 "Tulis checker limit IP" write_iplimit_checker
+  run_install_step "25_services" 85 "Setup service systemd" setup_services
+  run_install_step "26_udp_bootfix" 87 "Setup UDP bootfix" setup_udp_bootfix_service
+  run_install_step "27_auto_reboot" 88 "Setup auto reboot" setup_auto_reboot_timer
+  run_install_step "28_auto_backup" 89 "Setup auto backup" setup_auto_backup_timer
+  run_install_step "29_online_notify" 90 "Setup notifikasi online" setup_online_notify_timer
+  run_install_step "30_auto_update" 91 "Setup auto pull update" setup_auto_pull_update_timer
+  run_install_step "31_summary_api" 93 "Install Summary API 1FORCR" install_summary_api_optional
 
-  if flag_enabled "${AUTO_INSTALL_SUMMARY_API}"; then
-    show_install_progress 90 "Memasang Summary API 1FORCR..."
-    if ! install_summary_api_1forcr; then
-      echo "Peringatan: auto-install Summary API gagal. Kamu masih bisa install manual dari menu Tools."
-    fi
-  fi
-
-  show_install_progress 95 "Sedikit lagi, finishing konfigurasi..."
-
-  write_cli_menu
-  setup_auto_menu_login
-  write_version_marker
-  sync_zivpn_auth_token_with_api_runtime
-  apply_sshws_loop_guard_rules
-  apply_tunnel_outbound_guard_rules
-  apply_final_service_restart_chain
-  post_install_preflight
+  run_install_step "32_cli_menu" 95 "Tulis menu CLI" write_cli_menu
+  run_install_step "33_auto_menu" 96 "Setup auto menu login" setup_auto_menu_login
+  run_install_step "34_version_marker" 97 "Tulis marker versi" write_version_marker
+  run_install_step "35_sync_token" 98 "Sinkron token ZIVPN dan API" sync_zivpn_auth_token_with_api_runtime
+  run_install_step "36_sshws_guard" 98 "Terapkan guard SSHWS" apply_sshws_loop_guard_rules
+  run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
+  run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
+  run_install_step "39_preflight" 100 "Preflight akhir" post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."
 
   cat <<EOF
@@ -14127,6 +15181,7 @@ curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
 EOF
 
   clear_pending_operation
+  clear_install_resume_state
   rm -f "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
   open_menu_after_install
 }

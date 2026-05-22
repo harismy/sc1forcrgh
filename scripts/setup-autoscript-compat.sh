@@ -38,6 +38,7 @@ set -euo pipefail
 #   ZIVPN_HANDOFF_GRACE_SECONDS=90               (opsional, toleransi perpindahan IP seluler)
 #   ZIVPN_LISTEN_PORT=5667
 #   ZIVPN_DNAT_RANGE=6000:19999
+#   ZIVPN_EXTRA_UDP_PORTS=553                  (opsional, port UDP tambahan yang di-DNAT ke ZIVPN)
 #   ZIVPN_DNAT_IFACE=eth0                          (opsional, default auto-detect)
 #   UDPCUSTOM_BIN_URL=https://raw.github.com/http-custom/udp-custom/main/bin/udp-custom-linux-amd64
 #   UDPCUSTOM_SERVICE_NAME=sc-1forcr-udpcustom
@@ -119,6 +120,7 @@ ZIVPN_ACTIVE_WINDOW_SECONDS="${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}"
 ZIVPN_HANDOFF_GRACE_SECONDS="${ZIVPN_HANDOFF_GRACE_SECONDS:-90}"
 ZIVPN_LISTEN_PORT="${ZIVPN_LISTEN_PORT:-5667}"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
+ZIVPN_EXTRA_UDP_PORTS="${ZIVPN_EXTRA_UDP_PORTS:-553}"
 ZIVPN_DNAT_IFACE="${ZIVPN_DNAT_IFACE:-}"
 UDPCUSTOM_BIN_URL="${UDPCUSTOM_BIN_URL:-https://raw.github.com/http-custom/udp-custom/main/bin/udp-custom-linux-amd64}"
 UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE_NAME:-sc-1forcr-udpcustom}"
@@ -1840,6 +1842,29 @@ fw_delete_udp_dnat_to_port_all() {
   esac
 }
 
+setup_zivpn_extra_udp_ports() {
+  local listen_port="$1" ports p
+  ports="$(echo "${ZIVPN_EXTRA_UDP_PORTS:-}" | tr ',' ' ')"
+  for p in ${ports}; do
+    p="$(echo "${p}" | tr -cd '0-9')"
+    [[ -z "${p}" || "${p}" -lt 1 || "${p}" -gt 65535 ]] && continue
+    fw_allow_udp_input "${p}"
+    [[ "${p}" == "${listen_port}" ]] && continue
+    fw_add_udp_dnat_range "${p}" "${listen_port}"
+  done
+}
+
+cleanup_zivpn_extra_udp_ports_to_port() {
+  local to_port="$1" ports p
+  ports="$(echo "${ZIVPN_EXTRA_UDP_PORTS:-}" | tr ',' ' ')"
+  for p in ${ports}; do
+    p="$(echo "${p}" | tr -cd '0-9')"
+    [[ -z "${p}" || "${p}" -lt 1 || "${p}" -gt 65535 ]] && continue
+    [[ "${p}" == "${to_port}" ]] && continue
+    fw_delete_udp_dnat_range "${p}" "${to_port}"
+  done
+}
+
 fw_persist_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -1987,6 +2012,7 @@ setup_zivpn_udp_nat_rules() {
 
   fw_allow_udp_input "${listen_port}"
   fw_add_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${listen_port}"
+  setup_zivpn_extra_udp_ports "${listen_port}"
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
     log "Install netfilter-persistent agar rule iptables tidak hilang saat reboot..."
@@ -2073,6 +2099,7 @@ setup_udpcustom_udp_nat_rules() {
   if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
     fw_delete_udp_dnat_to_port_all "${listen_port}"
     fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${listen_port}"
+    cleanup_zivpn_extra_udp_ports_to_port "${listen_port}"
     log "DNAT legacy ke port ${listen_port} dibersihkan (backend UDPHC aktif)."
   fi
 
@@ -6593,6 +6620,7 @@ ZIVPN_SERVICE="${ZIVPN_SERVICE:-zivpn}"
 UDPCUSTOM_SERVICE="${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
 ACTIVE_UDP_BACKEND="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
+ZIVPN_EXTRA_UDP_PORTS="${ZIVPN_EXTRA_UDP_PORTS:-553}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 
@@ -6694,6 +6722,29 @@ fw_delete_udp_dnat_to_port_all() {
   esac
 }
 
+setup_zivpn_extra_udp_ports() {
+  local listen_port="$1" ports p
+  ports="$(echo "${ZIVPN_EXTRA_UDP_PORTS:-}" | tr ',' ' ')"
+  for p in ${ports}; do
+    p="$(echo "${p}" | tr -cd '0-9')"
+    [[ -z "${p}" || "${p}" -lt 1 || "${p}" -gt 65535 ]] && continue
+    fw_allow_udp_input "${p}"
+    [[ "${p}" == "${listen_port}" ]] && continue
+    fw_add_udp_dnat_range "${p}" "${listen_port}"
+  done
+}
+
+cleanup_zivpn_extra_udp_ports_to_port() {
+  local to_port="$1" ports p
+  ports="$(echo "${ZIVPN_EXTRA_UDP_PORTS:-}" | tr ',' ' ')"
+  for p in ${ports}; do
+    p="$(echo "${p}" | tr -cd '0-9')"
+    [[ -z "${p}" || "${p}" -lt 1 || "${p}" -gt 65535 ]] && continue
+    [[ "${p}" == "${to_port}" ]] && continue
+    fw_delete_udp_dnat_range "${p}" "${to_port}"
+  done
+}
+
 fw_persist_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -6719,6 +6770,7 @@ case "${ACTIVE_UDP_BACKEND}" in
     fw_allow_udp_input "${udphc_port}"
     fw_delete_udp_dnat_to_port_all "${udphc_port}"
     fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${udphc_port}"
+    cleanup_zivpn_extra_udp_ports_to_port "${udphc_port}"
     ;;
   *)
     systemctl disable --now "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
@@ -6726,6 +6778,7 @@ case "${ACTIVE_UDP_BACKEND}" in
     systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
     fw_allow_udp_input "${zivpn_port}"
     fw_add_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${zivpn_port}"
+    setup_zivpn_extra_udp_ports "${zivpn_port}"
     ;;
 esac
 
@@ -8522,6 +8575,7 @@ ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 ZIVPN_DNAT_RANGE=${ZIVPN_DNAT_RANGE}
+ZIVPN_EXTRA_UDP_PORTS=${ZIVPN_EXTRA_UDP_PORTS}
 UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
@@ -11042,7 +11096,7 @@ show_core_services_onoff() {
 }
 
 cleanup_zivpn_dnat_for_udphc() {
-  local udphc_port range_nft handle
+  local udphc_port range_nft handle ports p
   udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   [[ -z "${udphc_port}" ]] && udphc_port="5667"
   if command -v iptables >/dev/null 2>&1; then
@@ -11059,6 +11113,25 @@ cleanup_zivpn_dnat_for_udphc() {
         awk -v sig="udp dport ${range_nft} dnat to :${udphc_port}" '$0 ~ sig {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
     )
   fi
+
+  ports="$(echo "${ZIVPN_EXTRA_UDP_PORTS:-}" | tr ',' ' ')"
+  for p in ${ports}; do
+    p="$(echo "${p}" | tr -cd '0-9')"
+    [[ -z "${p}" || "${p}" -lt 1 || "${p}" -gt 65535 || "${p}" == "${udphc_port}" ]] && continue
+    if command -v iptables >/dev/null 2>&1; then
+      while iptables -w 10 -t nat -C PREROUTING -p udp --dport "${p}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1; do
+        iptables -w 10 -t nat -D PREROUTING -p udp --dport "${p}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1 || break
+      done
+    elif command -v nft >/dev/null 2>&1; then
+      while IFS= read -r handle; do
+        [[ -z "${handle}" ]] && continue
+        nft delete rule ip nat prerouting handle "${handle}" >/dev/null 2>&1 || true
+      done < <(
+        nft -a list chain ip nat prerouting 2>/dev/null | \
+          awk -v sig="udp dport ${p} dnat to :${udphc_port}" '$0 ~ sig {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
+      )
+    fi
+  done
 }
 
 cleanup_udphc_dnat_for_port() {
@@ -11085,7 +11158,7 @@ cleanup_udphc_dnat_for_port() {
 }
 
 ensure_zivpn_dnat_for_zivpn() {
-  local zivpn_port range_nft
+  local zivpn_port range_nft ports p
   [[ -z "${ZIVPN_DNAT_RANGE}" ]] && return 0
   zivpn_port="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   [[ -z "${zivpn_port}" ]] && zivpn_port="5667"
@@ -11109,6 +11182,32 @@ ensure_zivpn_dnat_for_zivpn() {
     nft list chain ip nat prerouting 2>/dev/null | grep -F -- "udp dport ${range_nft} dnat to :${zivpn_port}" >/dev/null 2>&1 || \
       nft add rule ip nat prerouting udp dport "${range_nft}" dnat to ":${zivpn_port}"
   fi
+
+  ports="$(echo "${ZIVPN_EXTRA_UDP_PORTS:-}" | tr ',' ' ')"
+  for p in ${ports}; do
+    p="$(echo "${p}" | tr -cd '0-9')"
+    [[ -z "${p}" || "${p}" -lt 1 || "${p}" -gt 65535 ]] && continue
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -w 10 -C INPUT -p udp --dport "${p}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w 10 -I INPUT -p udp --dport "${p}" -j ACCEPT
+      [[ "${p}" == "${zivpn_port}" ]] && continue
+      iptables -w 10 -t nat -C PREROUTING -p udp --dport "${p}" -j DNAT --to-destination ":${zivpn_port}" >/dev/null 2>&1 || \
+        iptables -w 10 -t nat -I PREROUTING -p udp --dport "${p}" -j DNAT --to-destination ":${zivpn_port}"
+    elif command -v nft >/dev/null 2>&1; then
+      if nft list chain inet filter input >/dev/null 2>&1; then
+        nft list chain inet filter input | grep -F -- "udp dport ${p} accept" >/dev/null 2>&1 || \
+          nft add rule inet filter input udp dport "${p}" accept
+      elif nft list chain ip filter input >/dev/null 2>&1; then
+        nft list chain ip filter input | grep -F -- "udp dport ${p} accept" >/dev/null 2>&1 || \
+          nft add rule ip filter input udp dport "${p}" accept
+      fi
+      [[ "${p}" == "${zivpn_port}" ]] && continue
+      nft add table ip nat >/dev/null 2>&1 || true
+      nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }' >/dev/null 2>&1 || true
+      nft list chain ip nat prerouting 2>/dev/null | grep -F -- "udp dport ${p} dnat to :${zivpn_port}" >/dev/null 2>&1 || \
+        nft add rule ip nat prerouting udp dport "${p}" dnat to ":${zivpn_port}"
+    fi
+  done
 }
 
 switch_udp_to_zivpn() {
@@ -11251,9 +11350,9 @@ diagnose_udp_backends() {
   echo
   echo "NAT PREROUTING (ringkas):"
   if command -v iptables >/dev/null 2>&1; then
-    iptables -t nat -S PREROUTING 2>/dev/null | grep -E 'DNAT|5667|5668|6000:19999' || echo "(tidak ada rule terkait)"
+    iptables -t nat -S PREROUTING 2>/dev/null | grep -E 'DNAT|553|5667|5668|6000:19999' || echo "(tidak ada rule terkait)"
   elif command -v nft >/dev/null 2>&1; then
-    nft list chain ip nat prerouting 2>/dev/null | grep -E 'dnat|5667|5668|6000-19999' || echo "(tidak ada rule terkait)"
+    nft list chain ip nat prerouting 2>/dev/null | grep -E 'dnat|553|5667|5668|6000-19999' || echo "(tidak ada rule terkait)"
   else
     echo "(iptables/nft tidak tersedia)"
   fi
@@ -13767,6 +13866,7 @@ Time     : $(date '+%F %T')"
     ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE}" \
     UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE}" \
     ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE}" \
+    ZIVPN_EXTRA_UDP_PORTS="${ZIVPN_EXTRA_UDP_PORTS:-553}" \
     UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
     UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
     SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}" \
@@ -14687,7 +14787,7 @@ write_version_marker() {
 }
 
 post_install_preflight() {
-  local fw zstat ustat xstat apistat wsstat zport uport range_nft nat_ok udpgw7300 udpgw7200
+  local fw zstat ustat xstat apistat wsstat zport uport range_nft nat_ok extra_nat_ok extra_ports p udpgw7300 udpgw7200
   fw="$(fw_backend_kind)"
   zstat="$(systemctl is-active "${ZIVPN_SERVICE_NAME}" 2>/dev/null || true)"
   ustat="$(systemctl is-active "${UDPCUSTOM_SERVICE_NAME}" 2>/dev/null || true)"
@@ -14726,6 +14826,33 @@ post_install_preflight() {
     esac
   fi
 
+  extra_nat_ok=""
+  extra_ports="$(echo "${ZIVPN_EXTRA_UDP_PORTS:-}" | tr ',' ' ')"
+  for p in ${extra_ports}; do
+    p="$(echo "${p}" | tr -cd '0-9')"
+    [[ -z "${p}" || "${p}" -lt 1 || "${p}" -gt 65535 || "${p}" == "${zport}" ]] && continue
+    case "${fw}" in
+      iptables)
+        if iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "--dport ${p}" | grep -F -- "--to-destination :${zport}" >/dev/null 2>&1; then
+          extra_nat_ok="${extra_nat_ok}${extra_nat_ok:+ }${p}=yes"
+        else
+          extra_nat_ok="${extra_nat_ok}${extra_nat_ok:+ }${p}=no"
+        fi
+        ;;
+      nft)
+        if nft list chain ip nat prerouting 2>/dev/null | grep -F -- "udp dport ${p}" | grep -F -- "dnat to :${zport}" >/dev/null 2>&1; then
+          extra_nat_ok="${extra_nat_ok}${extra_nat_ok:+ }${p}=yes"
+        else
+          extra_nat_ok="${extra_nat_ok}${extra_nat_ok:+ }${p}=no"
+        fi
+        ;;
+      *)
+        extra_nat_ok="${extra_nat_ok}${extra_nat_ok:+ }${p}=no-fw"
+        ;;
+    esac
+  done
+  [[ -z "${extra_nat_ok}" ]] && extra_nat_ok="none"
+
   cat <<EOF
 
 === PREFLIGHT CHECK ===
@@ -14738,6 +14865,7 @@ post_install_preflight() {
 - udpgw listen     : 7200=$(ss -lntup 2>/dev/null | awk '$5 ~ /:7200$/ {ok=1} END{print ok?"YES":"NO"}') 7300=$(ss -lntup 2>/dev/null | awk '$5 ~ /:7300$/ {ok=1} END{print ok?"YES":"NO"}')
 - zivpn cert/key   : $( [[ -s /etc/zivpn/zivpn.crt && -s /etc/zivpn/zivpn.key ]] && echo OK || echo MISSING )
 - dnat ${ZIVPN_DNAT_RANGE:-none}->${zport} : ${nat_ok}
+- extra udp ${ZIVPN_EXTRA_UDP_PORTS:-none}->${zport} : ${extra_nat_ok}
 =======================
 EOF
 }
@@ -14936,7 +15064,7 @@ persist_pending_install_env() {
     ZIVPN_BIN_URL ZIVPN_RELEASE_TAG ZIVPN_SERVICE_NAME ZIVPN_RELOAD_ON_AUTH_CHANGE
     ZIVPN_AUTH_APPLY_MODE ZIVPN_AUTH_MODE ZIVPN_HTTP_AUTH_URL ZIVPN_HTTP_AUTH_TOKEN
     ZIVPN_LIVE_TTL_SECONDS ZIVPN_ACTIVE_WINDOW_SECONDS ZIVPN_HANDOFF_GRACE_SECONDS
-    ZIVPN_LISTEN_PORT ZIVPN_DNAT_RANGE ZIVPN_DNAT_IFACE
+    ZIVPN_LISTEN_PORT ZIVPN_DNAT_RANGE ZIVPN_EXTRA_UDP_PORTS ZIVPN_DNAT_IFACE
     UDPCUSTOM_BIN_URL UDPCUSTOM_SERVICE_NAME UDPCUSTOM_LISTEN_PORT
     UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
     SSHWS_UDPGW_PORTS SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH

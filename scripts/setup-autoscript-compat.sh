@@ -1046,6 +1046,13 @@ CREATE TABLE IF NOT EXISTS temp_ip_locks (
   PRIMARY KEY (account_type, username)
 );
 
+CREATE TABLE IF NOT EXISTS account_trial_flags (
+  account_type TEXT NOT NULL,
+  username TEXT NOT NULL,
+  created_at INTEGER DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (account_type, username)
+);
+
 INSERT OR IGNORE INTO servers("key") VALUES('${API_AUTH_TOKEN}');
 SQL
     then
@@ -1544,6 +1551,13 @@ backend bk_sshws_tls
 EOF
 
   haproxy -c -f /etc/haproxy/haproxy.cfg
+  mkdir -p /etc/systemd/system/haproxy.service.d
+  cat > /etc/systemd/system/haproxy.service.d/sc-1forcr-order.conf <<EOF
+[Unit]
+After=network-online.target nginx.service sc-1forcr-sshws.service
+Wants=network-online.target nginx.service sc-1forcr-sshws.service
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl disable stunnel4 >/dev/null 2>&1 || true
   systemctl stop stunnel4 >/dev/null 2>&1 || true
   systemctl enable haproxy >/dev/null 2>&1 || true
@@ -2467,6 +2481,12 @@ async function ensureApiRuntimeTables() {
     hits INTEGER DEFAULT 1,
     PRIMARY KEY (username, ip)
   )`).catch(() => {});
+  await run(`CREATE TABLE IF NOT EXISTS account_trial_flags (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username)
+  )`).catch(() => {});
   await cleanupZivpnLiveSessions().catch(() => {});
 }
 function getOwnerInfo(req, body = {}) {
@@ -3232,6 +3252,86 @@ function isExpiredDateValue(v) {
   return Date.now() >= ts;
 }
 
+async function markTrialAccount(accountType, username) {
+  const t = String(accountType || '').trim().toLowerCase();
+  const u = String(username || '').trim();
+  if (!t || !u) return;
+  await run(
+    "INSERT OR REPLACE INTO account_trial_flags(account_type, username, created_at) VALUES(?, ?, COALESCE((SELECT created_at FROM account_trial_flags WHERE account_type=? AND LOWER(username)=LOWER(?)), strftime('%s','now')))",
+    [t, u, t, u]
+  ).catch(() => {});
+}
+
+async function cleanupDeletedAccountState(accountType, username) {
+  const t = String(accountType || '').trim().toLowerCase();
+  const u = String(username || '').trim();
+  if (!t || !u) return;
+  await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+  await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+  await run("DELETE FROM temp_ip_lock_grace WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+  await run("DELETE FROM account_trial_flags WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
+  if (t === 'ssh') {
+    await run("DELETE FROM zivpn_live_sessions WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+  }
+}
+
+async function cleanupExpiredTrialAccounts() {
+  let deletedSsh = 0;
+  let deletedXray = 0;
+  let xrayChanged = false;
+
+  const sshRows = await all(
+    "SELECT username, password, date_exp FROM account_sshs " +
+    "WHERE TRIM(COALESCE(date_exp,'')) <> '' " +
+    "AND (LOWER(username) LIKE 'trial%' OR EXISTS (" +
+    "SELECT 1 FROM account_trial_flags f WHERE f.account_type='ssh' AND LOWER(f.username)=LOWER(account_sshs.username)))"
+  ).catch(() => []);
+  for (const row of sshRows) {
+    const u = String(row?.username || '').trim();
+    const pass = String(row?.password || '').trim();
+    const exp = String(row?.date_exp || '').trim();
+    if (!u || !isExpiredDateValue(exp)) continue;
+    deleteLinuxUser(u);
+    await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+    syncZivpnUser(u, false);
+    if (pass) syncUdpcustomUser(pass, false);
+    syncUdpcustomUser(u, false);
+    await cleanupDeletedAccountState('ssh', u);
+    deletedSsh += 1;
+  }
+
+  const xrayTargets = [
+    { table: 'account_vmesses', type: 'vmess' },
+    { table: 'account_vlesses', type: 'vless' },
+    { table: 'account_trojans', type: 'trojan' }
+  ];
+  for (const item of xrayTargets) {
+    const rows = await all(
+      `SELECT username, date_exp FROM ${item.table} ` +
+      "WHERE TRIM(COALESCE(date_exp,'')) <> '' " +
+      `AND (LOWER(username) LIKE 'trial%' OR EXISTS (` +
+      `SELECT 1 FROM account_trial_flags f WHERE f.account_type='${item.type}' AND LOWER(f.username)=LOWER(${item.table}.username)))`
+    ).catch(() => []);
+    for (const row of rows) {
+      const u = String(row?.username || '').trim();
+      const exp = String(row?.date_exp || '').trim();
+      if (!u || !isExpiredDateValue(exp)) continue;
+      await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
+      await cleanupDeletedAccountState(item.type, u);
+      deletedXray += 1;
+      xrayChanged = true;
+    }
+  }
+
+  if (xrayChanged) {
+    await renderAndReloadXray().catch(() => {});
+  }
+  if (deletedSsh > 0 || deletedXray > 0) {
+    console.log(`[trial-cleanup] deleted ssh=${deletedSsh} xray=${deletedXray}`);
+  }
+  return { deletedSsh, deletedXray };
+}
+
 async function cleanupExpiredXrayAccounts() {
   const targets = [
     { table: 'account_vmesses', type: 'vmess' },
@@ -3377,6 +3477,7 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
     "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
     [username, password, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
   );
+  if (isTrial) await markTrialAccount('ssh', username);
   syncZivpnUser(username, true);
   syncUdpcustomUser(password, true);
   const payload = sshPayload(username, password, expDate, limitip);
@@ -3704,6 +3805,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       link: { tls: trojanLink(DOMAIN, pass, true, finalUsername), none: trojanLink(DOMAIN, pass, false, finalUsername), grpc: trojanGrpcLink(DOMAIN, pass, finalUsername), uptls: trojanLink(DOMAIN, pass, true, finalUsername), upntls: trojanLink(DOMAIN, pass, false, finalUsername) }
     };
   }
+  if (trial) await markTrialAccount(protocol, finalUsername);
   await renderAndReloadXray();
   await notifyAccountEvent(trial ? 'trial' : 'create', protocol, data, owner);
   return data;
@@ -3994,8 +4096,11 @@ app.listen(PORT, '127.0.0.1', () => {
   setInterval(() => {
     if (isRuntimeLicenseDenied()) stopApiByLicense('expired-or-rejected');
   }, 30 * 1000);
-  ensureApiRuntimeTables().catch(() => {});
+  ensureApiRuntimeTables()
+    .then(() => cleanupExpiredTrialAccounts())
+    .catch(() => {});
   setInterval(() => { cleanupZivpnLiveSessions().catch(() => {}); }, 60 * 1000);
+  setInterval(() => { cleanupExpiredTrialAccounts().catch(() => {}); }, 60 * 1000);
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
   syncXrayFromDbIfChanged(true).catch(() => {});
@@ -7743,6 +7848,9 @@ apply_restored_runtime_units
 systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
 systemctl restart xray >/dev/null 2>&1 || true
 systemctl restart "${ZIVPN_SERVICE:-zivpn}" >/dev/null 2>&1 || true
+systemctl restart "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}" >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-sshws nginx >/dev/null 2>&1 || true
+systemctl restart haproxy >/dev/null 2>&1 || true
 systemctl restart ssh >/dev/null 2>&1 || true
 systemctl restart dropbear >/dev/null 2>&1 || true
 echo "Restore akun selesai dari: ${backup_file}"
@@ -8413,6 +8521,7 @@ ENV_FILE="/etc/sc-1forcr.env"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
+VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
 STATE_DIR="/var/lib/sc-1forcr"
 LAST_VERSION_FILE="${STATE_DIR}/last-pull-update.version"
 LOCK_FILE="/run/sc-1forcr-pull-update.lock"
@@ -8427,11 +8536,34 @@ json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${1:-}"
 }
 
+detect_public_ipv4_pull() {
+  local ip
+  ip="${VPS_PUBLIC_IP:-}"
+  ip="$(echo "${ip}" | tr -d '[:space:]')"
+  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "${ip}"
+    return 0
+  fi
+  ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)"
+  ip="$(echo "${ip}" | tr -d '[:space:]')"
+  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "${ip}"
+    return 0
+  fi
+  echo ""
+  return 0
+}
+
 ack_update() {
-  local base_url="$1" version="$2" status="$3" message="$4"
+  local base_url="$1" version="$2" status="$3" message="$4" vps_ip="${5:-}"
   [[ -z "${base_url}" || -z "${version}" ]] && return 0
   local payload
-  payload="{\"version\":$(json_escape "${version}"),\"status\":$(json_escape "${status}"),\"message\":$(json_escape "${message}")}"
+  payload="{\"version\":$(json_escape "${version}"),\"status\":$(json_escape "${status}"),\"message\":$(json_escape "${message}")"
+  if [[ -n "${vps_ip}" ]]; then
+    payload="${payload},\"ip\":$(json_escape "${vps_ip}")"
+  fi
+  payload="${payload}}"
   curl -4fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
     -X POST "${base_url}/sc1forcr/update/ack" \
     -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
@@ -8457,15 +8589,20 @@ main_pull_update() {
   fi
 
   mkdir -p "${STATE_DIR}"
-  local base_url current_version payload resp ok required version note msg
+  local base_url current_version payload resp ok required version note msg vps_ip
   base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
   if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
     base_url="$(echo "${LICENSE_API_URL}" | sed 's|/license/activate$||')"
   fi
   [[ -z "${base_url}" || "${base_url}" == "${LICENSE_API_URL}" ]] && exit 0
 
+  vps_ip="$(detect_public_ipv4_pull)"
   current_version="$(cat "${LAST_VERSION_FILE}" 2>/dev/null || true)"
-  payload="{\"current_version\":$(json_escape "${current_version}"),\"script_version\":$(json_escape "${SCRIPT_VERSION:-}")}"
+  payload="{\"current_version\":$(json_escape "${current_version}"),\"script_version\":$(json_escape "${SCRIPT_VERSION:-}")"
+  if [[ -n "${vps_ip}" ]]; then
+    payload="${payload},\"ip\":$(json_escape "${vps_ip}")"
+  fi
+  payload="${payload}}"
 
   resp="$(
     curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
@@ -8493,14 +8630,14 @@ main_pull_update() {
   note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
 
   log_msg "Trigger update diterima dari bot: ${version}${note:+ (${note})}"
-  ack_update "${base_url}" "${version}" "running" "update mulai"
+  ack_update "${base_url}" "${version}" "running" "update mulai" "${vps_ip}"
   if /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
-    ack_update "${base_url}" "${version}" "success" "update selesai"
+    ack_update "${base_url}" "${version}" "success" "update selesai" "${vps_ip}"
     log_msg "Update trigger ${version} selesai."
   else
     msg="$(tail -n 20 /var/log/sc-1forcr-pull-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-500)"
-    ack_update "${base_url}" "${version}" "failed" "${msg:-update gagal}"
+    ack_update "${base_url}" "${version}" "failed" "${msg:-update gagal}" "${vps_ip}"
     log_msg "Update trigger ${version} gagal."
     exit 1
   fi
@@ -14876,6 +15013,8 @@ apply_final_service_restart_chain() {
   sleep 2
   systemctl restart "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
+  sleep 1
+  systemctl restart haproxy >/dev/null 2>&1 || true
 }
 
 update_sc_env_var() {

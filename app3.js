@@ -5268,10 +5268,10 @@ bot.on('text', async (ctx) => {
       await ctx.reply('Membuat backup, tunggu...');
 
       const [ssh, vmess, vless, trojan] = await Promise.all([
-        apiGet(state.host, key, '/internal/export-accounts', { type: 'ssh', limit: 50000 }),
-        apiGet(state.host, key, '/internal/export-accounts', { type: 'vmess', limit: 50000 }),
-        apiGet(state.host, key, '/internal/export-accounts', { type: 'vless', limit: 50000 }),
-        apiGet(state.host, key, '/internal/export-accounts', { type: 'trojan', limit: 50000 })
+        apiGet(state.host, key, '/internal/export-accounts', { type: 'ssh', limit: 50000, include_inactive: 1 }),
+        apiGet(state.host, key, '/internal/export-accounts', { type: 'vmess', limit: 50000, include_inactive: 1 }),
+        apiGet(state.host, key, '/internal/export-accounts', { type: 'vless', limit: 50000, include_inactive: 1 }),
+        apiGet(state.host, key, '/internal/export-accounts', { type: 'trojan', limit: 50000, include_inactive: 1 })
       ]);
 
       // ZIVPN disatukan dengan SSH: auth source mengikuti akun SSH.

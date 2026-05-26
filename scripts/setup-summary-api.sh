@@ -4,6 +4,7 @@ set -euo pipefail
 APP_DIR="${APP_DIR:-/root/tunnel-sync}"
 APP_NAME="${APP_NAME:-tunnel-summary}"
 SUMMARY_PORT="${SUMMARY_PORT:-8789}"
+SUMMARY_HOST="${SUMMARY_HOST:-0.0.0.0}"
 POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
 
@@ -68,6 +69,7 @@ require('dotenv').config();
 const app = express();
 app.use(express.json({ limit: '2mb' }));
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
+const HOST = String(process.env.SUMMARY_HOST || '0.0.0.0').trim() || '0.0.0.0';
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
 const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
 const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
@@ -1417,7 +1419,7 @@ function restoreRuntimeSettings(settingsInput) {
   };
 }
 
-function sendExportAccounts(db, res, rawType, rawLimit) {
+function sendExportAccounts(db, res, rawType, rawLimit, rawIncludeInactive = false) {
   const type = String(rawType || '').trim().toLowerCase();
   const table = getAccountTableByType(type);
   if (!table) {
@@ -1426,8 +1428,10 @@ function sendExportAccounts(db, res, rawType, rawLimit) {
   }
 
   const limit = Math.max(1, Math.min(50000, Number(rawLimit || 1000)));
+  const includeInactive = rawIncludeInactive === true || /^(1|true|yes|on)$/i.test(String(rawIncludeInactive || '').trim());
+  const where = includeInactive ? '1=1' : "UPPER(TRIM(COALESCE(status, '')))='AKTIF'";
   db.all(
-    `SELECT * FROM ${table} WHERE UPPER(TRIM(COALESCE(status, '')))='AKTIF' ORDER BY rowid DESC LIMIT ?`,
+    `SELECT * FROM ${table} WHERE ${where} ORDER BY rowid DESC LIMIT ?`,
     [limit],
     (err, rows) => {
       db.close();
@@ -1436,6 +1440,7 @@ function sendExportAccounts(db, res, rawType, rawLimit) {
         ok: true,
         type,
         table,
+        include_inactive: includeInactive,
         exported: Array.isArray(rows) ? rows.length : 0,
         accounts: Array.isArray(rows) ? rows : []
       });
@@ -2197,7 +2202,8 @@ app.get('/internal/vnstat-daily', (req, res) => {
 app.get('/internal/export-accounts', (req, res) => {
   const type = String(req.query.type || '').trim();
   const limit = Number(req.query.limit || 0);
-  return authorizeAndRun(req, res, (db) => sendExportAccounts(db, res, type, limit));
+  const includeInactive = req.query.include_inactive ?? req.query.all_status;
+  return authorizeAndRun(req, res, (db) => sendExportAccounts(db, res, type, limit, includeInactive));
 });
 
 app.get('/internal/export-zivpn-config', (req, res) => {
@@ -2452,13 +2458,14 @@ app.post('/internal/zivpn-service', (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`summary api on port ${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`summary api on ${HOST}:${PORT}`);
 });
 JS
 
   cat > "${APP_DIR}/.env" <<EOF
 SUMMARY_PORT=${SUMMARY_PORT}
+SUMMARY_HOST=${SUMMARY_HOST}
 POTATO_DB=${POTATO_DB}
 SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 USE_DB_AUTH=1
@@ -2507,6 +2514,32 @@ install_dependencies() {
   node -e "require('sqlite3'); console.log('sqlite3 load ok')"
 }
 
+open_summary_firewall() {
+  local port
+  port="$(echo "${SUMMARY_PORT:-8789}" | tr -cd '0-9')"
+  [[ -z "${port}" || "${port}" -lt 1 || "${port}" -gt 65535 ]] && port="8789"
+
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -w 10 -C INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -p tcp --dport "${port}" -j ACCEPT
+  elif command -v nft >/dev/null 2>&1; then
+    if nft list chain inet filter input >/dev/null 2>&1; then
+      nft list chain inet filter input | grep -F -- "tcp dport ${port} accept" >/dev/null 2>&1 || \
+        nft add rule inet filter input tcp dport "${port}" accept
+    elif nft list chain ip filter input >/dev/null 2>&1; then
+      nft list chain ip filter input | grep -F -- "tcp dport ${port} accept" >/dev/null 2>&1 || \
+        nft add rule ip filter input tcp dport "${port}" accept
+    fi
+  fi
+
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+  elif command -v nft >/dev/null 2>&1 && systemctl is-enabled --quiet nftables 2>/dev/null; then
+    nft list ruleset >/etc/nftables.conf 2>/dev/null || true
+  fi
+}
+
 start_pm2_service() {
   cd "${APP_DIR}"
 
@@ -2529,7 +2562,7 @@ print_result() {
   echo
   echo "Service Name : ${APP_NAME}"
   echo "Service Path : ${APP_DIR}/summary-api.js"
-  echo "Port         : ${SUMMARY_PORT}"
+  echo "Listen       : ${SUMMARY_HOST}:${SUMMARY_PORT}"
   echo "DB Path      : ${POTATO_DB}"
   echo "Auth Mode    : DB (servers.key)"
   echo
@@ -2578,4 +2611,5 @@ install_vnstat_if_missing
 write_files
 install_dependencies
 start_pm2_service
+open_summary_firewall
 print_result

@@ -241,19 +241,25 @@ async function isDomainAllowed(req) {
 }
 
 async function findActiveRegistrationByIp(ip) {
-  if (!ip) return null;
+  const safeIp = cleanIp(ip);
+  if (!safeIp) return null;
   const now = Date.now();
   return dbGet(
-    "SELECT user_id, vps_ip, client_name, status, updated_at, expires_at FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
-    [ip, now]
+    "SELECT user_id, vps_ip, client_name, status, updated_at, expires_at FROM sc_registrations " +
+      "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      "AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+    [safeIp, now]
   );
 }
 
 async function findLatestRegistrationByIp(ip) {
-  if (!ip) return null;
+  const safeIp = cleanIp(ip);
+  if (!safeIp) return null;
   return dbGet(
-    'SELECT user_id, vps_ip, client_name, status, updated_at, expires_at FROM sc_registrations WHERE vps_ip = ? ORDER BY updated_at DESC, id DESC LIMIT 1',
-    [ip]
+    "SELECT user_id, vps_ip, client_name, status, updated_at, expires_at FROM sc_registrations " +
+      "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      "ORDER BY updated_at DESC, id DESC LIMIT 1",
+    [safeIp]
   );
 }
 

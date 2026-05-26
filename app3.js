@@ -74,6 +74,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const SC_NOTIFY_INTERVAL_MS = 30 * 60 * 1000;
 const SC_H2_WINDOW_MS = 2 * DAY_MS;
 const SC_IP_CHANGE_MAX = 2;
+const MIGRATION_ROLLBACK_TTL_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.MIGRATION_ROLLBACK_TTL_MS || (2 * 60 * 60 * 1000)) || (2 * 60 * 60 * 1000)
+);
 
 function dbRun(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -202,6 +206,23 @@ async function initDb() {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (vps_ip, version)
   )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS migration_rollback_jobs (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    src_host TEXT NOT NULL,
+    dst_host TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ready',
+    message TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER
+  )`);
+  await dbRun(
+    "DELETE FROM migration_rollback_jobs WHERE expires_at < ? OR (status IN ('rolled_back','cancelled') AND used_at IS NOT NULL AND used_at < ?)",
+    [Date.now(), Date.now() - DAY_MS]
+  ).catch(() => {});
   await ensureScRegistrationSchema();
   await ensureUsersSchema();
   await ensurePendingDepositSchema();
@@ -2597,6 +2618,170 @@ function chunkArray(input, size = 200) {
   return out;
 }
 
+function accountMapByUsername(accounts) {
+  const out = new Map();
+  for (const row of Array.isArray(accounts) ? accounts : []) {
+    const u = String(row?.username || '').trim();
+    if (!u) continue;
+    out.set(u.toLowerCase(), { ...(row || {}), username: u });
+  }
+  return out;
+}
+
+function generateMigrationRollbackToken() {
+  return crypto.randomBytes(8).toString('hex');
+}
+
+async function createMigrationRollbackJob(userId, srcHost, dstHost, protocol, payload) {
+  const uid = Number(userId || 0);
+  const src = normalizeHost(srcHost);
+  const dst = normalizeHost(dstHost);
+  const proto = String(protocol || '').trim().toLowerCase() || 'all';
+  const createdAt = Date.now();
+  const expiresAt = createdAt + MIGRATION_ROLLBACK_TTL_MS;
+  const body = JSON.stringify(payload || {});
+
+  for (let i = 0; i < 5; i += 1) {
+    const token = generateMigrationRollbackToken();
+    try {
+      await dbRun(
+        `INSERT INTO migration_rollback_jobs
+         (token, user_id, src_host, dst_host, protocol, payload_json, status, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?)`,
+        [token, uid, src, dst, proto, body, createdAt, expiresAt]
+      );
+      return { token, expiresAt };
+    } catch (err) {
+      if (!/UNIQUE|constraint/i.test(String(err?.message || err))) throw err;
+    }
+  }
+  throw new Error('gagal membuat token rollback migrasi');
+}
+
+async function getMigrationRollbackJob(tokenInput) {
+  const token = String(tokenInput || '').trim();
+  if (!/^[a-f0-9]{16}$/i.test(token)) return null;
+  const row = await dbGet('SELECT * FROM migration_rollback_jobs WHERE token = ? LIMIT 1', [token]);
+  if (!row) return null;
+  let payload = {};
+  try {
+    payload = JSON.parse(String(row.payload_json || '{}'));
+  } catch (_) {
+    payload = {};
+  }
+  return { ...row, payload };
+}
+
+async function updateMigrationRollbackJob(tokenInput, status, message = '', usedAt = null) {
+  const token = String(tokenInput || '').trim();
+  const st = String(status || '').trim().toLowerCase();
+  const msg = String(message || '').replace(/\s+/g, ' ').trim().slice(0, 700);
+  const at = usedAt === null || usedAt === undefined ? null : Number(usedAt || Date.now());
+  await dbRun(
+    'UPDATE migration_rollback_jobs SET status = ?, message = ?, used_at = COALESCE(?, used_at) WHERE token = ?',
+    [st, msg, at, token]
+  );
+}
+
+async function startMigrationRollbackJob(tokenInput) {
+  const token = String(tokenInput || '').trim();
+  const now = Date.now();
+  const result = await dbRun(
+    "UPDATE migration_rollback_jobs SET status = 'running', message = '', used_at = NULL WHERE token = ? AND status IN ('ready','failed') AND expires_at >= ?",
+    [token, now]
+  );
+  return Number(result?.changes || 0) > 0;
+}
+
+function migrationRollbackKeyboard(token) {
+  const rows = [
+    [Markup.button.callback('↩️ Gajadi Migrasi (Rollback)', `m_migrate_rollback_view_${token}`)]
+  ];
+  const menuRows = mainMenu()?.reply_markup?.inline_keyboard;
+  if (Array.isArray(menuRows)) rows.push(...menuRows);
+  return Markup.inlineKeyboard(rows);
+}
+
+function migrationRollbackConfirmKeyboard(token) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Ya, rollback migrasi', `m_migrate_rollback_yes_${token}`)],
+    [Markup.button.callback('Batal', `m_migrate_rollback_no_${token}`)]
+  ]);
+}
+
+async function deleteAccountsByProtocol(host, key, type, usernamesInput) {
+  const t = String(type || '').trim().toLowerCase();
+  const usernames = uniqUsernames((Array.isArray(usernamesInput) ? usernamesInput : []).map((username) => ({ username })));
+  if (!usernames.length) return { requested: 0, deleted: 0 };
+
+  let deleted = 0;
+  for (const part of chunkArray(usernames, 200)) {
+    const res = await apiPost(host, key, '/internal/delete-accounts', { type: t, usernames: part });
+    deleted += Number(res?.deleted || res?.deleted_db || 0);
+  }
+  return { requested: usernames.length, deleted };
+}
+
+async function executeMigrationRollback(job) {
+  const dstHost = normalizeHost(job?.dst_host);
+  const key = await getServerKeyForHost(job?.user_id, dstHost);
+  if (!isIpv4(dstHost) || !key) {
+    throw new Error('key VPS tujuan tidak ditemukan, rollback tidak bisa dijalankan');
+  }
+
+  const byType = job?.payload?.types || {};
+  const lines = [
+    'Rollback migrasi selesai.',
+    `Tujuan: ${dstHost}`,
+    `Protokol: ${String(job?.protocol || 'all').toUpperCase()}`
+  ];
+  let totalDeleted = 0;
+  let totalRestored = 0;
+  let xrayTouched = false;
+
+  for (const t of ['ssh', 'vmess', 'vless', 'trojan']) {
+    const item = byType?.[t] || {};
+    const usernames = uniqUsernames((Array.isArray(item.usernames) ? item.usernames : []).map((username) => ({ username })));
+    const previousAccounts = Array.isArray(item.previous_accounts) ? item.previous_accounts : [];
+    if (!usernames.length && !previousAccounts.length) continue;
+
+    const deleted = usernames.length ? await deleteAccountsByProtocol(dstHost, key, t, usernames) : { requested: 0, deleted: 0 };
+    totalDeleted += Number(deleted.deleted || 0);
+
+    let restoredImported = 0;
+    let restoredSkipped = 0;
+    if (previousAccounts.length) {
+      const restoreRows = previousAccounts
+        .map((row) => normalizeAccountForImport(t, row, { forceActive: false, ensureNotExpired: false }))
+        .filter((row) => String(row?.username || '').trim().length > 0);
+      if (restoreRows.length) {
+        const restored = await apiPost(dstHost, key, '/internal/import-accounts', { type: t, accounts: restoreRows });
+        restoredImported = Number(restored?.imported || 0);
+        restoredSkipped = Number(restored?.skipped || 0);
+        totalRestored += restoredImported;
+      }
+    }
+
+    if (['vmess', 'vless', 'trojan'].includes(t)) xrayTouched = true;
+    lines.push(
+      `- ${protocolLabel(t)}: hapus ${Number(deleted.deleted || 0)}/${Number(deleted.requested || 0)}, restore lama ${restoredImported}, skipped ${restoredSkipped}`
+    );
+  }
+
+  if (xrayTouched) {
+    try {
+      await applyXrayRestart(dstHost, key);
+      lines.push('XRAY restart: OK');
+    } catch (err) {
+      lines.push(`XRAY restart: gagal (${parseErr(err)})`);
+    }
+  }
+
+  lines.push(`Total dihapus: ${totalDeleted}`);
+  lines.push(`Total akun lama direstore: ${totalRestored}`);
+  return { lines, totalDeleted, totalRestored };
+}
+
 async function rebuildXrayFromType(host, key, type, sampleUser) {
   const t = String(type || '').trim().toLowerCase();
   const u = String(sampleUser || '').trim();
@@ -3949,6 +4134,7 @@ bot.action('m_migrate_confirm_yes', async (ctx) => {
     let totalSkipped = 0;
     let migratedAny = false;
     let xrayTouched = false;
+    const rollbackPayload = { version: 1, types: {} };
 
     for (const t of migrateTypes) {
       const exported = await apiGet(state.srcHost, state.srcKey, '/internal/export-accounts', { type: t, limit: 50000 });
@@ -3964,9 +4150,24 @@ bot.action('m_migrate_confirm_yes', async (ctx) => {
 
       migratedAny = true;
       totalFound += accounts.length;
+      const dstBefore = await apiGet(state.dstHost, state.dstKey, '/internal/export-accounts', { type: t, limit: 50000, include_inactive: 1 });
+      const dstBeforeByUsername = accountMapByUsername(Array.isArray(dstBefore?.accounts) ? dstBefore.accounts : []);
       const imported = await apiPost(state.dstHost, state.dstKey, '/internal/import-accounts', { type: t, accounts });
       const importedN = Number(imported?.imported || 0);
       const skippedN = Number(imported?.skipped || 0);
+      const importedUsernames = uniqUsernames(
+        (Array.isArray(imported?.usernames) && imported.usernames.length ? imported.usernames : accounts.map((row) => row?.username))
+          .map((username) => ({ username }))
+      );
+      const previousAccounts = importedUsernames
+        .map((username) => dstBeforeByUsername.get(String(username || '').trim().toLowerCase()))
+        .filter(Boolean);
+      if (importedUsernames.length > 0) {
+        rollbackPayload.types[t] = {
+          usernames: importedUsernames,
+          previous_accounts: previousAccounts
+        };
+      }
       totalImported += importedN;
       totalSkipped += skippedN;
       lines.push(`- ${protocolLabel(t)}: sumber ${accounts.length}, imported ${importedN}, skipped ${skippedN}`);
@@ -4003,12 +4204,112 @@ bot.action('m_migrate_confirm_yes', async (ctx) => {
       }
     }
 
+    let rollbackJob = null;
+    if (totalImported > 0 && Object.keys(rollbackPayload.types).length > 0) {
+      try {
+        rollbackJob = await createMigrationRollbackJob(
+          ctx.from.id,
+          state.srcHost,
+          state.dstHost,
+          type,
+          rollbackPayload
+        );
+        lines.push(`Rollback tersedia sampai: ${formatDateTime(rollbackJob.expiresAt)}`);
+        lines.push('Tombol rollback akan menghapus hasil migrasi di VPS tujuan dan mengembalikan akun lama yang tertimpa.');
+      } catch (rollbackErr) {
+        lines.push(`Rollback: gagal disiapkan (${parseErr(rollbackErr)})`);
+      }
+    }
+
     await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip IN (?, ?) AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.srcHost, state.dstHost]).catch(() => {});
     userState.delete(ctx.chat.id);
-    return ctx.reply(lines.join('\n'), mainMenu());
+    return ctx.reply(lines.join('\n'), rollbackJob ? migrationRollbackKeyboard(rollbackJob.token) : mainMenu());
   } catch (err) {
     userState.delete(ctx.chat.id);
     return ctx.reply(`Gagal migrasi: ${parseErr(err)}`, mainMenu());
+  }
+});
+
+bot.action(/m_migrate_rollback_view_([a-f0-9]{16})/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const token = String(ctx.match?.[1] || '').trim();
+  const job = await getMigrationRollbackJob(token);
+  if (!job) return ctx.reply('Data rollback migrasi tidak ditemukan atau sudah dibersihkan.', mainMenu());
+  if (Number(job.user_id || 0) !== Number(ctx.from.id || 0) && !isAdmin(ctx.from.id)) {
+    return ctx.reply('Rollback ini bukan milik akun kamu.', mainMenu());
+  }
+  if (String(job.status || '').toLowerCase() === 'rolled_back') {
+    return ctx.reply('Rollback migrasi ini sudah pernah dijalankan.', mainMenu());
+  }
+  if (String(job.status || '').toLowerCase() === 'running') {
+    return ctx.reply('Rollback migrasi sedang berjalan. Tunggu proses sebelumnya selesai.');
+  }
+  if (Date.now() > Number(job.expires_at || 0)) {
+    await updateMigrationRollbackJob(token, 'expired', 'masa rollback habis').catch(() => {});
+    return ctx.reply('Masa rollback migrasi sudah habis.', mainMenu());
+  }
+
+  const byType = job.payload?.types || {};
+  const detailLines = [];
+  for (const t of ['ssh', 'vmess', 'vless', 'trojan']) {
+    const item = byType?.[t] || {};
+    const usernames = Array.isArray(item.usernames) ? item.usernames : [];
+    const previousAccounts = Array.isArray(item.previous_accounts) ? item.previous_accounts : [];
+    if (!usernames.length && !previousAccounts.length) continue;
+    detailLines.push(`- ${protocolLabel(t)}: hapus ${usernames.length}, restore lama ${previousAccounts.length}`);
+  }
+
+  return ctx.reply(
+    uiBox('KONFIRMASI ROLLBACK MIGRASI', [
+      `Sumber : ${job.src_host}`,
+      `Tujuan : ${job.dst_host}`,
+      `Batas  : ${formatDateTime(job.expires_at)}`,
+      '',
+      ...detailLines,
+      '',
+      'Lanjut rollback migrasi?'
+    ]),
+    migrationRollbackConfirmKeyboard(token)
+  );
+});
+
+bot.action(/m_migrate_rollback_no_([a-f0-9]{16})/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  return ctx.reply('Rollback tidak dijalankan. Hasil migrasi tetap ada di VPS tujuan.', mainMenu());
+});
+
+bot.action(/m_migrate_rollback_yes_([a-f0-9]{16})/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const token = String(ctx.match?.[1] || '').trim();
+  const job = await getMigrationRollbackJob(token);
+  if (!job) return ctx.reply('Data rollback migrasi tidak ditemukan atau sudah dibersihkan.', mainMenu());
+  if (Number(job.user_id || 0) !== Number(ctx.from.id || 0) && !isAdmin(ctx.from.id)) {
+    return ctx.reply('Rollback ini bukan milik akun kamu.', mainMenu());
+  }
+  if (String(job.status || '').toLowerCase() === 'rolled_back') {
+    return ctx.reply('Rollback migrasi ini sudah pernah dijalankan.', mainMenu());
+  }
+  if (Date.now() > Number(job.expires_at || 0)) {
+    await updateMigrationRollbackJob(token, 'expired', 'masa rollback habis').catch(() => {});
+    return ctx.reply('Masa rollback migrasi sudah habis.', mainMenu());
+  }
+
+  const started = await startMigrationRollbackJob(token);
+  if (!started) {
+    const latest = await getMigrationRollbackJob(token);
+    const st = String(latest?.status || job.status || '-');
+    return ctx.reply(`Rollback tidak bisa dimulai. Status saat ini: ${st}`, mainMenu());
+  }
+
+  try {
+    await ctx.reply('Rollback migrasi berjalan, tunggu...');
+    const freshJob = await getMigrationRollbackJob(token);
+    const result = await executeMigrationRollback(freshJob || job);
+    await updateMigrationRollbackJob(token, 'rolled_back', 'rollback sukses', Date.now()).catch(() => {});
+    return ctx.reply(result.lines.join('\n'), mainMenu());
+  } catch (err) {
+    await updateMigrationRollbackJob(token, 'failed', parseErr(err)).catch(() => {});
+    return ctx.reply(`Gagal rollback migrasi: ${parseErr(err)}`, mainMenu());
   }
 });
 

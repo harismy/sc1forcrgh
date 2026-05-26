@@ -83,6 +83,22 @@ async function initDb() {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (vps_ip, version)
   )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS summary_update_triggers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version TEXT NOT NULL UNIQUE,
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    triggered_by INTEGER,
+    status TEXT DEFAULT 'active'
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS summary_update_acks (
+    vps_ip TEXT NOT NULL,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (vps_ip, version)
+  )`);
   await ensureScRegistrationSchema();
 }
 
@@ -269,6 +285,12 @@ async function getLatestActiveUpdateTrigger() {
   );
 }
 
+async function getLatestActiveSummaryUpdateTrigger() {
+  return dbGet(
+    "SELECT version, note, created_at, triggered_by FROM summary_update_triggers WHERE status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1"
+  );
+}
+
 async function recordUpdateAck(ip, version, status, message) {
   const safeIp = cleanIp(ip);
   const safeVersion = String(version || '').trim().slice(0, 80);
@@ -278,6 +300,25 @@ async function recordUpdateAck(ip, version, status, message) {
   if (!safeIp || !safeVersion) return { ok: false, message: 'ip/version required' };
   await dbRun(
     `INSERT INTO sc_update_acks (vps_ip, version, status, message, updated_at)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(vps_ip, version) DO UPDATE SET
+       status=excluded.status,
+       message=excluded.message,
+       updated_at=excluded.updated_at`,
+    [safeIp, safeVersion, safeStatus, safeMessage, Date.now()]
+  );
+  return { ok: true, ip: safeIp, version: safeVersion, status: safeStatus };
+}
+
+async function recordSummaryUpdateAck(ip, version, status, message) {
+  const safeIp = cleanIp(ip);
+  const safeVersion = String(version || '').trim().slice(0, 80);
+  const safeStatusRaw = String(status || '').trim().toLowerCase();
+  const safeStatus = ['running', 'success', 'failed', 'skipped'].includes(safeStatusRaw) ? safeStatusRaw : 'running';
+  const safeMessage = String(message || '').replace(/\s+/g, ' ').trim().slice(0, 700);
+  if (!safeIp || !safeVersion) return { ok: false, message: 'ip/version required' };
+  await dbRun(
+    `INSERT INTO summary_update_acks (vps_ip, version, status, message, updated_at)
      VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(vps_ip, version) DO UPDATE SET
        status=excluded.status,
@@ -541,6 +582,76 @@ app.post('/sc1forcr/update/ack', requireBearer, async (req, res) => {
       return res.status(403).json({ ok: false, allowed: false, message: 'IP belum terdaftar atau expired', ip });
     }
     const result = await recordUpdateAck(
+      reg.vps_ip,
+      req.body?.version,
+      req.body?.status,
+      req.body?.message
+    );
+    if (!result.ok) return res.status(400).json(result);
+    return res.json({ ok: true, ...result });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+app.post('/sc1forcr/summary-update/check', requireBearer, async (req, res) => {
+  try {
+    const ip = cleanIp(req.body?.ip) || getClientIp(req);
+    const reg = await findActiveRegistrationByIp(ip);
+    if (!reg) {
+      const latest = await findLatestRegistrationByIp(ip);
+      const isExpired = Number(latest?.expires_at || 0) > 0 && Date.now() > Number(latest.expires_at);
+      if (latest && isExpired) {
+        await dbRun(
+          "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE vps_ip = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+          [Date.now(), ip, Date.now()]
+        ).catch(() => {});
+        return res.status(403).json({ ok: false, allowed: false, status: 'expired', message: 'SC expired', ip });
+      }
+      return res.status(403).json({ ok: false, allowed: false, status: 'rejected', message: 'IP belum terdaftar', ip });
+    }
+
+    await dbRun('UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip = ?', [
+      Date.now(),
+      Date.now(),
+      reg.user_id,
+      reg.vps_ip
+    ]).catch(() => {});
+
+    const trigger = await getLatestActiveSummaryUpdateTrigger();
+    if (!trigger?.version) {
+      return res.json({ ok: true, allowed: true, update_required: false, ip: reg.vps_ip });
+    }
+
+    const currentVersion = String(req.body?.current_version || '').trim();
+    const baseUrl = getBaseUrl(req);
+    const summaryApiPath = resolveSummaryApiLocalPath();
+    const hasInstaller = fs.existsSync(summaryApiPath);
+    const summaryApiUrl = `${baseUrl}/sc1forcr/payload/scripts/setup-summary-api.sh`;
+
+    return res.json({
+      ok: true,
+      allowed: true,
+      update_required: hasInstaller && currentVersion !== String(trigger.version),
+      version: String(trigger.version),
+      note: String(trigger.note || ''),
+      created_at: Number(trigger.created_at || 0) || null,
+      summary_api_url: hasInstaller ? summaryApiUrl : '',
+      ip: reg.vps_ip
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+app.post('/sc1forcr/summary-update/ack', requireBearer, async (req, res) => {
+  try {
+    const ip = cleanIp(req.body?.ip) || getClientIp(req);
+    const reg = await findActiveRegistrationByIp(ip);
+    if (!reg) {
+      return res.status(403).json({ ok: false, allowed: false, message: 'IP belum terdaftar atau expired', ip });
+    }
+    const result = await recordSummaryUpdateAck(
       reg.vps_ip,
       req.body?.version,
       req.body?.status,

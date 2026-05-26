@@ -7477,6 +7477,23 @@ Unit=sc-1forcr-pull-update.service
 WantedBy=timers.target
 EOF_TIMER
   fi
+  if [[ -f /etc/systemd/system/sc-1forcr-pull-summary-update.service ]]; then
+    cat > /etc/systemd/system/sc-1forcr-pull-summary-update.timer <<EOF_TIMER
+[Unit]
+Description=Check SC 1FORCR Summary API update trigger every ${pull_interval} minutes
+
+[Timer]
+OnBootSec=4m
+OnUnitActiveSec=${pull_interval}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=45s
+Unit=sc-1forcr-pull-summary-update.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+  fi
 
   notify_enable="${ONLINE_NOTIFY_ENABLE:-1}"
   [[ "${notify_enable}" != "0" ]] && notify_enable="1"
@@ -7522,8 +7539,13 @@ EOF_TIMER
   if [[ "${pull_enable}" == "1" ]]; then
     systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
     systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    if [[ -f /etc/systemd/system/sc-1forcr-pull-summary-update.service ]]; then
+      systemctl enable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+      systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+    fi
   else
     systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    systemctl disable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
   fi
 
   if [[ "${notify_enable}" == "1" ]]; then
@@ -8597,7 +8619,7 @@ main_pull_update() {
 
   mkdir -p "${STATE_DIR}"
   mkdir -p "${GOCACHE}" >/dev/null 2>&1 || true
-  local base_url current_version payload resp ok required version note msg vps_ip
+  local base_url current_version payload resp ok required version note summary_url msg vps_ip
   base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
   if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
     base_url="$(echo "${LICENSE_API_URL}" | sed 's|/license/activate$||')"
@@ -8658,6 +8680,146 @@ main_pull_update() {
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-pull-update
 
+  cat > /usr/local/sbin/sc-1forcr-pull-summary-update <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/sc-1forcr.env"
+[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+
+AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+LICENSE_API_URL="${LICENSE_API_URL:-}"
+LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
+VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
+STATE_DIR="/var/lib/sc-1forcr"
+LAST_VERSION_FILE="${STATE_DIR}/last-summary-update.version"
+LOCK_FILE="/run/sc-1forcr-pull-summary-update.lock"
+LOG_TAG="sc-1forcr-pull-summary-update"
+
+log_msg() {
+  logger -t "${LOG_TAG}" "$*" >/dev/null 2>&1 || true
+  echo "$*"
+}
+
+json_escape() {
+  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${1:-}"
+}
+
+detect_public_ipv4_pull() {
+  local ip
+  ip="${VPS_PUBLIC_IP:-}"
+  ip="$(echo "${ip}" | tr -d '[:space:]')"
+  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "${ip}"
+    return 0
+  fi
+  ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)"
+  ip="$(echo "${ip}" | tr -d '[:space:]')"
+  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "${ip}"
+    return 0
+  fi
+  echo ""
+  return 0
+}
+
+ack_summary_update() {
+  local base_url="$1" version="$2" status="$3" message="$4" vps_ip="${5:-}"
+  [[ -z "${base_url}" || -z "${version}" ]] && return 0
+  local payload
+  payload="{\"version\":$(json_escape "${version}"),\"status\":$(json_escape "${status}"),\"message\":$(json_escape "${message}")"
+  if [[ -n "${vps_ip}" ]]; then
+    payload="${payload},\"ip\":$(json_escape "${vps_ip}")"
+  fi
+  payload="${payload}}"
+  curl -4fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
+    -X POST "${base_url}/sc1forcr/summary-update/ack" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "${payload}" >/dev/null 2>&1 || \
+  curl -fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
+    -X POST "${base_url}/sc1forcr/summary-update/ack" \
+    -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    --data "${payload}" >/dev/null 2>&1 || true
+}
+
+main_pull_summary_update() {
+  if [[ "${AUTO_PULL_UPDATE_ENABLE}" != "1" ]]; then
+    exit 0
+  fi
+  if [[ -z "${LICENSE_API_URL}" || -z "${LICENSE_API_TOKEN}" ]]; then
+    exit 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    log_msg "jq tidak tersedia, skip auto pull summary update."
+    exit 0
+  fi
+
+  mkdir -p "${STATE_DIR}"
+  local base_url current_version payload resp ok required version note msg vps_ip
+  base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
+  if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
+    base_url="$(echo "${LICENSE_API_URL}" | sed 's|/license/activate$||')"
+  fi
+  [[ -z "${base_url}" || "${base_url}" == "${LICENSE_API_URL}" ]] && exit 0
+
+  vps_ip="$(detect_public_ipv4_pull)"
+  current_version="$(cat "${LAST_VERSION_FILE}" 2>/dev/null || true)"
+  payload="{\"current_version\":$(json_escape "${current_version}"),\"script_version\":$(json_escape "${SCRIPT_VERSION:-}")"
+  if [[ -n "${vps_ip}" ]]; then
+    payload="${payload},\"ip\":$(json_escape "${vps_ip}")"
+  fi
+  payload="${payload}}"
+
+  resp="$(
+    curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+      -X POST "${base_url}/sc1forcr/summary-update/check" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "${payload}" 2>/dev/null ||
+    curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+      -X POST "${base_url}/sc1forcr/summary-update/check" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      --data "${payload}" 2>/dev/null || true
+  )"
+  [[ -n "${resp}" ]] || exit 0
+
+  ok="$(echo "${resp}" | jq -r 'if .ok == true then "1" else "0" end' 2>/dev/null || echo 0)"
+  [[ "${ok}" == "1" ]] || exit 0
+  required="$(echo "${resp}" | jq -r 'if .update_required == true then "1" else "0" end' 2>/dev/null || echo 0)"
+  [[ "${required}" == "1" ]] || exit 0
+  version="$(echo "${resp}" | jq -r '.version // empty' 2>/dev/null || true)"
+  [[ -n "${version}" ]] || exit 0
+  if [[ "${version}" == "${current_version}" ]]; then
+    exit 0
+  fi
+  note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
+  summary_url="$(echo "${resp}" | jq -r '.summary_api_url // empty' 2>/dev/null || true)"
+
+  log_msg "Trigger update Summary API diterima dari bot: ${version}${note:+ (${note})}"
+  ack_summary_update "${base_url}" "${version}" "running" "summary update mulai" "${vps_ip}"
+  if SUMMARY_API_SETUP_URL="${summary_url:-${SUMMARY_API_SETUP_URL:-}}" /usr/local/sbin/menu-sc-1forcr update-summary >/var/log/sc-1forcr-pull-summary-update.log 2>&1; then
+    printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
+    ack_summary_update "${base_url}" "${version}" "success" "summary update selesai" "${vps_ip}"
+    log_msg "Update Summary API trigger ${version} selesai."
+  else
+    msg="$(tail -n 20 /var/log/sc-1forcr-pull-summary-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-500)"
+    ack_summary_update "${base_url}" "${version}" "failed" "${msg:-summary update gagal}" "${vps_ip}"
+    log_msg "Update Summary API trigger ${version} gagal."
+    exit 1
+  fi
+}
+
+(
+  flock -n 9 || exit 0
+  main_pull_summary_update "$@"
+) 9>"${LOCK_FILE}"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-pull-summary-update
+
   cat > /etc/systemd/system/sc-1forcr-pull-update.service <<'EOF'
 [Unit]
 Description=SC 1FORCR Pull Update Trigger from Bot
@@ -8670,6 +8832,22 @@ Environment=HOME=/root
 Environment=XDG_CACHE_HOME=/root/.cache
 Environment=GOCACHE=/root/.cache/go-build
 ExecStart=/usr/local/sbin/sc-1forcr-pull-update
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-pull-summary-update.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Pull Summary API Update Trigger from Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+Environment=XDG_CACHE_HOME=/root/.cache
+Environment=GOCACHE=/root/.cache/go-build
+ExecStart=/usr/local/sbin/sc-1forcr-pull-summary-update
 NoNewPrivileges=true
 PrivateTmp=true
 EOF
@@ -8690,11 +8868,29 @@ Unit=sc-1forcr-pull-update.service
 WantedBy=timers.target
 EOF
 
+  cat > /etc/systemd/system/sc-1forcr-pull-summary-update.timer <<EOF
+[Unit]
+Description=Check SC 1FORCR Summary API update trigger every ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} minutes
+
+[Timer]
+OnBootSec=4m
+OnUnitActiveSec=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=45s
+Unit=sc-1forcr-pull-summary-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
     systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    systemctl enable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
   else
     systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    systemctl disable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
   fi
 }
 
@@ -8718,6 +8914,8 @@ WILDCARD_ENABLE=${WILDCARD_ENABLE}
 WILDCARD_BASE_DOMAIN=${WILDCARD_BASE_DOMAIN}
 WILDCARD_CF_API_TOKEN=${WILDCARD_CF_API_TOKEN}
 UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
+AUTO_INSTALL_SUMMARY_API=${AUTO_INSTALL_SUMMARY_API}
+SUMMARY_API_SETUP_URL=${SUMMARY_API_SETUP_URL}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
@@ -9381,6 +9579,21 @@ Unit=sc-1forcr-pull-update.service
 [Install]
 WantedBy=timers.target
 EOF
+  cat > /etc/systemd/system/sc-1forcr-pull-summary-update.timer <<EOF
+[Unit]
+Description=Check SC 1FORCR Summary API update trigger every ${interval_min} minutes
+
+[Timer]
+OnBootSec=4m
+OnUnitActiveSec=${interval_min}min
+AccuracySec=30s
+Persistent=true
+RandomizedDelaySec=45s
+Unit=sc-1forcr-pull-summary-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
 }
 
 set_auto_reboot_config_menu() {
@@ -9555,9 +9768,15 @@ set_auto_pull_update_config_menu() {
     if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
       systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
       systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+      if [[ -f /etc/systemd/system/sc-1forcr-pull-summary-update.service ]]; then
+        systemctl enable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+        systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+      fi
     else
       systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
       systemctl stop sc-1forcr-pull-update.service >/dev/null 2>&1 || true
+      systemctl disable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+      systemctl stop sc-1forcr-pull-summary-update.service >/dev/null 2>&1 || true
     fi
   else
     echo
@@ -10127,6 +10346,16 @@ account_table_by_type() {
   esac
 }
 
+account_type_for_table() {
+  case "$1" in
+    account_sshs) echo "ssh" ;;
+    account_vmesses) echo "vmess" ;;
+    account_vlesses) echo "vless" ;;
+    account_trojans) echo "trojan" ;;
+    *) echo "" ;;
+  esac
+}
+
 username_exists_by_type() {
   local type="$1" username="$2" table cnt
   table="$(account_table_by_type "${type}")"
@@ -10628,57 +10857,110 @@ unlock_all_accounts() {
 
 list_accounts() {
   print_account_table() {
-    local table="$1" title="$2" rows
+    local table="$1" title="$2" mode="${3:-active}" acct_type trial_expr where rows total active_total trial_total expired_total
+    acct_type="$(account_type_for_table "${table}")"
+    trial_expr="(LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='${acct_type}' AND LOWER(f.username)=LOWER(${table}.username)))"
+    case "${mode}" in
+      trial)
+        where="WHERE ${trial_expr}"
+        ;;
+      expired)
+        where="WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT ${trial_expr}"
+        ;;
+      all)
+        where=""
+        ;;
+      active|*)
+        where="WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT ${trial_expr}"
+        ;;
+    esac
     rows="$(sqlite3 -separator '|' "$DB_PATH" \
-      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
-    echo "LIST AKUN ${title}"
+      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER), CASE WHEN ${trial_expr} THEN 'TRIAL' ELSE 'REGULER' END FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+    total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table};" 2>/dev/null || echo 0)"
+    active_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
+    trial_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE ${trial_expr};" 2>/dev/null || echo 0)"
+    expired_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
+    echo "LIST AKUN ${title} - ${mode^^}"
+    echo "Summary: aktif=${active_total:-0} | trial=${trial_total:-0} | expired=${expired_total:-0} | total_db=${total:-0}"
     printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
     printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"
     if [[ -z "${rows}" ]]; then
       echo "(kosong)"
       return
     fi
-    local i=0 u sisa st lim sisa_human
-    while IFS='|' read -r u sisa st lim; do
+    local i=0 u sisa st lim kind sisa_human display_st
+    while IFS='|' read -r u sisa st lim kind; do
       [[ -z "${u}" ]] && continue
       i=$((i + 1))
       sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
-      printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa_human}" "${lim:-0}"
+      display_st="${st:-AKTIF}"
+      [[ "${kind}" == "TRIAL" && "${display_st}" == "AKTIF" ]] && display_st="TRIAL"
+      printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${display_st}" "${sisa_human}" "${lim:-0}"
     done <<< "${rows}"
   }
 
   draw_menu_panel "Pilih list akun:" \
-    "1) SSH/ZIVPN/UDPHC" \
-    "2) VMESS" \
-    "3) VLESS" \
-    "4) TROJAN" \
-    "5) Semua" \
+    "1) SSH/ZIVPN/UDPHC aktif" \
+    "2) VMESS aktif" \
+    "3) VLESS aktif" \
+    "4) TROJAN aktif" \
+    "5) Semua aktif" \
+    "6) Trial saja" \
+    "7) Expired saja" \
+    "8) Semua status (debug)" \
     "0) Kembali"
-  prompt_input l "Input [0-5]: " || return
+  prompt_input l "Input [0-8]: " || return
   clear
 
   case "${l}" in
     0) return ;;
     1)
-      print_account_table "account_sshs" "SSH/ZIVPN"
+      print_account_table "account_sshs" "SSH/ZIVPN" "active"
       ;;
     2)
-      print_account_table "account_vmesses" "VMESS"
+      print_account_table "account_vmesses" "VMESS" "active"
       ;;
     3)
-      print_account_table "account_vlesses" "VLESS"
+      print_account_table "account_vlesses" "VLESS" "active"
       ;;
     4)
-      print_account_table "account_trojans" "TROJAN"
+      print_account_table "account_trojans" "TROJAN" "active"
       ;;
     5)
-      print_account_table "account_sshs" "SSH/ZIVPN"
+      print_account_table "account_sshs" "SSH/ZIVPN" "active"
       echo
-      print_account_table "account_vmesses" "VMESS"
+      print_account_table "account_vmesses" "VMESS" "active"
       echo
-      print_account_table "account_vlesses" "VLESS"
+      print_account_table "account_vlesses" "VLESS" "active"
       echo
-      print_account_table "account_trojans" "TROJAN"
+      print_account_table "account_trojans" "TROJAN" "active"
+      ;;
+    6)
+      print_account_table "account_sshs" "SSH/ZIVPN" "trial"
+      echo
+      print_account_table "account_vmesses" "VMESS" "trial"
+      echo
+      print_account_table "account_vlesses" "VLESS" "trial"
+      echo
+      print_account_table "account_trojans" "TROJAN" "trial"
+      ;;
+    7)
+      print_account_table "account_sshs" "SSH/ZIVPN" "expired"
+      echo
+      print_account_table "account_vmesses" "VMESS" "expired"
+      echo
+      print_account_table "account_vlesses" "VLESS" "expired"
+      echo
+      print_account_table "account_trojans" "TROJAN" "expired"
+      ;;
+    8)
+      print_account_table "account_sshs" "SSH/ZIVPN" "all"
+      echo
+      print_account_table "account_vmesses" "VMESS" "all"
+      echo
+      print_account_table "account_vlesses" "VLESS" "all"
+      echo
+      print_account_table "account_trojans" "TROJAN" "all"
       ;;
     *)
       echo "Pilihan tidak valid."
@@ -14040,6 +14322,7 @@ Time     : $(date '+%F %T')"
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}" \
     AUTO_INSTALL_SUMMARY_API="0" \
+    SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-}" \
     AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
     AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR}" \
     AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS}" \
@@ -14691,6 +14974,12 @@ if [[ "${1:-}" == "update" ]]; then
   exit $?
 fi
 
+if [[ "${1:-}" == "update-summary" || "${1:-}" == "summary-update" ]]; then
+  clear >/dev/null 2>&1 || true
+  install_summary_api_1forcr
+  exit $?
+fi
+
 while true; do
   normalize_pending_operation
   if has_pending_install_only; then
@@ -14825,6 +15114,10 @@ systemctl stop sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-pull-update.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-pull-update.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-pull-summary-update.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-pull-summary-update.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
@@ -14847,6 +15140,8 @@ rm -f /etc/systemd/system/sc-1forcr-online-notify.service
 rm -f /etc/systemd/system/sc-1forcr-online-notify.timer
 rm -f /etc/systemd/system/sc-1forcr-pull-update.service
 rm -f /etc/systemd/system/sc-1forcr-pull-update.timer
+rm -f /etc/systemd/system/sc-1forcr-pull-summary-update.service
+rm -f /etc/systemd/system/sc-1forcr-pull-summary-update.timer
 rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/sc-1forcr-udpgw@.service
@@ -14869,6 +15164,7 @@ rm -f /usr/local/sbin/sc-1forcr-auto-backup
 rm -f /usr/local/sbin/sc-1forcr-restore-backup
 rm -f /usr/local/sbin/sc-1forcr-online-notify
 rm -f /usr/local/sbin/sc-1forcr-pull-update
+rm -f /usr/local/sbin/sc-1forcr-pull-summary-update
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 rm -f /etc/profile.d/sc-1forcr-auto-menu.sh
 

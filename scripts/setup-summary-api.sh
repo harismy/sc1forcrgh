@@ -150,34 +150,78 @@ if (!USE_DB_AUTH && !STATIC_TOKEN) {
   process.exit(1);
 }
 
+function ensureRuntimeTables(db, cb) {
+  db.run(
+    `CREATE TABLE IF NOT EXISTS account_trial_flags (
+      account_type TEXT NOT NULL,
+      username TEXT NOT NULL,
+      created_at INTEGER DEFAULT (strftime('%s','now')),
+      PRIMARY KEY (account_type, username)
+    )`,
+    [],
+    (err) => cb(err || null)
+  );
+}
+
 function sendSummary(db, res) {
-  db.get(
-    `
-    SELECT
-      (SELECT COUNT(*) FROM account_sshs    WHERE UPPER(TRIM(status))='AKTIF') AS ssh,
-      (SELECT COUNT(*) FROM account_vmesses WHERE UPPER(TRIM(status))='AKTIF') AS vmess,
-      (SELECT COUNT(*) FROM account_vlesses WHERE UPPER(TRIM(status))='AKTIF') AS vless,
-      (SELECT COUNT(*) FROM account_trojans WHERE UPPER(TRIM(status))='AKTIF') AS trojan
-    `,
-    (err, row) => {
+  ensureRuntimeTables(db, (tableErr) => {
+    if (tableErr) {
       db.close();
-      if (err) return res.status(500).json({ ok: false, message: err.message });
+      return res.status(500).json({ ok: false, message: tableErr.message });
+    }
+    db.get(
+      `
+      SELECT
+        (SELECT COUNT(*) FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT (LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='ssh' AND LOWER(f.username)=LOWER(account_sshs.username)))) AS ssh,
+        (SELECT COUNT(*) FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT (LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='vmess' AND LOWER(f.username)=LOWER(account_vmesses.username)))) AS vmess,
+        (SELECT COUNT(*) FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT (LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='vless' AND LOWER(f.username)=LOWER(account_vlesses.username)))) AS vless,
+        (SELECT COUNT(*) FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT (LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='trojan' AND LOWER(f.username)=LOWER(account_trojans.username)))) AS trojan,
+        (SELECT COUNT(*) FROM account_sshs WHERE LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='ssh' AND LOWER(f.username)=LOWER(account_sshs.username))) AS trial_ssh,
+        (SELECT COUNT(*) FROM account_vmesses WHERE LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='vmess' AND LOWER(f.username)=LOWER(account_vmesses.username))) AS trial_vmess,
+        (SELECT COUNT(*) FROM account_vlesses WHERE LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='vless' AND LOWER(f.username)=LOWER(account_vlesses.username))) AS trial_vless,
+        (SELECT COUNT(*) FROM account_trojans WHERE LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='trojan' AND LOWER(f.username)=LOWER(account_trojans.username))) AS trial_trojan,
+        (SELECT COUNT(*) FROM account_sshs WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT (LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='ssh' AND LOWER(f.username)=LOWER(account_sshs.username)))) AS expired_ssh,
+        (SELECT COUNT(*) FROM account_vmesses WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT (LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='vmess' AND LOWER(f.username)=LOWER(account_vmesses.username)))) AS expired_vmess,
+        (SELECT COUNT(*) FROM account_vlesses WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT (LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='vless' AND LOWER(f.username)=LOWER(account_vlesses.username)))) AS expired_vless,
+        (SELECT COUNT(*) FROM account_trojans WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT (LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='trojan' AND LOWER(f.username)=LOWER(account_trojans.username)))) AS expired_trojan
+      `,
+      (err, row) => {
+        db.close();
+        if (err) return res.status(500).json({ ok: false, message: err.message });
 
       const ssh = Number(row?.ssh || 0);
       const vmess = Number(row?.vmess || 0);
       const vless = Number(row?.vless || 0);
       const trojan = Number(row?.trojan || 0);
+      const trial = {
+        ssh: Number(row?.trial_ssh || 0),
+        vmess: Number(row?.trial_vmess || 0),
+        vless: Number(row?.trial_vless || 0),
+        trojan: Number(row?.trial_trojan || 0)
+      };
+      trial.total = trial.ssh + trial.vmess + trial.vless + trial.trojan;
+      const expired = {
+        ssh: Number(row?.expired_ssh || 0),
+        vmess: Number(row?.expired_vmess || 0),
+        vless: Number(row?.expired_vless || 0),
+        trojan: Number(row?.expired_trojan || 0)
+      };
+      expired.total = expired.ssh + expired.vmess + expired.vless + expired.trojan;
 
-      return res.json({
-        ok: true,
-        ssh,
-        vmess,
-        vless,
-        trojan,
-        total: ssh + vmess + vless + trojan
-      });
-    }
-  );
+        return res.json({
+          ok: true,
+          ssh,
+          vmess,
+          vless,
+          trojan,
+          total: ssh + vmess + vless + trojan,
+          active_regular: { ssh, vmess, vless, trojan, total: ssh + vmess + vless + trojan },
+          trial,
+          expired
+        });
+      }
+    );
+  });
 }
 
 function sendAccountExpiry(db, res, username) {

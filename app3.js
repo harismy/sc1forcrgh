@@ -186,6 +186,22 @@ async function initDb() {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (vps_ip, version)
   )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS summary_update_triggers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version TEXT NOT NULL UNIQUE,
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    triggered_by INTEGER,
+    status TEXT DEFAULT 'active'
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS summary_update_acks (
+    vps_ip TEXT NOT NULL,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (vps_ip, version)
+  )`);
   await ensureScRegistrationSchema();
   await ensureUsersSchema();
   await ensurePendingDepositSchema();
@@ -1432,6 +1448,42 @@ async function getScUpdateTriggerAckSummary(version) {
   return out;
 }
 
+async function getLatestSummaryUpdateTrigger() {
+  return dbGet(
+    "SELECT version, note, created_at, triggered_by, status FROM summary_update_triggers WHERE status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1"
+  );
+}
+
+async function createSummaryUpdateTrigger(adminId, noteInput = '') {
+  const now = Date.now();
+  const version = `summary-${now}`;
+  const note = String(noteInput || '').replace(/\s+/g, ' ').trim().slice(0, 160) || 'manual summary api trigger';
+  await dbRun(
+    'INSERT INTO summary_update_triggers (version, note, created_at, triggered_by, status) VALUES (?, ?, ?, ?, ?)',
+    [version, note, now, Number(adminId || 0) || null, 'active']
+  );
+  return { version, note, created_at: now };
+}
+
+async function getSummaryUpdateTriggerAckSummary(version) {
+  const v = String(version || '').trim();
+  if (!v) return { success: 0, running: 0, failed: 0, total: 0 };
+  const rows = await dbAll(
+    "SELECT LOWER(TRIM(status)) AS status, COUNT(1) AS total FROM summary_update_acks WHERE version = ? GROUP BY LOWER(TRIM(status))",
+    [v]
+  );
+  const out = { success: 0, running: 0, failed: 0, total: 0 };
+  for (const row of rows) {
+    const st = String(row?.status || '').trim().toLowerCase();
+    const total = Number(row?.total || 0);
+    if (st === 'success') out.success += total;
+    else if (st === 'running') out.running += total;
+    else if (st === 'failed') out.failed += total;
+    out.total += total;
+  }
+  return out;
+}
+
 async function adminRemoveRegisteredIp(ip, adminId) {
   const now = Date.now();
   const rows = await dbAll(
@@ -2027,6 +2079,7 @@ function adminMenu() {
     [Markup.button.callback('❌ Hapus Domain', 'm_admin_remove_domain')],
     [Markup.button.callback('⬆️ Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('⬆️ Unggah Script Summary API', 'm_admin_upload_summary_api')],
     [Markup.button.callback('🚀 Trigger Update Semua SC', 'm_admin_trigger_sc_update')],
+    [Markup.button.callback('🚀 Trigger Update Summary API', 'm_admin_trigger_summary_update')],
 
     [Markup.button.callback('💸 Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
     [Markup.button.callback('⚙️ Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('🛠️ Ubah Pengaturan', 'm_admin_env_set')],
@@ -3413,6 +3466,59 @@ bot.action('m_admin_trigger_sc_update_confirm', async (ctx) => {
       '',
       'VPS yang sudah punya auto-pull akan update saat timer berikutnya.',
       'Default interval installer baru: 10 menit.'
+    ]),
+    adminMenu()
+  );
+});
+
+bot.action('m_admin_trigger_summary_update', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const [activeCount, latest] = await Promise.all([
+    countActiveScRegistrations().catch(() => 0),
+    getLatestSummaryUpdateTrigger().catch(() => null)
+  ]);
+  const ack = latest?.version ? await getSummaryUpdateTriggerAckSummary(latest.version).catch(() => null) : null;
+  const installerPath = await getSummaryApiLocalPath().catch(() => DEFAULT_SUMMARY_API_LOCAL_PATH);
+  const hasInstaller = fs.existsSync(installerPath);
+  const lines = [
+    `Target aktif : ${activeCount} IP VPS`,
+    `Installer   : ${installerPath}`,
+    `File ada    : ${hasInstaller ? 'YA' : 'TIDAK'}`,
+    latest ? `Trigger terakhir: ${latest.version} (${formatDateTime(latest.created_at)})` : 'Trigger terakhir: belum ada',
+    ack ? `Ack terakhir: success=${ack.success} running=${ack.running} failed=${ack.failed}` : '',
+    '',
+    'VPS akan mengambil update Summary API via timer auto-pull.',
+    'Lanjut trigger update Summary API sekarang?'
+  ];
+  return ctx.reply(
+    uiBox('TRIGGER UPDATE SUMMARY API', lines),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Ya, trigger sekarang', 'm_admin_trigger_summary_update_confirm')],
+      [Markup.button.callback('Batal', 'm_admin_menu')]
+    ])
+  );
+});
+
+bot.action('m_admin_trigger_summary_update_confirm', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const installerPath = await getSummaryApiLocalPath().catch(() => DEFAULT_SUMMARY_API_LOCAL_PATH);
+  if (!fs.existsSync(installerPath)) {
+    return ctx.reply(`File installer Summary API belum ada: ${installerPath}\nUpload dulu dari menu admin.`, adminMenu());
+  }
+  const [activeCount, trigger] = await Promise.all([
+    countActiveScRegistrations().catch(() => 0),
+    createSummaryUpdateTrigger(ctx.from.id, `manual summary api trigger by ${ctx.from.id}`)
+  ]);
+  return ctx.reply(
+    uiBox('TRIGGER SUMMARY API DIKIRIM', [
+      `Version  : ${trigger.version}`,
+      `Target   : ${activeCount} IP VPS aktif`,
+      `Waktu    : ${formatDateTime(trigger.created_at)}`,
+      '',
+      'VPS yang sudah punya puller Summary API akan update saat timer berikutnya.',
+      'Default interval mengikuti auto-pull SC.'
     ]),
     adminMenu()
   );

@@ -12960,10 +12960,12 @@ EOF
   local health_display="${YELLOW}CHECK${NC}"
   [[ "${health}" == "GOOD" ]] && health_display="${GREEN}GOOD${NC}"
 
-  c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs;" 2>/dev/null || echo 0)"
-  c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses;" 2>/dev/null || echo 0)"
-  c_vless="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vlesses;" 2>/dev/null || echo 0)"
-  c_trojan="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_trojans;" 2>/dev/null || echo 0)"
+  local active_account_where
+  active_account_where="UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND (TRIM(COALESCE(date_exp,''))='' OR CASE WHEN TRIM(COALESCE(date_exp,'')) GLOB '????-??-??' THEN date(TRIM(date_exp)) > date('now','localtime') ELSE datetime(REPLACE(TRIM(date_exp),'T',' ')) > datetime('now','localtime') END)"
+  c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs WHERE ${active_account_where};" 2>/dev/null || echo 0)"
+  c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses WHERE ${active_account_where};" 2>/dev/null || echo 0)"
+  c_vless="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vlesses WHERE ${active_account_where};" 2>/dev/null || echo 0)"
+  c_trojan="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_trojans WHERE ${active_account_where};" 2>/dev/null || echo 0)"
 
   read_vnstat_stats
   IFS='|' read -r cap_ram_gb cap_cores cap_tier cap_est <<< "$(get_server_capacity_profile)"

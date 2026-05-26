@@ -4570,6 +4570,10 @@ EOF
 build_go_files() {
   log "Build Go binaries..."
   mkdir -p "${APP_DIR}/bin"
+  export HOME="${HOME:-/root}"
+  export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
+  export GOCACHE="${GOCACHE:-${XDG_CACHE_HOME}/go-build}"
+  mkdir -p "${GOCACHE}"
   (
     cd "${APP_DIR}/go"
     GO111MODULE=off go build -ldflags "-s -w" -o "${APP_DIR}/bin/ssh-mux" ssh_mux.go
@@ -8522,6 +8526,9 @@ AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
 VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
+export HOME="${HOME:-/root}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
+export GOCACHE="${GOCACHE:-${XDG_CACHE_HOME}/go-build}"
 STATE_DIR="/var/lib/sc-1forcr"
 LAST_VERSION_FILE="${STATE_DIR}/last-pull-update.version"
 LOCK_FILE="/run/sc-1forcr-pull-update.lock"
@@ -8589,6 +8596,7 @@ main_pull_update() {
   fi
 
   mkdir -p "${STATE_DIR}"
+  mkdir -p "${GOCACHE}" >/dev/null 2>&1 || true
   local base_url current_version payload resp ok required version note msg vps_ip
   base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
   if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
@@ -8658,6 +8666,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+Environment=HOME=/root
+Environment=XDG_CACHE_HOME=/root/.cache
+Environment=GOCACHE=/root/.cache/go-build
 ExecStart=/usr/local/sbin/sc-1forcr-pull-update
 NoNewPrivileges=true
 PrivateTmp=true
@@ -13922,7 +13933,7 @@ update_script_from_repo() {
     echo "UPDATE_SCRIPT_URL belum terdeteksi."
     echo "Pastikan LICENSE_API_URL mengarah ke VPS bot, atau isi UPDATE_SCRIPT_URL ke endpoint VPS bot."
     echo "Contoh: https://<domain-bot>/sc1forcr/payload/scripts/setup-autoscript-compat.sh"
-    return
+    return 1
   fi
 
   tmp="/tmp/setup-autoscript-compat.sh"
@@ -13944,7 +13955,7 @@ Status   : GAGAL
 Domain   : ${DOMAIN}
 Alasan   : gagal download script update
 Time     : $(date '+%F %T')"
-    return
+    return 1
   fi
   chmod +x "${tmp}"
   if ! bash -n "${tmp}"; then
@@ -13955,7 +13966,7 @@ Status   : GAGAL
 Domain   : ${DOMAIN}
 Alasan   : validasi syntax script gagal
 Time     : $(date '+%F %T')"
-    return
+    return 1
   fi
 
   active_backend="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
@@ -14052,7 +14063,7 @@ Domain   : ${DOMAIN}
 Alasan   : installer update exit non-zero
 Time     : $(date '+%F %T')"
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
-    return
+    return 1
   fi
 
   # Restore banner lama (jika sebelumnya ada), atau tetap nonaktif bila sebelumnya memang tidak ada.
@@ -14108,6 +14119,7 @@ Online   : ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h win=${ONLINE
   telegram_notify "${update_note}"
 
   rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+  return 0
 }
 
 show_sc_key_info() {

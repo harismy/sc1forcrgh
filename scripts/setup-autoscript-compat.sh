@@ -2552,9 +2552,24 @@ const XRAY_FRONT_HOSTS = [
   ...parseHostList(process.env.XRAY_FRONT_DOMAINS || ''),
   ...parseHostList(process.env.XRAY_FRONT_DOMAIN || '')
 ].filter((v, i, arr) => arr.indexOf(v) === i);
-const XRAY_FRONT_TARGETS = (XRAY_ALIAS_HOSTS[0] || XRAY_PUBLIC_HOST)
-  ? XRAY_FRONT_HOSTS.map((address) => ({ address, host: XRAY_ALIAS_HOSTS[0] || XRAY_PUBLIC_HOST }))
-  : [];
+function buildXrayFrontTargets() {
+  const hosts = [];
+  pushUniqueHost(hosts, XRAY_LINK_HOST || XRAY_PUBLIC_HOST || DOMAIN);
+  for (const aliasHost of XRAY_ALIAS_HOSTS) pushUniqueHost(hosts, aliasHost);
+  if (hosts.length < 1) return [];
+  const targets = [];
+  for (const address of XRAY_FRONT_HOSTS) {
+    for (const host of hosts) {
+      targets.push({
+        address,
+        host,
+        host_type: host === (XRAY_LINK_HOST || XRAY_PUBLIC_HOST || DOMAIN) ? 'base' : 'wildcard'
+      });
+    }
+  }
+  return targets;
+}
+const XRAY_FRONT_TARGETS = buildXrayFrontTargets();
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
@@ -3500,8 +3515,8 @@ function addFrontBugLink(protocol, links, secret, username = '') {
       bugTlsLink = trojanFrontLink(target.address, target.host, secret, username, true, target.address);
       bugNoneLink = trojanFrontLink(target.address, target.host, secret, username, false);
     }
-    if (bugTlsLink) frontTlsLinks.push({ address: target.address, sni: target.address, host: target.host, link: bugTlsLink });
-    if (bugNoneLink) frontNoneLinks.push({ address: target.address, host: target.host, link: bugNoneLink });
+    if (bugTlsLink) frontTlsLinks.push({ address: target.address, sni: target.address, host: target.host, host_type: target.host_type || '', link: bugTlsLink });
+    if (bugNoneLink) frontNoneLinks.push({ address: target.address, host: target.host, host_type: target.host_type || '', link: bugNoneLink });
   }
   if (frontTlsLinks.length < 1 && frontNoneLinks.length < 1) return links;
   const nextLinks = { ...links };

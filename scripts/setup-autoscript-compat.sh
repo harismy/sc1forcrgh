@@ -22,6 +22,11 @@ set -euo pipefail
 #   WILDCARD_ENABLE=0                           (opsional, 1=aktif wildcard cert DNS-01)
 #   WILDCARD_BASE_DOMAIN=example.com            (opsional, wajib saat wildcard aktif)
 #   WILDCARD_CF_API_TOKEN=                      (opsional, token Cloudflare DNS edit)
+#   WILDCARD_BUG_PREFIX=support.zoom.us         (opsional legacy, hasil: support.zoom.us.DOMAIN)
+#   WILDCARD_BUG_PREFIXES=support.zoom.us,ava.game
+#   WILDCARD_XRAY_HOST=                         (opsional legacy, exact alias host Xray)
+#   WILDCARD_XRAY_HOSTS=                        (opsional, exact alias host Xray dipisah koma)
+#   XRAY_PUBLIC_HOST=                           (opsional legacy, alias host pertama)
 #   UPDATE_SCRIPT_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-autoscript-compat.sh
 #   AUTO_INSTALL_SUMMARY_API=1                   (opsional, 1=auto install summary API saat install SC)
 #   SUMMARY_API_SETUP_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-summary-api.sh
@@ -105,6 +110,11 @@ LICENSE_KEY="${LICENSE_KEY:-}"
 WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}"
 WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}"
 WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}"
+WILDCARD_BUG_PREFIX="${WILDCARD_BUG_PREFIX:-}"
+WILDCARD_BUG_PREFIXES="${WILDCARD_BUG_PREFIXES:-}"
+WILDCARD_XRAY_HOST="${WILDCARD_XRAY_HOST:-}"
+WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
+XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -247,6 +257,135 @@ flag_enabled() {
     *) return 1 ;;
   esac
 }
+
+sanitize_domain_host() {
+  local host
+  host="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  host="${host#https://}"
+  host="${host#http://}"
+  host="${host%%/*}"
+  host="${host%%:*}"
+  host="$(printf '%s' "${host}" | sed -E 's/[^a-z0-9.-]//g; s/^\.+//; s/\.+$//; s/\.\.+/./g')"
+  echo "${host}"
+}
+
+normalize_domain_host_list() {
+  local raw item host out
+  raw="$(printf '%s' "${1:-}" | tr '\r\n\t ;|' ',')"
+  out=""
+  IFS=',' read -ra __host_items <<< "${raw}"
+  for item in "${__host_items[@]}"; do
+    host="$(sanitize_domain_host "${item}")"
+    [[ -z "${host}" ]] && continue
+    if [[ ",${out}," != *",${host},"* ]]; then
+      out="${out}${out:+,}${host}"
+    fi
+  done
+  echo "${out}"
+}
+
+csv_first_item() {
+  local raw first
+  raw="${1:-}"
+  first="${raw%%,*}"
+  echo "${first}"
+}
+
+build_xray_alias_hosts() {
+  local domain aliases exact_hosts prefix_hosts host prefix candidate
+  domain="$(sanitize_domain_host "${DOMAIN:-}")"
+  aliases=""
+
+  if [[ -n "${WILDCARD_XRAY_HOSTS:-}${WILDCARD_XRAY_HOST:-}${WILDCARD_BUG_PREFIXES:-}${WILDCARD_BUG_PREFIX:-}" ]]; then
+    exact_hosts="$(normalize_domain_host_list "${WILDCARD_XRAY_HOSTS:-},${WILDCARD_XRAY_HOST:-}")"
+  else
+    exact_hosts="$(normalize_domain_host_list "${XRAY_PUBLIC_HOST:-}")"
+  fi
+  IFS=',' read -ra __exact_hosts <<< "${exact_hosts}"
+  for host in "${__exact_hosts[@]}"; do
+    [[ -z "${host}" || "${host}" == "${domain}" ]] && continue
+    if [[ ",${aliases}," != *",${host},"* ]]; then
+      aliases="${aliases}${aliases:+,}${host}"
+    fi
+  done
+
+  prefix_hosts="$(normalize_domain_host_list "${WILDCARD_BUG_PREFIXES:-},${WILDCARD_BUG_PREFIX:-}")"
+  IFS=',' read -ra __prefix_hosts <<< "${prefix_hosts}"
+  for prefix in "${__prefix_hosts[@]}"; do
+    [[ -z "${prefix}" || -z "${domain}" ]] && continue
+    if [[ "${prefix}" == "${domain}" || "${prefix}" == *".${domain}" ]]; then
+      candidate="${prefix}"
+    else
+      candidate="${prefix}.${domain}"
+    fi
+    candidate="$(sanitize_domain_host "${candidate}")"
+    [[ -z "${candidate}" || "${candidate}" == "${domain}" ]] && continue
+    if [[ ",${aliases}," != *",${candidate},"* ]]; then
+      aliases="${aliases}${aliases:+,}${candidate}"
+    fi
+  done
+
+  echo "${aliases}"
+}
+
+build_xray_public_host() {
+  local aliases first domain
+  domain="$(sanitize_domain_host "${DOMAIN:-}")"
+  aliases="$(build_xray_alias_hosts)"
+  first="$(csv_first_item "${aliases}")"
+  echo "${first:-${domain}}"
+}
+
+build_nginx_server_names() {
+  local names host base aliases
+  names=""
+  for host in "${DOMAIN:-}"; do
+    host="$(sanitize_domain_host "${host}")"
+    [[ -z "${host}" ]] && continue
+    if [[ " ${names} " != *" ${host} "* ]]; then
+      names="${names}${names:+ }${host}"
+    fi
+  done
+  aliases="$(build_xray_alias_hosts)"
+  IFS=',' read -ra __nginx_aliases <<< "${aliases}"
+  for host in "${__nginx_aliases[@]}"; do
+    [[ -z "${host}" ]] && continue
+    if [[ " ${names} " != *" ${host} "* ]]; then
+      names="${names}${names:+ }${host}"
+    fi
+  done
+  if flag_enabled "${WILDCARD_ENABLE:-0}"; then
+    base="$(sanitize_domain_host "${WILDCARD_BASE_DOMAIN:-}")"
+    if [[ -n "${base}" && " ${names} " != *" *.${base} "* ]]; then
+      names="${names}${names:+ }*.${base}"
+    fi
+  fi
+  [[ -z "${names}" ]] && names="_"
+  echo "${names}"
+}
+
+domain_covered_by_one_label_wildcard() {
+  local host base left
+  host="$(sanitize_domain_host "${1:-}")"
+  base="$(sanitize_domain_host "${2:-}")"
+  [[ -n "${host}" && -n "${base}" ]] || return 1
+  [[ "${host}" == *".${base}" ]] || return 1
+  left="${host%.${base}}"
+  [[ -n "${left}" && "${left}" != *.* ]]
+}
+
+DOMAIN="$(sanitize_domain_host "${DOMAIN}")"
+WILDCARD_BASE_DOMAIN="$(sanitize_domain_host "${WILDCARD_BASE_DOMAIN}")"
+WILDCARD_BUG_PREFIX="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_BUG_PREFIX}")")"
+WILDCARD_BUG_PREFIXES="$(normalize_domain_host_list "${WILDCARD_BUG_PREFIXES}")"
+WILDCARD_XRAY_HOST="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_XRAY_HOST}")")"
+WILDCARD_XRAY_HOSTS="$(normalize_domain_host_list "${WILDCARD_XRAY_HOSTS}")"
+XRAY_PUBLIC_HOST="$(build_xray_public_host)"
+
+if [[ -z "${DOMAIN}" ]]; then
+  echo "DOMAIN tidak valid."
+  exit 1
+fi
 
 tune_nginx_capacity() {
   local nginx_conf wc rl nof
@@ -1158,7 +1297,9 @@ setup_vnstat() {
 }
 
 issue_letsencrypt_cert() {
-  local certbot_email_arg cert_domain
+  local certbot_email_arg cert_domain xray_alias_hosts alias_host
+  local -a cert_extra_args
+  cert_extra_args=()
   cert_domain="$(tls_cert_domain)"
   if [[ -z "${cert_domain}" ]]; then
     log "Domain sertifikat TLS kosong. Skip issue cert."
@@ -1189,6 +1330,15 @@ issue_letsencrypt_cert() {
 dns_cloudflare_api_token = ${WILDCARD_CF_API_TOKEN}
 EOF
     chmod 600 /root/.secrets/certbot/cloudflare.ini
+    xray_alias_hosts="$(build_xray_alias_hosts)"
+    IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
+    for alias_host in "${__cert_alias_hosts[@]}"; do
+      [[ -z "${alias_host}" || "${alias_host}" == "${WILDCARD_BASE_DOMAIN}" ]] && continue
+      if ! domain_covered_by_one_label_wildcard "${alias_host}" "${WILDCARD_BASE_DOMAIN}"; then
+        cert_extra_args+=(-d "${alias_host}")
+        log "Tambahkan SAN exact untuk alias Xray wildcard: ${alias_host}"
+      fi
+    done
     log "Issue wildcard cert Let's Encrypt untuk *.${WILDCARD_BASE_DOMAIN} (DNS-01 Cloudflare)..."
     certbot certonly \
       --dns-cloudflare \
@@ -1197,12 +1347,20 @@ EOF
       --cert-name "${WILDCARD_BASE_DOMAIN}" \
       -d "${WILDCARD_BASE_DOMAIN}" \
       -d "*.${WILDCARD_BASE_DOMAIN}" \
+      "${cert_extra_args[@]}" \
       --non-interactive --agree-tos ${certbot_email_arg}
     return $?
   fi
 
+  xray_alias_hosts="$(build_xray_alias_hosts)"
+  IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
+  for alias_host in "${__cert_alias_hosts[@]}"; do
+    [[ -z "${alias_host}" || "${alias_host}" == "${DOMAIN}" ]] && continue
+    cert_extra_args+=(-d "${alias_host}")
+    log "Tambahkan SAN exact untuk alias Xray: ${alias_host}"
+  done
   log "Issue cert Let's Encrypt (webroot) untuk ${DOMAIN}..."
-  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}
+  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" "${cert_extra_args[@]}" --non-interactive --agree-tos ${certbot_email_arg}
 }
 
 prepare_haproxy_pem() {
@@ -1234,9 +1392,11 @@ prepare_haproxy_pem() {
 setup_nginx_and_cert() {
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
-  local sshws_nginx_limit_conf sshws_nginx_limit_rules
+  local sshws_nginx_limit_conf sshws_nginx_limit_rules nginx_server_names
   sshws_nginx_limit_conf=""
   sshws_nginx_limit_rules=""
+  XRAY_PUBLIC_HOST="$(build_xray_public_host)"
+  nginx_server_names="$(build_nginx_server_names)"
   if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
     sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
 map \$http_cf_connecting_ip \$sc_sshws_limit_key {
@@ -1261,7 +1421,7 @@ ${sshws_nginx_limit_conf}
 server {
     listen 80;
     listen [::]:80;
-    server_name ${DOMAIN};
+    server_name ${nginx_server_names};
     keepalive_timeout 30;
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
@@ -2202,6 +2362,11 @@ EOF
 PORT=${API_PORT}
 DB_PATH=${DB_PATH}
 DOMAIN=${DOMAIN}
+WILDCARD_BUG_PREFIX=${WILDCARD_BUG_PREFIX}
+WILDCARD_BUG_PREFIXES=${WILDCARD_BUG_PREFIXES}
+WILDCARD_XRAY_HOST=${WILDCARD_XRAY_HOST}
+WILDCARD_XRAY_HOSTS=${WILDCARD_XRAY_HOSTS}
+XRAY_PUBLIC_HOST=${XRAY_PUBLIC_HOST}
 AUTH_TOKEN=${API_AUTH_TOKEN}
 LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
@@ -2281,6 +2446,55 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = Number(process.env.PORT || 8088);
 const DB_PATH = process.env.DB_PATH || '/usr/sbin/potatonc/potato.db';
 const DOMAIN = String(process.env.DOMAIN || '').trim();
+function normalizeHost(raw) {
+  let host = String(raw || '').trim().toLowerCase();
+  host = host.replace(/^https?:\/\//, '').split('/')[0].split(':')[0];
+  host = host.replace(/[^a-z0-9.-]/g, '').replace(/^\.+|\.+$/g, '').replace(/\.+/g, '.');
+  return host;
+}
+function parseHostList(raw) {
+  return String(raw || '')
+    .split(/[,\s;|]+/)
+    .map((v) => normalizeHost(v))
+    .filter(Boolean)
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+}
+function pushUniqueHost(list, host) {
+  const clean = normalizeHost(host);
+  if (clean && !list.includes(clean)) list.push(clean);
+}
+function buildXrayAliasHosts() {
+  const domain = normalizeHost(DOMAIN);
+  const aliases = [];
+  const hasExplicitAliasSource = Boolean(
+    String(process.env.WILDCARD_XRAY_HOSTS || process.env.WILDCARD_XRAY_HOST || process.env.WILDCARD_BUG_PREFIXES || process.env.WILDCARD_BUG_PREFIX || '').trim()
+  );
+  const exacts = hasExplicitAliasSource
+    ? [
+        ...parseHostList(process.env.WILDCARD_XRAY_HOSTS || ''),
+        ...parseHostList(process.env.WILDCARD_XRAY_HOST || '')
+      ]
+    : parseHostList(process.env.XRAY_PUBLIC_HOST || '');
+  for (const host of exacts) {
+    if (host && host !== domain) pushUniqueHost(aliases, host);
+  }
+  const prefixes = [
+    ...parseHostList(process.env.WILDCARD_BUG_PREFIXES || ''),
+    ...parseHostList(process.env.WILDCARD_BUG_PREFIX || '')
+  ];
+  for (const prefix of prefixes) {
+    if (!prefix || !domain) continue;
+    const host = prefix === domain || prefix.endsWith(`.${domain}`) ? prefix : `${prefix}.${domain}`;
+    if (host !== domain) pushUniqueHost(aliases, host);
+  }
+  return aliases;
+}
+function buildXrayPublicHost() {
+  return buildXrayAliasHosts()[0] || normalizeHost(DOMAIN);
+}
+const XRAY_ALIAS_HOSTS = buildXrayAliasHosts();
+const XRAY_PUBLIC_HOST = buildXrayPublicHost();
+const XRAY_LINK_HOST = normalizeHost(DOMAIN) || XRAY_PUBLIC_HOST;
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
@@ -2390,9 +2604,10 @@ const XRAY_PATHS_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/tro
 const XRAY_PATH_VMESS = XRAY_PATHS_VMESS[0];
 const XRAY_PATH_VLESS = XRAY_PATHS_VLESS[0];
 const XRAY_PATH_TROJAN = XRAY_PATHS_TROJAN[0];
-const VMESS_BUG_PROFILE_ADDRESS = String(process.env.VMESS_BUG_PROFILE_ADDRESS || '').trim();
-const VMESS_BUG_PROFILE_SNI = String(process.env.VMESS_BUG_PROFILE_SNI || '').trim();
-const VMESS_BUG_PROFILE_HOST = String(process.env.VMESS_BUG_PROFILE_HOST || '').trim();
+const XRAY_PUBLIC_HOST_IS_CUSTOM = Boolean(XRAY_PUBLIC_HOST && normalizeHost(DOMAIN) && XRAY_PUBLIC_HOST !== normalizeHost(DOMAIN));
+const VMESS_BUG_PROFILE_ADDRESS = normalizeHost(process.env.VMESS_BUG_PROFILE_ADDRESS || '') || (XRAY_PUBLIC_HOST_IS_CUSTOM ? XRAY_PUBLIC_HOST : '');
+const VMESS_BUG_PROFILE_SNI = normalizeHost(process.env.VMESS_BUG_PROFILE_SNI || '') || (XRAY_PUBLIC_HOST_IS_CUSTOM ? XRAY_PUBLIC_HOST : '');
+const VMESS_BUG_PROFILE_HOST = normalizeHost(process.env.VMESS_BUG_PROFILE_HOST || '') || VMESS_BUG_PROFILE_ADDRESS;
 const VMESS_BUG_PROFILE_ALLOW_INSECURE = String(process.env.VMESS_BUG_PROFILE_ALLOW_INSECURE || '1').trim() === '1';
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
   .split(',')
@@ -3111,9 +3326,9 @@ function vmessBugProfile(id, opts = {}) {
   const reqHost = String(opts?.host || '').trim();
   const sni = reqSni || VMESS_BUG_PROFILE_SNI;
   if (!sni) return null;
-  const address = reqAddress || VMESS_BUG_PROFILE_ADDRESS || DOMAIN;
+  const address = reqAddress || VMESS_BUG_PROFILE_ADDRESS || XRAY_PUBLIC_HOST || DOMAIN;
   if (!address) return null;
-  const wsHost = reqHost || VMESS_BUG_PROFILE_HOST || DOMAIN || address;
+  const wsHost = reqHost || VMESS_BUG_PROFILE_HOST || XRAY_PUBLIC_HOST || DOMAIN || address;
   const cfg = {
     inbounds: [],
     outbounds: [
@@ -3754,6 +3969,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
   }
   if (!finalUsername) throw new Error('username required');
   const expDate = trial ? dateExpPlusMinutes(60) : dateExpPlusDays(expDays);
+  const xrayHost = XRAY_LINK_HOST;
   let data = null;
   if (protocol === 'vmess') {
     await ensureUsernameNotExists('account_vmesses', finalUsername);
@@ -3792,14 +4008,15 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
     })() : null;
     data = {
-      hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
+      hostname: xrayHost, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
+      wildcard_hosts: XRAY_ALIAS_HOSTS,
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: '/upvmess', aliases: XRAY_PATHS_VMESS },
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vmessLink(DOMAIN, uuid, true, finalUsername), none: vmessLink(DOMAIN, uuid, false, finalUsername), grpc: vmessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vmessLink(DOMAIN, uuid, true, finalUsername), upntls: vmessLink(DOMAIN, uuid, false, finalUsername) },
+      link: { tls: vmessLink(xrayHost, uuid, true, finalUsername), none: vmessLink(xrayHost, uuid, false, finalUsername), grpc: vmessGrpcLink(xrayHost, uuid, finalUsername), uptls: vmessLink(xrayHost, uuid, true, finalUsername), upntls: vmessLink(xrayHost, uuid, false, finalUsername) },
       bug_profile: bugCfg ? { config: bugCfg, vmess: bugVmess } : null
     };
   } else if (protocol === 'vless') {
@@ -3810,14 +4027,15 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       [finalUsername, uuid, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
     );
     data = {
-      hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
+      hostname: xrayHost, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
+      wildcard_hosts: XRAY_ALIAS_HOSTS,
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: '/upvless', aliases: XRAY_PATHS_VLESS },
       serviceName: 'vless-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vlessLink(DOMAIN, uuid, true, finalUsername), none: vlessLink(DOMAIN, uuid, false, finalUsername), grpc: vlessGrpcLink(DOMAIN, uuid, finalUsername), uptls: vlessLink(DOMAIN, uuid, true, finalUsername), upntls: vlessLink(DOMAIN, uuid, false, finalUsername) }
+      link: { tls: vlessLink(xrayHost, uuid, true, finalUsername), none: vlessLink(xrayHost, uuid, false, finalUsername), grpc: vlessGrpcLink(xrayHost, uuid, finalUsername), uptls: vlessLink(xrayHost, uuid, true, finalUsername), upntls: vlessLink(xrayHost, uuid, false, finalUsername) }
     };
   } else if (protocol === 'trojan') {
     await ensureUsernameNotExists('account_trojans', finalUsername);
@@ -3827,14 +4045,15 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       [finalUsername, pass, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
     );
     data = {
-      hostname: DOMAIN, username: finalUsername, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
+      hostname: xrayHost, username: finalUsername, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
+      wildcard_hosts: XRAY_ALIAS_HOSTS,
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: '/uptrojan', aliases: XRAY_PATHS_TROJAN },
       serviceName: 'trojan-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: trojanLink(DOMAIN, pass, true, finalUsername), none: trojanLink(DOMAIN, pass, false, finalUsername), grpc: trojanGrpcLink(DOMAIN, pass, finalUsername), uptls: trojanLink(DOMAIN, pass, true, finalUsername), upntls: trojanLink(DOMAIN, pass, false, finalUsername) }
+      link: { tls: trojanLink(xrayHost, pass, true, finalUsername), none: trojanLink(xrayHost, pass, false, finalUsername), grpc: trojanGrpcLink(xrayHost, pass, finalUsername), uptls: trojanLink(xrayHost, pass, true, finalUsername), upntls: trojanLink(xrayHost, pass, false, finalUsername) }
     };
   }
   if (trial) await markTrialAccount(protocol, finalUsername);
@@ -7163,6 +7382,13 @@ SETTINGS_KEYS = [
     "XRAY_PATHS_VMESS",
     "XRAY_PATHS_VLESS",
     "XRAY_PATHS_TROJAN",
+    "WILDCARD_ENABLE",
+    "WILDCARD_BASE_DOMAIN",
+    "WILDCARD_BUG_PREFIX",
+    "WILDCARD_BUG_PREFIXES",
+    "WILDCARD_XRAY_HOST",
+    "WILDCARD_XRAY_HOSTS",
+    "XRAY_PUBLIC_HOST",
     "VMESS_BUG_PROFILE_ADDRESS",
     "VMESS_BUG_PROFILE_SNI",
     "VMESS_BUG_PROFILE_HOST",
@@ -7758,6 +7984,13 @@ SETTINGS_KEYS = [
     "XRAY_PATHS_VMESS",
     "XRAY_PATHS_VLESS",
     "XRAY_PATHS_TROJAN",
+    "WILDCARD_ENABLE",
+    "WILDCARD_BASE_DOMAIN",
+    "WILDCARD_BUG_PREFIX",
+    "WILDCARD_BUG_PREFIXES",
+    "WILDCARD_XRAY_HOST",
+    "WILDCARD_XRAY_HOSTS",
+    "XRAY_PUBLIC_HOST",
     "VMESS_BUG_PROFILE_ADDRESS",
     "VMESS_BUG_PROFILE_SNI",
     "VMESS_BUG_PROFILE_HOST",
@@ -8953,6 +9186,11 @@ LICENSE_KEY=${LICENSE_KEY}
 WILDCARD_ENABLE=${WILDCARD_ENABLE}
 WILDCARD_BASE_DOMAIN=${WILDCARD_BASE_DOMAIN}
 WILDCARD_CF_API_TOKEN=${WILDCARD_CF_API_TOKEN}
+WILDCARD_BUG_PREFIX=${WILDCARD_BUG_PREFIX}
+WILDCARD_BUG_PREFIXES=${WILDCARD_BUG_PREFIXES}
+WILDCARD_XRAY_HOST=${WILDCARD_XRAY_HOST}
+WILDCARD_XRAY_HOSTS=${WILDCARD_XRAY_HOSTS}
+XRAY_PUBLIC_HOST=${XRAY_PUBLIC_HOST}
 UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
 AUTO_INSTALL_SUMMARY_API=${AUTO_INSTALL_SUMMARY_API}
 SUMMARY_API_SETUP_URL=${SUMMARY_API_SETUP_URL}
@@ -9236,6 +9474,130 @@ flag_enabled() {
   esac
 }
 
+sanitize_domain_host() {
+  local host
+  host="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  host="${host#https://}"
+  host="${host#http://}"
+  host="${host%%/*}"
+  host="${host%%:*}"
+  host="$(printf '%s' "${host}" | sed -E 's/[^a-z0-9.-]//g; s/^\.+//; s/\.+$//; s/\.\.+/./g')"
+  echo "${host}"
+}
+
+normalize_domain_host_list() {
+  local raw item host out
+  raw="$(printf '%s' "${1:-}" | tr '\r\n\t ;|' ',')"
+  out=""
+  IFS=',' read -ra __host_items <<< "${raw}"
+  for item in "${__host_items[@]}"; do
+    host="$(sanitize_domain_host "${item}")"
+    [[ -z "${host}" ]] && continue
+    if [[ ",${out}," != *",${host},"* ]]; then
+      out="${out}${out:+,}${host}"
+    fi
+  done
+  echo "${out}"
+}
+
+csv_first_item() {
+  local raw first
+  raw="${1:-}"
+  first="${raw%%,*}"
+  echo "${first}"
+}
+
+build_xray_alias_hosts() {
+  local domain aliases exact_hosts prefix_hosts host prefix candidate
+  domain="$(sanitize_domain_host "${DOMAIN:-}")"
+  aliases=""
+
+  if [[ -n "${WILDCARD_XRAY_HOSTS:-}${WILDCARD_XRAY_HOST:-}${WILDCARD_BUG_PREFIXES:-}${WILDCARD_BUG_PREFIX:-}" ]]; then
+    exact_hosts="$(normalize_domain_host_list "${WILDCARD_XRAY_HOSTS:-},${WILDCARD_XRAY_HOST:-}")"
+  else
+    exact_hosts="$(normalize_domain_host_list "${XRAY_PUBLIC_HOST:-}")"
+  fi
+  IFS=',' read -ra __exact_hosts <<< "${exact_hosts}"
+  for host in "${__exact_hosts[@]}"; do
+    [[ -z "${host}" || "${host}" == "${domain}" ]] && continue
+    if [[ ",${aliases}," != *",${host},"* ]]; then
+      aliases="${aliases}${aliases:+,}${host}"
+    fi
+  done
+
+  prefix_hosts="$(normalize_domain_host_list "${WILDCARD_BUG_PREFIXES:-},${WILDCARD_BUG_PREFIX:-}")"
+  IFS=',' read -ra __prefix_hosts <<< "${prefix_hosts}"
+  for prefix in "${__prefix_hosts[@]}"; do
+    [[ -z "${prefix}" || -z "${domain}" ]] && continue
+    if [[ "${prefix}" == "${domain}" || "${prefix}" == *".${domain}" ]]; then
+      candidate="${prefix}"
+    else
+      candidate="${prefix}.${domain}"
+    fi
+    candidate="$(sanitize_domain_host "${candidate}")"
+    [[ -z "${candidate}" || "${candidate}" == "${domain}" ]] && continue
+    if [[ ",${aliases}," != *",${candidate},"* ]]; then
+      aliases="${aliases}${aliases:+,}${candidate}"
+    fi
+  done
+
+  echo "${aliases}"
+}
+
+build_xray_public_host() {
+  local aliases first domain
+  domain="$(sanitize_domain_host "${DOMAIN:-}")"
+  aliases="$(build_xray_alias_hosts)"
+  first="$(csv_first_item "${aliases}")"
+  echo "${first:-${domain}}"
+}
+
+build_nginx_server_names() {
+  local names host base aliases
+  names=""
+  for host in "${DOMAIN:-}"; do
+    host="$(sanitize_domain_host "${host}")"
+    [[ -z "${host}" ]] && continue
+    if [[ " ${names} " != *" ${host} "* ]]; then
+      names="${names}${names:+ }${host}"
+    fi
+  done
+  aliases="$(build_xray_alias_hosts)"
+  IFS=',' read -ra __nginx_aliases <<< "${aliases}"
+  for host in "${__nginx_aliases[@]}"; do
+    [[ -z "${host}" ]] && continue
+    if [[ " ${names} " != *" ${host} "* ]]; then
+      names="${names}${names:+ }${host}"
+    fi
+  done
+  if flag_enabled "${WILDCARD_ENABLE:-0}"; then
+    base="$(sanitize_domain_host "${WILDCARD_BASE_DOMAIN:-}")"
+    if [[ -n "${base}" && " ${names} " != *" *.${base} "* ]]; then
+      names="${names}${names:+ }*.${base}"
+    fi
+  fi
+  [[ -z "${names}" ]] && names="_"
+  echo "${names}"
+}
+
+domain_covered_by_one_label_wildcard() {
+  local host base left
+  host="$(sanitize_domain_host "${1:-}")"
+  base="$(sanitize_domain_host "${2:-}")"
+  [[ -n "${host}" && -n "${base}" ]] || return 1
+  [[ "${host}" == *".${base}" ]] || return 1
+  left="${host%.${base}}"
+  [[ -n "${left}" && "${left}" != *.* ]]
+}
+
+DOMAIN="$(sanitize_domain_host "${DOMAIN:-}")"
+WILDCARD_BASE_DOMAIN="$(sanitize_domain_host "${WILDCARD_BASE_DOMAIN:-}")"
+WILDCARD_BUG_PREFIX="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_BUG_PREFIX:-}")")"
+WILDCARD_BUG_PREFIXES="$(normalize_domain_host_list "${WILDCARD_BUG_PREFIXES:-}")"
+WILDCARD_XRAY_HOST="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_XRAY_HOST:-}")")"
+WILDCARD_XRAY_HOSTS="$(normalize_domain_host_list "${WILDCARD_XRAY_HOSTS:-}")"
+XRAY_PUBLIC_HOST="$(build_xray_public_host)"
+
 tls_cert_domain() {
   if flag_enabled "${WILDCARD_ENABLE:-0}" && [[ -n "${WILDCARD_BASE_DOMAIN:-}" ]]; then
     echo "${WILDCARD_BASE_DOMAIN}"
@@ -9245,7 +9607,9 @@ tls_cert_domain() {
 }
 
 issue_letsencrypt_cert() {
-  local certbot_email_arg cert_domain
+  local certbot_email_arg cert_domain xray_alias_hosts alias_host
+  local -a cert_extra_args
+  cert_extra_args=()
   cert_domain="$(tls_cert_domain)"
   if [[ -z "${cert_domain}" ]]; then
     echo "Domain sertifikat TLS kosong. Skip issue cert."
@@ -9272,6 +9636,15 @@ issue_letsencrypt_cert() {
 dns_cloudflare_api_token = ${WILDCARD_CF_API_TOKEN}
 EOF
     chmod 600 /root/.secrets/certbot/cloudflare.ini
+    xray_alias_hosts="$(build_xray_alias_hosts)"
+    IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
+    for alias_host in "${__cert_alias_hosts[@]}"; do
+      [[ -z "${alias_host}" || "${alias_host}" == "${WILDCARD_BASE_DOMAIN}" ]] && continue
+      if ! domain_covered_by_one_label_wildcard "${alias_host}" "${WILDCARD_BASE_DOMAIN}"; then
+        cert_extra_args+=(-d "${alias_host}")
+        echo "Tambahkan SAN exact untuk alias Xray wildcard: ${alias_host}"
+      fi
+    done
     certbot certonly \
       --dns-cloudflare \
       --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
@@ -9279,11 +9652,19 @@ EOF
       --cert-name "${WILDCARD_BASE_DOMAIN}" \
       -d "${WILDCARD_BASE_DOMAIN}" \
       -d "*.${WILDCARD_BASE_DOMAIN}" \
+      "${cert_extra_args[@]}" \
       --non-interactive --agree-tos ${certbot_email_arg}
     return $?
   fi
 
-  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}
+  xray_alias_hosts="$(build_xray_alias_hosts)"
+  IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
+  for alias_host in "${__cert_alias_hosts[@]}"; do
+    [[ -z "${alias_host}" || "${alias_host}" == "${DOMAIN}" ]] && continue
+    cert_extra_args+=(-d "${alias_host}")
+    echo "Tambahkan SAN exact untuk alias Xray: ${alias_host}"
+  done
+  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" "${cert_extra_args[@]}" --non-interactive --agree-tos ${certbot_email_arg}
 }
 
 prepare_haproxy_pem() {
@@ -10099,7 +10480,7 @@ IP Limit     : ${lim}
 EOT_ZIVPN
       ;;
     vmess|vless|trojan)
-      local host user exp tls none linktls linknone
+      local host user exp tls none linktls linknone aliases
       host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
       user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
       exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
@@ -10107,6 +10488,7 @@ EOT_ZIVPN
       none="$(echo "${raw}" | jq -r '.data.port.none // "80"' )"
       linktls="$(echo "${raw}" | jq -r '.data.link.tls // "-"' )"
       linknone="$(echo "${raw}" | jq -r '.data.link.none // "-"' )"
+      aliases="$(echo "${raw}" | jq -r '(.data.wildcard_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
       cat <<EOT_XRAY
 =============================
  ${type^^} ACCOUNT CREATED
@@ -10116,6 +10498,7 @@ Username     : ${user}
 Expired      : ${exp}
 TLS Port     : ${tls}
 NON TLS Port : ${none}
+Wildcard     : ${aliases:-none}
 
 Link TLS:
 ${linktls}
@@ -11491,6 +11874,110 @@ trigger_online_notify_now() {
   fi
 }
 
+set_wildcard_config_menu() {
+  local ans base token prefixes exacts aliases nginx_server_names pem
+  aliases="$(build_xray_alias_hosts)"
+  echo "SETTING WILDCARD CLOUDFLARE"
+  echo "Domain utama       : ${DOMAIN}"
+  echo "Wildcard cert      : ${WILDCARD_ENABLE:-0}"
+  echo "Base domain        : ${WILDCARD_BASE_DOMAIN:-}"
+  echo "Bug prefixes       : ${WILDCARD_BUG_PREFIXES:-${WILDCARD_BUG_PREFIX:-}}"
+  echo "Exact alias hosts  : ${WILDCARD_XRAY_HOSTS:-${WILDCARD_XRAY_HOST:-}}"
+  echo "Alias aktif        : ${aliases:-none}"
+  echo
+  echo "Link Xray tetap memakai domain utama. Alias wildcard hanya agar host/SNI bug tetap diterima server."
+  echo "Pisahkan banyak bug dengan koma. Contoh: support.zoom.us,ava.game,blog"
+  echo "Ketik '-' untuk mengosongkan value."
+  echo
+
+  prompt_input ans "Aktifkan wildcard cert Cloudflare? [1/0, enter=keep]: " || return
+  ans="$(echo "${ans:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${ans}" in
+    1|true|yes|on) WILDCARD_ENABLE="1" ;;
+    0|false|no|off) WILDCARD_ENABLE="0" ;;
+    "") ;;
+    *) echo "Input wildcard enable tidak valid, value lama dipakai." ;;
+  esac
+
+  prompt_input base "Base domain wildcard [enter=keep]: " || return
+  if [[ "${base:-}" == "-" ]]; then
+    WILDCARD_BASE_DOMAIN=""
+  elif [[ -n "${base:-}" ]]; then
+    WILDCARD_BASE_DOMAIN="$(sanitize_domain_host "${base}")"
+  fi
+
+  prompt_input token "Cloudflare API token [enter=keep, -=hapus]: " || return
+  if [[ "${token:-}" == "-" ]]; then
+    WILDCARD_CF_API_TOKEN=""
+  elif [[ -n "${token:-}" ]]; then
+    WILDCARD_CF_API_TOKEN="${token}"
+  fi
+
+  prompt_input prefixes "Bug prefixes [enter=keep, -=hapus]: " || return
+  if [[ "${prefixes:-}" == "-" ]]; then
+    WILDCARD_BUG_PREFIXES=""
+    WILDCARD_BUG_PREFIX=""
+  elif [[ -n "${prefixes:-}" ]]; then
+    WILDCARD_BUG_PREFIXES="$(normalize_domain_host_list "${prefixes}")"
+    WILDCARD_BUG_PREFIX="$(csv_first_item "${WILDCARD_BUG_PREFIXES}")"
+  fi
+
+  prompt_input exacts "Exact alias hosts [enter=keep, -=hapus]: " || return
+  if [[ "${exacts:-}" == "-" ]]; then
+    WILDCARD_XRAY_HOSTS=""
+    WILDCARD_XRAY_HOST=""
+  elif [[ -n "${exacts:-}" ]]; then
+    WILDCARD_XRAY_HOSTS="$(normalize_domain_host_list "${exacts}")"
+    WILDCARD_XRAY_HOST="$(csv_first_item "${WILDCARD_XRAY_HOSTS}")"
+  fi
+
+  if [[ -z "${WILDCARD_BUG_PREFIXES:-}${WILDCARD_BUG_PREFIX:-}${WILDCARD_XRAY_HOSTS:-}${WILDCARD_XRAY_HOST:-}" ]]; then
+    XRAY_PUBLIC_HOST=""
+  fi
+  XRAY_PUBLIC_HOST="$(build_xray_public_host)"
+  aliases="$(build_xray_alias_hosts)"
+
+  update_sc_env_var "WILDCARD_ENABLE" "${WILDCARD_ENABLE:-0}"
+  update_sc_env_var "WILDCARD_BASE_DOMAIN" "${WILDCARD_BASE_DOMAIN:-}"
+  update_sc_env_var "WILDCARD_CF_API_TOKEN" "${WILDCARD_CF_API_TOKEN:-}"
+  update_sc_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
+  update_sc_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
+  update_sc_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
+  update_sc_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
+  update_sc_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
+
+  update_app_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
+  update_app_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
+  update_app_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
+  update_app_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
+  update_app_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
+
+  nginx_server_names="$(build_nginx_server_names)"
+  if [[ -f /etc/nginx/sites-available/sc-1forcr.conf ]]; then
+    sed -i "0,/server_name[[:space:]].*;/s//server_name ${nginx_server_names};/" /etc/nginx/sites-available/sc-1forcr.conf
+    if nginx -t; then
+      systemctl restart nginx >/dev/null 2>&1 || true
+    else
+      echo "Peringatan: konfigurasi nginx invalid setelah update server_name."
+    fi
+  fi
+
+  if [[ -n "${aliases}" ]] || flag_enabled "${WILDCARD_ENABLE:-0}"; then
+    if issue_letsencrypt_cert; then
+      pem="$(prepare_haproxy_pem)" || pem=""
+      [[ -n "${pem}" ]] && systemctl restart haproxy >/dev/null 2>&1 || true
+    else
+      echo "Peringatan: issue cert gagal. Alias bisa DNS resolve, tapi TLS bisa mismatch sampai cert berhasil."
+    fi
+  fi
+
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+  echo
+  echo "Setting wildcard selesai."
+  echo "- Link Xray tetap : ${DOMAIN}"
+  echo "- Alias wildcard  : ${aliases:-none}"
+}
+
 tools_menu() {
   while true; do
     clear
@@ -11509,9 +11996,10 @@ tools_menu() {
       "12) Setting Interval Auto Backup" \
       "13) Setting Interval Auto Reboot" \
       "14) Setting Auto Update Bot" \
+      "15) Setting Wildcard Cloudflare" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-14]: "; then
+    if ! prompt_input tm "Pilih menu [0-15]: "; then
       return
     fi
     clear
@@ -11530,6 +12018,7 @@ tools_menu() {
       12) set_auto_backup_config_menu || true ;;
       13) set_auto_reboot_config_menu || true ;;
       14) set_auto_pull_update_config_menu || true ;;
+      15) set_wildcard_config_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -12005,8 +12494,9 @@ backup_restore_menu() {
 }
 
 change_domain_menu() {
-  local new_domain email app_env pem cert_domain haproxy_maxconn haproxy_nbthread haproxy_limit_nofile haproxy_log_option cores
+  local new_domain email app_env pem cert_domain haproxy_maxconn haproxy_nbthread haproxy_limit_nofile haproxy_log_option cores nginx_server_names
   prompt_input new_domain "Masukkan domain baru: " || return
+  new_domain="$(sanitize_domain_host "${new_domain}")"
   if [[ -z "${new_domain}" ]]; then
     echo "Domain tidak boleh kosong."
     return
@@ -12021,11 +12511,18 @@ change_domain_menu() {
 
   DOMAIN="${new_domain}"
   EMAIL="${email}"
+  WILDCARD_BASE_DOMAIN="$(sanitize_domain_host "${WILDCARD_BASE_DOMAIN:-}")"
+  WILDCARD_BUG_PREFIX="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_BUG_PREFIX:-}")")"
+  WILDCARD_BUG_PREFIXES="$(normalize_domain_host_list "${WILDCARD_BUG_PREFIXES:-}")"
+  WILDCARD_XRAY_HOST="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_XRAY_HOST:-}")")"
+  WILDCARD_XRAY_HOSTS="$(normalize_domain_host_list "${WILDCARD_XRAY_HOSTS:-}")"
+  XRAY_PUBLIC_HOST="$(build_xray_public_host)"
 
   mkdir -p /var/www/html
   local sshws_nginx_limit_conf sshws_nginx_limit_rules
   sshws_nginx_limit_conf=""
   sshws_nginx_limit_rules=""
+  nginx_server_names="$(build_nginx_server_names)"
   if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
     sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
 map \$http_cf_connecting_ip \$sc_sshws_limit_key {
@@ -12050,7 +12547,7 @@ ${sshws_nginx_limit_conf}
 server {
     listen 80;
     listen [::]:80;
-    server_name ${new_domain};
+    server_name ${nginx_server_names};
     keepalive_timeout 30;
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
@@ -12407,6 +12904,18 @@ EOF
       echo "DOMAIN=${new_domain}" >> "${app_env}"
     fi
   fi
+  if [[ -f /etc/sc-1forcr.env ]]; then
+    update_sc_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
+    update_sc_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
+    update_sc_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
+    update_sc_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
+    update_sc_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
+  fi
+  update_app_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
+  update_app_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
+  update_app_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
+  update_app_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
+  update_app_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
 
   systemctl restart sc-1forcr-api sc-1forcr-sshws haproxy nginx
   echo "Domain berhasil diubah ke ${new_domain}"
@@ -14361,6 +14870,11 @@ Time     : $(date '+%F %T')"
     WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}" \
     WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}" \
     WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}" \
+    WILDCARD_BUG_PREFIX="${WILDCARD_BUG_PREFIX:-}" \
+    WILDCARD_BUG_PREFIXES="${WILDCARD_BUG_PREFIXES:-}" \
+    WILDCARD_XRAY_HOST="${WILDCARD_XRAY_HOST:-}" \
+    WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}" \
+    XRAY_PUBLIC_HOST="$(build_xray_public_host)" \
     UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
     DB_PATH="${DB_PATH}" \
     APP_DIR="/opt/sc-1forcr" \
@@ -15587,6 +16101,7 @@ persist_pending_install_env() {
     LICENSE_ENFORCE LICENSE_API_URL LICENSE_API_TOKEN LICENSE_KEY
     UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API SUMMARY_API_SETUP_URL
     WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN
+    WILDCARD_BUG_PREFIX WILDCARD_BUG_PREFIXES WILDCARD_XRAY_HOST WILDCARD_XRAY_HOSTS XRAY_PUBLIC_HOST
     ZIVPN_BIN_URL ZIVPN_RELEASE_TAG ZIVPN_SERVICE_NAME ZIVPN_RELOAD_ON_AUTH_CHANGE
     ZIVPN_AUTH_APPLY_MODE ZIVPN_AUTH_MODE ZIVPN_HTTP_AUTH_URL ZIVPN_HTTP_AUTH_TOKEN
     ZIVPN_LIVE_TTL_SECONDS ZIVPN_ACTIVE_WINDOW_SECONDS ZIVPN_HANDOFF_GRACE_SECONDS

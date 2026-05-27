@@ -22,6 +22,8 @@ set -euo pipefail
 #   WILDCARD_ENABLE=0                           (opsional, 1=aktif wildcard cert DNS-01)
 #   WILDCARD_BASE_DOMAIN=example.com            (opsional, wajib saat wildcard aktif)
 #   WILDCARD_CF_API_TOKEN=                      (opsional, token Cloudflare DNS edit)
+#   WILDCARD_CF_EMAIL=                          (opsional, jika pakai Global API Key)
+#   WILDCARD_CF_API_KEY=                        (opsional, Global API Key Cloudflare)
 #   WILDCARD_BUG_PREFIX=support.zoom.us         (opsional legacy, hasil: support.zoom.us.DOMAIN)
 #   WILDCARD_BUG_PREFIXES=support.zoom.us,ava.game
 #   WILDCARD_XRAY_HOST=                         (opsional legacy, exact alias host Xray)
@@ -110,6 +112,8 @@ LICENSE_KEY="${LICENSE_KEY:-}"
 WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}"
 WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}"
 WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}"
+WILDCARD_CF_EMAIL="${WILDCARD_CF_EMAIL:-}"
+WILDCARD_CF_API_KEY="${WILDCARD_CF_API_KEY:-}"
 WILDCARD_BUG_PREFIX="${WILDCARD_BUG_PREFIX:-}"
 WILDCARD_BUG_PREFIXES="${WILDCARD_BUG_PREFIXES:-}"
 WILDCARD_XRAY_HOST="${WILDCARD_XRAY_HOST:-}"
@@ -256,6 +260,50 @@ flag_enabled() {
     1|true|yes|on) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+trim_env_value() {
+  local value
+  value="$(printf '%s' "${1:-}" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  echo "${value}"
+}
+
+clean_cloudflare_secret() {
+  local value
+  value="$(trim_env_value "${1:-}")"
+  value="$(printf '%s' "${value}" | sed -E 's/^[Bb]earer[[:space:]]+//; s/[[:space:]]+//g')"
+  echo "${value}"
+}
+
+write_cloudflare_certbot_credentials() {
+  local cred_file cf_token cf_email cf_key
+  cred_file="${1:-/root/.secrets/certbot/cloudflare.ini}"
+  cf_token="$(clean_cloudflare_secret "${WILDCARD_CF_API_TOKEN:-}")"
+  cf_email="$(trim_env_value "${WILDCARD_CF_EMAIL:-}")"
+  cf_key="$(clean_cloudflare_secret "${WILDCARD_CF_API_KEY:-}")"
+
+  mkdir -p "$(dirname "${cred_file}")"
+  if [[ -n "${cf_token}" ]]; then
+    WILDCARD_CF_API_TOKEN="${cf_token}"
+    cat > "${cred_file}" <<EOF
+dns_cloudflare_api_token = ${cf_token}
+EOF
+  elif [[ -n "${cf_email}" && -n "${cf_key}" ]]; then
+    WILDCARD_CF_EMAIL="${cf_email}"
+    WILDCARD_CF_API_KEY="${cf_key}"
+    cat > "${cred_file}" <<EOF
+dns_cloudflare_email = ${cf_email}
+dns_cloudflare_api_key = ${cf_key}
+EOF
+  else
+    return 1
+  fi
+  chmod 600 "${cred_file}"
+  return 0
 }
 
 sanitize_domain_host() {
@@ -1317,19 +1365,18 @@ issue_letsencrypt_cert() {
       log "WILDCARD_ENABLE=1 tapi WILDCARD_BASE_DOMAIN kosong."
       return 1
     fi
-    if [[ -z "${WILDCARD_CF_API_TOKEN:-}" ]]; then
-      log "WILDCARD_ENABLE=1 tapi WILDCARD_CF_API_TOKEN kosong."
+    if [[ -z "${WILDCARD_CF_API_TOKEN:-}" && ( -z "${WILDCARD_CF_EMAIL:-}" || -z "${WILDCARD_CF_API_KEY:-}" ) ]]; then
+      log "WILDCARD_ENABLE=1 tapi kredensial Cloudflare kosong. Isi WILDCARD_CF_API_TOKEN atau WILDCARD_CF_EMAIL + WILDCARD_CF_API_KEY."
       return 1
     fi
     if ! certbot --help plugins 2>/dev/null | grep -qi 'dns-cloudflare'; then
       log "Plugin certbot dns-cloudflare belum tersedia."
       return 1
     fi
-    mkdir -p /root/.secrets/certbot
-    cat > /root/.secrets/certbot/cloudflare.ini <<EOF
-dns_cloudflare_api_token = ${WILDCARD_CF_API_TOKEN}
-EOF
-    chmod 600 /root/.secrets/certbot/cloudflare.ini
+    if ! write_cloudflare_certbot_credentials /root/.secrets/certbot/cloudflare.ini; then
+      log "Kredensial Cloudflare belum valid untuk certbot."
+      return 1
+    fi
     xray_alias_hosts="$(build_xray_alias_hosts)"
     IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
     for alias_host in "${__cert_alias_hosts[@]}"; do
@@ -9186,6 +9233,8 @@ LICENSE_KEY=${LICENSE_KEY}
 WILDCARD_ENABLE=${WILDCARD_ENABLE}
 WILDCARD_BASE_DOMAIN=${WILDCARD_BASE_DOMAIN}
 WILDCARD_CF_API_TOKEN=${WILDCARD_CF_API_TOKEN}
+WILDCARD_CF_EMAIL=${WILDCARD_CF_EMAIL}
+WILDCARD_CF_API_KEY=${WILDCARD_CF_API_KEY}
 WILDCARD_BUG_PREFIX=${WILDCARD_BUG_PREFIX}
 WILDCARD_BUG_PREFIXES=${WILDCARD_BUG_PREFIXES}
 WILDCARD_XRAY_HOST=${WILDCARD_XRAY_HOST}
@@ -9474,6 +9523,50 @@ flag_enabled() {
   esac
 }
 
+trim_env_value() {
+  local value
+  value="$(printf '%s' "${1:-}" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  value="${value%\"}"
+  value="${value#\"}"
+  value="${value%\'}"
+  value="${value#\'}"
+  echo "${value}"
+}
+
+clean_cloudflare_secret() {
+  local value
+  value="$(trim_env_value "${1:-}")"
+  value="$(printf '%s' "${value}" | sed -E 's/^[Bb]earer[[:space:]]+//; s/[[:space:]]+//g')"
+  echo "${value}"
+}
+
+write_cloudflare_certbot_credentials() {
+  local cred_file cf_token cf_email cf_key
+  cred_file="${1:-/root/.secrets/certbot/cloudflare.ini}"
+  cf_token="$(clean_cloudflare_secret "${WILDCARD_CF_API_TOKEN:-}")"
+  cf_email="$(trim_env_value "${WILDCARD_CF_EMAIL:-}")"
+  cf_key="$(clean_cloudflare_secret "${WILDCARD_CF_API_KEY:-}")"
+
+  mkdir -p "$(dirname "${cred_file}")"
+  if [[ -n "${cf_token}" ]]; then
+    WILDCARD_CF_API_TOKEN="${cf_token}"
+    cat > "${cred_file}" <<EOF
+dns_cloudflare_api_token = ${cf_token}
+EOF
+  elif [[ -n "${cf_email}" && -n "${cf_key}" ]]; then
+    WILDCARD_CF_EMAIL="${cf_email}"
+    WILDCARD_CF_API_KEY="${cf_key}"
+    cat > "${cred_file}" <<EOF
+dns_cloudflare_email = ${cf_email}
+dns_cloudflare_api_key = ${cf_key}
+EOF
+  else
+    return 1
+  fi
+  chmod 600 "${cred_file}"
+  return 0
+}
+
 sanitize_domain_host() {
   local host
   host="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -9623,19 +9716,18 @@ issue_letsencrypt_cert() {
   fi
 
   if flag_enabled "${WILDCARD_ENABLE:-0}"; then
-    if [[ -z "${WILDCARD_BASE_DOMAIN:-}" || -z "${WILDCARD_CF_API_TOKEN:-}" ]]; then
-      echo "Wildcard aktif tapi WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN belum valid."
+    if [[ -z "${WILDCARD_BASE_DOMAIN:-}" || ( -z "${WILDCARD_CF_API_TOKEN:-}" && ( -z "${WILDCARD_CF_EMAIL:-}" || -z "${WILDCARD_CF_API_KEY:-}" ) ) ]]; then
+      echo "Wildcard aktif tapi WILDCARD_BASE_DOMAIN/kredensial Cloudflare belum valid."
       return 1
     fi
     if ! certbot --help plugins 2>/dev/null | grep -qi 'dns-cloudflare'; then
       echo "Plugin certbot dns-cloudflare belum tersedia."
       return 1
     fi
-    mkdir -p /root/.secrets/certbot
-    cat > /root/.secrets/certbot/cloudflare.ini <<EOF
-dns_cloudflare_api_token = ${WILDCARD_CF_API_TOKEN}
-EOF
-    chmod 600 /root/.secrets/certbot/cloudflare.ini
+    if ! write_cloudflare_certbot_credentials /root/.secrets/certbot/cloudflare.ini; then
+      echo "Kredensial Cloudflare belum valid untuk certbot."
+      return 1
+    fi
     xray_alias_hosts="$(build_xray_alias_hosts)"
     IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
     for alias_host in "${__cert_alias_hosts[@]}"; do
@@ -11875,12 +11967,19 @@ trigger_online_notify_now() {
 }
 
 set_wildcard_config_menu() {
-  local ans base token prefixes exacts aliases nginx_server_names pem
+  local ans base token cf_email cf_key prefixes exacts aliases nginx_server_names pem
   aliases="$(build_xray_alias_hosts)"
   echo "SETTING WILDCARD CLOUDFLARE"
   echo "Domain utama       : ${DOMAIN}"
   echo "Wildcard cert      : ${WILDCARD_ENABLE:-0}"
   echo "Base domain        : ${WILDCARD_BASE_DOMAIN:-}"
+  if [[ -n "${WILDCARD_CF_API_TOKEN:-}" ]]; then
+    echo "CF credential      : API Token"
+  elif [[ -n "${WILDCARD_CF_EMAIL:-}" && -n "${WILDCARD_CF_API_KEY:-}" ]]; then
+    echo "CF credential      : Global API Key (${WILDCARD_CF_EMAIL})"
+  else
+    echo "CF credential      : none"
+  fi
   echo "Bug prefixes       : ${WILDCARD_BUG_PREFIXES:-${WILDCARD_BUG_PREFIX:-}}"
   echo "Exact alias hosts  : ${WILDCARD_XRAY_HOSTS:-${WILDCARD_XRAY_HOST:-}}"
   echo "Alias aktif        : ${aliases:-none}"
@@ -11910,7 +12009,21 @@ set_wildcard_config_menu() {
   if [[ "${token:-}" == "-" ]]; then
     WILDCARD_CF_API_TOKEN=""
   elif [[ -n "${token:-}" ]]; then
-    WILDCARD_CF_API_TOKEN="${token}"
+    WILDCARD_CF_API_TOKEN="$(clean_cloudflare_secret "${token}")"
+  fi
+
+  prompt_input cf_email "Cloudflare email untuk Global API Key [enter=keep, -=hapus]: " || return
+  if [[ "${cf_email:-}" == "-" ]]; then
+    WILDCARD_CF_EMAIL=""
+  elif [[ -n "${cf_email:-}" ]]; then
+    WILDCARD_CF_EMAIL="$(trim_env_value "${cf_email}")"
+  fi
+
+  prompt_input cf_key "Cloudflare Global API Key [enter=keep, -=hapus]: " || return
+  if [[ "${cf_key:-}" == "-" ]]; then
+    WILDCARD_CF_API_KEY=""
+  elif [[ -n "${cf_key:-}" ]]; then
+    WILDCARD_CF_API_KEY="$(clean_cloudflare_secret "${cf_key}")"
   fi
 
   prompt_input prefixes "Bug prefixes [enter=keep, -=hapus]: " || return
@@ -11940,6 +12053,8 @@ set_wildcard_config_menu() {
   update_sc_env_var "WILDCARD_ENABLE" "${WILDCARD_ENABLE:-0}"
   update_sc_env_var "WILDCARD_BASE_DOMAIN" "${WILDCARD_BASE_DOMAIN:-}"
   update_sc_env_var "WILDCARD_CF_API_TOKEN" "${WILDCARD_CF_API_TOKEN:-}"
+  update_sc_env_var "WILDCARD_CF_EMAIL" "${WILDCARD_CF_EMAIL:-}"
+  update_sc_env_var "WILDCARD_CF_API_KEY" "${WILDCARD_CF_API_KEY:-}"
   update_sc_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
   update_sc_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
   update_sc_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
@@ -12769,7 +12884,7 @@ EONGINX
   if ! issue_letsencrypt_cert; then
     echo "Peringatan: issue cert Let's Encrypt untuk ${new_domain} gagal. Lanjut dengan cert sementara."
     if flag_enabled "${WILDCARD_ENABLE:-0}"; then
-      echo "Cek WILDCARD_BASE_DOMAIN/WILDCARD_CF_API_TOKEN, lalu jalankan renew cert nanti."
+      echo "Cek WILDCARD_BASE_DOMAIN dan kredensial Cloudflare, lalu jalankan renew cert nanti."
     else
       echo "Cek A record domain ke VPS, lalu jalankan renew cert nanti."
     fi
@@ -14870,6 +14985,8 @@ Time     : $(date '+%F %T')"
     WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}" \
     WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}" \
     WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}" \
+    WILDCARD_CF_EMAIL="${WILDCARD_CF_EMAIL:-}" \
+    WILDCARD_CF_API_KEY="${WILDCARD_CF_API_KEY:-}" \
     WILDCARD_BUG_PREFIX="${WILDCARD_BUG_PREFIX:-}" \
     WILDCARD_BUG_PREFIXES="${WILDCARD_BUG_PREFIXES:-}" \
     WILDCARD_XRAY_HOST="${WILDCARD_XRAY_HOST:-}" \
@@ -16100,7 +16217,7 @@ persist_pending_install_env() {
     DOMAIN EMAIL API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH
     LICENSE_ENFORCE LICENSE_API_URL LICENSE_API_TOKEN LICENSE_KEY
     UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API SUMMARY_API_SETUP_URL
-    WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN
+    WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN WILDCARD_CF_EMAIL WILDCARD_CF_API_KEY
     WILDCARD_BUG_PREFIX WILDCARD_BUG_PREFIXES WILDCARD_XRAY_HOST WILDCARD_XRAY_HOSTS XRAY_PUBLIC_HOST
     ZIVPN_BIN_URL ZIVPN_RELEASE_TAG ZIVPN_SERVICE_NAME ZIVPN_RELOAD_ON_AUTH_CHANGE
     ZIVPN_AUTH_APPLY_MODE ZIVPN_AUTH_MODE ZIVPN_HTTP_AUTH_URL ZIVPN_HTTP_AUTH_TOKEN

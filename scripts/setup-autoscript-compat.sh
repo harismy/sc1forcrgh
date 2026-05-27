@@ -65,11 +65,11 @@ set -euo pipefail
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
 #   ONLINE_NOTIFY_INTERVAL_HOURS=3               (opsional, interval notifikasi online dalam jam)
 #   ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=300      (opsional, jendela realtime XRAY dalam detik)
-#   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
+#   IPLIMIT_CHECK_INTERVAL_MINUTES=3             (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
 #   IPLIMIT_AUTO_LOCK_ENABLE=1                   (opsional, 1=auto lock aktif, 0=monitor only)
 #   IPLIMIT_AUTO_TUNE=1                          (opsional, 1=otomatis tuning berbasis RAM/vCPU)
-#   IPLIMIT_DEBUG=1                              (opsional, 0=hemat log, 1=debug detail)
+#   IPLIMIT_DEBUG=0                              (opsional, 0=hemat log, 1=debug detail)
 #   DROPBEAR_LOG_MAX_LINES=auto                  (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   DROPBEAR_RECENT_LOG_MAX_LINES=auto           (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   UDPHC_LOG_LINES_HISTORY=auto                 (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
@@ -82,6 +82,11 @@ set -euo pipefail
 #   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_VLESS=/vless                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
+#   SSHWS_READER_BUFFER_KB=16                    (opsional, buffer per koneksi SSHWS; 16 hemat RAM, max 64)
+#   HAPROXY_TCPLOG_ENABLE=0                      (opsional, 1=log TCP detail; 0=hemat CPU/disk)
+#   HAPROXY_SERVICE_LIMIT_NOFILE=200000          (opsional, limit FD HAProxy untuk banyak koneksi)
+#   HAPROXY_MAXCONN=20000                        (opsional, batas koneksi HAProxy)
+#   HAPROXY_NBTHREAD=1                           (opsional, thread HAProxy; 1 paling hemat)
 #   VMESS_BUG_PROFILE_ADDRESS=                   (opsional, contoh: nusa-stb1.retrivip.xyz)
 #   VMESS_BUG_PROFILE_SNI=                       (opsional, contoh: dfsuporte.garena.com)
 #   VMESS_BUG_PROFILE_HOST=                      (opsional, default mengikuti ADDRESS)
@@ -153,11 +158,11 @@ ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}"
-IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}"
+IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
-IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
+IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-0}"
 SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-0}"
 SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS:-109,143}"
 SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE:-80/second}"
@@ -182,6 +187,11 @@ XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
+SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-16}"
+HAPROXY_TCPLOG_ENABLE="${HAPROXY_TCPLOG_ENABLE:-0}"
+HAPROXY_SERVICE_LIMIT_NOFILE="${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}"
+HAPROXY_MAXCONN="${HAPROXY_MAXCONN:-20000}"
+HAPROXY_NBTHREAD="${HAPROXY_NBTHREAD:-1}"
 VMESS_BUG_PROFILE_ADDRESS="${VMESS_BUG_PROFILE_ADDRESS:-}"
 VMESS_BUG_PROFILE_SNI="${VMESS_BUG_PROFILE_SNI:-}"
 VMESS_BUG_PROFILE_HOST="${VMESS_BUG_PROFILE_HOST:-}"
@@ -1477,11 +1487,25 @@ EOF
 }
 
 setup_haproxy_tls_mux() {
-  local pem
+  local pem haproxy_maxconn haproxy_nbthread haproxy_limit_nofile haproxy_log_option cores
   pem="$(prepare_haproxy_pem)" || {
     log "Gagal menyiapkan sertifikat HAProxy."
     return 1
   }
+  haproxy_maxconn="$(echo "${HAPROXY_MAXCONN:-20000}" | tr -cd '0-9')"
+  [[ -z "${haproxy_maxconn}" || "${haproxy_maxconn}" -lt 1024 ]] && haproxy_maxconn="20000"
+  haproxy_nbthread="$(echo "${HAPROXY_NBTHREAD:-1}" | tr -cd '0-9')"
+  [[ -z "${haproxy_nbthread}" || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
+  cores="$(get_cpu_cores)"
+  [[ "${haproxy_nbthread}" -gt "${cores}" ]] && haproxy_nbthread="${cores}"
+  [[ "${haproxy_nbthread}" -gt 8 ]] && haproxy_nbthread="8"
+  haproxy_limit_nofile="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
+  [[ -z "${haproxy_limit_nofile}" || "${haproxy_limit_nofile}" -lt 65536 ]] && haproxy_limit_nofile="200000"
+  if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then
+    haproxy_log_option="    option tcplog"
+  else
+    haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
+  fi
 
   log "Setup HAProxy TLS mux di 443..."
 
@@ -1490,8 +1514,8 @@ global
     log /dev/log local0
     log /dev/log local1 notice
     daemon
-    maxconn 20000
-    nbthread 1
+    maxconn ${haproxy_maxconn}
+    nbthread ${haproxy_nbthread}
     # Kompatibilitas TLS maksimum (security lebih lemah) untuk klien lawas/HC.
     ssl-default-bind-ciphers DEFAULT:@SECLEVEL=0
     ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
@@ -1500,7 +1524,7 @@ global
 defaults
     log global
     mode tcp
-    option tcplog
+${haproxy_log_option}
     option dontlognull
     timeout connect 30s
     # WS tunnel perlu timeout panjang; 2m sering bikin koneksi putus sendiri.
@@ -1556,6 +1580,9 @@ EOF
 [Unit]
 After=network-online.target nginx.service sc-1forcr-sshws.service
 Wants=network-online.target nginx.service sc-1forcr-sshws.service
+
+[Service]
+LimitNOFILE=${haproxy_limit_nofile}
 EOF
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl disable stunnel4 >/dev/null 2>&1 || true
@@ -2193,6 +2220,7 @@ SSH_WS_PORT=2082
 SSH_WS_TARGET_PORT=${ssh_ws_target_port}
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
+SSHWS_READER_BUFFER_KB=${SSHWS_READER_BUFFER_KB}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 UDPCUSTOM_CONFIG=/root/udp/config.json
@@ -2232,6 +2260,10 @@ BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
+HAPROXY_TCPLOG_ENABLE=${HAPROXY_TCPLOG_ENABLE}
+HAPROXY_SERVICE_LIMIT_NOFILE=${HAPROXY_SERVICE_LIMIT_NOFILE}
+HAPROXY_MAXCONN=${HAPROXY_MAXCONN}
+HAPROXY_NBTHREAD=${HAPROXY_NBTHREAD}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -4430,9 +4462,9 @@ func stripBufferedHttpJunk(reader *bufio.Reader) {
 	}
 }
 
-func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int) {
+func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, readerBufferSize int) {
 	defer client.Close()
-	reader := bufio.NewReaderSize(client, 64*1024)
+	reader := bufio.NewReaderSize(client, readerBufferSize)
 	afterConnect := false
 
 	peek, err := reader.Peek(4)
@@ -4547,13 +4579,21 @@ func main() {
 	sshPort := envInt("SSH_WS_TARGET_PORT", 109)
 	httpHost := envOr("SSH_HTTP_BACKEND_HOST", "127.0.0.1")
 	httpPort := envInt("SSH_HTTP_BACKEND_PORT", 80)
+	readerBufferKB := envInt("SSHWS_READER_BUFFER_KB", 16)
+	if readerBufferKB < 8 {
+		readerBufferKB = 8
+	}
+	if readerBufferKB > 64 {
+		readerBufferKB = 64
+	}
+	readerBufferSize := readerBufferKB * 1024
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d\n", port, sshHost, sshPort, httpHost, httpPort)
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d, buffer=%dKB\n", port, sshHost, sshPort, httpHost, httpPort, readerBufferKB)
 
 	for {
 		conn, err := ln.Accept()
@@ -4561,7 +4601,7 @@ func main() {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handleConn(conn, sshHost, sshPort, httpHost, httpPort)
+		go handleConn(conn, sshHost, sshPort, httpHost, httpPort, readerBufferSize)
 	}
 }
 EOF
@@ -7372,8 +7412,8 @@ apply_restored_runtime_units() {
     source /etc/sc-1forcr.env || true
   fi
 
-  iplimit_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}" | tr -cd '0-9')"
-  [[ -z "${iplimit_interval}" || "${iplimit_interval}" -lt 1 || "${iplimit_interval}" -gt 1440 ]] && iplimit_interval="1"
+  iplimit_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
+  [[ -z "${iplimit_interval}" || "${iplimit_interval}" -lt 1 || "${iplimit_interval}" -gt 1440 ]] && iplimit_interval="3"
   cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<EOF_TIMER
 [Unit]
 Description=Run SC 1FORCR IP Limit Checker every ${iplimit_interval} minutes
@@ -8964,11 +9004,16 @@ XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
+SSHWS_READER_BUFFER_KB=${SSHWS_READER_BUFFER_KB}
 SSHWS_LOOP_GUARD_ENABLE=${SSHWS_LOOP_GUARD_ENABLE}
 SSHWS_LOOP_GUARD_PORTS=${SSHWS_LOOP_GUARD_PORTS}
 SSHWS_LOOP_GUARD_NEW_ABOVE=${SSHWS_LOOP_GUARD_NEW_ABOVE}
 SSHWS_LOOP_GUARD_BURST=${SSHWS_LOOP_GUARD_BURST}
 SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE=${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE}
+HAPROXY_TCPLOG_ENABLE=${HAPROXY_TCPLOG_ENABLE}
+HAPROXY_SERVICE_LIMIT_NOFILE=${HAPROXY_SERVICE_LIMIT_NOFILE}
+HAPROXY_MAXCONN=${HAPROXY_MAXCONN}
+HAPROXY_NBTHREAD=${HAPROXY_NBTHREAD}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
@@ -11138,9 +11183,9 @@ akun_menu() {
 
 set_iplimit_checker_config_menu() {
   local current_interval current_lock interval_in lock_in
-  current_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  current_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
   current_lock="$(echo "${IPLIMIT_LOCK_MINUTES:-15}" | tr -cd '0-9')"
-  [[ -z "${current_interval}" ]] && current_interval="10"
+  [[ -z "${current_interval}" ]] && current_interval="3"
   [[ -z "${current_lock}" ]] && current_lock="15"
 
   draw_menu_header "SETTING IP LIMIT CHECKER"
@@ -11196,7 +11241,7 @@ set_autolock_realtime_tuning_menu() {
   local def_interval def_lock def_xray_recent def_xray_active def_xray_hits def_zivpn_active def_zivpn_handoff
 
   # Default rekomendasi (balanced realtime + minim false-positive).
-  def_interval="1"
+  def_interval="3"
   def_lock="15"
   def_xray_recent="5"
   def_xray_active="60"
@@ -11204,7 +11249,7 @@ set_autolock_realtime_tuning_menu() {
   def_zivpn_active="90"
   def_zivpn_handoff="90"
 
-  cur_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-1}" | tr -cd '0-9')"
+  cur_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
   cur_lock="$(echo "${IPLIMIT_LOCK_MINUTES:-15}" | tr -cd '0-9')"
   cur_xray_recent="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
   cur_xray_active="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
@@ -11212,7 +11257,7 @@ set_autolock_realtime_tuning_menu() {
   cur_zivpn_active="$(echo "${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}" | tr -cd '0-9')"
   cur_zivpn_handoff="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
 
-  [[ -z "${cur_interval}" ]] && cur_interval="1"
+  [[ -z "${cur_interval}" ]] && cur_interval="3"
   [[ -z "${cur_lock}" ]] && cur_lock="15"
   [[ -z "${cur_xray_recent}" ]] && cur_xray_recent="5"
   [[ -z "${cur_xray_active}" ]] && cur_xray_active="60"
@@ -11248,8 +11293,8 @@ set_autolock_realtime_tuning_menu() {
   echo
   echo "Rekomendasi:"
   echo "- Aman umum (disarankan): interval=${def_interval}, lock=${def_lock}, xray_recent=${def_xray_recent}, xray_active=${def_xray_active}, xray_hits=${def_xray_hits}, zivpn_active=${def_zivpn_active}, handoff=${def_zivpn_handoff}"
-  echo "- Agresif: interval=1, xray_active=30, xray_hits=1 (resiko false-positive naik)."
-  echo "- Stabil tinggi trafik: interval=2, xray_active=90, xray_hits=2."
+  echo "- Agresif: interval=1, xray_active=30, xray_hits=1 (CPU lebih tinggi, resiko false-positive naik)."
+  echo "- Stabil tinggi trafik: interval=3, xray_active=90, xray_hits=2."
   echo
   echo "Kosongkan input (Enter) untuk pakai DEFAULT REKOMENDASI."
   echo "Ketik 'batal' untuk keluar."
@@ -11960,7 +12005,7 @@ backup_restore_menu() {
 }
 
 change_domain_menu() {
-  local new_domain email app_env pem cert_domain
+  local new_domain email app_env pem cert_domain haproxy_maxconn haproxy_nbthread haproxy_limit_nofile haproxy_log_option cores
   prompt_input new_domain "Masukkan domain baru: " || return
   if [[ -z "${new_domain}" ]]; then
     echo "Domain tidak boleh kosong."
@@ -12237,14 +12282,28 @@ EONGINX
     echo "Gagal menyiapkan sertifikat HAProxy."
     return
   }
+  haproxy_maxconn="$(echo "${HAPROXY_MAXCONN:-20000}" | tr -cd '0-9')"
+  [[ -z "${haproxy_maxconn}" || "${haproxy_maxconn}" -lt 1024 ]] && haproxy_maxconn="20000"
+  haproxy_nbthread="$(echo "${HAPROXY_NBTHREAD:-1}" | tr -cd '0-9')"
+  [[ -z "${haproxy_nbthread}" || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
+  cores="$(get_cpu_cores)"
+  [[ "${haproxy_nbthread}" -gt "${cores}" ]] && haproxy_nbthread="${cores}"
+  [[ "${haproxy_nbthread}" -gt 8 ]] && haproxy_nbthread="8"
+  haproxy_limit_nofile="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
+  [[ -z "${haproxy_limit_nofile}" || "${haproxy_limit_nofile}" -lt 65536 ]] && haproxy_limit_nofile="200000"
+  if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then
+    haproxy_log_option="    option tcplog"
+  else
+    haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
+  fi
 
   cat > /etc/haproxy/haproxy.cfg <<EOHAP
 global
     log /dev/log local0
     log /dev/log local1 notice
     daemon
-    maxconn 20000
-    nbthread 1
+    maxconn ${haproxy_maxconn}
+    nbthread ${haproxy_nbthread}
     # Kompatibilitas TLS maksimum (security lebih lemah) untuk klien lawas/HC.
     ssl-default-bind-ciphers DEFAULT:@SECLEVEL=0
     ssl-default-bind-ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256
@@ -12253,7 +12312,7 @@ global
 defaults
     log global
     mode tcp
-    option tcplog
+${haproxy_log_option}
     option dontlognull
     timeout connect 30s
     # WS tunnel perlu timeout panjang; 2m sering bikin koneksi putus sendiri.
@@ -12303,6 +12362,16 @@ backend bk_sshws_tls
     server sshws_local 127.0.0.1:2082 check
 EOHAP
 
+  mkdir -p /etc/systemd/system/haproxy.service.d
+  cat > /etc/systemd/system/haproxy.service.d/sc-1forcr-order.conf <<EOF
+[Unit]
+After=network-online.target nginx.service sc-1forcr-sshws.service
+Wants=network-online.target nginx.service sc-1forcr-sshws.service
+
+[Service]
+LimitNOFILE=${haproxy_limit_nofile}
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
   haproxy -c -f /etc/haproxy/haproxy.cfg || {
     echo "Konfigurasi haproxy invalid."
     return
@@ -14307,6 +14376,9 @@ Time     : $(date '+%F %T')"
     DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
     IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
     IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
+    IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}" \
+    IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}" \
+    IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-0}" \
     XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS}" \
     XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES}" \
     XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
@@ -14314,11 +14386,16 @@ Time     : $(date '+%F %T')"
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \
     XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
     XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN}" \
+    SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-16}" \
     SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE}" \
     SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS}" \
     SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE}" \
     SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST}" \
     SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE}" \
+    HAPROXY_TCPLOG_ENABLE="${HAPROXY_TCPLOG_ENABLE:-0}" \
+    HAPROXY_SERVICE_LIMIT_NOFILE="${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}" \
+    HAPROXY_MAXCONN="${HAPROXY_MAXCONN:-20000}" \
+    HAPROXY_NBTHREAD="${HAPROXY_NBTHREAD:-1}" \
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \

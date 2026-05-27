@@ -29,6 +29,8 @@ set -euo pipefail
 #   WILDCARD_XRAY_HOST=                         (opsional legacy, exact alias host Xray)
 #   WILDCARD_XRAY_HOSTS=                        (opsional, exact alias host Xray dipisah koma)
 #   XRAY_PUBLIC_HOST=                           (opsional legacy, alias host pertama)
+#   XRAY_FRONT_DOMAIN=support.zoom.us           (opsional, server address bug/front domain)
+#   XRAY_FRONT_DOMAINS=support.zoom.us          (opsional, server address bug dipisah koma)
 #   UPDATE_SCRIPT_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-autoscript-compat.sh
 #   AUTO_INSTALL_SUMMARY_API=1                   (opsional, 1=auto install summary API saat install SC)
 #   SUMMARY_API_SETUP_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-summary-api.sh
@@ -119,6 +121,8 @@ WILDCARD_BUG_PREFIXES="${WILDCARD_BUG_PREFIXES:-}"
 WILDCARD_XRAY_HOST="${WILDCARD_XRAY_HOST:-}"
 WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
+XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
+XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
 SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -384,6 +388,10 @@ build_xray_public_host() {
   echo "${first:-${domain}}"
 }
 
+build_xray_front_hosts() {
+  normalize_domain_host_list "${XRAY_FRONT_DOMAINS:-},${XRAY_FRONT_DOMAIN:-}"
+}
+
 build_nginx_server_names() {
   local names host base aliases
   names=""
@@ -429,6 +437,8 @@ WILDCARD_BUG_PREFIXES="$(normalize_domain_host_list "${WILDCARD_BUG_PREFIXES}")"
 WILDCARD_XRAY_HOST="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_XRAY_HOST}")")"
 WILDCARD_XRAY_HOSTS="$(normalize_domain_host_list "${WILDCARD_XRAY_HOSTS}")"
 XRAY_PUBLIC_HOST="$(build_xray_public_host)"
+XRAY_FRONT_DOMAIN="$(csv_first_item "$(normalize_domain_host_list "${XRAY_FRONT_DOMAIN}")")"
+XRAY_FRONT_DOMAINS="$(normalize_domain_host_list "${XRAY_FRONT_DOMAINS}")"
 
 if [[ -z "${DOMAIN}" ]]; then
   echo "DOMAIN tidak valid."
@@ -2414,6 +2424,8 @@ WILDCARD_BUG_PREFIXES=${WILDCARD_BUG_PREFIXES}
 WILDCARD_XRAY_HOST=${WILDCARD_XRAY_HOST}
 WILDCARD_XRAY_HOSTS=${WILDCARD_XRAY_HOSTS}
 XRAY_PUBLIC_HOST=${XRAY_PUBLIC_HOST}
+XRAY_FRONT_DOMAIN=${XRAY_FRONT_DOMAIN}
+XRAY_FRONT_DOMAINS=${XRAY_FRONT_DOMAINS}
 AUTH_TOKEN=${API_AUTH_TOKEN}
 LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
@@ -2542,6 +2554,13 @@ function buildXrayPublicHost() {
 const XRAY_ALIAS_HOSTS = buildXrayAliasHosts();
 const XRAY_PUBLIC_HOST = buildXrayPublicHost();
 const XRAY_LINK_HOST = normalizeHost(DOMAIN) || XRAY_PUBLIC_HOST;
+const XRAY_FRONT_HOSTS = [
+  ...parseHostList(process.env.XRAY_FRONT_DOMAINS || ''),
+  ...parseHostList(process.env.XRAY_FRONT_DOMAIN || '')
+].filter((v, i, arr) => arr.indexOf(v) === i);
+const XRAY_FRONT_TARGET = XRAY_FRONT_HOSTS.length > 0 && (XRAY_ALIAS_HOSTS[0] || XRAY_PUBLIC_HOST)
+  ? { address: XRAY_FRONT_HOSTS[0], host: XRAY_ALIAS_HOSTS[0] || XRAY_PUBLIC_HOST }
+  : null;
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
@@ -3357,6 +3376,16 @@ function vmessLink(host, id, tls, username = '') {
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
+function vmessFrontLink(address, wsHost, id, username = '') {
+  const remark = String(username || `vmess-front-${address}`).trim() || `vmess-front-${address}`;
+  const allowInsecure = VMESS_BUG_PROFILE_ALLOW_INSECURE ? '1' : '0';
+  const payload = {
+    v: '2', ps: remark, add: address, port: '443', id, aid: '0',
+    net: 'ws', type: 'none', host: wsHost, path: XRAY_PATH_VMESS, tls: 'tls', sni: wsHost,
+    allowInsecure, alpn: 'http/1.1'
+  };
+  return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+}
 function vmessGrpcLink(host, id, username = '') {
   const remark = String(username || `vmess-grpc-${host}`).trim() || `vmess-grpc-${host}`;
   const allowInsecure = VMESS_BUG_PROFILE_ALLOW_INSECURE ? '1' : '0';
@@ -3423,6 +3452,10 @@ function vlessLink(host, id, tls, username = '') {
   }
   return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#${remark}`;
 }
+function vlessFrontLink(address, wsHost, id, username = '') {
+  const remark = encodeURIComponent(String(username || `vless-front-${address}`).trim() || `vless-front-${address}`);
+  return `vless://${id}@${address}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${wsHost}&host=${wsHost}&alpn=http%2F1.1&encryption=none#${remark}`;
+}
 function vlessGrpcLink(host, id, username = '') {
   const remark = encodeURIComponent(String(username || `vless-grpc-${host}`).trim() || `vless-grpc-${host}`);
   return `vless://${id}@${host}:443?type=grpc&serviceName=vless-grpc&security=tls&sni=${host}&alpn=h2&encryption=none#${remark}`;
@@ -3434,9 +3467,22 @@ function trojanLink(host, pass, tls, username = '') {
   }
   return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}#${remark}`;
 }
+function trojanFrontLink(address, wsHost, pass, username = '') {
+  const remark = encodeURIComponent(String(username || `trojan-front-${address}`).trim() || `trojan-front-${address}`);
+  return `trojan://${pass}@${address}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${wsHost}&host=${wsHost}&alpn=http%2F1.1#${remark}`;
+}
 function trojanGrpcLink(host, pass, username = '') {
   const remark = encodeURIComponent(String(username || `trojan-grpc-${host}`).trim() || `trojan-grpc-${host}`);
   return `trojan://${pass}@${host}:443?type=grpc&serviceName=trojan-grpc&security=tls&sni=${host}&alpn=h2#${remark}`;
+}
+function addFrontBugLink(protocol, links, secret, username = '') {
+  if (!XRAY_FRONT_TARGET) return links;
+  let bugLink = '';
+  if (protocol === 'vmess') bugLink = vmessFrontLink(XRAY_FRONT_TARGET.address, XRAY_FRONT_TARGET.host, secret, username);
+  if (protocol === 'vless') bugLink = vlessFrontLink(XRAY_FRONT_TARGET.address, XRAY_FRONT_TARGET.host, secret, username);
+  if (protocol === 'trojan') bugLink = trojanFrontLink(XRAY_FRONT_TARGET.address, XRAY_FRONT_TARGET.host, secret, username);
+  if (!bugLink) return links;
+  return { ...links, bugtls: bugLink, front_tls: bugLink };
 }
 
 async function renderAndReloadXray() {
@@ -4057,13 +4103,14 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
     data = {
       hostname: xrayHost, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       wildcard_hosts: XRAY_ALIAS_HOSTS,
+      front_hosts: XRAY_FRONT_HOSTS,
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: '/upvmess', aliases: XRAY_PATHS_VMESS },
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vmessLink(xrayHost, uuid, true, finalUsername), none: vmessLink(xrayHost, uuid, false, finalUsername), grpc: vmessGrpcLink(xrayHost, uuid, finalUsername), uptls: vmessLink(xrayHost, uuid, true, finalUsername), upntls: vmessLink(xrayHost, uuid, false, finalUsername) },
+      link: addFrontBugLink('vmess', { tls: vmessLink(xrayHost, uuid, true, finalUsername), none: vmessLink(xrayHost, uuid, false, finalUsername), grpc: vmessGrpcLink(xrayHost, uuid, finalUsername), uptls: vmessLink(xrayHost, uuid, true, finalUsername), upntls: vmessLink(xrayHost, uuid, false, finalUsername) }, uuid, finalUsername),
       bug_profile: bugCfg ? { config: bugCfg, vmess: bugVmess } : null
     };
   } else if (protocol === 'vless') {
@@ -4076,13 +4123,14 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
     data = {
       hostname: xrayHost, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       wildcard_hosts: XRAY_ALIAS_HOSTS,
+      front_hosts: XRAY_FRONT_HOSTS,
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: '/upvless', aliases: XRAY_PATHS_VLESS },
       serviceName: 'vless-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: vlessLink(xrayHost, uuid, true, finalUsername), none: vlessLink(xrayHost, uuid, false, finalUsername), grpc: vlessGrpcLink(xrayHost, uuid, finalUsername), uptls: vlessLink(xrayHost, uuid, true, finalUsername), upntls: vlessLink(xrayHost, uuid, false, finalUsername) }
+      link: addFrontBugLink('vless', { tls: vlessLink(xrayHost, uuid, true, finalUsername), none: vlessLink(xrayHost, uuid, false, finalUsername), grpc: vlessGrpcLink(xrayHost, uuid, finalUsername), uptls: vlessLink(xrayHost, uuid, true, finalUsername), upntls: vlessLink(xrayHost, uuid, false, finalUsername) }, uuid, finalUsername)
     };
   } else if (protocol === 'trojan') {
     await ensureUsernameNotExists('account_trojans', finalUsername);
@@ -4094,13 +4142,14 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
     data = {
       hostname: xrayHost, username: finalUsername, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
       wildcard_hosts: XRAY_ALIAS_HOSTS,
+      front_hosts: XRAY_FRONT_HOSTS,
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: '/uptrojan', aliases: XRAY_PATHS_TROJAN },
       serviceName: 'trojan-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
-      link: { tls: trojanLink(xrayHost, pass, true, finalUsername), none: trojanLink(xrayHost, pass, false, finalUsername), grpc: trojanGrpcLink(xrayHost, pass, finalUsername), uptls: trojanLink(xrayHost, pass, true, finalUsername), upntls: trojanLink(xrayHost, pass, false, finalUsername) }
+      link: addFrontBugLink('trojan', { tls: trojanLink(xrayHost, pass, true, finalUsername), none: trojanLink(xrayHost, pass, false, finalUsername), grpc: trojanGrpcLink(xrayHost, pass, finalUsername), uptls: trojanLink(xrayHost, pass, true, finalUsername), upntls: trojanLink(xrayHost, pass, false, finalUsername) }, pass, finalUsername)
     };
   }
   if (trial) await markTrialAccount(protocol, finalUsername);
@@ -7436,6 +7485,8 @@ SETTINGS_KEYS = [
     "WILDCARD_XRAY_HOST",
     "WILDCARD_XRAY_HOSTS",
     "XRAY_PUBLIC_HOST",
+    "XRAY_FRONT_DOMAIN",
+    "XRAY_FRONT_DOMAINS",
     "VMESS_BUG_PROFILE_ADDRESS",
     "VMESS_BUG_PROFILE_SNI",
     "VMESS_BUG_PROFILE_HOST",
@@ -8038,6 +8089,8 @@ SETTINGS_KEYS = [
     "WILDCARD_XRAY_HOST",
     "WILDCARD_XRAY_HOSTS",
     "XRAY_PUBLIC_HOST",
+    "XRAY_FRONT_DOMAIN",
+    "XRAY_FRONT_DOMAINS",
     "VMESS_BUG_PROFILE_ADDRESS",
     "VMESS_BUG_PROFILE_SNI",
     "VMESS_BUG_PROFILE_HOST",
@@ -9240,6 +9293,8 @@ WILDCARD_BUG_PREFIXES=${WILDCARD_BUG_PREFIXES}
 WILDCARD_XRAY_HOST=${WILDCARD_XRAY_HOST}
 WILDCARD_XRAY_HOSTS=${WILDCARD_XRAY_HOSTS}
 XRAY_PUBLIC_HOST=${XRAY_PUBLIC_HOST}
+XRAY_FRONT_DOMAIN=${XRAY_FRONT_DOMAIN}
+XRAY_FRONT_DOMAINS=${XRAY_FRONT_DOMAINS}
 UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
 AUTO_INSTALL_SUMMARY_API=${AUTO_INSTALL_SUMMARY_API}
 SUMMARY_API_SETUP_URL=${SUMMARY_API_SETUP_URL}
@@ -9645,6 +9700,10 @@ build_xray_public_host() {
   echo "${first:-${domain}}"
 }
 
+build_xray_front_hosts() {
+  normalize_domain_host_list "${XRAY_FRONT_DOMAINS:-},${XRAY_FRONT_DOMAIN:-}"
+}
+
 build_nginx_server_names() {
   local names host base aliases
   names=""
@@ -9690,6 +9749,8 @@ WILDCARD_BUG_PREFIXES="$(normalize_domain_host_list "${WILDCARD_BUG_PREFIXES:-}"
 WILDCARD_XRAY_HOST="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_XRAY_HOST:-}")")"
 WILDCARD_XRAY_HOSTS="$(normalize_domain_host_list "${WILDCARD_XRAY_HOSTS:-}")"
 XRAY_PUBLIC_HOST="$(build_xray_public_host)"
+XRAY_FRONT_DOMAIN="$(csv_first_item "$(normalize_domain_host_list "${XRAY_FRONT_DOMAIN:-}")")"
+XRAY_FRONT_DOMAINS="$(normalize_domain_host_list "${XRAY_FRONT_DOMAINS:-}")"
 
 tls_cert_domain() {
   if flag_enabled "${WILDCARD_ENABLE:-0}" && [[ -n "${WILDCARD_BASE_DOMAIN:-}" ]]; then
@@ -10572,7 +10633,7 @@ IP Limit     : ${lim}
 EOT_ZIVPN
       ;;
     vmess|vless|trojan)
-      local host user exp tls none linktls linknone aliases
+      local host user exp tls none linktls linknone linkbug aliases fronts
       host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
       user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
       exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
@@ -10580,7 +10641,9 @@ EOT_ZIVPN
       none="$(echo "${raw}" | jq -r '.data.port.none // "80"' )"
       linktls="$(echo "${raw}" | jq -r '.data.link.tls // "-"' )"
       linknone="$(echo "${raw}" | jq -r '.data.link.none // "-"' )"
+      linkbug="$(echo "${raw}" | jq -r '.data.link.bugtls // .data.link.front_tls // ""' 2>/dev/null || true)"
       aliases="$(echo "${raw}" | jq -r '(.data.wildcard_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
+      fronts="$(echo "${raw}" | jq -r '(.data.front_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
       cat <<EOT_XRAY
 =============================
  ${type^^} ACCOUNT CREATED
@@ -10591,6 +10654,7 @@ Expired      : ${exp}
 TLS Port     : ${tls}
 NON TLS Port : ${none}
 Wildcard     : ${aliases:-none}
+Front bug    : ${fronts:-none}
 
 Link TLS:
 ${linktls}
@@ -10598,6 +10662,13 @@ ${linktls}
 Link NON TLS:
 ${linknone}
 EOT_XRAY
+      if [[ -n "${linkbug:-}" && "${linkbug}" != "null" && "${linkbug}" != "-" ]]; then
+        cat <<EOT_XRAY_BUG
+
+Link BUG TLS:
+${linkbug}
+EOT_XRAY_BUG
+      fi
       ;;
     *)
       echo "${raw}" | jq . 2>/dev/null || echo "${raw}"
@@ -11967,7 +12038,7 @@ trigger_online_notify_now() {
 }
 
 set_wildcard_config_menu() {
-  local ans base token cf_email cf_key prefixes exacts aliases nginx_server_names pem
+  local ans base token cf_email cf_key prefixes exacts fronts aliases nginx_server_names pem
   aliases="$(build_xray_alias_hosts)"
   echo "SETTING WILDCARD CLOUDFLARE"
   echo "Domain utama       : ${DOMAIN}"
@@ -11982,10 +12053,12 @@ set_wildcard_config_menu() {
   fi
   echo "Bug prefixes       : ${WILDCARD_BUG_PREFIXES:-${WILDCARD_BUG_PREFIX:-}}"
   echo "Exact alias hosts  : ${WILDCARD_XRAY_HOSTS:-${WILDCARD_XRAY_HOST:-}}"
+  echo "Front bug domains  : ${XRAY_FRONT_DOMAINS:-${XRAY_FRONT_DOMAIN:-}}"
   echo "Alias aktif        : ${aliases:-none}"
   echo
   echo "Link Xray tetap memakai domain utama. Alias wildcard hanya agar host/SNI bug tetap diterima server."
   echo "Pisahkan banyak bug dengan koma. Contoh: support.zoom.us,ava.game,blog"
+  echo "Front bug domain adalah server address luar, contoh: support.zoom.us"
   echo "Ketik '-' untuk mengosongkan value."
   echo
 
@@ -12044,6 +12117,15 @@ set_wildcard_config_menu() {
     WILDCARD_XRAY_HOST="$(csv_first_item "${WILDCARD_XRAY_HOSTS}")"
   fi
 
+  prompt_input fronts "Front bug server address [enter=keep, -=hapus]: " || return
+  if [[ "${fronts:-}" == "-" ]]; then
+    XRAY_FRONT_DOMAINS=""
+    XRAY_FRONT_DOMAIN=""
+  elif [[ -n "${fronts:-}" ]]; then
+    XRAY_FRONT_DOMAINS="$(normalize_domain_host_list "${fronts}")"
+    XRAY_FRONT_DOMAIN="$(csv_first_item "${XRAY_FRONT_DOMAINS}")"
+  fi
+
   if [[ -z "${WILDCARD_BUG_PREFIXES:-}${WILDCARD_BUG_PREFIX:-}${WILDCARD_XRAY_HOSTS:-}${WILDCARD_XRAY_HOST:-}" ]]; then
     XRAY_PUBLIC_HOST=""
   fi
@@ -12060,12 +12142,16 @@ set_wildcard_config_menu() {
   update_sc_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
   update_sc_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
   update_sc_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
+  update_sc_env_var "XRAY_FRONT_DOMAIN" "${XRAY_FRONT_DOMAIN:-}"
+  update_sc_env_var "XRAY_FRONT_DOMAINS" "${XRAY_FRONT_DOMAINS:-}"
 
   update_app_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
   update_app_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
   update_app_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
   update_app_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
   update_app_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
+  update_app_env_var "XRAY_FRONT_DOMAIN" "${XRAY_FRONT_DOMAIN:-}"
+  update_app_env_var "XRAY_FRONT_DOMAINS" "${XRAY_FRONT_DOMAINS:-}"
 
   nginx_server_names="$(build_nginx_server_names)"
   if [[ -f /etc/nginx/sites-available/sc-1forcr.conf ]]; then
@@ -12091,6 +12177,7 @@ set_wildcard_config_menu() {
   echo "Setting wildcard selesai."
   echo "- Link Xray tetap : ${DOMAIN}"
   echo "- Alias wildcard  : ${aliases:-none}"
+  echo "- Front bug       : ${XRAY_FRONT_DOMAINS:-none}"
 }
 
 tools_menu() {
@@ -12631,6 +12718,8 @@ change_domain_menu() {
   WILDCARD_BUG_PREFIXES="$(normalize_domain_host_list "${WILDCARD_BUG_PREFIXES:-}")"
   WILDCARD_XRAY_HOST="$(csv_first_item "$(normalize_domain_host_list "${WILDCARD_XRAY_HOST:-}")")"
   WILDCARD_XRAY_HOSTS="$(normalize_domain_host_list "${WILDCARD_XRAY_HOSTS:-}")"
+  XRAY_FRONT_DOMAIN="$(csv_first_item "$(normalize_domain_host_list "${XRAY_FRONT_DOMAIN:-}")")"
+  XRAY_FRONT_DOMAINS="$(normalize_domain_host_list "${XRAY_FRONT_DOMAINS:-}")"
   XRAY_PUBLIC_HOST="$(build_xray_public_host)"
 
   mkdir -p /var/www/html
@@ -13025,12 +13114,16 @@ EOF
     update_sc_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
     update_sc_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
     update_sc_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
+    update_sc_env_var "XRAY_FRONT_DOMAIN" "${XRAY_FRONT_DOMAIN:-}"
+    update_sc_env_var "XRAY_FRONT_DOMAINS" "${XRAY_FRONT_DOMAINS:-}"
   fi
   update_app_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
   update_app_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
   update_app_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
   update_app_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
   update_app_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
+  update_app_env_var "XRAY_FRONT_DOMAIN" "${XRAY_FRONT_DOMAIN:-}"
+  update_app_env_var "XRAY_FRONT_DOMAINS" "${XRAY_FRONT_DOMAINS:-}"
 
   systemctl restart sc-1forcr-api sc-1forcr-sshws haproxy nginx
   echo "Domain berhasil diubah ke ${new_domain}"
@@ -14992,6 +15085,8 @@ Time     : $(date '+%F %T')"
     WILDCARD_XRAY_HOST="${WILDCARD_XRAY_HOST:-}" \
     WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}" \
     XRAY_PUBLIC_HOST="$(build_xray_public_host)" \
+    XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}" \
+    XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}" \
     UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
     DB_PATH="${DB_PATH}" \
     APP_DIR="/opt/sc-1forcr" \
@@ -16219,6 +16314,7 @@ persist_pending_install_env() {
     UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API SUMMARY_API_SETUP_URL
     WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN WILDCARD_CF_EMAIL WILDCARD_CF_API_KEY
     WILDCARD_BUG_PREFIX WILDCARD_BUG_PREFIXES WILDCARD_XRAY_HOST WILDCARD_XRAY_HOSTS XRAY_PUBLIC_HOST
+    XRAY_FRONT_DOMAIN XRAY_FRONT_DOMAINS
     ZIVPN_BIN_URL ZIVPN_RELEASE_TAG ZIVPN_SERVICE_NAME ZIVPN_RELOAD_ON_AUTH_CHANGE
     ZIVPN_AUTH_APPLY_MODE ZIVPN_AUTH_MODE ZIVPN_HTTP_AUTH_URL ZIVPN_HTTP_AUTH_TOKEN
     ZIVPN_LIVE_TTL_SECONDS ZIVPN_ACTIVE_WINDOW_SECONDS ZIVPN_HANDOFF_GRACE_SECONDS

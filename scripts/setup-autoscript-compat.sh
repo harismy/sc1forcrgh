@@ -21,8 +21,7 @@ set -euo pipefail
 #   LICENSE_KEY=LSC-XXXX-XXXX-XXXX
 #   WILDCARD_ENABLE=0                           (opsional, 1=aktif wildcard cert DNS-01)
 #   WILDCARD_BASE_DOMAIN=example.com            (opsional, wajib saat wildcard aktif)
-#   WILDCARD_CF_API_TOKEN=                      (opsional, token Cloudflare DNS edit)
-#   WILDCARD_CF_EMAIL=                          (opsional, jika pakai Global API Key)
+#   WILDCARD_CF_EMAIL=                          (opsional, email Cloudflare untuk Global API Key)
 #   WILDCARD_CF_API_KEY=                        (opsional, Global API Key Cloudflare)
 #   WILDCARD_BUG_PREFIX=support.zoom.us         (opsional legacy, hasil: support.zoom.us.DOMAIN)
 #   WILDCARD_BUG_PREFIXES=support.zoom.us,ava.game
@@ -30,7 +29,7 @@ set -euo pipefail
 #   WILDCARD_XRAY_HOSTS=                        (opsional, exact alias host Xray dipisah koma)
 #   XRAY_PUBLIC_HOST=                           (opsional legacy, alias host pertama)
 #   XRAY_FRONT_DOMAIN=support.zoom.us           (opsional, server address bug/front domain)
-#   XRAY_FRONT_DOMAINS=support.zoom.us          (opsional, server address bug dipisah koma)
+#   XRAY_FRONT_DOMAINS=support.zoom.us          (opsional, bug dipisah koma; TLS pakai SNI bug + Host alias)
 #   UPDATE_SCRIPT_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-autoscript-compat.sh
 #   AUTO_INSTALL_SUMMARY_API=1                   (opsional, 1=auto install summary API saat install SC)
 #   SUMMARY_API_SETUP_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-summary-api.sh
@@ -284,19 +283,14 @@ clean_cloudflare_secret() {
 }
 
 write_cloudflare_certbot_credentials() {
-  local cred_file cf_token cf_email cf_key
+  local cred_file cf_email cf_key
   cred_file="${1:-/root/.secrets/certbot/cloudflare.ini}"
-  cf_token="$(clean_cloudflare_secret "${WILDCARD_CF_API_TOKEN:-}")"
   cf_email="$(trim_env_value "${WILDCARD_CF_EMAIL:-}")"
   cf_key="$(clean_cloudflare_secret "${WILDCARD_CF_API_KEY:-}")"
 
   mkdir -p "$(dirname "${cred_file}")"
-  if [[ -n "${cf_token}" ]]; then
-    WILDCARD_CF_API_TOKEN="${cf_token}"
-    cat > "${cred_file}" <<EOF
-dns_cloudflare_api_token = ${cf_token}
-EOF
-  elif [[ -n "${cf_email}" && -n "${cf_key}" ]]; then
+  if [[ -n "${cf_email}" && -n "${cf_key}" ]]; then
+    WILDCARD_CF_API_TOKEN=""
     WILDCARD_CF_EMAIL="${cf_email}"
     WILDCARD_CF_API_KEY="${cf_key}"
     cat > "${cred_file}" <<EOF
@@ -1375,8 +1369,8 @@ issue_letsencrypt_cert() {
       log "WILDCARD_ENABLE=1 tapi WILDCARD_BASE_DOMAIN kosong."
       return 1
     fi
-    if [[ -z "${WILDCARD_CF_API_TOKEN:-}" && ( -z "${WILDCARD_CF_EMAIL:-}" || -z "${WILDCARD_CF_API_KEY:-}" ) ]]; then
-      log "WILDCARD_ENABLE=1 tapi kredensial Cloudflare kosong. Isi WILDCARD_CF_API_TOKEN atau WILDCARD_CF_EMAIL + WILDCARD_CF_API_KEY."
+    if [[ -z "${WILDCARD_CF_EMAIL:-}" || -z "${WILDCARD_CF_API_KEY:-}" ]]; then
+      log "WILDCARD_ENABLE=1 tapi kredensial Cloudflare kosong. Isi WILDCARD_CF_EMAIL + WILDCARD_CF_API_KEY."
       return 1
     fi
     if ! certbot --help plugins 2>/dev/null | grep -qi 'dns-cloudflare'; then
@@ -2558,9 +2552,9 @@ const XRAY_FRONT_HOSTS = [
   ...parseHostList(process.env.XRAY_FRONT_DOMAINS || ''),
   ...parseHostList(process.env.XRAY_FRONT_DOMAIN || '')
 ].filter((v, i, arr) => arr.indexOf(v) === i);
-const XRAY_FRONT_TARGET = XRAY_FRONT_HOSTS.length > 0 && (XRAY_ALIAS_HOSTS[0] || XRAY_PUBLIC_HOST)
-  ? { address: XRAY_FRONT_HOSTS[0], host: XRAY_ALIAS_HOSTS[0] || XRAY_PUBLIC_HOST }
-  : null;
+const XRAY_FRONT_TARGETS = (XRAY_ALIAS_HOSTS[0] || XRAY_PUBLIC_HOST)
+  ? XRAY_FRONT_HOSTS.map((address) => ({ address, host: XRAY_ALIAS_HOSTS[0] || XRAY_PUBLIC_HOST }))
+  : [];
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
@@ -3376,14 +3370,18 @@ function vmessLink(host, id, tls, username = '') {
   };
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
-function vmessFrontLink(address, wsHost, id, username = '') {
+function vmessFrontLink(address, wsHost, id, username = '', tls = true, sniHost = '') {
   const remark = String(username || `vmess-front-${address}`).trim() || `vmess-front-${address}`;
   const allowInsecure = VMESS_BUG_PROFILE_ALLOW_INSECURE ? '1' : '0';
   const payload = {
-    v: '2', ps: remark, add: address, port: '443', id, aid: '0',
-    net: 'ws', type: 'none', host: wsHost, path: XRAY_PATH_VMESS, tls: 'tls', sni: wsHost,
-    allowInsecure, alpn: 'http/1.1'
+    v: '2', ps: remark, add: address, port: tls ? '443' : '80', id, aid: '0',
+    net: 'ws', type: 'none', host: wsHost, path: XRAY_PATH_VMESS, tls: tls ? 'tls' : 'none',
+    allowInsecure
   };
+  if (tls) {
+    payload.sni = normalizeHost(sniHost || address || wsHost);
+    payload.alpn = 'http/1.1';
+  }
   return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
 }
 function vmessGrpcLink(host, id, username = '') {
@@ -3452,9 +3450,13 @@ function vlessLink(host, id, tls, username = '') {
   }
   return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none#${remark}`;
 }
-function vlessFrontLink(address, wsHost, id, username = '') {
+function vlessFrontLink(address, wsHost, id, username = '', tls = true, sniHost = '') {
   const remark = encodeURIComponent(String(username || `vless-front-${address}`).trim() || `vless-front-${address}`);
-  return `vless://${id}@${address}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${wsHost}&host=${wsHost}&alpn=http%2F1.1&encryption=none#${remark}`;
+  if (!tls) {
+    return `vless://${id}@${address}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${wsHost}&encryption=none#${remark}`;
+  }
+  const sni = normalizeHost(sniHost || address || wsHost);
+  return `vless://${id}@${address}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${sni}&host=${wsHost}&alpn=http%2F1.1&encryption=none#${remark}`;
 }
 function vlessGrpcLink(host, id, username = '') {
   const remark = encodeURIComponent(String(username || `vless-grpc-${host}`).trim() || `vless-grpc-${host}`);
@@ -3467,22 +3469,55 @@ function trojanLink(host, pass, tls, username = '') {
   }
   return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}#${remark}`;
 }
-function trojanFrontLink(address, wsHost, pass, username = '') {
+function trojanFrontLink(address, wsHost, pass, username = '', tls = true, sniHost = '') {
   const remark = encodeURIComponent(String(username || `trojan-front-${address}`).trim() || `trojan-front-${address}`);
-  return `trojan://${pass}@${address}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${wsHost}&host=${wsHost}&alpn=http%2F1.1#${remark}`;
+  if (!tls) {
+    return `trojan://${pass}@${address}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${wsHost}#${remark}`;
+  }
+  const sni = normalizeHost(sniHost || address || wsHost);
+  return `trojan://${pass}@${address}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${sni}&host=${wsHost}&alpn=http%2F1.1#${remark}`;
 }
 function trojanGrpcLink(host, pass, username = '') {
   const remark = encodeURIComponent(String(username || `trojan-grpc-${host}`).trim() || `trojan-grpc-${host}`);
   return `trojan://${pass}@${host}:443?type=grpc&serviceName=trojan-grpc&security=tls&sni=${host}&alpn=h2#${remark}`;
 }
 function addFrontBugLink(protocol, links, secret, username = '') {
-  if (!XRAY_FRONT_TARGET) return links;
-  let bugLink = '';
-  if (protocol === 'vmess') bugLink = vmessFrontLink(XRAY_FRONT_TARGET.address, XRAY_FRONT_TARGET.host, secret, username);
-  if (protocol === 'vless') bugLink = vlessFrontLink(XRAY_FRONT_TARGET.address, XRAY_FRONT_TARGET.host, secret, username);
-  if (protocol === 'trojan') bugLink = trojanFrontLink(XRAY_FRONT_TARGET.address, XRAY_FRONT_TARGET.host, secret, username);
-  if (!bugLink) return links;
-  return { ...links, bugtls: bugLink, front_tls: bugLink };
+  if (!Array.isArray(XRAY_FRONT_TARGETS) || XRAY_FRONT_TARGETS.length < 1) return links;
+  const frontTlsLinks = [];
+  const frontNoneLinks = [];
+  for (const target of XRAY_FRONT_TARGETS) {
+    let bugTlsLink = '';
+    let bugNoneLink = '';
+    if (protocol === 'vmess') {
+      bugTlsLink = vmessFrontLink(target.address, target.host, secret, username, true, target.address);
+      bugNoneLink = vmessFrontLink(target.address, target.host, secret, username, false);
+    }
+    if (protocol === 'vless') {
+      bugTlsLink = vlessFrontLink(target.address, target.host, secret, username, true, target.address);
+      bugNoneLink = vlessFrontLink(target.address, target.host, secret, username, false);
+    }
+    if (protocol === 'trojan') {
+      bugTlsLink = trojanFrontLink(target.address, target.host, secret, username, true, target.address);
+      bugNoneLink = trojanFrontLink(target.address, target.host, secret, username, false);
+    }
+    if (bugTlsLink) frontTlsLinks.push({ address: target.address, sni: target.address, host: target.host, link: bugTlsLink });
+    if (bugNoneLink) frontNoneLinks.push({ address: target.address, host: target.host, link: bugNoneLink });
+  }
+  if (frontTlsLinks.length < 1 && frontNoneLinks.length < 1) return links;
+  const nextLinks = { ...links };
+  if (frontTlsLinks.length > 0) {
+    nextLinks.bugtls = frontTlsLinks[0].link;
+    nextLinks.front_tls = frontTlsLinks[0].link;
+    nextLinks.bugtls_all = frontTlsLinks.map((item) => item.link);
+    nextLinks.front_tls_all = frontTlsLinks;
+  }
+  if (frontNoneLinks.length > 0) {
+    nextLinks.bugntls = frontNoneLinks[0].link;
+    nextLinks.front_none = frontNoneLinks[0].link;
+    nextLinks.bugntls_all = frontNoneLinks.map((item) => item.link);
+    nextLinks.front_none_all = frontNoneLinks;
+  }
+  return nextLinks;
 }
 
 async function renderAndReloadXray() {
@@ -9596,19 +9631,14 @@ clean_cloudflare_secret() {
 }
 
 write_cloudflare_certbot_credentials() {
-  local cred_file cf_token cf_email cf_key
+  local cred_file cf_email cf_key
   cred_file="${1:-/root/.secrets/certbot/cloudflare.ini}"
-  cf_token="$(clean_cloudflare_secret "${WILDCARD_CF_API_TOKEN:-}")"
   cf_email="$(trim_env_value "${WILDCARD_CF_EMAIL:-}")"
   cf_key="$(clean_cloudflare_secret "${WILDCARD_CF_API_KEY:-}")"
 
   mkdir -p "$(dirname "${cred_file}")"
-  if [[ -n "${cf_token}" ]]; then
-    WILDCARD_CF_API_TOKEN="${cf_token}"
-    cat > "${cred_file}" <<EOF
-dns_cloudflare_api_token = ${cf_token}
-EOF
-  elif [[ -n "${cf_email}" && -n "${cf_key}" ]]; then
+  if [[ -n "${cf_email}" && -n "${cf_key}" ]]; then
+    WILDCARD_CF_API_TOKEN=""
     WILDCARD_CF_EMAIL="${cf_email}"
     WILDCARD_CF_API_KEY="${cf_key}"
     cat > "${cred_file}" <<EOF
@@ -9777,7 +9807,7 @@ issue_letsencrypt_cert() {
   fi
 
   if flag_enabled "${WILDCARD_ENABLE:-0}"; then
-    if [[ -z "${WILDCARD_BASE_DOMAIN:-}" || ( -z "${WILDCARD_CF_API_TOKEN:-}" && ( -z "${WILDCARD_CF_EMAIL:-}" || -z "${WILDCARD_CF_API_KEY:-}" ) ) ]]; then
+    if [[ -z "${WILDCARD_BASE_DOMAIN:-}" || -z "${WILDCARD_CF_EMAIL:-}" || -z "${WILDCARD_CF_API_KEY:-}" ]]; then
       echo "Wildcard aktif tapi WILDCARD_BASE_DOMAIN/kredensial Cloudflare belum valid."
       return 1
     fi
@@ -10633,7 +10663,7 @@ IP Limit     : ${lim}
 EOT_ZIVPN
       ;;
     vmess|vless|trojan)
-      local host user exp tls none linktls linknone linkbug aliases fronts
+      local host user exp tls none linktls linknone linkbug linkbugs linkbugntls linkbugsntls aliases fronts
       host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
       user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
       exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
@@ -10642,6 +10672,9 @@ EOT_ZIVPN
       linktls="$(echo "${raw}" | jq -r '.data.link.tls // "-"' )"
       linknone="$(echo "${raw}" | jq -r '.data.link.none // "-"' )"
       linkbug="$(echo "${raw}" | jq -r '.data.link.bugtls // .data.link.front_tls // ""' 2>/dev/null || true)"
+      linkbugs="$(echo "${raw}" | jq -r 'if ((.data.link.front_tls_all // []) | type) == "array" and ((.data.link.front_tls_all // []) | length) > 0 then (.data.link.front_tls_all[] | "BUG " + (.address // "-") + " | SNI " + (.sni // .address // "-") + " -> Host " + (.host // "-") + ":\n" + (.link // "")) else empty end' 2>/dev/null || true)"
+      linkbugntls="$(echo "${raw}" | jq -r '.data.link.bugntls // .data.link.front_none // ""' 2>/dev/null || true)"
+      linkbugsntls="$(echo "${raw}" | jq -r 'if ((.data.link.front_none_all // []) | type) == "array" and ((.data.link.front_none_all // []) | length) > 0 then (.data.link.front_none_all[] | "BUG " + (.address // "-") + " -> " + (.host // "-") + ":\n" + (.link // "")) else empty end' 2>/dev/null || true)"
       aliases="$(echo "${raw}" | jq -r '(.data.wildcard_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
       fronts="$(echo "${raw}" | jq -r '(.data.front_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
       cat <<EOT_XRAY
@@ -10662,12 +10695,31 @@ ${linktls}
 Link NON TLS:
 ${linknone}
 EOT_XRAY
-      if [[ -n "${linkbug:-}" && "${linkbug}" != "null" && "${linkbug}" != "-" ]]; then
+      if [[ -n "${linkbugs:-}" ]]; then
+        cat <<EOT_XRAY_BUGS
+
+Link BUG TLS:
+${linkbugs}
+EOT_XRAY_BUGS
+      elif [[ -n "${linkbug:-}" && "${linkbug}" != "null" && "${linkbug}" != "-" ]]; then
         cat <<EOT_XRAY_BUG
 
 Link BUG TLS:
 ${linkbug}
 EOT_XRAY_BUG
+      fi
+      if [[ -n "${linkbugsntls:-}" ]]; then
+        cat <<EOT_XRAY_BUGS_NTLS
+
+Link BUG NON TLS:
+${linkbugsntls}
+EOT_XRAY_BUGS_NTLS
+      elif [[ -n "${linkbugntls:-}" && "${linkbugntls}" != "null" && "${linkbugntls}" != "-" ]]; then
+        cat <<EOT_XRAY_BUG_NTLS
+
+Link BUG NON TLS:
+${linkbugntls}
+EOT_XRAY_BUG_NTLS
       fi
       ;;
     *)
@@ -12038,15 +12090,13 @@ trigger_online_notify_now() {
 }
 
 set_wildcard_config_menu() {
-  local ans base token cf_email cf_key prefixes exacts fronts aliases nginx_server_names pem
+  local ans base cf_email cf_key prefixes exacts fronts aliases nginx_server_names pem
   aliases="$(build_xray_alias_hosts)"
   echo "SETTING WILDCARD CLOUDFLARE"
   echo "Domain utama       : ${DOMAIN}"
   echo "Wildcard cert      : ${WILDCARD_ENABLE:-0}"
   echo "Base domain        : ${WILDCARD_BASE_DOMAIN:-}"
-  if [[ -n "${WILDCARD_CF_API_TOKEN:-}" ]]; then
-    echo "CF credential      : API Token"
-  elif [[ -n "${WILDCARD_CF_EMAIL:-}" && -n "${WILDCARD_CF_API_KEY:-}" ]]; then
+  if [[ -n "${WILDCARD_CF_EMAIL:-}" && -n "${WILDCARD_CF_API_KEY:-}" ]]; then
     echo "CF credential      : Global API Key (${WILDCARD_CF_EMAIL})"
   else
     echo "CF credential      : none"
@@ -12078,12 +12128,7 @@ set_wildcard_config_menu() {
     WILDCARD_BASE_DOMAIN="$(sanitize_domain_host "${base}")"
   fi
 
-  prompt_input token "Cloudflare API token [enter=keep, -=hapus]: " || return
-  if [[ "${token:-}" == "-" ]]; then
-    WILDCARD_CF_API_TOKEN=""
-  elif [[ -n "${token:-}" ]]; then
-    WILDCARD_CF_API_TOKEN="$(clean_cloudflare_secret "${token}")"
-  fi
+  WILDCARD_CF_API_TOKEN=""
 
   prompt_input cf_email "Cloudflare email untuk Global API Key [enter=keep, -=hapus]: " || return
   if [[ "${cf_email:-}" == "-" ]]; then

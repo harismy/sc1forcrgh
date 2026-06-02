@@ -2693,6 +2693,7 @@ const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CH
   ? Math.floor(CHECK_INTERVAL_MINUTES_RAW)
   : 10;
 const LOCK_RECHECK_GRACE_SECONDS = Math.max(180, CHECK_INTERVAL_MINUTES * 120);
+const SAFE_EXEC_TIMEOUT_MS = Math.max(3000, Number(process.env.SC_SAFE_EXEC_TIMEOUT_MS || 15000) || 15000);
 
 function ok(res, data, message = 'success') {
   return res.json({ meta: { code: 200, message }, data });
@@ -3134,7 +3135,7 @@ function all(sql, params = []) {
 
 function safeExec(cmd, args, input) {
   try {
-    const opts = { stdio: ['pipe', 'ignore', 'ignore'] };
+    const opts = { stdio: ['pipe', 'ignore', 'ignore'], timeout: SAFE_EXEC_TIMEOUT_MS };
     if (input) opts.input = input;
     execFileSync(cmd, args, opts);
     return true;

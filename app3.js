@@ -5117,6 +5117,10 @@ bot.on('text', async (ctx) => {
       const installerText = sendInstaller
         ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
         : null;
+      let unlockResult = { attempted: false, ok: false, message: '' };
+      if (result.reactivatedFromExpired) {
+        unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'unlimited_after_natural_expired');
+      }
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Registrasi SC Unlimited berhasil.\n` +
@@ -5124,7 +5128,10 @@ bot.on('text', async (ctx) => {
           `IP: ${ip}\n` +
           `Biaya potong saldo: Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}\n` +
           `Expired: tanpa batas\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`,
+          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
+          `${result.reactivatedFromExpired
+            ? `\nUnlock menu VPS otomatis: ${unlockResult.ok ? 'berhasil' : `gagal (${unlockResult.message || 'unknown'})`}`
+            : ''}`,
         mainMenu()
       );
       await syncScRegistrationMetaToHost(ip, activeServerKey, {
@@ -5370,13 +5377,20 @@ bot.on('text', async (ctx) => {
         client_name: result.clientName || clientName,
         expires_at: 0
       }).catch(() => {});
+      let unlockResult = { attempted: false, ok: false, message: '' };
+      if (result.reactivatedFromExpired) {
+        unlockResult = await tryAutoUnlockAfterRenew(targetUserId, ip, 'admin_unlimited_after_natural_expired');
+      }
       return ctx.reply(
         `SC Unlimited manual berhasil didaftarkan.\n` +
           `Target user ID: ${targetUserId}\n` +
           `Nama Client: ${result.clientName || clientName}\n` +
           `IP: ${ip}\n` +
           `Biaya: Rp 0 (manual admin)\n` +
-          `Expired: tanpa batas`,
+          `Expired: tanpa batas` +
+          `${result.reactivatedFromExpired
+            ? `\nUnlock menu VPS otomatis: ${unlockResult.ok ? 'berhasil' : `gagal (${unlockResult.message || 'unknown'})`}`
+            : ''}`,
         adminMenu()
       );
     }

@@ -13275,6 +13275,16 @@ read_license_value_global() {
   sed -n "s/^${key}=//p" "${file}" | head -n1
 }
 
+read_sc_meta_value_global() {
+  local key="$1"
+  local file="/etc/sc-1forcr-registration.env"
+  if [[ ! -f "${file}" ]]; then
+    echo ""
+    return
+  fi
+  sed -n "s/^${key}=//p" "${file}" | head -n1
+}
+
 parse_license_expire_epoch() {
   local raw ts
   raw="$(echo "${1:-}" | tr -cd '0-9')"
@@ -13287,9 +13297,37 @@ parse_license_expire_epoch() {
   echo "${ts}"
 }
 
+sc_access_state_is_valid() {
+  local status_raw expires_raw status expires_epoch now_epoch
+  status_raw="${1:-}"
+  expires_raw="${2:-}"
+  status="$(echo "${status_raw}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  expires_epoch="$(parse_license_expire_epoch "${expires_raw}")"
+  now_epoch="$(date +%s)"
+
+  case "${status}" in
+    expired|rejected|deny|denied|blocked|suspended|inactive|deleted_by_admin|migrated_ip)
+      return 1
+      ;;
+  esac
+
+  if [[ "${expires_epoch}" -gt 0 && "${now_epoch}" -ge "${expires_epoch}" ]]; then
+    return 1
+  fi
+
+  case "${status}" in
+    active|valid|allowed|ok|unlimited|lifetime)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
 refresh_license_cache_guard() {
   local enabled now_s last_s stamp_file
   local ip_text resp status msg bound_ip expires distribution client_name key_hash
+  local force="${1:-0}"
   enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
   [[ "${enabled}" != "1" ]] && return 0
   [[ -z "${LICENSE_API_URL:-}" || -z "${LICENSE_API_TOKEN:-}" || -z "${LICENSE_KEY:-}" ]] && return 0
@@ -13302,7 +13340,7 @@ refresh_license_cache_guard() {
     last_s="$(tr -cd '0-9' < "${stamp_file}" 2>/dev/null || echo 0)"
     [[ -z "${last_s}" ]] && last_s=0
   fi
-  if (( now_s - last_s < 60 )); then
+  if [[ "${force}" != "1" ]] && (( now_s - last_s < 60 )); then
     return 0
   fi
   printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
@@ -13350,13 +13388,34 @@ EOF
 }
 
 enforce_menu_license_access() {
-  local enabled ip_text status expires_raw expires_epoch now_epoch lock_file lock_reason
+  local enabled ip_text status expires_raw expires_epoch now_epoch lock_file lock_reason meta_status meta_expires
   lock_file="/etc/sc-1forcr-access.lock"
   ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip_text="${ip_text:-unknown}"
   if [[ -f "${lock_file}" ]]; then
     lock_reason="$(sed -n 's/^reason=//p' "${lock_file}" | head -n1)"
     [[ -z "${lock_reason}" ]] && lock_reason="locked_by_admin"
+    if [[ "${lock_reason}" == "natural_expired" ]]; then
+      if [[ "$(menu_bool_01 "${LICENSE_ENFORCE:-1}")" == "1" ]]; then
+        refresh_license_cache_guard 1
+      fi
+      status="$(echo "$(read_license_value_global "LICENSE_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
+      expires_raw="$(read_license_value_global "LICENSE_EXPIRES_AT")"
+      if sc_access_state_is_valid "${status}" "${expires_raw}"; then
+        rm -f "${lock_file}" >/dev/null 2>&1 || true
+        systemctl enable sc-1forcr-api >/dev/null 2>&1 || true
+        systemctl start sc-1forcr-api >/dev/null 2>&1 || true
+        return 0
+      fi
+      meta_status="$(echo "$(read_sc_meta_value_global "SC_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
+      meta_expires="$(read_sc_meta_value_global "SC_EXPIRES_AT")"
+      if sc_access_state_is_valid "${meta_status}" "${meta_expires}"; then
+        rm -f "${lock_file}" >/dev/null 2>&1 || true
+        systemctl enable sc-1forcr-api >/dev/null 2>&1 || true
+        systemctl start sc-1forcr-api >/dev/null 2>&1 || true
+        return 0
+      fi
+    fi
     clear
     if [[ "${lock_reason}" == "natural_expired" ]]; then
       cat <<EOF

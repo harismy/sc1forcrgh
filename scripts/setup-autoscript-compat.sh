@@ -2711,6 +2711,57 @@ function auth(req, res, next) {
   if (!token || token !== AUTH_TOKEN) return fail(res, 401, 'unauthorized');
   next();
 }
+let vpsLocationCache = { at: 0, data: { city: '-', isp: '-' } };
+function sanitizeInfoText(raw, maxLen = 96) {
+  return String(raw || '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLen) || '-';
+}
+function fetchJsonHttps(url, timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    try {
+      const req = https.get(url, { timeout: timeoutMs, headers: { Accept: 'application/json' } }, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          body += chunk;
+          if (body.length > 65536) {
+            try { req.destroy(); } catch (_) {}
+          }
+        });
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(body || '{}'));
+          } catch (_) {
+            resolve(null);
+          }
+        });
+      });
+      req.on('timeout', () => {
+        try { req.destroy(); } catch (_) {}
+        resolve(null);
+      });
+      req.on('error', () => resolve(null));
+    } catch (_) {
+      resolve(null);
+    }
+  });
+}
+async function getVpsLocationInfo() {
+  const now = Date.now();
+  if (vpsLocationCache.at > 0 && now - vpsLocationCache.at < 10 * 60 * 1000) {
+    return vpsLocationCache.data;
+  }
+  const info = await fetchJsonHttps('https://ipinfo.io/json');
+  const data = {
+    city: sanitizeInfoText(info?.city || info?.region || '-'),
+    isp: sanitizeInfoText(info?.org || info?.isp || info?.as || '-')
+  };
+  vpsLocationCache = { at: now, data };
+  return data;
+}
 function parseIntId(raw) {
   const s = String(raw ?? '').trim();
   if (!s) return null;
@@ -3799,7 +3850,7 @@ app.get('/vps/my-accounts', async (req, res) => {
   }
 });
 
-function sshPayload(username, password, expDate, limitip) {
+function sshPayload(username, password, expDate, limitip, location = null) {
   const udpgwPorts = SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'];
   return {
     hostname: DOMAIN,
@@ -3807,6 +3858,8 @@ function sshPayload(username, password, expDate, limitip) {
     password,
     exp: expDate,
     time: nowTime(),
+    city: sanitizeInfoText(location?.city || '-'),
+    isp: sanitizeInfoText(location?.isp || '-'),
     port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: udpgwPorts.join(',') },
     ws_path: '/ssh-ws',
     ws_alt_path: '/ws',
@@ -3871,7 +3924,8 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   if (isTrial) await markTrialAccount('ssh', username);
   syncZivpnUser(username, true);
   syncUdpcustomUser(password, true);
-  const payload = sshPayload(username, password, expDate, limitip);
+  const location = await getVpsLocationInfo();
+  const payload = sshPayload(username, password, expDate, limitip, location);
   await notifyAccountEvent(isTrial ? 'trial' : 'create', 'ssh/zivpn', payload, owner);
   return payload;
 }
@@ -4114,6 +4168,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
   if (!finalUsername) throw new Error('username required');
   const expDate = trial ? dateExpPlusMinutes(60) : dateExpPlusDays(expDays);
   const xrayHost = XRAY_LINK_HOST;
+  const location = await getVpsLocationInfo();
   let data = null;
   if (protocol === 'vmess') {
     await ensureUsernameNotExists('account_vmesses', finalUsername);
@@ -4155,7 +4210,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: xrayHost, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
-      city: 'Auto', isp: 'Auto',
+      city: location.city, isp: location.isp,
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: '/upvmess', aliases: XRAY_PATHS_VMESS },
       serviceName: 'vmess-grpc',
@@ -4175,7 +4230,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: xrayHost, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
-      city: 'Auto', isp: 'Auto',
+      city: location.city, isp: location.isp,
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: '/upvless', aliases: XRAY_PATHS_VLESS },
       serviceName: 'vless-grpc',
@@ -4194,7 +4249,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       hostname: xrayHost, username: finalUsername, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
-      city: 'Auto', isp: 'Auto',
+      city: location.city, isp: location.isp,
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: '/uptrojan', aliases: XRAY_PATHS_TROJAN },
       serviceName: 'trojan-grpc',

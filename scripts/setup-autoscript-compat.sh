@@ -13819,11 +13819,12 @@ EOF
   refresh_license_cache
   city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
   isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
-  local license_distribution license_client_name license_expires_raw expiry_in_text
+  local license_distribution license_client_name license_status license_expires_raw expiry_in_text
   local sc_meta_status sc_meta_client sc_meta_expires
   local update_component update_version update_desc update_time update_desc_short
   license_distribution="$(read_license_value "LICENSE_DISTRIBUTION")"
   license_client_name="$(read_license_value "LICENSE_CLIENT_NAME")"
+  license_status="$(echo "$(read_license_value "LICENSE_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
   license_expires_raw="$(read_license_value "LICENSE_EXPIRES_AT")"
   sc_meta_status="$(echo "$(read_sc_meta_value "SC_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
   sc_meta_client="$(read_sc_meta_value "SC_CLIENT_NAME")"
@@ -13839,10 +13840,14 @@ EOF
   elif [[ -z "${license_client_name}" ]]; then
     license_client_name="${ip}"
   fi
-  if [[ "${sc_meta_status}" == "active" || "${sc_meta_status}" == "unlimited" || -n "${sc_meta_expires}" ]]; then
+  if sc_access_state_is_valid "${sc_meta_status}" "${sc_meta_expires}"; then
     expiry_in_text="$(format_expiry_in "${sc_meta_expires}")"
-  else
+  elif sc_access_state_is_valid "${license_status}" "${license_expires_raw}"; then
     expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
+  elif [[ -n "${license_expires_raw}" ]]; then
+    expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
+  else
+    expiry_in_text="$(format_expiry_in "${sc_meta_expires}")"
   fi
   [[ -z "${update_component}" ]] && update_component="-"
   [[ -z "${update_version}" ]] && update_version="-"

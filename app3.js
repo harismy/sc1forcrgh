@@ -71,8 +71,21 @@ const SETTING_LABELS = {
   SC_INSTALLER_LOCAL_PATH: 'Path Script Installer'
 };
 const DAY_MS = 24 * 60 * 60 * 1000;
-const SC_NOTIFY_INTERVAL_MS = 30 * 60 * 1000;
-const SC_H2_WINDOW_MS = 2 * DAY_MS;
+const SC_NOTIFY_INTERVAL_MS = Math.max(
+  60 * 1000,
+  Number(process.env.SC_NOTIFY_INTERVAL_MS || 0) ||
+    ((Number(process.env.SC_NOTIFY_INTERVAL_MINUTES || process.env.SC_REMINDER_REPEAT_MINUTES || 30) || 30) * 60 * 1000)
+);
+const SC_EXPIRY_JOB_INTERVAL_MS = Math.max(
+  60 * 1000,
+  Number(process.env.SC_EXPIRY_JOB_INTERVAL_MS || 0) ||
+    ((Number(process.env.SC_EXPIRY_JOB_INTERVAL_MINUTES || 5) || 5) * 60 * 1000)
+);
+const SC_H2_WINDOW_MS = Math.max(
+  60 * 60 * 1000,
+  Number(process.env.SC_H2_WINDOW_MS || 0) ||
+    ((Number(process.env.SC_H2_WINDOW_HOURS || 48) || 48) * 60 * 60 * 1000)
+);
 const SC_IP_CHANGE_MAX = 2;
 const MIGRATION_ROLLBACK_TTL_MS = Math.max(
   5 * 60 * 1000,
@@ -1192,11 +1205,19 @@ async function shouldSendScNotify(userId, host, event, intervalMs = SC_NOTIFY_IN
   if (last > 0 && now - last < Math.max(60000, Number(intervalMs) || SC_NOTIFY_INTERVAL_MS)) {
     return false;
   }
+  return true;
+}
+
+async function markScNotifySent(userId, host, event, sentAt = Date.now()) {
+  const uid = Number(userId || 0);
+  const ip = normalizeHost(host);
+  const ev = String(event || '').trim().toLowerCase();
+  if (!uid || !isIpv4(ip) || !ev) return false;
   await dbRun(
     `INSERT INTO sc_notify_state (user_id, vps_ip, event, last_sent_at)
      VALUES (?, ?, ?, ?)
      ON CONFLICT(user_id, vps_ip, event) DO UPDATE SET last_sent_at=excluded.last_sent_at`,
-    [uid, ip, ev, now]
+    [uid, ip, ev, Number(sentAt || Date.now()) || Date.now()]
   ).catch(() => {});
   return true;
 }
@@ -1611,7 +1632,8 @@ async function notifySingleUserInBot(userId, message) {
   try {
     await bot.telegram.sendMessage(uid, String(message || '').trim());
     return true;
-  } catch (_) {
+  } catch (err) {
+    console.error(`[sc-notify] gagal kirim Telegram user=${uid}: ${parseErr(err)}`);
     return false;
   }
 }
@@ -1624,6 +1646,19 @@ async function runNaturalScExpiryJobs() {
       "WHERE status='active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
     [remindUntil]
   ).catch(() => []);
+  const summary = {
+    scanned: activeRows.length,
+    expiredUserSent: 0,
+    expiredUserFailed: 0,
+    expiredLocalSent: 0,
+    expiredLocalFailed: 0,
+    reminderUserSent: 0,
+    reminderUserFailed: 0,
+    reminderLocalSent: 0,
+    reminderLocalFailed: 0,
+    locked: 0,
+    lockFailed: 0
+  };
 
   for (const row of activeRows) {
     const uid = Number(row?.user_id || 0);
@@ -1639,13 +1674,19 @@ async function runNaturalScExpiryJobs() {
 
       const canNotifyUser = await shouldSendScNotify(uid, host, 'natural_expired_user', SC_NOTIFY_INTERVAL_MS);
       if (canNotifyUser) {
-        await notifySingleUserInBot(
+        const sent = await notifySingleUserInBot(
           uid,
           `SC kamu sudah expired karena masa aktif habis.\n` +
             `IP VPS: ${host}\n` +
             `Expired: ${formatDateTime(expTs)}\n\n` +
             `Akses menu SC ditolak sampai diperpanjang.`
         );
+        if (sent) {
+          await markScNotifySent(uid, host, 'natural_expired_user');
+          summary.expiredUserSent += 1;
+        } else {
+          summary.expiredUserFailed += 1;
+        }
       }
 
       const serverKey = await getServerKeyForHost(uid, host);
@@ -1655,21 +1696,34 @@ async function runNaturalScExpiryJobs() {
           client_name: normalizeClientName(row?.client_name || host) || host,
           expires_at: Number(expTs || 0)
         }).catch(() => {});
-        await lockScAccessByHost(host, serverKey, uid, 'natural_expired').catch(() => {});
+        try {
+          await lockScAccessByHost(host, serverKey, uid, 'natural_expired');
+          summary.locked += 1;
+        } catch (lockErr) {
+          summary.lockFailed += 1;
+          console.error(`[sc-expiry-job] gagal lock VPS ${host}: ${parseErr(lockErr)}`);
+        }
         const canNotifyLocal = await shouldSendScNotify(uid, host, 'natural_expired_local', SC_NOTIFY_INTERVAL_MS);
         if (canNotifyLocal) {
-          await notifyScExpiredOnHost(host, serverKey, {
-            ip: host,
-            reason: 'natural_expired',
-            actor: String(uid),
-            users: [String(uid)],
-            message:
-              'SC 1FORCR NOTIF\n' +
-              'Status : SC expired (natural)\n' +
-              `IP VPS : ${host}\n` +
-              `User   : ${uid}\n\n` +
-              'SC harus diperpanjang untuk akses kembali.'
-          }).catch(() => {});
+          try {
+            await notifyScExpiredOnHost(host, serverKey, {
+              ip: host,
+              reason: 'natural_expired',
+              actor: String(uid),
+              users: [String(uid)],
+              message:
+                'SC 1FORCR NOTIF\n' +
+                'Status : SC expired (natural)\n' +
+                `IP VPS : ${host}\n` +
+                `User   : ${uid}\n\n` +
+                'SC harus diperpanjang untuk akses kembali.'
+            });
+            await markScNotifySent(uid, host, 'natural_expired_local');
+            summary.expiredLocalSent += 1;
+          } catch (notifyErr) {
+            summary.expiredLocalFailed += 1;
+            console.error(`[sc-expiry-job] gagal notif VPS expired ${host}: ${parseErr(notifyErr)}`);
+          }
         }
       }
       continue;
@@ -1678,7 +1732,7 @@ async function runNaturalScExpiryJobs() {
     const canRemind = await shouldSendScNotify(uid, host, 'h2_reminder_user', SC_NOTIFY_INTERVAL_MS);
     if (canRemind) {
       const remain = formatRemainingDays(expTs);
-      await notifySingleUserInBot(
+      const sent = await notifySingleUserInBot(
         uid,
         `Pengingat H-2: masa aktif SC akan segera habis.\n` +
           `IP VPS: ${host}\n` +
@@ -1686,28 +1740,42 @@ async function runNaturalScExpiryJobs() {
           `Sisa: ${remain}\n\n` +
           `Silakan perpanjang agar akses tidak terblokir.`
       );
+      if (sent) {
+        await markScNotifySent(uid, host, 'h2_reminder_user');
+        summary.reminderUserSent += 1;
+      } else {
+        summary.reminderUserFailed += 1;
+      }
     }
 
     const serverKey = await getServerKeyForHost(uid, host);
     if (serverKey) {
       const canRemindLocal = await shouldSendScNotify(uid, host, 'h2_reminder_local', SC_NOTIFY_INTERVAL_MS);
       if (canRemindLocal) {
-        await notifyScExpiredOnHost(host, serverKey, {
-          ip: host,
-          reason: 'h2_reminder',
-          actor: String(uid),
-          users: [String(uid)],
-          message:
-            'SC 1FORCR NOTIF\n' +
-            'Reminder : H-2 masa aktif SC\n' +
-            `IP VPS   : ${host}\n` +
-            `User     : ${uid}\n` +
-            `Expired  : ${formatDateTime(expTs)}\n\n` +
-            'Silakan perpanjang sebelum expired.'
-        }).catch(() => {});
+        try {
+          await notifyScExpiredOnHost(host, serverKey, {
+            ip: host,
+            reason: 'h2_reminder',
+            actor: String(uid),
+            users: [String(uid)],
+            message:
+              'SC 1FORCR NOTIF\n' +
+              'Reminder : H-2 masa aktif SC\n' +
+              `IP VPS   : ${host}\n` +
+              `User     : ${uid}\n` +
+              `Expired  : ${formatDateTime(expTs)}\n\n` +
+              'Silakan perpanjang sebelum expired.'
+          });
+          await markScNotifySent(uid, host, 'h2_reminder_local');
+          summary.reminderLocalSent += 1;
+        } catch (notifyErr) {
+          summary.reminderLocalFailed += 1;
+          console.error(`[sc-expiry-job] gagal notif VPS reminder ${host}: ${parseErr(notifyErr)}`);
+        }
       }
     }
   }
+  return summary;
 }
 
 async function isIpOwnedByOther(ip, userId) {
@@ -6008,6 +6076,48 @@ function formatStartError(err) {
   return err?.message ? String(err.message) : util.inspect(err, { depth: 2 });
 }
 
+let scExpiryJobRunning = false;
+
+function logScExpirySummary(source, summary, durationMs) {
+  const data = summary || {};
+  const scanned = Number(data.scanned || 0);
+  const sent =
+    Number(data.expiredUserSent || 0) +
+    Number(data.expiredLocalSent || 0) +
+    Number(data.reminderUserSent || 0) +
+    Number(data.reminderLocalSent || 0);
+  const failed =
+    Number(data.expiredUserFailed || 0) +
+    Number(data.expiredLocalFailed || 0) +
+    Number(data.reminderUserFailed || 0) +
+    Number(data.reminderLocalFailed || 0) +
+    Number(data.lockFailed || 0);
+  if (scanned <= 0 && sent <= 0 && failed <= 0) return;
+  console.log(
+    `[sc-expiry-job] ${source} scanned=${scanned} ` +
+      `reminder_user=${Number(data.reminderUserSent || 0)} reminder_vps=${Number(data.reminderLocalSent || 0)} ` +
+      `expired_user=${Number(data.expiredUserSent || 0)} expired_vps=${Number(data.expiredLocalSent || 0)} ` +
+      `locked=${Number(data.locked || 0)} failed=${failed} duration_ms=${Number(durationMs || 0)}`
+  );
+}
+
+async function runScExpiryJobOnce(source = 'timer') {
+  if (scExpiryJobRunning) {
+    console.error(`[sc-expiry-job] skip ${source}: job sebelumnya masih berjalan`);
+    return;
+  }
+  scExpiryJobRunning = true;
+  const started = Date.now();
+  try {
+    const summary = await runNaturalScExpiryJobs();
+    logScExpirySummary(source, summary, Date.now() - started);
+  } catch (err) {
+    console.error('natural expiry job failed:', formatStartError(err));
+  } finally {
+    scExpiryJobRunning = false;
+  }
+}
+
 async function launchBotWithRetry(maxAttempts = 6) {
   let lastErr = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -6029,15 +6139,15 @@ async function launchBotWithRetry(maxAttempts = 6) {
 function startBackgroundJobs() {
   setInterval(pollPendingTopups, 15000);
   setInterval(() => {
-    runNaturalScExpiryJobs().catch((err) => {
+    runScExpiryJobOnce('timer').catch((err) => {
       console.error('natural expiry job failed:', formatStartError(err));
     });
-  }, SC_NOTIFY_INTERVAL_MS);
+  }, SC_EXPIRY_JOB_INTERVAL_MS);
 
   pollPendingTopups().catch((err) => {
     console.error('initial topup poll failed:', formatStartError(err));
   });
-  runNaturalScExpiryJobs().catch((err) => {
+  runScExpiryJobOnce('initial').catch((err) => {
     console.error('initial natural expiry job failed:', formatStartError(err));
   });
 }

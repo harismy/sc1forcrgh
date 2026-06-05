@@ -78,6 +78,7 @@ const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/loca
 const RESTORE_TMP_DIR = String(process.env.RESTORE_TMP_DIR || '/tmp').trim();
 const BANNER_HTML_FILE = String(process.env.BANNER_HTML_FILE || '/etc/sc-1forcr/banner.html').trim();
 const BANNER_TXT_FILE = String(process.env.BANNER_TXT_FILE || '/etc/sc-1forcr/banner.txt').trim();
+const DB_BUSY_TIMEOUT_MS = Math.max(1000, Math.min(30000, Number(process.env.DB_BUSY_TIMEOUT_MS || 8000)));
 const XRAY_CONFIG_FILE = String(process.env.XRAY_CONFIG_FILE || '/usr/local/etc/xray/config.json').trim();
 const SC_ACCESS_LOCK_FILE = String(process.env.SC_ACCESS_LOCK_FILE || '/etc/sc-1forcr-access.lock').trim();
 const SC_RUNTIME_ENV_FILE = String(process.env.SC_RUNTIME_ENV_FILE || '/etc/sc-1forcr.env').trim();
@@ -92,6 +93,8 @@ const RUNTIME_SETTINGS_KEYS = Object.freeze([
   'AUTO_BACKUP_WIB_HOUR',
   'AUTO_REBOOT_ENABLE',
   'AUTO_REBOOT_INTERVAL_MINUTES',
+  'AUTO_REBOOT_SCHEDULE_MODE',
+  'AUTO_REBOOT_WIB_HOUR',
   'AUTO_PULL_UPDATE_ENABLE',
   'AUTO_PULL_UPDATE_INTERVAL_MINUTES',
   'ONLINE_NOTIFY_ENABLE',
@@ -104,6 +107,8 @@ const RUNTIME_SETTINGS_KEYS = Object.freeze([
   'IPLIMIT_DEBUG',
   'DROPBEAR_LOG_MAX_LINES',
   'DROPBEAR_RECENT_LOG_MAX_LINES',
+  'DROPBEAR_KEEPALIVE_SECONDS',
+  'DROPBEAR_IDLE_TIMEOUT_SECONDS',
   'UDPHC_LOG_LINES_HISTORY',
   'UDPHC_LOG_LINES_REALTIME',
   'UDPHC_LOG_LINES_CHECKER',
@@ -126,6 +131,7 @@ const RUNTIME_SETTINGS_KEYS = Object.freeze([
   'ZIVPN_RELOAD_ON_AUTH_CHANGE',
   'ACTIVE_UDP_BACKEND',
   'SSH_HC_AUTH_LOOKBACK_HOURS',
+  'SSHWS_TCP_KEEPALIVE_SECONDS',
   'SSHWS_UDPGW_PORTS',
   'SSH_TUNNEL_SHELL',
   'SSH_TUNNEL_BLOCK_OUTBOUND_SSH',
@@ -148,6 +154,12 @@ const RUNTIME_SETTINGS_KEY_SET = new Set(RUNTIME_SETTINGS_KEYS);
 if (!USE_DB_AUTH && !STATIC_TOKEN) {
   console.error('SYNC_TOKEN kosong saat USE_DB_AUTH=0');
   process.exit(1);
+}
+
+function openDatabase() {
+  const db = new sqlite3.Database(DB);
+  try { db.configure('busyTimeout', DB_BUSY_TIMEOUT_MS); } catch (_) {}
+  return db;
 }
 
 function ensureRuntimeTables(db, cb) {
@@ -700,7 +712,7 @@ function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
       return resolve({ ok: false, statusCode: 500, message: `config xray tidak ditemukan: ${cfgPath}` });
     }
 
-    const cfgDb = new sqlite3.Database(DB);
+    const cfgDb = openDatabase();
     cfgDb.all(
       `SELECT * FROM ${table} WHERE UPPER(TRIM(COALESCE(status, '')))='AKTIF' ORDER BY rowid DESC`,
       [],
@@ -1309,14 +1321,80 @@ WantedBy=timers.target
   return true;
 }
 
+function writeAutoRebootScript() {
+  const scriptPath = '/usr/local/sbin/sc-1forcr-safe-reboot';
+  try {
+    fs.writeFileSync(scriptPath, [
+      '#!/usr/bin/env bash',
+      'set -euo pipefail',
+      '',
+      'ENV_FILE="/etc/sc-1forcr.env"',
+      '[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true',
+      '',
+      'AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-0}"',
+      'AUTO_REBOOT_SCHEDULE_MODE="$(echo "${AUTO_REBOOT_SCHEDULE_MODE:-interval}" | tr \'[:upper:]\' \'[:lower:]\' | tr -d \'[:space:]\')"',
+      'AUTO_REBOOT_WIB_HOUR="$(echo "${AUTO_REBOOT_WIB_HOUR:-3}" | tr -cd \'0-9\')"',
+      '[[ -n "${AUTO_REBOOT_WIB_HOUR}" ]] && AUTO_REBOOT_WIB_HOUR="$((10#${AUTO_REBOOT_WIB_HOUR}))"',
+      '[[ "${AUTO_REBOOT_ENABLE}" == "1" ]] || exit 0',
+      'case "${AUTO_REBOOT_SCHEDULE_MODE}" in',
+      '  daily|daily_wib|wib) AUTO_REBOOT_SCHEDULE_MODE="daily_wib" ;;',
+      '  *) AUTO_REBOOT_SCHEDULE_MODE="interval" ;;',
+      'esac',
+      '[[ -z "${AUTO_REBOOT_WIB_HOUR}" || "${AUTO_REBOOT_WIB_HOUR}" -gt 23 ]] && AUTO_REBOOT_WIB_HOUR="3"',
+      '',
+      'if [[ "${AUTO_REBOOT_SCHEDULE_MODE}" == "daily_wib" ]]; then',
+      '  wib_now="$(TZ=Asia/Jakarta date +%H)"',
+      '  wib_date="$(TZ=Asia/Jakarta date +%F)"',
+      '  target_hour="$(printf "%02d" "${AUTO_REBOOT_WIB_HOUR}")"',
+      '  stamp_file="/var/lib/sc-1forcr/last-auto-reboot-date"',
+      '  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true',
+      '  [[ "${wib_now}" == "${target_hour}" ]] || exit 0',
+      '  [[ "$(cat "${stamp_file}" 2>/dev/null || true)" == "${wib_date}" ]] && exit 0',
+      "  uptime_sec=\"$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)\"",
+      '  [[ "${uptime_sec}" -lt 600 ]] && exit 0',
+      '  printf \'%s\\n\' "${wib_date}" > "${stamp_file}" 2>/dev/null || true',
+      'fi',
+      '',
+      'logger -t sc-1forcr "Auto reboot timer triggered (${AUTO_REBOOT_SCHEDULE_MODE})."',
+      'sync',
+      'sleep 2',
+      '/usr/bin/systemctl --force reboot'
+    ].join('\n') + '\n', { mode: 0o755 });
+    fs.chmodSync(scriptPath, 0o755);
+    return true;
+  } catch (_err) {
+    return false;
+  }
+}
+
 function writeAutoRebootTimerUnit(settings) {
   if (!fs.existsSync('/etc/systemd/system/sc-1forcr-autoreboot.service')) return false;
+  writeAutoRebootScript();
   const interval = intSetting(settings, 'AUTO_REBOOT_INTERVAL_MINUTES', 1440, 30, 10080);
+  const modeRaw = String(settings?.AUTO_REBOOT_SCHEDULE_MODE || 'interval').trim().toLowerCase();
+  const mode = ['daily', 'daily_wib', 'wib'].includes(modeRaw) ? 'daily_wib' : 'interval';
+  const wibHour = intSetting(settings, 'AUTO_REBOOT_WIB_HOUR', 3, 0, 23);
+  if (mode === 'daily_wib') {
+    fs.writeFileSync('/etc/systemd/system/sc-1forcr-autoreboot.timer', `[Unit]
+Description=Run SC 1FORCR auto reboot daily at ${String(wibHour).padStart(2, '0')}:00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+`, 'utf8');
+    return true;
+  }
   fs.writeFileSync('/etc/systemd/system/sc-1forcr-autoreboot.timer', `[Unit]
 Description=Run SC 1FORCR auto reboot every ${interval} minutes
 
 [Timer]
-OnBootSec=10m
+OnBootSec=${interval}min
 OnUnitActiveSec=${interval}min
 Persistent=true
 AccuracySec=1min
@@ -1391,7 +1469,7 @@ function applyRuntimeSettingsUnits(settings) {
   }
 
   if (hasAutoRebootTimer) {
-    if (enabledSetting(settings, 'AUTO_REBOOT_ENABLE', '1') === '1') {
+    if (enabledSetting(settings, 'AUTO_REBOOT_ENABLE', '0') === '1') {
       actions.push(runSystemctl(['enable', '--now', 'sc-1forcr-autoreboot.timer']));
       actions.push(runSystemctl(['restart', 'sc-1forcr-autoreboot.timer']));
     } else {
@@ -2187,7 +2265,7 @@ function authorizeAndRun(req, res, runHandler) {
     return res.status(401).json({ ok: false, message: 'unauthorized' });
   }
 
-  const db = new sqlite3.Database(DB);
+  const db = openDatabase();
 
   if (USE_DB_AUTH) {
     db.get('SELECT COUNT(*) AS c FROM servers WHERE "key" = ?', [incomingToken], (authErr, authRow) => {
@@ -2514,6 +2592,7 @@ POTATO_DB=${POTATO_DB}
 SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 USE_DB_AUTH=1
 SYNC_TOKEN=
+DB_BUSY_TIMEOUT_MS=8000
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=
 BANNER_HTML_FILE=/etc/sc-1forcr/banner.html
@@ -2588,7 +2667,7 @@ start_pm2_service() {
   cd "${APP_DIR}"
 
   pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
-  pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}"
+  pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M
   pm2 save --force
 
   pm2 startup systemd -u root --hp /root >/tmp/pm2-startup.out 2>&1 || true
@@ -2599,6 +2678,75 @@ start_pm2_service() {
 
   systemctl enable pm2-root >/dev/null 2>&1 || true
   systemctl restart pm2-root >/dev/null 2>&1 || true
+}
+
+install_summary_watchdog() {
+  local port app_name app_dir
+  port="$(echo "${SUMMARY_PORT:-8789}" | tr -cd '0-9')"
+  [[ -z "${port}" || "${port}" -lt 1 || "${port}" -gt 65535 ]] && port="8789"
+  app_name="${APP_NAME:-tunnel-summary}"
+  app_dir="${APP_DIR:-/root/tunnel-sync}"
+
+  cat > /usr/local/sbin/sc-1forcr-summary-watchdog <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+APP_NAME="${app_name}"
+APP_DIR="${app_dir}"
+PORT="${port}"
+LOG_TAG="sc-1forcr-summary-watchdog"
+
+log_msg() {
+  logger -t "\${LOG_TAG}" "\$*" 2>/dev/null || echo "[\${LOG_TAG}] \$*"
+}
+
+if curl -fsS --connect-timeout 2 --max-time 6 "http://127.0.0.1:\${PORT}/health" >/dev/null 2>&1; then
+  exit 0
+fi
+
+log_msg "summary api health gagal, restart pm2 \${APP_NAME}"
+if command -v pm2 >/dev/null 2>&1; then
+  pm2 restart "\${APP_NAME}" --update-env >/dev/null 2>&1 || \
+    pm2 start "\${APP_DIR}/summary-api.js" --name "\${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
+  pm2 save --force >/dev/null 2>&1 || true
+fi
+
+sleep 3
+if ! curl -fsS --connect-timeout 2 --max-time 6 "http://127.0.0.1:\${PORT}/health" >/dev/null 2>&1; then
+  log_msg "summary api masih gagal setelah restart"
+  exit 1
+fi
+
+log_msg "summary api pulih"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-summary-watchdog
+
+  cat > /etc/systemd/system/sc-1forcr-summary-watchdog.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Summary API watchdog
+After=network-online.target pm2-root.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-summary-watchdog
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-summary-watchdog.timer <<'EOF'
+[Unit]
+Description=Run SC 1FORCR Summary API watchdog
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=2m
+AccuracySec=30s
+Unit=sc-1forcr-summary-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
 }
 
 print_result() {
@@ -2655,5 +2803,6 @@ install_vnstat_if_missing
 write_files
 install_dependencies
 start_pm2_service
+install_summary_watchdog
 open_summary_firewall
 print_result

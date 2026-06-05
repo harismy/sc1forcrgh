@@ -62,11 +62,17 @@ set -euo pipefail
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
 #   DROPBEAR_VERSION=2019.78
+#   DROPBEAR_KEEPALIVE_SECONDS=30               (opsional, keepalive server SSH agar NAT HP tidak idle)
+#   DROPBEAR_IDLE_TIMEOUT_SECONDS=0             (opsional, 0=tidak putus karena idle)
 #   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
 #   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
+#   AUTO_REBOOT_ENABLE=0                         (opsional, 1=aktif reboot berkala; default nonaktif)
+#   AUTO_REBOOT_INTERVAL_MINUTES=1440            (opsional, interval auto reboot jika diaktifkan)
+#   AUTO_REBOOT_SCHEDULE_MODE=interval           (opsional: interval|daily_wib)
+#   AUTO_REBOOT_WIB_HOUR=3                       (opsional, jam reboot harian WIB 0-23)
 #   AUTO_PULL_UPDATE_ENABLE=1                    (opsional, 1=cek trigger update dari bot)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
@@ -91,6 +97,7 @@ set -euo pipefail
 #   XRAY_PATHS_VLESS=/vless                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
 #   SSHWS_READER_BUFFER_KB=16                    (opsional, buffer per koneksi SSHWS; 16 hemat RAM, max 64)
+#   SSHWS_TCP_KEEPALIVE_SECONDS=30               (opsional, keepalive TCP mux SSHWS)
 #   HAPROXY_TCPLOG_ENABLE=0                      (opsional, 1=log TCP detail; 0=hemat CPU/disk)
 #   HAPROXY_SERVICE_LIMIT_NOFILE=200000          (opsional, limit FD HAProxy untuk banyak koneksi)
 #   HAPROXY_MAXCONN=20000                        (opsional, batas koneksi HAProxy)
@@ -168,8 +175,10 @@ AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 AUTO_BACKUP_INTERVAL_MINUTES="${AUTO_BACKUP_INTERVAL_MINUTES:-1440}"
 AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}"
 AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}"
-AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-1}"
+AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-0}"
 AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}"
+AUTO_REBOOT_SCHEDULE_MODE="${AUTO_REBOOT_SCHEDULE_MODE:-interval}"
+AUTO_REBOOT_WIB_HOUR="${AUTO_REBOOT_WIB_HOUR:-3}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
@@ -205,6 +214,9 @@ XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
 SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-16}"
+SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}"
+DROPBEAR_KEEPALIVE_SECONDS="${DROPBEAR_KEEPALIVE_SECONDS:-30}"
+DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}"
 HAPROXY_TCPLOG_ENABLE="${HAPROXY_TCPLOG_ENABLE:-0}"
 HAPROXY_SERVICE_LIMIT_NOFILE="${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}"
 HAPROXY_MAXCONN="${HAPROXY_MAXCONN:-20000}"
@@ -998,10 +1010,20 @@ EOF
 
   chmod 644 /etc/sc-1forcr/banner.html /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
 }
+
+dropbear_runtime_args() {
+  local keepalive idle
+  keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
+  idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" | tr -cd '0-9')"
+  [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
+  [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
+  printf -- '-K %s -I %s' "${keepalive}" "${idle}"
+}
+
 setup_dropbear() {
   log "Setup Dropbear..."
 
-  local main_port alt_port banner_file
+  local main_port alt_port banner_file dropbear_args
   main_port="$(echo "${DROPBEAR_PORT}" | tr -cd '0-9')"
   alt_port="$(echo "${DROPBEAR_ALT_PORT}" | tr -cd '0-9')"
   [[ -z "${main_port}" ]] && main_port="109"
@@ -1012,6 +1034,7 @@ setup_dropbear() {
   if [[ ! -s "${banner_file}" ]]; then
     banner_file=""
   fi
+  dropbear_args="$(dropbear_runtime_args)"
 
   if [[ -n "${banner_file}" ]]; then
     if grep -qE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null; then
@@ -1024,7 +1047,7 @@ setup_dropbear() {
   cat > /etc/default/dropbear <<EOF
 NO_START=0
 DROPBEAR_PORT=${main_port}
-DROPBEAR_EXTRA_ARGS="-p ${alt_port}"
+DROPBEAR_EXTRA_ARGS="${dropbear_args} -p ${alt_port}"
 DROPBEAR_BANNER="${banner_file}"
 DROPBEAR_RECEIVE_WINDOW=65536
 EOF
@@ -1088,8 +1111,10 @@ Type=simple
 KillMode=control-group
 TimeoutStopSec=5
 Restart=on-failure
+LimitNOFILE=65536
+TasksMax=8192
 ExecStart=
-ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
+ExecStart=${dropbear_bin} -R -E -F ${dropbear_args} -p ${main_port} -p ${alt_port} -b ${banner_file}
 EOF
   else
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
@@ -1098,8 +1123,10 @@ Type=simple
 KillMode=control-group
 TimeoutStopSec=5
 Restart=on-failure
+LimitNOFILE=65536
+TasksMax=8192
 ExecStart=
-ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port}
+ExecStart=${dropbear_bin} -R -E -F ${dropbear_args} -p ${main_port} -p ${alt_port}
 EOF
   fi
 
@@ -1304,6 +1331,9 @@ apply_system_optimizations() {
 vm.swappiness=10
 vm.vfs_cache_pressure=50
 net.core.somaxconn=1024
+net.ipv4.tcp_keepalive_time=60
+net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_keepalive_probes=4
 net.ipv4.tcp_fin_timeout=15
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_max_syn_backlog=4096
@@ -2439,8 +2469,11 @@ SSH_WS_TARGET_PORT=${ssh_ws_target_port}
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 SSHWS_READER_BUFFER_KB=${SSHWS_READER_BUFFER_KB}
+SSHWS_TCP_KEEPALIVE_SECONDS=${SSHWS_TCP_KEEPALIVE_SECONDS}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
+DROPBEAR_KEEPALIVE_SECONDS=${DROPBEAR_KEEPALIVE_SECONDS}
+DROPBEAR_IDLE_TIMEOUT_SECONDS=${DROPBEAR_IDLE_TIMEOUT_SECONDS}
 UDPCUSTOM_CONFIG=/root/udp/config.json
 UDPCUSTOM_LISTEN_PORT=${UDPCUSTOM_LISTEN_PORT}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
@@ -2475,6 +2508,10 @@ TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
 BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
+AUTO_REBOOT_ENABLE=${AUTO_REBOOT_ENABLE}
+AUTO_REBOOT_INTERVAL_MINUTES=${AUTO_REBOOT_INTERVAL_MINUTES}
+AUTO_REBOOT_SCHEDULE_MODE=${AUTO_REBOOT_SCHEDULE_MODE}
+AUTO_REBOOT_WIB_HOUR=${AUTO_REBOOT_WIB_HOUR}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
@@ -2948,7 +2985,7 @@ app.post('/internal/zivpn-auth', async (req, res) => {
 function telegramNotify(text) {
   return new Promise((resolve) => {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !text) return resolve(false);
-    const payload = `chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&text=${encodeURIComponent(String(text))}`;
+    const payload = `chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&disable_web_page_preview=true&text=${encodeURIComponent(String(text))}`;
     const req = https.request({
       hostname: 'api.telegram.org',
       path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -2970,30 +3007,126 @@ function telegramNotify(text) {
     req.end();
   });
 }
+
+function notifyValue(value, fallback = '-') {
+  const s = sanitizeInfoText(value ?? '').trim();
+  return s || fallback;
+}
+
+function notifyPortValue(port, keys, fallback = '-') {
+  const p = port && typeof port === 'object' ? port : {};
+  const list = Array.isArray(keys) ? keys : [keys];
+  for (const key of list) {
+    const v = notifyValue(p[key], '');
+    if (v) return v;
+  }
+  return fallback;
+}
+
+function notifyOwnerValue(owner, camel, snake) {
+  const n = Number(owner?.[camel] ?? owner?.[snake] ?? 0);
+  return Number.isInteger(n) && n !== 0 ? String(n) : '-';
+}
+
+function accountEventLabel(action) {
+  const a = String(action || '').trim().toLowerCase();
+  if (a === 'delete' || a === 'deleted') return 'DELETE ACCOUNT';
+  if (a === 'trial') return 'CREATE TRIAL';
+  if (a === 'create' || a === 'created') return 'CREATE ACCOUNT';
+  return notifyValue(action).toUpperCase();
+}
+
+function serviceLabel(service) {
+  const s = String(service || '').trim().toLowerCase();
+  if (s === 'ssh' || s === 'zivpn' || s === 'ssh/zivpn') return 'SSH / ZIVPN';
+  if (s === 'vmess') return 'VMESS';
+  if (s === 'vless') return 'VLESS';
+  if (s === 'trojan') return 'TROJAN';
+  return notifyValue(service).toUpperCase();
+}
+
+function accountSecretInfo(service, account = {}) {
+  const s = String(service || '').trim().toLowerCase();
+  if (s === 'vmess' || s === 'vless') {
+    return { label: 'UUID', value: notifyValue(account.uuid || account.secret || account.id) };
+  }
+  return { label: 'Password', value: notifyValue(account.password || account.secret || account.uuid || account.id) };
+}
+
+function accountPathValue(account = {}) {
+  const path = account.path;
+  if (typeof path === 'string') return notifyValue(path);
+  if (path && typeof path === 'object') return notifyValue(path.ws || path.stn || path.upgrade || path.multi);
+  return notifyValue(account.ws_path || account.wsAltPath || account.ws_alt_path);
+}
+
+function accountQuotaValue(account = {}) {
+  const raw = account.quota ?? account.kuota ?? account.quota_gb;
+  if (raw === null || raw === undefined || raw === '') return '0 GB';
+  const n = Number(raw);
+  if (Number.isFinite(n)) return `${n} GB`;
+  return notifyValue(raw);
+}
+
+function formatAccountNotification(action, service, account = {}, owner = {}, location = {}) {
+  const username = notifyValue(account.username);
+  const kind = /^trial/i.test(username) || String(action || '').trim().toLowerCase() === 'trial' ? 'TRIAL' : 'REGULER';
+  const secret = accountSecretInfo(service, account);
+  const port = account.port || {};
+  const tlsPort = notifyPortValue(port, ['tls', 'any'], service === 'ssh/zivpn' ? '443' : '443');
+  const ntlsPort = notifyPortValue(port, ['none', 'ntls'], '80');
+  const grpcPort = notifyPortValue(port, ['grpc'], '-');
+  const udpgwPort = notifyPortValue(port, ['udpgw'], Array.isArray(account.udpgw?.ports) ? account.udpgw.ports.join(',') : '-');
+  const host = notifyValue(account.hostname || account.host || (String(service || '').includes('ssh') ? DOMAIN : XRAY_LINK_HOST || DOMAIN));
+  const city = notifyValue(account.city || location.city);
+  const isp = notifyValue(account.isp || location.isp);
+  const status = String(action || '').trim().toLowerCase() === 'delete'
+    ? 'DELETED'
+    : notifyValue(account.status || 'AKTIF').toUpperCase();
+  const ownerUser = notifyOwnerValue(owner, 'ownerTelegramId', 'owner_telegram_id');
+  const ownerChat = notifyOwnerValue(owner, 'ownerTelegramChatId', 'owner_telegram_chat_id');
+
+  return [
+    'SC 1FORCR NOTIF',
+    '==============================',
+    `Event    : ${accountEventLabel(action)}`,
+    `Layanan  : ${serviceLabel(service)}`,
+    `Kategori : ${kind}`,
+    `Status   : ${status}`,
+    '',
+    'VPS',
+    `Domain   : ${notifyValue(DOMAIN)}`,
+    `Host     : ${host}`,
+    `City     : ${city}`,
+    `ISP      : ${isp}`,
+    '',
+    'AKUN',
+    `Username : ${username}`,
+    `${secret.label.padEnd(8, ' ')} : ${secret.value}`,
+    `Expired  : ${notifyValue(account.exp || account.expired || account.date_exp || account.to)}`,
+    `Limit IP : ${notifyValue(account.limitip ?? account.iplimit ?? 0, '0')}`,
+    `Quota    : ${accountQuotaValue(account)}`,
+    '',
+    'KONEKSI',
+    `TLS      : ${tlsPort}`,
+    `NTLS     : ${ntlsPort}`,
+    `GRPC     : ${grpcPort}`,
+    `WS Path  : ${accountPathValue(account)}`,
+    `UDPGW    : ${udpgwPort}`,
+    '',
+    'OWNER',
+    `TG User  : ${ownerUser}`,
+    `TG Chat  : ${ownerChat}`,
+    `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`,
+    '=============================='
+  ].join('\n');
+}
+
 async function notifyAccountEvent(action, service, account, owner) {
   try {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    const userIdNum = Number(owner?.ownerTelegramId || 0);
-    const chatIdNum = Number(owner?.ownerTelegramChatId || 0);
-    const userId = Number.isInteger(userIdNum) && userIdNum !== 0 ? String(userIdNum) : '-';
-    const chatId = Number.isInteger(chatIdNum) && chatIdNum !== 0 ? String(chatIdNum) : '-';
-    const username = String(account?.username || '-');
-    const exp = String(account?.exp || account?.expired || account?.to || '-');
-    const limitip = String(account?.limitip ?? account?.iplimit ?? '0');
-    const kind = /^trial/i.test(username) || String(action || '').toLowerCase() === 'trial' ? 'TRIAL' : 'REGULER';
-    const msg =
-      `SC 1FORCR NOTIF\n` +
-      `Event    : ${String(action || '-').toUpperCase()}\n` +
-      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
-      `Domain   : ${DOMAIN || '-'}\n` +
-      `Username : ${username}\n` +
-      `Kategori : ${kind}\n` +
-      `Expired  : ${exp}\n` +
-      `Limit IP : ${limitip}\n` +
-      `TG User  : ${userId}\n` +
-      `TG Chat  : ${chatId}\n` +
-      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
-    await telegramNotify(msg);
+    const location = await getVpsLocationInfo().catch(() => ({ city: '-', isp: '-' }));
+    await telegramNotify(formatAccountNotification(action, service, account || {}, owner || {}, location));
   } catch (_) {}
 }
 async function notifyExpiredAccountEvent(service, account = {}, owner = {}) {
@@ -3850,7 +3983,7 @@ app.get('/vps/my-accounts', async (req, res) => {
   }
 });
 
-function sshPayload(username, password, expDate, limitip, location = null) {
+function sshPayload(username, password, expDate, limitip, location = null, quota = 0) {
   const udpgwPorts = SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'];
   return {
     hostname: DOMAIN,
@@ -3868,7 +4001,8 @@ function sshPayload(username, password, expDate, limitip, location = null) {
       ports: udpgwPorts,
       notes: 'Untuk VC/telp/game di SSH/SSHWS, set badvpn/udpgw ke salah satu port ini.'
     },
-    limitip: String(limitip || 0)
+    limitip: String(limitip || 0),
+    quota: String(quota || 0)
   };
 }
 
@@ -3925,7 +4059,7 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   syncZivpnUser(username, true);
   syncUdpcustomUser(password, true);
   const location = await getVpsLocationInfo();
-  const payload = sshPayload(username, password, expDate, limitip, location);
+  const payload = sshPayload(username, password, expDate, limitip, location, quota);
   await notifyAccountEvent(isTrial ? 'trial' : 'create', 'ssh/zivpn', payload, owner);
   return payload;
 }
@@ -4040,13 +4174,37 @@ app.post('/vps/passwordsshvpn-all', async (req, res) => {
 app.delete('/vps/deletesshvpn/:username', async (req, res) => {
   try {
     const username = String(req.params.username || '').trim();
-    const row = await get("SELECT password FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+    const row = await get(
+      "SELECT username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id FROM account_sshs WHERE LOWER(username)=LOWER(?)",
+      [username]
+    ).catch(() => null);
     deleteLinuxUser(username);
     await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
     syncZivpnUser(username, false);
     syncUdpcustomUser(String(row?.password || ''), false);
     syncUdpcustomUser(username, false);
-    return ok(res, { username });
+    if (row) {
+      const location = await getVpsLocationInfo().catch(() => ({ city: '-', isp: '-' }));
+      await notifyAccountEvent('delete', 'ssh/zivpn', {
+        hostname: DOMAIN,
+        username: row.username || username,
+        password: row.password || '-',
+        exp: row.date_exp || '-',
+        date_exp: row.date_exp || '-',
+        status: row.status || 'DELETED',
+        quota: row.quota ?? 0,
+        limitip: row.limitip ?? 0,
+        city: location.city,
+        isp: location.isp,
+        port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: (SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200']).join(',') },
+        ws_path: '/ssh-ws',
+        udpgw: { ports: SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'] }
+      }, {
+        ownerTelegramId: row.owner_telegram_id,
+        ownerTelegramChatId: row.owner_telegram_chat_id
+      });
+    }
+    return ok(res, { username: row?.username || username });
   } catch (e) {
     return fail(res, 500, e.message);
   }
@@ -4216,6 +4374,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
+      quota: String(quota || 0),
       link: addFrontBugLink('vmess', { tls: vmessLink(xrayHost, uuid, true, finalUsername), none: vmessLink(xrayHost, uuid, false, finalUsername), grpc: vmessGrpcLink(xrayHost, uuid, finalUsername), uptls: vmessLink(xrayHost, uuid, true, finalUsername), upntls: vmessLink(xrayHost, uuid, false, finalUsername) }, uuid, finalUsername),
       bug_profile: bugCfg ? { config: bugCfg, vmess: bugVmess } : null
     };
@@ -4236,6 +4395,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'vless-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
+      quota: String(quota || 0),
       link: addFrontBugLink('vless', { tls: vlessLink(xrayHost, uuid, true, finalUsername), none: vlessLink(xrayHost, uuid, false, finalUsername), grpc: vlessGrpcLink(xrayHost, uuid, finalUsername), uptls: vlessLink(xrayHost, uuid, true, finalUsername), upntls: vlessLink(xrayHost, uuid, false, finalUsername) }, uuid, finalUsername)
     };
   } else if (protocol === 'trojan') {
@@ -4255,6 +4415,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       serviceName: 'trojan-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
+      quota: String(quota || 0),
       link: addFrontBugLink('trojan', { tls: trojanLink(xrayHost, pass, true, finalUsername), none: trojanLink(xrayHost, pass, false, finalUsername), grpc: trojanGrpcLink(xrayHost, pass, finalUsername), uptls: trojanLink(xrayHost, pass, true, finalUsername), upntls: trojanLink(xrayHost, pass, false, finalUsername) }, pass, finalUsername)
     };
   }
@@ -4373,10 +4534,53 @@ async function renewXray(table, username, exp, req) {
     time: nowTime()
   };
 }
-async function delXray(table, username) {
+function xrayTableMeta(table) {
+  const t = String(table || '').trim();
+  if (t === 'account_vmesses') {
+    return { protocol: 'vmess', secretColumn: 'uuid', path: XRAY_PATH_VMESS, serviceName: 'vmess-grpc' };
+  }
+  if (t === 'account_vlesses') {
+    return { protocol: 'vless', secretColumn: 'uuid', path: XRAY_PATH_VLESS, serviceName: 'vless-grpc' };
+  }
+  if (t === 'account_trojans') {
+    return { protocol: 'trojan', secretColumn: 'password', path: XRAY_PATH_TROJAN, serviceName: 'trojan-grpc' };
+  }
+  return { protocol: 'xray', secretColumn: 'uuid', path: '/', serviceName: '-' };
+}
+async function delXray(table, username, req = null) {
+  const meta = xrayTableMeta(table);
+  const row = await get(
+    `SELECT username,${meta.secretColumn} AS secret,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id FROM ${table} WHERE LOWER(username)=LOWER(?)`,
+    [username]
+  ).catch(() => null);
   await run(`DELETE FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]);
   await renderAndReloadXray();
-  return { username };
+  if (row) {
+    const location = await getVpsLocationInfo().catch(() => ({ city: '-', isp: '-' }));
+    const owner = {
+      ownerTelegramId: row.owner_telegram_id ?? getOwnerInfo(req, req?.body || {}).ownerTelegramId,
+      ownerTelegramChatId: row.owner_telegram_chat_id ?? getOwnerInfo(req, req?.body || {}).ownerTelegramChatId
+    };
+    await notifyAccountEvent('delete', meta.protocol, {
+      hostname: XRAY_LINK_HOST || DOMAIN,
+      username: row.username || username,
+      uuid: meta.secretColumn === 'uuid' ? row.secret : undefined,
+      password: meta.secretColumn === 'password' ? row.secret : undefined,
+      secret: row.secret || '-',
+      exp: row.date_exp || '-',
+      date_exp: row.date_exp || '-',
+      status: row.status || 'DELETED',
+      quota: row.quota ?? 0,
+      limitip: row.limitip ?? 0,
+      iplimit: row.limitip ?? 0,
+      city: location.city,
+      isp: location.isp,
+      port: { tls: '443', none: '80', any: '443', grpc: '443' },
+      path: { ws: meta.path },
+      serviceName: meta.serviceName
+    }, owner);
+  }
+  return { username: row?.username || username };
 }
 async function setStatusXray(table, username, status) {
   await run(`UPDATE ${table} SET status=? WHERE LOWER(username)=LOWER(?)`, [status, username]);
@@ -4443,9 +4647,9 @@ app.patch('/vps/renewvless/:username/:exp', renewXrayHandler('account_vlesses'))
 app.post('/vps/renewtrojan/:username/:exp', renewXrayHandler('account_trojans'));
 app.patch('/vps/renewtrojan/:username/:exp', renewXrayHandler('account_trojans'));
 
-app.delete('/vps/deletevmess/:username', async (req, res) => ok(res, await delXray('account_vmesses', String(req.params.username || '').trim())));
-app.delete('/vps/deletevless/:username', async (req, res) => ok(res, await delXray('account_vlesses', String(req.params.username || '').trim())));
-app.delete('/vps/deletetrojan/:username', async (req, res) => ok(res, await delXray('account_trojans', String(req.params.username || '').trim())));
+app.delete('/vps/deletevmess/:username', async (req, res) => ok(res, await delXray('account_vmesses', String(req.params.username || '').trim(), req)));
+app.delete('/vps/deletevless/:username', async (req, res) => ok(res, await delXray('account_vlesses', String(req.params.username || '').trim(), req)));
+app.delete('/vps/deletetrojan/:username', async (req, res) => ok(res, await delXray('account_trojans', String(req.params.username || '').trim(), req)));
 
 app.patch('/vps/lockvmess/:username', async (req, res) => ok(res, await setStatusXray('account_vmesses', String(req.params.username || '').trim(), 'LOCK')));
 app.patch('/vps/lockvless/:username', async (req, res) => ok(res, await setStatusXray('account_vlesses', String(req.params.username || '').trim(), 'LOCK')));
@@ -4572,10 +4776,19 @@ const SSH_HOST = process.env.SSH_WS_TARGET_HOST || '127.0.0.1';
 const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 109);
 const HTTP_BACKEND_HOST = process.env.SSH_HTTP_BACKEND_HOST || '127.0.0.1';
 const HTTP_BACKEND_PORT = Number(process.env.SSH_HTTP_BACKEND_PORT || 80);
+const TCP_KEEPALIVE_SECONDS = Math.max(0, Math.min(3600, Number(process.env.SSHWS_TCP_KEEPALIVE_SECONDS || 30)));
 
 function firstLine(head) {
   const i = head.indexOf('\r\n');
   return (i >= 0 ? head.slice(0, i) : head).trim();
+}
+
+function tuneSocket(sock) {
+  try { sock.setNoDelay(true); } catch (_) {}
+  try {
+    if (TCP_KEEPALIVE_SECONDS > 0) sock.setKeepAlive(true, TCP_KEEPALIVE_SECONDS * 1000);
+  } catch (_) {}
+  try { sock.setTimeout(0); } catch (_) {}
 }
 
 const server = net.createServer((client) => {
@@ -4583,6 +4796,7 @@ const server = net.createServer((client) => {
   let closed = false;
   let stage = 'first';
   let stash = Buffer.alloc(0);
+  tuneSocket(client);
 
   const closeAll = () => {
     if (closed) return;
@@ -4593,6 +4807,7 @@ const server = net.createServer((client) => {
 
   const startPipeTo = (host, port, firstPayload, firstResponse) => {
     upstream = net.connect({ host, port }, () => {
+      tuneSocket(upstream);
       if (firstResponse) client.write(firstResponse);
       if (firstPayload && firstPayload.length > 0) upstream.write(firstPayload);
       client.pipe(upstream);
@@ -4601,7 +4816,7 @@ const server = net.createServer((client) => {
     });
     upstream.on('error', closeAll);
     upstream.on('close', closeAll);
-    upstream.setTimeout(0);
+    tuneSocket(upstream);
   };
 
   const startRawSshTunnel = (firstPayload) => {
@@ -4691,7 +4906,7 @@ const server = net.createServer((client) => {
 
   client.on('error', closeAll);
   client.on('close', closeAll);
-  client.setTimeout(0);
+  tuneSocket(client);
 });
 
 server.listen(PORT, '127.0.0.1', () => {
@@ -4806,6 +5021,27 @@ func writeAll(conn net.Conn, data []byte) error {
 	return nil
 }
 
+func tuneTCP(conn net.Conn, keepAliveSeconds int) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetNoDelay(true)
+	if keepAliveSeconds > 0 {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(time.Duration(keepAliveSeconds) * time.Second)
+	}
+}
+
+func dialTCP(host string, port int, keepAliveSeconds int) (net.Conn, error) {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	tuneTCP(conn, keepAliveSeconds)
+	return conn, nil
+}
+
 func tunnelBoth(a, b net.Conn) {
 	defer a.Close()
 	defer b.Close()
@@ -4883,14 +5119,15 @@ func stripBufferedHttpJunk(reader *bufio.Reader) {
 	}
 }
 
-func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, readerBufferSize int) {
+func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, readerBufferSize int, keepAliveSeconds int) {
 	defer client.Close()
+	tuneTCP(client, keepAliveSeconds)
 	reader := bufio.NewReaderSize(client, readerBufferSize)
 	afterConnect := false
 
 	peek, err := reader.Peek(4)
 	if err == nil && string(peek) == "SSH-" {
-		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+		sshUp, err := dialTCP(sshHost, sshPort, keepAliveSeconds)
 		if err != nil {
 			return
 		}
@@ -4918,7 +5155,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			}
 
 			if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
-				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+				sshUp, err := dialTCP(sshHost, sshPort, keepAliveSeconds)
 				if err != nil {
 					return
 				}
@@ -4936,7 +5173,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			// Mode longgar SSL-only: setelah CONNECT, request HTTP lanjutan
 			// tanpa header Upgrade yang rapi tetap diarahkan jadi tunnel SSH.
 			if afterConnect && looksHttpLike(first) {
-				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+				sshUp, err := dialTCP(sshHost, sshPort, keepAliveSeconds)
 				if err != nil {
 					return
 				}
@@ -4953,7 +5190,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 
 		// keep API and xray ws paths reachable through the same mux.
 		if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
-			httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
+			httpUp, err := dialTCP(httpHost, httpPort, keepAliveSeconds)
 			if err != nil {
 				return
 			}
@@ -4976,7 +5213,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			}
 
 		// fallback to raw SSH.
-		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+		sshUp, err := dialTCP(sshHost, sshPort, keepAliveSeconds)
 		if err != nil {
 			return
 		}
@@ -5008,13 +5245,20 @@ func main() {
 		readerBufferKB = 64
 	}
 	readerBufferSize := readerBufferKB * 1024
+	keepAliveSeconds := envInt("SSHWS_TCP_KEEPALIVE_SECONDS", 30)
+	if keepAliveSeconds < 0 {
+		keepAliveSeconds = 30
+	}
+	if keepAliveSeconds > 3600 {
+		keepAliveSeconds = 3600
+	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d, buffer=%dKB\n", port, sshHost, sshPort, httpHost, httpPort, readerBufferKB)
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d, buffer=%dKB, keepalive=%ds\n", port, sshHost, sshPort, httpHost, httpPort, readerBufferKB, keepAliveSeconds)
 
 	for {
 		conn, err := ln.Accept()
@@ -5022,7 +5266,7 @@ func main() {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handleConn(conn, sshHost, sshPort, httpHost, httpPort, readerBufferSize)
+		go handleConn(conn, sshHost, sshPort, httpHost, httpPort, readerBufferSize, keepAliveSeconds)
 	}
 }
 EOF
@@ -7036,7 +7280,8 @@ Restart=always
 RestartSec=2
 NoNewPrivileges=true
 PrivateTmp=true
-TasksMax=256
+TasksMax=4096
+LimitNOFILE=200000
 MemoryMax=512M
 
 [Install]
@@ -7152,6 +7397,8 @@ Restart=always
 RestartSec=1
 NoNewPrivileges=true
 PrivateTmp=true
+TasksMax=4096
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -7376,20 +7623,64 @@ EOF
 }
 
 setup_auto_reboot_timer() {
-  local reboot_interval_min
+  local reboot_interval_min reboot_mode reboot_wib_hour
   reboot_interval_min="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
   if [[ -z "${reboot_interval_min}" || "${reboot_interval_min}" -lt 30 || "${reboot_interval_min}" -gt 10080 ]]; then
     reboot_interval_min="1440"
   fi
   AUTO_REBOOT_INTERVAL_MINUTES="${reboot_interval_min}"
+  reboot_mode="$(echo "${AUTO_REBOOT_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${reboot_mode}" in
+    daily|daily_wib|wib) reboot_mode="daily_wib" ;;
+    *) reboot_mode="interval" ;;
+  esac
+  AUTO_REBOOT_SCHEDULE_MODE="${reboot_mode}"
+  reboot_wib_hour="$(echo "${AUTO_REBOOT_WIB_HOUR:-3}" | tr -cd '0-9')"
+  [[ -n "${reboot_wib_hour}" ]] && reboot_wib_hour="$((10#${reboot_wib_hour}))"
+  if [[ -z "${reboot_wib_hour}" || "${reboot_wib_hour}" -gt 23 ]]; then
+    reboot_wib_hour="3"
+  fi
+  AUTO_REBOOT_WIB_HOUR="${reboot_wib_hour}"
 
-  log "Setup auto reboot berkala tiap ${AUTO_REBOOT_INTERVAL_MINUTES} menit..."
+  if [[ "${AUTO_REBOOT_SCHEDULE_MODE}" == "daily_wib" ]]; then
+    log "Setup auto reboot harian jam $(printf '%02d' "${AUTO_REBOOT_WIB_HOUR}"):00 WIB..."
+  else
+    log "Setup auto reboot berkala tiap ${AUTO_REBOOT_INTERVAL_MINUTES} menit..."
+  fi
 
   cat > /usr/local/sbin/sc-1forcr-safe-reboot <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-logger -t sc-1forcr "Auto reboot timer triggered."
+ENV_FILE="/etc/sc-1forcr.env"
+[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+
+AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-0}"
+AUTO_REBOOT_SCHEDULE_MODE="$(echo "${AUTO_REBOOT_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+AUTO_REBOOT_WIB_HOUR="$(echo "${AUTO_REBOOT_WIB_HOUR:-3}" | tr -cd '0-9')"
+[[ -n "${AUTO_REBOOT_WIB_HOUR}" ]] && AUTO_REBOOT_WIB_HOUR="$((10#${AUTO_REBOOT_WIB_HOUR}))"
+[[ "${AUTO_REBOOT_ENABLE}" == "1" ]] || exit 0
+case "${AUTO_REBOOT_SCHEDULE_MODE}" in
+  daily|daily_wib|wib) AUTO_REBOOT_SCHEDULE_MODE="daily_wib" ;;
+  *) AUTO_REBOOT_SCHEDULE_MODE="interval" ;;
+esac
+[[ -z "${AUTO_REBOOT_WIB_HOUR}" || "${AUTO_REBOOT_WIB_HOUR}" -gt 23 ]] && AUTO_REBOOT_WIB_HOUR="3"
+
+if [[ "${AUTO_REBOOT_SCHEDULE_MODE}" == "daily_wib" ]]; then
+  wib_now="$(TZ=Asia/Jakarta date +%H)"
+  wib_date="$(TZ=Asia/Jakarta date +%F)"
+  target_hour="$(printf "%02d" "${AUTO_REBOOT_WIB_HOUR}")"
+  stamp_file="/var/lib/sc-1forcr/last-auto-reboot-date"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  [[ "${wib_now}" == "${target_hour}" ]] || exit 0
+  [[ "$(cat "${stamp_file}" 2>/dev/null || true)" == "${wib_date}" ]] && exit 0
+  uptime_sec="$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)"
+  # Cegah loop reboot kalau timer ikut terpanggil tepat setelah boot.
+  [[ "${uptime_sec}" -lt 600 ]] && exit 0
+  printf '%s\n' "${wib_date}" > "${stamp_file}" 2>/dev/null || true
+fi
+
+logger -t sc-1forcr "Auto reboot timer triggered (${AUTO_REBOOT_SCHEDULE_MODE})."
 sync
 sleep 2
 /usr/bin/systemctl --force reboot
@@ -7409,20 +7700,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
-[Unit]
-Description=Run SC 1FORCR auto reboot every ${AUTO_REBOOT_INTERVAL_MINUTES} minutes
-
-[Timer]
-OnBootSec=10m
-OnUnitActiveSec=${AUTO_REBOOT_INTERVAL_MINUTES}min
-Persistent=true
-AccuracySec=1min
-Unit=sc-1forcr-autoreboot.service
-
-[Install]
-WantedBy=timers.target
-EOF
+  write_auto_reboot_timer_unit "${AUTO_REBOOT_INTERVAL_MINUTES}" "${AUTO_REBOOT_SCHEDULE_MODE}" "${AUTO_REBOOT_WIB_HOUR}"
 
   systemctl daemon-reload
   if [[ "${AUTO_REBOOT_ENABLE}" == "1" ]]; then
@@ -7562,6 +7840,8 @@ SETTINGS_KEYS = [
     "AUTO_BACKUP_WIB_HOUR",
     "AUTO_REBOOT_ENABLE",
     "AUTO_REBOOT_INTERVAL_MINUTES",
+    "AUTO_REBOOT_SCHEDULE_MODE",
+    "AUTO_REBOOT_WIB_HOUR",
     "AUTO_PULL_UPDATE_ENABLE",
     "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
     "ONLINE_NOTIFY_ENABLE",
@@ -7574,6 +7854,8 @@ SETTINGS_KEYS = [
     "IPLIMIT_DEBUG",
     "DROPBEAR_LOG_MAX_LINES",
     "DROPBEAR_RECENT_LOG_MAX_LINES",
+    "DROPBEAR_KEEPALIVE_SECONDS",
+    "DROPBEAR_IDLE_TIMEOUT_SECONDS",
     "UDPHC_LOG_LINES_HISTORY",
     "UDPHC_LOG_LINES_REALTIME",
     "UDPHC_LOG_LINES_CHECKER",
@@ -7605,6 +7887,7 @@ SETTINGS_KEYS = [
     "ZIVPN_RELOAD_ON_AUTH_CHANGE",
     "ACTIVE_UDP_BACKEND",
     "SSH_HC_AUTH_LOOKBACK_HOURS",
+    "SSHWS_TCP_KEEPALIVE_SECONDS",
     "SSHWS_UDPGW_PORTS",
     "SSH_TUNNEL_SHELL",
     "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
@@ -7835,7 +8118,7 @@ SQL
 
 apply_restored_runtime_units() {
   local iplimit_interval backup_enable backup_mode backup_interval backup_wib_hour
-  local auto_reboot_enable auto_reboot_interval pull_enable pull_interval notify_enable notify_interval
+  local auto_reboot_enable auto_reboot_interval auto_reboot_mode auto_reboot_wib_hour pull_enable pull_interval notify_enable notify_interval
 
   if [[ -f /etc/sc-1forcr.env ]]; then
     # shellcheck disable=SC1091
@@ -7905,17 +8188,41 @@ EOF_TIMER
     fi
   fi
 
-  auto_reboot_enable="${AUTO_REBOOT_ENABLE:-1}"
+  auto_reboot_enable="${AUTO_REBOOT_ENABLE:-0}"
   [[ "${auto_reboot_enable}" != "0" ]] && auto_reboot_enable="1"
   auto_reboot_interval="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
   [[ -z "${auto_reboot_interval}" || "${auto_reboot_interval}" -lt 30 || "${auto_reboot_interval}" -gt 10080 ]] && auto_reboot_interval="1440"
+  auto_reboot_mode="$(echo "${AUTO_REBOOT_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${auto_reboot_mode}" in
+    daily|daily_wib|wib) auto_reboot_mode="daily_wib" ;;
+    *) auto_reboot_mode="interval" ;;
+  esac
+  auto_reboot_wib_hour="$(echo "${AUTO_REBOOT_WIB_HOUR:-3}" | tr -cd '0-9')"
+  [[ -n "${auto_reboot_wib_hour}" ]] && auto_reboot_wib_hour="$((10#${auto_reboot_wib_hour}))"
+  [[ -z "${auto_reboot_wib_hour}" || "${auto_reboot_wib_hour}" -gt 23 ]] && auto_reboot_wib_hour="3"
   if [[ -f /etc/systemd/system/sc-1forcr-autoreboot.service ]]; then
-    cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF_TIMER
+    if [[ "${auto_reboot_mode}" == "daily_wib" ]]; then
+      cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF_TIMER
+[Unit]
+Description=Run SC 1FORCR auto reboot daily at $(printf '%02d' "${auto_reboot_wib_hour}"):00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+    else
+      cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF_TIMER
 [Unit]
 Description=Run SC 1FORCR auto reboot every ${auto_reboot_interval} minutes
 
 [Timer]
-OnBootSec=10m
+OnBootSec=${auto_reboot_interval}min
 OnUnitActiveSec=${auto_reboot_interval}min
 Persistent=true
 AccuracySec=1min
@@ -7924,6 +8231,7 @@ Unit=sc-1forcr-autoreboot.service
 [Install]
 WantedBy=timers.target
 EOF_TIMER
+    fi
   fi
 
   pull_enable="${AUTO_PULL_UPDATE_ENABLE:-1}"
@@ -8166,6 +8474,8 @@ SETTINGS_KEYS = [
     "AUTO_BACKUP_WIB_HOUR",
     "AUTO_REBOOT_ENABLE",
     "AUTO_REBOOT_INTERVAL_MINUTES",
+    "AUTO_REBOOT_SCHEDULE_MODE",
+    "AUTO_REBOOT_WIB_HOUR",
     "AUTO_PULL_UPDATE_ENABLE",
     "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
     "ONLINE_NOTIFY_ENABLE",
@@ -8178,6 +8488,8 @@ SETTINGS_KEYS = [
     "IPLIMIT_DEBUG",
     "DROPBEAR_LOG_MAX_LINES",
     "DROPBEAR_RECENT_LOG_MAX_LINES",
+    "DROPBEAR_KEEPALIVE_SECONDS",
+    "DROPBEAR_IDLE_TIMEOUT_SECONDS",
     "UDPHC_LOG_LINES_HISTORY",
     "UDPHC_LOG_LINES_REALTIME",
     "UDPHC_LOG_LINES_CHECKER",
@@ -8209,6 +8521,7 @@ SETTINGS_KEYS = [
     "ZIVPN_RELOAD_ON_AUTH_CHANGE",
     "ACTIVE_UDP_BACKEND",
     "SSH_HC_AUTH_LOOKBACK_HOURS",
+    "SSHWS_TCP_KEEPALIVE_SECONDS",
     "SSHWS_UDPGW_PORTS",
     "SSH_TUNNEL_SHELL",
     "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
@@ -9416,6 +9729,8 @@ SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 DROPBEAR_VERSION=${DROPBEAR_VERSION}
+DROPBEAR_KEEPALIVE_SECONDS=${DROPBEAR_KEEPALIVE_SECONDS}
+DROPBEAR_IDLE_TIMEOUT_SECONDS=${DROPBEAR_IDLE_TIMEOUT_SECONDS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -9428,6 +9743,8 @@ AUTO_BACKUP_SCHEDULE_MODE=${AUTO_BACKUP_SCHEDULE_MODE}
 AUTO_BACKUP_WIB_HOUR=${AUTO_BACKUP_WIB_HOUR}
 AUTO_REBOOT_ENABLE=${AUTO_REBOOT_ENABLE}
 AUTO_REBOOT_INTERVAL_MINUTES=${AUTO_REBOOT_INTERVAL_MINUTES}
+AUTO_REBOOT_SCHEDULE_MODE=${AUTO_REBOOT_SCHEDULE_MODE}
+AUTO_REBOOT_WIB_HOUR=${AUTO_REBOOT_WIB_HOUR}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
@@ -9453,6 +9770,7 @@ XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_READER_BUFFER_KB=${SSHWS_READER_BUFFER_KB}
+SSHWS_TCP_KEEPALIVE_SECONDS=${SSHWS_TCP_KEEPALIVE_SECONDS}
 SSHWS_LOOP_GUARD_ENABLE=${SSHWS_LOOP_GUARD_ENABLE}
 SSHWS_LOOP_GUARD_PORTS=${SSHWS_LOOP_GUARD_PORTS}
 SSHWS_LOOP_GUARD_NEW_ABOVE=${SSHWS_LOOP_GUARD_NEW_ABOVE}
@@ -10223,13 +10541,42 @@ EOF
 }
 
 write_auto_reboot_timer_unit() {
-  local interval_min="$1"
+  local interval_min="${1:-1440}" mode="${2:-${AUTO_REBOOT_SCHEDULE_MODE:-interval}}" wib_hour="${3:-${AUTO_REBOOT_WIB_HOUR:-3}}"
+  interval_min="$(echo "${interval_min:-1440}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 30 || "${interval_min}" -gt 10080 ]] && interval_min="1440"
+  mode="$(echo "${mode:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${mode}" in
+    daily|daily_wib|wib) mode="daily_wib" ;;
+    *) mode="interval" ;;
+  esac
+  wib_hour="$(echo "${wib_hour:-3}" | tr -cd '0-9')"
+  [[ -n "${wib_hour}" ]] && wib_hour="$((10#${wib_hour}))"
+  [[ -z "${wib_hour}" || "${wib_hour}" -gt 23 ]] && wib_hour="3"
+
+  if [[ "${mode}" == "daily_wib" ]]; then
+    cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto reboot daily at $(printf '%02d' "${wib_hour}"):00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    return
+  fi
+
   cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
 [Unit]
 Description=Run SC 1FORCR auto reboot every ${interval_min} minutes
 
 [Timer]
-OnBootSec=10m
+OnBootSec=${interval_min}min
 OnUnitActiveSec=${interval_min}min
 Persistent=true
 AccuracySec=1min
@@ -10277,16 +10624,28 @@ EOF
 }
 
 set_auto_reboot_config_menu() {
-  local current_enable current_interval current_hours enable_in mode_in val_in interval_min
-  current_enable="${AUTO_REBOOT_ENABLE:-1}"
+  local current_enable current_interval current_hours current_mode current_wib_hour enable_in mode_in val_in interval_min wib_hour_in
+  current_enable="${AUTO_REBOOT_ENABLE:-0}"
   [[ "${current_enable}" != "0" ]] && current_enable="1"
   current_interval="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
   [[ -z "${current_interval}" || "${current_interval}" -lt 30 || "${current_interval}" -gt 10080 ]] && current_interval="1440"
   current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
+  current_mode="$(echo "${AUTO_REBOOT_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${current_mode}" in
+    daily|daily_wib|wib) current_mode="daily_wib" ;;
+    *) current_mode="interval" ;;
+  esac
+  current_wib_hour="$(echo "${AUTO_REBOOT_WIB_HOUR:-3}" | tr -cd '0-9')"
+  [[ -n "${current_wib_hour}" ]] && current_wib_hour="$((10#${current_wib_hour}))"
+  [[ -z "${current_wib_hour}" || "${current_wib_hour}" -gt 23 ]] && current_wib_hour="3"
 
   draw_menu_header "SETTING AUTO REBOOT"
   echo "Status saat ini   : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
-  echo "Interval saat ini : ${current_interval} menit (~${current_hours} jam)"
+  if [[ "${current_mode}" == "daily_wib" ]]; then
+    echo "Jadwal saat ini   : harian jam $(printf '%02d' "${current_wib_hour}"):00 WIB"
+  else
+    echo "Jadwal saat ini   : interval ${current_interval} menit (~${current_hours} jam)"
+  fi
   echo
   echo "Kosongkan input untuk mempertahankan nilai lama."
   echo "Ketik 'batal' untuk kembali."
@@ -10305,52 +10664,90 @@ set_auto_reboot_config_menu() {
       ;;
   esac
 
-  if ! prompt_input mode_in "Set interval dalam (m=menit, h=jam) [m]: "; then
+  if ! prompt_input mode_in "Mode jadwal (i=interval,d=harian WIB) [${current_mode}]: "; then
     return
   fi
   [[ "${mode_in,,}" == "batal" ]] && return
-  mode_in="${mode_in:-m}"
+  mode_in="${mode_in:-${current_mode}}"
   case "${mode_in,,}" in
-    m|menit) mode_in="m" ;;
-    h|jam) mode_in="h" ;;
+    i|interval) mode_in="interval" ;;
+    d|daily|daily_wib|wib|harian) mode_in="daily_wib" ;;
     *)
-      echo "Mode interval tidak valid. Gunakan m atau h."
+      echo "Mode jadwal tidak valid. Gunakan i atau d."
       return
       ;;
   esac
 
-  if [[ "${mode_in}" == "m" ]]; then
-    if ! prompt_input val_in "Interval reboot (menit, min 30) [${current_interval}]: "; then
+  interval_min="${current_interval}"
+  wib_hour_in="${current_wib_hour}"
+  if [[ "${mode_in}" == "daily_wib" ]]; then
+    if ! prompt_input wib_hour_in "Jam reboot WIB (0-23) [${current_wib_hour}]: "; then
       return
     fi
-    [[ "${val_in,,}" == "batal" ]] && return
-    val_in="${val_in:-${current_interval}}"
-    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 30 || "${val_in}" -gt 10080 ]]; then
-      echo "Interval menit harus angka 30-10080."
+    [[ "${wib_hour_in,,}" == "batal" ]] && return
+    wib_hour_in="${wib_hour_in:-${current_wib_hour}}"
+    if [[ ! "${wib_hour_in}" =~ ^[0-9]+$ ]]; then
+      echo "Jam WIB harus angka 0-23."
       return
     fi
-    interval_min="${val_in}"
+    wib_hour_in="$((10#${wib_hour_in}))"
+    if [[ "${wib_hour_in}" -gt 23 ]]; then
+      echo "Jam WIB harus angka 0-23."
+      return
+    fi
   else
-    if ! prompt_input val_in "Interval reboot (jam) [24]: "; then
+    if ! prompt_input val_in "Set interval dalam (m=menit, h=jam) [m]: "; then
       return
     fi
     [[ "${val_in,,}" == "batal" ]] && return
-    val_in="${val_in:-24}"
-    if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 168 ]]; then
-      echo "Interval jam harus angka 1-168."
-      return
+    val_in="${val_in:-m}"
+    case "${val_in,,}" in
+      m|menit) val_in="m" ;;
+      h|jam) val_in="h" ;;
+      *)
+        echo "Mode interval tidak valid. Gunakan m atau h."
+        return
+        ;;
+    esac
+
+    if [[ "${val_in}" == "m" ]]; then
+      if ! prompt_input interval_min "Interval reboot (menit, min 30) [${current_interval}]: "; then
+        return
+      fi
+      [[ "${interval_min,,}" == "batal" ]] && return
+      interval_min="${interval_min:-${current_interval}}"
+      if [[ ! "${interval_min}" =~ ^[0-9]+$ || "${interval_min}" -lt 30 || "${interval_min}" -gt 10080 ]]; then
+        echo "Interval menit harus angka 30-10080."
+        return
+      fi
+    else
+      if ! prompt_input val_in "Interval reboot (jam) [24]: "; then
+        return
+      fi
+      [[ "${val_in,,}" == "batal" ]] && return
+      val_in="${val_in:-24}"
+      if [[ ! "${val_in}" =~ ^[0-9]+$ || "${val_in}" -lt 1 || "${val_in}" -gt 168 ]]; then
+        echo "Interval jam harus angka 1-168."
+        return
+      fi
+      interval_min="$(( val_in * 60 ))"
     fi
-    interval_min="$(( val_in * 60 ))"
   fi
 
   AUTO_REBOOT_ENABLE="${enable_in}"
   AUTO_REBOOT_INTERVAL_MINUTES="${interval_min}"
+  AUTO_REBOOT_SCHEDULE_MODE="${mode_in}"
+  AUTO_REBOOT_WIB_HOUR="${wib_hour_in}"
   update_sc_env_var "AUTO_REBOOT_ENABLE" "${AUTO_REBOOT_ENABLE}"
   update_sc_env_var "AUTO_REBOOT_INTERVAL_MINUTES" "${AUTO_REBOOT_INTERVAL_MINUTES}"
+  update_sc_env_var "AUTO_REBOOT_SCHEDULE_MODE" "${AUTO_REBOOT_SCHEDULE_MODE}"
+  update_sc_env_var "AUTO_REBOOT_WIB_HOUR" "${AUTO_REBOOT_WIB_HOUR}"
   update_app_env_var "AUTO_REBOOT_ENABLE" "${AUTO_REBOOT_ENABLE}"
   update_app_env_var "AUTO_REBOOT_INTERVAL_MINUTES" "${AUTO_REBOOT_INTERVAL_MINUTES}"
+  update_app_env_var "AUTO_REBOOT_SCHEDULE_MODE" "${AUTO_REBOOT_SCHEDULE_MODE}"
+  update_app_env_var "AUTO_REBOOT_WIB_HOUR" "${AUTO_REBOOT_WIB_HOUR}"
 
-  write_auto_reboot_timer_unit "${AUTO_REBOOT_INTERVAL_MINUTES}"
+  write_auto_reboot_timer_unit "${AUTO_REBOOT_INTERVAL_MINUTES}" "${AUTO_REBOOT_SCHEDULE_MODE}" "${AUTO_REBOOT_WIB_HOUR}"
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [[ "${AUTO_REBOOT_ENABLE}" == "1" ]]; then
     systemctl enable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
@@ -10362,7 +10759,11 @@ set_auto_reboot_config_menu() {
   echo
   echo "Berhasil update auto reboot:"
   echo "- Status   : $([[ "${AUTO_REBOOT_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
-  echo "- Interval : ${AUTO_REBOOT_INTERVAL_MINUTES} menit"
+  if [[ "${AUTO_REBOOT_SCHEDULE_MODE}" == "daily_wib" ]]; then
+    echo "- Jadwal   : harian jam $(printf '%02d' "${AUTO_REBOOT_WIB_HOUR}"):00 WIB"
+  else
+    echo "- Jadwal   : interval ${AUTO_REBOOT_INTERVAL_MINUTES} menit"
+  fi
 }
 
 set_auto_pull_update_config_menu() {
@@ -10850,7 +11251,6 @@ create_account() {
     resp="$(api_call "POST" "$ep" "$payload")"
     print_created_account "$type" "${resp}"
     code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
-    [[ "${code}" == "200" ]] && telegram_notify_action "CREATE" "${type}" "${username}"
     return
   done
 }
@@ -10907,7 +11307,6 @@ create_trial_account() {
     code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
     if [[ "${code}" == "200" ]]; then
       schedule_trial_delete_1h "${type}" "${username}"
-      telegram_notify_action "TRIAL_1H" "${type}" "${username}"
     fi
     return
   done
@@ -11473,7 +11872,6 @@ delete_account() {
     return
   fi
   echo "Akun ${type^^} '${username}' berhasil dihapus."
-  telegram_notify_action "DELETE" "${type}" "${username}"
 }
 
 unlock_account() {
@@ -15280,6 +15678,8 @@ Time     : $(date '+%F %T')"
     DROPBEAR_PORT="${DROPBEAR_PORT}" \
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
     DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
+    DROPBEAR_KEEPALIVE_SECONDS="${DROPBEAR_KEEPALIVE_SECONDS:-30}" \
+    DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" \
     IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
     IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
     IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}" \
@@ -15293,6 +15693,7 @@ Time     : $(date '+%F %T')"
     XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
     XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN}" \
     SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-16}" \
+    SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}" \
     SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE}" \
     SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS}" \
     SSHWS_LOOP_GUARD_NEW_ABOVE="${SSHWS_LOOP_GUARD_NEW_ABOVE}" \
@@ -15314,8 +15715,10 @@ Time     : $(date '+%F %T')"
     AUTO_BACKUP_INTERVAL_MINUTES="${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" \
     AUTO_BACKUP_SCHEDULE_MODE="${AUTO_BACKUP_SCHEDULE_MODE:-interval}" \
     AUTO_BACKUP_WIB_HOUR="${AUTO_BACKUP_WIB_HOUR:-2}" \
-    AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-1}" \
+    AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-0}" \
     AUTO_REBOOT_INTERVAL_MINUTES="${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" \
+    AUTO_REBOOT_SCHEDULE_MODE="${AUTO_REBOOT_SCHEDULE_MODE:-interval}" \
+    AUTO_REBOOT_WIB_HOUR="${AUTO_REBOOT_WIB_HOUR:-3}" \
     AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}" \
     AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" \
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
@@ -15561,7 +15964,7 @@ EOF
 }
 
 apply_html_banner_config() {
-  local banner_file="$1" main_port alt_port dropbear_bin
+  local banner_file="$1" main_port alt_port dropbear_bin dropbear_args
 
   main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
@@ -15573,6 +15976,7 @@ apply_html_banner_config() {
   # Prioritaskan binary custom build, fallback ke dropbear bawaan sistem.
   dropbear_bin="$(ls -1 /usr/local/sbin/dropbear-* 2>/dev/null | head -n1 || true)"
   [[ -z "${dropbear_bin}" || ! -x "${dropbear_bin}" ]] && dropbear_bin="/usr/sbin/dropbear"
+  dropbear_args="$(dropbear_runtime_args)"
 
   if [[ -n "${banner_file}" && -f "${banner_file}" ]]; then
     if grep -qE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null; then
@@ -15591,8 +15995,13 @@ apply_html_banner_config() {
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
 Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
+LimitNOFILE=65536
+TasksMax=8192
 ExecStart=
-ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
+ExecStart=${dropbear_bin} -R -E -F ${dropbear_args} -p ${main_port} -p ${alt_port} -b ${banner_file}
 EOF
     echo "Banner aktif: ${banner_file}"
   else
@@ -15608,8 +16017,13 @@ EOF
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
 Type=simple
+KillMode=control-group
+TimeoutStopSec=5
+Restart=on-failure
+LimitNOFILE=65536
+TasksMax=8192
 ExecStart=
-ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port}
+ExecStart=${dropbear_bin} -R -E -F ${dropbear_args} -p ${main_port} -p ${alt_port}
 EOF
     echo "Banner dinonaktifkan."
   fi
@@ -15630,7 +16044,7 @@ resolve_dropbear_release_from_menu() {
 }
 
 apply_dropbear_version_with_lock() {
-  local major="$1" ver src_dir archive_url archive_path build_dir custom_bin main_port alt_port banner_file
+  local major="$1" ver src_dir archive_url archive_path build_dir custom_bin main_port alt_port banner_file dropbear_args
   ver="$(resolve_dropbear_release_from_menu "${major}")"
   if [[ -z "${ver}" ]]; then
     echo "Versi tidak didukung. Pilih: 2018, 2019, 2020, 2022."
@@ -15651,6 +16065,7 @@ apply_dropbear_version_with_lock() {
   custom_bin="/usr/local/sbin/dropbear-${ver}"
   banner_file="/etc/sc-1forcr/banner.html"
   [[ -s "${banner_file}" ]] || banner_file=""
+  dropbear_args="$(dropbear_runtime_args)"
 
   mkdir -p "${src_dir}"
   rm -rf "${build_dir}"
@@ -15685,7 +16100,7 @@ apply_dropbear_version_with_lock() {
   cat > /etc/default/dropbear <<EOF
 NO_START=0
 DROPBEAR_PORT=${main_port}
-DROPBEAR_EXTRA_ARGS="-p ${alt_port}"
+DROPBEAR_EXTRA_ARGS="${dropbear_args} -p ${alt_port}"
 DROPBEAR_BANNER="${banner_file}"
 DROPBEAR_RECEIVE_WINDOW=65536
 EOF
@@ -15698,8 +16113,10 @@ Type=simple
 KillMode=control-group
 TimeoutStopSec=5
 Restart=on-failure
+LimitNOFILE=65536
+TasksMax=8192
 ExecStart=
-ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
+ExecStart=${custom_bin} -R -E -F ${dropbear_args} -p ${main_port} -p ${alt_port} -b ${banner_file}
 EOF
   else
     cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
@@ -15708,8 +16125,10 @@ Type=simple
 KillMode=control-group
 TimeoutStopSec=5
 Restart=on-failure
+LimitNOFILE=65536
+TasksMax=8192
 ExecStart=
-ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port}
+ExecStart=${custom_bin} -R -E -F ${dropbear_args} -p ${main_port} -p ${alt_port}
 EOF
   fi
 
@@ -16503,13 +16922,13 @@ persist_pending_install_env() {
     UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
     SSHWS_UDPGW_PORTS SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
     SSH_TUNNEL_BLOCK_OUTBOUND_PORTS ACTIVE_UDP_BACKEND
-    DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION
+    DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION DROPBEAR_KEEPALIVE_SECONDS DROPBEAR_IDLE_TIMEOUT_SECONDS
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
-    AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
+    AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES
     IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
-    SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
+    SSHWS_TCP_KEEPALIVE_SECONDS SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER

@@ -3082,8 +3082,25 @@ function accountXrayLinkLines(action, service, account = {}) {
   const serviceText = String(service || '').trim().toLowerCase();
   if (!['vmess', 'vless', 'trojan'].includes(serviceText)) return [];
   const links = account.link && typeof account.link === 'object' ? account.link : {};
-  const tls = accountLinkValue(links.tls || links.uptls);
-  const ntls = accountLinkValue(links.none || links.ntls || links.upntls);
+  let tls = accountLinkValue(links.tls || links.uptls);
+  let ntls = accountLinkValue(links.none || links.ntls || links.upntls);
+  if (!tls || !ntls) {
+    const host = String(account.hostname || account.host || XRAY_LINK_HOST || DOMAIN || '').trim();
+    const username = String(account.username || '').trim();
+    const secret = String(account.uuid || account.password || account.secret || account.id || '').trim();
+    if (host && secret) {
+      if (serviceText === 'vmess') {
+        if (!tls) tls = accountLinkValue(vmessLink(host, secret, true, username));
+        if (!ntls) ntls = accountLinkValue(vmessLink(host, secret, false, username));
+      } else if (serviceText === 'vless') {
+        if (!tls) tls = accountLinkValue(vlessLink(host, secret, true, username));
+        if (!ntls) ntls = accountLinkValue(vlessLink(host, secret, false, username));
+      } else if (serviceText === 'trojan') {
+        if (!tls) tls = accountLinkValue(trojanLink(host, secret, true, username));
+        if (!ntls) ntls = accountLinkValue(trojanLink(host, secret, false, username));
+      }
+    }
+  }
   if (!tls && !ntls) return [];
   return [
     '',

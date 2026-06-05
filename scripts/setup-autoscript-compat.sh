@@ -55,7 +55,7 @@ set -euo pipefail
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
-#   SSH_TUNNEL_SHELL=/usr/sbin/nologin         (akun SSH/ZIVPN tunnel-only, tanpa shell VPS)
+#   SSH_TUNNEL_SHELL=/usr/local/sbin/sc-1forcr-tunnel-shell (tunnel-only, tahan sesi HTTP Custom tanpa shell VPS)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1            (blok akun tunnel konek keluar ke port SSH)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=22,2222     (port keluar yang diblok untuk UID non-root)
 #   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
@@ -158,7 +158,7 @@ UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
 SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
-SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
+SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}"
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}"
 ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
@@ -1136,10 +1136,38 @@ EOF
   systemctl restart dropbear >/dev/null 2>&1 || true
 }
 
+install_tunnel_hold_shell() {
+  local shell="/usr/local/sbin/sc-1forcr-tunnel-shell"
+  mkdir -p "$(dirname "${shell}")" >/dev/null 2>&1 || true
+  cat > "${shell}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+trap 'exit 0' HUP INT TERM
+
+# Beberapa client tunnel HTTP Custom membuka session shell selain port-forward.
+# Shell ini tidak menjalankan command user, hanya menjaga session tetap hidup
+# supaya port-forward tidak EOF setelah banner/login.
+while true; do
+  sleep 86400 &
+  wait "$!" || true
+done
+EOF
+  chmod 755 "${shell}" >/dev/null 2>&1 || true
+}
+
 resolve_tunnel_shell() {
-  local shell="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
+  local shell="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
+  if [[ "${shell}" == "/usr/local/sbin/sc-1forcr-tunnel-shell" ]]; then
+    install_tunnel_hold_shell
+  fi
   if [[ -x "${shell}" ]]; then
     printf '%s' "${shell}"
+    return
+  fi
+  install_tunnel_hold_shell
+  if [[ -x /usr/local/sbin/sc-1forcr-tunnel-shell ]]; then
+    printf '%s' "/usr/local/sbin/sc-1forcr-tunnel-shell"
     return
   fi
   if [[ -x /usr/sbin/nologin ]]; then
@@ -2616,7 +2644,8 @@ const ZIVPN_LIVE_TTL_SECONDS_RAW = Number(process.env.ZIVPN_LIVE_TTL_SECONDS || 
 const ZIVPN_LIVE_TTL_SECONDS = Number.isFinite(ZIVPN_LIVE_TTL_SECONDS_RAW) && ZIVPN_LIVE_TTL_SECONDS_RAW >= 20
   ? Math.min(Math.floor(ZIVPN_LIVE_TTL_SECONDS_RAW), 1800)
   : 90;
-const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
+const DEFAULT_TUNNEL_SHELL = '/usr/local/sbin/sc-1forcr-tunnel-shell';
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || DEFAULT_TUNNEL_SHELL).trim() || DEFAULT_TUNNEL_SHELL;
 const ZIVPN_RELOAD_ON_AUTH_CHANGE = String(process.env.ZIVPN_RELOAD_ON_AUTH_CHANGE || '0').trim() === '1';
 const ZIVPN_AUTH_APPLY_MODE_RAW = String(process.env.ZIVPN_AUTH_APPLY_MODE || '').trim().toLowerCase();
 const ZIVPN_AUTH_APPLY_MODE = ZIVPN_AUTH_APPLY_MODE_RAW || (ZIVPN_RELOAD_ON_AUTH_CHANGE ? 'restart' : 'reload-restart');
@@ -3371,16 +3400,34 @@ function safeExec(cmd, args, input) {
   }
 }
 
+function ensureTunnelHoldShell() {
+  try {
+    fs.mkdirSync('/usr/local/sbin', { recursive: true });
+    const content = `#!/usr/bin/env bash
+set -euo pipefail
+trap 'exit 0' HUP INT TERM
+while true; do
+  sleep 86400 &
+  wait "$!" || true
+done
+`;
+    fs.writeFileSync(DEFAULT_TUNNEL_SHELL, content, { mode: 0o755 });
+    fs.chmodSync(DEFAULT_TUNNEL_SHELL, 0o755);
+  } catch (_) {}
+}
+
 function resolveTunnelShell() {
-  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+  if (SSH_TUNNEL_SHELL === DEFAULT_TUNNEL_SHELL) ensureTunnelHoldShell();
+  const choices = [SSH_TUNNEL_SHELL, DEFAULT_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
     .map((v) => String(v || '').trim())
     .filter(Boolean);
   for (const shell of choices) {
+    if (shell === DEFAULT_TUNNEL_SHELL) ensureTunnelHoldShell();
     try {
       if (fs.existsSync(shell)) return shell;
     } catch (_) {}
   }
-  return '/usr/sbin/nologin';
+  return DEFAULT_TUNNEL_SHELL;
 }
 
 function ensureTunnelShellAllowed() {
@@ -5348,7 +5395,8 @@ const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
-const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
+const DEFAULT_TUNNEL_SHELL = '/usr/local/sbin/sc-1forcr-tunnel-shell';
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || DEFAULT_TUNNEL_SHELL).trim() || DEFAULT_TUNNEL_SHELL;
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const BOT_ACCOUNT_EVENT_WEBHOOK_URL = String(process.env.BOT_ACCOUNT_EVENT_WEBHOOK_URL || '').trim();
@@ -5643,16 +5691,34 @@ function safeExec(cmd, args, input) {
   }
 }
 
+function ensureTunnelHoldShell() {
+  try {
+    fs.mkdirSync('/usr/local/sbin', { recursive: true });
+    const content = `#!/usr/bin/env bash
+set -euo pipefail
+trap 'exit 0' HUP INT TERM
+while true; do
+  sleep 86400 &
+  wait "$!" || true
+done
+`;
+    fs.writeFileSync(DEFAULT_TUNNEL_SHELL, content, { mode: 0o755 });
+    fs.chmodSync(DEFAULT_TUNNEL_SHELL, 0o755);
+  } catch (_) {}
+}
+
 function resolveTunnelShell() {
-  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+  if (SSH_TUNNEL_SHELL === DEFAULT_TUNNEL_SHELL) ensureTunnelHoldShell();
+  const choices = [SSH_TUNNEL_SHELL, DEFAULT_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
     .map((v) => String(v || '').trim())
     .filter(Boolean);
   for (const shell of choices) {
+    if (shell === DEFAULT_TUNNEL_SHELL) ensureTunnelHoldShell();
     try {
       if (fs.existsSync(shell)) return shell;
     } catch (_) {}
   }
-  return '/usr/sbin/nologin';
+  return DEFAULT_TUNNEL_SHELL;
 }
 
 function ensureTunnelShellAllowed() {

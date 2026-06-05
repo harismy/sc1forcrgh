@@ -6,7 +6,7 @@ APP_NAME="${APP_NAME:-tunnel-summary}"
 SUMMARY_PORT="${SUMMARY_PORT:-8789}"
 SUMMARY_HOST="${SUMMARY_HOST:-0.0.0.0}"
 POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
-SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
+SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root (or use sudo)."
@@ -71,7 +71,8 @@ app.use(express.json({ limit: '2mb' }));
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
 const HOST = String(process.env.SUMMARY_HOST || '0.0.0.0').trim() || '0.0.0.0';
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
-const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || '/usr/sbin/nologin').trim() || '/usr/sbin/nologin';
+const DEFAULT_TUNNEL_SHELL = '/usr/local/sbin/sc-1forcr-tunnel-shell';
+const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || DEFAULT_TUNNEL_SHELL).trim() || DEFAULT_TUNNEL_SHELL;
 const USE_DB_AUTH = String(process.env.USE_DB_AUTH || '1') !== '0';
 const STATIC_TOKEN = (process.env.SYNC_TOKEN || '').trim();
 const FULL_RESTORE_SCRIPT = String(process.env.FULL_RESTORE_SCRIPT || '/usr/local/sbin/sc-1forcr-restore-backup').trim();
@@ -323,16 +324,34 @@ function isValidUnixUsername(username) {
   return /^[a-z0-9][a-z0-9_-]{2,31}$/.test(String(username || '').trim());
 }
 
+function ensureTunnelHoldShell() {
+  try {
+    fs.mkdirSync('/usr/local/sbin', { recursive: true });
+    const content = `#!/usr/bin/env bash
+set -euo pipefail
+trap 'exit 0' HUP INT TERM
+while true; do
+  sleep 86400 &
+  wait "$!" || true
+done
+`;
+    fs.writeFileSync(DEFAULT_TUNNEL_SHELL, content, { mode: 0o755 });
+    fs.chmodSync(DEFAULT_TUNNEL_SHELL, 0o755);
+  } catch (_) {}
+}
+
 function resolveTunnelShell() {
-  const choices = [SSH_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
+  if (SSH_TUNNEL_SHELL === DEFAULT_TUNNEL_SHELL) ensureTunnelHoldShell();
+  const choices = [SSH_TUNNEL_SHELL, DEFAULT_TUNNEL_SHELL, '/usr/sbin/nologin', '/sbin/nologin', '/bin/false']
     .map((v) => String(v || '').trim())
     .filter(Boolean);
   for (const shell of choices) {
+    if (shell === DEFAULT_TUNNEL_SHELL) ensureTunnelHoldShell();
     try {
       if (fs.existsSync(shell)) return shell;
     } catch (_) {}
   }
-  return '/usr/sbin/nologin';
+  return DEFAULT_TUNNEL_SHELL;
 }
 
 function ensureTunnelShellAllowed() {

@@ -3068,6 +3068,31 @@ function accountQuotaValue(account = {}) {
   return notifyValue(raw);
 }
 
+function accountLinkValue(value) {
+  const s = String(value || '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return s ? s.slice(0, 1800) : '';
+}
+
+function accountXrayLinkLines(action, service, account = {}) {
+  const actionText = String(action || '').trim().toLowerCase();
+  if (!['create', 'created', 'trial'].includes(actionText)) return [];
+  const serviceText = String(service || '').trim().toLowerCase();
+  if (!['vmess', 'vless', 'trojan'].includes(serviceText)) return [];
+  const links = account.link && typeof account.link === 'object' ? account.link : {};
+  const tls = accountLinkValue(links.tls || links.uptls);
+  const ntls = accountLinkValue(links.none || links.ntls || links.upntls);
+  if (!tls && !ntls) return [];
+  return [
+    '',
+    'LINK XRAY',
+    `Link TLS : ${tls || '-'}`,
+    `Link NTLS: ${ntls || '-'}`
+  ];
+}
+
 function formatAccountNotification(action, service, account = {}, owner = {}, location = {}) {
   const username = notifyValue(account.username);
   const kind = /^trial/i.test(username) || String(action || '').trim().toLowerCase() === 'trial' ? 'TRIAL' : 'REGULER';
@@ -3113,6 +3138,7 @@ function formatAccountNotification(action, service, account = {}, owner = {}, lo
     `GRPC     : ${grpcPort}`,
     `WS Path  : ${accountPathValue(account)}`,
     `UDPGW    : ${udpgwPort}`,
+    ...accountXrayLinkLines(action, service, account),
     '',
     'OWNER',
     `TG User  : ${ownerUser}`,

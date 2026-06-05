@@ -7622,6 +7622,53 @@ EOF
   systemctl enable --now sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 }
 
+write_auto_reboot_timer_unit() {
+  local interval_min="${1:-1440}" mode="${2:-${AUTO_REBOOT_SCHEDULE_MODE:-interval}}" wib_hour="${3:-${AUTO_REBOOT_WIB_HOUR:-3}}"
+  interval_min="$(echo "${interval_min:-1440}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 30 || "${interval_min}" -gt 10080 ]] && interval_min="1440"
+  mode="$(echo "${mode:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${mode}" in
+    daily|daily_wib|wib) mode="daily_wib" ;;
+    *) mode="interval" ;;
+  esac
+  wib_hour="$(echo "${wib_hour:-3}" | tr -cd '0-9')"
+  [[ -n "${wib_hour}" ]] && wib_hour="$((10#${wib_hour}))"
+  [[ -z "${wib_hour}" || "${wib_hour}" -gt 23 ]] && wib_hour="3"
+
+  if [[ "${mode}" == "daily_wib" ]]; then
+    cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto reboot daily at $(printf '%02d' "${wib_hour}"):00 WIB
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    return
+  fi
+
+  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR auto reboot every ${interval_min} minutes
+
+[Timer]
+OnBootSec=${interval_min}min
+OnUnitActiveSec=${interval_min}min
+Persistent=true
+AccuracySec=1min
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 setup_auto_reboot_timer() {
   local reboot_interval_min reboot_mode reboot_wib_hour
   reboot_interval_min="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"

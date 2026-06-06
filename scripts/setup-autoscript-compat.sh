@@ -83,6 +83,7 @@ set -euo pipefail
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=3             (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
 #   IPLIMIT_AUTO_LOCK_ENABLE=1                   (opsional, 1=auto lock aktif, 0=monitor only)
+#   QUOTA_LOCK_ENABLE=1                          (opsional, 1=lock akun saat quota habis)
 #   IPLIMIT_AUTO_TUNE=1                          (opsional, 1=otomatis tuning berbasis RAM/vCPU)
 #   IPLIMIT_DEBUG=0                              (opsional, 0=hemat log, 1=debug detail)
 #   DROPBEAR_LOG_MAX_LINES=auto                  (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
@@ -189,6 +190,7 @@ AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
+QUOTA_LOCK_ENABLE="${QUOTA_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
 IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-0}"
 SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE:-0}"
@@ -1308,6 +1310,24 @@ CREATE TABLE IF NOT EXISTS account_trial_flags (
   account_type TEXT NOT NULL,
   username TEXT NOT NULL,
   created_at INTEGER DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (account_type, username)
+);
+
+CREATE TABLE IF NOT EXISTS account_quota_usage (
+  account_type TEXT NOT NULL,
+  username TEXT NOT NULL,
+  used_bytes INTEGER DEFAULT 0,
+  last_counter_bytes INTEGER DEFAULT 0,
+  updated_at INTEGER DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (account_type, username)
+);
+
+CREATE TABLE IF NOT EXISTS account_quota_locks (
+  account_type TEXT NOT NULL,
+  username TEXT NOT NULL,
+  quota_bytes INTEGER DEFAULT 0,
+  used_bytes INTEGER DEFAULT 0,
+  locked_at INTEGER DEFAULT (strftime('%s','now')),
   PRIMARY KEY (account_type, username)
 );
 
@@ -2511,6 +2531,7 @@ ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
+QUOTA_LOCK_ENABLE=${QUOTA_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
 DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
@@ -2666,6 +2687,7 @@ const SSHWS_UDPGW_PORTS = String(process.env.SSHWS_UDPGW_PORTS || '7300,7200')
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const LICENSE_ENFORCE = String(process.env.LICENSE_ENFORCE || '1').trim().toLowerCase();
+const QUOTA_BYTES_PER_GB = 1024 * 1024 * 1024;
 
 const db = new sqlite3.Database(DB_PATH);
 let licenseApiStopped = false;
@@ -4094,6 +4116,13 @@ async function renderAndReloadXray() {
     },
     inbounds: [
       {
+        tag: 'api',
+        listen: '127.0.0.1',
+        port: 10085,
+        protocol: 'dokodemo-door',
+        settings: { address: '127.0.0.1' }
+      },
+      {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
         streamSettings: { network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } }
@@ -4124,7 +4153,21 @@ async function renderAndReloadXray() {
         streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
-    outbounds: [{ protocol: 'freedom', tag: 'direct' }]
+    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
+    stats: {},
+    api: { tag: 'api', services: ['StatsService'] },
+    policy: {
+      levels: { '0': { statsUserUplink: true, statsUserDownlink: true } },
+      system: {
+        statsInboundUplink: true,
+        statsInboundDownlink: true,
+        statsOutboundUplink: true,
+        statsOutboundDownlink: true
+      }
+    },
+    routing: {
+      rules: [{ type: 'field', inboundTag: ['api'], outboundTag: 'api' }]
+    }
   };
   writeXrayConfigAndReload(cfg);
 }
@@ -4386,6 +4429,54 @@ async function generateTrialUsername(table, prefix = 'trial') {
   return `${cleanPrefix}${Date.now().toString().slice(-6)}`;
 }
 
+function quotaToBytesApi(quotaGb) {
+  const n = Number(quotaGb || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n * QUOTA_BYTES_PER_GB);
+}
+
+async function ensureQuotaRuntimeTables() {
+  await run(`CREATE TABLE IF NOT EXISTS account_quota_usage (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    used_bytes INTEGER DEFAULT 0,
+    last_counter_bytes INTEGER DEFAULT 0,
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username)
+  )`).catch(() => {});
+  await run(`CREATE TABLE IF NOT EXISTS account_quota_locks (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    quota_bytes INTEGER DEFAULT 0,
+    used_bytes INTEGER DEFAULT 0,
+    locked_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username)
+  )`).catch(() => {});
+}
+
+async function getQuotaRuntimeUsage(type, username) {
+  await ensureQuotaRuntimeTables();
+  const row = await get(
+    "SELECT used_bytes FROM account_quota_usage WHERE account_type=? AND LOWER(username)=LOWER(?)",
+    [type, username]
+  ).catch(() => null);
+  return Number(row?.used_bytes || 0);
+}
+
+async function canUnlockQuotaAccount(type, username, quotaGb) {
+  await ensureQuotaRuntimeTables();
+  const lock = await get("SELECT used_bytes FROM account_quota_locks WHERE account_type=? AND LOWER(username)=LOWER(?)", [type, username]).catch(() => null);
+  if (!lock) return { ok: true, usedBytes: await getQuotaRuntimeUsage(type, username), quotaBytes: quotaToBytesApi(quotaGb) };
+  const usedBytes = Math.max(Number(lock?.used_bytes || 0), await getQuotaRuntimeUsage(type, username));
+  const quotaBytes = quotaToBytesApi(quotaGb);
+  return { ok: quotaBytes === 0 || quotaBytes > usedBytes, usedBytes, quotaBytes };
+}
+
+async function clearQuotaLock(type, username) {
+  await ensureQuotaRuntimeTables();
+  await run("DELETE FROM account_quota_locks WHERE account_type=? AND LOWER(username)=LOWER(?)", [type, username]).catch(() => {});
+}
+
 function randomAlnum(length = 8) {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let out = '';
@@ -4618,20 +4709,29 @@ async function renewSsh(req, res) {
     const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
     const currentLimitIp = Number(row?.limitip || 0);
     const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : currentLimitIp;
+    const quotaUnlock = await canUnlockQuotaAccount('ssh', username, nextQuota);
+    const nextStatus = quotaUnlock.ok ? 'AKTIF' : 'LOCK_QUOTA';
     ensureLinuxUser(username, pass, linuxExpDate);
     await run(
-      "UPDATE account_sshs SET password=?, date_exp=?, quota=?, limitip=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)",
-      [pass, expDate, nextQuota, nextLimitIp, username]
+      "UPDATE account_sshs SET password=?, date_exp=?, quota=?, limitip=?, status=? WHERE LOWER(username)=LOWER(?)",
+      [pass, expDate, nextQuota, nextLimitIp, nextStatus, username]
     );
-    syncZivpnUser(username, true);
+    if (quotaUnlock.ok) {
+      await clearQuotaLock('ssh', username);
+      syncZivpnUser(username, true);
+    } else {
+      lockLinuxUser(username);
+    }
     if (oldPass && oldPass !== pass) syncUdpcustomUser(oldPass, false);
-    syncUdpcustomUser(pass, true);
+    if (quotaUnlock.ok) syncUdpcustomUser(pass, true);
     return ok(res, {
       username,
       from: fromExp,
       to: expDate,
       exp: expDate,
       quota: String(nextQuota),
+      quota_used_bytes: String(quotaUnlock.usedBytes || 0),
+      quota_unlocked: quotaUnlock.ok,
       limitip: String(nextLimitIp),
       created: false,
       time: nowTime()
@@ -4660,6 +4760,12 @@ async function syncAfterManualSshUnlock(username) {
 
 app.patch('/vps/unlocksshvpn/:username', async (req, res) => {
   const username = String(req.params.username || '').trim();
+  const row = await get("SELECT quota FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+  const quotaUnlock = await canUnlockQuotaAccount('ssh', username, Number(row?.quota || 0));
+  if (!quotaUnlock.ok) {
+    return fail(res, 409, `quota habis: terpakai ${Math.ceil(quotaUnlock.usedBytes / QUOTA_BYTES_PER_GB)} GB, tambah quota dulu`);
+  }
+  await clearQuotaLock('ssh', username);
   unlockLinuxUser(username);
   await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
   await syncAfterManualSshUnlock(username);
@@ -4667,6 +4773,12 @@ app.patch('/vps/unlocksshvpn/:username', async (req, res) => {
 });
 app.patch('/vps/unlocksshvpn/:username/pw', async (req, res) => {
   const username = String(req.params.username || '').trim();
+  const row = await get("SELECT quota FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+  const quotaUnlock = await canUnlockQuotaAccount('ssh', username, Number(row?.quota || 0));
+  if (!quotaUnlock.ok) {
+    return fail(res, 409, `quota habis: terpakai ${Math.ceil(quotaUnlock.usedBytes / QUOTA_BYTES_PER_GB)} GB, tambah quota dulu`);
+  }
+  await clearQuotaLock('ssh', username);
   unlockLinuxUser(username);
   await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
   await syncAfterManualSshUnlock(username);
@@ -4879,10 +4991,14 @@ async function renewXray(table, username, exp, req) {
   const currentLimitIp = Number(row?.limitip || 0);
   const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : currentLimitIp;
   const secret = String(row?.secret || '').trim() || crypto.randomUUID();
+  const meta = xrayTableMeta(table);
+  const quotaUnlock = await canUnlockQuotaAccount(meta.protocol, username, nextQuota);
+  const nextStatus = quotaUnlock.ok ? 'AKTIF' : 'LOCK_QUOTA';
   await run(
-    `UPDATE ${table} SET ${secretCol}=?, date_exp=?, quota=?, limitip=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)`,
-    [secret, expDate, nextQuota, nextLimitIp, username]
+    `UPDATE ${table} SET ${secretCol}=?, date_exp=?, quota=?, limitip=?, status=? WHERE LOWER(username)=LOWER(?)`,
+    [secret, expDate, nextQuota, nextLimitIp, nextStatus, username]
   );
+  if (quotaUnlock.ok) await clearQuotaLock(meta.protocol, username);
   await renderAndReloadXray();
   return {
     username,
@@ -4890,6 +5006,8 @@ async function renewXray(table, username, exp, req) {
     to: expDate,
     exp: expDate,
     quota: String(nextQuota),
+    quota_used_bytes: String(quotaUnlock.usedBytes || 0),
+    quota_unlocked: quotaUnlock.ok,
     limitip: String(nextLimitIp),
     created: false,
     time: nowTime()
@@ -4958,6 +5076,13 @@ async function setStatusXray(table, username, status) {
     },
     inbounds: [
       {
+        tag: 'api',
+        listen: '127.0.0.1',
+        port: 10085,
+        protocol: 'dokodemo-door',
+        settings: { address: '127.0.0.1' }
+      },
+      {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
         streamSettings: { network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } }
@@ -4988,7 +5113,21 @@ async function setStatusXray(table, username, status) {
         streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
-    outbounds: [{ protocol: 'freedom', tag: 'direct' }]
+    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
+    stats: {},
+    api: { tag: 'api', services: ['StatsService'] },
+    policy: {
+      levels: { '0': { statsUserUplink: true, statsUserDownlink: true } },
+      system: {
+        statsInboundUplink: true,
+        statsInboundDownlink: true,
+        statsOutboundUplink: true,
+        statsOutboundDownlink: true
+      }
+    },
+    routing: {
+      rules: [{ type: 'field', inboundTag: ['api'], outboundTag: 'api' }]
+    }
   };
   writeXrayConfigAndReload(cfg, true);
   return { username };
@@ -5065,6 +5204,10 @@ async function releaseTempLockNow(accountType, username) {
 app.patch('/vps/unlockvmess/:username', async (req, res) => {
   try {
     const username = String(req.params.username || '').trim();
+    const row = await get("SELECT quota FROM account_vmesses WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+    const quotaUnlock = await canUnlockQuotaAccount('vmess', username, Number(row?.quota || 0));
+    if (!quotaUnlock.ok) return fail(res, 409, `quota habis: terpakai ${Math.ceil(quotaUnlock.usedBytes / QUOTA_BYTES_PER_GB)} GB, tambah quota dulu`);
+    await clearQuotaLock('vmess', username);
     const out = await setStatusXray('account_vmesses', username, 'AKTIF');
     await releaseTempLockNow('vmess', username);
     return ok(res, out);
@@ -5075,6 +5218,10 @@ app.patch('/vps/unlockvmess/:username', async (req, res) => {
 app.patch('/vps/unlockvless/:username', async (req, res) => {
   try {
     const username = String(req.params.username || '').trim();
+    const row = await get("SELECT quota FROM account_vlesses WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+    const quotaUnlock = await canUnlockQuotaAccount('vless', username, Number(row?.quota || 0));
+    if (!quotaUnlock.ok) return fail(res, 409, `quota habis: terpakai ${Math.ceil(quotaUnlock.usedBytes / QUOTA_BYTES_PER_GB)} GB, tambah quota dulu`);
+    await clearQuotaLock('vless', username);
     const out = await setStatusXray('account_vlesses', username, 'AKTIF');
     await releaseTempLockNow('vless', username);
     return ok(res, out);
@@ -5085,6 +5232,10 @@ app.patch('/vps/unlockvless/:username', async (req, res) => {
 app.patch('/vps/unlocktrojan/:username', async (req, res) => {
   try {
     const username = String(req.params.username || '').trim();
+    const row = await get("SELECT quota FROM account_trojans WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+    const quotaUnlock = await canUnlockQuotaAccount('trojan', username, Number(row?.quota || 0));
+    if (!quotaUnlock.ok) return fail(res, 409, `quota habis: terpakai ${Math.ceil(quotaUnlock.usedBytes / QUOTA_BYTES_PER_GB)} GB, tambah quota dulu`);
+    await clearQuotaLock('trojan', username);
     const out = await setStatusXray('account_trojans', username, 'AKTIF');
     await releaseTempLockNow('trojan', username);
     return ok(res, out);
@@ -5092,6 +5243,93 @@ app.patch('/vps/unlocktrojan/:username', async (req, res) => {
     return fail(res, 500, e?.message || 'unlock trojan failed');
   }
 });
+
+function tableByQuotaType(type) {
+  const t = String(type || '').trim().toLowerCase();
+  if (t === 'ssh' || t === 'zivpn' || t === 'sshvpn') return { type: 'ssh', table: 'account_sshs', secretColumn: 'password' };
+  if (t === 'vmess') return { type: 'vmess', table: 'account_vmesses', secretColumn: 'uuid' };
+  if (t === 'vless') return { type: 'vless', table: 'account_vlesses', secretColumn: 'uuid' };
+  if (t === 'trojan') return { type: 'trojan', table: 'account_trojans', secretColumn: 'password' };
+  return null;
+}
+
+async function updateAccountQuota(typeRaw, usernameRaw, body = {}) {
+  const meta = tableByQuotaType(typeRaw);
+  if (!meta) {
+    const err = new Error('invalid account type');
+    err.statusCode = 400;
+    throw err;
+  }
+  const username = String(usernameRaw || '').trim();
+  if (!username) {
+    const err = new Error('username required');
+    err.statusCode = 400;
+    throw err;
+  }
+  const row = await get(
+    `SELECT username, ${meta.secretColumn} AS secret, quota, status, date_exp FROM ${meta.table} WHERE LOWER(username)=LOWER(?)`,
+    [username]
+  ).catch(() => null);
+  if (!row) {
+    const err = new Error(`account ${username} not found`);
+    err.statusCode = 404;
+    throw err;
+  }
+  const currentQuota = Number(row?.quota || 0);
+  const rawQuota = body?.kuota ?? body?.quota ?? body?.quota_gb;
+  const inputQuota = Number(rawQuota);
+  if (!Number.isFinite(inputQuota) || inputQuota < 0) {
+    const err = new Error('quota harus angka 0 atau lebih');
+    err.statusCode = 400;
+    throw err;
+  }
+  const addMode = body?.add === true || String(body?.mode || '').trim().toLowerCase() === 'add' || String(body?.tambah || '').trim() === '1';
+  const nextQuota = addMode ? currentQuota + inputQuota : inputQuota;
+  const quotaUnlock = await canUnlockQuotaAccount(meta.type, username, nextQuota);
+  const oldStatus = String(row?.status || '').trim().toUpperCase();
+  const nextStatus = oldStatus === 'LOCK_QUOTA' && quotaUnlock.ok ? 'AKTIF' : oldStatus || 'AKTIF';
+  await run(`UPDATE ${meta.table} SET quota=?, status=? WHERE LOWER(username)=LOWER(?)`, [nextQuota, nextStatus, username]);
+
+  if (oldStatus === 'LOCK_QUOTA' && quotaUnlock.ok) {
+    await clearQuotaLock(meta.type, username);
+    if (meta.type === 'ssh') {
+      const password = String(row?.secret || '').trim();
+      if (password) safeExec('chpasswd', [], `${username}:${password}\n`);
+      safeExec('usermod', ['-s', ensureTunnelShellAllowed(), username]);
+      unlockLinuxUser(username);
+      syncZivpnUser(username, true);
+      if (password) syncUdpcustomUser(password, true);
+      safeExec('systemctl', ['start', 'sc-1forcr-iplimit.service']);
+    } else {
+      await renderAndReloadXray();
+    }
+  }
+
+  return {
+    username: String(row?.username || username),
+    type: meta.type,
+    quota_before: String(currentQuota),
+    quota: String(nextQuota),
+    quota_used_bytes: String(quotaUnlock.usedBytes || 0),
+    quota_unlocked: oldStatus === 'LOCK_QUOTA' && quotaUnlock.ok,
+    status: nextStatus,
+    time: nowTime()
+  };
+}
+
+async function quotaRoute(type, req, res) {
+  try {
+    return ok(res, await updateAccountQuota(type, String(req.params.username || '').trim(), req.body || {}));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e?.message || 'edit quota failed');
+  }
+}
+
+app.patch('/vps/quota/:type/:username', async (req, res) => quotaRoute(String(req.params.type || ''), req, res));
+app.patch('/vps/editquotasshvpn/:username', async (req, res) => quotaRoute('ssh', req, res));
+app.patch('/vps/editquotavmess/:username', async (req, res) => quotaRoute('vmess', req, res));
+app.patch('/vps/editquotavless/:username', async (req, res) => quotaRoute('vless', req, res));
+app.patch('/vps/editquotatrojan/:username', async (req, res) => quotaRoute('trojan', req, res));
 
 // Endpoint untuk dipanggil bot setelah proses restore/import DB selesai.
 // Auto-sync xray hanya on-demand (bukan berkala) agar ringan dan deterministik.
@@ -5703,6 +5941,8 @@ const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 1);
 const XRAY_MIN_HITS_PER_IP = Number.isFinite(XRAY_MIN_HITS_PER_IP_RAW) && XRAY_MIN_HITS_PER_IP_RAW >= 1
   ? Math.min(Math.floor(XRAY_MIN_HITS_PER_IP_RAW), 20)
   : 1;
+const QUOTA_LOCK_ENABLED = !/^(0|false|off|no)$/i.test(String(process.env.QUOTA_LOCK_ENABLE || '1').trim());
+const QUOTA_BYTES_PER_GB = 1024 * 1024 * 1024;
 function normalizeXrayPath(raw, fallback = '/') {
   const source = String(raw || '').trim();
   const base = source || String(fallback || '/').trim() || '/';
@@ -5886,6 +6126,46 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       `Unlock   : ${Number(LOCK_MINUTES || 15)} menit\n` +
       `TG User  : ${ownerId || '-'}\n` +
       `TG Chat  : ${ownerChatId || '-'}`;
+    await telegramNotify(msg);
+  } catch (_) {}
+}
+
+function bytesToGbText(bytes) {
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n <= 0) return '0 GB';
+  return `${(n / QUOTA_BYTES_PER_GB).toFixed(2).replace(/\.00$/, '')} GB`;
+}
+
+async function notifyQuotaLock(service, username, quotaBytes, usedBytes, ownerId = null, ownerChatId = null) {
+  try {
+    const ownerIdNum = Number(ownerId || 0);
+    const ownerChatIdNum = Number(ownerChatId || 0);
+    const event = {
+      event: 'QUOTA_EXCEEDED',
+      action: 'LOCK_QUOTA',
+      source_domain: DOMAIN || null,
+      service: String(service || '-').toUpperCase(),
+      username: String(username || '-'),
+      quota_bytes: Number(quotaBytes || 0),
+      used_bytes: Number(usedBytes || 0),
+      owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
+      owner_telegram_chat_id: ownerChatIdNum > 0 ? ownerChatIdNum : (ownerIdNum > 0 ? ownerIdNum : null),
+      at: new Date().toISOString()
+    };
+    await notifyAccountBotMultiLogin(event);
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    const msg =
+      `SC 1FORCR NOTIF\n` +
+      `==============================\n` +
+      `Event    : QUOTA HABIS\n` +
+      `Action   : LOCK_QUOTA\n` +
+      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
+      `Username : ${username}\n` +
+      `Quota    : ${bytesToGbText(quotaBytes)}\n` +
+      `Terpakai : ${bytesToGbText(usedBytes)}\n` +
+      `Status   : LOCK sampai admin tambah/edit quota\n` +
+      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n` +
+      `==============================`;
     await telegramNotify(msg);
   } catch (_) {}
 }
@@ -7070,6 +7350,237 @@ async function ensureTables() {
     created_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`);
+  await run(`CREATE TABLE IF NOT EXISTS account_quota_usage (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    used_bytes INTEGER DEFAULT 0,
+    last_counter_bytes INTEGER DEFAULT 0,
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username)
+  )`);
+  await run(`CREATE TABLE IF NOT EXISTS account_quota_locks (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    quota_bytes INTEGER DEFAULT 0,
+    used_bytes INTEGER DEFAULT 0,
+    locked_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username)
+  )`);
+}
+
+function quotaToBytes(quotaGb) {
+  const n = Number(quotaGb || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n * QUOTA_BYTES_PER_GB);
+}
+
+async function getQuotaUsage(type, username) {
+  const row = await get(
+    "SELECT used_bytes, last_counter_bytes FROM account_quota_usage WHERE account_type=? AND LOWER(username)=LOWER(?)",
+    [type, username]
+  ).catch(() => null);
+  return {
+    exists: !!row,
+    used: Number(row?.used_bytes || 0),
+    lastCounter: Number(row?.last_counter_bytes || 0)
+  };
+}
+
+async function saveQuotaUsage(type, username, usedBytes, lastCounterBytes = null) {
+  const now = Math.floor(Date.now() / 1000);
+  await run(
+    `INSERT INTO account_quota_usage(account_type, username, used_bytes, last_counter_bytes, updated_at)
+     VALUES(?, ?, ?, ?, ?)
+     ON CONFLICT(account_type, username) DO UPDATE SET
+       used_bytes=excluded.used_bytes,
+       last_counter_bytes=excluded.last_counter_bytes,
+       updated_at=excluded.updated_at`,
+    [type, username, Math.max(0, Math.floor(Number(usedBytes || 0))), Math.max(0, Math.floor(Number(lastCounterBytes || 0))), now]
+  ).catch(() => {});
+}
+
+async function addQuotaDelta(type, username, deltaBytes, lastCounterBytes = null) {
+  const current = await getQuotaUsage(type, username);
+  const delta = Math.max(0, Math.floor(Number(deltaBytes || 0)));
+  const nextUsed = current.used + delta;
+  const nextCounter = lastCounterBytes === null ? current.lastCounter : Math.max(0, Math.floor(Number(lastCounterBytes || 0)));
+  await saveQuotaUsage(type, username, nextUsed, nextCounter);
+  return nextUsed;
+}
+
+function setupSshQuotaAccounting(rows = []) {
+  if (!Array.isArray(rows) || rows.length === 0) return new Map();
+  if (!safeExec('iptables', ['-N', 'SC_1FORCR_QUOTA_OUT'])) {
+    // chain may already exist
+  }
+  if (!safeExec('iptables', ['-C', 'OUTPUT', '-j', 'SC_1FORCR_QUOTA_OUT'])) {
+    safeExec('iptables', ['-I', 'OUTPUT', '1', '-j', 'SC_1FORCR_QUOTA_OUT']);
+  }
+  for (const row of rows) {
+    const user = String(row?.username || '').trim();
+    if (!user) continue;
+    const uid = readExec('id', ['-u', user]).trim();
+    if (!/^\d+$/.test(uid)) continue;
+    const comment = `scquota:${user.toLowerCase()}`;
+    if (!safeExec('iptables', ['-C', 'SC_1FORCR_QUOTA_OUT', '-m', 'owner', '--uid-owner', uid, '-m', 'comment', '--comment', comment, '-j', 'RETURN'])) {
+      safeExec('iptables', ['-A', 'SC_1FORCR_QUOTA_OUT', '-m', 'owner', '--uid-owner', uid, '-m', 'comment', '--comment', comment, '-j', 'RETURN']);
+    }
+  }
+  const out = readExec('iptables', ['-L', 'SC_1FORCR_QUOTA_OUT', '-vxn']);
+  const map = new Map();
+  for (const line of out.split(/\r?\n/)) {
+    const m = line.match(/^\s*\d+\s+(\d+)\s+.*\/\*\s*scquota:([^*]+?)\s*\*\//);
+    if (!m) continue;
+    const bytes = Number(m[1] || 0);
+    const user = String(m[2] || '').trim().toLowerCase();
+    if (user && Number.isFinite(bytes)) map.set(user, bytes);
+  }
+  return map;
+}
+
+function parseXrayStatsOutput(out, username) {
+  const userKey = String(username || '').trim().toLowerCase();
+  if (!out || !userKey) return 0;
+  let total = 0;
+  const addIfMatch = (name, value) => {
+    const n = String(name || '').toLowerCase();
+    const v = Number(value || 0);
+    if (!Number.isFinite(v) || v <= 0) return;
+    if (n.includes(`user>>>${userKey}>>>traffic>>>`)) total += v;
+  };
+  try {
+    const parsed = JSON.parse(out);
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (node.name !== undefined && node.value !== undefined) addIfMatch(node.name, node.value);
+      for (const v of Object.values(node)) {
+        if (Array.isArray(v)) v.forEach(walk);
+        else if (v && typeof v === 'object') walk(v);
+      }
+    };
+    walk(parsed);
+  } catch (_) {}
+  for (const m of out.matchAll(/name:\s*"([^"]+)"[\s\S]*?value:\s*([0-9]+)/g)) {
+    addIfMatch(m[1], m[2]);
+  }
+  for (const m of out.matchAll(/"name"\s*:\s*"([^"]+)"[\s\S]*?"value"\s*:\s*([0-9]+)/g)) {
+    addIfMatch(m[1], m[2]);
+  }
+  return total;
+}
+
+function queryXrayUserTrafficDelta(username) {
+  const user = String(username || '').trim();
+  if (!user) return 0;
+  const pattern = `user>>>${user}>>>traffic`;
+  const bins = ['/usr/local/bin/xray', '/usr/bin/xray', 'xray'];
+  const argSets = [
+    ['api', 'statsquery', '--server=127.0.0.1:10085', '-pattern', pattern, '-reset=true'],
+    ['api', 'statsquery', '--server=127.0.0.1:10085', '-pattern', pattern, '-reset']
+  ];
+  for (const bin of bins) {
+    for (const args of argSets) {
+      const out = readExec(bin, args);
+      const value = parseXrayStatsOutput(out, user);
+      if (value > 0) return value;
+    }
+  }
+  return 0;
+}
+
+async function isQuotaLocked(type, username) {
+  const row = await get("SELECT 1 AS ok FROM account_quota_locks WHERE account_type=? AND LOWER(username)=LOWER(?)", [type, username]).catch(() => null);
+  return !!row;
+}
+
+async function lockSshForQuota(row, usedBytes, quotaBytes) {
+  const user = String(row?.username || '').trim();
+  const pass = String(row?.password || '').trim();
+  if (!user || await isQuotaLocked('ssh', user)) return { zivpnChanged: false, udpcustomChanged: false };
+  safeExec('pkill', ['-KILL', '-u', user]);
+  safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
+  safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
+  safeExec('passwd', ['-l', user]);
+  const zivpnChanged = removeZivpnUser(user);
+  let udpcustomChanged = false;
+  if (pass && removeUdpcustomUser(pass)) udpcustomChanged = true;
+  if (removeUdpcustomUser(user)) udpcustomChanged = true;
+  await run("UPDATE account_sshs SET status='LOCK_QUOTA' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
+  await run(
+    "INSERT OR REPLACE INTO account_quota_locks(account_type, username, quota_bytes, used_bytes, locked_at) VALUES('ssh', ?, ?, ?, strftime('%s','now'))",
+    [user, quotaBytes, usedBytes]
+  ).catch(() => {});
+  await notifyQuotaLock('ssh/zivpn/udphc', user, quotaBytes, usedBytes, Number(row?.owner_telegram_id || 0) || null, Number(row?.owner_telegram_chat_id || 0) || null);
+  return { zivpnChanged, udpcustomChanged };
+}
+
+async function lockXrayForQuota(type, table, row, usedBytes, quotaBytes) {
+  const user = String(row?.username || '').trim();
+  if (!user || await isQuotaLocked(type, user)) return false;
+  await run(`UPDATE ${table} SET status='LOCK_QUOTA' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
+  await run(
+    "INSERT OR REPLACE INTO account_quota_locks(account_type, username, quota_bytes, used_bytes, locked_at) VALUES(?, ?, ?, ?, strftime('%s','now'))",
+    [type, user, quotaBytes, usedBytes]
+  ).catch(() => {});
+  await notifyQuotaLock(type, user, quotaBytes, usedBytes, Number(row?.owner_telegram_id || 0) || null, Number(row?.owner_telegram_chat_id || 0) || null);
+  return true;
+}
+
+async function enforceQuotaLimits() {
+  if (!QUOTA_LOCK_ENABLED) return { zivpnChanged: false, udpcustomChanged: false, xrayChanged: false };
+  let zivpnChanged = false;
+  let udpcustomChanged = false;
+  let xrayChanged = false;
+
+  const sshRows = await all(
+    "SELECT username, password, quota, owner_telegram_id, owner_telegram_chat_id FROM account_sshs " +
+    "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(quota,0) AS INTEGER) > 0"
+  ).catch(() => []);
+  const sshCounters = setupSshQuotaAccounting(sshRows);
+  for (const row of sshRows) {
+    const user = String(row?.username || '').trim();
+    const key = user.toLowerCase();
+    const quotaBytes = quotaToBytes(row?.quota);
+    if (!user || quotaBytes <= 0) continue;
+    const counter = Number(sshCounters.get(key) || 0);
+    const current = await getQuotaUsage('ssh', user);
+    let delta = 0;
+    if (current.exists) {
+      delta = counter >= current.lastCounter ? counter - current.lastCounter : counter;
+    }
+    const used = await addQuotaDelta('ssh', user, delta, counter);
+    if (IPLIMIT_DEBUG) console.log(`[quota-debug][ssh] user=${user} quota=${quotaBytes} used=${used} delta=${delta} counter=${counter}`);
+    if (used >= quotaBytes) {
+      const out = await lockSshForQuota(row, used, quotaBytes);
+      if (out.zivpnChanged) zivpnChanged = true;
+      if (out.udpcustomChanged) udpcustomChanged = true;
+    }
+  }
+
+  const xrayScan = [
+    { type: 'vmess', table: 'account_vmesses' },
+    { type: 'vless', table: 'account_vlesses' },
+    { type: 'trojan', table: 'account_trojans' }
+  ];
+  for (const item of xrayScan) {
+    const rows = await all(
+      `SELECT username, quota, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
+      "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(quota,0) AS INTEGER) > 0"
+    ).catch(() => []);
+    for (const row of rows) {
+      const user = String(row?.username || '').trim();
+      const quotaBytes = quotaToBytes(row?.quota);
+      if (!user || quotaBytes <= 0) continue;
+      const delta = queryXrayUserTrafficDelta(user);
+      const used = await addQuotaDelta(item.type, user, delta, null);
+      if (IPLIMIT_DEBUG) console.log(`[quota-debug][${item.type}] user=${user} quota=${quotaBytes} used=${used} delta=${delta}`);
+      if (used >= quotaBytes) {
+        if (await lockXrayForQuota(item.type, item.table, row, used, quotaBytes)) xrayChanged = true;
+      }
+    }
+  }
+
+  return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
 
 async function cleanupExpiredGrace(nowTs) {
@@ -7513,9 +8024,9 @@ function applyXrayConfigAndRestart(cfg) {
 
 async function detectLockedUsersStillInXrayConfig() {
   const lockedRows = await all(
-    "SELECT LOWER(username) AS username FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') " +
-    "UNION ALL SELECT LOWER(username) AS username FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') " +
-    "UNION ALL SELECT LOWER(username) AS username FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')"
+    "SELECT LOWER(username) AS username FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA') " +
+    "UNION ALL SELECT LOWER(username) AS username FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA') " +
+    "UNION ALL SELECT LOWER(username) AS username FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA')"
   ).catch(() => []);
   if (!lockedRows.length) return { changed: false, users: [] };
   const lockedSet = new Set(
@@ -7545,6 +8056,13 @@ async function rebuildXrayFromDb() {
       loglevel: 'warning'
     },
     inbounds: [
+      {
+        tag: 'api',
+        listen: '127.0.0.1',
+        port: 10085,
+        protocol: 'dokodemo-door',
+        settings: { address: '127.0.0.1' }
+      },
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
@@ -7576,7 +8094,21 @@ async function rebuildXrayFromDb() {
         streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
-    outbounds: [{ protocol: 'freedom', tag: 'direct' }]
+    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
+    stats: {},
+    api: { tag: 'api', services: ['StatsService'] },
+    policy: {
+      levels: { '0': { statsUserUplink: true, statsUserDownlink: true } },
+      system: {
+        statsInboundUplink: true,
+        statsInboundDownlink: true,
+        statsOutboundUplink: true,
+        statsOutboundDownlink: true
+      }
+    },
+    routing: {
+      rules: [{ type: 'field', inboundTag: ['api'], outboundTag: 'api' }]
+    }
   };
   applyXrayConfigAndRestart(cfg);
 }
@@ -7587,21 +8119,22 @@ async function main() {
   await cleanupExpiredGrace(now);
   const e = await enforceExpiredAccounts();
   const u = await unlockExpired(now);
+  const q = await enforceQuotaLimits();
   const l = await lockIfExceeded(now);
   const staleLockSync = await detectLockedUsersStillInXrayConfig().catch(() => ({ changed: false, users: [] }));
   await cleanupOrphanXrayDropRules().catch(() => {});
   if (staleLockSync.changed && IPLIMIT_DEBUG) {
     console.log(`[iplimit-debug][xray] stale-locked-user-in-config -> force rebuild users=${staleLockSync.users.join(',')}`);
   }
-  if (e.xrayChanged || u.xrayChanged || l.xrayChanged || staleLockSync.changed) {
+  if (e.xrayChanged || u.xrayChanged || q.xrayChanged || l.xrayChanged || staleLockSync.changed) {
     await rebuildXrayFromDb().catch((err) => {
       console.error('[iplimit-checker] rebuildXrayFromDb failed:', err?.message || err);
     });
   }
-  if ((e.zivpnChanged || u.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
+  if ((e.zivpnChanged || u.zivpnChanged || q.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
     restartService(ZIVPN_SERVICE);
   }
-  if ((e.udpcustomChanged || u.udpcustomChanged || l.udpcustomChanged) && shouldRestartUdpcustom()) {
+  if ((e.udpcustomChanged || u.udpcustomChanged || q.udpcustomChanged || l.udpcustomChanged) && shouldRestartUdpcustom()) {
     restartService(UDPCUSTOM_SERVICE);
   }
   ensureXrayInboundsHealthy();
@@ -8278,6 +8811,7 @@ SETTINGS_KEYS = [
     "IPLIMIT_CHECK_INTERVAL_MINUTES",
     "IPLIMIT_LOCK_MINUTES",
     "IPLIMIT_AUTO_LOCK_ENABLE",
+    "QUOTA_LOCK_ENABLE",
     "IPLIMIT_AUTO_TUNE",
     "IPLIMIT_DEBUG",
     "DROPBEAR_LOG_MAX_LINES",
@@ -8369,6 +8903,8 @@ payload = {
         "vmess": fetch("account_vmesses", ["username", "uuid", "date_exp", "status", "quota", "limitip", "owner_telegram_id", "owner_telegram_chat_id"]),
         "vless": fetch("account_vlesses", ["username", "uuid", "date_exp", "status", "quota", "limitip", "owner_telegram_id", "owner_telegram_chat_id"]),
         "trojan": fetch("account_trojans", ["username", "password", "date_exp", "status", "quota", "limitip", "owner_telegram_id", "owner_telegram_chat_id"]),
+        "quota_usage": fetch("account_quota_usage", ["account_type", "username", "used_bytes", "last_counter_bytes", "updated_at"]),
+        "quota_locks": fetch("account_quota_locks", ["account_type", "username", "quota_bytes", "used_bytes", "locked_at"]),
         "zivpn_auth": [],
         "banner_html": "",
         "banner_txt": "",
@@ -8541,6 +9077,22 @@ CREATE TABLE IF NOT EXISTS account_trojans (
   limitip INTEGER DEFAULT 0,
   owner_telegram_id INTEGER,
   owner_telegram_chat_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS account_quota_usage (
+  account_type TEXT NOT NULL,
+  username TEXT NOT NULL,
+  used_bytes INTEGER DEFAULT 0,
+  last_counter_bytes INTEGER DEFAULT 0,
+  updated_at INTEGER DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (account_type, username)
+);
+CREATE TABLE IF NOT EXISTS account_quota_locks (
+  account_type TEXT NOT NULL,
+  username TEXT NOT NULL,
+  quota_bytes INTEGER DEFAULT 0,
+  used_bytes INTEGER DEFAULT 0,
+  locked_at INTEGER DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (account_type, username)
 );
 SQL
 
@@ -8893,6 +9445,63 @@ def upsert_trojan(rows):
             ),
         )
 
+def upsert_quota_usage(rows):
+    for r in rows:
+        t = str((r or {}).get("account_type", "")).strip().lower()
+        u = str((r or {}).get("username", "")).strip()
+        if not t or not u:
+            continue
+        cur.execute(
+            """
+            INSERT INTO account_quota_usage(account_type,username,used_bytes,last_counter_bytes,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(account_type,username) DO UPDATE SET
+              used_bytes=excluded.used_bytes,
+              last_counter_bytes=excluded.last_counter_bytes,
+              updated_at=excluded.updated_at
+            """,
+            (
+                t,
+                u,
+                to_int((r or {}).get("used_bytes", 0)),
+                to_int((r or {}).get("last_counter_bytes", 0)),
+                to_int((r or {}).get("updated_at", 0)),
+            ),
+        )
+
+def upsert_quota_locks(rows):
+    lock_tables = {
+        "ssh": "account_sshs",
+        "vmess": "account_vmesses",
+        "vless": "account_vlesses",
+        "trojan": "account_trojans",
+    }
+    for r in rows:
+        t = str((r or {}).get("account_type", "")).strip().lower()
+        u = str((r or {}).get("username", "")).strip()
+        if not t or not u:
+            continue
+        cur.execute(
+            """
+            INSERT INTO account_quota_locks(account_type,username,quota_bytes,used_bytes,locked_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(account_type,username) DO UPDATE SET
+              quota_bytes=excluded.quota_bytes,
+              used_bytes=excluded.used_bytes,
+              locked_at=excluded.locked_at
+            """,
+            (
+                t,
+                u,
+                to_int((r or {}).get("quota_bytes", 0)),
+                to_int((r or {}).get("used_bytes", 0)),
+                to_int((r or {}).get("locked_at", 0)),
+            ),
+        )
+        table = lock_tables.get(t)
+        if table:
+            cur.execute(f"UPDATE {table} SET status='LOCK_QUOTA' WHERE LOWER(username)=LOWER(?)", (u.lower(),))
+
 SETTINGS_KEYS = [
     "AUTO_BACKUP_ENABLE",
     "AUTO_BACKUP_DIR",
@@ -8913,6 +9522,7 @@ SETTINGS_KEYS = [
     "IPLIMIT_CHECK_INTERVAL_MINUTES",
     "IPLIMIT_LOCK_MINUTES",
     "IPLIMIT_AUTO_LOCK_ENABLE",
+    "QUOTA_LOCK_ENABLE",
     "IPLIMIT_AUTO_TUNE",
     "IPLIMIT_DEBUG",
     "DROPBEAR_LOG_MAX_LINES",
@@ -9032,6 +9642,8 @@ upsert_ssh(data.get("ssh") or [])
 upsert_uuid("account_vmesses", data.get("vmess") or [])
 upsert_uuid("account_vlesses", data.get("vless") or [])
 upsert_trojan(data.get("trojan") or [])
+upsert_quota_usage(data.get("quota_usage") or [])
+upsert_quota_locks(data.get("quota_locks") or [])
 restored_settings = restore_runtime_settings(data.get("settings") or data.get("runtime_settings") or {})
 
 zivpn_auth = data.get("zivpn_auth") or []
@@ -10277,6 +10889,7 @@ ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
+QUOTA_LOCK_ENABLE=${QUOTA_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
 DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
@@ -10492,6 +11105,7 @@ ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECON
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
+QUOTA_LOCK_ENABLE="${QUOTA_LOCK_ENABLE:-1}"
 DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
 DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
@@ -10518,6 +11132,7 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
 [[ "${AUTO_PULL_UPDATE_ENABLE}" != "0" ]] && AUTO_PULL_UPDATE_ENABLE="1"
 [[ -z "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -lt 1 || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -gt 1440 ]] && AUTO_PULL_UPDATE_INTERVAL_MINUTES="10"
 [[ -z "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" || "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" -lt 10 || "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" -gt 10080 ]] && AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="360"
+[[ "${QUOTA_LOCK_ENABLE}" != "0" ]] && QUOTA_LOCK_ENABLE="1"
 
 # Compatibility helpers for older runtime files on upgraded VPS.
 flag_enabled() {
@@ -11623,6 +12238,15 @@ endpoint_unlock() {
     *) echo "" ;;
   esac
 }
+endpoint_quota() {
+  case "$1" in
+    ssh|zivpn) echo "/editquotasshvpn" ;;
+    vmess) echo "/editquotavmess" ;;
+    vless) echo "/editquotavless" ;;
+    trojan) echo "/editquotatrojan" ;;
+    *) echo "" ;;
+  esac
+}
 
 print_created_account() {
   local type="$1" raw="$2"
@@ -11911,6 +12535,81 @@ edit_limit_ip_all_accounts() {
   echo "Total akun ter-update: ${changed}"
 }
 
+edit_quota_account() {
+  local type ep username quota mode payload resp code message used unlocked status
+  type="$(pick_type)"
+  [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
+  ep="$(endpoint_quota "${type}")"
+  [[ -z "${ep}" ]] && { echo "Endpoint quota tidak ada."; return; }
+  username="$(pick_existing_username "${type}")" || return
+  echo "EDIT QUOTA AKUN ${type^^}: ${username}"
+  echo "Mode: set = ganti quota total, add = tambah quota dari quota sekarang."
+  prompt_input mode "Mode quota (set/add) [set]: " || return
+  mode="${mode:-set}"
+  case "${mode,,}" in
+    set|ganti) mode="set" ;;
+    add|tambah) mode="add" ;;
+    *) echo "Mode tidak valid."; return ;;
+  esac
+  prompt_input quota "Quota GB [0=unlimited]: " || return
+  quota="${quota:-0}"
+  if [[ ! "${quota}" =~ ^[0-9]+$ ]]; then
+    echo "Quota harus angka 0 atau lebih."
+    return
+  fi
+  payload="$(jq -nc --arg q "${quota}" --arg m "${mode}" '{kuota:$q,mode:$m}')"
+  resp="$(api_call "PATCH" "${ep}/${username}" "${payload}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal edit quota: ${message}"
+    return
+  fi
+  quota="$(echo "${resp}" | jq -r '.data.quota // "0"' 2>/dev/null || echo "0")"
+  used="$(echo "${resp}" | jq -r '.data.quota_used_bytes // "0"' 2>/dev/null || echo "0")"
+  unlocked="$(echo "${resp}" | jq -r '.data.quota_unlocked // false' 2>/dev/null || echo "false")"
+  status="$(echo "${resp}" | jq -r '.data.status // "-"' 2>/dev/null || echo "-")"
+  echo "Berhasil edit quota akun ${type^^} '${username}'."
+  echo "Quota sekarang : ${quota} GB"
+  echo "Used bytes     : ${used}"
+  echo "Status         : ${status}"
+  echo "Unlock quota   : ${unlocked}"
+}
+
+edit_quota_all_accounts() {
+  local type table new_quota changed title
+  type="$(pick_type)"
+  [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
+  table="$(account_table_by_type "${type}")"
+  [[ -z "${table}" ]] && { echo "Tabel akun tidak ditemukan."; return; }
+
+  case "${type}" in
+    ssh|zivpn) title="SSH/ZIVPN/UDPHC" ; type="ssh" ;;
+    vmess) title="VMESS" ;;
+    vless) title="VLESS" ;;
+    trojan) title="TROJAN" ;;
+    *) title="${type^^}" ;;
+  esac
+
+  echo "EDIT QUOTA SEMUA USER (${title})"
+  prompt_input new_quota "Quota baru semua akun ${title} dalam GB [0=unlimited]: " || return
+  new_quota="${new_quota:-0}"
+  if [[ ! "${new_quota}" =~ ^[0-9]+$ ]]; then
+    echo "Quota harus angka 0 atau lebih."
+    return
+  fi
+  changed="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE CAST(COALESCE(quota,0) AS INTEGER) <> ${new_quota};" 2>/dev/null || echo 0)"
+  [[ "${changed}" =~ ^[0-9]+$ ]] || changed="0"
+  sqlite3 "${DB_PATH}" "UPDATE ${table} SET quota=${new_quota};" >/dev/null 2>&1 || {
+    echo "Gagal update quota."
+    return
+  }
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+  echo "Berhasil update quota semua akun ${title} jadi ${new_quota} GB."
+  echo "Total akun ter-update: ${changed}"
+  echo "Jika ada akun LOCK_QUOTA, jalankan menu Unlock Semua Akun setelah quota dinaikkan."
+}
+
 validate_ssh_password_cli() {
   local password="$1"
   if [[ -z "${password}" ]]; then
@@ -12076,7 +12775,7 @@ print_account_picker_table() {
   where=""
   if [[ "${lock_only}" == "1" ]]; then
     where="WHERE LOWER(username) IN (
-      SELECT LOWER(username) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+      SELECT LOWER(username) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA')
       UNION
       SELECT LOWER(username) FROM temp_ip_locks WHERE account_type='${type}' AND locked_until > strftime('%s','now')
     )"
@@ -12137,7 +12836,7 @@ pick_locked_username() {
   rows="$(sqlite3 "$DB_PATH" "
     SELECT username FROM (
       SELECT username FROM ${table}
-      WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+      WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA')
       UNION
       SELECT username FROM temp_ip_locks
       WHERE account_type='${type}' AND locked_until > strftime('%s','now')
@@ -12448,7 +13147,7 @@ unlock_account() {
 
 unlock_all_accounts() {
   local ans type table ep rows username resp code message ok_count fail_count total_count username_sql
-  echo "Unlock semua akun LOCK/LOCK_TMP (SSH/VMESS/VLESS/TROJAN)."
+  echo "Unlock semua akun LOCK/LOCK_TMP/LOCK_QUOTA (SSH/VMESS/VLESS/TROJAN)."
   if ! prompt_input ans "Lanjutkan? [y/N]: "; then
     return
   fi
@@ -12467,7 +13166,7 @@ unlock_all_accounts() {
     rows="$(sqlite3 "${DB_PATH}" "
       SELECT username FROM (
         SELECT username FROM ${table}
-        WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')
+        WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA')
         UNION
         SELECT username FROM temp_ip_locks
         WHERE account_type='${type}' AND locked_until > strftime('%s','now')
@@ -12498,7 +13197,7 @@ unlock_all_accounts() {
   done
 
   if [[ "${total_count}" -eq 0 ]]; then
-    echo "Tidak ada akun LOCK/LOCK_TMP yang perlu di-unlock."
+    echo "Tidak ada akun LOCK/LOCK_TMP/LOCK_QUOTA yang perlu di-unlock."
     return
   fi
 
@@ -12751,9 +13450,11 @@ akun_menu() {
       "12) Edit UUID Xray" \
       "13) Ganti Password SSH" \
       "14) Ganti Password Semua SSH" \
+      "15) Edit Quota" \
+      "16) Edit Quota Semua Akun" \
       "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-14]: "; then
+    if ! prompt_input am "Pilih menu [0-16]: "; then
       return
     fi
     clear
@@ -12779,6 +13480,8 @@ akun_menu() {
       12) edit_uuid_xray_account || true ;;
       13) change_ssh_password_account || true ;;
       14) change_ssh_password_all_accounts || true ;;
+      15) edit_quota_account || true ;;
+      16) edit_quota_all_accounts || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -15439,7 +16142,7 @@ show_combined_online() {
       cnt=(n >= 4 ? b[4] + 0 : (ssh + udp));
       s=(u in st ? st[u] : "AMAN");
       l=(u in lim ? lim[u] : 0);
-      if (s == "LOCK" || s == "LOCK_TMP") {
+      if (s == "LOCK" || s == "LOCK_TMP" || s == "LOCK_QUOTA") {
         out="KENA_LOCK";
       } else if (l > 0 && cnt > l) {
         out="MULTI_LOGIN";
@@ -15728,7 +16431,7 @@ show_ssh_only_online() {
       u=$1; n=$2+0;
       s=(u in st ? st[u] : "AMAN");
       l=(u in lim ? lim[u] : 0);
-      if (s=="LOCK" || s=="LOCK_TMP") out="KENA_LOCK";
+      if (s=="LOCK" || s=="LOCK_TMP" || s=="LOCK_QUOTA") out="KENA_LOCK";
       else if (l > 0 && n > l) out="MULTI_LOGIN";
       else out="AMAN";
       printf "%-24s %-12s %-10d %-13d\n", u, out, l, n;
@@ -15868,7 +16571,7 @@ show_xray_online_by_table() {
       if (!(u in db_status)) next;
       s=db_status[u];
       l=(u in db_limit ? db_limit[u] : 0);
-      if (s=="LOCK" || s=="LOCK_TMP") out="KENA_LOCK";
+      if (s=="LOCK" || s=="LOCK_TMP" || s=="LOCK_QUOTA") out="KENA_LOCK";
       else if (l > 0 && c > l) out="MULTI_LOGIN";
       else out="AMAN";
       printf "%-24s %-12s %-10d %-13d %-22s\n", u, out, l, c, (lip=="" ? "-" : lip);
@@ -16227,6 +16930,7 @@ Time     : $(date '+%F %T')"
     IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
     IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
     IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}" \
+    QUOTA_LOCK_ENABLE="${QUOTA_LOCK_ENABLE:-1}" \
     IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}" \
     IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-0}" \
     XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS}" \
@@ -17472,7 +18176,7 @@ persist_pending_install_env() {
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES
-    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
+    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
     SSHWS_TCP_KEEPALIVE_SECONDS SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE

@@ -3327,7 +3327,89 @@ function formatXrayCreateNotification(action, service, account = {}, location = 
   ].join('\n');
 }
 
+function normalizedSshService(service) {
+  const serviceText = String(service || '').trim().toLowerCase();
+  return ['ssh', 'zivpn', 'ssh/zivpn', 'ssh/zivpn/udphc', 'sshvpn'].includes(serviceText) ? 'ssh' : '';
+}
+
+function sshExpiryTime(account = {}) {
+  const expired = notifyValue(account.exp || account.expired || account.date_exp || account.to);
+  const match = expired.match(/\b(\d{2}:\d{2}:\d{2})\b/);
+  return match ? match[1] : notifyValue(account.time);
+}
+
+function formatSshCreateNotification(action, service, account = {}, location = {}) {
+  if (!isCreateLikeAction(action)) return '';
+  if (!normalizedSshService(service)) return '';
+
+  const port = account.port || {};
+  const host = notifyValue(account.hostname || account.host || DOMAIN);
+  const username = notifyValue(account.username);
+  const password = notifyValue(account.password || account.secret);
+  const tlsPort = notifyPortValue(port, ['tls', 'ssl', 'any'], '443');
+  const ntlsPort = notifyPortValue(port, ['none', 'ntls', 'ws'], '80');
+  const dnsPort = notifyPortValue(port, ['dns', 'dnsslow', 'dnslow'], '5300');
+  const ovpnTcp = notifyPortValue(port, ['ovpntcp', 'ovpn_tcp'], '1194');
+  const ovpnUdp = notifyPortValue(port, ['ovpnudp', 'ovpn_udp'], '2200');
+  const sshOhp = notifyPortValue(port, ['sshohp', 'ssh_ohp'], '8181');
+  const udpCustom = notifyPortValue(
+    port,
+    ['udpcustom', 'udp_custom', 'udphc'],
+    notifyValue(account.udpcustom_port || account.udp_custom_port || process.env.UDPCUSTOM_LISTEN_PORT || 'undefined')
+  );
+  const city = notifyValue(account.city || location.city);
+  const isp = notifyValue(account.isp || location.isp);
+  const expired = notifyValue(account.exp || account.expired || account.date_exp || account.to);
+
+  return [
+    '=============================',
+    ' SSH ACCOUNT CREATED',
+    '=============================',
+    '',
+    '[ SSH PREMIUM DETAILS ]',
+    '-----------------------------',
+    notifyRow('SSH WS', `${host}:${ntlsPort}@${username}:${password}`),
+    notifyRow('SSH SSL', `${host}:${tlsPort}@${username}:${password}`),
+    notifyRow('DNS SELOW', `${host}:${dnsPort}@${username}:${password}`),
+    '',
+    '[ HOST INFORMATION ]',
+    '-----------------------------',
+    notifyRow('Hostname', host),
+    notifyRow('City', city),
+    notifyRow('ISP', isp),
+    notifyRow('Username', username),
+    notifyRow('Password', password),
+    notifyRow('Expiry Date', expired),
+    notifyRow('Expiry Time', sshExpiryTime(account)),
+    notifyRow('IP Limit', notifyValue(account.limitip ?? account.iplimit ?? 0, '0')),
+    '',
+    '[ PORTS ]',
+    '------------------------------',
+    notifyRow('TLS', tlsPort),
+    notifyRow('Non-TLS', ntlsPort),
+    notifyRow('OVPN TCP', ovpnTcp),
+    notifyRow('OVPN UDP', ovpnUdp),
+    notifyRow('SSH OHP', sshOhp),
+    notifyRow('UDP Custom', udpCustom),
+    '',
+    '[ PAYLOAD WS ]',
+    '------------------------------',
+    'GET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]',
+    '',
+    '[ PAYLOAD ENHANCED + SPLIT ]',
+    '------------------------------',
+    'PATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection:',
+    'Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]',
+    '------------------------------',
+    `Telegram Bots 1forcr - ${new Date().getFullYear()}`,
+    'Terima kasih telah menggunakan layanan kami.'
+  ].join('\n');
+}
+
 function formatAccountNotification(action, service, account = {}, owner = {}, location = {}) {
+  const sshMessage = formatSshCreateNotification(action, service, account, location);
+  if (sshMessage) return sshMessage;
+
   const xrayMessage = formatXrayCreateNotification(action, service, account, location);
   if (xrayMessage) return xrayMessage;
 

@@ -3322,7 +3322,6 @@ function formatXrayCreateNotification(action, service, account = {}, location = 
     notifyRow('GRPC TLS', grpcPort),
     notifyRow('ANY PORT', anyPort),
     '-----------------------------',
-    `Telegram Bots 1forcr - ${new Date().getFullYear()}`,
     'Terima kasih telah menggunakan layanan kami.'
   ].join('\n');
 }
@@ -3401,7 +3400,6 @@ function formatSshCreateNotification(action, service, account = {}, location = {
     'PATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection:',
     'Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]',
     '------------------------------',
-    `Telegram Bots 1forcr - ${new Date().getFullYear()}`,
     'Terima kasih telah menggunakan layanan kami.'
   ].join('\n');
 }

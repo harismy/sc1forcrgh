@@ -310,6 +310,17 @@ async function recordUpdateAck(ip, version, status, message) {
   return { ok: true, ip: safeIp, version: safeVersion, status: safeStatus };
 }
 
+async function getUpdateAckStatus(ip, version) {
+  const safeIp = cleanIp(ip);
+  const safeVersion = String(version || '').trim().slice(0, 80);
+  if (!safeIp || !safeVersion) return '';
+  const row = await dbGet(
+    'SELECT status FROM sc_update_acks WHERE vps_ip = ? AND version = ? LIMIT 1',
+    [safeIp, safeVersion]
+  ).catch(() => null);
+  return String(row?.status || '').trim().toLowerCase();
+}
+
 async function recordSummaryUpdateAck(ip, version, status, message) {
   const safeIp = cleanIp(ip);
   const safeVersion = String(version || '').trim().slice(0, 80);
@@ -327,6 +338,17 @@ async function recordSummaryUpdateAck(ip, version, status, message) {
     [safeIp, safeVersion, safeStatus, safeMessage, Date.now()]
   );
   return { ok: true, ip: safeIp, version: safeVersion, status: safeStatus };
+}
+
+async function getSummaryUpdateAckStatus(ip, version) {
+  const safeIp = cleanIp(ip);
+  const safeVersion = String(version || '').trim().slice(0, 80);
+  if (!safeIp || !safeVersion) return '';
+  const row = await dbGet(
+    'SELECT status FROM summary_update_acks WHERE vps_ip = ? AND version = ? LIMIT 1',
+    [safeIp, safeVersion]
+  ).catch(() => null);
+  return String(row?.status || '').trim().toLowerCase();
 }
 
 app.get('/health', async (_req, res) => {
@@ -553,6 +575,9 @@ app.post('/sc1forcr/update/check', requireBearer, async (req, res) => {
     const scInstallerPath = resolveScInstallerLocalPath();
     const summaryApiPath = resolveSummaryApiLocalPath();
     const hasInstaller = fs.existsSync(scInstallerPath);
+    const triggerVersion = String(trigger.version);
+    const ackStatus = await getUpdateAckStatus(reg.vps_ip, triggerVersion);
+    const alreadySucceeded = ackStatus === 'success';
     const scriptUrl = `${baseUrl}/sc1forcr/payload/scripts/setup-autoscript-compat.sh`;
     const summaryApiUrl = fs.existsSync(summaryApiPath)
       ? `${baseUrl}/sc1forcr/payload/scripts/setup-summary-api.sh`
@@ -561,12 +586,13 @@ app.post('/sc1forcr/update/check', requireBearer, async (req, res) => {
     return res.json({
       ok: true,
       allowed: true,
-      update_required: hasInstaller && currentVersion !== String(trigger.version),
-      version: String(trigger.version),
+      update_required: hasInstaller && !alreadySucceeded && currentVersion !== triggerVersion,
+      version: triggerVersion,
       note: String(trigger.note || ''),
       created_at: Number(trigger.created_at || 0) || null,
       script_url: hasInstaller ? scriptUrl : '',
       summary_api_url: summaryApiUrl,
+      ack_status: ackStatus,
       ip: reg.vps_ip
     });
   } catch (e) {
@@ -627,16 +653,20 @@ app.post('/sc1forcr/summary-update/check', requireBearer, async (req, res) => {
     const baseUrl = getBaseUrl(req);
     const summaryApiPath = resolveSummaryApiLocalPath();
     const hasInstaller = fs.existsSync(summaryApiPath);
+    const triggerVersion = String(trigger.version);
+    const ackStatus = await getSummaryUpdateAckStatus(reg.vps_ip, triggerVersion);
+    const alreadySucceeded = ackStatus === 'success';
     const summaryApiUrl = `${baseUrl}/sc1forcr/payload/scripts/setup-summary-api.sh`;
 
     return res.json({
       ok: true,
       allowed: true,
-      update_required: hasInstaller && currentVersion !== String(trigger.version),
-      version: String(trigger.version),
+      update_required: hasInstaller && !alreadySucceeded && currentVersion !== triggerVersion,
+      version: triggerVersion,
       note: String(trigger.note || ''),
       created_at: Number(trigger.created_at || 0) || null,
       summary_api_url: hasInstaller ? summaryApiUrl : '',
+      ack_status: ackStatus,
       ip: reg.vps_ip
     });
   } catch (e) {

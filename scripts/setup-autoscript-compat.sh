@@ -74,6 +74,7 @@ set -euo pipefail
 #   AUTO_REBOOT_SCHEDULE_MODE=interval           (opsional: interval|daily_wib)
 #   AUTO_REBOOT_WIB_HOUR=3                       (opsional, jam reboot harian WIB 0-23)
 #   AUTO_PULL_UPDATE_ENABLE=1                    (opsional, 1=cek trigger update dari bot)
+#   AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=360   (opsional, tahan retry versi update gagal agar tidak putus tiap cek)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
@@ -184,6 +185,7 @@ ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}"
+AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
@@ -2540,6 +2542,9 @@ AUTO_REBOOT_ENABLE=${AUTO_REBOOT_ENABLE}
 AUTO_REBOOT_INTERVAL_MINUTES=${AUTO_REBOOT_INTERVAL_MINUTES}
 AUTO_REBOOT_SCHEDULE_MODE=${AUTO_REBOOT_SCHEDULE_MODE}
 AUTO_REBOOT_WIB_HOUR=${AUTO_REBOOT_WIB_HOUR}
+AUTO_PULL_UPDATE_ENABLE=${AUTO_PULL_UPDATE_ENABLE}
+AUTO_PULL_UPDATE_INTERVAL_MINUTES=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}
+AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
@@ -8000,6 +8005,7 @@ SETTINGS_KEYS = [
     "AUTO_REBOOT_WIB_HOUR",
     "AUTO_PULL_UPDATE_ENABLE",
     "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
+    "AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES",
     "ONLINE_NOTIFY_ENABLE",
     "ONLINE_NOTIFY_INTERVAL_HOURS",
     "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
@@ -8634,6 +8640,7 @@ SETTINGS_KEYS = [
     "AUTO_REBOOT_WIB_HOUR",
     "AUTO_PULL_UPDATE_ENABLE",
     "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
+    "AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES",
     "ONLINE_NOTIFY_ENABLE",
     "ONLINE_NOTIFY_INTERVAL_HOURS",
     "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
@@ -9475,12 +9482,17 @@ EOF
 }
 
 setup_auto_pull_update_timer() {
-  local pull_interval_min
+  local pull_interval_min pull_fail_cooldown_min
   pull_interval_min="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
   if [[ -z "${pull_interval_min}" || "${pull_interval_min}" -lt 1 || "${pull_interval_min}" -gt 1440 ]]; then
     pull_interval_min="10"
   fi
+  pull_fail_cooldown_min="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
+  if [[ -z "${pull_fail_cooldown_min}" || "${pull_fail_cooldown_min}" -lt 10 || "${pull_fail_cooldown_min}" -gt 10080 ]]; then
+    pull_fail_cooldown_min="360"
+  fi
   AUTO_PULL_UPDATE_INTERVAL_MINUTES="${pull_interval_min}"
+  AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${pull_fail_cooldown_min}"
   [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" != "0" ]] && AUTO_PULL_UPDATE_ENABLE="1"
 
   log "Setup auto pull update dari trigger bot tiap ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} menit..."
@@ -9493,6 +9505,7 @@ ENV_FILE="/etc/sc-1forcr.env"
 [[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
 
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
 VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
@@ -9501,6 +9514,8 @@ export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
 export GOCACHE="${GOCACHE:-${XDG_CACHE_HOME}/go-build}"
 STATE_DIR="/var/lib/sc-1forcr"
 LAST_VERSION_FILE="${STATE_DIR}/last-pull-update.version"
+ATTEMPT_VERSION_FILE="${STATE_DIR}/last-pull-update.attempt.version"
+ATTEMPT_AT_FILE="${STATE_DIR}/last-pull-update.attempt.at"
 LOCK_FILE="/run/sc-1forcr-pull-update.lock"
 LOG_TAG="sc-1forcr-pull-update"
 
@@ -9511,6 +9526,41 @@ log_msg() {
 
 json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${1:-}"
+}
+
+retry_cooldown_seconds() {
+  local minutes
+  minutes="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
+  if [[ -z "${minutes}" || "${minutes}" -lt 10 || "${minutes}" -gt 10080 ]]; then
+    minutes="360"
+  fi
+  echo $((minutes * 60))
+}
+
+skip_recent_attempt() {
+  local version="$1" attempted_version attempted_at now cooldown age
+  attempted_version="$(cat "${ATTEMPT_VERSION_FILE}" 2>/dev/null || true)"
+  [[ "${attempted_version}" == "${version}" ]] || return 1
+  attempted_at="$(cat "${ATTEMPT_AT_FILE}" 2>/dev/null | tr -cd '0-9' || true)"
+  [[ -n "${attempted_at}" ]] || return 1
+  now="$(date +%s)"
+  cooldown="$(retry_cooldown_seconds)"
+  age=$((now - attempted_at))
+  if [[ "${age}" -ge 0 && "${age}" -lt "${cooldown}" ]]; then
+    log_msg "Skip update ${version}: percobaan sebelumnya baru ${age}s lalu, cooldown ${cooldown}s."
+    return 0
+  fi
+  return 1
+}
+
+mark_attempt() {
+  local version="$1"
+  printf '%s\n' "${version}" > "${ATTEMPT_VERSION_FILE}" 2>/dev/null || true
+  date +%s > "${ATTEMPT_AT_FILE}" 2>/dev/null || true
+}
+
+clear_attempt() {
+  rm -f "${ATTEMPT_VERSION_FILE}" "${ATTEMPT_AT_FILE}" >/dev/null 2>&1 || true
 }
 
 detect_public_ipv4_pull() {
@@ -9605,12 +9655,18 @@ main_pull_update() {
   if [[ "${version}" == "${current_version}" ]]; then
     exit 0
   fi
+  if skip_recent_attempt "${version}"; then
+    ack_update "${base_url}" "${version}" "skipped" "skip retry: cooldown percobaan update masih aktif" "${vps_ip}"
+    exit 0
+  fi
   note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
 
   log_msg "Trigger update diterima dari bot: ${version}${note:+ (${note})}"
+  mark_attempt "${version}"
   ack_update "${base_url}" "${version}" "running" "update mulai" "${vps_ip}"
   if /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
+    clear_attempt
     ack_update "${base_url}" "${version}" "success" "update selesai" "${vps_ip}"
     log_msg "Update trigger ${version} selesai."
   else
@@ -9636,11 +9692,14 @@ ENV_FILE="/etc/sc-1forcr.env"
 [[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
 
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
+AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
 VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
 STATE_DIR="/var/lib/sc-1forcr"
 LAST_VERSION_FILE="${STATE_DIR}/last-summary-update.version"
+ATTEMPT_VERSION_FILE="${STATE_DIR}/last-summary-update.attempt.version"
+ATTEMPT_AT_FILE="${STATE_DIR}/last-summary-update.attempt.at"
 LOCK_FILE="/run/sc-1forcr-pull-summary-update.lock"
 LOG_TAG="sc-1forcr-pull-summary-update"
 
@@ -9651,6 +9710,41 @@ log_msg() {
 
 json_escape() {
   python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${1:-}"
+}
+
+retry_cooldown_seconds() {
+  local minutes
+  minutes="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
+  if [[ -z "${minutes}" || "${minutes}" -lt 10 || "${minutes}" -gt 10080 ]]; then
+    minutes="360"
+  fi
+  echo $((minutes * 60))
+}
+
+skip_recent_attempt() {
+  local version="$1" attempted_version attempted_at now cooldown age
+  attempted_version="$(cat "${ATTEMPT_VERSION_FILE}" 2>/dev/null || true)"
+  [[ "${attempted_version}" == "${version}" ]] || return 1
+  attempted_at="$(cat "${ATTEMPT_AT_FILE}" 2>/dev/null | tr -cd '0-9' || true)"
+  [[ -n "${attempted_at}" ]] || return 1
+  now="$(date +%s)"
+  cooldown="$(retry_cooldown_seconds)"
+  age=$((now - attempted_at))
+  if [[ "${age}" -ge 0 && "${age}" -lt "${cooldown}" ]]; then
+    log_msg "Skip summary update ${version}: percobaan sebelumnya baru ${age}s lalu, cooldown ${cooldown}s."
+    return 0
+  fi
+  return 1
+}
+
+mark_attempt() {
+  local version="$1"
+  printf '%s\n' "${version}" > "${ATTEMPT_VERSION_FILE}" 2>/dev/null || true
+  date +%s > "${ATTEMPT_AT_FILE}" 2>/dev/null || true
+}
+
+clear_attempt() {
+  rm -f "${ATTEMPT_VERSION_FILE}" "${ATTEMPT_AT_FILE}" >/dev/null 2>&1 || true
 }
 
 detect_public_ipv4_pull() {
@@ -9744,13 +9838,19 @@ main_pull_summary_update() {
   if [[ "${version}" == "${current_version}" ]]; then
     exit 0
   fi
+  if skip_recent_attempt "${version}"; then
+    ack_summary_update "${base_url}" "${version}" "skipped" "skip retry: cooldown percobaan summary update masih aktif" "${vps_ip}"
+    exit 0
+  fi
   note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
   summary_url="$(echo "${resp}" | jq -r '.summary_api_url // empty' 2>/dev/null || true)"
 
   log_msg "Trigger update Summary API diterima dari bot: ${version}${note:+ (${note})}"
+  mark_attempt "${version}"
   ack_summary_update "${base_url}" "${version}" "running" "summary update mulai" "${vps_ip}"
   if SUMMARY_API_SETUP_URL="${summary_url:-${SUMMARY_API_SETUP_URL:-}}" /usr/local/sbin/menu-sc-1forcr update-summary >/var/log/sc-1forcr-pull-summary-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
+    clear_attempt
     ack_summary_update "${base_url}" "${version}" "success" "summary update selesai" "${vps_ip}"
     log_msg "Update Summary API trigger ${version} selesai."
   else
@@ -9906,6 +10006,7 @@ ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
 AUTO_PULL_UPDATE_ENABLE=${AUTO_PULL_UPDATE_ENABLE}
 AUTO_PULL_UPDATE_INTERVAL_MINUTES=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}
+AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}
 ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
@@ -10124,6 +10225,7 @@ ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
 DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
 DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
@@ -10149,6 +10251,7 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
 [[ "${AUTO_PULL_UPDATE_ENABLE}" != "0" ]] && AUTO_PULL_UPDATE_ENABLE="1"
 [[ -z "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -lt 1 || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -gt 1440 ]] && AUTO_PULL_UPDATE_INTERVAL_MINUTES="10"
+[[ -z "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" || "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" -lt 10 || "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" -gt 10080 ]] && AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="360"
 
 # Compatibility helpers for older runtime files on upgraded VPS.
 flag_enabled() {
@@ -10923,18 +11026,22 @@ set_auto_reboot_config_menu() {
 }
 
 set_auto_pull_update_config_menu() {
-  local current_enable current_interval current_hours enable_in mode_in val_in interval_min
+  local current_enable current_interval current_hours current_cooldown enable_in mode_in val_in interval_min cooldown_in cooldown_min
   current_enable="${AUTO_PULL_UPDATE_ENABLE:-1}"
   [[ "${current_enable}" != "0" ]] && current_enable="1"
   current_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
   [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 1440 ]] && current_interval="10"
   current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
+  current_cooldown="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
+  [[ -z "${current_cooldown}" || "${current_cooldown}" -lt 10 || "${current_cooldown}" -gt 10080 ]] && current_cooldown="360"
 
   draw_menu_header "SETTING AUTO UPDATE BOT"
   echo "Status saat ini   : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "Interval saat ini : ${current_interval} menit (~${current_hours} jam)"
+  echo "Cooldown gagal    : ${current_cooldown} menit"
   echo
   echo "Jika NONAKTIF, VPS ini tidak akan menjalankan update saat admin trigger dari bot."
+  echo "Cooldown mencegah retry versi gagal terus-menerus yang bisa memutus tunnel."
   echo "Update manual dari menu tetap bisa dijalankan."
   echo
   echo "Kosongkan input untuk mempertahankan nilai lama."
@@ -10992,12 +11099,26 @@ set_auto_pull_update_config_menu() {
     interval_min="$(( val_in * 60 ))"
   fi
 
+  if ! prompt_input cooldown_in "Cooldown retry jika update gagal (menit, 10-10080) [${current_cooldown}]: "; then
+    return
+  fi
+  [[ "${cooldown_in,,}" == "batal" ]] && return
+  cooldown_in="${cooldown_in:-${current_cooldown}}"
+  if [[ ! "${cooldown_in}" =~ ^[0-9]+$ || "${cooldown_in}" -lt 10 || "${cooldown_in}" -gt 10080 ]]; then
+    echo "Cooldown harus angka 10-10080 menit."
+    return
+  fi
+  cooldown_min="${cooldown_in}"
+
   AUTO_PULL_UPDATE_ENABLE="${enable_in}"
   AUTO_PULL_UPDATE_INTERVAL_MINUTES="${interval_min}"
+  AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${cooldown_min}"
   update_sc_env_var "AUTO_PULL_UPDATE_ENABLE" "${AUTO_PULL_UPDATE_ENABLE}"
   update_sc_env_var "AUTO_PULL_UPDATE_INTERVAL_MINUTES" "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
+  update_sc_env_var "AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES" "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}"
   update_app_env_var "AUTO_PULL_UPDATE_ENABLE" "${AUTO_PULL_UPDATE_ENABLE}"
   update_app_env_var "AUTO_PULL_UPDATE_INTERVAL_MINUTES" "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
+  update_app_env_var "AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES" "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}"
 
   if [[ -f /etc/systemd/system/sc-1forcr-pull-update.service ]]; then
     write_pull_update_timer_unit "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}"
@@ -11024,6 +11145,7 @@ set_auto_pull_update_config_menu() {
   echo "Berhasil update auto update bot:"
   echo "- Status   : $([[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "- Interval : ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} menit"
+  echo "- Cooldown : ${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES} menit"
 }
 
 set_auto_backup_config_menu() {
@@ -15877,6 +15999,7 @@ Time     : $(date '+%F %T')"
     AUTO_REBOOT_WIB_HOUR="${AUTO_REBOOT_WIB_HOUR:-3}" \
     AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}" \
     AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" \
+    AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" \
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
     ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
     ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" \
@@ -17082,7 +17205,7 @@ persist_pending_install_env() {
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
-    AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES
+    AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES
     IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
     SSHWS_TCP_KEEPALIVE_SECONDS SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN

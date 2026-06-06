@@ -3110,15 +3110,43 @@ function accountLinkValue(value) {
   return s ? s.slice(0, 1800) : '';
 }
 
-function accountXrayLinkLines(action, service, account = {}) {
-  const actionText = String(action || '').trim().toLowerCase();
-  if (!['create', 'created', 'trial'].includes(actionText)) return [];
+function accountFirstLinkValue(...values) {
+  for (const value of values) {
+    if (Array.isArray(value)) {
+      const nested = accountFirstLinkValue(...value);
+      if (nested) return nested;
+      continue;
+    }
+    if (value && typeof value === 'object') {
+      const nested = accountFirstLinkValue(value.link, value.url, value.value);
+      if (nested) return nested;
+      continue;
+    }
+    const text = accountLinkValue(value);
+    if (text) return text;
+  }
+  return '';
+}
+
+function normalizedXrayService(service) {
   const serviceText = String(service || '').trim().toLowerCase();
-  if (!['vmess', 'vless', 'trojan'].includes(serviceText)) return [];
+  return ['vmess', 'vless', 'trojan'].includes(serviceText) ? serviceText : '';
+}
+
+function isCreateLikeAction(action) {
+  return ['create', 'created', 'trial'].includes(String(action || '').trim().toLowerCase());
+}
+
+function accountXrayLinkBundle(service, account = {}) {
+  const serviceText = normalizedXrayService(service);
+  if (!serviceText) return { tls: '', ntls: '', grpc: '', uptls: '', upntls: '' };
   const links = account.link && typeof account.link === 'object' ? account.link : {};
-  let tls = accountLinkValue(links.tls || links.uptls);
-  let ntls = accountLinkValue(links.none || links.ntls || links.upntls);
-  if (!tls || !ntls) {
+  let tls = accountFirstLinkValue(links.tls, links.ws_tls, links.uptls, links.bugtls, links.front_tls, links.bugtls_all, links.front_tls_all);
+  let ntls = accountFirstLinkValue(links.none, links.ntls, links.ws_ntls, links.upntls, links.bugntls, links.front_none, links.bugntls_all, links.front_none_all);
+  let grpc = accountFirstLinkValue(links.grpc, links.grpc_tls, links.grpcs);
+  let uptls = accountFirstLinkValue(links.uptls, links.up_tls, links.tls);
+  let upntls = accountFirstLinkValue(links.upntls, links.up_ntls, links.none, links.ntls);
+  if (!tls || !ntls || !grpc) {
     const host = String(account.hostname || account.host || XRAY_LINK_HOST || DOMAIN || '').trim();
     const username = String(account.username || '').trim();
     const secret = String(account.uuid || account.password || account.secret || account.id || '').trim();
@@ -3126,25 +3154,183 @@ function accountXrayLinkLines(action, service, account = {}) {
       if (serviceText === 'vmess') {
         if (!tls) tls = accountLinkValue(vmessLink(host, secret, true, username));
         if (!ntls) ntls = accountLinkValue(vmessLink(host, secret, false, username));
+        if (!grpc) grpc = accountLinkValue(vmessGrpcLink(host, secret, username));
+        if (!uptls) uptls = accountLinkValue(vmessLink(host, secret, true, username));
+        if (!upntls) upntls = accountLinkValue(vmessLink(host, secret, false, username));
       } else if (serviceText === 'vless') {
         if (!tls) tls = accountLinkValue(vlessLink(host, secret, true, username));
         if (!ntls) ntls = accountLinkValue(vlessLink(host, secret, false, username));
+        if (!grpc) grpc = accountLinkValue(vlessGrpcLink(host, secret, username));
+        if (!uptls) uptls = accountLinkValue(vlessLink(host, secret, true, username));
+        if (!upntls) upntls = accountLinkValue(vlessLink(host, secret, false, username));
       } else if (serviceText === 'trojan') {
         if (!tls) tls = accountLinkValue(trojanLink(host, secret, true, username));
         if (!ntls) ntls = accountLinkValue(trojanLink(host, secret, false, username));
+        if (!grpc) grpc = accountLinkValue(trojanGrpcLink(host, secret, username));
+        if (!uptls) uptls = accountLinkValue(trojanLink(host, secret, true, username));
+        if (!upntls) upntls = accountLinkValue(trojanLink(host, secret, false, username));
       }
     }
   }
-  if (!tls && !ntls) return [];
+  return {
+    tls,
+    ntls,
+    grpc,
+    uptls: uptls || tls,
+    upntls: upntls || ntls
+  };
+}
+
+function accountXrayLinkLines(action, service, account = {}) {
+  if (!isCreateLikeAction(action)) return [];
+  const serviceText = normalizedXrayService(service);
+  if (!serviceText) return [];
+  const { tls, ntls, grpc } = accountXrayLinkBundle(serviceText, account);
+  if (!tls && !ntls && !grpc) return [];
   return [
     '',
     'LINK XRAY',
     `Link TLS : ${tls || '-'}`,
-    `Link NTLS: ${ntls || '-'}`
+    `Link NTLS: ${ntls || '-'}`,
+    `Link GRPC: ${grpc || '-'}`
   ];
 }
 
+function notifyRow(label, value) {
+  return `${String(label || '').padEnd(12, ' ')}: ${notifyValue(value)}`;
+}
+
+function accountPathPart(account = {}, key = 'ws', fallback = '-') {
+  const path = account.path;
+  if (path && typeof path === 'object') {
+    if (path[key]) return notifyValue(path[key]);
+    if (key === 'ws') return notifyValue(path.ws || path.stn || path.multi || fallback);
+  }
+  if (typeof path === 'string' && key === 'ws') return notifyValue(path);
+  return notifyValue(account[`${key}_path`] || fallback);
+}
+
+function accountExpiredText(account = {}) {
+  const expired = notifyValue(account.exp || account.expired || account.date_exp || account.to);
+  if (expired === '-') return expired;
+  if (expired.includes(' - ')) return expired;
+  const match = expired.match(/\b(\d{2}:\d{2}:\d{2})\b/);
+  return match ? `${expired} - ${match[1]}` : expired;
+}
+
+function accountIpLimitText(account = {}) {
+  const raw = account.limitip ?? account.iplimit ?? 0;
+  const n = Number(raw);
+  if (Number.isFinite(n)) return `${n} pengguna`;
+  return notifyValue(raw);
+}
+
+function accountProtocolDetailRows(serviceText, secretValue) {
+  if (serviceText === 'vmess') {
+    return [
+      notifyRow('UUID', secretValue),
+      notifyRow('ALTER ID', '0'),
+      notifyRow('SECURITY', 'auto')
+    ];
+  }
+  if (serviceText === 'vless') {
+    return [
+      notifyRow('UUID', secretValue),
+      notifyRow('ENCRYPTION', 'none'),
+      notifyRow('SECURITY', 'tls / none')
+    ];
+  }
+  return [
+    notifyRow('PASSWORD', secretValue),
+    notifyRow('SECURITY', 'tls / none')
+  ];
+}
+
+function formatXrayCreateNotification(action, service, account = {}, location = {}) {
+  if (!isCreateLikeAction(action)) return '';
+  const serviceText = normalizedXrayService(service);
+  if (!serviceText) return '';
+
+  const title = serviceLabel(serviceText);
+  const username = notifyValue(account.username);
+  const port = account.port || {};
+  const tlsPort = notifyPortValue(port, ['tls', 'any'], '443');
+  const ntlsPort = notifyPortValue(port, ['none', 'ntls'], '80');
+  const grpcPort = notifyPortValue(port, ['grpc'], '443');
+  const anyPort = notifyPortValue(port, ['any', 'tls'], '443');
+  const host = notifyValue(account.hostname || account.host || XRAY_LINK_HOST || DOMAIN);
+  const secret = notifyValue(account.uuid || account.password || account.secret || account.id);
+  const pathWs = accountPathPart(account, 'ws', `/${serviceText}`);
+  const pathUpgrade = accountPathPart(account, 'upgrade', `/up${serviceText}`);
+  const serviceName = notifyValue(account.serviceName || `${serviceText}-grpc`);
+  const city = notifyValue(account.city || location.city);
+  const isp = notifyValue(account.isp || location.isp);
+  const domain = notifyValue(DOMAIN || host);
+  const sni = notifyValue(account.sni || account.server_name || host);
+  const links = accountXrayLinkBundle(serviceText, account);
+
+  return [
+    '=============================',
+    `        ${title} ACCOUNT`,
+    '=============================',
+    '',
+    `[ ${title} DETAILS ]`,
+    '-----------------------------',
+    notifyRow('REMARKS', username),
+    notifyRow('HOST', host),
+    notifyRow('PORT TLS', tlsPort),
+    notifyRow('PORT NTLS', ntlsPort),
+    notifyRow('PORT GRPC', grpcPort),
+    notifyRow('PORT ANY', anyPort),
+    ...accountProtocolDetailRows(serviceText, secret),
+    notifyRow('NETWORK', 'ws, grpc, upgrade'),
+    notifyRow('PATH WS', pathWs),
+    notifyRow('SERVICE', serviceName),
+    notifyRow('PATH UPGRADE', pathUpgrade),
+    notifyRow('EXPIRED', accountExpiredText(account)),
+    notifyRow('QUOTA', accountQuotaValue(account)),
+    notifyRow('IP LIMIT', accountIpLimitText(account)),
+    '',
+    `[ ${title} URL ]`,
+    '-----------------------------',
+    'TLS:',
+    links.tls || '-',
+    '',
+    'Non-TLS:',
+    links.ntls || '-',
+    '',
+    'gRPC:',
+    links.grpc || '-',
+    '',
+    'Up TLS:',
+    links.uptls || '-',
+    '',
+    'Up Non-TLS:',
+    links.upntls || '-',
+    '',
+    '[ HOST INFORMATION ]',
+    '-----------------------------',
+    notifyRow('Domain', domain),
+    notifyRow('SNI', sni),
+    notifyRow('City', city),
+    notifyRow('ISP', isp),
+    '',
+    '[ PORTS ]',
+    '-----------------------------',
+    notifyRow('WS TLS', tlsPort),
+    notifyRow('WS NTLS', ntlsPort),
+    notifyRow('GRPC TLS', grpcPort),
+    notifyRow('ANY PORT', anyPort),
+    '-----------------------------',
+    `Telegram Bots 1forcr - ${new Date().getFullYear()}`,
+    'Terima kasih telah menggunakan layanan kami.'
+  ].join('\n');
+}
+
 function formatAccountNotification(action, service, account = {}, owner = {}, location = {}) {
+  const xrayMessage = formatXrayCreateNotification(action, service, account, location);
+  if (xrayMessage) return xrayMessage;
+
   const username = notifyValue(account.username);
   const kind = /^trial/i.test(username) || String(action || '').trim().toLowerCase() === 'trial' ? 'TRIAL' : 'REGULER';
   const secret = accountSecretInfo(service, account);

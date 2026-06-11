@@ -51,6 +51,7 @@ const DYNAMIC_SETTING_KEYS = [
   'TOPUP_EXPIRE_MS',
   'TOPUP_SUCCESS_NOTIFY_ENABLE',
   'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS',
+  'SC_H2_REMINDER_INTERVAL_MINUTES',
   'RESELLER_ADMIN_WA',
   'AUTO_PROVISION_DOMAIN',
   'CERTBOT_EMAIL',
@@ -65,6 +66,7 @@ const SETTING_LABELS = {
   TOPUP_EXPIRE_MS: 'Masa Aktif QR Top Up',
   TOPUP_SUCCESS_NOTIFY_ENABLE: 'Notif TopUp Sukses',
   TOPUP_SUCCESS_NOTIFY_ADMIN_IDS: 'Admin ID Notif TopUp',
+  SC_H2_REMINDER_INTERVAL_MINUTES: 'Interval Reminder H-2 SC',
   RESELLER_ADMIN_WA: 'Nomor WA Admin Reseller',
   AUTO_PROVISION_DOMAIN: 'Auto Setup Domain',
   CERTBOT_EMAIL: 'Email Certbot',
@@ -85,6 +87,14 @@ const SC_H2_WINDOW_MS = Math.max(
   60 * 60 * 1000,
   Number(process.env.SC_H2_WINDOW_MS || 0) ||
     ((Number(process.env.SC_H2_WINDOW_HOURS || 48) || 48) * 60 * 60 * 1000)
+);
+const DEFAULT_SC_H2_REMINDER_INTERVAL_MINUTES = Math.max(
+  1,
+  Math.floor(
+    Number(process.env.SC_H2_REMINDER_INTERVAL_MINUTES || 0) ||
+      (Number(process.env.SC_H2_REMINDER_INTERVAL_MS || 0) / 60000) ||
+      ((Number(process.env.SC_H2_REMINDER_REPEAT_HOURS || 72) || 72) * 60)
+  )
 );
 const SC_IP_CHANGE_MAX = 2;
 const MIGRATION_ROLLBACK_TTL_MS = Math.max(
@@ -344,6 +354,7 @@ async function seedDefaultSettings() {
     TOPUP_EXPIRE_MS: String(DEFAULT_TOPUP_EXPIRE_MS),
     TOPUP_SUCCESS_NOTIFY_ENABLE: '1',
     TOPUP_SUCCESS_NOTIFY_ADMIN_IDS: ADMIN_IDS.join(','),
+    SC_H2_REMINDER_INTERVAL_MINUTES: String(DEFAULT_SC_H2_REMINDER_INTERVAL_MINUTES),
     RESELLER_ADMIN_WA: '089612745096',
     SC_FEATURES_INFO_TEXT: defaultScFeaturesText,
     AUTO_PROVISION_DOMAIN: DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0',
@@ -470,6 +481,16 @@ async function getTopupSuccessNotifyAdminIds() {
   return ids.length ? ids : ADMIN_IDS;
 }
 
+async function getScH2ReminderIntervalMs() {
+  const minutes = await getSettingNumber(
+    'SC_H2_REMINDER_INTERVAL_MINUTES',
+    DEFAULT_SC_H2_REMINDER_INTERVAL_MINUTES,
+    1,
+    525600
+  );
+  return Math.max(60000, minutes * 60000);
+}
+
 function normalizeWaNumber(raw) {
   const digits = String(raw || '').replace(/\D/g, '');
   if (!digits) return '';
@@ -559,22 +580,26 @@ async function getSummaryApiLocalPath() {
 }
 
 async function getDynamicSettingsSnapshot() {
-  const [pricePerDay, unlimitedPrice, minDays, minTopup, expMs, autoProv, certEmail, installerPath] = await Promise.all([
+  const [pricePerDay, resellerPrice, unlimitedPrice, minDays, minTopup, expMs, h2ReminderMs, autoProv, certEmail, installerPath] = await Promise.all([
     getRegistrationPricePerDay(),
+    getSettingNumber('SC_RESELLER_PRICE_PER_DAY', DEFAULT_SC_REGISTRATION_PRICE_PER_DAY, 0, 1000000000),
     getUnlimitedPrice(),
     getRegistrationMinDays(),
     getTopupMin(),
     getTopupExpireMs(),
+    getScH2ReminderIntervalMs(),
     getAutoProvisionDomain(),
     getCertbotEmail(),
     getScInstallerLocalPath()
   ]);
   return {
     SC_REGISTRATION_PRICE_PER_DAY: String(pricePerDay),
+    SC_RESELLER_PRICE_PER_DAY: String(resellerPrice),
     SC_UNLIMITED_PRICE: String(unlimitedPrice),
     SC_REGISTRATION_MIN_DAYS: String(minDays),
     TOPUP_MIN: String(minTopup),
     TOPUP_EXPIRE_MS: String(expMs),
+    SC_H2_REMINDER_INTERVAL_MINUTES: String(Math.max(1, Math.floor(Number(h2ReminderMs || 0) / 60000))),
     AUTO_PROVISION_DOMAIN: autoProv ? '1' : '0',
     CERTBOT_EMAIL: certEmail || '-',
     SC_INSTALLER_LOCAL_PATH: installerPath
@@ -1641,6 +1666,7 @@ async function notifySingleUserInBot(userId, message) {
 async function runNaturalScExpiryJobs() {
   const now = Date.now();
   const remindUntil = now + SC_H2_WINDOW_MS;
+  const h2ReminderIntervalMs = await getScH2ReminderIntervalMs();
   const activeRows = await dbAll(
     "SELECT user_id, vps_ip, client_name, status, expires_at FROM sc_registrations " +
       "WHERE status='active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
@@ -1729,16 +1755,19 @@ async function runNaturalScExpiryJobs() {
       continue;
     }
 
-    const canRemind = await shouldSendScNotify(uid, host, 'h2_reminder_user', SC_NOTIFY_INTERVAL_MS);
+    const canRemind = await shouldSendScNotify(uid, host, 'h2_reminder_user', h2ReminderIntervalMs);
     if (canRemind) {
       const remain = formatRemainingDays(expTs);
       const sent = await notifySingleUserInBot(
         uid,
-        `Pengingat H-2: masa aktif SC akan segera habis.\n` +
-          `IP VPS: ${host}\n` +
-          `Expired: ${formatDateTime(expTs)}\n` +
-          `Sisa: ${remain}\n\n` +
-          `Silakan perpanjang agar akses tidak terblokir.`
+        `SC 1FORCR REMINDER H-2\n` +
+          `==============================\n` +
+          `Masa aktif script kamu akan segera habis.\n\n` +
+          `IP VPS  : ${host}\n` +
+          `Client  : ${normalizeClientName(row?.client_name || host) || host}\n` +
+          `Expired : ${formatDateTime(expTs)}\n` +
+          `Sisa    : ${remain}\n\n` +
+          `Silakan perpanjang sebelum expired agar akses tidak terblokir.`
       );
       if (sent) {
         await markScNotifySent(uid, host, 'h2_reminder_user');
@@ -1750,20 +1779,28 @@ async function runNaturalScExpiryJobs() {
 
     const serverKey = await getServerKeyForHost(uid, host);
     if (serverKey) {
-      const canRemindLocal = await shouldSendScNotify(uid, host, 'h2_reminder_local', SC_NOTIFY_INTERVAL_MS);
+      const canRemindLocal = await shouldSendScNotify(uid, host, 'h2_reminder_local', h2ReminderIntervalMs);
       if (canRemindLocal) {
+        const remain = formatRemainingDays(expTs);
         try {
           await notifyScExpiredOnHost(host, serverKey, {
             ip: host,
             reason: 'h2_reminder',
             actor: String(uid),
+            status: 'active',
+            expires_at: expTs,
             users: [String(uid)],
             message:
               'SC 1FORCR NOTIF\n' +
-              'Reminder : H-2 masa aktif SC\n' +
-              `IP VPS   : ${host}\n` +
-              `User     : ${uid}\n` +
-              `Expired  : ${formatDateTime(expTs)}\n\n` +
+              '==============================\n' +
+              'Event   : SC H-2 REMINDER\n' +
+              'Status  : AKTIF\n' +
+              `IP VPS  : ${host}\n` +
+              `Client  : ${normalizeClientName(row?.client_name || host) || host}\n` +
+              `User ID : ${uid}\n` +
+              `Expired : ${formatDateTime(expTs)}\n` +
+              `Sisa    : ${remain}\n` +
+              '==============================\n\n' +
               'Silakan perpanjang sebelum expired.'
           });
           await markScNotifySent(uid, host, 'h2_reminder_local');
@@ -2370,6 +2407,7 @@ function adminEnvGroupMenu(group) {
       [Markup.button.callback(getSettingLabel('TOPUP_EXPIRE_MS'), 'm_admin_env_pick_TOPUP_EXPIRE_MS')],
       [Markup.button.callback(getSettingLabel('TOPUP_SUCCESS_NOTIFY_ENABLE'), 'm_admin_env_pick_TOPUP_SUCCESS_NOTIFY_ENABLE')],
       [Markup.button.callback(getSettingLabel('TOPUP_SUCCESS_NOTIFY_ADMIN_IDS'), 'm_admin_env_pick_TOPUP_SUCCESS_NOTIFY_ADMIN_IDS')],
+      [Markup.button.callback(getSettingLabel('SC_H2_REMINDER_INTERVAL_MINUTES'), 'm_admin_env_pick_SC_H2_REMINDER_INTERVAL_MINUTES')],
       [Markup.button.callback('Kembali', 'm_admin_env_set')]
     ]);
   }
@@ -2407,6 +2445,8 @@ function envKeyInputHint(key) {
       return 'Isi: 1 atau 0 (1=aktif, 0=nonaktif).';
     case 'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS':
       return;
+    case 'SC_H2_REMINDER_INTERVAL_MINUTES':
+      return 'Isi angka menit. Contoh: 10, 60, 1440.';
     case 'RESELLER_ADMIN_WA':
       return;
     case 'AUTO_PROVISION_DOMAIN':
@@ -3546,6 +3586,7 @@ bot.action('m_admin_env_show', async (ctx) => {
       `${getSettingLabel('SC_REGISTRATION_MIN_DAYS')} : ${snap.SC_REGISTRATION_MIN_DAYS} hari`,
       `${getSettingLabel('TOPUP_MIN')} : Rp ${Number(snap.TOPUP_MIN || 0).toLocaleString('id-ID')}`,
       `${getSettingLabel('TOPUP_EXPIRE_MS')} : ${topupExpireMinute} menit`,
+      `${getSettingLabel('SC_H2_REMINDER_INTERVAL_MINUTES')} : ${Number(snap.SC_H2_REMINDER_INTERVAL_MINUTES || 0).toLocaleString('id-ID')} menit`,
       `${getSettingLabel('AUTO_PROVISION_DOMAIN')} : ${String(snap.AUTO_PROVISION_DOMAIN) === '1' ? 'Aktif' : 'Nonaktif'}`,
       `${getSettingLabel('CERTBOT_EMAIL')} : ${snap.CERTBOT_EMAIL || '-'}`,
       `${getSettingLabel('SC_INSTALLER_LOCAL_PATH')} :`,
@@ -3901,13 +3942,14 @@ bot.action('m_register_sc_extend', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   userState.set(ctx.chat.id, { step: 'extend_sc_ip' });
   await ctx.reply(
-    uiBox('PERPANJANG SC', [
-      'Masukkan IP VPS yang ingin diperpanjang.',
-      '',
-      'Setelah itu bot akan minta key server VPS.',
-      '',
-      'Ketik "batal" untuk membatalkan.'
-    ])
+      uiBox('PERPANJANG SC', [
+        'Masukkan IP VPS yang ingin diperpanjang.',
+        '',
+        'IP harus sudah terdaftar di akun kamu.',
+        'Setelah itu bot langsung minta jumlah hari.',
+        '',
+        'Ketik "batal" untuk membatalkan.'
+      ])
   );
 });
 
@@ -4607,6 +4649,10 @@ bot.on('text', async (ctx) => {
           .filter((n) => Number.isInteger(n) && n > 0);
         if (!ids.length) return ctx.reply('Isi minimal 1 Telegram ID admin.');
         value = ids.join(',');
+      } else if (key === 'SC_H2_REMINDER_INTERVAL_MINUTES') {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n < 1) return ctx.reply('Harus angka menit >= 1.');
+        value = String(Math.floor(n));
       } else if (key === 'RESELLER_ADMIN_WA') {
         const wa = normalizeWaNumber(value);
         if (!wa || wa.length < 9) return ctx.reply('Nomor WA tidak valid.');
@@ -5490,20 +5536,20 @@ bot.on('text', async (ctx) => {
       }
 
       const clientName = normalizeClientName(reg.client_name || ctx.from.first_name || ip) || ip;
-      state.step = 'extend_sc_key';
+      state.step = 'extend_sc_days';
       state.ip = ip;
       state.clientName = clientName;
       userState.set(ctx.chat.id, state);
       return ctx.reply(
-        uiBox('KONFIRMASI PERPANJANGAN SC', [
+        uiBox('INPUT DURASI PERPANJANGAN', [
           `Nama Client   : ${clientName}`,
           `IP VPS        : ${ip}`,
           `Expired Saat Ini : ${formatDateTime(reg.expires_at)}`,
+          `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
+          `Minimal Hari  : ${minDays}`,
+          `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
           '',
-          'Masukkan key server VPS terlebih dahulu.',
-          'Key ini akan disimpan otomatis di database bot.',
-          '',
-          ''
+          'Masukkan jumlah hari perpanjangan.'
         ])
       );
     }

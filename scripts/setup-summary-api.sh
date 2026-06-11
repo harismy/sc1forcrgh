@@ -2208,6 +2208,75 @@ async function sendScTelegramMessage(textInput) {
   }
 }
 
+function formatScNotifyDateTime(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return '-';
+  return new Date(n).toLocaleString('id-ID', { hour12: false, timeZone: 'Asia/Jakarta' });
+}
+
+function formatScNotifyRemaining(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return '-';
+  const diff = n - Date.now();
+  if (diff <= 0) return 'sudah expired';
+  const totalMinutes = Math.floor(diff / 60000);
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days} hari ${hours} jam ${minutes} menit`;
+  if (hours > 0) return `${hours} jam ${minutes} menit`;
+  return `${Math.max(1, minutes)} menit`;
+}
+
+function buildScExpiredNotifyMessage(payload = {}) {
+  const customMessage = String(payload?.message || '').trim();
+  if (customMessage) return customMessage;
+
+  const ip = String(payload?.ip || '').trim() || '-';
+  const reason = String(payload?.reason || 'expired').trim();
+  const actor = String(payload?.actor || '-').trim();
+  const users = Array.isArray(payload?.users) ? payload.users : [];
+  const usersText = users
+    .map((u) => String(u || '').trim())
+    .filter(Boolean)
+    .slice(0, 50)
+    .join(', ');
+  const expiresAt = Number(payload?.expires_at || payload?.expired_at || 0);
+  const isReminder = reason === 'h2_reminder';
+
+  if (isReminder) {
+    return [
+      'SC 1FORCR NOTIF',
+      '==============================',
+      'Event   : SC H-2 REMINDER',
+      'Status  : AKTIF',
+      `IP VPS  : ${ip}`,
+      `Actor   : ${actor}`,
+      `Users   : ${usersText || '-'}`,
+      `Expired : ${formatScNotifyDateTime(expiresAt)}`,
+      `Sisa    : ${formatScNotifyRemaining(expiresAt)}`,
+      '==============================',
+      '',
+      'Silakan perpanjang sebelum expired agar akses tidak terblokir.'
+    ].join('\n');
+  }
+
+  return [
+    'SC 1FORCR NOTIF',
+    '==============================',
+    'Event  : SC EXPIRED',
+    'Status : SC expired',
+    `IP VPS : ${ip}`,
+    `Reason : ${reason}`,
+    `Actor  : ${actor}`,
+    `Users  : ${usersText || '-'}`,
+    `Time   : ${formatScNotifyDateTime(Date.now())}`,
+    '==============================',
+    '',
+    'Silakan perpanjang SC jika ingin akses kembali.'
+  ].join('\n');
+}
+
 function readCoreApiRuntimeConfig() {
   const envFile = '/opt/sc-1forcr/.env';
   let token = String(process.env.CORE_AUTH_TOKEN || '').trim();
@@ -2533,26 +2602,7 @@ app.post('/internal/sc-access-lock', (req, res) => {
 });
 
 app.post('/internal/sc-expired-notify', (req, res) => {
-  const ip = String(req.body?.ip || '').trim() || '-';
-  const reason = String(req.body?.reason || 'expired').trim();
-  const actor = String(req.body?.actor || '-').trim();
-  const users = Array.isArray(req.body?.users) ? req.body.users : [];
-  const usersText = users
-    .map((u) => String(u || '').trim())
-    .filter(Boolean)
-    .slice(0, 50)
-    .join(', ');
-  const customMessage = String(req.body?.message || '').trim();
-  const message = customMessage || [
-    'SC 1FORCR NOTIF',
-    `Status : SC expired`,
-    `IP VPS : ${ip}`,
-    `Reason : ${reason}`,
-    `Actor  : ${actor}`,
-    `Users  : ${usersText || '-'}`,
-    '',
-    'Silakan perpanjang SC jika ingin akses kembali.'
-  ].join('\n');
+  const message = buildScExpiredNotifyMessage(req.body || {});
   return authorizeAndRun(req, res, (db) => {
     db.close();
     sendScTelegramMessage(message)

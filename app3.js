@@ -6184,11 +6184,13 @@ async function launchBotWithRetry(maxAttempts = 6) {
 
 function startBackgroundJobs() {
   setInterval(pollPendingTopups, 15000);
+  const scExpiryTickMs = Math.min(SC_EXPIRY_JOB_INTERVAL_MS, 60 * 1000);
+  console.log(`[sc-expiry-job] scheduler interval=${Math.round(scExpiryTickMs / 1000)}s`);
   setInterval(() => {
     runScExpiryJobOnce('timer').catch((err) => {
       console.error('natural expiry job failed:', formatStartError(err));
     });
-  }, SC_EXPIRY_JOB_INTERVAL_MS);
+  }, scExpiryTickMs);
 
   pollPendingTopups().catch((err) => {
     console.error('initial topup poll failed:', formatStartError(err));

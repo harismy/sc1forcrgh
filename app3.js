@@ -667,6 +667,39 @@ function uiBox(title, lines = []) {
   return out.join('\n');
 }
 
+function splitTelegramText(textInput, maxLen = 3800) {
+  const text = String(textInput || '').trim();
+  if (!text) return [];
+  const limit = Math.max(1000, Math.min(4000, Number(maxLen) || 3800));
+  const chunks = [];
+  let current = '';
+  for (const line of text.split('\n')) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length <= limit) {
+      current = next;
+      continue;
+    }
+    if (current) chunks.push(current);
+    if (line.length <= limit) {
+      current = line;
+      continue;
+    }
+    for (let i = 0; i < line.length; i += limit) chunks.push(line.slice(i, i + limit));
+    current = '';
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function replyTelegramTextChunks(ctx, textInput, extraLast = undefined) {
+  const chunks = splitTelegramText(textInput);
+  if (!chunks.length) return ctx.reply('-', extraLast);
+  for (let i = 0; i < chunks.length; i += 1) {
+    const isLast = i === chunks.length - 1;
+    await ctx.reply(chunks[i], isLast ? extraLast : undefined);
+  }
+}
+
 function buildMainMenuHtml(title, lines = []) {
   const safeTitle = escapeHtml(String(title || '').trim());
   const body = Array.isArray(lines) ? lines : [String(lines || '')];
@@ -3837,7 +3870,8 @@ bot.action('m_cek_saldo', async (ctx) => {
 bot.action('m_sc_features', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const info = await getScFeaturesInfoText();
-  await ctx.reply(
+  await replyTelegramTextChunks(
+    ctx,
     uiBox('FITUR-FITUR SC 1FORCR NEXUS', String(info || '').split('\n')),
     mainMenu()
   );

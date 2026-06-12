@@ -6215,16 +6215,6 @@ async function runScExpiryJobOnce(source = 'timer') {
   }
 }
 
-function scheduleNextScExpiryJob(delayMs = getScExpiryTickMs()) {
-  const wait = Math.max(1000, Number(delayMs) || getScExpiryTickMs());
-  if (scExpirySchedulerTimer) clearTimeout(scExpirySchedulerTimer);
-  scExpirySchedulerTimer = setTimeout(async () => {
-    console.log(`[sc-expiry-job] tick interval=${Math.round(getScExpiryTickMs() / 1000)}s`);
-    await runScExpiryJobOnce('timer');
-    scheduleNextScExpiryJob();
-  }, wait);
-}
-
 async function launchBotWithRetry(maxAttempts = 6) {
   let lastErr = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -6245,8 +6235,21 @@ async function launchBotWithRetry(maxAttempts = 6) {
 
 function startBackgroundJobs() {
   setInterval(pollPendingTopups, 15000);
-  console.log(`[sc-expiry-job] scheduler interval=${Math.round(getScExpiryTickMs() / 1000)}s`);
-  scheduleNextScExpiryJob();
+  const scExpiryTickMs = getScExpiryTickMs();
+  console.log(`[sc-expiry-job] scheduler interval=${Math.round(scExpiryTickMs / 1000)}s`);
+  if (scExpirySchedulerTimer) clearInterval(scExpirySchedulerTimer);
+  scExpirySchedulerTimer = setInterval(() => {
+    console.log(`[sc-expiry-job] tick interval=${Math.round(scExpiryTickMs / 1000)}s`);
+    runScExpiryJobOnce('timer').catch((err) => {
+      console.error('natural expiry job failed:', formatStartError(err));
+    });
+  }, scExpiryTickMs);
+  setTimeout(() => {
+    console.log('[sc-expiry-job] warmup tick');
+    runScExpiryJobOnce('warmup').catch((err) => {
+      console.error('natural expiry job failed:', formatStartError(err));
+    });
+  }, 5000);
 
   pollPendingTopups().catch((err) => {
     console.error('initial topup poll failed:', formatStartError(err));

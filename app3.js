@@ -1680,8 +1680,12 @@ async function runNaturalScExpiryJobs() {
     expiredLocalFailed: 0,
     reminderUserSent: 0,
     reminderUserFailed: 0,
+    reminderUserSkipped: 0,
     reminderLocalSent: 0,
     reminderLocalFailed: 0,
+    reminderLocalSkipped: 0,
+    reminderLocalNoKey: 0,
+    h2ReminderIntervalMinutes: Math.max(1, Math.floor(Number(h2ReminderIntervalMs || 0) / 60000)),
     locked: 0,
     lockFailed: 0
   };
@@ -1775,6 +1779,8 @@ async function runNaturalScExpiryJobs() {
       } else {
         summary.reminderUserFailed += 1;
       }
+    } else {
+      summary.reminderUserSkipped += 1;
     }
 
     const serverKey = await getServerKeyForHost(uid, host);
@@ -1809,7 +1815,11 @@ async function runNaturalScExpiryJobs() {
           summary.reminderLocalFailed += 1;
           console.error(`[sc-expiry-job] gagal notif VPS reminder ${host}: ${parseErr(notifyErr)}`);
         }
+      } else {
+        summary.reminderLocalSkipped += 1;
       }
+    } else {
+      summary.reminderLocalNoKey += 1;
     }
   }
   return summary;
@@ -6141,7 +6151,9 @@ function logScExpirySummary(source, summary, durationMs) {
   if (scanned <= 0 && sent <= 0 && failed <= 0) return;
   console.log(
     `[sc-expiry-job] ${source} scanned=${scanned} ` +
+      `interval_min=${Number(data.h2ReminderIntervalMinutes || 0)} ` +
       `reminder_user=${Number(data.reminderUserSent || 0)} reminder_vps=${Number(data.reminderLocalSent || 0)} ` +
+      `skip_user=${Number(data.reminderUserSkipped || 0)} skip_vps=${Number(data.reminderLocalSkipped || 0)} no_key_vps=${Number(data.reminderLocalNoKey || 0)} ` +
       `expired_user=${Number(data.expiredUserSent || 0)} expired_vps=${Number(data.expiredLocalSent || 0)} ` +
       `locked=${Number(data.locked || 0)} failed=${failed} duration_ms=${Number(durationMs || 0)}`
   );

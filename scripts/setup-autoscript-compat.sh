@@ -948,12 +948,26 @@ install_go_if_missing() {
 }
 
 install_xray() {
+  local tmp
   if command -v xray >/dev/null 2>&1; then
     log "Xray sudah ada: $(xray version | head -n1)"
     return
   fi
   log "Install Xray..."
-  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+  tmp="$(mktemp)"
+  if ! curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 \
+    https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "${tmp}"; then
+    rm -f "${tmp}" >/dev/null 2>&1 || true
+    echo "Gagal download installer Xray."
+    return 1
+  fi
+  bash "${tmp}" install
+  rm -f "${tmp}" >/dev/null 2>&1 || true
+  if ! command -v xray >/dev/null 2>&1; then
+    echo "Install Xray selesai tanpa binary xray. Cek koneksi/repo installer Xray."
+    return 1
+  fi
+  log "Xray terpasang: $(xray version | head -n1)"
 }
 
 setup_default_banner_assets() {

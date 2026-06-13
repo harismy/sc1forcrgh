@@ -10699,7 +10699,7 @@ main_pull_summary_update() {
   log_msg "Trigger update Summary API diterima dari bot: ${version}${note:+ (${note})}"
   mark_attempt "${version}"
   ack_summary_update "${base_url}" "${version}" "running" "summary update mulai" "${vps_ip}"
-  if SUMMARY_API_SETUP_URL="${summary_url:-${SUMMARY_API_SETUP_URL:-}}" /usr/local/sbin/menu-sc-1forcr update-summary >/var/log/sc-1forcr-pull-summary-update.log 2>&1; then
+  if SUMMARY_UPDATE_SAFE_MODE=1 SUMMARY_API_SETUP_URL="${summary_url:-${SUMMARY_API_SETUP_URL:-}}" /usr/local/sbin/menu-sc-1forcr update-summary >/var/log/sc-1forcr-pull-summary-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
     clear_attempt
     ack_summary_update "${base_url}" "${version}" "success" "summary update selesai" "${vps_ip}"

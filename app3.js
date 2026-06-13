@@ -3776,7 +3776,7 @@ bot.action('m_admin_trigger_sc_update', async (ctx) => {
     'Lanjut trigger update sekarang?'
   ];
   return ctx.reply(
-    uiBox('TRIGGER UPDATE SEMUA SC', lines),
+    uiBox('UPDATE SC', lines),
     Markup.inlineKeyboard([
       [Markup.button.callback('Ya, trigger sekarang', 'm_admin_trigger_sc_update_confirm')],
       [Markup.button.callback('Batal', 'm_admin_menu')]
@@ -3796,13 +3796,13 @@ bot.action('m_admin_trigger_sc_update_confirm', async (ctx) => {
     createScUpdateTrigger(ctx.from.id, `manual trigger by ${ctx.from.id}`)
   ]);
   return ctx.reply(
-    uiBox('TRIGGER UPDATE DIKIRIM', [
+    uiBox('UPDATE SC DIKIRIM', [
       `Version  : ${trigger.version}`,
       `Target   : ${activeCount} IP VPS aktif`,
       `Waktu    : ${formatDateTime(trigger.created_at)}`,
       '',
       'VPS yang sudah punya auto-pull akan update saat timer berikutnya.',
-      'Default interval installer baru: 10 menit.'
+      'Default interval auto-pull: 360 menit. Bisa diubah dari menu SC.'
     ]),
     adminMenu()
   );
@@ -3829,7 +3829,7 @@ bot.action('m_admin_trigger_summary_update', async (ctx) => {
     'Lanjut trigger update Summary API sekarang?'
   ];
   return ctx.reply(
-    uiBox('TRIGGER UPDATE SUMMARY API', lines),
+    uiBox('UPDATE SUMMARY API', lines),
     Markup.inlineKeyboard([
       [Markup.button.callback('Ya, trigger sekarang', 'm_admin_trigger_summary_update_confirm')],
       [Markup.button.callback('Batal', 'm_admin_menu')]
@@ -3849,13 +3849,13 @@ bot.action('m_admin_trigger_summary_update_confirm', async (ctx) => {
     createSummaryUpdateTrigger(ctx.from.id, `manual summary api trigger by ${ctx.from.id}`)
   ]);
   return ctx.reply(
-    uiBox('TRIGGER SUMMARY API DIKIRIM', [
+    uiBox('UPDATE SUMMARY API DIKIRIM', [
       `Version  : ${trigger.version}`,
       `Target   : ${activeCount} IP VPS aktif`,
       `Waktu    : ${formatDateTime(trigger.created_at)}`,
       '',
       'VPS yang sudah punya puller Summary API akan update saat timer berikutnya.',
-      'Default interval mengikuti auto-pull SC.'
+      'Default interval auto-pull mengikuti setting SC.'
     ]),
     adminMenu()
   );

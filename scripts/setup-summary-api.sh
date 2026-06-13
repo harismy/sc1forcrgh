@@ -2737,6 +2737,17 @@ open_summary_firewall() {
 start_pm2_service() {
   cd "${APP_DIR}"
 
+  if [[ "${SUMMARY_UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+    if pm2 describe "${APP_NAME}" >/dev/null 2>&1; then
+      pm2 restart "${APP_NAME}" --update-env >/dev/null 2>&1 || \
+        pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
+    else
+      pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
+    fi
+    pm2 save --force >/dev/null 2>&1 || true
+    return 0
+  fi
+
   pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
   pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M
   pm2 save --force

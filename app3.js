@@ -6183,7 +6183,8 @@ function logScExpirySummary(source, summary, durationMs) {
     Number(data.reminderUserFailed || 0) +
     Number(data.reminderLocalFailed || 0) +
     Number(data.lockFailed || 0);
-  if (scanned <= 0 && sent <= 0 && failed <= 0) return;
+  const shouldAlwaysLog = ['cli', 'initial', 'warmup', 'timer'].includes(String(source || '').trim().toLowerCase());
+  if (!shouldAlwaysLog && scanned <= 0 && sent <= 0 && failed <= 0) return;
   console.log(
     `[sc-expiry-job] ${source} scanned=${scanned} ` +
       `interval_min=${Number(data.h2ReminderIntervalMinutes || 0)} ` +

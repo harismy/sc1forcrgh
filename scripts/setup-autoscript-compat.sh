@@ -12583,6 +12583,69 @@ edit_limit_ip_all_accounts() {
   echo "Total akun ter-update: ${changed}"
 }
 
+quota_type_key() {
+  case "${1,,}" in
+    ssh|zivpn|udphc) echo "ssh" ;;
+    vmess) echo "vmess" ;;
+    vless) echo "vless" ;;
+    trojan) echo "trojan" ;;
+    *) echo "${1,,}" ;;
+  esac
+}
+
+quota_type_from_table() {
+  case "${1}" in
+    account_sshs) echo "ssh" ;;
+    account_vmesses) echo "vmess" ;;
+    account_vlesses) echo "vless" ;;
+    account_trojans) echo "trojan" ;;
+    *) echo "${1#account_}" ;;
+  esac
+}
+
+bytes_to_gb_label() {
+  local bytes="${1:-0}"
+  [[ "${bytes}" =~ ^[0-9]+$ ]] || bytes="0"
+  awk -v b="${bytes}" 'BEGIN {
+    gb = b / 1073741824;
+    if (gb >= 100 || gb == int(gb)) printf "%d GB", gb;
+    else printf "%.2f GB", gb;
+  }'
+}
+
+quota_limit_label() {
+  local quota="${1:-0}"
+  [[ "${quota}" =~ ^[0-9]+$ ]] || quota="0"
+  if [[ "${quota}" -le 0 ]]; then
+    echo "Unlimited"
+  else
+    echo "${quota} GB"
+  fi
+}
+
+quota_usage_bytes_for_account() {
+  local type username username_sql usage_type
+  type="$(quota_type_key "${1:-}")"
+  username="${2:-}"
+  username_sql="${username//\'/''}"
+  usage_type="${type//\'/''}"
+  sqlite3 "${DB_PATH}" \
+    "SELECT COALESCE(MAX(used_bytes),0) FROM account_quota_usage WHERE account_type='${usage_type}' AND LOWER(username)=LOWER('${username_sql}');" \
+    2>/dev/null || echo "0"
+}
+
+quota_usage_label_for_account() {
+  local type username quota used used_label limit_label
+  type="${1:-}"
+  username="${2:-}"
+  quota="${3:-0}"
+  used="$(quota_usage_bytes_for_account "${type}" "${username}")"
+  [[ "${used}" =~ ^[0-9]+$ ]] || used="0"
+  used_label="$(bytes_to_gb_label "${used}")"
+  limit_label="$(quota_limit_label "${quota}")"
+  echo "${used_label} / ${limit_label}"
+}
+
 edit_quota_account() {
   local type ep username quota mode payload resp code message used unlocked status
   type="$(pick_type)"
@@ -13278,27 +13341,28 @@ list_accounts() {
         ;;
     esac
     rows="$(sqlite3 -separator '|' "$DB_PATH" \
-      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER), CASE WHEN ${trial_expr} THEN 'TRIAL' ELSE 'REGULER' END FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER), CAST(COALESCE(quota,0) AS INTEGER), CASE WHEN ${trial_expr} THEN 'TRIAL' ELSE 'REGULER' END FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
     total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table};" 2>/dev/null || echo 0)"
     active_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
     trial_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE ${trial_expr};" 2>/dev/null || echo 0)"
     expired_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
     echo "LIST AKUN ${title} - ${mode^^}"
     echo "Summary: aktif=${active_total:-0} | trial=${trial_total:-0} | expired=${expired_total:-0} | total_db=${total:-0}"
-    printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
-    printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"
+    printf "%-4s %-22s %-10s %-8s %-7s %-24s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP" "QUOTA"
+    printf "%-4s %-22s %-10s %-8s %-7s %-24s\n" "----" "----------------------" "----------" "--------" "-------" "------------------------"
     if [[ -z "${rows}" ]]; then
       echo "(kosong)"
       return
     fi
-    local i=0 u sisa st lim kind sisa_human display_st
-    while IFS='|' read -r u sisa st lim kind; do
+    local i=0 u sisa st lim quota kind sisa_human display_st quota_text
+    while IFS='|' read -r u sisa st lim quota kind; do
       [[ -z "${u}" ]] && continue
       i=$((i + 1))
       sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
       display_st="${st:-AKTIF}"
       [[ "${kind}" == "TRIAL" && "${display_st}" == "AKTIF" ]] && display_st="TRIAL"
-      printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${display_st}" "${sisa_human}" "${lim:-0}"
+      quota_text="$(quota_usage_label_for_account "$(quota_type_from_table "${table}")" "${u}" "${quota:-0}")"
+      printf "%-4s %-22s %-10s %-8s %-7s %-24s\n" "${i}" "${u}" "${display_st}" "${sisa_human}" "${lim:-0}" "${quota_text}"
     done <<< "${rows}"
   }
 
@@ -13372,7 +13436,7 @@ list_accounts() {
 }
 
 show_account_detail() {
-  local type username username_sql row
+  local type username username_sql row d_quota_usage
   type="$(pick_type)"
   [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
   username="$(pick_existing_username "${type}")" || return
@@ -13387,6 +13451,7 @@ show_account_detail() {
         return
       fi
       IFS='|' read -r d_user d_pass d_exp d_status d_quota d_limit <<< "${row}"
+      d_quota_usage="$(quota_usage_label_for_account "ssh" "${d_user}" "${d_quota}")"
       cat <<EOT_SSH_DETAIL
 =============================
  DETAIL AKUN ${type^^}
@@ -13395,7 +13460,8 @@ Username     : ${d_user}
 Password     : ${d_pass}
 Expired      : ${d_exp}
 Status       : ${d_status}
-Quota        : ${d_quota}
+Quota        : $(quota_limit_label "${d_quota}")
+Quota Pakai  : ${d_quota_usage}
 Limit IP     : ${d_limit}
 Host         : ${DOMAIN}
 SSH WS       : ${DOMAIN}:80@${d_user}:${d_pass}
@@ -13410,6 +13476,7 @@ EOT_SSH_DETAIL
         return
       fi
       IFS='|' read -r d_user d_uuid d_exp d_status d_quota d_limit <<< "${row}"
+      d_quota_usage="$(quota_usage_label_for_account "vmess" "${d_user}" "${d_quota}")"
       vmess_tls="$(printf '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/vmess","tls":"tls","sni":"%s"}' "${d_user}" "${DOMAIN}" "${d_uuid}" "${DOMAIN}" "${DOMAIN}" | base64 -w 0 2>/dev/null || true)"
       vmess_ntls="$(printf '{"v":"2","ps":"%s","add":"%s","port":"80","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/vmess","tls":"none","sni":"%s"}' "${d_user}" "${DOMAIN}" "${d_uuid}" "${DOMAIN}" "${DOMAIN}" | base64 -w 0 2>/dev/null || true)"
       cat <<EOT_VMESS_DETAIL
@@ -13420,7 +13487,8 @@ Username     : ${d_user}
 UUID         : ${d_uuid}
 Expired      : ${d_exp}
 Status       : ${d_status}
-Quota        : ${d_quota}
+Quota        : $(quota_limit_label "${d_quota}")
+Quota Pakai  : ${d_quota_usage}
 Limit IP     : ${d_limit}
 Host         : ${DOMAIN}
 Link TLS     : vmess://${vmess_tls}
@@ -13435,6 +13503,7 @@ EOT_VMESS_DETAIL
         return
       fi
       IFS='|' read -r d_user d_uuid d_exp d_status d_quota d_limit <<< "${row}"
+      d_quota_usage="$(quota_usage_label_for_account "vless" "${d_user}" "${d_quota}")"
       cat <<EOT_VLESS_DETAIL
 =============================
  DETAIL AKUN VLESS
@@ -13443,7 +13512,8 @@ Username     : ${d_user}
 UUID         : ${d_uuid}
 Expired      : ${d_exp}
 Status       : ${d_status}
-Quota        : ${d_quota}
+Quota        : $(quota_limit_label "${d_quota}")
+Quota Pakai  : ${d_quota_usage}
 Limit IP     : ${d_limit}
 Host         : ${DOMAIN}
 Link TLS     : vless://${d_uuid}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls&sni=${DOMAIN}&host=${DOMAIN}&encryption=none#${d_user}
@@ -13458,6 +13528,7 @@ EOT_VLESS_DETAIL
         return
       fi
       IFS='|' read -r d_user d_pass d_exp d_status d_quota d_limit <<< "${row}"
+      d_quota_usage="$(quota_usage_label_for_account "trojan" "${d_user}" "${d_quota}")"
       cat <<EOT_TROJAN_DETAIL
 =============================
  DETAIL AKUN TROJAN
@@ -13466,7 +13537,8 @@ Username     : ${d_user}
 Password     : ${d_pass}
 Expired      : ${d_exp}
 Status       : ${d_status}
-Quota        : ${d_quota}
+Quota        : $(quota_limit_label "${d_quota}")
+Quota Pakai  : ${d_quota_usage}
 Limit IP     : ${d_limit}
 Host         : ${DOMAIN}
 Link TLS     : trojan://${d_pass}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls&sni=${DOMAIN}&host=${DOMAIN}&alpn=http%2F1.1#${d_user}
@@ -13477,6 +13549,59 @@ EOT_TROJAN_DETAIL
       echo "Tipe tidak valid."
       ;;
   esac
+}
+
+show_account_quota_info() {
+  local type table username username_sql usage_type row quota status used_bytes quota_bytes used_label limit_label remain_bytes remain_label locked locked_at percent
+  type="$(pick_type)"
+  [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
+  table="$(account_table_by_type "${type}")"
+  [[ -z "${table}" ]] && { echo "Tabel akun tidak ditemukan."; return; }
+  username="$(pick_existing_username "${type}")" || return
+  username_sql="${username//\'/''}"
+  usage_type="$(quota_type_key "${type}")"
+
+  row="$(sqlite3 -separator '|' "${DB_PATH}" \
+    "SELECT username, CAST(COALESCE(quota,0) AS INTEGER), UPPER(TRIM(COALESCE(status,''))) FROM ${table} WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+  if [[ -z "${row}" ]]; then
+    echo "Data akun tidak ditemukan."
+    return
+  fi
+
+  IFS='|' read -r d_user quota status <<< "${row}"
+  used_bytes="$(quota_usage_bytes_for_account "${usage_type}" "${d_user}")"
+  [[ "${used_bytes}" =~ ^[0-9]+$ ]] || used_bytes="0"
+  quota_bytes="$(( ${quota:-0} * 1024 * 1024 * 1024 ))"
+  used_label="$(bytes_to_gb_label "${used_bytes}")"
+  limit_label="$(quota_limit_label "${quota:-0}")"
+  if [[ "${quota:-0}" -le 0 ]]; then
+    remain_label="Unlimited"
+    percent="0%"
+  else
+    if (( used_bytes >= quota_bytes )); then
+      remain_bytes=0
+    else
+      remain_bytes=$((quota_bytes - used_bytes))
+    fi
+    remain_label="$(bytes_to_gb_label "${remain_bytes}")"
+    percent="$(awk -v u="${used_bytes}" -v q="${quota_bytes}" 'BEGIN { if (q <= 0) print "0%"; else printf "%.1f%%", (u/q)*100 }')"
+  fi
+  locked="$(sqlite3 "${DB_PATH}" "SELECT used_bytes FROM account_quota_locks WHERE account_type='${usage_type}' AND LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+  locked_at="$(sqlite3 "${DB_PATH}" "SELECT datetime(locked_at,'unixepoch','localtime') FROM account_quota_locks WHERE account_type='${usage_type}' AND LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+
+  cat <<EOT_QUOTA_INFO
+=============================
+ INFO QUOTA AKUN ${type^^}
+=============================
+Username     : ${d_user}
+Status       : ${status:-AKTIF}
+Quota Pakai  : ${used_label} / ${limit_label}
+Sisa Quota   : ${remain_label}
+Persentase   : ${percent}
+Lock Quota   : $([[ -n "${locked}" ]] && echo "YA" || echo "TIDAK")
+Locked At    : ${locked_at:-"-"}
+=============================
+EOT_QUOTA_INFO
 }
 
 akun_menu() {
@@ -13500,9 +13625,10 @@ akun_menu() {
       "14) Ganti Password Semua SSH" \
       "15) Edit Quota" \
       "16) Edit Quota Semua Akun" \
+      "17) Info Quota Akun" \
       "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-16]: "; then
+    if ! prompt_input am "Pilih menu [0-17]: "; then
       return
     fi
     clear
@@ -13530,6 +13656,7 @@ akun_menu() {
       14) change_ssh_password_all_accounts || true ;;
       15) edit_quota_account || true ;;
       16) edit_quota_all_accounts || true ;;
+      17) show_account_quota_info || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

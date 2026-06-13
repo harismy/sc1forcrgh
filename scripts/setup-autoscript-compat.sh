@@ -1788,8 +1788,10 @@ setup_haproxy_tls_mux() {
   haproxy_nbthread="$(echo "${HAPROXY_NBTHREAD:-1}" | tr -cd '0-9')"
   [[ -z "${haproxy_nbthread}" || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
   cores="$(get_cpu_cores)"
+  [[ -z "${cores}" || ! "${cores}" =~ ^[0-9]+$ || "${cores}" -lt 1 ]] && cores="1"
   [[ "${haproxy_nbthread}" -gt "${cores}" ]] && haproxy_nbthread="${cores}"
   [[ "${haproxy_nbthread}" -gt 8 ]] && haproxy_nbthread="8"
+  [[ -z "${haproxy_nbthread}" || ! "${haproxy_nbthread}" =~ ^[0-9]+$ || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
   haproxy_limit_nofile="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
   [[ -z "${haproxy_limit_nofile}" || "${haproxy_limit_nofile}" -lt 65536 ]] && haproxy_limit_nofile="200000"
   if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then
@@ -11319,6 +11321,52 @@ tls_cert_domain() {
   fi
 }
 
+get_cpu_cores() {
+  local cores
+  cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  if [[ -z "${cores}" || ! "${cores}" =~ ^[0-9]+$ || "${cores}" -lt 1 ]]; then
+    echo "1"
+    return
+  fi
+  echo "${cores}"
+}
+
+tune_nginx_capacity() {
+  local nginx_conf wc rl nof
+  nginx_conf="/etc/nginx/nginx.conf"
+  [[ -f "${nginx_conf}" ]] || return 0
+
+  wc="$(echo "${NGINX_WORKER_CONNECTIONS:-8192}" | tr -cd '0-9')"
+  rl="$(echo "${NGINX_WORKER_RLIMIT_NOFILE:-200000}" | tr -cd '0-9')"
+  nof="$(echo "${NGINX_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
+  [[ -z "${wc}" || "${wc}" -lt 1024 ]] && wc="8192"
+  [[ -z "${rl}" || "${rl}" -lt 65536 ]] && rl="200000"
+  [[ -z "${nof}" || "${nof}" -lt 65536 ]] && nof="200000"
+
+  sed -ri 's/^[[:space:]]*worker_processes[[:space:]]+[^;]+;/worker_processes auto;/' "${nginx_conf}" || true
+
+  if grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]+[0-9]+;' "${nginx_conf}"; then
+    sed -ri "s/^[[:space:]]*worker_rlimit_nofile[[:space:]]+[0-9]+;/worker_rlimit_nofile ${rl};/" "${nginx_conf}" || true
+  else
+    sed -ri "/^[[:space:]]*worker_processes[[:space:]]+auto;/a worker_rlimit_nofile ${rl};" "${nginx_conf}" || true
+  fi
+
+  sed -ri "0,/worker_connections[[:space:]]+[0-9]+[[:space:]]*;/{s/worker_connections[[:space:]]+[0-9]+[[:space:]]*;/worker_connections ${wc};/}" "${nginx_conf}" || true
+  if ! grep -qE '^[[:space:]]*multi_accept[[:space:]]+on;' "${nginx_conf}"; then
+    sed -ri "/worker_connections[[:space:]]+${wc}[[:space:]]*;/a\\    multi_accept on;" "${nginx_conf}" || true
+  fi
+  if ! grep -qE '^[[:space:]]*use[[:space:]]+epoll;' "${nginx_conf}"; then
+    sed -ri "/worker_connections[[:space:]]+${wc}[[:space:]]*;/a\\    use epoll;" "${nginx_conf}" || true
+  fi
+
+  mkdir -p /etc/systemd/system/nginx.service.d
+  cat > /etc/systemd/system/nginx.service.d/limits.conf <<EOF
+[Service]
+LimitNOFILE=${nof}
+EOF
+  systemctl daemon-reload || true
+}
+
 issue_letsencrypt_cert() {
   local certbot_email_arg cert_domain xray_alias_hosts alias_host
   local -a cert_extra_args
@@ -14749,8 +14797,10 @@ EONGINX
   haproxy_nbthread="$(echo "${HAPROXY_NBTHREAD:-1}" | tr -cd '0-9')"
   [[ -z "${haproxy_nbthread}" || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
   cores="$(get_cpu_cores)"
+  [[ -z "${cores}" || ! "${cores}" =~ ^[0-9]+$ || "${cores}" -lt 1 ]] && cores="1"
   [[ "${haproxy_nbthread}" -gt "${cores}" ]] && haproxy_nbthread="${cores}"
   [[ "${haproxy_nbthread}" -gt 8 ]] && haproxy_nbthread="8"
+  [[ -z "${haproxy_nbthread}" || ! "${haproxy_nbthread}" =~ ^[0-9]+$ || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
   haproxy_limit_nofile="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
   [[ -z "${haproxy_limit_nofile}" || "${haproxy_limit_nofile}" -lt 65536 ]] && haproxy_limit_nofile="200000"
   if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then

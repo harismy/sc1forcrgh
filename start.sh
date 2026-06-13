@@ -118,6 +118,7 @@ npm install --omit=dev
 echo "Menjalankan bot via PM2..."
 pm2 start ecosystem.config.cjs --only sc1forcr-nexus-bot --update-env
 pm2 start ecosystem.config.cjs --only sc1forcr-license-api --update-env
+pm2 start ecosystem.config.cjs --only sc1forcr-expiry-job --update-env
 pm2 save
 
 echo
@@ -126,3 +127,5 @@ echo "Cek status: pm2 status sc1forcr-nexus-bot"
 echo "Cek log   : pm2 logs sc1forcr-nexus-bot"
 echo "Cek status API: pm2 status sc1forcr-license-api"
 echo "Cek log API   : pm2 logs sc1forcr-license-api"
+echo "Cek status reminder: pm2 status sc1forcr-expiry-job"
+echo "Cek log reminder   : pm2 logs sc1forcr-expiry-job"

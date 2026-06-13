@@ -6183,7 +6183,8 @@ function logScExpirySummary(source, summary, durationMs) {
     Number(data.reminderUserFailed || 0) +
     Number(data.reminderLocalFailed || 0) +
     Number(data.lockFailed || 0);
-  const shouldAlwaysLog = ['cli', 'initial', 'warmup', 'timer'].includes(String(source || '').trim().toLowerCase());
+  const src = String(source || '').trim().toLowerCase();
+  const shouldAlwaysLog = ['cli', 'initial', 'warmup', 'timer'].includes(src) || src.startsWith('scheduler');
   if (!shouldAlwaysLog && scanned <= 0 && sent <= 0 && failed <= 0) return;
   console.log(
     `[sc-expiry-job] ${source} scanned=${scanned} ` +
@@ -6260,6 +6261,20 @@ function startBackgroundJobs() {
   });
 }
 
+function startScExpiryOnlyScheduler() {
+  const scExpiryTickMs = getScExpiryTickMs();
+  console.log(`[sc-expiry-job] standalone scheduler interval=${Math.round(scExpiryTickMs / 1000)}s`);
+  runScExpiryJobOnce('scheduler-initial').catch((err) => {
+    console.error('standalone expiry job failed:', formatStartError(err));
+  });
+  setInterval(() => {
+    console.log(`[sc-expiry-job] standalone tick interval=${Math.round(scExpiryTickMs / 1000)}s`);
+    runScExpiryJobOnce('scheduler-timer').catch((err) => {
+      console.error('standalone expiry job failed:', formatStartError(err));
+    });
+  }, scExpiryTickMs);
+}
+
 (async () => {
   try {
     await initDb();
@@ -6269,6 +6284,10 @@ function startBackgroundJobs() {
       logScExpirySummary('cli', summary, Date.now() - started);
       try { db.close(); } catch (_) {}
       process.exit(0);
+    }
+    if (process.argv.includes('--run-sc-expiry-scheduler')) {
+      startScExpiryOnlyScheduler();
+      return;
     }
     await launchBotWithRetry();
     console.log('app3 bot running...');

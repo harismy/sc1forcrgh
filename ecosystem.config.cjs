@@ -17,6 +17,16 @@ module.exports = {
       autorestart: true,
       watch: false,
       max_memory_restart: '200M'
+    },
+    {
+      name: 'sc1forcr-expiry-job',
+      script: 'app3.js',
+      args: '--run-sc-expiry-scheduler',
+      cwd: __dirname,
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '150M'
     }
   ]
 };

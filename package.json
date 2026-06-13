@@ -5,7 +5,9 @@
   "main": "app3.js",
   "scripts": {
     "start": "node app3.js",
-    "start:api": "node license-api.js"
+    "start:api": "node license-api.js",
+    "start:expiry": "node app3.js --run-sc-expiry-scheduler",
+    "run:expiry-once": "node app3.js --run-sc-expiry-job"
   },
   "dependencies": {
     "axios": "^1.12.2",

@@ -1429,7 +1429,7 @@ WantedBy=timers.target
 
 function writePullUpdateTimerUnit(settings) {
   if (!fs.existsSync('/etc/systemd/system/sc-1forcr-pull-update.service')) return false;
-  const interval = intSetting(settings, 'AUTO_PULL_UPDATE_INTERVAL_MINUTES', 10, 1, 1440);
+  const interval = intSetting(settings, 'AUTO_PULL_UPDATE_INTERVAL_MINUTES', 360, 1, 1440);
   fs.writeFileSync('/etc/systemd/system/sc-1forcr-pull-update.timer', `[Unit]
 Description=Check SC 1FORCR update trigger every ${interval} minutes
 

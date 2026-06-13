@@ -74,6 +74,7 @@ set -euo pipefail
 #   AUTO_REBOOT_SCHEDULE_MODE=interval           (opsional: interval|daily_wib)
 #   AUTO_REBOOT_WIB_HOUR=3                       (opsional, jam reboot harian WIB 0-23)
 #   AUTO_PULL_UPDATE_ENABLE=1                    (opsional, 1=cek trigger update dari bot)
+#   AUTO_PULL_UPDATE_INTERVAL_MINUTES=360        (opsional, interval cek trigger update dari bot)
 #   AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=360   (opsional, tahan retry versi update gagal agar tidak putus tiap cek)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
@@ -185,7 +186,7 @@ ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
-AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}"
+AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
@@ -956,61 +957,31 @@ install_xray() {
 }
 
 setup_default_banner_assets() {
-  log "Menyiapkan banner default 1FORCR..."
+  log "Menyiapkan banner default umum..."
   mkdir -p /etc/sc-1forcr
 
-  cat > /etc/sc-1forcr/banner.html <<'EOF'
-<div style="text-align:center; line-height:1.6; font-family: monospace;">
+  if [[ ! -s /etc/sc-1forcr/banner.html || "${BANNER_FORCE_DEFAULT:-0}" == "1" ]]; then
+    write_default_banner_html
+  else
+    log "Banner HTML sudah ada, tidak ditimpa."
+  fi
 
-<font color="#00ffff">=======================</font><br>
-<font color="#17e8ff">SSH PREMIUM BY 1FORCR</font><br>
-<font color="#00ffff">=======================</font><br>
-
-
-<!-- ATURAN PAKAI -->
-<font color="#ff45ba"><b>ATURAN PEMAKAIAN</b></font><br>
-<font color="#84ecdb">
-Jika beli akun untuk 1 pengguna <br>- gunakan hanya untuk 1 orang.<br>
-Jika beli akun untuk 2 pengguna <br>- gunakan untuk 2 orang saja.<br>
-</font><br>
-
-<font color="red"><b>Melanggar = Akun Expired Otomatis!</b></font><br><br>
-
-<!-- KONTAK ADMIN -->
-<font color="#00ffff">===== KONTAK ADMIN =====</font><br>
-<font color="#84ecdb">
-Hubungi Admin: <br>
-<font color="#00ffff">http://wa.me/6289527159281</font><br><br>
-Info Config & SSH: <br>
-<font color="#ff45ba">https://t.me/Oneforcr_info</font><br><br>
-Order via Bot: <br>
-<font color="#ff17e8">https://t.me/BOT1FORCR_STORE_bot</font>
-</font><br>
-<font color="#00ffff">========================</font><br><br>
-
-<font color="#84ecdb"><i>Terimakasih udah order di 1FORCR</i></font><br>
-<font color="#00ffff">=========================</font><br>
-
-</div>
-EOF
-
-  cat > /etc/sc-1forcr/banner.txt <<'EOF'
+  if [[ ! -s /etc/sc-1forcr/banner.txt || "${BANNER_FORCE_DEFAULT:-0}" == "1" ]]; then
+    cat > /etc/sc-1forcr/banner.txt <<'EOF'
 =================================
-      SSH PREMIUM BY 1FORCR
+       SECURE SSH SERVICE
 =================================
-ATURAN PEMAKAIAN:
-- Jika beli akun untuk 1 pengguna, gunakan untuk 1 orang.
-- Jika beli akun untuk 2 pengguna, gunakan untuk 2 orang.
-Melanggar = akun expired otomatis.
+INFORMASI LAYANAN:
+- Gunakan akun sesuai limit perangkat.
+- Jangan membagikan akun ke pengguna lain.
+- Akun dapat dikunci otomatis jika melanggar limit.
 
-Kontak Admin:
-- WA: http://wa.me/6289527159281
-- Telegram Info: https://t.me/Oneforcr_info
-- Bot Order: https://t.me/BOT1FORCR_STORE_bot
-
-Terimakasih sudah order di 1FORCR.
+Hubungi admin layanan jika butuh bantuan.
 =================================
 EOF
+  else
+    log "Banner TXT sudah ada, tidak ditimpa."
+  fi
 
   chmod 644 /etc/sc-1forcr/banner.html /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
 }
@@ -9218,8 +9189,8 @@ EOF_TIMER
 
   pull_enable="${AUTO_PULL_UPDATE_ENABLE:-1}"
   [[ "${pull_enable}" != "0" ]] && pull_enable="1"
-  pull_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
-  [[ -z "${pull_interval}" || "${pull_interval}" -lt 1 || "${pull_interval}" -gt 1440 ]] && pull_interval="10"
+  pull_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}" | tr -cd '0-9')"
+  [[ -z "${pull_interval}" || "${pull_interval}" -lt 1 || "${pull_interval}" -gt 1440 ]] && pull_interval="360"
   if [[ -f /etc/systemd/system/sc-1forcr-pull-update.service ]]; then
     cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF_TIMER
 [Unit]
@@ -10363,9 +10334,9 @@ EOF
 
 setup_auto_pull_update_timer() {
   local pull_interval_min pull_fail_cooldown_min
-  pull_interval_min="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  pull_interval_min="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}" | tr -cd '0-9')"
   if [[ -z "${pull_interval_min}" || "${pull_interval_min}" -lt 1 || "${pull_interval_min}" -gt 1440 ]]; then
-    pull_interval_min="10"
+    pull_interval_min="360"
   fi
   pull_fail_cooldown_min="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
   if [[ -z "${pull_fail_cooldown_min}" || "${pull_fail_cooldown_min}" -lt 10 || "${pull_fail_cooldown_min}" -gt 10080 ]]; then
@@ -10544,7 +10515,7 @@ main_pull_update() {
   log_msg "Trigger update diterima dari bot: ${version}${note:+ (${note})}"
   mark_attempt "${version}"
   ack_update "${base_url}" "${version}" "running" "update mulai" "${vps_ip}"
-  if /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
+  if UPDATE_SAFE_MODE=1 /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
     clear_attempt
     ack_update "${base_url}" "${version}" "success" "update selesai" "${vps_ip}"
@@ -11105,7 +11076,7 @@ ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
-AUTO_PULL_UPDATE_INTERVAL_MINUTES="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+AUTO_PULL_UPDATE_INTERVAL_MINUTES="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}" | tr -cd '0-9')"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
 QUOTA_LOCK_ENABLE="${QUOTA_LOCK_ENABLE:-1}"
 DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
@@ -11132,7 +11103,7 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
 [[ "${AUTO_PULL_UPDATE_ENABLE}" != "0" ]] && AUTO_PULL_UPDATE_ENABLE="1"
-[[ -z "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -lt 1 || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -gt 1440 ]] && AUTO_PULL_UPDATE_INTERVAL_MINUTES="10"
+[[ -z "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -lt 1 || "${AUTO_PULL_UPDATE_INTERVAL_MINUTES}" -gt 1440 ]] && AUTO_PULL_UPDATE_INTERVAL_MINUTES="360"
 [[ -z "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" || "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" -lt 10 || "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}" -gt 10080 ]] && AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="360"
 [[ "${QUOTA_LOCK_ENABLE}" != "0" ]] && QUOTA_LOCK_ENABLE="1"
 
@@ -11777,8 +11748,8 @@ EOF
 
 write_pull_update_timer_unit() {
   local interval_min="$1"
-  interval_min="$(echo "${interval_min:-10}" | tr -cd '0-9')"
-  [[ -z "${interval_min}" || "${interval_min}" -lt 1 || "${interval_min}" -gt 1440 ]] && interval_min="10"
+  interval_min="$(echo "${interval_min:-360}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 1 || "${interval_min}" -gt 1440 ]] && interval_min="360"
   cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF
 [Unit]
 Description=Check SC 1FORCR update trigger every ${interval_min} minutes
@@ -11958,8 +11929,8 @@ set_auto_pull_update_config_menu() {
   local current_enable current_interval current_hours current_cooldown enable_in mode_in val_in interval_min cooldown_in cooldown_min
   current_enable="${AUTO_PULL_UPDATE_ENABLE:-1}"
   [[ "${current_enable}" != "0" ]] && current_enable="1"
-  current_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
-  [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 1440 ]] && current_interval="10"
+  current_interval="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 1440 ]] && current_interval="360"
   current_hours="$(awk -v m="${current_interval}" 'BEGIN { printf "%.2f", (m/60) }')"
   current_cooldown="$(echo "${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" | tr -cd '0-9')"
   [[ -z "${current_cooldown}" || "${current_cooldown}" -lt 10 || "${current_cooldown}" -gt 10080 ]] && current_cooldown="360"
@@ -11970,6 +11941,7 @@ set_auto_pull_update_config_menu() {
   echo "Cooldown gagal    : ${current_cooldown} menit"
   echo
   echo "Jika NONAKTIF, VPS ini tidak akan menjalankan update saat admin trigger dari bot."
+  echo "Update dari bot memakai mode aman: service SSHWS/Xray aktif tidak direstart penuh."
   echo "Cooldown mencegah retry versi gagal terus-menerus yang bisa memutus tunnel."
   echo "Update manual dari menu tetap bisa dijalankan."
   echo
@@ -14419,6 +14391,42 @@ restart_all_services() {
   systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
   restart_active_udp_backend
+}
+
+restart_update_safe_services() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if declare -F ensure_sshws_firewall_allow_rules >/dev/null 2>&1; then
+    ensure_sshws_firewall_allow_rules
+  elif declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+    apply_sshws_loop_guard_rules
+  fi
+
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+  if [[ "${AUTO_REBOOT_ENABLE:-0}" == "1" ]]; then
+    systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  else
+    systemctl stop sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  fi
+  if [[ "${AUTO_BACKUP_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  else
+    systemctl stop sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  fi
+  if [[ "${ONLINE_NOTIFY_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+  else
+    systemctl stop sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  fi
+  if [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+  fi
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 || true
+  fi
 }
 
 udp_port_from_config() {
@@ -17145,7 +17153,7 @@ Time     : $(date '+%F %T')"
     AUTO_REBOOT_SCHEDULE_MODE="${AUTO_REBOOT_SCHEDULE_MODE:-interval}" \
     AUTO_REBOOT_WIB_HOUR="${AUTO_REBOOT_WIB_HOUR:-3}" \
     AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}" \
-    AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-10}" \
+    AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}" \
     AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}" \
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
     ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
@@ -17185,18 +17193,23 @@ Time     : $(date '+%F %T')"
   ACTIVE_UDP_BACKEND="${active_backend}"
   update_sc_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
   update_app_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
-  if [[ "${ACTIVE_UDP_BACKEND}" == "udpcustom" ]]; then
-    switch_udp_to_udpcustom || true
+  if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+    restart_update_safe_services
+    echo "Update mode aman: service SSHWS/Xray/Dropbear/HAProxy tidak direstart penuh."
   else
-    switch_udp_to_zivpn || true
+    if [[ "${ACTIVE_UDP_BACKEND}" == "udpcustom" ]]; then
+      switch_udp_to_udpcustom || true
+    else
+      switch_udp_to_zivpn || true
+    fi
+    # Terapkan ulang kebijakan loop guard sesuai env terbaru (default nonaktif).
+    if declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+      apply_sshws_loop_guard_rules
+    fi
+    systemctl restart sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
+    restart_all_services
+    echo "Semua service selesai direstart otomatis setelah update."
   fi
-  # Terapkan ulang kebijakan loop guard sesuai env terbaru (default nonaktif).
-  if declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
-    apply_sshws_loop_guard_rules
-  fi
-  systemctl restart sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
-  restart_all_services
-  echo "Semua service selesai direstart otomatis setelah update."
 
   ts_now="$(date '+%F %T')"
   new_ver="-"
@@ -17356,32 +17369,20 @@ write_default_banner_html() {
 <div style="text-align:center; line-height:1.6; font-family: monospace;">
 
 <font color="#00ffff">=======================</font><br>
-<font color="#17e8ff">SSH PREMIUM BY 1FORCR</font><br>
+<font color="#17e8ff">SECURE SSH SERVICE</font><br>
 <font color="#00ffff">=======================</font><br>
 
 
 <!-- ATURAN PAKAI -->
 <font color="#ff45ba"><b>ATURAN PEMAKAIAN</b></font><br>
 <font color="#84ecdb">
-Jika beli akun untuk 1 pengguna <br>- gunakan hanya untuk 1 orang.<br>
-Jika beli akun untuk 2 pengguna <br>- gunakan untuk 2 orang saja.<br>
+Gunakan akun sesuai limit perangkat.<br>
+Jangan membagikan akun ke pengguna lain.<br>
+Hubungi admin layanan jika butuh bantuan.<br>
 </font><br>
 
-<font color="red"><b>Melanggar = Akun Expired Otomatis!</b></font><br><br>
-
-<!-- KONTAK ADMIN -->
-<font color="#00ffff">===== KONTAK ADMIN =====</font><br>
-<font color="#84ecdb">
-Hubungi Admin: <br>
-<font color="#00ffff">http://wa.me/6289527159281</font><br><br>
-Info Config & SSH: <br>
-<font color="#ff45ba">https://t.me/Oneforcr_info</font><br><br>
-Order via Bot: <br>
-<font color="#ff17e8">https://t.me/BOT1FORCR_STORE_bot</font>
-</font><br>
-<font color="#00ffff">========================</font><br><br>
-
-<font color="#84ecdb"><i>Terimakasih udah order di 1FORCR</i></font><br>
+<font color="red"><b>Akun dapat dikunci otomatis jika melanggar limit.</b></font><br><br>
+<font color="#84ecdb"><i>Terima kasih telah menggunakan layanan kami.</i></font><br>
 <font color="#00ffff">=========================</font><br>
 
 </div>
@@ -17610,16 +17611,16 @@ set_dropbear_version_menu() {
 }
 
 set_html_banner_menu() {
-  local banner_file tmp line
+  local banner_file
   banner_file="/etc/sc-1forcr/banner.html"
   mkdir -p /etc/sc-1forcr
 
   while true; do
     draw_menu_panel "SETTING BANNER HTML" \
-      "1) Set/Edit banner" \
+      "1) Set/Edit banner via GNU nano" \
       "2) Lihat banner aktif" \
       "3) Nonaktifkan banner" \
-      "4) Pakai template default 1FORCR" \
+      "4) Pakai template default umum" \
       "0) Kembali"
     echo
     if ! prompt_input bm "Pilih menu [0-4]: "; then
@@ -17627,20 +17628,21 @@ set_html_banner_menu() {
     fi
     case "${bm}" in
       1)
-        tmp="$(mktemp)"
-        echo "Paste HTML banner. Akhiri dengan satu baris: EOF"
-        : > "${tmp}"
-        while IFS= read -r line </dev/tty; do
-          [[ "${line}" == "EOF" ]] && break
-          printf '%s\n' "${line}" >> "${tmp}"
-        done
-        if [[ ! -s "${tmp}" ]]; then
-          rm -f "${tmp}"
-          echo "Banner kosong, dibatalkan."
-        else
-          mv -f "${tmp}" "${banner_file}"
-          chmod 644 "${banner_file}"
+        if ! command -v nano >/dev/null 2>&1; then
+          echo "GNU nano belum ada, install nano..."
+          apt_get_safe update -y
+          apt_get_safe install -y nano
+        fi
+        [[ -s "${banner_file}" ]] || write_default_banner_html
+        echo "GNU nano akan dibuka."
+        echo "Simpan banner: tekan Ctrl+X, lalu Y, lalu Enter."
+        sleep 1
+        nano "${banner_file}"
+        if [[ -s "${banner_file}" ]]; then
+          chmod 644 "${banner_file}" >/dev/null 2>&1 || true
           apply_html_banner_config "${banner_file}"
+        else
+          echo "Banner kosong, tidak diterapkan."
         fi
         ;;
       2)
@@ -17658,7 +17660,7 @@ set_html_banner_menu() {
       4)
         write_default_banner_html
         apply_html_banner_config "${banner_file}"
-        echo "Template default 1FORCR berhasil diterapkan."
+        echo "Template default umum berhasil diterapkan."
         ;;
       0)
         return

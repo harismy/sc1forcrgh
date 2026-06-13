@@ -6262,6 +6262,13 @@ function startBackgroundJobs() {
 (async () => {
   try {
     await initDb();
+    if (process.argv.includes('--run-sc-expiry-job')) {
+      const started = Date.now();
+      const summary = await runNaturalScExpiryJobs();
+      logScExpirySummary('cli', summary, Date.now() - started);
+      try { db.close(); } catch (_) {}
+      process.exit(0);
+    }
     await launchBotWithRetry();
     console.log('app3 bot running...');
     startBackgroundJobs();

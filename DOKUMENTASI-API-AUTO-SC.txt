@@ -1,0 +1,992 @@
+DOCUMENTATION API AUTO SC
+==========================
+
+Dokumen ini merangkum API yang terpasang di VPS Auto SC.
+
+Komponen API:
+1. Core VPS API
+   Base URL : https://DOMAIN/vps
+   Service  : sc-1forcr-api
+   Listen   : 127.0.0.1:API_PORT, diproxy lewat Nginx/Haproxy ke /vps/*
+
+2. ZIVPN Auth API
+   Base URL : http://127.0.0.1:API_PORT/internal
+   Service  : sc-1forcr-api
+   Dipakai internal oleh ZIVPN.
+
+3. Summary API
+   Base URL : http://IP_VPS:8789/internal
+   Service  : tunnel-summary / Summary API
+   Dipakai bot untuk sync, backup, restore, summary akun, dan kontrol tertentu.
+
+
+AUTHENTICATION
+==============
+
+Core VPS API /vps/*
+-------------------
+Semua endpoint /vps/* wajib memakai token API, kecuali:
+- GET /vps/health
+
+Header auth yang didukung:
+Authorization: TOKEN
+Authorization: Bearer TOKEN
+
+Header opsional untuk menyimpan owner Telegram akun:
+x-telegram-user-id: TELEGRAM_USER_ID
+x-telegram-chat-id: TELEGRAM_CHAT_ID
+
+Body opsional alternatif owner:
+{
+  "telegram_user_id": 123456789,
+  "telegram_chat_id": 123456789
+}
+
+Response sukses standar:
+{
+  "meta": {
+    "code": 200,
+    "message": "success"
+  },
+  "data": {}
+}
+
+Response gagal standar:
+{
+  "meta": {
+    "code": 401,
+    "message": "unauthorized"
+  },
+  "message": "unauthorized"
+}
+
+
+Summary API /internal/*
+-----------------------
+Semua endpoint /internal/* wajib memakai:
+x-sync-token: TOKEN
+
+Token valid diambil dari tabel servers kolom key pada database potato.db.
+
+Endpoint yang tidak butuh token:
+- GET /health
+
+Response gagal auth:
+{
+  "ok": false,
+  "message": "unauthorized"
+}
+
+
+CORE VPS API
+============
+
+Health
+------
+GET /vps/health
+
+Auth:
+Tidak wajib.
+
+Response:
+{
+  "meta": { "code": 200, "message": "success" },
+  "data": {
+    "ok": true,
+    "domain": "example.com"
+  }
+}
+
+
+List Akun Milik User Telegram
+-----------------------------
+GET /vps/my-accounts?telegram_user_id=123456789
+GET /vps/my-accounts?telegram_user_id=123456789&include_inactive=1
+
+Auth:
+Authorization wajib.
+
+Query:
+- telegram_user_id: wajib
+- include_inactive: opsional, 1 untuk ikut menampilkan akun nonaktif
+
+Response data:
+{
+  "telegram_user_id": 123456789,
+  "accounts": [
+    {
+      "type": "ssh",
+      "username": "user1",
+      "date_exp": "2026-07-01 12:00:00",
+      "status": "AKTIF",
+      "quota": 100,
+      "limitip": 1
+    }
+  ],
+  "total": 1
+}
+
+
+SSH / SSHWS / ZIVPN
+===================
+
+Buat Akun SSH
+-------------
+POST /vps/sshvpn
+
+Body:
+{
+  "username": "user1",
+  "password": "pass123",
+  "expired": 30,
+  "kuota": 100,
+  "limitip": 1,
+  "telegram_user_id": 123456789,
+  "telegram_chat_id": 123456789
+}
+
+Field:
+- username: wajib
+- password: opsional, jika kosong dibuat random
+- expired: jumlah hari, default 30
+- kuota: quota GB, 0 berarti unlimited
+- limitip: limit IP/perangkat, 0 berarti tidak dibatasi oleh field ini
+
+Response data utama:
+{
+  "hostname": "domain.com",
+  "username": "user1",
+  "password": "pass123",
+  "exp": "2026-07-01 12:00:00",
+  "city": "Jakarta",
+  "isp": "ISP Name",
+  "port": {
+    "tls": "443",
+    "none": "80",
+    "ovpntcp": "1194",
+    "ovpnudp": "2200",
+    "sshohp": "8181",
+    "udpgw": "7300,7200"
+  },
+  "ws_path": "/ssh-ws",
+  "ws_alt_path": "/ws",
+  "limitip": "1",
+  "quota": "100"
+}
+
+
+Buat Trial SSH
+--------------
+POST /vps/trialsshvpn
+
+Body:
+{
+  "username": "trialuser",
+  "password": "pass123",
+  "kuota": 5,
+  "limitip": 1
+}
+
+Catatan:
+- Expired trial dibuat 60 menit.
+- username opsional; jika kosong dibuat otomatis.
+
+
+Ganti Password SSH Per Akun
+---------------------------
+PATCH /vps/passwordsshvpn/:username
+POST  /vps/passwordsshvpn/:username
+
+Body:
+{
+  "password": "newpass123"
+}
+
+Validasi password:
+- wajib
+- tidak boleh mengandung spasi, enter, atau titik dua
+- maksimal 128 karakter
+
+
+Ganti Password Semua SSH
+------------------------
+PATCH /vps/passwordsshvpn-all
+POST  /vps/passwordsshvpn-all
+
+Body:
+{
+  "password": "newpass123"
+}
+
+Response data:
+{
+  "password": "newpass123",
+  "changed": 10,
+  "total": 10,
+  "time": "12:00:00"
+}
+
+
+Delete SSH
+----------
+DELETE /vps/deletesshvpn/:username
+
+Efek:
+- hapus user Linux
+- hapus data account_sshs
+- hapus dari ZIVPN/UDP Custom auth
+- kirim notifikasi delete jika notifikasi bot SC aktif
+
+
+Perpanjang SSH
+--------------
+POST  /vps/renewsshvpn/:username/:exp
+PATCH /vps/renewsshvpn/:username/:exp
+
+Path:
+- username: username akun
+- exp: tambahan hari
+
+Body opsional:
+{
+  "password": "pass123",
+  "kuota": 200,
+  "limitip": 2,
+  "recover_missing": true,
+  "telegram_user_id": 123456789,
+  "telegram_chat_id": 123456789
+}
+
+Catatan:
+- Jika akun masih ada, expired ditambah dari expired lama.
+- Jika akun tidak ada dan recover_missing=true + password ada, akun akan dibuat ulang.
+- Jika akun sebelumnya LOCK_QUOTA, unlock hanya berhasil jika kuota baru lebih besar dari pemakaian.
+
+
+Lock SSH
+--------
+PATCH /vps/locksshvpn/:username
+
+Efek:
+- status DB menjadi LOCK
+- user Linux dikunci
+
+
+Unlock SSH
+----------
+PATCH /vps/unlocksshvpn/:username
+PATCH /vps/unlocksshvpn/:username/pw
+
+Catatan:
+- Jika akun terkunci karena quota habis, unlock gagal sampai quota ditambah.
+- Saat berhasil, temp lock dilepas dan checker IP limit dijalankan ulang.
+
+
+XRAY VMESS / VLESS / TROJAN
+===========================
+
+Buat VMess
+----------
+POST /vps/vmessall
+
+Body:
+{
+  "username": "vmess1",
+  "expired": 30,
+  "kuota": 100,
+  "limitip": 1,
+  "telegram_user_id": 123456789,
+  "telegram_chat_id": 123456789
+}
+
+Response data umum:
+{
+  "username": "vmess1",
+  "uuid": "UUID",
+  "exp": "2026-07-01 12:00:00",
+  "domain": "domain.com",
+  "port": {
+    "tls": "443",
+    "none": "80",
+    "grpc": "443",
+    "any": "443"
+  },
+  "path": {
+    "ws": "/vmess"
+  },
+  "serviceName": "vmess-grpc",
+  "limitip": "1",
+  "quota": "100",
+  "link": {
+    "tls": "vmess://...",
+    "none": "vmess://...",
+    "grpc": "vmess://...",
+    "uptls": "vmess://...",
+    "upntls": "vmess://..."
+  }
+}
+
+
+Buat Trial VMess
+----------------
+POST /vps/trialvmessall
+
+Body:
+{
+  "username": "trialvmess",
+  "kuota": 5,
+  "limitip": 1
+}
+
+Catatan:
+- Expired trial 1 hari.
+- username opsional; jika kosong dibuat otomatis.
+
+
+Buat VLESS
+----------
+POST /vps/vlessall
+
+Body:
+{
+  "username": "vless1",
+  "expired": 30,
+  "kuota": 100,
+  "limitip": 1
+}
+
+Response data berisi UUID dan link:
+- vless:// TLS
+- vless:// Non-TLS
+- vless:// gRPC
+- vless:// Upgrade TLS/Non-TLS jika tersedia
+
+
+Buat Trial VLESS
+----------------
+POST /vps/trialvlessall
+
+
+Buat Trojan
+-----------
+POST /vps/trojanall
+
+Body:
+{
+  "username": "trojan1",
+  "expired": 30,
+  "kuota": 100,
+  "limitip": 1
+}
+
+Response data berisi password/secret dan link:
+- trojan:// TLS
+- trojan:// Non-TLS
+- trojan:// gRPC
+- trojan:// Upgrade TLS/Non-TLS jika tersedia
+
+
+Buat Trial Trojan
+-----------------
+POST /vps/trialtrojanall
+
+
+Perpanjang VMess
+----------------
+POST  /vps/renewvmess/:username/:exp
+PATCH /vps/renewvmess/:username/:exp
+
+Body opsional:
+{
+  "kuota": 200,
+  "limitip": 2,
+  "telegram_user_id": 123456789,
+  "telegram_chat_id": 123456789
+}
+
+
+Perpanjang VLESS
+----------------
+POST  /vps/renewvless/:username/:exp
+PATCH /vps/renewvless/:username/:exp
+
+
+Perpanjang Trojan
+-----------------
+POST  /vps/renewtrojan/:username/:exp
+PATCH /vps/renewtrojan/:username/:exp
+
+
+Delete Xray
+-----------
+DELETE /vps/deletevmess/:username
+DELETE /vps/deletevless/:username
+DELETE /vps/deletetrojan/:username
+
+Efek:
+- hapus akun dari DB
+- render ulang config Xray
+- reload/restart Xray sesuai helper runtime
+- kirim notifikasi delete jika bot SC aktif
+
+
+Lock Xray
+---------
+PATCH /vps/lockvmess/:username
+PATCH /vps/lockvless/:username
+PATCH /vps/locktrojan/:username
+
+Efek:
+- status akun menjadi LOCK
+- config Xray dirender ulang
+- Xray direstart agar sesi lama putus
+
+
+Unlock Xray
+-----------
+PATCH /vps/unlockvmess/:username
+PATCH /vps/unlockvless/:username
+PATCH /vps/unlocktrojan/:username
+
+Catatan:
+- Jika status LOCK_QUOTA dan pemakaian sudah melebihi quota, unlock gagal.
+- Tambah quota dulu sebelum unlock.
+
+
+QUOTA API
+=========
+
+Edit Quota Generic
+------------------
+PATCH /vps/quota/:type/:username
+
+Path:
+- type: ssh, sshvpn, zivpn, vmess, vless, trojan
+- username: username akun
+
+Body set quota:
+{
+  "kuota": 300
+}
+
+Body tambah quota:
+{
+  "kuota": 100,
+  "mode": "add"
+}
+
+Alternatif tambah quota:
+{
+  "quota": 100,
+  "add": true
+}
+
+Field quota yang diterima:
+- kuota
+- quota
+- quota_gb
+
+Response data:
+{
+  "username": "user1",
+  "type": "ssh",
+  "quota_before": "100",
+  "quota": "300",
+  "quota_used_bytes": "123456789",
+  "quota_unlocked": true,
+  "status": "AKTIF",
+  "time": "12:00:00"
+}
+
+
+Edit Quota Shortcut
+-------------------
+PATCH /vps/editquotasshvpn/:username
+PATCH /vps/editquotavmess/:username
+PATCH /vps/editquotavless/:username
+PATCH /vps/editquotatrojan/:username
+
+Body sama seperti /vps/quota/:type/:username.
+
+
+SYNC / RESTORE EVENT API
+========================
+
+Sync Xray dari DB
+-----------------
+POST /vps/sync-xray
+
+Efek:
+- render ulang config Xray dari DB
+- restart/reload Xray sesuai helper
+
+
+Restore Finished
+----------------
+POST /vps/restore-finished
+
+Efek:
+- dipanggil setelah restore/import DB selesai
+- sync Xray dari DB
+
+
+ZIVPN AUTH API
+==============
+
+ZIVPN Auth Check
+----------------
+POST /internal/zivpn-auth?token=ZIVPN_HTTP_AUTH_TOKEN
+
+Header alternatif:
+x-auth-token: ZIVPN_HTTP_AUTH_TOKEN
+
+Body:
+{
+  "auth": "username:password",
+  "addr": "1.2.3.4:12345"
+}
+
+Response sukses:
+{
+  "ok": true,
+  "id": "username"
+}
+
+Response gagal:
+{
+  "ok": false,
+  "id": ""
+}
+
+Catatan:
+- Endpoint ini untuk ZIVPN internal.
+- Mengecek akun SSH karena ZIVPN auth memakai akun SSH.
+- Menolak akun expired, LOCK, LOCK_QUOTA, atau password salah.
+- Mencatat live session untuk kebutuhan monitoring/limit IP.
+
+
+SUMMARY API
+===========
+
+Health
+------
+GET /health
+
+Auth:
+Tidak wajib.
+
+Response:
+{
+  "ok": true,
+  "service": "tunnel-summary",
+  "useDbAuth": true
+}
+
+
+Account Summary
+---------------
+GET /internal/account-summary
+
+Auth:
+x-sync-token wajib.
+
+Fungsi:
+Mengambil ringkasan jumlah akun SSH, VMess, VLESS, Trojan, dan statistik yang tersedia dari database.
+
+
+Account Expiry Per Username
+---------------------------
+GET /internal/account-expiry?username=user1
+
+Query:
+- username: wajib
+
+Fungsi:
+Mencari expired akun berdasarkan username lintas tabel yang didukung.
+
+
+Expiry Summary
+--------------
+GET /internal/expiry-summary?date=2026-06-13
+
+Query:
+- date: opsional, format YYYY-MM-DD, default hari ini
+
+Fungsi:
+Mengambil daftar/ringkasan akun yang expired pada tanggal tertentu.
+
+
+Vnstat Daily
+------------
+GET /internal/vnstat-daily
+
+Fungsi:
+Mengambil pemakaian traffic harian dari vnStat.
+
+
+Export Accounts
+---------------
+GET /internal/export-accounts?type=ssh&limit=100&include_inactive=1
+
+Query:
+- type: ssh, vmess, vless, trojan, atau kosong sesuai implementasi export
+- limit: opsional, 0 berarti tanpa limit
+- include_inactive: opsional, 1 untuk ikut status nonaktif
+- all_status: alias include_inactive
+
+Fungsi:
+Export akun untuk backup/migrasi.
+
+
+Export ZIVPN Config
+-------------------
+GET /internal/export-zivpn-config
+
+Fungsi:
+Export file konfigurasi ZIVPN.
+
+
+Export ZIVPN Auth
+-----------------
+GET /internal/export-zivpn-auth
+
+Fungsi:
+Export data auth ZIVPN.
+
+
+Export Banner Config
+--------------------
+GET /internal/export-banner-config
+
+Fungsi:
+Export banner HTML/TXT yang aktif.
+
+
+Export Runtime Settings
+-----------------------
+GET /internal/export-runtime-settings
+
+Fungsi:
+Export setting runtime seperti auto backup, auto reboot, auto update, iplimit, quota lock, dan setting lain yang masuk whitelist.
+
+
+Import Accounts
+---------------
+POST /internal/import-accounts
+
+Body:
+{
+  "type": "ssh",
+  "accounts": []
+}
+
+Type:
+- ssh
+- vmess
+- vless
+- trojan
+
+Fungsi:
+Import akun ke database.
+
+
+Delete Accounts
+---------------
+POST /internal/delete-accounts
+
+Body:
+{
+  "type": "ssh",
+  "usernames": ["user1", "user2"]
+}
+
+Fungsi:
+Hapus akun tertentu dari database.
+
+
+Delete All Accounts
+-------------------
+POST /internal/delete-all-accounts
+
+Body:
+{
+  "type": "ssh"
+}
+
+Type:
+- ssh
+- vmess
+- vless
+- trojan
+
+Fungsi:
+Hapus semua akun dari type tertentu.
+
+
+Restore ZIVPN Config
+--------------------
+POST /internal/restore-zivpn-config
+
+Body:
+{
+  "config": {}
+}
+
+Efek:
+- restore config ZIVPN
+- reload service ZIVPN
+
+
+Restore ZIVPN Auth
+------------------
+POST /internal/restore-zivpn-auth
+
+Body:
+{
+  "users": []
+}
+
+Efek:
+- restore user auth ZIVPN
+- reload service ZIVPN
+
+
+Restore Banner Config
+---------------------
+POST /internal/restore-banner-config
+
+Body:
+{
+  "html": "<div>...</div>",
+  "txt": "banner text"
+}
+
+Fungsi:
+Restore banner HTML/TXT.
+
+
+Restore Runtime Settings
+------------------------
+POST /internal/restore-runtime-settings
+
+Body:
+{
+  "settings": {
+    "AUTO_PULL_UPDATE_ENABLE": "1",
+    "AUTO_PULL_UPDATE_INTERVAL_MINUTES": "360",
+    "AUTO_REBOOT_ENABLE": "0"
+  }
+}
+
+Fungsi:
+Restore setting runtime ke file env dan unit systemd terkait.
+
+
+Restore Full Backup from URL
+----------------------------
+POST /internal/restore-full-backup-url
+
+Body:
+{
+  "file_url": "https://api.telegram.org/file/bot.../backup.tar.gz",
+  "file_name": "backup.tar.gz"
+}
+
+Fungsi:
+Download dan restore full backup dari URL file.
+
+
+Renew Xray Account via Summary API
+----------------------------------
+POST /internal/renew-xray-account
+
+Body:
+{
+  "type": "vmess",
+  "username": "user1",
+  "days": 30
+}
+
+Type:
+- vmess
+- vless
+- trojan
+
+Catatan:
+- Summary API akan meneruskan request ke Core VPS API.
+
+
+Sync Xray From DB
+-----------------
+POST /internal/sync-xray-from-db
+
+Body:
+{
+  "type": "vmess",
+  "restart": true
+}
+
+Type:
+- vmess
+- vless
+- trojan
+- kosong untuk sync semua sesuai implementasi
+
+Fungsi:
+Render config Xray dari database.
+
+
+Apply Xray Restart
+------------------
+POST /internal/apply-xray-restart
+
+Body:
+{}
+
+Fungsi:
+Restart service Xray.
+
+
+SC Access Lock
+--------------
+POST /internal/sc-access-lock
+
+Body lock:
+{
+  "blocked": true,
+  "reason": "admin_remove_sc_ip",
+  "actor": "123456789"
+}
+
+Body unlock:
+{
+  "blocked": false,
+  "reason": "renew",
+  "actor": "123456789"
+}
+
+Fungsi:
+Mengunci atau membuka akses SC pada VPS.
+
+
+SC Expired Notify
+-----------------
+POST /internal/sc-expired-notify
+
+Body contoh:
+{
+  "event": "h2_reminder",
+  "ip": "1.2.3.4",
+  "client": "Client A",
+  "expired_at": 1780000000000,
+  "remaining_ms": 86400000,
+  "reason": "expired_reminder"
+}
+
+Fungsi:
+Mengirim notifikasi Telegram lewat bot SC yang terpasang di VPS.
+
+
+SC Registration Meta
+--------------------
+POST /internal/sc-registration-meta
+
+Body:
+{
+  "ip": "1.2.3.4",
+  "user_id": 123456789,
+  "chat_id": 123456789,
+  "client_name": "Client A",
+  "expires_at": 1780000000000
+}
+
+Fungsi:
+Menyimpan metadata registrasi SC di VPS.
+
+
+Trigger Update Legacy
+---------------------
+POST /internal/trigger-update
+
+Status:
+Dinonaktifkan permanen.
+
+Response:
+HTTP 410
+{
+  "ok": false,
+  "message": "endpoint trigger-update sudah dinonaktifkan permanen"
+}
+
+
+ZIVPN Service Control
+---------------------
+POST /internal/zivpn-service
+
+Body:
+{
+  "action": "status"
+}
+
+Action umum:
+- status
+- start
+- stop
+- restart
+
+Response:
+{
+  "ok": true,
+  "action": "status",
+  "service": "zivpn",
+  "status": "active"
+}
+
+
+CONTOH CURL
+===========
+
+Create SSH:
+curl -s -X POST "https://DOMAIN/vps/sshvpn" \
+  -H "Authorization: API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"user1","password":"pass123","expired":30,"kuota":100,"limitip":1}'
+
+Create VMess:
+curl -s -X POST "https://DOMAIN/vps/vmessall" \
+  -H "Authorization: API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"vmess1","expired":30,"kuota":100,"limitip":1}'
+
+Renew SSH:
+curl -s -X PATCH "https://DOMAIN/vps/renewsshvpn/user1/30" \
+  -H "Authorization: API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"kuota":200,"limitip":2}'
+
+Tambah quota VMess:
+curl -s -X PATCH "https://DOMAIN/vps/quota/vmess/vmess1" \
+  -H "Authorization: API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"kuota":100,"mode":"add"}'
+
+Summary account:
+curl -s "http://IP_VPS:8789/internal/account-summary" \
+  -H "x-sync-token: API_TOKEN"
+
+Sync Xray dari Summary API:
+curl -s -X POST "http://IP_VPS:8789/internal/sync-xray-from-db" \
+  -H "x-sync-token: API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"vmess","restart":true}'
+
+
+CATATAN KEAMANAN
+================
+
+- Jangan expose Summary API ke publik tanpa firewall/IP allowlist.
+- Simpan API_TOKEN dan x-sync-token secara private.
+- Endpoint delete-all, restore-full-backup-url, apply-xray-restart, dan sc-access-lock bersifat sensitif.
+- Jika license runtime expired, endpoint /vps/* akan mengembalikan 403 license expired.
+- Endpoint /internal/zivpn-auth sebaiknya tetap lokal/internal.
+

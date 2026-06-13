@@ -961,7 +961,26 @@ setup_default_banner_assets() {
   mkdir -p /etc/sc-1forcr
 
   if [[ ! -s /etc/sc-1forcr/banner.html || "${BANNER_FORCE_DEFAULT:-0}" == "1" ]]; then
-    write_default_banner_html
+    cat > /etc/sc-1forcr/banner.html <<'EOF'
+<div style="text-align:center; line-height:1.6; font-family: monospace;">
+
+<font color="#00ffff">=======================</font><br>
+<font color="#17e8ff">SECURE SSH SERVICE</font><br>
+<font color="#00ffff">=======================</font><br>
+
+<font color="#ff45ba"><b>ATURAN PEMAKAIAN</b></font><br>
+<font color="#84ecdb">
+Gunakan akun sesuai limit perangkat.<br>
+Jangan membagikan akun ke pengguna lain.<br>
+Hubungi admin layanan jika butuh bantuan.<br>
+</font><br>
+
+<font color="red"><b>Akun dapat dikunci otomatis jika melanggar limit.</b></font><br><br>
+<font color="#84ecdb"><i>Terima kasih telah menggunakan layanan kami.</i></font><br>
+<font color="#00ffff">=========================</font><br>
+
+</div>
+EOF
   else
     log "Banner HTML sudah ada, tidak ditimpa."
   fi

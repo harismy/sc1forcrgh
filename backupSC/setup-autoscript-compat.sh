@@ -46,6 +46,9 @@ set -euo pipefail
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
+#   SSHWS_UDPGW_MAX_CLIENTS=128                (opsional, hemat RAM; naikkan hanya untuk server besar)
+#   SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=32  (opsional, koneksi UDP per client badvpn)
+#   SSHWS_UDPGW_MEMORY_MAX=128M                (opsional, batas RAM per service badvpn)
 #   SSH_TUNNEL_SHELL=/usr/sbin/nologin         (akun SSH/ZIVPN tunnel-only, tanpa shell VPS)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1            (blok akun tunnel konek keluar ke port SSH)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=22,2222     (port keluar yang diblok untuk UID non-root)
@@ -127,6 +130,9 @@ UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
 SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
+SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-128}"
+SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-32}"
+SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-128M}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/sbin/nologin}"
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}"
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}"
@@ -2181,6 +2187,9 @@ VMESS_BUG_PROFILE_HOST=${VMESS_BUG_PROFILE_HOST}
 VMESS_BUG_PROFILE_ALLOW_INSECURE=${VMESS_BUG_PROFILE_ALLOW_INSECURE}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
+SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
+SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
+SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
 SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH}
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS}
@@ -6492,7 +6501,7 @@ EOF
 }
 
 setup_udpgw_service_if_possible() {
-  local udpgw_bin udpgw_ports_raw udpgw_ports p
+  local udpgw_bin udpgw_ports_raw udpgw_ports udpgw_max_clients udpgw_max_connections_per_client udpgw_memory_max p
   udpgw_bin=""
   for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
     if [[ -x "${p}" ]]; then
@@ -6542,7 +6551,14 @@ setup_udpgw_service_if_possible() {
   udpgw_ports="$(echo "${udpgw_ports_raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 {print $1}' | awk '!seen[$0]++')"
   [[ -z "${udpgw_ports}" ]] && udpgw_ports="7300"$'\n'"7200"
 
-  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//')"
+  udpgw_max_clients="$(echo "${SSHWS_UDPGW_MAX_CLIENTS:-128}" | tr -cd '0-9')"
+  [[ -z "${udpgw_max_clients}" || "${udpgw_max_clients}" -lt 16 || "${udpgw_max_clients}" -gt 2048 ]] && udpgw_max_clients="128"
+  udpgw_max_connections_per_client="$(echo "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-32}" | tr -cd '0-9')"
+  [[ -z "${udpgw_max_connections_per_client}" || "${udpgw_max_connections_per_client}" -lt 4 || "${udpgw_max_connections_per_client}" -gt 256 ]] && udpgw_max_connections_per_client="32"
+  udpgw_memory_max="$(printf '%s' "${SSHWS_UDPGW_MEMORY_MAX:-128M}" | tr '[:lower:]' '[:upper:]' | tr -cd '0-9KMG')"
+  [[ -z "${udpgw_memory_max}" ]] && udpgw_memory_max="128M"
+
+  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//') limit=${udpgw_max_clients}/${udpgw_max_connections_per_client} mem=${udpgw_memory_max}"
   cat > /etc/systemd/system/sc-1forcr-udpgw@.service <<EOF
 [Unit]
 Description=SC 1FORCR UDPGW on 0.0.0.0:%i
@@ -6550,11 +6566,15 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${udpgw_bin} --listen-addr 0.0.0.0:%i --max-clients 2048 --max-connections-for-client 256
+ExecStart=${udpgw_bin} --listen-addr 0.0.0.0:%i --max-clients ${udpgw_max_clients} --max-connections-for-client ${udpgw_max_connections_per_client}
 Restart=always
 RestartSec=1
 NoNewPrivileges=true
 PrivateTmp=true
+MemoryAccounting=true
+MemoryMax=${udpgw_memory_max}
+TasksMax=1024
+LimitNOFILE=32768
 
 [Install]
 WantedBy=multi-user.target
@@ -6562,7 +6582,8 @@ EOF
 
   systemctl daemon-reload
   for p in ${udpgw_ports}; do
-    systemctl enable --now "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    systemctl enable "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    systemctl restart "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
     if command -v iptables >/dev/null 2>&1; then
       iptables -w 10 -C INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1 || \
         iptables -w 10 -I INPUT -p tcp --dport "${p}" -j ACCEPT
@@ -6974,6 +6995,9 @@ SETTINGS_KEYS = [
     "ACTIVE_UDP_BACKEND",
     "SSH_HC_AUTH_LOOKBACK_HOURS",
     "SSHWS_UDPGW_PORTS",
+    "SSHWS_UDPGW_MAX_CLIENTS",
+    "SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT",
+    "SSHWS_UDPGW_MEMORY_MAX",
     "SSH_TUNNEL_SHELL",
     "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
     "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
@@ -8525,6 +8549,9 @@ ZIVPN_DNAT_RANGE=${ZIVPN_DNAT_RANGE}
 UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
+SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
+SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
+SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 DROPBEAR_VERSION=${DROPBEAR_VERSION}
@@ -13770,6 +13797,9 @@ Time     : $(date '+%F %T')"
     UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
     UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
     SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}" \
+    SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-128}" \
+    SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-32}" \
+    SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-128M}" \
     DROPBEAR_PORT="${DROPBEAR_PORT}" \
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
     DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
@@ -14939,7 +14969,8 @@ persist_pending_install_env() {
     ZIVPN_LISTEN_PORT ZIVPN_DNAT_RANGE ZIVPN_DNAT_IFACE
     UDPCUSTOM_BIN_URL UDPCUSTOM_SERVICE_NAME UDPCUSTOM_LISTEN_PORT
     UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
-    SSHWS_UDPGW_PORTS SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
+    SSHWS_UDPGW_PORTS SSHWS_UDPGW_MAX_CLIENTS SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT SSHWS_UDPGW_MEMORY_MAX
+    SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
     SSH_TUNNEL_BLOCK_OUTBOUND_PORTS ACTIVE_UDP_BACKEND
     DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN

@@ -98,6 +98,48 @@ Response:
 }
 
 
+Kapasitas / Auto Tune
+---------------------
+GET /vps/capacity
+
+Auth:
+Authorization wajib.
+
+Fungsi:
+- Membaca hasil analyzer resource auto-tune.
+- Dipakai untuk melihat apakah server masih aman ditambah user aktif.
+- Target default menjaga RAM/CPU tidak melewati 85%.
+
+Response data utama:
+{
+  "ready": true,
+  "capacity_status": "OK",
+  "resource_target_percent": 85,
+  "ram_total_mib": 961,
+  "ram_used_mib": 620,
+  "avg_ram_used_percent": 64.5,
+  "cpu_used_percent": 12.0,
+  "avg_cpu_used_percent": 10.4,
+  "cpu_cores": 1,
+  "active_connection_count": 24,
+  "active_unique_ip_count": 8,
+  "active_ssh_user_count": 6,
+  "active_xray_user_count": 4,
+  "active_user_estimate": 10,
+  "active_account_total": 40,
+  "capacity_active_user_target": 39,
+  "user_ram_estimate_mib": 10.2,
+  "user_cpu_estimate_percent": 2.13,
+  "can_add_users": 5,
+  "recommended_add_batch": 5
+}
+
+Catatan:
+- active_user_estimate adalah nilai maksimum dari estimasi koneksi aktif, IP unik, username SSH/dropbear, dan username Xray terbaru.
+- recommended_add_batch akan bernilai 5, 2, 1, atau 0 sesuai sisa aman.
+- Jika capacity_status FULL/CRITICAL, jangan tambah user aktif dulu.
+
+
 List Akun Milik User Telegram
 -----------------------------
 GET /vps/my-accounts?telegram_user_id=123456789
@@ -989,4 +1031,3 @@ CATATAN KEAMANAN
 - Endpoint delete-all, restore-full-backup-url, apply-xray-restart, dan sc-access-lock bersifat sensitif.
 - Jika license runtime expired, endpoint /vps/* akan mengembalikan 403 license expired.
 - Endpoint /internal/zivpn-auth sebaiknya tetap lokal/internal.
-

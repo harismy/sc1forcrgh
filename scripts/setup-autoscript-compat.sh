@@ -55,6 +55,9 @@ set -euo pipefail
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
+#   SSHWS_UDPGW_MAX_CLIENTS=auto               (opsional, hemat RAM; auto by RAM/vCPU)
+#   SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=auto (opsional, koneksi UDP per client badvpn)
+#   SSHWS_UDPGW_MEMORY_MAX=auto                (opsional, batas RAM per service badvpn)
 #   SSH_TUNNEL_SHELL=/usr/local/sbin/sc-1forcr-tunnel-shell (tunnel-only, tahan sesi HTTP Custom tanpa shell VPS)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1            (blok akun tunnel konek keluar ke port SSH)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=22,2222     (port keluar yang diblok untuk UID non-root)
@@ -81,6 +84,10 @@ set -euo pipefail
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
 #   ONLINE_NOTIFY_INTERVAL_HOURS=3               (opsional, interval notifikasi online dalam jam)
 #   ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=300      (opsional, jendela realtime XRAY dalam detik)
+#   RESOURCE_AUTOTUNE_ENABLE=1                   (opsional, 1=auto tune RAM/CPU service dan capacity analyzer)
+#   RESOURCE_TARGET_USAGE_PERCENT=85             (opsional, target maksimum RAM/CPU sebelum dianggap penuh)
+#   RESOURCE_AUTOTUNE_INTERVAL_MINUTES=5         (opsional, interval analyzer kapasitas)
+#   RESOURCE_CAPACITY_STATE_FILE=/var/lib/sc-1forcr/capacity.env
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=3             (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
 #   IPLIMIT_AUTO_LOCK_ENABLE=1                   (opsional, 1=auto lock aktif, 0=monitor only)
@@ -101,10 +108,12 @@ set -euo pipefail
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
 #   SSHWS_READER_BUFFER_KB=16                    (opsional, buffer per koneksi SSHWS; 16 hemat RAM, max 64)
 #   SSHWS_TCP_KEEPALIVE_SECONDS=30               (opsional, keepalive TCP mux SSHWS)
+#   SC_API_MEMORY_MAX=auto                       (opsional, batas RAM service API; auto by RAM/vCPU)
+#   SSHWS_SERVICE_MEMORY_MAX=auto                (opsional, batas RAM service SSHWS mux; auto by RAM/vCPU)
 #   HAPROXY_TCPLOG_ENABLE=0                      (opsional, 1=log TCP detail; 0=hemat CPU/disk)
-#   HAPROXY_SERVICE_LIMIT_NOFILE=200000          (opsional, limit FD HAProxy untuk banyak koneksi)
-#   HAPROXY_MAXCONN=20000                        (opsional, batas koneksi HAProxy)
-#   HAPROXY_NBTHREAD=1                           (opsional, thread HAProxy; 1 paling hemat)
+#   HAPROXY_SERVICE_LIMIT_NOFILE=auto            (opsional, limit FD HAProxy auto by RAM/vCPU)
+#   HAPROXY_MAXCONN=auto                         (opsional, batas koneksi HAProxy auto by RAM/vCPU)
+#   HAPROXY_NBTHREAD=auto                        (opsional, thread HAProxy auto by RAM/vCPU)
 #   VMESS_BUG_PROFILE_ADDRESS=                   (opsional, contoh: nusa-stb1.retrivip.xyz)
 #   VMESS_BUG_PROFILE_SNI=                       (opsional, contoh: dfsuporte.garena.com)
 #   VMESS_BUG_PROFILE_HOST=                      (opsional, default mengikuti ADDRESS)
@@ -161,6 +170,9 @@ UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
 SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
+SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-auto}"
+SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-auto}"
+SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-auto}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}"
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}"
@@ -185,6 +197,10 @@ AUTO_REBOOT_WIB_HOUR="${AUTO_REBOOT_WIB_HOUR:-3}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
+RESOURCE_AUTOTUNE_ENABLE="${RESOURCE_AUTOTUNE_ENABLE:-1}"
+RESOURCE_TARGET_USAGE_PERCENT="${RESOURCE_TARGET_USAGE_PERCENT:-85}"
+RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}"
+RESOURCE_CAPACITY_STATE_FILE="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
@@ -202,10 +218,10 @@ SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE:-200}"
 SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
 SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-20r/s}"
 SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-40}"
-SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-50}"
-NGINX_WORKER_CONNECTIONS="${NGINX_WORKER_CONNECTIONS:-8192}"
-NGINX_WORKER_RLIMIT_NOFILE="${NGINX_WORKER_RLIMIT_NOFILE:-200000}"
-NGINX_SERVICE_LIMIT_NOFILE="${NGINX_SERVICE_LIMIT_NOFILE:-200000}"
+SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-auto}"
+NGINX_WORKER_CONNECTIONS="${NGINX_WORKER_CONNECTIONS:-auto}"
+NGINX_WORKER_RLIMIT_NOFILE="${NGINX_WORKER_RLIMIT_NOFILE:-auto}"
+NGINX_SERVICE_LIMIT_NOFILE="${NGINX_SERVICE_LIMIT_NOFILE:-auto}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
@@ -218,14 +234,16 @@ XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
-SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-16}"
+SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-auto}"
 SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}"
 DROPBEAR_KEEPALIVE_SECONDS="${DROPBEAR_KEEPALIVE_SECONDS:-30}"
 DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}"
+SC_API_MEMORY_MAX="${SC_API_MEMORY_MAX:-auto}"
+SSHWS_SERVICE_MEMORY_MAX="${SSHWS_SERVICE_MEMORY_MAX:-auto}"
 HAPROXY_TCPLOG_ENABLE="${HAPROXY_TCPLOG_ENABLE:-0}"
-HAPROXY_SERVICE_LIMIT_NOFILE="${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}"
-HAPROXY_MAXCONN="${HAPROXY_MAXCONN:-20000}"
-HAPROXY_NBTHREAD="${HAPROXY_NBTHREAD:-1}"
+HAPROXY_SERVICE_LIMIT_NOFILE="${HAPROXY_SERVICE_LIMIT_NOFILE:-auto}"
+HAPROXY_MAXCONN="${HAPROXY_MAXCONN:-auto}"
+HAPROXY_NBTHREAD="${HAPROXY_NBTHREAD:-auto}"
 VMESS_BUG_PROFILE_ADDRESS="${VMESS_BUG_PROFILE_ADDRESS:-}"
 VMESS_BUG_PROFILE_SNI="${VMESS_BUG_PROFILE_SNI:-}"
 VMESS_BUG_PROFILE_HOST="${VMESS_BUG_PROFILE_HOST:-}"
@@ -818,7 +836,144 @@ auto_tune_iplimit_vars() {
   return 0
 }
 
+is_auto_value() {
+  local raw
+  raw="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  [[ -z "${raw}" || "${raw}" == "auto" ]]
+}
+
+sanitize_memory_max_value() {
+  local raw fallback
+  raw="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]' | tr -cd '0-9KMG')"
+  fallback="${2:-256M}"
+  [[ -z "${raw}" ]] && raw="${fallback}"
+  echo "${raw}"
+}
+
+sanitize_percent_value() {
+  local raw fallback
+  raw="$(echo "${1:-}" | tr -cd '0-9')"
+  fallback="${2:-85}"
+  [[ -z "${raw}" || "${raw}" -lt 50 || "${raw}" -gt 95 ]] && raw="${fallback}"
+  echo "${raw}"
+}
+
+auto_tune_resource_vars() {
+  local enabled ram_mib cores tier target interval
+  local def_nginx_conn def_nofile def_haproxy_maxconn def_haproxy_thread
+  local def_sshws_buffer def_sshws_conn def_api_mem def_sshws_mem def_udpgw_clients def_udpgw_conn def_udpgw_mem
+
+  enabled="$(normalize_bool_01 "${RESOURCE_AUTOTUNE_ENABLE}")"
+  RESOURCE_AUTOTUNE_ENABLE="${enabled}"
+  RESOURCE_TARGET_USAGE_PERCENT="$(sanitize_percent_value "${RESOURCE_TARGET_USAGE_PERCENT}" "85")"
+  RESOURCE_AUTOTUNE_INTERVAL_MINUTES="$(echo "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
+  [[ -z "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" || "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" -lt 1 || "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" -gt 60 ]] && RESOURCE_AUTOTUNE_INTERVAL_MINUTES="5"
+  [[ -z "${RESOURCE_CAPACITY_STATE_FILE}" ]] && RESOURCE_CAPACITY_STATE_FILE="/var/lib/sc-1forcr/capacity.env"
+
+  ram_mib="$(get_total_ram_mib)"
+  cores="$(get_cpu_cores)"
+  tier="$(ram_mib_to_nominal_gb "${ram_mib}")"
+  (( cores < tier )) && tier="${cores}"
+  (( tier < 1 )) && tier=1
+  target="${RESOURCE_TARGET_USAGE_PERCENT}"
+  interval="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}"
+
+  def_nginx_conn="2048"
+  def_nofile="65536"
+  def_haproxy_maxconn="4096"
+  def_haproxy_thread="1"
+  def_sshws_buffer="8"
+  def_sshws_conn="30"
+  def_api_mem="256M"
+  def_sshws_mem="192M"
+  def_udpgw_clients="128"
+  def_udpgw_conn="32"
+  def_udpgw_mem="128M"
+
+  if (( tier >= 8 )); then
+    def_nginx_conn="16384"
+    def_nofile="262144"
+    def_haproxy_maxconn="24000"
+    def_haproxy_thread="4"
+    def_sshws_buffer="16"
+    def_sshws_conn="80"
+    def_api_mem="512M"
+    def_sshws_mem="768M"
+    def_udpgw_clients="512"
+    def_udpgw_conn="64"
+    def_udpgw_mem="256M"
+  elif (( tier >= 4 )); then
+    def_nginx_conn="8192"
+    def_nofile="200000"
+    def_haproxy_maxconn="16000"
+    def_haproxy_thread="2"
+    def_sshws_buffer="16"
+    def_sshws_conn="60"
+    def_api_mem="384M"
+    def_sshws_mem="512M"
+    def_udpgw_clients="256"
+    def_udpgw_conn="48"
+    def_udpgw_mem="192M"
+  elif (( tier >= 2 )); then
+    def_nginx_conn="4096"
+    def_nofile="100000"
+    def_haproxy_maxconn="8192"
+    def_haproxy_thread="1"
+    def_sshws_buffer="12"
+    def_sshws_conn="45"
+    def_api_mem="300M"
+    def_sshws_mem="320M"
+    def_udpgw_clients="192"
+    def_udpgw_conn="32"
+    def_udpgw_mem="160M"
+  fi
+
+  if [[ "${enabled}" == "1" ]]; then
+    is_auto_value "${NGINX_WORKER_CONNECTIONS}" && NGINX_WORKER_CONNECTIONS="${def_nginx_conn}"
+    is_auto_value "${NGINX_WORKER_RLIMIT_NOFILE}" && NGINX_WORKER_RLIMIT_NOFILE="${def_nofile}"
+    is_auto_value "${NGINX_SERVICE_LIMIT_NOFILE}" && NGINX_SERVICE_LIMIT_NOFILE="${def_nofile}"
+    is_auto_value "${HAPROXY_SERVICE_LIMIT_NOFILE}" && HAPROXY_SERVICE_LIMIT_NOFILE="${def_nofile}"
+    is_auto_value "${HAPROXY_MAXCONN}" && HAPROXY_MAXCONN="${def_haproxy_maxconn}"
+    is_auto_value "${HAPROXY_NBTHREAD}" && HAPROXY_NBTHREAD="${def_haproxy_thread}"
+    is_auto_value "${SSHWS_READER_BUFFER_KB}" && SSHWS_READER_BUFFER_KB="${def_sshws_buffer}"
+    is_auto_value "${SSHWS_NGINX_LIMIT_CONN}" && SSHWS_NGINX_LIMIT_CONN="${def_sshws_conn}"
+    is_auto_value "${SC_API_MEMORY_MAX}" && SC_API_MEMORY_MAX="${def_api_mem}"
+    is_auto_value "${SSHWS_SERVICE_MEMORY_MAX}" && SSHWS_SERVICE_MEMORY_MAX="${def_sshws_mem}"
+    is_auto_value "${SSHWS_UDPGW_MAX_CLIENTS}" && SSHWS_UDPGW_MAX_CLIENTS="${def_udpgw_clients}"
+    is_auto_value "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}" && SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${def_udpgw_conn}"
+    is_auto_value "${SSHWS_UDPGW_MEMORY_MAX}" && SSHWS_UDPGW_MEMORY_MAX="${def_udpgw_mem}"
+    log "Resource auto-tune aktif: RAM=${ram_mib}MiB vCPU=${cores} tier=${tier} target=${target}% interval=${interval}m"
+  fi
+
+  NGINX_WORKER_CONNECTIONS="$(echo "${NGINX_WORKER_CONNECTIONS:-${def_nginx_conn}}" | tr -cd '0-9')"
+  NGINX_WORKER_RLIMIT_NOFILE="$(echo "${NGINX_WORKER_RLIMIT_NOFILE:-${def_nofile}}" | tr -cd '0-9')"
+  NGINX_SERVICE_LIMIT_NOFILE="$(echo "${NGINX_SERVICE_LIMIT_NOFILE:-${def_nofile}}" | tr -cd '0-9')"
+  HAPROXY_SERVICE_LIMIT_NOFILE="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-${def_nofile}}" | tr -cd '0-9')"
+  HAPROXY_MAXCONN="$(echo "${HAPROXY_MAXCONN:-${def_haproxy_maxconn}}" | tr -cd '0-9')"
+  HAPROXY_NBTHREAD="$(echo "${HAPROXY_NBTHREAD:-${def_haproxy_thread}}" | tr -cd '0-9')"
+  SSHWS_READER_BUFFER_KB="$(echo "${SSHWS_READER_BUFFER_KB:-${def_sshws_buffer}}" | tr -cd '0-9')"
+  SSHWS_NGINX_LIMIT_CONN="$(echo "${SSHWS_NGINX_LIMIT_CONN:-${def_sshws_conn}}" | tr -cd '0-9')"
+  SC_API_MEMORY_MAX="$(sanitize_memory_max_value "${SC_API_MEMORY_MAX}" "${def_api_mem}")"
+  SSHWS_SERVICE_MEMORY_MAX="$(sanitize_memory_max_value "${SSHWS_SERVICE_MEMORY_MAX}" "${def_sshws_mem}")"
+  SSHWS_UDPGW_MAX_CLIENTS="$(echo "${SSHWS_UDPGW_MAX_CLIENTS:-${def_udpgw_clients}}" | tr -cd '0-9')"
+  SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="$(echo "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-${def_udpgw_conn}}" | tr -cd '0-9')"
+  SSHWS_UDPGW_MEMORY_MAX="$(sanitize_memory_max_value "${SSHWS_UDPGW_MEMORY_MAX}" "${def_udpgw_mem}")"
+
+  [[ -z "${NGINX_WORKER_CONNECTIONS}" || "${NGINX_WORKER_CONNECTIONS}" -lt 1024 ]] && NGINX_WORKER_CONNECTIONS="${def_nginx_conn}"
+  [[ -z "${NGINX_WORKER_RLIMIT_NOFILE}" || "${NGINX_WORKER_RLIMIT_NOFILE}" -lt 32768 ]] && NGINX_WORKER_RLIMIT_NOFILE="${def_nofile}"
+  [[ -z "${NGINX_SERVICE_LIMIT_NOFILE}" || "${NGINX_SERVICE_LIMIT_NOFILE}" -lt 32768 ]] && NGINX_SERVICE_LIMIT_NOFILE="${def_nofile}"
+  [[ -z "${HAPROXY_SERVICE_LIMIT_NOFILE}" || "${HAPROXY_SERVICE_LIMIT_NOFILE}" -lt 32768 ]] && HAPROXY_SERVICE_LIMIT_NOFILE="${def_nofile}"
+  [[ -z "${HAPROXY_MAXCONN}" || "${HAPROXY_MAXCONN}" -lt 1024 ]] && HAPROXY_MAXCONN="${def_haproxy_maxconn}"
+  [[ -z "${HAPROXY_NBTHREAD}" || "${HAPROXY_NBTHREAD}" -lt 1 ]] && HAPROXY_NBTHREAD="${def_haproxy_thread}"
+  [[ -z "${SSHWS_READER_BUFFER_KB}" || "${SSHWS_READER_BUFFER_KB}" -lt 8 ]] && SSHWS_READER_BUFFER_KB="${def_sshws_buffer}"
+  [[ "${SSHWS_READER_BUFFER_KB}" -gt 64 ]] && SSHWS_READER_BUFFER_KB="64"
+  [[ -z "${SSHWS_NGINX_LIMIT_CONN}" || "${SSHWS_NGINX_LIMIT_CONN}" -lt 10 ]] && SSHWS_NGINX_LIMIT_CONN="${def_sshws_conn}"
+  [[ -z "${SSHWS_UDPGW_MAX_CLIENTS}" || "${SSHWS_UDPGW_MAX_CLIENTS}" -lt 16 ]] && SSHWS_UDPGW_MAX_CLIENTS="${def_udpgw_clients}"
+  [[ -z "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}" || "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}" -lt 4 ]] && SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${def_udpgw_conn}"
+}
+
 auto_tune_iplimit_vars
+auto_tune_resource_vars
 
 check_supported_os() {
   local id ver major
@@ -1787,8 +1942,8 @@ setup_haproxy_tls_mux() {
     log "Gagal menyiapkan sertifikat HAProxy."
     return 1
   }
-  haproxy_maxconn="$(echo "${HAPROXY_MAXCONN:-20000}" | tr -cd '0-9')"
-  [[ -z "${haproxy_maxconn}" || "${haproxy_maxconn}" -lt 1024 ]] && haproxy_maxconn="20000"
+  haproxy_maxconn="$(echo "${HAPROXY_MAXCONN:-4096}" | tr -cd '0-9')"
+  [[ -z "${haproxy_maxconn}" || "${haproxy_maxconn}" -lt 1024 ]] && haproxy_maxconn="4096"
   haproxy_nbthread="$(echo "${HAPROXY_NBTHREAD:-1}" | tr -cd '0-9')"
   [[ -z "${haproxy_nbthread}" || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
   cores="$(get_cpu_cores)"
@@ -1796,8 +1951,8 @@ setup_haproxy_tls_mux() {
   [[ "${haproxy_nbthread}" -gt "${cores}" ]] && haproxy_nbthread="${cores}"
   [[ "${haproxy_nbthread}" -gt 8 ]] && haproxy_nbthread="8"
   [[ -z "${haproxy_nbthread}" || ! "${haproxy_nbthread}" =~ ^[0-9]+$ || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
-  haproxy_limit_nofile="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
-  [[ -z "${haproxy_limit_nofile}" || "${haproxy_limit_nofile}" -lt 65536 ]] && haproxy_limit_nofile="200000"
+  haproxy_limit_nofile="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-65536}" | tr -cd '0-9')"
+  [[ -z "${haproxy_limit_nofile}" || "${haproxy_limit_nofile}" -lt 32768 ]] && haproxy_limit_nofile="65536"
   if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then
     haproxy_log_option="    option tcplog"
   else
@@ -2558,6 +2713,9 @@ VMESS_BUG_PROFILE_HOST=${VMESS_BUG_PROFILE_HOST}
 VMESS_BUG_PROFILE_ALLOW_INSECURE=${VMESS_BUG_PROFILE_ALLOW_INSECURE}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
+SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
+SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
+SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
 SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH}
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS}
@@ -2575,10 +2733,16 @@ AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
+RESOURCE_AUTOTUNE_ENABLE=${RESOURCE_AUTOTUNE_ENABLE}
+RESOURCE_TARGET_USAGE_PERCENT=${RESOURCE_TARGET_USAGE_PERCENT}
+RESOURCE_AUTOTUNE_INTERVAL_MINUTES=${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}
+RESOURCE_CAPACITY_STATE_FILE=${RESOURCE_CAPACITY_STATE_FILE}
 HAPROXY_TCPLOG_ENABLE=${HAPROXY_TCPLOG_ENABLE}
 HAPROXY_SERVICE_LIMIT_NOFILE=${HAPROXY_SERVICE_LIMIT_NOFILE}
 HAPROXY_MAXCONN=${HAPROXY_MAXCONN}
 HAPROXY_NBTHREAD=${HAPROXY_NBTHREAD}
+SC_API_MEMORY_MAX=${SC_API_MEMORY_MAX}
+SSHWS_SERVICE_MEMORY_MAX=${SSHWS_SERVICE_MEMORY_MAX}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -2694,6 +2858,7 @@ const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const LICENSE_ENFORCE = String(process.env.LICENSE_ENFORCE || '1').trim().toLowerCase();
 const QUOTA_BYTES_PER_GB = 1024 * 1024 * 1024;
+const RESOURCE_CAPACITY_STATE_FILE = String(process.env.RESOURCE_CAPACITY_STATE_FILE || '/var/lib/sc-1forcr/capacity.env').trim();
 
 const db = new sqlite3.Database(DB_PATH);
 let licenseApiStopped = false;
@@ -2725,6 +2890,63 @@ function readLicenseFileState() {
   } catch (_) {
     return { status: '', expiresAt: 0 };
   }
+}
+function readKeyValueFile(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return {};
+    const raw = String(fs.readFileSync(filePath, 'utf8') || '');
+    const out = {};
+    for (const line of raw.split(/\r?\n/)) {
+      if (!line || /^\s*#/.test(line)) continue;
+      const i = line.indexOf('=');
+      if (i <= 0) continue;
+      const key = line.slice(0, i).trim();
+      let value = line.slice(i + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (key) out[key] = value;
+    }
+    return out;
+  } catch (_) {
+    return {};
+  }
+}
+function readCapacityState() {
+  const kv = readKeyValueFile(RESOURCE_CAPACITY_STATE_FILE);
+  const numKeys = new Set([
+    'RESOURCE_TARGET_PERCENT',
+    'RAM_TOTAL_MIB',
+    'RAM_USED_MIB',
+    'RAM_USED_PERCENT',
+    'CPU_USED_PERCENT',
+    'CPU_CORES',
+    'ACTIVE_CONNECTION_COUNT',
+    'ACTIVE_UNIQUE_IP_COUNT',
+    'ACTIVE_SSH_USER_COUNT',
+    'ACTIVE_XRAY_USER_COUNT',
+    'ACTIVE_USER_ESTIMATE',
+    'ACTIVE_ACCOUNT_TOTAL',
+    'CAPACITY_ACTIVE_USER_TARGET',
+    'USER_RAM_ESTIMATE_MIB',
+    'USER_CPU_ESTIMATE_PERCENT',
+    'CAN_ADD_USERS',
+    'RECOMMENDED_ADD_BATCH'
+  ]);
+  const out = {};
+  for (const [key, value] of Object.entries(kv)) {
+    if (numKeys.has(key)) {
+      const n = Number(value);
+      out[key.toLowerCase()] = Number.isFinite(n) ? n : value;
+    } else {
+      out[key.toLowerCase()] = value;
+    }
+  }
+  return {
+    state_file: RESOURCE_CAPACITY_STATE_FILE,
+    ready: Object.keys(kv).length > 0,
+    ...out
+  };
 }
 function isRuntimeLicenseDenied() {
   if (LICENSE_ENFORCE === '0' || LICENSE_ENFORCE === 'false' || LICENSE_ENFORCE === 'no' || LICENSE_ENFORCE === 'off') {
@@ -4358,6 +4580,8 @@ async function cleanupExpiredXrayAccounts() {
 
 app.get('/vps/health', (_req, res) => ok(res, { ok: true, domain: DOMAIN }));
 app.use('/vps', runtimeLicenseGuard, auth);
+
+app.get('/vps/capacity', (_req, res) => ok(res, readCapacityState()));
 
 app.get('/vps/my-accounts', async (req, res) => {
   try {
@@ -8180,7 +8404,7 @@ RestartSec=2
 NoNewPrivileges=true
 PrivateTmp=true
 TasksMax=256
-MemoryMax=350M
+MemoryMax=${SC_API_MEMORY_MAX}
 
 [Install]
 WantedBy=multi-user.target
@@ -8200,8 +8424,8 @@ RestartSec=2
 NoNewPrivileges=true
 PrivateTmp=true
 TasksMax=4096
-LimitNOFILE=200000
-MemoryMax=512M
+LimitNOFILE=${NGINX_SERVICE_LIMIT_NOFILE}
+MemoryMax=${SSHWS_SERVICE_MEMORY_MAX}
 
 [Install]
 WantedBy=multi-user.target
@@ -8252,8 +8476,298 @@ EOF
   systemctl restart dropbear || true
 }
 
+setup_resource_autotune_timer() {
+  local interval
+  interval="$(echo "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
+  [[ -z "${interval}" || "${interval}" -lt 1 || "${interval}" -gt 60 ]] && interval="5"
+
+  log "Setup resource auto-tune analyzer tiap ${interval} menit..."
+  cat > /usr/local/sbin/sc-1forcr-capacity-tune <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+for env_file in /etc/sc-1forcr.env /opt/sc-1forcr/.env; do
+  if [[ -f "${env_file}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${env_file}" >/dev/null 2>&1 || true
+    set +a
+  fi
+done
+
+state_file="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
+target="$(echo "${RESOURCE_TARGET_USAGE_PERCENT:-85}" | tr -cd '0-9')"
+[[ -z "${target}" || "${target}" -lt 50 || "${target}" -gt 95 ]] && target="85"
+db_path="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+dropbear_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+[[ -z "${dropbear_port}" ]] && dropbear_port="109"
+[[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
+
+cpu_cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+[[ -z "${cpu_cores}" || ! "${cpu_cores}" =~ ^[0-9]+$ || "${cpu_cores}" -lt 1 ]] && cpu_cores="1"
+
+mem_total_mib="$(awk '/^MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 1024)"
+mem_avail_mib="$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 0)"
+[[ -z "${mem_total_mib}" || "${mem_total_mib}" -lt 256 ]] && mem_total_mib="1024"
+[[ -z "${mem_avail_mib}" || "${mem_avail_mib}" -lt 0 ]] && mem_avail_mib="0"
+mem_used_mib="$((mem_total_mib - mem_avail_mib))"
+(( mem_used_mib < 0 )) && mem_used_mib="0"
+mem_used_pct="$(awk -v u="${mem_used_mib}" -v t="${mem_total_mib}" 'BEGIN{if(t<=0) printf "0.0"; else printf "%.1f", (u/t)*100}')"
+
+read_cpu_totals() {
+  awk '/^cpu / {
+    total=0;
+    for (i=2;i<=NF;i++) total+=$i;
+    idle=$5+$6;
+    print total, idle;
+    exit;
+  }' /proc/stat
+}
+
+read -r cpu_total_1 cpu_idle_1 < <(read_cpu_totals)
+sleep 1
+read -r cpu_total_2 cpu_idle_2 < <(read_cpu_totals)
+cpu_used_pct="$(awk -v t1="${cpu_total_1:-0}" -v i1="${cpu_idle_1:-0}" -v t2="${cpu_total_2:-0}" -v i2="${cpu_idle_2:-0}" 'BEGIN{
+  dt=t2-t1; di=i2-i1;
+  if (dt<=0) printf "0.0"; else printf "%.1f", ((dt-di)/dt)*100;
+}')"
+
+tmp_conn="$(mktemp)"
+trap 'rm -f "${tmp_conn:-}"' EXIT
+port_re="^(22|80|443|2082|${dropbear_port}|${dropbear_alt_port})$"
+ss -Htn state established 2>/dev/null | awk -v port_re="${port_re}" '
+  function port_of(v, x) {
+    x=v;
+    gsub(/^\[/, "", x);
+    gsub(/\]$/, "", x);
+    if (match(x, /:([0-9]+)$/)) return substr(x, RSTART + 1);
+    return "";
+  }
+  function ip_of(v, x) {
+    x=v;
+    gsub(/^\[/, "", x);
+    gsub(/\]$/, "", x);
+    sub(/:[0-9]+$/, "", x);
+    return x;
+  }
+  {
+    lp=port_of($4);
+    if (lp !~ port_re) next;
+    ip=ip_of($5);
+    if (ip == "" || ip ~ /^(127\.|::1$|0\.0\.0\.0$)/) next;
+    print ip;
+  }' > "${tmp_conn}" || true
+
+conn_count="$(wc -l < "${tmp_conn}" 2>/dev/null | tr -cd '0-9')"
+uniq_ip_count="$(sort -u "${tmp_conn}" 2>/dev/null | wc -l | tr -cd '0-9')"
+[[ -z "${conn_count}" ]] && conn_count="0"
+[[ -z "${uniq_ip_count}" ]] && uniq_ip_count="0"
+conn_user_guess="$(( (conn_count + 2) / 3 ))"
+active_user_estimate="${uniq_ip_count}"
+(( conn_user_guess > active_user_estimate )) && active_user_estimate="${conn_user_guess}"
+
+ssh_user_count="$(ps -eo args= 2>/dev/null | awk '
+  {
+    u="";
+    if ($0 ~ /^sshd:/) {
+      u=$0;
+      sub(/^sshd:[[:space:]]*/, "", u);
+      sub(/[[:space:]].*$/, "", u);
+      sub(/@.*$/, "", u);
+      sub(/\[.*$/, "", u);
+    } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+      u=$0;
+      sub(/^.*\[/, "", u);
+      sub(/\].*$/, "", u);
+    }
+    u=tolower(u);
+    if (u ~ /^[a-z0-9._-]+$/ && u!="root" && u!="priv" && u!="net" && u!="unknown") seen[u]=1;
+  }
+  END { for (u in seen) n++; print n+0; }' | tr -cd '0-9')"
+[[ -z "${ssh_user_count}" ]] && ssh_user_count="0"
+(( ssh_user_count > active_user_estimate )) && active_user_estimate="${ssh_user_count}"
+
+xray_user_count="0"
+if [[ -f /var/log/xray/access.log ]]; then
+  xray_active_window="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
+  [[ -z "${xray_active_window}" || "${xray_active_window}" -lt 30 ]] && xray_active_window="60"
+  xray_cutoff="$(( $(date +%s) - xray_active_window ))"
+  xray_user_count="$(tail -n 10000 /var/log/xray/access.log 2>/dev/null | awk -v cutoff="${xray_cutoff}" '
+    function ts_from_line(line, stamp, ts) {
+      if (line !~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return systime();
+      stamp=substr(line,1,19);
+      gsub(/\//," ",stamp); gsub(/:/," ",stamp); gsub(/[[:space:]]+/," ",stamp);
+      ts=mktime(stamp);
+      return ts > 0 ? ts : systime();
+    }
+    {
+      ts=ts_from_line($0);
+      if (ts < cutoff) next;
+      email="";
+      if (match($0, /"email":"[^"]+"/)) {
+        email=substr($0, RSTART+9, RLENGTH-10);
+      } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
+        email=substr($0, RSTART, RLENGTH);
+        sub(/email:[[:space:]]*/, "", email);
+      }
+      gsub(/[[:space:]]/, "", email);
+      email=tolower(email);
+      if (email ~ /^[a-z0-9._-]+$/) seen[email]=1;
+    }
+    END { for (u in seen) n++; print n+0; }' | tr -cd '0-9')"
+fi
+[[ -z "${xray_user_count}" ]] && xray_user_count="0"
+(( xray_user_count > active_user_estimate )) && active_user_estimate="${xray_user_count}"
+
+active_account_total="0"
+if command -v sqlite3 >/dev/null 2>&1 && [[ -f "${db_path}" ]]; then
+  active_account_total="$(sqlite3 "${db_path}" "
+    SELECT
+      (SELECT COUNT(1) FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF') +
+      (SELECT COUNT(1) FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF') +
+      (SELECT COUNT(1) FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF') +
+      (SELECT COUNT(1) FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF');
+  " 2>/dev/null | tr -cd '0-9' || echo 0)"
+fi
+[[ -z "${active_account_total}" ]] && active_account_total="0"
+
+base_ram_mib="$(awk -v t="${mem_total_mib}" -v c="${cpu_cores}" 'BEGIN{
+  b=360+(c*60);
+  max=t*0.70;
+  if (b>max) b=max;
+  if (b<220) b=220;
+  printf "%.0f", b;
+}')"
+target_ram_mib="$(awk -v t="${mem_total_mib}" -v p="${target}" 'BEGIN{printf "%.0f", t*(p/100)}')"
+ram_budget_mib="$((target_ram_mib - base_ram_mib))"
+(( ram_budget_mib < 128 )) && ram_budget_mib="128"
+ram_capacity="$((ram_budget_mib / 10))"
+cpu_capacity="$((cpu_cores * 40))"
+capacity_target="${ram_capacity}"
+(( cpu_capacity < capacity_target )) && capacity_target="${cpu_capacity}"
+(( capacity_target < 10 )) && capacity_target="10"
+
+user_ram_mib="$(awk -v b="${ram_budget_mib}" -v c="${capacity_target}" 'BEGIN{if(c<=0) printf "10.0"; else printf "%.1f", b/c}')"
+user_cpu_pct="$(awk -v p="${target}" -v c="${cpu_capacity}" 'BEGIN{if(c<=0) printf "2.0"; else printf "%.2f", p/c}')"
+
+prev_avg_cpu=""
+prev_avg_ram=""
+prev_avg_active=""
+if [[ -f "${state_file}" ]]; then
+  # shellcheck disable=SC1090
+  source "${state_file}" >/dev/null 2>&1 || true
+  prev_avg_cpu="${AVG_CPU_USED_PERCENT:-}"
+  prev_avg_ram="${AVG_RAM_USED_PERCENT:-}"
+  prev_avg_active="${AVG_ACTIVE_USER_ESTIMATE:-}"
+fi
+avg_cpu="$(awk -v p="${prev_avg_cpu}" -v n="${cpu_used_pct}" 'BEGIN{if(p=="" || p !~ /^[0-9.]+$/) printf "%.1f", n; else printf "%.1f", (p*0.70)+(n*0.30)}')"
+avg_ram="$(awk -v p="${prev_avg_ram}" -v n="${mem_used_pct}" 'BEGIN{if(p=="" || p !~ /^[0-9.]+$/) printf "%.1f", n; else printf "%.1f", (p*0.70)+(n*0.30)}')"
+avg_active="$(awk -v p="${prev_avg_active}" -v n="${active_user_estimate}" 'BEGIN{if(p=="" || p !~ /^[0-9.]+$/) printf "%.1f", n; else printf "%.1f", (p*0.70)+(n*0.30)}')"
+
+cpu_more="$(awk -v target="${target}" -v avg="${avg_cpu}" -v per="${user_cpu_pct}" 'BEGIN{m=(target-avg)/per; if(m<0) m=0; printf "%d", m}')"
+ram_more="$(awk -v target_mib="${target_ram_mib}" -v used="${mem_used_mib}" -v per="${user_ram_mib}" 'BEGIN{m=(target_mib-used)/per; if(m<0) m=0; printf "%d", m}')"
+cap_more="$(awk -v cap="${capacity_target}" -v active="${avg_active}" 'BEGIN{m=cap-active; if(m<0) m=0; printf "%d", m}')"
+can_add_users="${cpu_more}"
+(( ram_more < can_add_users )) && can_add_users="${ram_more}"
+(( cap_more < can_add_users )) && can_add_users="${cap_more}"
+
+recommended_add_batch="0"
+if (( can_add_users >= 5 )); then
+  recommended_add_batch="5"
+elif (( can_add_users >= 2 )); then
+  recommended_add_batch="2"
+elif (( can_add_users >= 1 )); then
+  recommended_add_batch="1"
+fi
+
+max_avg="$(awk -v c="${avg_cpu}" -v r="${avg_ram}" 'BEGIN{print (c>r?c:r)}')"
+status="OK"
+reason="under_target"
+awk -v m="${max_avg}" 'BEGIN{exit !(m>=92)}' && { status="CRITICAL"; reason="above_92_percent"; }
+if [[ "${status}" == "OK" ]]; then
+  awk -v m="${max_avg}" -v t="${target}" 'BEGIN{exit !(m>=t)}' && { status="FULL"; reason="above_target"; }
+fi
+if [[ "${status}" == "OK" ]]; then
+  warn_at="$((target - 10))"
+  (( warn_at < 60 )) && warn_at="60"
+  awk -v m="${max_avg}" -v w="${warn_at}" 'BEGIN{exit !(m>=w)}' && { status="WATCH"; reason="near_target"; }
+fi
+
+mkdir -p "$(dirname "${state_file}")"
+tmp_state="$(mktemp)"
+{
+  printf 'CAPACITY_UPDATED_AT=%s\n' "$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
+  printf 'RESOURCE_TARGET_PERCENT=%s\n' "${target}"
+  printf 'RAM_TOTAL_MIB=%s\n' "${mem_total_mib}"
+  printf 'RAM_USED_MIB=%s\n' "${mem_used_mib}"
+  printf 'RAM_USED_PERCENT=%s\n' "${mem_used_pct}"
+  printf 'AVG_RAM_USED_PERCENT=%s\n' "${avg_ram}"
+  printf 'CPU_USED_PERCENT=%s\n' "${cpu_used_pct}"
+  printf 'AVG_CPU_USED_PERCENT=%s\n' "${avg_cpu}"
+  printf 'CPU_CORES=%s\n' "${cpu_cores}"
+  printf 'ACTIVE_CONNECTION_COUNT=%s\n' "${conn_count}"
+  printf 'ACTIVE_UNIQUE_IP_COUNT=%s\n' "${uniq_ip_count}"
+  printf 'ACTIVE_SSH_USER_COUNT=%s\n' "${ssh_user_count}"
+  printf 'ACTIVE_XRAY_USER_COUNT=%s\n' "${xray_user_count}"
+  printf 'ACTIVE_USER_ESTIMATE=%s\n' "${active_user_estimate}"
+  printf 'AVG_ACTIVE_USER_ESTIMATE=%s\n' "${avg_active}"
+  printf 'ACTIVE_ACCOUNT_TOTAL=%s\n' "${active_account_total}"
+  printf 'CAPACITY_ACTIVE_USER_TARGET=%s\n' "${capacity_target}"
+  printf 'USER_RAM_ESTIMATE_MIB=%s\n' "${user_ram_mib}"
+  printf 'USER_CPU_ESTIMATE_PERCENT=%s\n' "${user_cpu_pct}"
+  printf 'CAN_ADD_USERS=%s\n' "${can_add_users}"
+  printf 'RECOMMENDED_ADD_BATCH=%s\n' "${recommended_add_batch}"
+  printf 'CAPACITY_STATUS=%s\n' "${status}"
+  printf 'CAPACITY_REASON=%s\n' "${reason}"
+} > "${tmp_state}"
+chmod 600 "${tmp_state}" >/dev/null 2>&1 || true
+mv -f "${tmp_state}" "${state_file}"
+echo "capacity=${status} active~${active_user_estimate}/${capacity_target} ram=${mem_used_pct}% cpu=${cpu_used_pct}% add=${recommended_add_batch}"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-capacity-tune
+
+  cat > /etc/systemd/system/sc-1forcr-capacity-tune.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Resource Capacity Analyzer
+After=network.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/sc-1forcr.env
+EnvironmentFile=-/opt/sc-1forcr/.env
+ExecStart=/usr/local/sbin/sc-1forcr-capacity-tune
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-capacity-tune.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR Resource Capacity Analyzer every ${interval} minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=${interval}min
+AccuracySec=30s
+RandomizedDelaySec=15s
+Persistent=true
+Unit=sc-1forcr-capacity-tune.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+  fi
+}
+
 setup_udpgw_service_if_possible() {
-  local udpgw_bin udpgw_ports_raw udpgw_ports p
+  local udpgw_bin udpgw_ports_raw udpgw_ports udpgw_max_clients udpgw_max_connections_per_client udpgw_memory_max p
   udpgw_bin=""
   for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
     if [[ -x "${p}" ]]; then
@@ -8303,7 +8817,14 @@ setup_udpgw_service_if_possible() {
   udpgw_ports="$(echo "${udpgw_ports_raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 {print $1}' | awk '!seen[$0]++')"
   [[ -z "${udpgw_ports}" ]] && udpgw_ports="7300"$'\n'"7200"
 
-  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//')"
+  udpgw_max_clients="$(echo "${SSHWS_UDPGW_MAX_CLIENTS:-128}" | tr -cd '0-9')"
+  [[ -z "${udpgw_max_clients}" || "${udpgw_max_clients}" -lt 16 || "${udpgw_max_clients}" -gt 2048 ]] && udpgw_max_clients="128"
+  udpgw_max_connections_per_client="$(echo "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-32}" | tr -cd '0-9')"
+  [[ -z "${udpgw_max_connections_per_client}" || "${udpgw_max_connections_per_client}" -lt 4 || "${udpgw_max_connections_per_client}" -gt 256 ]] && udpgw_max_connections_per_client="32"
+  udpgw_memory_max="$(printf '%s' "${SSHWS_UDPGW_MEMORY_MAX:-128M}" | tr '[:lower:]' '[:upper:]' | tr -cd '0-9KMG')"
+  [[ -z "${udpgw_memory_max}" ]] && udpgw_memory_max="128M"
+
+  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//') limit=${udpgw_max_clients}/${udpgw_max_connections_per_client} mem=${udpgw_memory_max}"
   cat > /etc/systemd/system/sc-1forcr-udpgw@.service <<EOF
 [Unit]
 Description=SC 1FORCR UDPGW on 0.0.0.0:%i
@@ -8311,13 +8832,15 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${udpgw_bin} --listen-addr 0.0.0.0:%i --max-clients 2048 --max-connections-for-client 256
+ExecStart=${udpgw_bin} --listen-addr 0.0.0.0:%i --max-clients ${udpgw_max_clients} --max-connections-for-client ${udpgw_max_connections_per_client}
 Restart=always
 RestartSec=1
 NoNewPrivileges=true
 PrivateTmp=true
-TasksMax=4096
-LimitNOFILE=65536
+MemoryAccounting=true
+MemoryMax=${udpgw_memory_max}
+TasksMax=1024
+LimitNOFILE=32768
 
 [Install]
 WantedBy=multi-user.target
@@ -8325,7 +8848,8 @@ EOF
 
   systemctl daemon-reload
   for p in ${udpgw_ports}; do
-    systemctl enable --now "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    systemctl enable "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    systemctl restart "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
     if command -v iptables >/dev/null 2>&1; then
       iptables -w 10 -C INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1 || \
         iptables -w 10 -I INPUT -p tcp --dport "${p}" -j ACCEPT
@@ -8814,6 +9338,10 @@ SETTINGS_KEYS = [
     "ONLINE_NOTIFY_ENABLE",
     "ONLINE_NOTIFY_INTERVAL_HOURS",
     "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
+    "RESOURCE_AUTOTUNE_ENABLE",
+    "RESOURCE_TARGET_USAGE_PERCENT",
+    "RESOURCE_AUTOTUNE_INTERVAL_MINUTES",
+    "RESOURCE_CAPACITY_STATE_FILE",
     "IPLIMIT_CHECK_INTERVAL_MINUTES",
     "IPLIMIT_LOCK_MINUTES",
     "IPLIMIT_AUTO_LOCK_ENABLE",
@@ -8857,6 +9385,9 @@ SETTINGS_KEYS = [
     "SSH_HC_AUTH_LOOKBACK_HOURS",
     "SSHWS_TCP_KEEPALIVE_SECONDS",
     "SSHWS_UDPGW_PORTS",
+    "SSHWS_UDPGW_MAX_CLIENTS",
+    "SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT",
+    "SSHWS_UDPGW_MEMORY_MAX",
     "SSH_TUNNEL_SHELL",
     "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
     "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
@@ -8872,6 +9403,8 @@ SETTINGS_KEYS = [
     "NGINX_WORKER_CONNECTIONS",
     "NGINX_WORKER_RLIMIT_NOFILE",
     "NGINX_SERVICE_LIMIT_NOFILE",
+    "SC_API_MEMORY_MAX",
+    "SSHWS_SERVICE_MEMORY_MAX",
 ]
 SETTINGS_KEY_SET = set(SETTINGS_KEYS)
 
@@ -9525,6 +10058,10 @@ SETTINGS_KEYS = [
     "ONLINE_NOTIFY_ENABLE",
     "ONLINE_NOTIFY_INTERVAL_HOURS",
     "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
+    "RESOURCE_AUTOTUNE_ENABLE",
+    "RESOURCE_TARGET_USAGE_PERCENT",
+    "RESOURCE_AUTOTUNE_INTERVAL_MINUTES",
+    "RESOURCE_CAPACITY_STATE_FILE",
     "IPLIMIT_CHECK_INTERVAL_MINUTES",
     "IPLIMIT_LOCK_MINUTES",
     "IPLIMIT_AUTO_LOCK_ENABLE",
@@ -9583,6 +10120,8 @@ SETTINGS_KEYS = [
     "NGINX_WORKER_CONNECTIONS",
     "NGINX_WORKER_RLIMIT_NOFILE",
     "NGINX_SERVICE_LIMIT_NOFILE",
+    "SC_API_MEMORY_MAX",
+    "SSHWS_SERVICE_MEMORY_MAX",
 ]
 SETTINGS_KEY_SET = set(SETTINGS_KEYS)
 APP_ENV_FILE = "/opt/sc-1forcr/.env"
@@ -10866,6 +11405,9 @@ ZIVPN_EXTRA_UDP_PORTS=${ZIVPN_EXTRA_UDP_PORTS}
 UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
+SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
+SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
+SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 DROPBEAR_VERSION=${DROPBEAR_VERSION}
@@ -10888,6 +11430,10 @@ AUTO_REBOOT_WIB_HOUR=${AUTO_REBOOT_WIB_HOUR}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
+RESOURCE_AUTOTUNE_ENABLE=${RESOURCE_AUTOTUNE_ENABLE}
+RESOURCE_TARGET_USAGE_PERCENT=${RESOURCE_TARGET_USAGE_PERCENT}
+RESOURCE_AUTOTUNE_INTERVAL_MINUTES=${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}
+RESOURCE_CAPACITY_STATE_FILE=${RESOURCE_CAPACITY_STATE_FILE}
 AUTO_PULL_UPDATE_ENABLE=${AUTO_PULL_UPDATE_ENABLE}
 AUTO_PULL_UPDATE_INTERVAL_MINUTES=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}
@@ -10922,6 +11468,8 @@ HAPROXY_TCPLOG_ENABLE=${HAPROXY_TCPLOG_ENABLE}
 HAPROXY_SERVICE_LIMIT_NOFILE=${HAPROXY_SERVICE_LIMIT_NOFILE}
 HAPROXY_MAXCONN=${HAPROXY_MAXCONN}
 HAPROXY_NBTHREAD=${HAPROXY_NBTHREAD}
+SC_API_MEMORY_MAX=${SC_API_MEMORY_MAX}
+SSHWS_SERVICE_MEMORY_MAX=${SSHWS_SERVICE_MEMORY_MAX}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
@@ -14423,6 +14971,10 @@ restart_all_services() {
   systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+  if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
+  fi
   restart_active_udp_backend
 }
 
@@ -14456,6 +15008,10 @@ restart_update_safe_services() {
   if [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" == "1" ]]; then
     systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
     systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+  fi
+  if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
   fi
   if nginx -t >/dev/null 2>&1; then
     systemctl reload nginx >/dev/null 2>&1 || true
@@ -14597,8 +15153,9 @@ service_menu() {
     "5) aktifkan UDPHC (matikan ZIVPN)" \
     "6) status backend UDP" \
     "7) diagnose + auto-repair UDP backend" \
-    "8) heal rule SSHWS+XRAY"
-  prompt_input s "Pilih [0-8]: " || return
+    "8) heal rule SSHWS+XRAY" \
+    "9) resource auto tune"
+  prompt_input s "Pilih [0-9]: " || return
   clear
   case "$s" in
     0)
@@ -14628,6 +15185,12 @@ service_menu() {
       ;;
     8)
       heal_sshws_xray_rules
+      ;;
+    9)
+      if [[ -x /usr/local/sbin/sc-1forcr-capacity-tune ]]; then
+        /usr/local/sbin/sc-1forcr-capacity-tune >/dev/null 2>&1 || true
+      fi
+      show_capacity_report
       ;;
     *)
       echo "Pilihan tidak valid."
@@ -14960,8 +15523,8 @@ EONGINX
     echo "Gagal menyiapkan sertifikat HAProxy."
     return
   }
-  haproxy_maxconn="$(echo "${HAPROXY_MAXCONN:-20000}" | tr -cd '0-9')"
-  [[ -z "${haproxy_maxconn}" || "${haproxy_maxconn}" -lt 1024 ]] && haproxy_maxconn="20000"
+  haproxy_maxconn="$(echo "${HAPROXY_MAXCONN:-4096}" | tr -cd '0-9')"
+  [[ -z "${haproxy_maxconn}" || "${haproxy_maxconn}" -lt 1024 ]] && haproxy_maxconn="4096"
   haproxy_nbthread="$(echo "${HAPROXY_NBTHREAD:-1}" | tr -cd '0-9')"
   [[ -z "${haproxy_nbthread}" || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
   cores="$(get_cpu_cores)"
@@ -14969,8 +15532,8 @@ EONGINX
   [[ "${haproxy_nbthread}" -gt "${cores}" ]] && haproxy_nbthread="${cores}"
   [[ "${haproxy_nbthread}" -gt 8 ]] && haproxy_nbthread="8"
   [[ -z "${haproxy_nbthread}" || ! "${haproxy_nbthread}" =~ ^[0-9]+$ || "${haproxy_nbthread}" -lt 1 ]] && haproxy_nbthread="1"
-  haproxy_limit_nofile="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}" | tr -cd '0-9')"
-  [[ -z "${haproxy_limit_nofile}" || "${haproxy_limit_nofile}" -lt 65536 ]] && haproxy_limit_nofile="200000"
+  haproxy_limit_nofile="$(echo "${HAPROXY_SERVICE_LIMIT_NOFILE:-65536}" | tr -cd '0-9')"
+  [[ -z "${haproxy_limit_nofile}" || "${haproxy_limit_nofile}" -lt 32768 ]] && haproxy_limit_nofile="65536"
   if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then
     haproxy_log_option="    option tcplog"
   else
@@ -15433,6 +15996,74 @@ get_server_capacity_profile() {
   echo "${ram_gb}|${cores}|${tier}|${est}"
 }
 
+read_capacity_state_value() {
+  local key="$1" file="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
+  [[ -n "${key}" && -f "${file}" ]] || return 0
+  awk -F= -v k="${key}" '$1==k {print substr($0, index($0,"=")+1); exit}' "${file}" 2>/dev/null || true
+}
+
+ensure_capacity_state_once() {
+  local file="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
+  if [[ ! -s "${file}" && -x /usr/local/sbin/sc-1forcr-capacity-tune ]]; then
+    /usr/local/sbin/sc-1forcr-capacity-tune >/dev/null 2>&1 || true
+  fi
+}
+
+show_capacity_report() {
+  local file updated status reason target ram_total ram_used ram_pct avg_ram cpu_pct avg_cpu cores
+  local active avg_active accounts cap user_ram user_cpu can_add add_batch conn_count ip_count ssh_count xray_count
+  file="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
+  ensure_capacity_state_once
+  updated="$(read_capacity_state_value CAPACITY_UPDATED_AT)"
+  status="$(read_capacity_state_value CAPACITY_STATUS)"
+  reason="$(read_capacity_state_value CAPACITY_REASON)"
+  target="$(read_capacity_state_value RESOURCE_TARGET_PERCENT)"
+  ram_total="$(read_capacity_state_value RAM_TOTAL_MIB)"
+  ram_used="$(read_capacity_state_value RAM_USED_MIB)"
+  ram_pct="$(read_capacity_state_value RAM_USED_PERCENT)"
+  avg_ram="$(read_capacity_state_value AVG_RAM_USED_PERCENT)"
+  cpu_pct="$(read_capacity_state_value CPU_USED_PERCENT)"
+  avg_cpu="$(read_capacity_state_value AVG_CPU_USED_PERCENT)"
+  cores="$(read_capacity_state_value CPU_CORES)"
+  conn_count="$(read_capacity_state_value ACTIVE_CONNECTION_COUNT)"
+  ip_count="$(read_capacity_state_value ACTIVE_UNIQUE_IP_COUNT)"
+  ssh_count="$(read_capacity_state_value ACTIVE_SSH_USER_COUNT)"
+  xray_count="$(read_capacity_state_value ACTIVE_XRAY_USER_COUNT)"
+  active="$(read_capacity_state_value ACTIVE_USER_ESTIMATE)"
+  avg_active="$(read_capacity_state_value AVG_ACTIVE_USER_ESTIMATE)"
+  accounts="$(read_capacity_state_value ACTIVE_ACCOUNT_TOTAL)"
+  cap="$(read_capacity_state_value CAPACITY_ACTIVE_USER_TARGET)"
+  user_ram="$(read_capacity_state_value USER_RAM_ESTIMATE_MIB)"
+  user_cpu="$(read_capacity_state_value USER_CPU_ESTIMATE_PERCENT)"
+  can_add="$(read_capacity_state_value CAN_ADD_USERS)"
+  add_batch="$(read_capacity_state_value RECOMMENDED_ADD_BATCH)"
+
+  draw_menu_header "RESOURCE AUTO TUNE"
+  if [[ -z "${status}" ]]; then
+    echo "Data kapasitas belum tersedia."
+    echo "Jalankan: systemctl start sc-1forcr-capacity-tune.service"
+    return 0
+  fi
+
+  echo "Status          : ${status} (${reason:-unknown})"
+  echo "Target aman     : maksimal ${target:-85}% RAM/CPU, sisakan minimal $((100 - ${target:-85}))%"
+  echo "Update          : ${updated:-"-"}"
+  echo
+  echo "Server          : ${ram_total:-"-"} MiB RAM / ${cores:-"-"} vCPU"
+  echo "RAM             : ${ram_used:-"-"} MiB (${ram_pct:-"-"}%), avg ${avg_ram:-"-"}%"
+  echo "CPU             : ${cpu_pct:-"-"}%, avg ${avg_cpu:-"-"}%"
+  echo
+  echo "Akun aktif DB   : ${accounts:-0}"
+  echo "Online estimasi : ${active:-0} user sekarang, avg ${avg_active:-0}"
+  echo "Detail online   : conn=${conn_count:-0}, ip=${ip_count:-0}, ssh=${ssh_count:-0}, xray=${xray_count:-0}"
+  echo "Target online   : sekitar ${cap:-"-"} user aktif ringan"
+  echo "Patokan/user    : RAM ~${user_ram:-"-"} MiB, CPU ~${user_cpu:-"-"}%"
+  echo
+  echo "Sisa aman       : ${can_add:-0} user estimasi"
+  echo "Saran tambah    : ${add_batch:-0} user dulu, lalu lihat rata-rata berikutnya"
+  echo "State file      : ${file}"
+}
+
 bytes_human() {
   local bytes="${1:-0}"
   if [[ -z "${bytes}" || ! "${bytes}" =~ ^[0-9]+$ ]]; then
@@ -15493,6 +16124,7 @@ draw_dashboard() {
   local c_ssh c_vmess c_vless c_trojan
   local health
   local cap_ram_gb cap_cores cap_tier cap_est cap_mode
+  local live_status live_active live_cap live_add live_ram live_cpu
 
   # ANSI colors (aman untuk bash di Linux)
   local ESC=$'\033'
@@ -15798,6 +16430,19 @@ EOF
 
   read_vnstat_stats
   IFS='|' read -r cap_ram_gb cap_cores cap_tier cap_est <<< "$(get_server_capacity_profile)"
+  ensure_capacity_state_once
+  live_status="$(read_capacity_state_value CAPACITY_STATUS)"
+  live_active="$(read_capacity_state_value ACTIVE_USER_ESTIMATE)"
+  live_cap="$(read_capacity_state_value CAPACITY_ACTIVE_USER_TARGET)"
+  live_add="$(read_capacity_state_value RECOMMENDED_ADD_BATCH)"
+  live_ram="$(read_capacity_state_value AVG_RAM_USED_PERCENT)"
+  live_cpu="$(read_capacity_state_value AVG_CPU_USED_PERCENT)"
+  [[ -z "${live_status}" ]] && live_status="WAIT"
+  [[ -z "${live_active}" ]] && live_active="0"
+  [[ -z "${live_cap}" ]] && live_cap="${cap_est}"
+  [[ -z "${live_add}" ]] && live_add="0"
+  [[ -z "${live_ram}" ]] && live_ram="-"
+  [[ -z "${live_cpu}" ]] && live_cpu="-"
 
   if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" == "1" ]]; then
     cap_mode="AUTO"
@@ -15824,6 +16469,7 @@ EOF
   kv_line "Spesifikasi"  "${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
   kv_line "Auto tuningSC" "${cap_mode} (tier ${cap_tier})"
   kv_line "Estimasi akun"  "sekitar ${cap_est} user"
+  kv_line "Kapasitas live" "${live_status} online~${live_active}/${live_cap} add+${live_add} RAM ${live_ram}% CPU ${live_cpu}%"
   print_mid
 
   section_title "LOCATION & ISP"
@@ -17140,6 +17786,9 @@ Time     : $(date '+%F %T')"
     UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
     UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
     SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}" \
+    SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-auto}" \
+    SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-auto}" \
+    SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-auto}" \
     DROPBEAR_PORT="${DROPBEAR_PORT}" \
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
     DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
@@ -17158,7 +17807,7 @@ Time     : $(date '+%F %T')"
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \
     XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
     XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN}" \
-    SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-16}" \
+    SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-auto}" \
     SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}" \
     SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE}" \
     SSHWS_LOOP_GUARD_PORTS="${SSHWS_LOOP_GUARD_PORTS}" \
@@ -17166,9 +17815,11 @@ Time     : $(date '+%F %T')"
     SSHWS_LOOP_GUARD_BURST="${SSHWS_LOOP_GUARD_BURST}" \
     SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE="${SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE}" \
     HAPROXY_TCPLOG_ENABLE="${HAPROXY_TCPLOG_ENABLE:-0}" \
-    HAPROXY_SERVICE_LIMIT_NOFILE="${HAPROXY_SERVICE_LIMIT_NOFILE:-200000}" \
-    HAPROXY_MAXCONN="${HAPROXY_MAXCONN:-20000}" \
-    HAPROXY_NBTHREAD="${HAPROXY_NBTHREAD:-1}" \
+    HAPROXY_SERVICE_LIMIT_NOFILE="${HAPROXY_SERVICE_LIMIT_NOFILE:-auto}" \
+    HAPROXY_MAXCONN="${HAPROXY_MAXCONN:-auto}" \
+    HAPROXY_NBTHREAD="${HAPROXY_NBTHREAD:-auto}" \
+    SC_API_MEMORY_MAX="${SC_API_MEMORY_MAX:-auto}" \
+    SSHWS_SERVICE_MEMORY_MAX="${SSHWS_SERVICE_MEMORY_MAX:-auto}" \
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
@@ -17191,6 +17842,10 @@ Time     : $(date '+%F %T')"
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
     ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
     ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" \
+    RESOURCE_AUTOTUNE_ENABLE="${RESOURCE_AUTOTUNE_ENABLE:-1}" \
+    RESOURCE_TARGET_USAGE_PERCENT="${RESOURCE_TARGET_USAGE_PERCENT:-85}" \
+    RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}" \
+    RESOURCE_CAPACITY_STATE_FILE="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}" \
     ACTIVE_UDP_BACKEND="${active_backend}" \
     bash "${tmp}"; then
     echo "Update script gagal dijalankan."
@@ -17983,6 +18638,10 @@ systemctl stop sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-pull-summary-update.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-pull-summary-update.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
@@ -18007,6 +18666,8 @@ rm -f /etc/systemd/system/sc-1forcr-pull-update.service
 rm -f /etc/systemd/system/sc-1forcr-pull-update.timer
 rm -f /etc/systemd/system/sc-1forcr-pull-summary-update.service
 rm -f /etc/systemd/system/sc-1forcr-pull-summary-update.timer
+rm -f /etc/systemd/system/sc-1forcr-capacity-tune.service
+rm -f /etc/systemd/system/sc-1forcr-capacity-tune.timer
 rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/sc-1forcr-udpgw@.service
@@ -18030,6 +18691,7 @@ rm -f /usr/local/sbin/sc-1forcr-restore-backup
 rm -f /usr/local/sbin/sc-1forcr-online-notify
 rm -f /usr/local/sbin/sc-1forcr-pull-update
 rm -f /usr/local/sbin/sc-1forcr-pull-summary-update
+rm -f /usr/local/sbin/sc-1forcr-capacity-tune
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 rm -f /etc/profile.d/sc-1forcr-auto-menu.sh
 
@@ -18381,17 +19043,19 @@ persist_pending_install_env() {
     ZIVPN_LISTEN_PORT ZIVPN_DNAT_RANGE ZIVPN_EXTRA_UDP_PORTS ZIVPN_DNAT_IFACE
     UDPCUSTOM_BIN_URL UDPCUSTOM_SERVICE_NAME UDPCUSTOM_LISTEN_PORT
     UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
-    SSHWS_UDPGW_PORTS SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
+    SSHWS_UDPGW_PORTS SSHWS_UDPGW_MAX_CLIENTS SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT SSHWS_UDPGW_MEMORY_MAX
+    SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
     SSH_TUNNEL_BLOCK_OUTBOUND_PORTS ACTIVE_UDP_BACKEND
     DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION DROPBEAR_KEEPALIVE_SECONDS DROPBEAR_IDLE_TIMEOUT_SECONDS
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
+    RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE
     AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES
     IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
     SSHWS_TCP_KEEPALIVE_SECONDS SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
-    NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE
+    NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
     XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP
     XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
@@ -18590,6 +19254,7 @@ main() {
   run_install_step "28_auto_backup" 89 "Setup auto backup" setup_auto_backup_timer
   run_install_step "29_online_notify" 90 "Setup notifikasi online" setup_online_notify_timer
   run_install_step "30_auto_update" 91 "Setup auto pull update" setup_auto_pull_update_timer
+  run_install_step "30b_resource_autotune" 92 "Setup resource auto tune" setup_resource_autotune_timer
   run_install_step "31_summary_api" 93 "Install Summary API 1FORCR" install_summary_api_optional
 
   run_install_step "32_cli_menu" 95 "Tulis menu CLI" write_cli_menu

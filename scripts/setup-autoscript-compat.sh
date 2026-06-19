@@ -777,7 +777,7 @@ auto_tune_iplimit_vars() {
   profile_udphc_hist="1200"
   profile_udphc_rt="400"
   profile_udphc_checker="6000"
-  profile_users="80-100"
+  profile_users="30-40"
 
   if [[ "$(normalize_bool_01 "${IPLIMIT_AUTO_TUNE}")" == "1" ]]; then
     local ram_mib ram_gb cores tier
@@ -796,21 +796,21 @@ auto_tune_iplimit_vars() {
       profile_udphc_hist="3200"
       profile_udphc_rt="1000"
       profile_udphc_checker="18000"
-      profile_users="220-300"
+      profile_users="180-260"
     elif (( tier >= 4 )); then
       profile_dropbear="22000"
       profile_recent="9000"
       profile_udphc_hist="2200"
       profile_udphc_rt="700"
       profile_udphc_checker="12000"
-      profile_users="150-220"
+      profile_users="100-160"
     elif (( tier >= 2 )); then
       profile_dropbear="16000"
       profile_recent="6500"
       profile_udphc_hist="1600"
       profile_udphc_rt="500"
       profile_udphc_checker="8000"
-      profile_users="100-150"
+      profile_users="50-80"
     fi
     log "IPLIMIT auto-tune aktif: RAM=${ram_gb}GB vCPU=${cores} tier=${tier} target_user~${profile_users}"
   fi
@@ -15985,13 +15985,13 @@ get_server_capacity_profile() {
   (( cores < tier )) && tier="${cores}"
   (( tier < 1 )) && tier=1
 
-  est="80-100"
+  est="30-40"
   if (( tier >= 8 )); then
-    est="220-300"
+    est="180-260"
   elif (( tier >= 4 )); then
-    est="150-220"
+    est="100-160"
   elif (( tier >= 2 )); then
-    est="100-150"
+    est="50-80"
   fi
 
   echo "${ram_gb}|${cores}|${tier}|${est}"
@@ -16126,6 +16126,7 @@ draw_dashboard() {
   local health
   local cap_ram_gb cap_cores cap_tier cap_est cap_mode
   local live_status live_active live_cap live_add live_ram live_cpu
+  local estimate_text live_capacity_text
 
   # ANSI colors (aman untuk bash di Linux)
   local ESC=$'\033'
@@ -16444,6 +16445,14 @@ EOF
   [[ -z "${live_add}" ]] && live_add="0"
   [[ -z "${live_ram}" ]] && live_ram="-"
   [[ -z "${live_cpu}" ]] && live_cpu="-"
+  estimate_text="sekitar ${cap_est} user aktif"
+  if [[ "${live_status}" != "WAIT" && "${live_cap}" =~ ^[0-9]+$ ]]; then
+    estimate_text="sekitar ${live_cap} user aktif"
+    if [[ "${live_add}" =~ ^[0-9]+$ && "${live_add}" -gt 0 ]]; then
+      estimate_text="${estimate_text} | add+${live_add}"
+    fi
+  fi
+  live_capacity_text="${live_status} online~${live_active} RAM ${live_ram}% CPU ${live_cpu}%"
 
   if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" == "1" ]]; then
     cap_mode="AUTO"
@@ -16469,8 +16478,8 @@ EOF
   kv_line "UPTIME"  "${uptime_h}h ${uptime_m}m"
   kv_line "Spesifikasi"  "${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
   kv_line "Auto tuningSC" "${cap_mode} (tier ${cap_tier})"
-  kv_line "Estimasi akun"  "sekitar ${cap_est} user"
-  kv_line "Kapasitas live" "${live_status} online~${live_active}/${live_cap} add+${live_add} RAM ${live_ram}% CPU ${live_cpu}%"
+  kv_line "Estimasi akun"  "${estimate_text}"
+  kv_line "Kapasitas live" "${live_capacity_text}"
   print_mid
 
   section_title "LOCATION & ISP"

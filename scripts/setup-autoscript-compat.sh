@@ -7767,14 +7767,14 @@ async function enforceQuotaLimits() {
 
   const sshRows = await all(
     "SELECT username, password, quota, owner_telegram_id, owner_telegram_chat_id FROM account_sshs " +
-    "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(quota,0) AS INTEGER) > 0"
+    "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'"
   ).catch(() => []);
   const sshCounters = setupSshQuotaAccounting(sshRows);
   for (const row of sshRows) {
     const user = String(row?.username || '').trim();
     const key = user.toLowerCase();
     const quotaBytes = quotaToBytes(row?.quota);
-    if (!user || quotaBytes <= 0) continue;
+    if (!user) continue;
     const counter = Number(sshCounters.get(key) || 0);
     const current = await getQuotaUsage('ssh', user);
     let delta = 0;
@@ -7783,7 +7783,7 @@ async function enforceQuotaLimits() {
     }
     const used = await addQuotaDelta('ssh', user, delta, counter);
     if (IPLIMIT_DEBUG) console.log(`[quota-debug][ssh] user=${user} quota=${quotaBytes} used=${used} delta=${delta} counter=${counter}`);
-    if (used >= quotaBytes) {
+    if (quotaBytes > 0 && used >= quotaBytes) {
       const out = await lockSshForQuota(row, used, quotaBytes);
       if (out.zivpnChanged) zivpnChanged = true;
       if (out.udpcustomChanged) udpcustomChanged = true;
@@ -7798,16 +7798,16 @@ async function enforceQuotaLimits() {
   for (const item of xrayScan) {
     const rows = await all(
       `SELECT username, quota, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
-      "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(quota,0) AS INTEGER) > 0"
+      "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'"
     ).catch(() => []);
     for (const row of rows) {
       const user = String(row?.username || '').trim();
       const quotaBytes = quotaToBytes(row?.quota);
-      if (!user || quotaBytes <= 0) continue;
+      if (!user) continue;
       const delta = queryXrayUserTrafficDelta(user);
       const used = await addQuotaDelta(item.type, user, delta, null);
       if (IPLIMIT_DEBUG) console.log(`[quota-debug][${item.type}] user=${user} quota=${quotaBytes} used=${used} delta=${delta}`);
-      if (used >= quotaBytes) {
+      if (quotaBytes > 0 && used >= quotaBytes) {
         if (await lockXrayForQuota(item.type, item.table, row, used, quotaBytes)) xrayChanged = true;
       }
     }
@@ -13471,6 +13471,10 @@ format_remaining_from_minutes() {
   local mins="${1:-0}" d h m
   mins="$(echo "${mins}" | tr -cd '0-9')"
   [[ -z "${mins}" ]] && mins=0
+  if [[ "${mins}" -ge 999999999 ]]; then
+    echo "Unlimited"
+    return
+  fi
   if [[ "${mins}" -le 0 ]]; then
     echo "0m"
     return
@@ -13489,20 +13493,54 @@ format_remaining_from_minutes() {
   echo "${m}m"
 }
 
+account_remaining_minutes_expr() {
+  cat <<'EOF'
+CASE
+  WHEN TRIM(COALESCE(date_exp,''))='' THEN 999999999
+  ELSE COALESCE(MAX(0, CAST(((julianday(datetime(REPLACE(TRIM(date_exp),'T',' '))) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), 0)
+END
+EOF
+}
+
+account_expire_datetime_expr() {
+  echo "datetime(REPLACE(TRIM(date_exp),'T',' '))"
+}
+
+account_active_where_expr() {
+  local exp_expr
+  exp_expr="$(account_expire_datetime_expr)"
+  echo "UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND (TRIM(COALESCE(date_exp,''))='' OR (${exp_expr}) > datetime('now','localtime'))"
+}
+
+account_expired_where_expr() {
+  local exp_expr
+  exp_expr="$(account_expire_datetime_expr)"
+  echo "UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR (TRIM(COALESCE(date_exp,''))<>'' AND (${exp_expr}) <= datetime('now','localtime'))"
+}
+
 print_account_picker_table() {
-  local type="$1" lock_only="${2:-0}" table where rows
+  local type="$1" lock_only="${2:-0}" mode="${3:-all}" table where rows active_where expired_where rem_expr
   table="$(account_table_by_type "${type}")"
   [[ -z "${table}" ]] && return 1
   where=""
+  active_where="$(account_active_where_expr)"
+  expired_where="$(account_expired_where_expr)"
   if [[ "${lock_only}" == "1" ]]; then
     where="WHERE LOWER(username) IN (
       SELECT LOWER(username) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA')
       UNION
       SELECT LOWER(username) FROM temp_ip_locks WHERE account_type='${type}' AND locked_until > strftime('%s','now')
     )"
+  else
+    case "${mode}" in
+      active) where="WHERE ${active_where}" ;;
+      expired) where="WHERE ${expired_where}" ;;
+      *) where="" ;;
+    esac
   fi
+  rem_expr="$(account_remaining_minutes_expr)"
   rows="$(sqlite3 -separator '|' "$DB_PATH" \
-    "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+    "SELECT username, ${rem_expr}, UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
   if [[ -z "${rows}" ]]; then
     return 1
   fi
@@ -13519,18 +13557,26 @@ print_account_picker_table() {
 }
 
 pick_existing_username() {
-  local type="$1" table rows input username
+  local type="$1" mode="${2:-all}" table rows input username where active_where expired_where
   table="$(account_table_by_type "${type}")"
   [[ -z "${table}" ]] && return 1
 
-  rows="$(sqlite3 "$DB_PATH" "SELECT username FROM ${table} ORDER BY username;" 2>/dev/null || true)"
+  active_where="$(account_active_where_expr)"
+  expired_where="$(account_expired_where_expr)"
+  case "${mode}" in
+    active) where="WHERE ${active_where}" ;;
+    expired) where="WHERE ${expired_where}" ;;
+    *) where="" ;;
+  esac
+
+  rows="$(sqlite3 "$DB_PATH" "SELECT username FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
   if [[ -z "${rows}" ]]; then
-    echo "Tidak ada akun ${type} di DB." >&2
+    echo "Tidak ada akun ${type} ${mode} di DB." >&2
     return 1
   fi
 
-  echo "LIST AKUN ${type^^}" >&2
-  if ! print_account_picker_table "${type}" "0" >&2; then
+  echo "LIST AKUN ${type^^} - ${mode^^}" >&2
+  if ! print_account_picker_table "${type}" "0" "${mode}" >&2; then
     echo "Tidak ada data akun untuk ditampilkan." >&2
   fi
   prompt_input input "Pilih nomor atau isi username: " || return 1
@@ -13547,6 +13593,23 @@ pick_existing_username() {
 
   echo "${username}"
   return 0
+}
+
+pick_account_detail_mode() {
+  local mode
+  draw_menu_panel "Pilih status akun:" \
+    "1) Aktif" \
+    "2) Expired" \
+    "3) Semua status" \
+    "0) Kembali" >&2
+  prompt_input mode "Input [0-3]: " || return 1
+  case "${mode}" in
+    1) echo "active" ;;
+    2) echo "expired" ;;
+    3) echo "all" ;;
+    0) return 1 ;;
+    *) echo "Pilihan tidak valid." >&2; return 1 ;;
+  esac
 }
 
 pick_locked_username() {
@@ -13933,29 +13996,32 @@ unlock_all_accounts() {
 
 list_accounts() {
   print_account_table() {
-    local table="$1" title="$2" mode="${3:-active}" acct_type trial_expr where rows total active_total trial_total expired_total
+    local table="$1" title="$2" mode="${3:-active}" acct_type trial_expr where rows total active_total trial_total expired_total active_where expired_where rem_expr
     acct_type="$(account_type_for_table "${table}")"
     trial_expr="(LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='${acct_type}' AND LOWER(f.username)=LOWER(${table}.username)))"
+    active_where="$(account_active_where_expr)"
+    expired_where="$(account_expired_where_expr)"
     case "${mode}" in
       trial)
         where="WHERE ${trial_expr}"
         ;;
       expired)
-        where="WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT ${trial_expr}"
+        where="WHERE (${expired_where}) AND NOT ${trial_expr}"
         ;;
       all)
         where=""
         ;;
       active|*)
-        where="WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT ${trial_expr}"
+        where="WHERE ${active_where} AND NOT ${trial_expr}"
         ;;
     esac
+    rem_expr="$(account_remaining_minutes_expr)"
     rows="$(sqlite3 -separator '|' "$DB_PATH" \
-      "SELECT username, MAX(0, CAST(((julianday(datetime(date_exp)) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER), CAST(COALESCE(quota,0) AS INTEGER), CASE WHEN ${trial_expr} THEN 'TRIAL' ELSE 'REGULER' END FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+      "SELECT username, ${rem_expr}, UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER), CAST(COALESCE(quota,0) AS INTEGER), CASE WHEN ${trial_expr} THEN 'TRIAL' ELSE 'REGULER' END FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
     total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table};" 2>/dev/null || echo 0)"
-    active_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
+    active_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE ${active_where} AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
     trial_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE ${trial_expr};" 2>/dev/null || echo 0)"
-    expired_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE (UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR date(COALESCE(date_exp,'')) < date('now','localtime')) AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
+    expired_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE (${expired_where}) AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
     echo "LIST AKUN ${title} - ${mode^^}"
     echo "Summary: aktif=${active_total:-0} | trial=${trial_total:-0} | expired=${expired_total:-0} | total_db=${total:-0}"
     printf "%-4s %-22s %-10s %-8s %-7s %-24s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP" "QUOTA"
@@ -14046,10 +14112,11 @@ list_accounts() {
 }
 
 show_account_detail() {
-  local type username username_sql row d_quota_usage
+  local type mode username username_sql row d_quota_usage
   type="$(pick_type)"
   [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
-  username="$(pick_existing_username "${type}")" || return
+  mode="$(pick_account_detail_mode)" || return
+  username="$(pick_existing_username "${type}" "${mode}")" || return
   username_sql="${username//\'/''}"
 
   case "${type}" in
@@ -16481,7 +16548,7 @@ EOF
   [[ "${health}" == "GOOD" ]] && health_display="${GREEN}GOOD${NC}"
 
   local active_account_where
-  active_account_where="UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND (TRIM(COALESCE(date_exp,''))='' OR CASE WHEN TRIM(COALESCE(date_exp,'')) GLOB '????-??-??' THEN date(TRIM(date_exp)) > date('now','localtime') ELSE datetime(REPLACE(TRIM(date_exp),'T',' ')) > datetime('now','localtime') END)"
+  active_account_where="$(account_active_where_expr)"
   c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs WHERE ${active_account_where};" 2>/dev/null || echo 0)"
   c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses WHERE ${active_account_where};" 2>/dev/null || echo 0)"
   c_vless="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vlesses WHERE ${active_account_where};" 2>/dev/null || echo 0)"

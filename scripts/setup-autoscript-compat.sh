@@ -1355,10 +1355,11 @@ ensure_tunnel_shell_allowed() {
 }
 
 harden_ssh_tunnel_shells() {
-  local shell user changed
+  local shell user changed active_where
   command -v sqlite3 >/dev/null 2>&1 || return 0
   [[ -s "${DB_PATH}" ]] || return 0
   shell="$(ensure_tunnel_shell_allowed)"
+  active_where="$(account_active_where_expr)"
   changed=0
   while IFS= read -r user; do
     [[ -z "${user}" || "${user}" == "root" ]] && continue
@@ -1366,7 +1367,7 @@ harden_ssh_tunnel_shells() {
       usermod -s "${shell}" "${user}" >/dev/null 2>&1 || true
       changed=$((changed + 1))
     fi
-  done < <(sqlite3 -noheader "${DB_PATH}" "SELECT username FROM account_sshs WHERE TRIM(COALESCE(username,'')) <> '';" 2>/dev/null || true)
+  done < <(sqlite3 -noheader "${DB_PATH}" "SELECT username FROM account_sshs WHERE TRIM(COALESCE(username,'')) <> '' AND ${active_where};" 2>/dev/null || true)
   log "Tunnel-only shell diterapkan ke ${changed} akun SSH/ZIVPN (${shell})."
 }
 
@@ -3982,6 +3983,24 @@ function deleteLinuxUser(username) {
   safeExec('userdel', ['-r', username]);
 }
 
+function disableSshSystemAccess(username, password = '') {
+  const user = String(username || '').trim();
+  const pass = String(password || '').trim();
+  if (!user || user === 'root') return false;
+  safeExec('pkill', ['-KILL', '-u', user]);
+  safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
+  safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
+  const deleted = safeExec('userdel', ['-r', user]);
+  if (!deleted) {
+    safeExec('passwd', ['-l', user]);
+    safeExec('usermod', ['-s', '/usr/sbin/nologin', user]);
+  }
+  syncZivpnUser(user, false);
+  if (pass) syncUdpcustomUser(pass, false);
+  syncUdpcustomUser(user, false);
+  return true;
+}
+
 function lockLinuxUser(username) {
   safeExec('passwd', ['-l', username]);
 }
@@ -4110,7 +4129,7 @@ async function syncSshBackendsFromDb() {
       "SELECT username, password FROM account_sshs " +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
       "AND (TRIM(COALESCE(date_exp,''))='' " +
-      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(date_exp) > datetime('now','localtime')) " +
+      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(REPLACE(TRIM(date_exp),'T',' ')) > datetime('now','localtime')) " +
       "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) > date('now','localtime'))) " +
       "ORDER BY LOWER(username)"
     );
@@ -4501,11 +4520,8 @@ async function cleanupExpiredTrialAccounts() {
     const pass = String(row?.password || '').trim();
     const exp = String(row?.date_exp || '').trim();
     if (!u || !isExpiredDateValue(exp)) continue;
-    deleteLinuxUser(u);
+    disableSshSystemAccess(u, pass);
     await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
-    syncZivpnUser(u, false);
-    if (pass) syncUdpcustomUser(pass, false);
-    syncUdpcustomUser(u, false);
     await cleanupDeletedAccountState('ssh', u);
     deletedSsh += 1;
   }
@@ -4540,6 +4556,38 @@ async function cleanupExpiredTrialAccounts() {
     console.log(`[trial-cleanup] deleted ssh=${deletedSsh} xray=${deletedXray}`);
   }
   return { deletedSsh, deletedXray };
+}
+
+async function cleanupExpiredSshAccounts() {
+  const rows = await all(
+    "SELECT username, password, date_exp, limitip FROM account_sshs " +
+    "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
+    "AND TRIM(COALESCE(date_exp,'')) <> ''"
+  ).catch(() => []);
+  const expiredBatch = [];
+  let changed = 0;
+
+  for (const row of rows) {
+    const u = String(row?.username || '').trim();
+    const pass = String(row?.password || '').trim();
+    const exp = String(row?.date_exp || '').trim();
+    if (!u || !isExpiredDateValue(exp)) continue;
+    disableSshSystemAccess(u, pass);
+    await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+    await cleanupDeletedAccountState('ssh', u);
+    expiredBatch.push({
+      username: u,
+      date_exp: exp,
+      limitip: String(row?.limitip ?? '0')
+    });
+    changed += 1;
+  }
+
+  await notifyExpiredAccountsBatchEvent('ssh/zivpn/udphc', expiredBatch);
+  if (changed > 0) {
+    console.log(`[ssh-expired-cleanup] expired=${changed}`);
+  }
+  return { changed };
 }
 
 async function cleanupExpiredXrayAccounts() {
@@ -4993,7 +5041,13 @@ async function syncAfterManualSshUnlock(username) {
 
 app.patch('/vps/unlocksshvpn/:username', async (req, res) => {
   const username = String(req.params.username || '').trim();
-  const row = await get("SELECT quota FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+  const row = await get("SELECT quota, date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+  if (row && isExpiredDateValue(row?.date_exp)) {
+    disableSshSystemAccess(username, '');
+    await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
+    await cleanupDeletedAccountState('ssh', username);
+    return fail(res, 409, 'akun sudah expired, renew dulu sebelum unlock');
+  }
   const quotaUnlock = await canUnlockQuotaAccount('ssh', username, Number(row?.quota || 0));
   if (!quotaUnlock.ok) {
     return fail(res, 409, `quota habis: terpakai ${Math.ceil(quotaUnlock.usedBytes / QUOTA_BYTES_PER_GB)} GB, tambah quota dulu`);
@@ -5587,9 +5641,11 @@ app.listen(PORT, '127.0.0.1', () => {
   }, 30 * 1000);
   ensureApiRuntimeTables()
     .then(() => cleanupExpiredTrialAccounts())
+    .then(() => cleanupExpiredSshAccounts())
     .catch(() => {});
   setInterval(() => { cleanupZivpnLiveSessions().catch(() => {}); }, 60 * 1000);
   setInterval(() => { cleanupExpiredTrialAccounts().catch(() => {}); }, 60 * 1000);
+  setInterval(() => { cleanupExpiredSshAccounts().catch(() => {}); }, 60 * 1000);
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
   syncXrayFromDbIfChanged(true).catch(() => {});
@@ -7929,6 +7985,23 @@ async function unlockExpired(nowTs) {
       const sshRow = await get("SELECT password, date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => null);
       const pass = String(sshRow?.password || '').trim();
       const expDate = String(sshRow?.date_exp || '').trim();
+      if (isExpiredDate(expDate)) {
+        if (!safeExec('userdel', ['-r', u])) {
+          safeExec('passwd', ['-l', u]);
+          safeExec('usermod', ['-s', '/usr/sbin/nologin', u]);
+        }
+        if (removeZivpnUser(u)) zivpnChanged = true;
+        let expiredUdphcChanged = false;
+        if (pass && removeUdpcustomUser(pass)) expiredUdphcChanged = true;
+        if (removeUdpcustomUser(u)) expiredUdphcChanged = true;
+        if (expiredUdphcChanged) udpcustomChanged = true;
+        await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+        await run("DELETE FROM zivpn_live_sessions WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+        await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+        await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+        await run("DELETE FROM temp_ip_lock_grace WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+        continue;
+      }
       // Selalu sinkronkan ulang kredensial Linux dari DB saat unlock.
       if (pass) {
         safeExec('chpasswd', [], `${u}:${pass}\n`);
@@ -13518,6 +13591,12 @@ account_expired_where_expr() {
   echo "UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR (TRIM(COALESCE(date_exp,''))<>'' AND (${exp_expr}) <= datetime('now','localtime'))"
 }
 
+account_effective_status_sql() {
+  local exp_expr
+  exp_expr="$(account_expire_datetime_expr)"
+  echo "CASE WHEN UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND TRIM(COALESCE(date_exp,''))<>'' AND (${exp_expr}) <= datetime('now','localtime') THEN 'EXPIRED' ELSE UPPER(TRIM(COALESCE(status,''))) END"
+}
+
 print_account_picker_table() {
   local type="$1" lock_only="${2:-0}" mode="${3:-all}" table where rows active_where expired_where rem_expr
   table="$(account_table_by_type "${type}")"
@@ -13551,6 +13630,9 @@ print_account_picker_table() {
     [[ -z "${u}" ]] && continue
     i=$((i + 1))
     sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
+    if [[ "${mode}" == "expired" && "${st}" == "AKTIF" ]]; then
+      st="EXPIRED"
+    fi
     printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa_human}" "${lim:-0}"
   done <<< "${rows}"
   return 0
@@ -14036,6 +14118,9 @@ list_accounts() {
       i=$((i + 1))
       sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
       display_st="${st:-AKTIF}"
+      if [[ "${mode}" == "expired" && "${display_st}" == "AKTIF" ]]; then
+        display_st="EXPIRED"
+      fi
       [[ "${kind}" == "TRIAL" && "${display_st}" == "AKTIF" ]] && display_st="TRIAL"
       quota_text="$(quota_usage_label_for_account "$(quota_type_from_table "${table}")" "${u}" "${quota:-0}")"
       printf "%-4s %-22s %-10s %-8s %-7s %-24s\n" "${i}" "${u}" "${display_st}" "${sisa_human}" "${lim:-0}" "${quota_text}"
@@ -14112,17 +14197,18 @@ list_accounts() {
 }
 
 show_account_detail() {
-  local type mode username username_sql row d_quota_usage
+  local type mode username username_sql row d_quota_usage status_expr
   type="$(pick_type)"
   [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
   mode="$(pick_account_detail_mode)" || return
   username="$(pick_existing_username "${type}" "${mode}")" || return
   username_sql="${username//\'/''}"
+  status_expr="$(account_effective_status_sql)"
 
   case "${type}" in
     ssh|zivpn)
       row="$(sqlite3 -separator '|' "${DB_PATH}" \
-        "SELECT username,password,date_exp,UPPER(TRIM(COALESCE(status,''))),CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+        "SELECT username,password,date_exp,${status_expr},CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
       if [[ -z "${row}" ]]; then
         echo "Data akun tidak ditemukan."
         return
@@ -14147,7 +14233,7 @@ EOT_SSH_DETAIL
       ;;
     vmess)
       row="$(sqlite3 -separator '|' "${DB_PATH}" \
-        "SELECT username,uuid,date_exp,UPPER(TRIM(COALESCE(status,''))),CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_vmesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+        "SELECT username,uuid,date_exp,${status_expr},CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_vmesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
       if [[ -z "${row}" ]]; then
         echo "Data akun tidak ditemukan."
         return
@@ -14174,7 +14260,7 @@ EOT_VMESS_DETAIL
       ;;
     vless)
       row="$(sqlite3 -separator '|' "${DB_PATH}" \
-        "SELECT username,uuid,date_exp,UPPER(TRIM(COALESCE(status,''))),CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_vlesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+        "SELECT username,uuid,date_exp,${status_expr},CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_vlesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
       if [[ -z "${row}" ]]; then
         echo "Data akun tidak ditemukan."
         return
@@ -14199,7 +14285,7 @@ EOT_VLESS_DETAIL
       ;;
     trojan)
       row="$(sqlite3 -separator '|' "${DB_PATH}" \
-        "SELECT username,password,date_exp,UPPER(TRIM(COALESCE(status,''))),CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_trojans WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+        "SELECT username,password,date_exp,${status_expr},CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_trojans WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
       if [[ -z "${row}" ]]; then
         echo "Data akun tidak ditemukan."
         return

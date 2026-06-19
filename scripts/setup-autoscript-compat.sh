@@ -2926,6 +2926,8 @@ function readCapacityState() {
     'ACTIVE_UNIQUE_IP_COUNT',
     'ACTIVE_SSH_USER_COUNT',
     'ACTIVE_XRAY_USER_COUNT',
+    'ACTIVE_UDPHC_USER_COUNT',
+    'ACTIVE_ZIVPN_USER_COUNT',
     'ACTIVE_USER_ESTIMATE',
     'ACTIVE_ACCOUNT_TOTAL',
     'CAPACITY_ACTIVE_USER_TARGET',
@@ -8497,6 +8499,7 @@ for env_file in /etc/sc-1forcr.env /opt/sc-1forcr/.env; do
 done
 
 state_file="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
+online_state_file="${ONLINE_NOTIFY_LIVE_STATE_FILE:-/var/lib/sc-1forcr/online-live.env}"
 target="$(echo "${RESOURCE_TARGET_USAGE_PERCENT:-85}" | tr -cd '0-9')"
 [[ -z "${target}" || "${target}" -lt 50 || "${target}" -gt 95 ]] && target="85"
 db_path="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
@@ -8621,6 +8624,34 @@ fi
 [[ -z "${xray_user_count}" ]] && xray_user_count="0"
 (( xray_user_count > active_user_estimate )) && active_user_estimate="${xray_user_count}"
 
+udphc_user_count="0"
+zivpn_user_count="0"
+online_source="capacity_fallback"
+read_online_state_value() {
+  local key="$1"
+  [[ -n "${key}" && -f "${online_state_file}" ]] || return 0
+  awk -F= -v k="${key}" '$1==k {print substr($0, index($0,"=")+1); exit}' "${online_state_file}" 2>/dev/null || true
+}
+if [[ -x /usr/local/sbin/sc-1forcr-online-notify ]]; then
+  ONLINE_NOTIFY_STATE_ONLY=1 \
+    ONLINE_NOTIFY_ENABLE=1 \
+    ONLINE_NOTIFY_LIVE_STATE_FILE="${online_state_file}" \
+    /usr/local/sbin/sc-1forcr-online-notify >/dev/null 2>&1 || true
+fi
+online_total_detected="$(read_online_state_value ONLINE_TOTAL_DETECTED)"
+if [[ "${online_total_detected}" =~ ^[0-9]+$ ]]; then
+  active_user_estimate="${online_total_detected}"
+  ssh_user_count="$(read_online_state_value ONLINE_SSH_COUNT)"
+  xray_user_count="$(read_online_state_value ONLINE_XRAY_COUNT)"
+  udphc_user_count="$(read_online_state_value ONLINE_UDPHC_COUNT)"
+  zivpn_user_count="$(read_online_state_value ONLINE_ZIVPN_COUNT)"
+  [[ -z "${ssh_user_count}" || ! "${ssh_user_count}" =~ ^[0-9]+$ ]] && ssh_user_count="0"
+  [[ -z "${xray_user_count}" || ! "${xray_user_count}" =~ ^[0-9]+$ ]] && xray_user_count="0"
+  [[ -z "${udphc_user_count}" || ! "${udphc_user_count}" =~ ^[0-9]+$ ]] && udphc_user_count="0"
+  [[ -z "${zivpn_user_count}" || ! "${zivpn_user_count}" =~ ^[0-9]+$ ]] && zivpn_user_count="0"
+  online_source="online_notify"
+fi
+
 active_account_total="0"
 if command -v sqlite3 >/dev/null 2>&1 && [[ -f "${db_path}" ]]; then
   active_account_total="$(sqlite3 "${db_path}" "
@@ -8711,7 +8742,10 @@ tmp_state="$(mktemp)"
   printf 'ACTIVE_UNIQUE_IP_COUNT=%s\n' "${uniq_ip_count}"
   printf 'ACTIVE_SSH_USER_COUNT=%s\n' "${ssh_user_count}"
   printf 'ACTIVE_XRAY_USER_COUNT=%s\n' "${xray_user_count}"
+  printf 'ACTIVE_UDPHC_USER_COUNT=%s\n' "${udphc_user_count}"
+  printf 'ACTIVE_ZIVPN_USER_COUNT=%s\n' "${zivpn_user_count}"
   printf 'ACTIVE_USER_ESTIMATE=%s\n' "${active_user_estimate}"
+  printf 'ACTIVE_ONLINE_SOURCE=%s\n' "${online_source}"
   printf 'AVG_ACTIVE_USER_ESTIMATE=%s\n' "${avg_active}"
   printf 'ACTIVE_ACCOUNT_TOTAL=%s\n' "${active_account_total}"
   printf 'CAPACITY_ACTIVE_USER_TARGET=%s\n' "${capacity_target}"
@@ -8724,7 +8758,7 @@ tmp_state="$(mktemp)"
 } > "${tmp_state}"
 chmod 600 "${tmp_state}" >/dev/null 2>&1 || true
 mv -f "${tmp_state}" "${state_file}"
-echo "capacity=${status} active~${active_user_estimate}/${capacity_target} ram=${mem_used_pct}% cpu=${cpu_used_pct}% add=${recommended_add_batch}"
+echo "capacity=${status} online=${active_user_estimate} ram=${mem_used_pct}% cpu=${cpu_used_pct}% add=${recommended_add_batch}"
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-capacity-tune
 
@@ -10336,14 +10370,16 @@ ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
 ZIVPN_HANDOFF_GRACE_SECONDS="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
 ONLINE_NOTIFY_STATE_FILE="/var/lib/sc-1forcr/online-notify.last"
+ONLINE_NOTIFY_LIVE_STATE_FILE="${ONLINE_NOTIFY_LIVE_STATE_FILE:-/var/lib/sc-1forcr/online-live.env}"
+ONLINE_NOTIFY_STATE_ONLY="${ONLINE_NOTIFY_STATE_ONLY:-0}"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
 [[ -z "${ZIVPN_HANDOFF_GRACE_SECONDS}" || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -lt 3 || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -gt 120 ]] && ZIVPN_HANDOFF_GRACE_SECONDS="90"
 
-if [[ "${ONLINE_NOTIFY_ENABLE}" != "1" ]]; then
+if [[ "${ONLINE_NOTIFY_ENABLE}" != "1" && "${ONLINE_NOTIFY_STATE_ONLY}" != "1" ]]; then
   exit 0
 fi
-if [[ -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
+if [[ "${ONLINE_NOTIFY_STATE_ONLY}" != "1" ]] && { [[ -z "${TELEGRAM_BOT_TOKEN}" ]] || [[ -z "${TELEGRAM_CHAT_ID}" ]]; }; then
   exit 0
 fi
 
@@ -10838,6 +10874,26 @@ format_protocol_block() {
   fi
   format_user_rows "${users}"
 }
+
+online_total_detected="$((ssh_cnt + xray_cnt + udphc_cnt + zivpn_cnt))"
+tmp_online_state="$(mktemp)"
+mkdir -p "$(dirname "${ONLINE_NOTIFY_LIVE_STATE_FILE}")" >/dev/null 2>&1 || true
+{
+  printf 'ONLINE_UPDATED_AT=%s\n' "$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
+  printf 'ONLINE_WINDOW_SECONDS=%s\n' "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}"
+  printf 'ONLINE_TOTAL_DETECTED=%s\n' "${online_total_detected}"
+  printf 'ONLINE_SSH_COUNT=%s\n' "${ssh_cnt}"
+  printf 'ONLINE_XRAY_COUNT=%s\n' "${xray_cnt}"
+  printf 'ONLINE_UDPHC_COUNT=%s\n' "${udphc_cnt}"
+  printf 'ONLINE_ZIVPN_COUNT=%s\n' "${zivpn_cnt}"
+} > "${tmp_online_state}"
+chmod 600 "${tmp_online_state}" >/dev/null 2>&1 || true
+mv -f "${tmp_online_state}" "${ONLINE_NOTIFY_LIVE_STATE_FILE}" >/dev/null 2>&1 || true
+
+if [[ "${ONLINE_NOTIFY_STATE_ONLY}" == "1" ]]; then
+  echo "online_total=${online_total_detected} ssh=${ssh_cnt} xray=${xray_cnt} udphc=${udphc_cnt} zivpn=${zivpn_cnt}"
+  exit 0
+fi
 
 msg="SC 1FORCR NOTIF
 Event: ONLINE_REPORT
@@ -16012,7 +16068,7 @@ ensure_capacity_state_once() {
 
 show_capacity_report() {
   local file updated status reason target ram_total ram_used ram_pct avg_ram cpu_pct avg_cpu cores
-  local active avg_active accounts cap user_ram user_cpu can_add add_batch conn_count ip_count ssh_count xray_count
+  local active avg_active accounts cap user_ram user_cpu can_add add_batch conn_count ip_count ssh_count xray_count udphc_count zivpn_count online_source
   file="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
   ensure_capacity_state_once
   updated="$(read_capacity_state_value CAPACITY_UPDATED_AT)"
@@ -16030,6 +16086,9 @@ show_capacity_report() {
   ip_count="$(read_capacity_state_value ACTIVE_UNIQUE_IP_COUNT)"
   ssh_count="$(read_capacity_state_value ACTIVE_SSH_USER_COUNT)"
   xray_count="$(read_capacity_state_value ACTIVE_XRAY_USER_COUNT)"
+  udphc_count="$(read_capacity_state_value ACTIVE_UDPHC_USER_COUNT)"
+  zivpn_count="$(read_capacity_state_value ACTIVE_ZIVPN_USER_COUNT)"
+  online_source="$(read_capacity_state_value ACTIVE_ONLINE_SOURCE)"
   active="$(read_capacity_state_value ACTIVE_USER_ESTIMATE)"
   avg_active="$(read_capacity_state_value AVG_ACTIVE_USER_ESTIMATE)"
   accounts="$(read_capacity_state_value ACTIVE_ACCOUNT_TOTAL)"
@@ -16055,9 +16114,7 @@ show_capacity_report() {
   echo "CPU             : ${cpu_pct:-"-"}%, avg ${avg_cpu:-"-"}%"
   echo
   echo "Akun aktif DB   : ${accounts:-0}"
-  echo "Online estimasi : ${active:-0} user sekarang, avg ${avg_active:-0}"
-  echo "Detail online   : conn=${conn_count:-0}, ip=${ip_count:-0}, ssh=${ssh_count:-0}, xray=${xray_count:-0}"
-  echo "Target online   : sekitar ${cap:-"-"} user aktif ringan"
+  echo "Target kapasitas: sekitar ${cap:-"-"} user aktif ringan"
   echo "Patokan/user    : RAM ~${user_ram:-"-"} MiB, CPU ~${user_cpu:-"-"}%"
   echo
   echo "Sisa aman       : ${can_add:-0} user estimasi"
@@ -16452,7 +16509,7 @@ EOF
       estimate_text="${estimate_text} | add+${live_add}"
     fi
   fi
-  live_capacity_text="${live_status} online~${live_active} RAM ${live_ram}% CPU ${live_cpu}%"
+  live_capacity_text="${live_status} Online: ${live_active} RAM ${live_ram}% CPU ${live_cpu}%"
 
   if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" == "1" ]]; then
     cap_mode="AUTO"
@@ -16479,7 +16536,7 @@ EOF
   kv_line "Spesifikasi"  "${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
   kv_line "Auto tuningSC" "${cap_mode} (tier ${cap_tier})"
   kv_line "Estimasi akun"  "${estimate_text}"
-  kv_line "Kapasitas live" "${live_capacity_text}"
+  kv_line "Info Realtime" "${live_capacity_text}"
   print_mid
 
   section_title "LOCATION & ISP"

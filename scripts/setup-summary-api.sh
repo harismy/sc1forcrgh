@@ -615,6 +615,53 @@ function getXrayCredentialFromRow(type, row) {
   return '';
 }
 
+function numericValue(input, fallback = 0) {
+  const n = Number(input);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function bytesToQuotaGb(input) {
+  const n = numericValue(input, 0);
+  if (n <= 0) return 0;
+  return Math.max(1, Math.ceil(n / (1024 * 1024 * 1024)));
+}
+
+function normalizeImportedStatus(statusInput) {
+  const s = String(statusInput || '').trim().toUpperCase();
+  if (!s) return 'AKTIF';
+  if (['AKTIF', 'ACTIVE', 'NORMAL', 'UNLOCKED', 'ENABLE', 'ENABLED', 'OK'].includes(s)) return 'AKTIF';
+  if (['EXPIRED', 'KADALUARSA', 'RECOVERY'].includes(s)) return 'EXPIRED';
+  if (['LOCK', 'LOCKED', 'LOCK_TMP', 'LOCK_QUOTA', 'BANNED', 'BAN'].includes(s)) return 'LOCK';
+  return 'AKTIF';
+}
+
+function normalizeImportedAccountRow(type, rowInput) {
+  const typeKey = String(type || '').trim().toLowerCase();
+  const row = { ...((rowInput && typeof rowInput === 'object') ? rowInput : {}) };
+  row.username = String(row.username || '').trim();
+  row.status = normalizeImportedStatus(row.status || row.status_lock || row.type);
+
+  if ((row.limitip === undefined || row.limitip === null || row.limitip === '') && row.limit_ip !== undefined && row.limit_ip !== null) {
+    row.limitip = row.limit_ip;
+  }
+
+  if ((row.quota === undefined || row.quota === null || row.quota === '' || Number(row.quota || 0) <= 0) && numericValue(row.max_bw, 0) > 0) {
+    row.quota = bytesToQuotaGb(row.max_bw);
+  }
+
+  if (typeKey === 'trojan') {
+    const pass = String(row.password || '').trim();
+    const uid = String(row.uuid || row.id || row.secret || '').trim();
+    if (!pass && uid) row.password = uid;
+  } else if (typeKey === 'vmess' || typeKey === 'vless') {
+    const uuid = String(row.uuid || '').trim();
+    const alt = String(row.id || row.password || row.secret || '').trim();
+    if (!uuid && alt) row.uuid = alt;
+  }
+
+  return row;
+}
+
 function normalizeXrayClientsForType(type, rows, templateClient) {
   const list = Array.isArray(rows) ? rows : [];
   const tpl = (templateClient && typeof templateClient === 'object') ? { ...templateClient } : {};
@@ -685,6 +732,36 @@ function buildDefaultXrayInbound(type) {
     };
   }
   return null;
+}
+
+function buildDefaultXrayGrpcInbound(type) {
+  if (type === 'vmess') {
+    return {
+      port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+      settings: { clients: [] },
+      streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+    };
+  }
+  if (type === 'vless') {
+    return {
+      port: 11002, listen: '127.0.0.1', protocol: 'vless',
+      settings: { clients: [], decryption: 'none' },
+      streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+    };
+  }
+  if (type === 'trojan') {
+    return {
+      port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+      settings: { clients: [] },
+      streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
+    };
+  }
+  return null;
+}
+
+function isGrpcInboundForType(inbound, type) {
+  return String(inbound?.protocol || '').trim().toLowerCase() === type &&
+    String(inbound?.streamSettings?.network || '').trim().toLowerCase() === 'grpc';
 }
 
 function writeXrayConfigToCandidates(cfgObj, primaryPath) {
@@ -761,6 +838,13 @@ function syncXrayConfigFromDbByType(typeInput, restartAfter = false) {
           }
           inbounds.push(createdInbound);
           targetInbounds = [createdInbound];
+        }
+        if (!targetInbounds.some((ib) => isGrpcInboundForType(ib, type))) {
+          const grpcInbound = buildDefaultXrayGrpcInbound(type);
+          if (grpcInbound) {
+            inbounds.push(grpcInbound);
+            targetInbounds.push(grpcInbound);
+          }
         }
 
         const firstTemplate = Array.isArray(targetInbounds[0]?.settings?.clients) && targetInbounds[0].settings.clients[0]
@@ -1617,25 +1701,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
       return res.status(500).json({ ok: false, message: `kolom username tidak ada di ${table}` });
     }
 
-    const importRows = (Array.isArray(accounts) ? accounts : []).map((raw) => ({ ...(raw || {}) }));
-
-    // Kompatibilitas backup lintas script:
-    // - Beberapa backup (mis. potato) mengirim trojan credential di field "uuid"
-    // - DB 1FORCR menyimpan trojan credential di kolom "password"
-    if (type === 'trojan') {
-      for (const r of importRows) {
-        const pass = String(r.password || '').trim();
-        const uid = String(r.uuid || r.id || r.secret || '').trim();
-        if (!pass && uid) r.password = uid;
-      }
-    }
-
-    // Kompatibilitas nama field limit IP lintas source.
-    for (const r of importRows) {
-      if ((r.limitip === undefined || r.limitip === null || r.limitip === '') && r.limit_ip !== undefined && r.limit_ip !== null) {
-        r.limitip = r.limit_ip;
-      }
-    }
+    const importRows = (Array.isArray(accounts) ? accounts : []).map((raw) => normalizeImportedAccountRow(type, raw));
 
     const insertCols = columns.filter((col) => importRows.some((row) => Object.prototype.hasOwnProperty.call(row || {}, col)));
     if (!insertCols.includes('username')) insertCols.unshift('username');
@@ -1700,7 +1766,7 @@ function sendImportAccounts(db, res, rawType, accountsInput) {
             });
           };
           if (getXrayProtocolByType(type)) {
-            return syncXrayConfigFromDbByType(type, false).then((syncRes) => {
+            return syncXrayConfigFromDbByType(type, true).then((syncRes) => {
               if (!syncRes.ok) {
                 return res.status(Number(syncRes.statusCode || 500)).json({
                   ok: false,

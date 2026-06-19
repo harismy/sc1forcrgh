@@ -10113,9 +10113,42 @@ def to_int(v, d=0):
 def pick_limitip(r):
     return to_int((r or {}).get("limitip", (r or {}).get("limit_ip", 0)), 0)
 
-def restored_status(_raw):
-    # Restore akun dipaksa aktif agar langsung usable setelah import.
+def pick_quota(r):
+    raw = (r or {})
+    q = to_int(raw.get("quota", 0), 0)
+    if q > 0:
+        return q
+    max_bw = to_int(raw.get("max_bw", 0), 0)
+    if max_bw > 0:
+        return max(1, (max_bw + (1024 * 1024 * 1024) - 1) // (1024 * 1024 * 1024))
+    return 0
+
+def restored_status(raw):
+    s = str(raw or "").strip().upper()
+    if not s:
+        return "AKTIF"
+    if s in ("AKTIF", "ACTIVE", "NORMAL", "UNLOCKED", "ENABLE", "ENABLED", "OK"):
+        return "AKTIF"
+    if s in ("EXPIRED", "KADALUARSA", "RECOVERY"):
+        return "EXPIRED"
+    if s in ("LOCK", "LOCKED", "LOCK_TMP", "LOCK_QUOTA", "BANNED", "BAN"):
+        return "LOCK"
     return "AKTIF"
+
+def upsert_account_usage(account_type, username, r):
+    used = to_int((r or {}).get("used_bytes", (r or {}).get("use_bw", 0)), 0)
+    if used <= 0:
+        return
+    cur.execute(
+        """
+        INSERT INTO account_quota_usage(account_type,username,used_bytes,last_counter_bytes,updated_at)
+        VALUES(?,?,?,?,strftime('%s','now'))
+        ON CONFLICT(account_type,username) DO UPDATE SET
+          used_bytes=MAX(account_quota_usage.used_bytes, excluded.used_bytes),
+          updated_at=excluded.updated_at
+        """,
+        (account_type, username, used, 0),
+    )
 
 def upsert_ssh(rows):
     for r in rows:
@@ -10140,12 +10173,13 @@ def upsert_ssh(rows):
                 str((r or {}).get("password", "")),
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
-                to_int((r or {}).get("quota", 0)),
+                pick_quota(r),
                 pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
         )
+        upsert_account_usage("ssh", u, r)
 
 def upsert_uuid(table, rows):
     for r in rows:
@@ -10170,12 +10204,14 @@ def upsert_uuid(table, rows):
                 str((r or {}).get("uuid", "")),
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or {}).get("status")),
-                to_int((r or {}).get("quota", 0)),
+                pick_quota(r),
                 pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
         )
+        usage_type = "vmess" if table == "account_vmesses" else "vless"
+        upsert_account_usage(usage_type, u, r)
 
 def upsert_trojan(rows):
     for r in rows:
@@ -10211,12 +10247,13 @@ def upsert_trojan(rows):
                 str((r or {}).get("date_exp", "")),
                 restored_status((r or 
                 {}).get("status")),
-                to_int((r or {}).get("quota", 0)),
+                pick_quota(r),
                 pick_limitip(r),
                 to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
                 to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
         )
+        upsert_account_usage("trojan", u, r)
 
 def upsert_quota_usage(rows):
     for r in rows:

@@ -774,14 +774,30 @@ function isDateExpExpired(dateExp) {
   return end.getTime() < now.getTime();
 }
 
+function normalizeImportedAccountStatus(statusInput) {
+  const s = String(statusInput || '').trim().toUpperCase();
+  if (!s) return 'AKTIF';
+  if (['AKTIF', 'ACTIVE', 'NORMAL', 'UNLOCKED', 'ENABLE', 'ENABLED', 'OK'].includes(s)) return 'AKTIF';
+  if (['EXPIRED', 'KADALUARSA', 'RECOVERY'].includes(s)) return 'EXPIRED';
+  if (['LOCK', 'LOCKED', 'LOCK_TMP', 'LOCK_QUOTA', 'BANNED', 'BAN'].includes(s)) return 'LOCK';
+  return 'AKTIF';
+}
+
+function importedBytesToQuotaGb(input) {
+  const n = Number(input || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.max(1, Math.ceil(n / (1024 * 1024 * 1024)));
+}
+
 function normalizeAccountForImport(type, row, opts = {}) {
   const t = String(type || '').trim().toLowerCase();
   const out = { ...(row || {}) };
+  const normalizedStatus = normalizeImportedAccountStatus(out.status || out.status_lock || out.type);
   const forceActive = opts.forceActive !== false;
-  if (forceActive) out.status = 'AKTIF';
+  out.status = forceActive && normalizedStatus === 'AKTIF' ? 'AKTIF' : normalizedStatus;
 
   const shouldFixDate = opts.ensureNotExpired !== false;
-  if (shouldFixDate) {
+  if (shouldFixDate && out.status === 'AKTIF') {
     const future = new Date(Date.now() + (24 * 60 * 60 * 1000));
     const fallbackDate = toYmdUtc(future);
     if (isDateExpExpired(out.date_exp)) {
@@ -791,9 +807,27 @@ function normalizeAccountForImport(type, row, opts = {}) {
     }
   }
 
+  if ((out.limitip === undefined || out.limitip === null || out.limitip === '') && out.limit_ip !== undefined && out.limit_ip !== null) {
+    out.limitip = out.limit_ip;
+  }
+
+  if ((out.quota === undefined || out.quota === null || out.quota === '' || Number(out.quota || 0) <= 0) && Number(out.max_bw || 0) > 0) {
+    out.quota = importedBytesToQuotaGb(out.max_bw);
+  }
+
   if (t === 'ssh') {
     const username = String(out.username || '').trim();
     if (!String(out.password || '').trim()) out.password = username || '123456';
+  }
+
+  if (t === 'trojan') {
+    const pass = String(out.password || '').trim();
+    const alt = String(out.uuid || out.id || out.secret || '').trim();
+    if (!pass && alt) out.password = alt;
+  } else if (t === 'vmess' || t === 'vless') {
+    const uuid = String(out.uuid || '').trim();
+    const alt = String(out.id || out.password || out.secret || '').trim();
+    if (!uuid && alt) out.uuid = alt;
   }
 
   return out;

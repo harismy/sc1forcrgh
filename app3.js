@@ -1128,6 +1128,59 @@ async function getSaldo(userId) {
   return Number(row?.saldo || 0);
 }
 
+function parseTelegramUserId(input) {
+  const raw = String(input || '').trim();
+  const n = Number(raw.replace(/[^0-9]/g, ''));
+  return Number.isInteger(n) && n > 0 ? n : 0;
+}
+
+async function getAdminUserSaldoInfo(userId) {
+  const uid = Number(userId || 0);
+  if (!Number.isInteger(uid) || uid <= 0) return null;
+  const user = await dbGet('SELECT user_id, saldo, is_reseller FROM users WHERE user_id = ? LIMIT 1', [uid]);
+  if (!user) return null;
+  const now = Date.now();
+  const [activeSc, totalSc, lastTx] = await Promise.all([
+    dbGet(
+      "SELECT COUNT(1) AS total FROM sc_registrations WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
+      [uid, now]
+    ).catch(() => ({ total: 0 })),
+    dbGet('SELECT COUNT(1) AS total FROM sc_registrations WHERE user_id = ?', [uid]).catch(() => ({ total: 0 })),
+    dbGet(
+      'SELECT amount, type, reference_id, timestamp FROM transactions WHERE user_id = ? ORDER BY timestamp DESC, id DESC LIMIT 1',
+      [uid]
+    ).catch(() => null)
+  ]);
+  return {
+    userId: uid,
+    saldo: Number(user?.saldo || 0),
+    isReseller: Number(user?.is_reseller || 0) === 1,
+    activeSc: Number(activeSc?.total || 0),
+    totalSc: Number(totalSc?.total || 0),
+    lastTx: lastTx || null
+  };
+}
+
+function formatAdminUserSaldoInfo(info) {
+  if (!info) return 'User belum ada di database bot.';
+  const lastTx = info.lastTx
+    ? [
+        `Transaksi terakhir: ${String(info.lastTx.type || '-')}`,
+        `Nominal terakhir: Rp ${Number(info.lastTx.amount || 0).toLocaleString('id-ID')}`,
+        `Waktu terakhir: ${formatDateTime(info.lastTx.timestamp)}`
+      ]
+    : ['Transaksi terakhir: -'];
+  return uiBox('CEK SALDO USER', [
+    `User ID: ${info.userId}`,
+    `Saldo: Rp ${Number(info.saldo || 0).toLocaleString('id-ID')}`,
+    `Status reseller: ${info.isReseller ? 'AKTIF' : 'NONAKTIF'}`,
+    `SC aktif: ${info.activeSc}`,
+    `Total SC pernah daftar: ${info.totalSc}`,
+    '',
+    ...lastTx
+  ]);
+}
+
 async function addSaldo(userId, amount) {
   await ensureUser(userId);
   await dbRun('UPDATE users SET saldo = saldo + ? WHERE user_id = ?', [amount, userId]);
@@ -2234,7 +2287,8 @@ async function registerScMenu() {
 
 function adminMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('💳 Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('📜 Histori TopUp', 'm_admin_topup_history')],
+    [Markup.button.callback('💳 Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('💰 Cek Saldo User', 'm_admin_check_saldo')],
+    [Markup.button.callback('📜 Histori TopUp', 'm_admin_topup_history')],
     [Markup.button.callback('📢 Broadcast Semua User', 'm_admin_broadcast'), Markup.button.callback('♾️ Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
 
     [Markup.button.callback('👥 Jadikan Reseller', 'm_admin_reseller_enable'), Markup.button.callback('🚫 Nonaktifkan Reseller', 'm_admin_reseller_disable')],
@@ -3347,6 +3401,17 @@ bot.command('broadcast', async (ctx) => {
   );
 });
 
+bot.command(['ceksaldouser', 'saldouser'], async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const text = String(ctx.message?.text || '').replace(/^\/(ceksaldouser|saldouser)(@\w+)?/i, '').trim();
+  const targetUserId = parseTelegramUserId(text);
+  if (!targetUserId) {
+    return ctx.reply('Gunakan: /ceksaldouser <telegram_user_id>');
+  }
+  const info = await getAdminUserSaldoInfo(targetUserId);
+  return ctx.reply(formatAdminUserSaldoInfo(info), adminMenu());
+});
+
 bot.action('m_admin_topup_history', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
@@ -3581,6 +3646,16 @@ bot.action('m_admin_add_saldo', async (ctx) => {
   userState.set(ctx.chat.id, { step: 'admin_add_saldo_user' });
   await ctx.reply(
     'Masukkan Telegram User ID yang ingin ditambah saldo.\n' + 'Ketik "batal" untuk batal.'
+  );
+});
+
+bot.action('m_admin_check_saldo', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_check_saldo_user' });
+  return ctx.reply(
+    'Masukkan Telegram User ID yang ingin dicek saldonya.\n' +
+      'Ketik "batal" untuk batal.'
   );
 });
 
@@ -4540,6 +4615,20 @@ bot.on('text', async (ctx) => {
       state.envKey = key;
       userState.set(ctx.chat.id, state);
       return ctx.reply(`Masukkan nilai baru untuk "${getSettingLabel(key)}":\n${envKeyInputHint(key)}`);
+    }
+
+    if (state.step === 'admin_check_saldo_user') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const targetUserId = parseTelegramUserId(text);
+      if (!targetUserId) {
+        return ctx.reply('User ID tidak valid.');
+      }
+      const info = await getAdminUserSaldoInfo(targetUserId);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(formatAdminUserSaldoInfo(info), adminMenu());
     }
 
     if (state.step === 'admin_add_saldo_user') {

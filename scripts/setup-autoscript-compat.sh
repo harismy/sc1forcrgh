@@ -1359,7 +1359,7 @@ harden_ssh_tunnel_shells() {
   command -v sqlite3 >/dev/null 2>&1 || return 0
   [[ -s "${DB_PATH}" ]] || return 0
   shell="$(ensure_tunnel_shell_allowed)"
-  active_where="$(account_active_where_expr)"
+  active_where="UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND (TRIM(COALESCE(date_exp,''))='' OR datetime(REPLACE(TRIM(date_exp),'T',' ')) > datetime('now','localtime'))"
   changed=0
   while IFS= read -r user; do
     [[ -z "${user}" || "${user}" == "root" ]] && continue

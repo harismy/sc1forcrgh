@@ -970,6 +970,7 @@ auto_tune_resource_vars() {
   [[ -z "${SSHWS_NGINX_LIMIT_CONN}" || "${SSHWS_NGINX_LIMIT_CONN}" -lt 10 ]] && SSHWS_NGINX_LIMIT_CONN="${def_sshws_conn}"
   [[ -z "${SSHWS_UDPGW_MAX_CLIENTS}" || "${SSHWS_UDPGW_MAX_CLIENTS}" -lt 16 ]] && SSHWS_UDPGW_MAX_CLIENTS="${def_udpgw_clients}"
   [[ -z "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}" || "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}" -lt 4 ]] && SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${def_udpgw_conn}"
+  return 0
 }
 
 auto_tune_iplimit_vars
@@ -17669,6 +17670,22 @@ show_zivpn_online_realtime() {
   done
 }
 
+normalize_downloaded_script_file() {
+  local file="$1" tmp_clean bom
+  [[ -f "${file}" ]] || return 1
+  bom="$(printf '\357\273\277')"
+  if [[ "$(head -c 3 "${file}" 2>/dev/null || true)" == "${bom}" ]]; then
+    tmp_clean="${file}.nobom.$$"
+    if tail -c +4 "${file}" > "${tmp_clean}" 2>/dev/null; then
+      mv -f "${tmp_clean}" "${file}"
+    else
+      rm -f "${tmp_clean}" 2>/dev/null || true
+    fi
+  fi
+  sed -i 's/\r$//' "${file}" 2>/dev/null || true
+  return 0
+}
+
 update_script_from_repo() {
   local url tmp active_backend downloaded_ok derived_url
   local udpcustom_svc zstat ustat
@@ -17716,6 +17733,8 @@ Alasan   : gagal download script update
 Time     : $(date '+%F %T')"
     return 1
   fi
+  chmod +x "${tmp}"
+  normalize_downloaded_script_file "${tmp}"
   chmod +x "${tmp}"
   if ! bash -n "${tmp}"; then
     echo "Update script gagal validasi syntax (bash -n)."

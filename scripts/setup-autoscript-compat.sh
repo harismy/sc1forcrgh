@@ -7647,6 +7647,14 @@ async function ensureTables() {
     updated_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`);
+  await run(`CREATE TABLE IF NOT EXISTS account_quota_session_counters (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    last_counter_bytes INTEGER DEFAULT 0,
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username, session_key)
+  )`).catch(() => {});
   await run(`CREATE TABLE IF NOT EXISTS account_quota_locks (
     account_type TEXT NOT NULL,
     username TEXT NOT NULL,
@@ -7695,6 +7703,121 @@ async function addQuotaDelta(type, username, deltaBytes, lastCounterBytes = null
   const nextCounter = lastCounterBytes === null ? current.lastCounter : Math.max(0, Math.floor(Number(lastCounterBytes || 0)));
   await saveQuotaUsage(type, username, nextUsed, nextCounter);
   return nextUsed;
+}
+
+function readProcIoTotal(pid) {
+  try {
+    const p = String(pid || '').trim();
+    if (!/^\d+$/.test(p)) return 0;
+    const out = fs.readFileSync(`/proc/${p}/io`, 'utf8');
+    let rchar = 0;
+    let wchar = 0;
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.match(/^(rchar|wchar):\s*([0-9]+)/);
+      if (!m) continue;
+      if (m[1] === 'rchar') rchar = Number(m[2] || 0);
+      if (m[1] === 'wchar') wchar = Number(m[2] || 0);
+    }
+    const total = rchar + wchar;
+    return Number.isFinite(total) && total > 0 ? total : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function readProcStartTicks(pid) {
+  try {
+    const p = String(pid || '').trim();
+    if (!/^\d+$/.test(p)) return '0';
+    const stat = fs.readFileSync(`/proc/${p}/stat`, 'utf8');
+    const end = stat.lastIndexOf(')');
+    if (end < 0) return '0';
+    const fields = stat.slice(end + 2).trim().split(/\s+/);
+    return String(fields[19] || '0');
+  } catch (_) {
+    return '0';
+  }
+}
+
+function sshQuotaUserFromProcessArgs(argsInput) {
+  const args = String(argsInput || '').trim();
+  let user = '';
+  if (/^sshd:\s+/i.test(args)) {
+    if (/\[(priv|preauth|listener)\]/i.test(args)) return '';
+    user = args.replace(/^sshd:\s*/i, '').split(/\s+/)[0] || '';
+    user = user.replace(/@.*$/, '').replace(/\[.*$/, '');
+  } else if (/^dropbear[^\s]*\s+\[[^\]]+\]/i.test(args) || /\/dropbear-[^\s]+\s+\[[^\]]+\]/i.test(args)) {
+    const m = args.match(/\[([^\]]+)\]/);
+    user = String(m?.[1] || '').trim();
+  }
+  user = user.toLowerCase();
+  if (!/^[a-z0-9._-]+$/.test(user)) return '';
+  if (user === 'root' || user === 'priv' || user === 'net') return '';
+  return user;
+}
+
+function readSshProcessQuotaCounters() {
+  const map = new Map();
+  let psOut = '';
+  try {
+    psOut = execFileSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  } catch (_) {
+    return map;
+  }
+  for (const lineRaw of String(psOut || '').split('\n')) {
+    const m = String(lineRaw || '').match(/^\s*(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const pid = String(m[1] || '').trim();
+    const user = sshQuotaUserFromProcessArgs(m[2]);
+    if (!user) continue;
+    const counter = readProcIoTotal(pid);
+    if (counter <= 0) continue;
+    const startTicks = readProcStartTicks(pid);
+    const sessionKey = `proc:${pid}:${startTicks}`;
+    if (!map.has(user)) map.set(user, new Map());
+    map.get(user).set(sessionKey, counter);
+  }
+  return map;
+}
+
+async function addQuotaSessionDeltas(type, username, sessionCounters) {
+  const t = String(type || '').trim().toLowerCase();
+  const user = String(username || '').trim();
+  if (!t || !user || !(sessionCounters instanceof Map) || sessionCounters.size < 1) return 0;
+  const now = Math.floor(Date.now() / 1000);
+  let totalDelta = 0;
+  const activeKeys = [];
+  for (const [sessionKeyRaw, counterRaw] of sessionCounters.entries()) {
+    const sessionKey = String(sessionKeyRaw || '').trim();
+    const counter = Math.max(0, Math.floor(Number(counterRaw || 0)));
+    if (!sessionKey || counter <= 0) continue;
+    activeKeys.push(sessionKey);
+    const row = await get(
+      "SELECT last_counter_bytes FROM account_quota_session_counters WHERE account_type=? AND LOWER(username)=LOWER(?) AND session_key=?",
+      [t, user, sessionKey]
+    ).catch(() => null);
+    const prev = Number(row?.last_counter_bytes || 0);
+    const delta = row ? (counter >= prev ? counter - prev : counter) : 0;
+    if (delta > 0) totalDelta += delta;
+    await run(
+      `INSERT INTO account_quota_session_counters(account_type, username, session_key, last_counter_bytes, updated_at)
+       VALUES(?, ?, ?, ?, ?)
+       ON CONFLICT(account_type, username, session_key) DO UPDATE SET
+         last_counter_bytes=excluded.last_counter_bytes,
+         updated_at=excluded.updated_at`,
+      [t, user, sessionKey, counter, now]
+    ).catch(() => {});
+  }
+  if (activeKeys.length > 0) {
+    const placeholders = activeKeys.map(() => '?').join(',');
+    await run(
+      `DELETE FROM account_quota_session_counters
+       WHERE account_type=? AND LOWER(username)=LOWER(?) AND session_key NOT IN (${placeholders})`,
+      [t, user, ...activeKeys]
+    ).catch(() => {});
+  }
+  await run("DELETE FROM account_quota_session_counters WHERE updated_at < ?", [now - 86400]).catch(() => {});
+  return Math.max(0, Math.floor(totalDelta));
 }
 
 function setupSshQuotaAccounting(rows = []) {
@@ -7826,6 +7949,7 @@ async function enforceQuotaLimits() {
     "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'"
   ).catch(() => []);
   const sshCounters = setupSshQuotaAccounting(sshRows);
+  const sshProcCounters = readSshProcessQuotaCounters();
   for (const row of sshRows) {
     const user = String(row?.username || '').trim();
     const key = user.toLowerCase();
@@ -7833,12 +7957,14 @@ async function enforceQuotaLimits() {
     if (!user) continue;
     const counter = Number(sshCounters.get(key) || 0);
     const current = await getQuotaUsage('ssh', user);
-    let delta = 0;
+    let ownerDelta = 0;
     if (current.exists) {
-      delta = counter >= current.lastCounter ? counter - current.lastCounter : counter;
+      ownerDelta = counter >= current.lastCounter ? counter - current.lastCounter : counter;
     }
+    const procDelta = await addQuotaSessionDeltas('ssh', user, sshProcCounters.get(key) || new Map());
+    const delta = Math.max(ownerDelta, procDelta);
     const used = await addQuotaDelta('ssh', user, delta, counter);
-    if (IPLIMIT_DEBUG) console.log(`[quota-debug][ssh] user=${user} quota=${quotaBytes} used=${used} delta=${delta} counter=${counter}`);
+    if (IPLIMIT_DEBUG) console.log(`[quota-debug][ssh] user=${user} quota=${quotaBytes} used=${used} delta=${delta} owner_delta=${ownerDelta} proc_delta=${procDelta} counter=${counter}`);
     if (quotaBytes > 0 && used >= quotaBytes) {
       const out = await lockSshForQuota(row, used, quotaBytes);
       if (out.zivpnChanged) zivpnChanged = true;

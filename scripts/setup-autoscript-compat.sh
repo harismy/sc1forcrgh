@@ -14055,7 +14055,7 @@ COMMIT;
 }
 
 edit_uuid_xray_account() {
-  local type username username_sql new_uuid row old_uuid
+  local type username username_sql new_uuid new_uuid_sql row old_uuid
   echo "EDIT ID XRAY (VMESS/VLESS/TROJAN)"
   draw_menu_panel "Pilih tipe Xray:" \
     "1) VMESS" \
@@ -14089,25 +14089,32 @@ edit_uuid_xray_account() {
   else
     echo "UUID lama: ${old_uuid:--}"
   fi
-  prompt_input new_uuid "ID baru (min 3 huruf/angka): " || return
+  prompt_input new_uuid "ID baru ${type^^} (bebas tanpa spasi / UUID standar): " || return
   new_uuid="$(echo "${new_uuid}" | tr -d '\r' | xargs)"
-  if [[ ! "${new_uuid}" =~ ^[A-Za-z0-9]{3,}$ ]]; then
-    echo "Format tidak valid. Gunakan minimal 3 karakter huruf/angka."
+  if [[ ! "${new_uuid}" =~ ^[^[:space:]]{3,}$ ]]; then
+    echo "Format tidak valid. Gunakan minimal 3 karakter tanpa spasi."
     return
   fi
+  if [[ "${type}" == "vmess" || "${type}" == "vless" ]]; then
+    if [[ ! "${new_uuid}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+      echo "Peringatan: ${type^^} umumnya paling aman memakai UUID standar."
+      echo "Jika sync/restart Xray gagal, pakai format: $(uuidgen 2>/dev/null || echo "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")"
+    fi
+  fi
+  new_uuid_sql="${new_uuid//\'/''}"
 
   if [[ "${type}" == "vmess" ]]; then
-    sqlite3 "${DB_PATH}" "UPDATE account_vmesses SET uuid='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+    sqlite3 "${DB_PATH}" "UPDATE account_vmesses SET uuid='${new_uuid_sql}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
       echo "Gagal update UUID VMESS."
       return
     }
   elif [[ "${type}" == "vless" ]]; then
-    sqlite3 "${DB_PATH}" "UPDATE account_vlesses SET uuid='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+    sqlite3 "${DB_PATH}" "UPDATE account_vlesses SET uuid='${new_uuid_sql}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
       echo "Gagal update UUID VLESS."
       return
     }
   else
-    sqlite3 "${DB_PATH}" "UPDATE account_trojans SET password='${new_uuid}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
+    sqlite3 "${DB_PATH}" "UPDATE account_trojans SET password='${new_uuid_sql}' WHERE LOWER(username)=LOWER('${username_sql}');" >/dev/null 2>&1 || {
       echo "Gagal update password TROJAN."
       return
     }

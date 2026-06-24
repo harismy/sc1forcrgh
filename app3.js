@@ -74,9 +74,9 @@ const SETTING_LABELS = {
 };
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SC_NOTIFY_INTERVAL_MS = Math.max(
-  60 * 1000,
+  60 * 60 * 1000,
   Number(process.env.SC_NOTIFY_INTERVAL_MS || 0) ||
-    ((Number(process.env.SC_NOTIFY_INTERVAL_MINUTES || process.env.SC_REMINDER_REPEAT_MINUTES || 30) || 30) * 60 * 1000)
+    ((Number(process.env.SC_NOTIFY_INTERVAL_MINUTES || process.env.SC_REMINDER_REPEAT_MINUTES || 60) || 60) * 60 * 1000)
 );
 const SC_EXPIRY_JOB_INTERVAL_MS = Math.max(
   60 * 1000,
@@ -89,11 +89,11 @@ const SC_H2_WINDOW_MS = Math.max(
     ((Number(process.env.SC_H2_WINDOW_HOURS || 48) || 48) * 60 * 60 * 1000)
 );
 const DEFAULT_SC_H2_REMINDER_INTERVAL_MINUTES = Math.max(
-  1,
+  60,
   Math.floor(
     Number(process.env.SC_H2_REMINDER_INTERVAL_MINUTES || 0) ||
       (Number(process.env.SC_H2_REMINDER_INTERVAL_MS || 0) / 60000) ||
-      ((Number(process.env.SC_H2_REMINDER_REPEAT_HOURS || 72) || 72) * 60)
+      60
   )
 );
 const SC_IP_CHANGE_MAX = 2;
@@ -374,6 +374,16 @@ async function seedDefaultSettings() {
       [key, String(value), now, 0]
     );
   }
+
+  const h2Reminder = await dbGet('SELECT value FROM app_settings WHERE key = ? LIMIT 1', ['SC_H2_REMINDER_INTERVAL_MINUTES'])
+    .catch(() => null);
+  const h2ReminderMinutes = Math.floor(Number(String(h2Reminder?.value || '').trim()));
+  if (!Number.isFinite(h2ReminderMinutes) || h2ReminderMinutes < 60 || h2ReminderMinutes === 4320) {
+    await dbRun(
+      'UPDATE app_settings SET value = ?, updated_at = ?, updated_by = ? WHERE key = ?',
+      ['60', now, 0, 'SC_H2_REMINDER_INTERVAL_MINUTES']
+    ).catch(() => {});
+  }
 }
 
 async function getScFeaturesInfoText() {
@@ -492,7 +502,7 @@ async function getScH2ReminderIntervalMs() {
   const minutes = await getSettingNumber(
     'SC_H2_REMINDER_INTERVAL_MINUTES',
     DEFAULT_SC_H2_REMINDER_INTERVAL_MINUTES,
-    1,
+    60,
     525600
   );
   return Math.max(60000, minutes * 60000);
@@ -2621,7 +2631,7 @@ function envKeyInputHint(key) {
     case 'TOPUP_SUCCESS_NOTIFY_ADMIN_IDS':
       return;
     case 'SC_H2_REMINDER_INTERVAL_MINUTES':
-      return 'Isi angka menit. Contoh: 10, 60, 1440.';
+      return 'Isi angka menit minimal 60. Contoh: 60, 120, 1440.';
     case 'RESELLER_ADMIN_WA':
       return;
     case 'AUTO_PROVISION_DOMAIN':
@@ -4860,7 +4870,7 @@ bot.on('text', async (ctx) => {
         value = ids.join(',');
       } else if (key === 'SC_H2_REMINDER_INTERVAL_MINUTES') {
         const n = Number(value);
-        if (!Number.isFinite(n) || n < 1) return ctx.reply('Harus angka menit >= 1.');
+        if (!Number.isFinite(n) || n < 60) return ctx.reply('Harus angka menit >= 60.');
         value = String(Math.floor(n));
       } else if (key === 'RESELLER_ADMIN_WA') {
         const wa = normalizeWaNumber(value);

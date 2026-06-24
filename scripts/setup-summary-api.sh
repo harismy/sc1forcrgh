@@ -17,6 +17,42 @@ log() {
   echo "[setup-summary-api] $*"
 }
 
+wait_for_apt_locks() {
+  local waited=0 max_wait=900
+  while true; do
+    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+       fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+       fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+       fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
+      if (( waited == 0 )); then
+        log "Menunggu lock apt/dpkg dilepas..."
+      fi
+      sleep 5
+      waited=$((waited + 5))
+      if (( waited >= max_wait )); then
+        log "Timeout menunggu lock apt/dpkg (${max_wait}s)."
+        return 1
+      fi
+      continue
+    fi
+    return 0
+  done
+}
+
+repair_dpkg_state() {
+  wait_for_apt_locks || return 1
+  if ! DEBIAN_FRONTEND=noninteractive dpkg --configure -a; then
+    log "dpkg --configure -a gagal. Selesaikan masalah dpkg lalu jalankan installer lagi."
+    return 1
+  fi
+  wait_for_apt_locks || return 1
+}
+
+apt_get_safe() {
+  repair_dpkg_state || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get "$@"
+}
+
 install_node_if_missing() {
   if command -v node >/dev/null 2>&1; then
     log "Node.js already installed: $(node -v)"
@@ -24,10 +60,10 @@ install_node_if_missing() {
   fi
 
   log "Installing Node.js 20.x..."
-  apt-get update -y
-  apt-get install -y curl ca-certificates gnupg apt-transport-https
+  apt_get_safe update -y
+  apt_get_safe install -y curl ca-certificates gnupg apt-transport-https
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
+  apt_get_safe install -y nodejs
   log "Node.js installed: $(node -v)"
 }
 
@@ -49,8 +85,8 @@ install_vnstat_if_missing() {
   fi
 
   log "Installing vnstat..."
-  apt-get update -y
-  apt-get install -y vnstat
+  apt_get_safe update -y
+  apt_get_safe install -y vnstat
   systemctl enable vnstat >/dev/null 2>&1 || true
   systemctl restart vnstat >/dev/null 2>&1 || true
   log "vnstat installed"
@@ -2754,8 +2790,8 @@ install_dependencies() {
   # sqlite3 prebuilt sering gagal di VPS dengan glibc lama,
   # jadi paksa build from source agar kompatibel dengan sistem.
   log "Installing build tools for sqlite3 (source build)..."
-  apt-get update -y
-  apt-get install -y build-essential python3 make g++ gcc libc6-dev pkg-config
+  apt_get_safe update -y
+  apt_get_safe install -y build-essential python3 make g++ gcc libc6-dev pkg-config
 
   log "Installing npm dependencies..."
   # Bersihkan hasil install lama agar sqlite3 binary lama tidak kepakai.

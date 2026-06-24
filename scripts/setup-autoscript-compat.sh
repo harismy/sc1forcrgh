@@ -1042,8 +1042,17 @@ wait_for_apt_locks() {
   done
 }
 
-apt_get_safe() {
+repair_dpkg_state() {
   wait_for_apt_locks || return 1
+  if ! DEBIAN_FRONTEND=noninteractive dpkg --configure -a; then
+    log "dpkg --configure -a gagal. Selesaikan masalah dpkg lalu jalankan installer lagi."
+    return 1
+  fi
+  wait_for_apt_locks || return 1
+}
+
+apt_get_safe() {
+  repair_dpkg_state || return 1
   DEBIAN_FRONTEND=noninteractive apt-get "$@"
 }
 
@@ -2437,7 +2446,7 @@ apply_sshws_loop_guard_rules() {
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
     log "Install netfilter-persistent agar rule SSHWS loop guard tidak hilang saat reboot..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+    apt_get_safe install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
   fi
   fw_persist_rules
   log "SSHWS loop guard aktif: ports=${ports}, new_above=${rate}, burst=${burst}, connlimit_above=${connlimit}"
@@ -2511,7 +2520,7 @@ setup_zivpn_udp_nat_rules() {
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
     log "Install netfilter-persistent agar rule iptables tidak hilang saat reboot..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+    apt_get_safe install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
   fi
   fw_persist_rules
 }
@@ -2600,7 +2609,7 @@ setup_udpcustom_udp_nat_rules() {
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
     log "Install netfilter-persistent agar rule iptables tidak hilang saat reboot..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+    apt_get_safe install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
   fi
   fw_persist_rules
 }
@@ -9012,7 +9021,7 @@ setup_udpgw_service_if_possible() {
 
   if [[ -z "${udpgw_bin}" ]]; then
     log "badvpn-udpgw belum ada. Coba install paket 'badvpn'..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y badvpn >/dev/null 2>&1 || true
+    apt_get_safe install -y badvpn >/dev/null 2>&1 || true
     for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
       if [[ -x "${p}" ]]; then
         udpgw_bin="${p}"
@@ -9023,7 +9032,7 @@ setup_udpgw_service_if_possible() {
 
   if [[ -z "${udpgw_bin}" ]]; then
     log "Paket badvpn tidak tersedia. Build badvpn-udpgw dari source..."
-    DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake build-essential libssl-dev zlib1g-dev >/dev/null 2>&1 || true
+    apt_get_safe install -y git cmake build-essential libssl-dev zlib1g-dev >/dev/null 2>&1 || true
     (
       set -e
       cd /usr/local/src

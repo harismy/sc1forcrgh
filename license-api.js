@@ -355,7 +355,7 @@ app.get('/health', async (_req, res) => {
   return res.json({ ok: true, service: 'sc1forcr-license-api', db: DB_PATH });
 });
 
-app.get('/sc1forcr/installer.sh', async (req, res) => {
+async function sendInstallerScript(req, res) {
   try {
     const allowDomain = await isDomainAllowed(req);
     if (!allowDomain) {
@@ -399,6 +399,39 @@ set -euo pipefail
 
 TMP_SC="/tmp/setup-autoscript-compat.sh"
 
+wait_apt_locks() {
+  local waited=0
+  local max_wait=900
+  while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || pgrep -x 'apt|apt-get|dpkg|unattended-upgrade' >/dev/null 2>&1; do
+    if [ "$waited" -eq 0 ]; then
+      echo "Menunggu apt/dpkg lock selesai..."
+    fi
+    sleep 5
+    waited=$((waited + 5))
+    if [ "$waited" -ge "$max_wait" ]; then
+      echo "Timeout menunggu apt/dpkg lock."
+      return 1
+    fi
+  done
+}
+
+repair_dpkg_state() {
+  wait_apt_locks || return 1
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+  wait_apt_locks || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get install -f -y || true
+}
+
+ensure_curl_ready() {
+  command -v curl >/dev/null 2>&1 && return 0
+  repair_dpkg_state || true
+  wait_apt_locks || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+  wait_apt_locks || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates || true
+  command -v curl >/dev/null 2>&1
+}
+
 download_installer_payload() {
   local url="$1"
   local out="$2"
@@ -408,6 +441,8 @@ download_installer_payload() {
   curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "$url" -o "$out"
 }
 
+repair_dpkg_state || true
+ensure_curl_ready
 download_installer_payload "${sourceUrl}" "$TMP_SC"
 chmod +x "$TMP_SC"
 
@@ -418,7 +453,10 @@ bash "$TMP_SC"
   } catch (e) {
     return res.status(500).type('text/plain').send(`Internal error: ${e.message}`);
   }
-});
+}
+
+app.get('/i', sendInstallerScript);
+app.get('/sc1forcr/installer.sh', sendInstallerScript);
 
 app.get('/sc1forcr/payload/setup-autoscript-compat.sh', async (req, res) => {
   try {

@@ -3272,7 +3272,8 @@ async function buildInstallerQuickCopyText(options = {}) {
     ? `API_AUTH_TOKEN=${shellQuote(serverKey)} AUTH_TOKEN=${shellQuote(serverKey)} ZIVPN_HTTP_AUTH_TOKEN=${shellQuote(serverKey)} `
     : '';
   const curlArgs = `--connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 ${shellQuote(installerUrl)}`;
-  const cmd = `apt-get update -y && apt-get upgrade -y && apt-get install -y curl ca-certificates htop && TMP_INSTALLER=/tmp/sc1forcr-installer.sh && (curl -4fsSL ${curlArgs} -o "$TMP_INSTALLER" || curl -fsSL ${curlArgs} -o "$TMP_INSTALLER") && chmod +x "$TMP_INSTALLER" && ${keyEnv}bash "$TMP_INSTALLER"`;
+  const aptWait = `wait_apt(){ while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || pgrep -x apt apt-get dpkg unattended-upgrade >/dev/null 2>&1; do echo "Menunggu apt/dpkg lock selesai..."; sleep 5; done; }`;
+  const cmd = `${aptWait}; wait_apt; apt-get update -y && wait_apt && apt-get install -y curl ca-certificates htop && TMP_INSTALLER=/tmp/sc1forcr-installer.sh && (curl -4fsSL ${curlArgs} -o "$TMP_INSTALLER" || curl -fsSL ${curlArgs} -o "$TMP_INSTALLER") && chmod +x "$TMP_INSTALLER" && ${keyEnv}bash "$TMP_INSTALLER"`;
   const safeUrl = escapeHtml(installerUrl);
   const safeCmd = escapeHtml(cmd);
   return {

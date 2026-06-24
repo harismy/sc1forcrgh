@@ -101,6 +101,13 @@ const MIGRATION_ROLLBACK_TTL_MS = Math.max(
   5 * 60 * 1000,
   Number(process.env.MIGRATION_ROLLBACK_TTL_MS || (2 * 60 * 60 * 1000)) || (2 * 60 * 60 * 1000)
 );
+const SC_POST_REGISTRATION_UNLOCK_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.SC_POST_REGISTRATION_UNLOCK_TIMEOUT_MS || 10000) || 10000
+);
+const SC_POST_REGISTRATION_NOTIFY_UNLOCK = /^(1|true|yes|on)$/i.test(
+  String(process.env.SC_POST_REGISTRATION_NOTIFY_UNLOCK || '1').trim()
+);
 
 function dbRun(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -1721,12 +1728,12 @@ async function lockScAccessByHost(host, key, actorId, reason = 'admin_remove_sc_
   });
 }
 
-async function unlockScAccessByHost(host, key, actorId, reason = 'renew_after_expired') {
+async function unlockScAccessByHost(host, key, actorId, reason = 'renew_after_expired', timeoutMs = 120000) {
   return apiPost(host, key, '/internal/sc-access-lock', {
     blocked: false,
     reason: String(reason || 'renew_after_expired'),
     actor: String(actorId || '')
-  });
+  }, timeoutMs);
 }
 
 async function tryAutoUnlockAfterRenew(userId, host, reason = 'renew_after_expired') {
@@ -1737,11 +1744,48 @@ async function tryAutoUnlockAfterRenew(userId, host, reason = 'renew_after_expir
     return { attempted: false, ok: false, message: 'key server belum tersimpan' };
   }
   try {
-    const res = await unlockScAccessByHost(ip, key, userId, reason);
+    const res = await unlockScAccessByHost(ip, key, userId, reason, SC_POST_REGISTRATION_UNLOCK_TIMEOUT_MS);
     return { attempted: true, ok: res?.blocked === false, message: 'unlock berhasil' };
   } catch (err) {
     return { attempted: true, ok: false, message: parseErr(err) };
   }
+}
+
+function schedulePostRegistrationHostSync(options = {}) {
+  const userId = Number(options.userId || 0);
+  const chatId = Number(options.chatId || 0);
+  const ip = normalizeHost(options.ip || options.host || '');
+  const key = String(options.key || '').trim();
+  const meta = options.meta && typeof options.meta === 'object' ? { ...options.meta } : null;
+  const shouldUnlock = options.unlock === true;
+  const unlockReason = String(options.unlockReason || 'renew_after_expired').trim() || 'renew_after_expired';
+  if (!isIpv4(ip)) return;
+
+  setImmediate(() => {
+    (async () => {
+      if (shouldUnlock) {
+        const unlockResult = await tryAutoUnlockAfterRenew(userId, ip, unlockReason);
+        const unlockText = unlockResult.ok
+          ? 'berhasil'
+          : `gagal (${unlockResult.message || 'unknown'})`;
+        if (SC_POST_REGISTRATION_NOTIFY_UNLOCK && chatId) {
+          await bot.telegram.sendMessage(chatId, `Unlock menu VPS otomatis untuk ${ip}: ${unlockText}`).catch(() => {});
+        }
+        if (!unlockResult.ok) {
+          console.error(`[post-registration] unlock VPS ${ip} gagal: ${unlockResult.message || 'unknown'}`);
+        }
+      }
+
+      if (meta && key.length >= 8) {
+        const syncResult = await syncScRegistrationMetaToHost(ip, key, meta);
+        if (!syncResult.ok && !syncResult.skipped) {
+          console.error(`[post-registration] sync meta VPS ${ip} gagal: ${syncResult.message || 'unknown'}`);
+        }
+      }
+    })().catch((err) => {
+      console.error(`[post-registration] host task VPS ${ip} gagal: ${parseErr(err)}`);
+    });
+  });
 }
 
 async function notifyScExpiredOnHost(host, key, payload = {}) {
@@ -5396,10 +5440,6 @@ bot.on('text', async (ctx) => {
       const installerText = sendInstaller
         ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
         : null;
-      let unlockResult = { attempted: false, ok: false, message: '' };
-      if (result.reactivatedFromExpired) {
-        unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'unlimited_after_natural_expired');
-      }
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Registrasi SC Unlimited berhasil.\n` +
@@ -5409,15 +5449,23 @@ bot.on('text', async (ctx) => {
           `Expired: tanpa batas\n` +
           `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
           `${result.reactivatedFromExpired
-            ? `\nUnlock menu VPS otomatis: ${unlockResult.ok ? 'berhasil' : `gagal (${unlockResult.message || 'unknown'})`}`
+            ? '\nUnlock menu VPS otomatis: diproses background'
             : ''}`,
         mainMenu()
       );
-      await syncScRegistrationMetaToHost(ip, activeServerKey, {
-        status: 'active',
-        client_name: result.clientName || clientName,
-        expires_at: 0
-      }).catch(() => {});
+      schedulePostRegistrationHostSync({
+        userId: ctx.from.id,
+        chatId: ctx.chat.id,
+        ip,
+        key: activeServerKey,
+        unlock: result.reactivatedFromExpired,
+        unlockReason: 'unlimited_after_natural_expired',
+        meta: {
+          status: 'active',
+          client_name: result.clientName || clientName,
+          expires_at: 0
+        }
+      });
       if (installerText?.ok) {
         await ctx.reply(installerText.text, {
           parse_mode: installerText.parse_mode,
@@ -5551,10 +5599,6 @@ bot.on('text', async (ctx) => {
       const installerText = sendInstaller
         ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
         : null;
-      let unlockResult = { attempted: false, ok: false, message: '' };
-      if (result.reactivatedFromExpired) {
-        unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'renew_after_natural_expired');
-      }
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Registrasi/perpanjang SC berhasil.\n` +
@@ -5565,15 +5609,23 @@ bot.on('text', async (ctx) => {
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
           `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
           `${result.reactivatedFromExpired
-            ? `\nUnlock menu VPS otomatis: ${unlockResult.ok ? 'berhasil' : `gagal (${unlockResult.message || 'unknown'})`}`
+            ? '\nUnlock menu VPS otomatis: diproses background'
             : ''}`,
         mainMenu()
       );
-      await syncScRegistrationMetaToHost(ip, activeServerKey, {
-        status: 'active',
-        client_name: result.clientName || clientName,
-        expires_at: Number(result.expiresAt || 0)
-      }).catch(() => {});
+      schedulePostRegistrationHostSync({
+        userId: ctx.from.id,
+        chatId: ctx.chat.id,
+        ip,
+        key: activeServerKey,
+        unlock: result.reactivatedFromExpired,
+        unlockReason: 'renew_after_natural_expired',
+        meta: {
+          status: 'active',
+          client_name: result.clientName || clientName,
+          expires_at: Number(result.expiresAt || 0)
+        }
+      });
       if (installerText?.ok) {
         await ctx.reply(installerText.text, {
           parse_mode: installerText.parse_mode,
@@ -5651,16 +5703,7 @@ bot.on('text', async (ctx) => {
       }
       await syncKnownServerKeyAfterScRegistration(targetUserId, ip).catch(() => {});
       const hostKeyAdminUnl = await getServerKeyForHost(targetUserId, ip);
-      await syncScRegistrationMetaToHost(ip, hostKeyAdminUnl, {
-        status: 'active',
-        client_name: result.clientName || clientName,
-        expires_at: 0
-      }).catch(() => {});
-      let unlockResult = { attempted: false, ok: false, message: '' };
-      if (result.reactivatedFromExpired) {
-        unlockResult = await tryAutoUnlockAfterRenew(targetUserId, ip, 'admin_unlimited_after_natural_expired');
-      }
-      return ctx.reply(
+      const reply = await ctx.reply(
         `SC Unlimited manual berhasil didaftarkan.\n` +
           `Target user ID: ${targetUserId}\n` +
           `Nama Client: ${result.clientName || clientName}\n` +
@@ -5668,10 +5711,24 @@ bot.on('text', async (ctx) => {
           `Biaya: Rp 0 (manual admin)\n` +
           `Expired: tanpa batas` +
           `${result.reactivatedFromExpired
-            ? `\nUnlock menu VPS otomatis: ${unlockResult.ok ? 'berhasil' : `gagal (${unlockResult.message || 'unknown'})`}`
+            ? '\nUnlock menu VPS otomatis: diproses background'
             : ''}`,
         adminMenu()
       );
+      schedulePostRegistrationHostSync({
+        userId: targetUserId,
+        chatId: ctx.chat.id,
+        ip,
+        key: hostKeyAdminUnl,
+        unlock: result.reactivatedFromExpired,
+        unlockReason: 'admin_unlimited_after_natural_expired',
+        meta: {
+          status: 'active',
+          client_name: result.clientName || clientName,
+          expires_at: 0
+        }
+      });
+      return reply;
     }
 
     if (state.step === 'extend_sc_ip') {
@@ -5779,10 +5836,6 @@ bot.on('text', async (ctx) => {
 
       const saldoNow = await getSaldo(ctx.from.id);
       const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, serverKey);
-      let unlockResult = { attempted: false, ok: false, message: '' };
-      if (result.reactivatedFromExpired) {
-        unlockResult = await tryAutoUnlockAfterRenew(ctx.from.id, ip, 'renew_after_natural_expired');
-      }
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Perpanjang SC berhasil.\n` +
@@ -5793,15 +5846,23 @@ bot.on('text', async (ctx) => {
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
           `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
           `${result.reactivatedFromExpired
-            ? `\nUnlock menu VPS otomatis: ${unlockResult.ok ? 'berhasil' : `gagal (${unlockResult.message || 'unknown'})`}`
+            ? '\nUnlock menu VPS otomatis: diproses background'
             : ''}`,
         mainMenu()
       );
-      await syncScRegistrationMetaToHost(ip, activeServerKey, {
-        status: 'active',
-        client_name: result.clientName || clientName,
-        expires_at: Number(result.expiresAt || 0)
-      }).catch(() => {});
+      schedulePostRegistrationHostSync({
+        userId: ctx.from.id,
+        chatId: ctx.chat.id,
+        ip,
+        key: activeServerKey,
+        unlock: result.reactivatedFromExpired,
+        unlockReason: 'renew_after_natural_expired',
+        meta: {
+          status: 'active',
+          client_name: result.clientName || clientName,
+          expires_at: Number(result.expiresAt || 0)
+        }
+      });
       return;
     }
 

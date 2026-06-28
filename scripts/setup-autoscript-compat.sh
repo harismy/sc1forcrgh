@@ -14072,7 +14072,7 @@ EOT_RENEW
 }
 
 recover_expired_account() {
-  local expired_where rows choice selected type username old_exp old_status days ep resp code message to_date status
+  local expired_where rows choice selected matches match_count type username old_exp old_status days ep resp code message to_date status
   expired_where="$(account_expired_where_expr)"
   rows="$(sqlite3 -separator '|' "${DB_PATH}" "
     SELECT type, username, date_exp, status FROM (
@@ -14107,16 +14107,26 @@ recover_expired_account() {
     printf "%-4s %-9s %-24s %-20s %-10s\n" "${i}" "${row_type^^}" "${row_user}" "${row_exp:--}" "EXPIRED"
   done <<< "${rows}"
 
-  prompt_input choice "Pilih nomor akun [0=kembali]: " || return
+  prompt_input choice "Pilih nomor atau username akun [0=kembali]: " || return
   choice="$(echo "${choice}" | tr -d '[:space:]')"
   [[ "${choice}" == "0" ]] && return
-  if [[ ! "${choice}" =~ ^[0-9]+$ || "${choice}" -lt 1 ]]; then
-    echo "Nomor tidak valid."
-    return
+  if [[ "${choice}" =~ ^[0-9]+$ ]]; then
+    if [[ "${choice}" -lt 1 ]]; then
+      echo "Nomor tidak valid."
+      return
+    fi
+    selected="$(printf '%s\n' "${rows}" | sed -n "${choice}p")"
+  else
+    matches="$(printf '%s\n' "${rows}" | awk -F'|' -v q="${choice}" 'tolower($2)==tolower(q)')"
+    match_count="$(printf '%s\n' "${matches}" | awk 'NF {n++} END {print n+0}')"
+    if [[ "${match_count}" -gt 1 ]]; then
+      echo "Username '${choice}' ada di beberapa tipe akun. Pilih menggunakan nomor."
+      return
+    fi
+    selected="$(printf '%s\n' "${matches}" | head -n1)"
   fi
-  selected="$(printf '%s\n' "${rows}" | sed -n "${choice}p")"
   if [[ -z "${selected}" ]]; then
-    echo "Nomor tidak ditemukan."
+    echo "Nomor atau username tidak ditemukan."
     return
   fi
   IFS='|' read -r type username old_exp old_status <<< "${selected}"
@@ -14768,73 +14778,150 @@ Locked At    : ${locked_at:-"-"}
 EOT_QUOTA_INFO
 }
 
-akun_menu() {
-  local skip_post_pause
+account_menu_pause() {
+  echo
+  read -rp "Enter untuk kembali..." _ || true
+}
+
+account_lifetime_menu() {
+  local choice
   while true; do
     clear
-    draw_menu_panel "MENU AKUN" \
+    draw_menu_panel "BUAT & MASA AKTIF" \
       "1) Add Account" \
       "2) Trial Account (1 jam)" \
-      "3) Renew Account" \
-      "4) Edit Limit IP" \
-      "5) Hapus Account Aktif" \
-      "6) List Account" \
-      "7) Unlock Account" \
-      "8) Unlock Semua Akun" \
-      "9) Lihat Detail Account" \
-      "10) Edit Limit IP Semua Akun" \
-      "11) Tambah Masa Aktif Semua Akun" \
-      "12) Edit UUID Xray" \
-      "13) Ganti Password SSH" \
-      "14) Ganti Password Semua SSH" \
-      "15) Edit Quota" \
-      "16) Edit Quota Semua Akun" \
-      "17) Info Quota Akun" \
-      "18) Hapus Account Expired" \
-      "19) Recovery Account Expired" \
+      "3) Renew Account Aktif" \
+      "4) Recovery Account Expired" \
+      "5) Tambah Masa Aktif Semua Akun" \
       "0) Kembali"
-    echo
-    if ! prompt_input am "Pilih menu [0-19]: "; then
-      return
-    fi
+    prompt_input choice "Pilih menu [0-5]: " || return
     clear
-    skip_post_pause=0
-    case "${am}" in
+    case "${choice}" in
       1) create_account || true ;;
       2) create_trial_account || true ;;
       3) renew_account || true ;;
-      4) edit_limit_ip_account || true ;;
-      5) delete_account "nonexpired" || true ;;
-      6) list_accounts || true ;;
-      7)
-        unlock_account || true
-        skip_post_pause=1
-        ;;
-      8)
-        unlock_all_accounts || true
-        skip_post_pause=1
-        ;;
-      9) show_account_detail || true ;;
-      10) edit_limit_ip_all_accounts || true ;;
-      11) extend_expired_all_accounts || true ;;
-      12) edit_uuid_xray_account || true ;;
-      13) change_ssh_password_account || true ;;
-      14) change_ssh_password_all_accounts || true ;;
-      15) edit_quota_account || true ;;
-      16) edit_quota_all_accounts || true ;;
-      17) show_account_quota_info || true ;;
-      18) delete_account "expired" || true ;;
-      19) recover_expired_account || true ;;
+      4) recover_expired_account || true ;;
+      5) extend_expired_all_accounts || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
-    if [[ "${skip_post_pause}" == "1" ]]; then
-      echo
-      read -rp "Enter untuk kembali ke menu sebelumnya..." _ || true
-      continue
-    fi
-    echo
-    read -rp "Enter untuk lanjut..." _ || true
+    account_menu_pause
+  done
+}
+
+account_edit_menu() {
+  local choice
+  while true; do
+    clear
+    draw_menu_panel "EDIT ACCOUNT" \
+      "1) Edit Limit IP" \
+      "2) Edit Limit IP Semua Akun" \
+      "3) Edit UUID Xray" \
+      "4) Ganti Password SSH" \
+      "5) Ganti Password Semua SSH" \
+      "6) Edit Quota" \
+      "7) Edit Quota Semua Akun" \
+      "0) Kembali"
+    prompt_input choice "Pilih menu [0-7]: " || return
+    clear
+    case "${choice}" in
+      1) edit_limit_ip_account || true ;;
+      2) edit_limit_ip_all_accounts || true ;;
+      3) edit_uuid_xray_account || true ;;
+      4) change_ssh_password_account || true ;;
+      5) change_ssh_password_all_accounts || true ;;
+      6) edit_quota_account || true ;;
+      7) edit_quota_all_accounts || true ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    account_menu_pause
+  done
+}
+
+account_delete_menu() {
+  local choice
+  while true; do
+    clear
+    draw_menu_panel "HAPUS ACCOUNT" \
+      "1) Hapus Account Aktif" \
+      "2) Hapus Account Expired" \
+      "0) Kembali"
+    prompt_input choice "Pilih menu [0-2]: " || return
+    clear
+    case "${choice}" in
+      1) delete_account "nonexpired" || true ;;
+      2) delete_account "expired" || true ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    account_menu_pause
+  done
+}
+
+account_info_menu() {
+  local choice
+  while true; do
+    clear
+    draw_menu_panel "INFORMASI ACCOUNT" \
+      "1) List Account" \
+      "2) Lihat Detail Account" \
+      "3) Info Quota Akun" \
+      "0) Kembali"
+    prompt_input choice "Pilih menu [0-3]: " || return
+    clear
+    case "${choice}" in
+      1) list_accounts || true ;;
+      2) show_account_detail || true ;;
+      3) show_account_quota_info || true ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    account_menu_pause
+  done
+}
+
+account_lock_menu() {
+  local choice
+  while true; do
+    clear
+    draw_menu_panel "LOCK & UNLOCK" \
+      "1) Unlock Account" \
+      "2) Unlock Semua Akun" \
+      "0) Kembali"
+    prompt_input choice "Pilih menu [0-2]: " || return
+    clear
+    case "${choice}" in
+      1) unlock_account || true ;;
+      2) unlock_all_accounts || true ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    account_menu_pause
+  done
+}
+
+akun_menu() {
+  local choice
+  while true; do
+    clear
+    draw_menu_panel "MENU AKUN" \
+      "1) Buat & Masa Aktif" \
+      "2) Edit Account" \
+      "3) Hapus Account" \
+      "4) Informasi Account" \
+      "5) Lock & Unlock" \
+      "0) Kembali"
+    prompt_input choice "Pilih menu [0-5]: " || return
+    case "${choice}" in
+      1) account_lifetime_menu ;;
+      2) account_edit_menu ;;
+      3) account_delete_menu ;;
+      4) account_info_menu ;;
+      5) account_lock_menu ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid."; account_menu_pause ;;
+    esac
   done
 }
 

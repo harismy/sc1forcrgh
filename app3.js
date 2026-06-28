@@ -3323,9 +3323,32 @@ async function buildInstallerQuickCopyText(options = {}) {
   const installerUrl = `https://${domain}/i`;
   const serverKey = String(options?.serverKey || '').trim();
   const keyEnv = serverKey.length >= 8
-    ? `API_AUTH_TOKEN=${shellQuote(serverKey)} AUTH_TOKEN=${shellQuote(serverKey)} ZIVPN_HTTP_AUTH_TOKEN=${shellQuote(serverKey)} `
+    ? `AUTH_TOKEN=${shellQuote(serverKey)} `
     : '';
-  const cmd = `u=${shellQuote(installerUrl)}; (curl -4fsSL "$u" || curl -fsSL "$u" || wget -qO- "$u") | ${keyEnv}bash`;
+  const cmd = [
+    'ensure_dl(){',
+    'if [ -s /etc/ssl/certs/ca-certificates.crt ] && { command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; }; then return 0; fi;',
+    'command -v apt-get >/dev/null 2>&1 || { echo "Installer membutuhkan apt-get (Debian/Ubuntu)."; return 1; };',
+    'export DEBIAN_FRONTEND=noninteractive;',
+    'n=0;',
+    'while [ "$n" -lt 3 ]; do',
+    'dpkg --configure -a >/dev/null 2>&1 || true;',
+    'if apt-get -o DPkg::Lock::Timeout=900 update -y && apt-get -o DPkg::Lock::Timeout=900 install -y ca-certificates curl; then return 0; fi;',
+    'n=$((n+1)); echo "Mengulang persiapan downloader ($n/3)..."; sleep 5;',
+    'done;',
+    'echo "Gagal memasang curl. Periksa repository dan koneksi VPS."; return 1;',
+    '};',
+    'ensure_dl || exit 1;',
+    `u=${shellQuote(installerUrl)};`,
+    'f=/tmp/sc1forcr-bootstrap.sh;',
+    'rm -f "$f";',
+    'if command -v curl >/dev/null 2>&1; then',
+    'curl -4fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "$u" -o "$f" || curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "$u" -o "$f";',
+    'else wget -qO "$f" "$u"; fi;',
+    '[ -s "$f" ] && head -n 1 "$f" | grep -q "^#!" || { echo "Bootstrap installer gagal diunduh."; rm -f "$f"; exit 1; };',
+    `${keyEnv}bash "$f";`,
+    'r=$?; rm -f "$f"; exit "$r"'
+  ].join(' ');
   const safeCmd = escapeHtml(cmd);
   return {
     ok: true,

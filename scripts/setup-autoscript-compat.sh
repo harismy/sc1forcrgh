@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
-# Target OS: Debian 10+ / Ubuntu 20+
+# Target OS: Debian 10+ / Ubuntu 22+ (Ubuntu 20 tetap kompatibel)
 #
 # Fitur:
 # - SSH
@@ -261,11 +261,15 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 if [[ -z "${DOMAIN}" ]]; then
-  read -r -p "Masukkan domain server: " DOMAIN
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    read -r -p "Masukkan domain server: " DOMAIN </dev/tty || true
+  else
+    read -r -p "Masukkan domain server: " DOMAIN || true
+  fi
 fi
 
 if [[ -z "${DOMAIN}" ]]; then
-  echo "DOMAIN wajib diisi."
+  echo "DOMAIN wajib diisi. Jalankan installer dari terminal interaktif atau isi env DOMAIN."
   exit 1
 fi
 
@@ -1020,13 +1024,26 @@ install_optional_pkg_if_available() {
   return 1
 }
 
+package_manager_busy() {
+  local proc comm
+  if command -v fuser >/dev/null 2>&1 && \
+     fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
+    return 0
+  fi
+  for proc in /proc/[0-9]*/comm; do
+    [[ -r "${proc}" ]] || continue
+    IFS= read -r comm < "${proc}" || continue
+    case "${comm}" in
+      apt|apt-get|dpkg|unattended-upgrade|packagekitd) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 wait_for_apt_locks() {
   local waited=0 max_wait=900
   while true; do
-    if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-       fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
-       fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
-       fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
+    if package_manager_busy; then
       if (( waited == 0 )); then
         log "Menunggu lock apt/dpkg dilepas (apt/unattended-upgrades sedang jalan)..."
       fi

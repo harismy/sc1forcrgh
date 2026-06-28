@@ -399,10 +399,31 @@ set -euo pipefail
 
 TMP_SC="/tmp/setup-autoscript-compat.sh"
 
+cleanup() {
+  rm -f "$TMP_SC"
+}
+trap cleanup EXIT
+
+package_manager_busy() {
+  local proc comm
+  if command -v fuser >/dev/null 2>&1 && \
+     fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
+    return 0
+  fi
+  for proc in /proc/[0-9]*/comm; do
+    [ -r "$proc" ] || continue
+    IFS= read -r comm < "$proc" || continue
+    case "$comm" in
+      apt|apt-get|dpkg|unattended-upgrade|packagekitd) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 wait_apt_locks() {
   local waited=0
   local max_wait=900
-  while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1 || pgrep -x 'apt|apt-get|dpkg|unattended-upgrade' >/dev/null 2>&1; do
+  while package_manager_busy; do
     if [ "$waited" -eq 0 ]; then
       echo "Menunggu apt/dpkg lock selesai..."
     fi
@@ -443,11 +464,20 @@ download_installer_payload() {
 
 repair_dpkg_state || true
 ensure_curl_ready
+echo "Mengunduh installer utama..."
 download_installer_payload "${sourceUrl}" "$TMP_SC"
+if ! head -n 1 "$TMP_SC" | grep -q '^#!'; then
+  echo "Installer utama tidak valid atau gagal diunduh."
+  exit 1
+fi
 chmod +x "$TMP_SC"
 
 ${envLines.map((v) => `${v} \\`).join('\n')}
-bash "$TMP_SC"
+if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  bash "$TMP_SC" </dev/tty
+else
+  bash "$TMP_SC"
+fi
 `;
     return res.type('text/plain').send(script);
   } catch (e) {

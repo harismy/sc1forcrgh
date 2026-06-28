@@ -88,6 +88,7 @@ set -euo pipefail
 #   RESOURCE_TARGET_USAGE_PERCENT=85             (opsional, target maksimum RAM/CPU sebelum dianggap penuh)
 #   RESOURCE_AUTOTUNE_INTERVAL_MINUTES=5         (opsional, interval analyzer kapasitas)
 #   RESOURCE_CAPACITY_STATE_FILE=/var/lib/sc-1forcr/capacity.env
+#   EXPIRED_ACCOUNT_RETENTION_DAYS=30            (akun expired dihapus permanen setelah masa recovery)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=3             (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
 #   IPLIMIT_AUTO_LOCK_ENABLE=1                   (opsional, 1=auto lock aktif, 0=monitor only)
@@ -201,6 +202,7 @@ RESOURCE_AUTOTUNE_ENABLE="${RESOURCE_AUTOTUNE_ENABLE:-1}"
 RESOURCE_TARGET_USAGE_PERCENT="${RESOURCE_TARGET_USAGE_PERCENT:-85}"
 RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}"
 RESOURCE_CAPACITY_STATE_FILE="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
+EXPIRED_ACCOUNT_RETENTION_DAYS="${EXPIRED_ACCOUNT_RETENTION_DAYS:-30}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
@@ -1484,6 +1486,11 @@ CREATE TABLE IF NOT EXISTS account_trojans (
   owner_telegram_chat_id INTEGER
 );
 
+CREATE INDEX IF NOT EXISTS idx_account_sshs_status_exp ON account_sshs(status, date_exp);
+CREATE INDEX IF NOT EXISTS idx_account_vmesses_status_exp ON account_vmesses(status, date_exp);
+CREATE INDEX IF NOT EXISTS idx_account_vlesses_status_exp ON account_vlesses(status, date_exp);
+CREATE INDEX IF NOT EXISTS idx_account_trojans_status_exp ON account_trojans(status, date_exp);
+
 CREATE TABLE IF NOT EXISTS temp_ip_locks (
   account_type TEXT NOT NULL,
   username TEXT NOT NULL,
@@ -2765,6 +2772,7 @@ RESOURCE_AUTOTUNE_ENABLE=${RESOURCE_AUTOTUNE_ENABLE}
 RESOURCE_TARGET_USAGE_PERCENT=${RESOURCE_TARGET_USAGE_PERCENT}
 RESOURCE_AUTOTUNE_INTERVAL_MINUTES=${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}
 RESOURCE_CAPACITY_STATE_FILE=${RESOURCE_CAPACITY_STATE_FILE}
+EXPIRED_ACCOUNT_RETENTION_DAYS=${EXPIRED_ACCOUNT_RETENTION_DAYS}
 HAPROXY_TCPLOG_ENABLE=${HAPROXY_TCPLOG_ENABLE}
 HAPROXY_SERVICE_LIMIT_NOFILE=${HAPROXY_SERVICE_LIMIT_NOFILE}
 HAPROXY_MAXCONN=${HAPROXY_MAXCONN}
@@ -2887,6 +2895,11 @@ const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const LICENSE_ENFORCE = String(process.env.LICENSE_ENFORCE || '1').trim().toLowerCase();
 const QUOTA_BYTES_PER_GB = 1024 * 1024 * 1024;
 const RESOURCE_CAPACITY_STATE_FILE = String(process.env.RESOURCE_CAPACITY_STATE_FILE || '/var/lib/sc-1forcr/capacity.env').trim();
+const EXPIRED_ACCOUNT_RETENTION_DAYS = Math.min(
+  3650,
+  Math.max(1, Number(process.env.EXPIRED_ACCOUNT_RETENTION_DAYS || 30) || 30)
+);
+const EXPIRED_ACCOUNT_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 const db = new sqlite3.Database(DB_PATH);
 let licenseApiStopped = false;
@@ -3212,6 +3225,13 @@ async function ensureApiRuntimeTables() {
     created_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`).catch(() => {});
+  const accountIndexes = [
+    'CREATE INDEX IF NOT EXISTS idx_account_sshs_status_exp ON account_sshs(status, date_exp)',
+    'CREATE INDEX IF NOT EXISTS idx_account_vmesses_status_exp ON account_vmesses(status, date_exp)',
+    'CREATE INDEX IF NOT EXISTS idx_account_vlesses_status_exp ON account_vlesses(status, date_exp)',
+    'CREATE INDEX IF NOT EXISTS idx_account_trojans_status_exp ON account_trojans(status, date_exp)'
+  ];
+  for (const sql of accountIndexes) await run(sql).catch(() => {});
   await cleanupZivpnLiveSessions().catch(() => {});
 }
 function getOwnerInfo(req, body = {}) {
@@ -4530,6 +4550,16 @@ async function cleanupDeletedAccountState(accountType, username) {
   }
 }
 
+async function cleanupPurgedAccountState(accountType, username) {
+  const t = String(accountType || '').trim().toLowerCase();
+  const u = String(username || '').trim();
+  if (!t || !u) return;
+  await cleanupDeletedAccountState(t, u);
+  await run("DELETE FROM account_quota_usage WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
+  await run("DELETE FROM account_quota_session_counters WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
+  await run("DELETE FROM account_quota_locks WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
+}
+
 async function cleanupExpiredTrialAccounts() {
   let deletedSsh = 0;
   let deletedXray = 0;
@@ -4548,7 +4578,7 @@ async function cleanupExpiredTrialAccounts() {
     if (!u || !isExpiredDateValue(exp)) continue;
     disableSshSystemAccess(u, pass);
     await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
-    await cleanupDeletedAccountState('ssh', u);
+    await cleanupPurgedAccountState('ssh', u);
     deletedSsh += 1;
   }
 
@@ -4569,7 +4599,7 @@ async function cleanupExpiredTrialAccounts() {
       const exp = String(row?.date_exp || '').trim();
       if (!u || !isExpiredDateValue(exp)) continue;
       await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
-      await cleanupDeletedAccountState(item.type, u);
+      await cleanupPurgedAccountState(item.type, u);
       deletedXray += 1;
       xrayChanged = true;
     }
@@ -4644,6 +4674,7 @@ async function cleanupExpiredXrayAccounts() {
         limitip: String(row?.limitip ?? '0')
       });
       await run(`UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
+      await cleanupDeletedAccountState(item.type, u);
       changed = true;
     }
   }
@@ -4652,6 +4683,63 @@ async function cleanupExpiredXrayAccounts() {
   await notifyExpiredAccountsBatchEvent('trojan', expiredBatch.trojan);
   if (changed) {
     await renderAndReloadXray().catch(() => {});
+  }
+}
+
+let staleExpiredCleanupRunning = false;
+async function cleanupStaleExpiredAccounts() {
+  if (staleExpiredCleanupRunning) return { skipped: true };
+  staleExpiredCleanupRunning = true;
+  const cutoffMs = Date.now() - (EXPIRED_ACCOUNT_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  const targets = [
+    { table: 'account_sshs', type: 'ssh', secret: 'password' },
+    { table: 'account_vmesses', type: 'vmess', secret: 'uuid' },
+    { table: 'account_vlesses', type: 'vless', secret: 'uuid' },
+    { table: 'account_trojans', type: 'trojan', secret: 'password' }
+  ];
+  const removed = { ssh: 0, vmess: 0, vless: 0, trojan: 0 };
+  let xrayChanged = false;
+
+  try {
+    for (const item of targets) {
+      const rows = await all(
+        `SELECT username, ${item.secret} AS secret, date_exp FROM ${item.table} ` +
+        "WHERE TRIM(COALESCE(date_exp,'')) <> '' " +
+        "AND status IN ('EXPIRED','RECOVERY','KADALUARSA')"
+      ).catch(() => []);
+      for (const row of rows) {
+        const username = String(row?.username || '').trim();
+        const dateExp = String(row?.date_exp || '').trim();
+        const expDate = parseDateExpToDate(dateExp);
+        if (!username || !expDate || expDate.getTime() > cutoffMs) continue;
+
+        // Cocokkan date_exp agar akun yang baru saja diperpanjang tidak ikut terhapus.
+        const deleted = await run(
+          `DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?) AND date_exp=?`,
+          [username, dateExp]
+        ).catch(() => null);
+        if (Number(deleted?.changes || 0) < 1) continue;
+
+        if (item.type === 'ssh') {
+          disableSshSystemAccess(username, String(row?.secret || ''));
+        } else {
+          xrayChanged = true;
+        }
+        await cleanupPurgedAccountState(item.type, username);
+        removed[item.type] += 1;
+      }
+    }
+    if (xrayChanged) await renderAndReloadXray().catch(() => {});
+    const total = Object.values(removed).reduce((sum, value) => sum + value, 0);
+    if (total > 0) {
+      console.log(
+        `[expired-retention] purged=${total} retention_days=${EXPIRED_ACCOUNT_RETENTION_DAYS} ` +
+        `ssh=${removed.ssh} vmess=${removed.vmess} vless=${removed.vless} trojan=${removed.trojan}`
+      );
+    }
+    return { total, removed };
+  } finally {
+    staleExpiredCleanupRunning = false;
   }
 }
 
@@ -4939,6 +5027,7 @@ app.delete('/vps/deletesshvpn/:username', async (req, res) => {
     ).catch(() => null);
     deleteLinuxUser(username);
     await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
+    await cleanupPurgedAccountState('ssh', username);
     syncZivpnUser(username, false);
     syncUdpcustomUser(String(row?.password || ''), false);
     syncUdpcustomUser(username, false);
@@ -5006,6 +5095,7 @@ async function renewSsh(req, res) {
         limitip: String(nextLimitIp),
         created: true,
         recovered: true,
+        status: 'AKTIF',
         time: nowTime()
       });
     }
@@ -5025,6 +5115,7 @@ async function renewSsh(req, res) {
     );
     if (quotaUnlock.ok) {
       await clearQuotaLock('ssh', username);
+      await releaseTempLockNow('ssh', username).catch(() => {});
       syncZivpnUser(username, true);
     } else {
       lockLinuxUser(username);
@@ -5039,6 +5130,7 @@ async function renewSsh(req, res) {
       quota: String(nextQuota),
       quota_used_bytes: String(quotaUnlock.usedBytes || 0),
       quota_unlocked: quotaUnlock.ok,
+      status: nextStatus,
       limitip: String(nextLimitIp),
       created: false,
       time: nowTime()
@@ -5295,6 +5387,7 @@ async function renewXray(table, username, exp, req) {
       quota: String(nextQuota),
       limitip: String(nextLimitIp),
       created: true,
+      status: 'AKTIF',
       time: nowTime()
     };
   }
@@ -5311,7 +5404,10 @@ async function renewXray(table, username, exp, req) {
     `UPDATE ${table} SET ${secretCol}=?, date_exp=?, quota=?, limitip=?, status=? WHERE LOWER(username)=LOWER(?)`,
     [secret, expDate, nextQuota, nextLimitIp, nextStatus, username]
   );
-  if (quotaUnlock.ok) await clearQuotaLock(meta.protocol, username);
+  if (quotaUnlock.ok) {
+    await clearQuotaLock(meta.protocol, username);
+    await releaseTempLockNow(meta.protocol, username).catch(() => {});
+  }
   await renderAndReloadXray();
   return {
     username,
@@ -5321,6 +5417,7 @@ async function renewXray(table, username, exp, req) {
     quota: String(nextQuota),
     quota_used_bytes: String(quotaUnlock.usedBytes || 0),
     quota_unlocked: quotaUnlock.ok,
+    status: nextStatus,
     limitip: String(nextLimitIp),
     created: false,
     time: nowTime()
@@ -5346,6 +5443,7 @@ async function delXray(table, username, req = null) {
     [username]
   ).catch(() => null);
   await run(`DELETE FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]);
+  await cleanupPurgedAccountState(meta.protocol, username);
   await renderAndReloadXray();
   if (row) {
     const location = await getVpsLocationInfo().catch(() => ({ city: '-', isp: '-' }));
@@ -5668,6 +5766,8 @@ app.listen(PORT, '127.0.0.1', () => {
   ensureApiRuntimeTables()
     .then(() => cleanupExpiredTrialAccounts())
     .then(() => cleanupExpiredSshAccounts())
+    .then(() => cleanupExpiredXrayAccounts())
+    .then(() => cleanupStaleExpiredAccounts())
     .catch(() => {});
   setInterval(() => { cleanupZivpnLiveSessions().catch(() => {}); }, 60 * 1000);
   setInterval(() => { cleanupExpiredTrialAccounts().catch(() => {}); }, 60 * 1000);
@@ -5675,8 +5775,11 @@ app.listen(PORT, '127.0.0.1', () => {
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
   syncXrayFromDbIfChanged(true).catch(() => {});
-  cleanupExpiredXrayAccounts().catch(() => {});
   setInterval(() => { cleanupExpiredXrayAccounts().catch(() => {}); }, 60 * 1000);
+  const expiredPurgeTimer = setInterval(() => {
+    cleanupStaleExpiredAccounts().catch(() => {});
+  }, EXPIRED_ACCOUNT_PURGE_INTERVAL_MS);
+  if (typeof expiredPurgeTimer.unref === 'function') expiredPurgeTimer.unref();
   console.log(`sc-1forcr-api on 127.0.0.1:${PORT}`);
 });
 EOF
@@ -11753,6 +11856,7 @@ RESOURCE_AUTOTUNE_ENABLE=${RESOURCE_AUTOTUNE_ENABLE}
 RESOURCE_TARGET_USAGE_PERCENT=${RESOURCE_TARGET_USAGE_PERCENT}
 RESOURCE_AUTOTUNE_INTERVAL_MINUTES=${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}
 RESOURCE_CAPACITY_STATE_FILE=${RESOURCE_CAPACITY_STATE_FILE}
+EXPIRED_ACCOUNT_RETENTION_DAYS=${EXPIRED_ACCOUNT_RETENTION_DAYS}
 AUTO_PULL_UPDATE_ENABLE=${AUTO_PULL_UPDATE_ENABLE}
 AUTO_PULL_UPDATE_INTERVAL_MINUTES=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}
@@ -13774,24 +13878,31 @@ account_active_where_expr() {
   echo "UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND (TRIM(COALESCE(date_exp,''))='' OR (${exp_expr}) > datetime('now','localtime'))"
 }
 
+account_nonexpired_where_expr() {
+  local exp_expr
+  exp_expr="$(account_expire_datetime_expr)"
+  echo "UPPER(TRIM(COALESCE(status,''))) NOT IN ('EXPIRED','RECOVERY','KADALUARSA') AND (TRIM(COALESCE(date_exp,''))='' OR (${exp_expr}) > datetime('now','localtime'))"
+}
+
 account_expired_where_expr() {
   local exp_expr
   exp_expr="$(account_expire_datetime_expr)"
-  echo "UPPER(TRIM(COALESCE(status,'')))='EXPIRED' OR (TRIM(COALESCE(date_exp,''))<>'' AND (${exp_expr}) <= datetime('now','localtime'))"
+  echo "UPPER(TRIM(COALESCE(status,''))) IN ('EXPIRED','RECOVERY','KADALUARSA') OR (TRIM(COALESCE(date_exp,''))<>'' AND (${exp_expr}) <= datetime('now','localtime'))"
 }
 
 account_effective_status_sql() {
   local exp_expr
   exp_expr="$(account_expire_datetime_expr)"
-  echo "CASE WHEN UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND TRIM(COALESCE(date_exp,''))<>'' AND (${exp_expr}) <= datetime('now','localtime') THEN 'EXPIRED' ELSE UPPER(TRIM(COALESCE(status,''))) END"
+  echo "CASE WHEN UPPER(TRIM(COALESCE(status,''))) IN ('EXPIRED','RECOVERY','KADALUARSA') THEN 'EXPIRED' WHEN UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND TRIM(COALESCE(date_exp,''))<>'' AND (${exp_expr}) <= datetime('now','localtime') THEN 'EXPIRED' ELSE UPPER(TRIM(COALESCE(status,''))) END"
 }
 
 print_account_picker_table() {
-  local type="$1" lock_only="${2:-0}" mode="${3:-all}" table where rows active_where expired_where rem_expr
+  local type="$1" lock_only="${2:-0}" mode="${3:-all}" table where rows active_where nonexpired_where expired_where rem_expr
   table="$(account_table_by_type "${type}")"
   [[ -z "${table}" ]] && return 1
   where=""
   active_where="$(account_active_where_expr)"
+  nonexpired_where="$(account_nonexpired_where_expr)"
   expired_where="$(account_expired_where_expr)"
   if [[ "${lock_only}" == "1" ]]; then
     where="WHERE LOWER(username) IN (
@@ -13802,6 +13913,7 @@ print_account_picker_table() {
   else
     case "${mode}" in
       active) where="WHERE ${active_where}" ;;
+      nonexpired) where="WHERE ${nonexpired_where}" ;;
       expired) where="WHERE ${expired_where}" ;;
       *) where="" ;;
     esac
@@ -13819,7 +13931,7 @@ print_account_picker_table() {
     [[ -z "${u}" ]] && continue
     i=$((i + 1))
     sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
-    if [[ "${mode}" == "expired" && "${st}" == "AKTIF" ]]; then
+    if [[ "${mode}" == "expired" && "${st}" != "EXPIRED" ]]; then
       st="EXPIRED"
     fi
     printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa_human}" "${lim:-0}"
@@ -13828,14 +13940,16 @@ print_account_picker_table() {
 }
 
 pick_existing_username() {
-  local type="$1" mode="${2:-all}" table rows input username where active_where expired_where
+  local type="$1" mode="${2:-all}" table rows input username where active_where nonexpired_where expired_where
   table="$(account_table_by_type "${type}")"
   [[ -z "${table}" ]] && return 1
 
   active_where="$(account_active_where_expr)"
+  nonexpired_where="$(account_nonexpired_where_expr)"
   expired_where="$(account_expired_where_expr)"
   case "${mode}" in
     active) where="WHERE ${active_where}" ;;
+    nonexpired) where="WHERE ${nonexpired_where}" ;;
     expired) where="WHERE ${expired_where}" ;;
     *) where="" ;;
   esac
@@ -13928,8 +14042,8 @@ renew_account() {
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_renew "$type")"
   [[ -z "$ep" ]] && { echo "Endpoint renew tidak ada."; return; }
-  echo "RENEW AKUN ${type^^}"
-  username="$(pick_existing_username "$type")" || return
+  echo "RENEW AKUN ${type^^} - AKTIF/NON-EXPIRED"
+  username="$(pick_existing_username "$type" "nonexpired")" || return
   printf "%-12s : %s\n" "Username" "${username}"
   prompt_input exp "Tambah expired (hari) [30]: " || return
   exp="${exp:-30}"
@@ -13955,6 +14069,90 @@ Quota        : ${quota}
 IP Limit     : ${limitip}
 EOT_RENEW
   telegram_notify_action "RENEW" "${type}" "${username}"
+}
+
+recover_expired_account() {
+  local expired_where rows choice selected type username old_exp old_status days ep resp code message to_date status
+  expired_where="$(account_expired_where_expr)"
+  rows="$(sqlite3 -separator '|' "${DB_PATH}" "
+    SELECT type, username, date_exp, status FROM (
+      SELECT 'ssh' AS type, username, date_exp, UPPER(TRIM(COALESCE(status,''))) AS status
+        FROM account_sshs WHERE ${expired_where}
+      UNION ALL
+      SELECT 'vmess', username, date_exp, UPPER(TRIM(COALESCE(status,'')))
+        FROM account_vmesses WHERE ${expired_where}
+      UNION ALL
+      SELECT 'vless', username, date_exp, UPPER(TRIM(COALESCE(status,'')))
+        FROM account_vlesses WHERE ${expired_where}
+      UNION ALL
+      SELECT 'trojan', username, date_exp, UPPER(TRIM(COALESCE(status,'')))
+        FROM account_trojans WHERE ${expired_where}
+    ) ORDER BY date_exp, type, username;
+  " 2>/dev/null || true)"
+
+  if [[ -z "${rows}" ]]; then
+    echo "Tidak ada akun expired yang masih dalam masa recovery."
+    echo "Akun expired lebih dari ${EXPIRED_ACCOUNT_RETENTION_DAYS:-30} hari dihapus otomatis."
+    return
+  fi
+
+  echo "RECOVERY AKUN EXPIRED"
+  echo "Masa recovery: ${EXPIRED_ACCOUNT_RETENTION_DAYS:-30} hari sejak tanggal expired."
+  printf "%-4s %-9s %-24s %-20s %-10s\n" "NO" "TYPE" "USERNAME" "EXPIRED" "STATUS"
+  printf "%-4s %-9s %-24s %-20s %-10s\n" "----" "---------" "------------------------" "--------------------" "----------"
+  local i=0 row_type row_user row_exp row_status
+  while IFS='|' read -r row_type row_user row_exp row_status; do
+    [[ -z "${row_user}" ]] && continue
+    i=$((i + 1))
+    printf "%-4s %-9s %-24s %-20s %-10s\n" "${i}" "${row_type^^}" "${row_user}" "${row_exp:--}" "EXPIRED"
+  done <<< "${rows}"
+
+  prompt_input choice "Pilih nomor akun [0=kembali]: " || return
+  choice="$(echo "${choice}" | tr -d '[:space:]')"
+  [[ "${choice}" == "0" ]] && return
+  if [[ ! "${choice}" =~ ^[0-9]+$ || "${choice}" -lt 1 ]]; then
+    echo "Nomor tidak valid."
+    return
+  fi
+  selected="$(printf '%s\n' "${rows}" | sed -n "${choice}p")"
+  if [[ -z "${selected}" ]]; then
+    echo "Nomor tidak ditemukan."
+    return
+  fi
+  IFS='|' read -r type username old_exp old_status <<< "${selected}"
+  ep="$(endpoint_renew "${type}")"
+  [[ -z "${ep}" ]] && { echo "Endpoint recovery tidak tersedia."; return; }
+
+  prompt_input days "Tambah masa aktif dari sekarang (hari) [30]: " || return
+  days="${days:-30}"
+  if [[ ! "${days}" =~ ^[0-9]+$ || "${days}" -lt 1 || "${days}" -gt 3650 ]]; then
+    echo "Jumlah hari tidak valid. Gunakan angka 1-3650."
+    return
+  fi
+
+  resp="$(api_call "POST" "${ep}/${username}/${days}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal recovery akun ${type^^}: ${message}"
+    return
+  fi
+  to_date="$(echo "${resp}" | jq -r '.data.to // .data.exp // "-"' 2>/dev/null || echo "-")"
+  status="$(echo "${resp}" | jq -r '.data.status // "AKTIF"' 2>/dev/null || echo "AKTIF")"
+  cat <<EOT_RECOVERY
+=============================
+ RECOVERY ${type^^} BERHASIL
+=============================
+Username     : ${username}
+Expired Lama : ${old_exp:--}
+Expired Baru : ${to_date}
+Tambah Hari  : ${days}
+Status       : ${status}
+EOT_RECOVERY
+  if [[ "${status}" == "LOCK_QUOTA" ]]; then
+    echo "Catatan: masa aktif pulih, tetapi akun tetap lock karena quota habis."
+  fi
+  telegram_notify_action "RECOVERY" "${type}" "${username}"
 }
 
 sync_xray_from_summary_api() {
@@ -14161,14 +14359,21 @@ edit_uuid_xray_account() {
 }
 
 delete_account() {
-  local type ep username resp code message
+  local mode="${1:-nonexpired}" type ep username resp code message label confirm
+  case "${mode}" in
+    expired) label="EXPIRED" ;;
+    nonexpired) label="AKTIF/NON-EXPIRED" ;;
+    *) echo "Mode hapus tidak valid."; return ;;
+  esac
   type="$(pick_type)"
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_delete "$type")"
   [[ -z "$ep" ]] && { echo "Endpoint delete tidak ada."; return; }
-  echo "DELETE AKUN ${type^^}"
-  username="$(pick_existing_username "$type")" || return
+  echo "DELETE AKUN ${type^^} - ${label}"
+  username="$(pick_existing_username "$type" "$mode")" || return
   printf "%-12s : %s\n" "Username" "${username}"
+  prompt_input confirm "Ketik HAPUS untuk konfirmasi: " || return
+  [[ "${confirm^^}" != "HAPUS" ]] && { echo "Dibatalkan."; return; }
   resp="$(api_call "DELETE" "${ep}/${username}")"
   code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
   message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
@@ -14176,7 +14381,7 @@ delete_account() {
     echo "Gagal hapus akun ${type^^}: ${message}"
     return
   fi
-  echo "Akun ${type^^} '${username}' berhasil dihapus."
+  echo "Akun ${type^^} ${label} '${username}' berhasil dihapus permanen."
 }
 
 unlock_account() {
@@ -14314,7 +14519,7 @@ list_accounts() {
       i=$((i + 1))
       sisa_human="$(format_remaining_from_minutes "${sisa:-0}")"
       display_st="${st:-AKTIF}"
-      if [[ "${mode}" == "expired" && "${display_st}" == "AKTIF" ]]; then
+      if [[ "${mode}" == "expired" && "${display_st}" != "EXPIRED" ]]; then
         display_st="EXPIRED"
       fi
       [[ "${kind}" == "TRIAL" && "${display_st}" == "AKTIF" ]] && display_st="TRIAL"
@@ -14572,7 +14777,7 @@ akun_menu() {
       "2) Trial Account (1 jam)" \
       "3) Renew Account" \
       "4) Edit Limit IP" \
-      "5) Delete Account" \
+      "5) Hapus Account Aktif" \
       "6) List Account" \
       "7) Unlock Account" \
       "8) Unlock Semua Akun" \
@@ -14585,9 +14790,11 @@ akun_menu() {
       "15) Edit Quota" \
       "16) Edit Quota Semua Akun" \
       "17) Info Quota Akun" \
+      "18) Hapus Account Expired" \
+      "19) Recovery Account Expired" \
       "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-17]: "; then
+    if ! prompt_input am "Pilih menu [0-19]: "; then
       return
     fi
     clear
@@ -14597,7 +14804,7 @@ akun_menu() {
       2) create_trial_account || true ;;
       3) renew_account || true ;;
       4) edit_limit_ip_account || true ;;
-      5) delete_account || true ;;
+      5) delete_account "nonexpired" || true ;;
       6) list_accounts || true ;;
       7)
         unlock_account || true
@@ -14616,6 +14823,8 @@ akun_menu() {
       15) edit_quota_account || true ;;
       16) edit_quota_all_accounts || true ;;
       17) show_account_quota_info || true ;;
+      18) delete_account "expired" || true ;;
+      19) recover_expired_account || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -19485,6 +19694,7 @@ persist_pending_install_env() {
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE
+    EXPIRED_ACCOUNT_RETENTION_DAYS
     AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES
     IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
     SSHWS_TCP_KEEPALIVE_SECONDS SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE

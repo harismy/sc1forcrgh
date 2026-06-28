@@ -1,4 +1,4 @@
-﻿const fs = require('fs');
+const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
@@ -107,6 +107,10 @@ const SC_POST_REGISTRATION_UNLOCK_TIMEOUT_MS = Math.max(
 );
 const SC_POST_REGISTRATION_NOTIFY_UNLOCK = /^(1|true|yes|on)$/i.test(
   String(process.env.SC_POST_REGISTRATION_NOTIFY_UNLOCK || '1').trim()
+);
+const SC_ADMIN_REMOVE_REMOTE_TIMEOUT_MS = Math.max(
+  3000,
+  Number(process.env.SC_ADMIN_REMOVE_REMOTE_TIMEOUT_MS || 10000) || 10000
 );
 
 function dbRun(sql, params = []) {
@@ -1730,12 +1734,12 @@ async function adminRemoveRegisteredIp(ip, adminId) {
   };
 }
 
-async function lockScAccessByHost(host, key, actorId, reason = 'admin_remove_sc_ip') {
+async function lockScAccessByHost(host, key, actorId, reason = 'admin_remove_sc_ip', timeoutMs = 120000) {
   return apiPost(host, key, '/internal/sc-access-lock', {
     blocked: true,
     reason: String(reason || 'admin_remove_sc_ip'),
     actor: String(actorId || '')
-  });
+  }, timeoutMs);
 }
 
 async function unlockScAccessByHost(host, key, actorId, reason = 'renew_after_expired', timeoutMs = 120000) {
@@ -1798,11 +1802,11 @@ function schedulePostRegistrationHostSync(options = {}) {
   });
 }
 
-async function notifyScExpiredOnHost(host, key, payload = {}) {
-  return apiPost(host, key, '/internal/sc-expired-notify', payload);
+async function notifyScExpiredOnHost(host, key, payload = {}, timeoutMs = 120000) {
+  return apiPost(host, key, '/internal/sc-expired-notify', payload, timeoutMs);
 }
 
-async function notifyExpiredUsersInBot(ctx, userIds, ip, reason = 'admin_remove_sc_ip') {
+async function notifyExpiredUsersInBot(userIds, ip, reason = 'admin_remove_sc_ip') {
   const ids = Array.isArray(userIds)
     ? Array.from(new Set(userIds.map((n) => Number(n || 0)).filter((n) => Number.isInteger(n) && n > 0)))
     : [];
@@ -1810,7 +1814,7 @@ async function notifyExpiredUsersInBot(ctx, userIds, ip, reason = 'admin_remove_
   let fail = 0;
   for (const uid of ids) {
     try {
-      await ctx.telegram.sendMessage(
+      await bot.telegram.sendMessage(
         uid,
         `SC kamu telah expired oleh admin.\n` +
           `IP VPS: ${ip}\n` +
@@ -1823,6 +1827,75 @@ async function notifyExpiredUsersInBot(ctx, userIds, ip, reason = 'admin_remove_
     }
   }
   return { total: ids.length, ok, fail };
+}
+
+function scheduleAdminRemovedIpCleanup(options = {}) {
+  const chatId = Number(options.chatId || 0);
+  const adminId = Number(options.adminId || 0);
+  const ip = normalizeHost(options.ip || '');
+  const key = String(options.key || '').trim();
+  const users = Array.isArray(options.users) ? [...options.users] : [];
+  if (!isIpv4(ip)) return;
+
+  setImmediate(() => {
+    (async () => {
+      const userNotifyPromise = notifyExpiredUsersInBot(users, ip, 'admin_remove_sc_ip')
+        .catch(() => ({ total: users.length, ok: 0, fail: users.length }));
+      let lockMsg = 'Lock menu VPS: skip (key belum tersimpan)';
+      let syncMsg = 'Sinkron status VPS: skip (key belum tersimpan)';
+      let vpsNotifyMsg = 'Notif bot VPS: skip (key belum tersimpan)';
+
+      if (key.length >= 8) {
+        try {
+          const lockResp = await lockScAccessByHost(
+            ip,
+            key,
+            adminId,
+            'admin_remove_sc_ip',
+            SC_ADMIN_REMOVE_REMOTE_TIMEOUT_MS
+          );
+          lockMsg = lockResp?.blocked === true ? 'Lock menu VPS: berhasil' : 'Lock menu VPS: gagal';
+        } catch (lockErr) {
+          lockMsg = `Lock menu VPS: gagal (${parseErr(lockErr)})`;
+        }
+
+        const syncResult = await syncScRegistrationMetaToHost(ip, key, {
+          status: 'expired',
+          client_name: '-',
+          expires_at: Date.now()
+        }, SC_ADMIN_REMOVE_REMOTE_TIMEOUT_MS);
+        syncMsg = syncResult.ok
+          ? 'Sinkron status VPS: berhasil'
+          : `Sinkron status VPS: gagal (${syncResult.message || 'unknown'})`;
+
+        try {
+          await notifyScExpiredOnHost(ip, key, {
+            ip,
+            reason: 'admin_remove_sc_ip',
+            actor: String(adminId || ''),
+            users: users.map((u) => String(u))
+          }, SC_ADMIN_REMOVE_REMOTE_TIMEOUT_MS);
+          vpsNotifyMsg = 'Notif bot VPS: berhasil';
+        } catch (notifyErr) {
+          vpsNotifyMsg = `Notif bot VPS: gagal (${parseErr(notifyErr)})`;
+        }
+      }
+
+      const userNotify = await userNotifyPromise;
+      if (chatId) {
+        await bot.telegram.sendMessage(
+          chatId,
+          `Proses background hapus IP ${ip} selesai.\n` +
+            `${lockMsg}\n` +
+            `${syncMsg}\n` +
+            `Notif user Bot SC: ${userNotify.ok}/${userNotify.total} terkirim\n` +
+            `${vpsNotifyMsg}`
+        ).catch(() => {});
+      }
+    })().catch((err) => {
+      console.error(`[admin-remove-ip] cleanup VPS ${ip} gagal: ${parseErr(err)}`);
+    });
+  });
 }
 
 async function notifySingleUserInBot(userId, message) {
@@ -2810,7 +2883,7 @@ async function apiPost(host, key, endpoint, body = {}, timeoutMs = 120000) {
   return res.data;
 }
 
-async function syncScRegistrationMetaToHost(host, key, meta = {}) {
+async function syncScRegistrationMetaToHost(host, key, meta = {}, timeoutMs = 30000) {
   const safeHost = normalizeHost(host);
   const safeKey = String(key || '').trim();
   if (!isIpv4(safeHost) || safeKey.length < 8) {
@@ -2822,7 +2895,7 @@ async function syncScRegistrationMetaToHost(host, key, meta = {}) {
       client_name: String(meta.client_name || '').trim(),
       expires_at: Number(meta.expires_at || 0)
     };
-    await apiPost(safeHost, safeKey, '/internal/sc-registration-meta', payload, 30000);
+    await apiPost(safeHost, safeKey, '/internal/sc-registration-meta', payload, timeoutMs);
     return { ok: true };
   } catch (err) {
     return { ok: false, message: parseErr(err) };
@@ -5101,50 +5174,22 @@ bot.on('text', async (ctx) => {
         return ctx.reply(`IP ${ip} tidak ditemukan pada registrasi aktif.`, adminMenu());
       }
 
-      let lockMsg = 'Lock menu VPS: skip (key belum tersimpan)';
-      if (String(key || '').trim().length >= 8) {
-        try {
-          const lockResp = await lockScAccessByHost(ip, key, ctx.from.id, 'admin_remove_sc_ip');
-          const blocked = lockResp?.blocked === true;
-          lockMsg = blocked ? 'Lock menu VPS: berhasil' : 'Lock menu VPS: gagal';
-        } catch (lockErr) {
-          lockMsg = `Lock menu VPS: gagal (${parseErr(lockErr)})`;
-        }
-      }
-
       const users = Array.isArray(result.affectedUsers) ? result.affectedUsers : [];
-      const userNotify = await notifyExpiredUsersInBot(ctx, users, ip, 'admin_remove_sc_ip').catch(() => ({ total: users.length, ok: 0, fail: users.length }));
-
-      let vpsNotifyMsg = 'Notif bot VPS: skip (key belum tersimpan)';
-      if (String(key || '').trim().length >= 8) {
-        try {
-          await syncScRegistrationMetaToHost(ip, key, {
-            status: 'expired',
-            client_name: '-',
-            expires_at: Date.now()
-          }).catch(() => {});
-          await notifyScExpiredOnHost(ip, key, {
-            ip,
-            reason: 'admin_remove_sc_ip',
-            actor: String(ctx.from.id || ''),
-            users: users.map((u) => String(u))
-          });
-          vpsNotifyMsg = 'Notif bot VPS: berhasil';
-        } catch (notifyErr) {
-          vpsNotifyMsg = `Notif bot VPS: gagal (${parseErr(notifyErr)})`;
-        }
-      }
-
       userState.delete(ctx.chat.id);
+      scheduleAdminRemovedIpCleanup({
+        chatId: ctx.chat.id,
+        adminId: ctx.from.id,
+        ip,
+        key,
+        users
+      });
       return ctx.reply(
         `Berhasil hapus registrasi aktif untuk IP ${ip}.\n` +
           `Baris IP cocok: ${result.removed}\n` +
           `Total baris aktif yang di-expire: ${Number(result.removedRowsAllIps || 0)}\n` +
           `User terdampak: ${users.length ? users.join(', ') : '-'}\n` +
-          `${lockMsg}\n` +
-          `Notif user Bot SC: ${userNotify.ok}/${userNotify.total} terkirim\n` +
-          `${vpsNotifyMsg}\n` +
-          `Efek: SC client expired + menu VPS terkunci (jika lock berhasil).`,
+          'Lock dan notifikasi VPS: diproses background.\n' +
+          'Hasilnya akan dikirim sebagai pesan berikutnya.',
         adminMenu()
       );
     }

@@ -41,6 +41,7 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
 
 const bot = new Telegraf(BOT_TOKEN);
 const userState = new Map();
+const pendingBroadcastAlbums = new Map();
 const db = new sqlite3.Database(DB_PATH);
 const DYNAMIC_SETTING_KEYS = [
   'SC_REGISTRATION_PRICE_PER_DAY',
@@ -2534,6 +2535,99 @@ async function sendPhotoBroadcastToAllUsers(senderCtx) {
   return { total: ids.length, ok, fail };
 }
 
+async function sendPhotoAlbumBroadcastToAllUsers(senderCtx, itemsInput) {
+  const items = (Array.isArray(itemsInput) ? itemsInput : [])
+    .filter((item) => String(item?.media || '').trim())
+    .slice(0, 10);
+  if (!items.length) return { total: 0, ok: 0, fail: 0, photos: 0 };
+  if (items.length === 1) {
+    const item = items[0];
+    const extra = {};
+    if (item.caption) extra.caption = item.caption;
+    if (item.caption && item.caption_entities?.length) extra.caption_entities = item.caption_entities;
+    const ids = await listAllUserIds();
+    let ok = 0;
+    let fail = 0;
+    for (const uid of ids) {
+      try {
+        await senderCtx.telegram.sendPhoto(uid, item.media, extra);
+        ok += 1;
+      } catch (_) {
+        fail += 1;
+      }
+    }
+    return { total: ids.length, ok, fail, photos: 1 };
+  }
+
+  const media = items.map((item) => {
+    const payload = { type: 'photo', media: item.media };
+    if (item.caption) payload.caption = item.caption;
+    if (item.caption && item.caption_entities?.length) {
+      payload.caption_entities = item.caption_entities;
+    }
+    return payload;
+  });
+  const ids = await listAllUserIds();
+  let ok = 0;
+  let fail = 0;
+  for (const uid of ids) {
+    try {
+      await senderCtx.telegram.sendMediaGroup(uid, media);
+      ok += 1;
+    } catch (_) {
+      fail += 1;
+    }
+  }
+  return { total: ids.length, ok, fail, photos: media.length };
+}
+
+function queueBroadcastPhotoAlbum(ctx) {
+  const mediaGroupId = String(ctx.message?.media_group_id || '').trim();
+  const chatId = Number(ctx.chat?.id || 0);
+  if (!mediaGroupId || !chatId) return false;
+
+  const photos = Array.isArray(ctx.message?.photo) ? ctx.message.photo : [];
+  const photo = photos[photos.length - 1];
+  const fileId = String(photo?.file_id || '').trim();
+  if (!fileId) return false;
+
+  const key = `${chatId}:${mediaGroupId}`;
+  const pending = pendingBroadcastAlbums.get(key) || {
+    ctx,
+    chatId,
+    items: [],
+    timer: null
+  };
+  if (pending.items.length < 10) {
+    pending.items.push({
+      media: fileId,
+      caption: String(ctx.message?.caption || '').trim(),
+      caption_entities: Array.isArray(ctx.message?.caption_entities)
+        ? ctx.message.caption_entities
+        : []
+    });
+  }
+  if (pending.timer) clearTimeout(pending.timer);
+  pending.timer = setTimeout(async () => {
+    pendingBroadcastAlbums.delete(key);
+    const currentState = userState.get(chatId);
+    if (!currentState || currentState.step !== 'admin_broadcast_message') return;
+    userState.delete(chatId);
+    try {
+      await pending.ctx.reply(`Broadcast album (${pending.items.length} foto) sedang dikirim ke semua user...`);
+      const result = await sendPhotoAlbumBroadcastToAllUsers(pending.ctx, pending.items);
+      await pending.ctx.reply(
+        `Broadcast album selesai.\nJumlah foto: ${result.photos}\nTotal user: ${result.total}\nBerhasil: ${result.ok}\nGagal: ${result.fail}`,
+        adminMenu()
+      );
+    } catch (err) {
+      await pending.ctx.reply(`Broadcast album gagal: ${parseErr(err)}`, adminMenu()).catch(() => {});
+    }
+  }, 1500);
+  pendingBroadcastAlbums.set(key, pending);
+  return true;
+}
+
 function getRangeStartEnd(period) {
   const p = String(period || '').toLowerCase();
   const now = new Date();
@@ -3641,7 +3735,7 @@ bot.action('m_admin_broadcast', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_broadcast_message' });
   return ctx.reply(
-    'Kirim teks atau foto untuk broadcast ke semua user.\n' +
+    'Kirim teks, satu foto, atau album maksimal 10 foto.\n' +
     'Foto boleh menggunakan caption atau tanpa caption.\n' +
     'Teks dan caption akan dikirim apa adanya.\n' +
     'Ketik "batal" untuk membatalkan.'
@@ -6307,6 +6401,13 @@ bot.on('photo', async (ctx) => {
 
   const photos = Array.isArray(ctx.message?.photo) ? ctx.message.photo : [];
   if (!photos.length) return ctx.reply('Foto broadcast tidak valid. Silakan kirim ulang.');
+
+  if (ctx.message?.media_group_id) {
+    if (!queueBroadcastPhotoAlbum(ctx)) {
+      return ctx.reply('Album broadcast tidak valid. Silakan kirim ulang.');
+    }
+    return;
+  }
 
   userState.delete(ctx.chat.id);
   try {

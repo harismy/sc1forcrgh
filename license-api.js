@@ -148,6 +148,10 @@ function normalizeScriptLineEndings(input) {
   return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+function shellQuote(input) {
+  return `'${String(input || '').replace(/'/g, `'\\''`)}'`;
+}
+
 function uniqPaths(paths) {
   return [...new Set((Array.isArray(paths) ? paths : []).map((p) => String(p || '').trim()).filter(Boolean))];
 }
@@ -385,14 +389,14 @@ async function sendInstallerScript(req, res) {
       : '';
     const activateUrl = `${baseUrl}/sc1forcr/license/activate`;
     const envLines = [
-      'LICENSE_ENFORCE=1',
-      `LICENSE_API_URL="${activateUrl}"`,
-      `LICENSE_API_TOKEN="${LICENSE_API_TOKEN}"`,
-      `LICENSE_KEY="IP_REGISTERED_${ip}"`,
-      `UPDATE_SCRIPT_URL="${sourceUrl}"`
+      'export LICENSE_ENFORCE=1',
+      `export LICENSE_API_URL=${shellQuote(activateUrl)}`,
+      `export LICENSE_API_TOKEN=${shellQuote(LICENSE_API_TOKEN)}`,
+      `export LICENSE_KEY=${shellQuote(`IP_REGISTERED_${ip}`)}`,
+      `export UPDATE_SCRIPT_URL=${shellQuote(sourceUrl)}`
     ];
     if (hasLocalSummaryApi) {
-      envLines.push(`SUMMARY_API_SETUP_URL="${summaryApiUrl}"`);
+      envLines.push(`export SUMMARY_API_SETUP_URL=${shellQuote(summaryApiUrl)}`);
     }
     const script = `#!/usr/bin/env bash
 set -euo pipefail
@@ -476,7 +480,7 @@ if ! head -n 1 "$TMP_SC" | grep -q '^#!'; then
 fi
 chmod +x "$TMP_SC"
 
-${envLines.map((v) => `${v} \\`).join('\n')}
+${envLines.join('\n')}
 if [ -r /dev/tty ] && [ -w /dev/tty ]; then
   bash "$TMP_SC" </dev/tty
 else

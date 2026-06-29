@@ -753,6 +753,19 @@ function formatDateTime(ts) {
   return new Date(n).toLocaleString('id-ID', { hour12: false, timeZone: 'Asia/Jakarta' });
 }
 
+function formatDateYmd(ts) {
+  const n = Number(ts || 0);
+  if (!n) return 'tanpa batas';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jakarta',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date(n));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
 function formatRemainingDays(expiresAt) {
   const n = Number(expiresAt || 0);
   if (!n) return 'tanpa batas';
@@ -3395,38 +3408,38 @@ async function buildInstallerQuickCopyText(options = {}) {
   }
   const installerUrl = `https://${domain}/i`;
   const serverKey = String(options?.serverKey || '').trim();
-  const keyEnv = serverKey.length >= 8
-    ? `AUTH_TOKEN=${shellQuote(serverKey)} `
-    : '';
-  const cmd = [
-    'ensure_dl(){',
-    'if [ -s /etc/ssl/certs/ca-certificates.crt ] && { command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; }; then return 0; fi;',
-    'command -v apt-get >/dev/null 2>&1 || { echo "Installer membutuhkan apt-get (Debian/Ubuntu)."; return 1; };',
-    'export DEBIAN_FRONTEND=noninteractive;',
-    'n=0;',
-    'while [ "$n" -lt 3 ]; do',
-    'dpkg --configure -a >/dev/null 2>&1 || true;',
-    'if apt-get -o DPkg::Lock::Timeout=900 update -y && apt-get -o DPkg::Lock::Timeout=900 install -y ca-certificates curl; then return 0; fi;',
-    'n=$((n+1)); echo "Mengulang persiapan downloader ($n/3)..."; sleep 5;',
-    'done;',
-    'echo "Gagal memasang curl. Periksa repository dan koneksi VPS."; return 1;',
-    '};',
-    'ensure_dl || exit 1;',
-    `u=${shellQuote(installerUrl)};`,
-    'f=/tmp/sc1forcr-bootstrap.sh;',
-    'rm -f "$f";',
-    'if command -v curl >/dev/null 2>&1; then',
-    'curl -4fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "$u" -o "$f" || curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "$u" -o "$f";',
-    'else wget -qO "$f" "$u"; fi;',
-    '[ -s "$f" ] && head -n 1 "$f" | grep -q "^#!" || { echo "Bootstrap installer gagal diunduh."; rm -f "$f"; exit 1; };',
-    `${keyEnv}bash "$f";`,
-    'r=$?; rm -f "$f"; exit "$r"'
-  ].join(' ');
-  const safeCmd = escapeHtml(cmd);
+  const keyEnv = serverKey.length >= 8 ? `AUTH_TOKEN=${shellQuote(serverKey)} ` : '';
+  const cmd = `curl -4fsSL --connect-timeout 15 --retry 5 ${shellQuote(installerUrl)} -o install && chmod +x install && ${keyEnv}screen -S potato ./install`;
+  const clientName = String(options?.clientName || options?.ip || '-').trim() || '-';
+  const ip = String(options?.ip || '-').trim() || '-';
+  const expired = options?.expiresAt === undefined ? '-' : formatDateYmd(options.expiresAt);
+  const authText = serverKey.length >= 8 ? serverKey : 'dibuat otomatis saat install';
+  const line = '━━━━━━━━━━━━━━━━━━━━━━';
   return {
     ok: true,
-    text:
-      `Link instalasi untuk di vps:\n<pre><code>${safeCmd}</code></pre>`,
+    text: [
+      '<b>STATUS SUCCESS</b>',
+      line,
+      `Name    : ${escapeHtml(clientName)}`,
+      `IP      : ${escapeHtml(ip)}`,
+      `Expired : ${escapeHtml(expired)}`,
+      line,
+      `Domain  : ${escapeHtml(domain)}`,
+      line,
+      `Auth API: ${escapeHtml(authText)}`,
+      line,
+      'OS Support',
+      '☞ Debian 11 or latest (recommended)',
+      '☞ Ubuntu 20.04 or latest (04)',
+      line,
+      '1. <code>apt update</code>',
+      '2. <code>apt install curl jq wget screen build-essential ca-certificates -y</code>',
+      `3. <code>${escapeHtml(cmd)}</code>`,
+      line,
+      'Jika koneksi terputus saat instalasi, login kembali lalu jalankan:',
+      '<code>screen -r potato</code> atau <code>screen -d -r potato</code>',
+      line
+    ].join('\n'),
     parse_mode: 'HTML'
   };
 }
@@ -4160,7 +4173,17 @@ bot.action('m_check_sc_ip_expiry', async (ctx) => {
 bot.action('m_install_link', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!(await requireRegistered(ctx))) return;
-  const installerText = await buildInstallerQuickCopyText();
+  const registrations = await getActiveRegistrations(ctx.from.id).catch(() => []);
+  const registration = registrations[0] || null;
+  const serverKey = registration
+    ? await ensureServerKeyForHost(ctx.from.id, registration.vps_ip)
+    : '';
+  const installerText = await buildInstallerQuickCopyText({
+    serverKey,
+    clientName: registration?.client_name,
+    ip: registration?.vps_ip,
+    expiresAt: registration?.expires_at
+  });
   if (!installerText.ok) {
     return ctx.reply(
       'Domain API installer belum diset admin.\nHubungi admin agar tambah domain via menu admin.',
@@ -5516,21 +5539,34 @@ bot.on('text', async (ctx) => {
         ? await issueRandomServerKeyForHost(ctx.from.id, ip)
         : await ensureServerKeyForHost(ctx.from.id, ip);
       const installerText = sendInstaller
-        ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
+        ? await buildInstallerQuickCopyText({
+            serverKey: activeServerKey,
+            clientName: result.clientName || clientName,
+            ip,
+            expiresAt: 0
+          })
         : null;
       userState.delete(ctx.chat.id);
-      await ctx.reply(
-        `Registrasi SC Unlimited berhasil.\n` +
-          `Nama Client: ${result.clientName || clientName}\n` +
-          `IP: ${ip}\n` +
-          `Biaya potong saldo: Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}\n` +
-          `Expired: tanpa batas\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
-          `${result.reactivatedFromExpired
-            ? '\nUnlock menu VPS otomatis: diproses background'
-            : ''}`,
-        mainMenu()
-      );
+      if (installerText?.ok) {
+        await ctx.reply(installerText.text, {
+          ...mainMenu(),
+          parse_mode: installerText.parse_mode,
+          disable_web_page_preview: true
+        });
+      } else {
+        await ctx.reply(
+          `Registrasi SC Unlimited berhasil.\n` +
+            `Nama Client: ${result.clientName || clientName}\n` +
+            `IP: ${ip}\n` +
+            `Biaya potong saldo: Rp ${Number(unlimitedPrice).toLocaleString('id-ID')}\n` +
+            `Expired: tanpa batas\n` +
+            `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
+            `${result.reactivatedFromExpired
+              ? '\nUnlock menu VPS otomatis: diproses background'
+              : ''}`,
+          mainMenu()
+        );
+      }
       schedulePostRegistrationHostSync({
         userId: ctx.from.id,
         chatId: ctx.chat.id,
@@ -5544,12 +5580,7 @@ bot.on('text', async (ctx) => {
           expires_at: 0
         }
       });
-      if (installerText?.ok) {
-        await ctx.reply(installerText.text, {
-          parse_mode: installerText.parse_mode,
-          disable_web_page_preview: true
-        });
-      } else if (installerText) {
+      if (installerText && !installerText.ok) {
         await ctx.reply(installerText.text);
       }
       return;
@@ -5675,22 +5706,35 @@ bot.on('text', async (ctx) => {
         ? await issueRandomServerKeyForHost(ctx.from.id, ip)
         : await ensureServerKeyForHost(ctx.from.id, ip, state.serverKey || '');
       const installerText = sendInstaller
-        ? await buildInstallerQuickCopyText({ serverKey: activeServerKey })
+        ? await buildInstallerQuickCopyText({
+            serverKey: activeServerKey,
+            clientName: result.clientName || clientName,
+            ip,
+            expiresAt: result.expiresAt
+          })
         : null;
       userState.delete(ctx.chat.id);
-      await ctx.reply(
-        `Registrasi/perpanjang SC berhasil.\n` +
-          `Nama Client: ${result.clientName || clientName}\n` +
-          `IP: ${ip}\n` +
-          `Durasi: ${Math.floor(days)} hari\n` +
-          `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
-          `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
-          `${result.reactivatedFromExpired
-            ? '\nUnlock menu VPS otomatis: diproses background'
-            : ''}`,
-        mainMenu()
-      );
+      if (installerText?.ok) {
+        await ctx.reply(installerText.text, {
+          ...mainMenu(),
+          parse_mode: installerText.parse_mode,
+          disable_web_page_preview: true
+        });
+      } else {
+        await ctx.reply(
+          `Registrasi/perpanjang SC berhasil.\n` +
+            `Nama Client: ${result.clientName || clientName}\n` +
+            `IP: ${ip}\n` +
+            `Durasi: ${Math.floor(days)} hari\n` +
+            `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
+            `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
+            `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
+            `${result.reactivatedFromExpired
+              ? '\nUnlock menu VPS otomatis: diproses background'
+              : ''}`,
+          mainMenu()
+        );
+      }
       schedulePostRegistrationHostSync({
         userId: ctx.from.id,
         chatId: ctx.chat.id,
@@ -5704,12 +5748,7 @@ bot.on('text', async (ctx) => {
           expires_at: Number(result.expiresAt || 0)
         }
       });
-      if (installerText?.ok) {
-        await ctx.reply(installerText.text, {
-          parse_mode: installerText.parse_mode,
-          disable_web_page_preview: true
-        });
-      } else if (installerText) {
+      if (installerText && !installerText.ok) {
         await ctx.reply(installerText.text);
       }
       return;

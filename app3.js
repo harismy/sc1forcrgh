@@ -3407,14 +3407,42 @@ async function buildInstallerQuickCopyText(options = {}) {
     };
   }
   const installerUrl = `https://${domain}/i`;
+  const isGeneral = options?.general === true;
   const serverKey = String(options?.serverKey || '').trim();
-  const keyEnv = serverKey.length >= 8 ? `AUTH_TOKEN=${shellQuote(serverKey)} ` : '';
+  const keyEnv = !isGeneral && serverKey.length >= 8 ? `AUTH_TOKEN=${shellQuote(serverKey)} ` : '';
   const cmd = `curl -4fsSL --connect-timeout 15 --retry 5 ${shellQuote(installerUrl)} -o /root/nexus-installer.sh && chmod +x /root/nexus-installer.sh && ${keyEnv}screen -S nexus-sc /root/nexus-installer.sh`;
+  const line = '────────────────────────';
+  if (isGeneral) {
+    return {
+      ok: true,
+      text: [
+        '╭─〔 <b>1FORCR NEXUS</b> 〕',
+        '│ GLOBAL INSTALLER',
+        '╰───────────────────────',
+        '',
+        `Installer URL: ${escapeHtml(installerUrl)}`,
+        '',
+        'Link ini berlaku untuk semua VPS.',
+        'IP VPS wajib diregistrasikan terlebih dahulu.',
+        'API key akan dipilih otomatis berdasarkan IP VPS yang menjalankan installer.',
+        '',
+        '<b>INSTALLATION</b>',
+        line,
+        '[1/3] <code>apt update</code>',
+        '[2/3] <code>apt install curl jq wget screen build-essential ca-certificates -y</code>',
+        `[3/3] <code>${escapeHtml(cmd)}</code>`,
+        line,
+        '<b>SESSION RECOVERY</b>',
+        '<code>screen -r nexus-sc</code>',
+        '<code>screen -d -r nexus-sc</code>'
+      ].join('\n'),
+      parse_mode: 'HTML'
+    };
+  }
   const clientName = String(options?.clientName || options?.ip || '-').trim() || '-';
   const ip = String(options?.ip || '-').trim() || '-';
   const expired = options?.expiresAt === undefined ? '-' : formatDateYmd(options.expiresAt);
   const authText = serverKey.length >= 8 ? serverKey : 'dibuat otomatis saat install';
-  const line = '────────────────────────';
   return {
     ok: true,
     text: [
@@ -4181,18 +4209,7 @@ bot.action('m_check_sc_ip_expiry', async (ctx) => {
 
 bot.action('m_install_link', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  if (!(await requireRegistered(ctx))) return;
-  const registrations = await getActiveRegistrations(ctx.from.id).catch(() => []);
-  const registration = registrations[0] || null;
-  const serverKey = registration
-    ? await ensureServerKeyForHost(ctx.from.id, registration.vps_ip)
-    : '';
-  const installerText = await buildInstallerQuickCopyText({
-    serverKey,
-    clientName: registration?.client_name,
-    ip: registration?.vps_ip,
-    expiresAt: registration?.expires_at
-  });
+  const installerText = await buildInstallerQuickCopyText({ general: true });
   if (!installerText.ok) {
     return ctx.reply(
       'Domain API installer belum diset admin.\nHubungi admin agar tambah domain via menu admin.',

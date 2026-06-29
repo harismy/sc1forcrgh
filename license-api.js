@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 require('dotenv').config();
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
@@ -66,6 +67,13 @@ async function initDb() {
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     added_by INTEGER
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS sc_server_keys (
+    user_id INTEGER NOT NULL,
+    vps_ip TEXT NOT NULL,
+    server_key TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (user_id, vps_ip)
   )`);
   await dbRun(`CREATE TABLE IF NOT EXISTS sc_update_triggers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,6 +291,30 @@ async function findLatestRegistrationByIp(ip) {
   );
 }
 
+async function ensureServerKeyForRegistration(reg) {
+  const userId = Number(reg?.user_id || 0);
+  const ip = cleanIp(reg?.vps_ip);
+  if (!userId || !ip) throw new Error('Data registrasi untuk API key tidak valid');
+
+  const existing = await dbGet(
+    'SELECT server_key FROM sc_server_keys WHERE user_id = ? AND vps_ip = ? LIMIT 1',
+    [userId, ip]
+  );
+  const existingKey = String(existing?.server_key || '').trim();
+  if (existingKey.length >= 8) return existingKey;
+
+  const serverKey = crypto.randomBytes(24).toString('hex');
+  await dbRun(
+    `INSERT INTO sc_server_keys (user_id, vps_ip, server_key, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, vps_ip) DO UPDATE SET
+       server_key=excluded.server_key,
+       updated_at=excluded.updated_at`,
+    [userId, ip, serverKey, Date.now()]
+  );
+  return serverKey;
+}
+
 async function getLatestActiveUpdateTrigger() {
   return dbGet(
     "SELECT version, note, created_at, triggered_by FROM sc_update_triggers WHERE status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1"
@@ -375,6 +407,8 @@ async function sendInstallerScript(req, res) {
       return res.type('text/plain').send(renderNotRegisteredBash(ip));
     }
 
+    const serverKey = await ensureServerKeyForRegistration(reg);
+
     const baseUrl = getBaseUrl(req);
     const scInstallerPath = resolveScInstallerLocalPath();
     const hasLocalInstaller = fs.existsSync(scInstallerPath);
@@ -393,7 +427,9 @@ async function sendInstallerScript(req, res) {
       `export LICENSE_API_URL=${shellQuote(activateUrl)}`,
       `export LICENSE_API_TOKEN=${shellQuote(LICENSE_API_TOKEN)}`,
       `export LICENSE_KEY=${shellQuote(`IP_REGISTERED_${ip}`)}`,
-      `export UPDATE_SCRIPT_URL=${shellQuote(sourceUrl)}`
+      `export UPDATE_SCRIPT_URL=${shellQuote(sourceUrl)}`,
+      `export API_AUTH_TOKEN=${shellQuote(serverKey)}`,
+      `export AUTH_TOKEN=${shellQuote(serverKey)}`
     ];
     if (hasLocalSummaryApi) {
       envLines.push(`export SUMMARY_API_SETUP_URL=${shellQuote(summaryApiUrl)}`);

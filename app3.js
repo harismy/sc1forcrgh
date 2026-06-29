@@ -3409,36 +3409,45 @@ async function buildInstallerQuickCopyText(options = {}) {
   const installerUrl = `https://${domain}/i`;
   const serverKey = String(options?.serverKey || '').trim();
   const keyEnv = serverKey.length >= 8 ? `AUTH_TOKEN=${shellQuote(serverKey)} ` : '';
-  const cmd = `curl -4fsSL --connect-timeout 15 --retry 5 ${shellQuote(installerUrl)} -o install && chmod +x install && ${keyEnv}screen -S potato ./install`;
+  const cmd = `curl -4fsSL --connect-timeout 15 --retry 5 ${shellQuote(installerUrl)} -o /root/nexus-installer.sh && chmod +x /root/nexus-installer.sh && ${keyEnv}screen -S nexus-sc /root/nexus-installer.sh`;
   const clientName = String(options?.clientName || options?.ip || '-').trim() || '-';
   const ip = String(options?.ip || '-').trim() || '-';
   const expired = options?.expiresAt === undefined ? '-' : formatDateYmd(options.expiresAt);
   const authText = serverKey.length >= 8 ? serverKey : 'dibuat otomatis saat install';
-  const line = '━━━━━━━━━━━━━━━━━━━━━━';
+  const line = '────────────────────────';
   return {
     ok: true,
     text: [
-      '<b>STATUS SUCCESS</b>',
+      '╭─〔 <b>1FORCR NEXUS</b> 〕',
+      '│ LICENSE STATUS : <b>ACTIVE</b>',
+      '╰───────────────────────',
+      '',
+      '<b>SERVER PROFILE</b>',
       line,
-      `Name    : ${escapeHtml(clientName)}`,
-      `IP      : ${escapeHtml(ip)}`,
-      `Expired : ${escapeHtml(expired)}`,
+      `Client        : ${escapeHtml(clientName)}`,
+      `VPS Address   : ${escapeHtml(ip)}`,
+      `Valid Until   : ${escapeHtml(expired)}`,
+      `Installer Host: ${escapeHtml(domain)}`,
       line,
-      `Domain  : ${escapeHtml(domain)}`,
+      `Nexus API Key : ${escapeHtml(authText)}`,
+      '',
+      '<b>SUPPORTED SYSTEM</b>',
+      '• Debian 11 atau versi terbaru',
+      '• Ubuntu 20.04 atau versi terbaru',
+      '',
+      '<b>INSTALLATION</b>',
       line,
-      `Auth API: ${escapeHtml(authText)}`,
+      '[1/3] <code>apt update</code>',
+      '[2/3] <code>apt install curl jq wget screen build-essential ca-certificates -y</code>',
+      `[3/3] <code>${escapeHtml(cmd)}</code>`,
       line,
-      'OS Support',
-      '☞ Debian 11 or latest (recommended)',
-      '☞ Ubuntu 20.04 or latest (04)',
-      line,
-      '1. <code>apt update</code>',
-      '2. <code>apt install curl jq wget screen build-essential ca-certificates -y</code>',
-      `3. <code>${escapeHtml(cmd)}</code>`,
-      line,
-      'Jika koneksi terputus saat instalasi, login kembali lalu jalankan:',
-      '<code>screen -r potato</code> atau <code>screen -d -r potato</code>',
-      line
+      '<b>SESSION RECOVERY</b>',
+      'Koneksi terputus? Login kembali lalu jalankan:',
+      '<code>screen -r nexus-sc</code>',
+      'Jika sesi masih attached:',
+      '<code>screen -d -r nexus-sc</code>',
+      '',
+      '— 1FORCR NEXUS Installer —'
     ].join('\n'),
     parse_mode: 'HTML'
   };

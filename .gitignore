@@ -1,0 +1,62 @@
+# Secrets dan konfigurasi lokal
+.env
+.env.*
+!.env.example
+.vars.json
+.vars.*.json
+!.vars.example.json
+
+# Dependency Node.js
+node_modules/
+
+# Database runtime SQLite
+sc1forcrnexus.db
+sc1forcrnexus.db-*
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Log dan state proses
+*.log
+logs/
+*.pid
+*.pid.lock
+pids/
+.pm2/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Cache, coverage, dan hasil build
+.cache/
+coverage/
+dist/
+build/
+.nyc_output/
+
+# File sementara dan hasil download installer
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+install
+nexus-installer.sh
+backup-sc-*.json
+sc1forcr-restore-*
+
+# Workspace tool lokal
+.codex-tmp/
+.agents/
+.vscode/
+.idea/
+
+# File sistem operasi
+.DS_Store
+Thumbs.db
+Desktop.ini

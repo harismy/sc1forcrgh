@@ -3531,7 +3531,9 @@ async function buildInstallerQuickCopyText(options = {}) {
   const installerUrl = `https://${domain}/i`;
   const isGeneral = options?.general === true;
   const serverKey = String(options?.serverKey || '').trim();
-  const keyEnv = !isGeneral && serverKey.length >= 8 ? `AUTH_TOKEN=${shellQuote(serverKey)} ` : '';
+  const keyEnv = !isGeneral && serverKey.length >= 8
+    ? `INSTALL_AUTH_TOKEN=${shellQuote(serverKey)} API_AUTH_TOKEN=${shellQuote(serverKey)} AUTH_TOKEN=${shellQuote(serverKey)} `
+    : '';
   const cmd = `curl -4fsSL --connect-timeout 15 --retry 5 ${shellQuote(installerUrl)} -o /root/nexus-installer.sh && chmod +x /root/nexus-installer.sh && ${keyEnv}screen -S nexus-sc /root/nexus-installer.sh`;
   const line = '────────────────────────';
   if (isGeneral) {

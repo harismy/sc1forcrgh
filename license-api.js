@@ -428,6 +428,7 @@ async function sendInstallerScript(req, res) {
       `export LICENSE_API_TOKEN=${shellQuote(LICENSE_API_TOKEN)}`,
       `export LICENSE_KEY=${shellQuote(`IP_REGISTERED_${ip}`)}`,
       `export UPDATE_SCRIPT_URL=${shellQuote(sourceUrl)}`,
+      `export INSTALL_AUTH_TOKEN=${shellQuote(serverKey)}`,
       `export API_AUTH_TOKEN=${shellQuote(serverKey)}`,
       `export AUTH_TOKEN=${shellQuote(serverKey)}`
     ];

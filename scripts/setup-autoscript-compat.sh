@@ -126,6 +126,7 @@ DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 API_AUTH_TOKEN="${API_AUTH_TOKEN:-}"
 AUTH_TOKEN="${AUTH_TOKEN:-}"
+INSTALL_AUTH_TOKEN="${INSTALL_AUTH_TOKEN:-}"
 LICENSE_ENFORCE="${LICENSE_ENFORCE:-1}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
@@ -278,13 +279,15 @@ fi
 # EMAIL opsional: jika kosong/invalid, certbot dijalankan tanpa email
 # dengan --register-unsafely-without-email.
 
-if [[ -z "${API_AUTH_TOKEN}" && -n "${AUTH_TOKEN}" ]]; then
-  API_AUTH_TOKEN="${AUTH_TOKEN}"
-fi
-if [[ -z "${AUTH_TOKEN}" && -n "${API_AUTH_TOKEN}" ]]; then
+if [[ -n "${INSTALL_AUTH_TOKEN}" ]]; then
+  # Token dari endpoint installer/bot selalu menjadi sumber utama.
+  API_AUTH_TOKEN="${INSTALL_AUTH_TOKEN}"
+  AUTH_TOKEN="${INSTALL_AUTH_TOKEN}"
+elif [[ -n "${API_AUTH_TOKEN}" ]]; then
   AUTH_TOKEN="${API_AUTH_TOKEN}"
-fi
-if [[ -z "${API_AUTH_TOKEN}" && -z "${AUTH_TOKEN}" ]]; then
+elif [[ -n "${AUTH_TOKEN}" ]]; then
+  API_AUTH_TOKEN="${AUTH_TOKEN}"
+else
   API_AUTH_TOKEN="$(openssl rand -hex 24)"
   AUTH_TOKEN="${API_AUTH_TOKEN}"
 fi
@@ -1529,6 +1532,7 @@ CREATE TABLE IF NOT EXISTS account_quota_locks (
   PRIMARY KEY (account_type, username)
 );
 
+DELETE FROM servers;
 INSERT OR IGNORE INTO servers("key") VALUES('${API_AUTH_TOKEN}');
 SQL
     then
@@ -2701,6 +2705,7 @@ XRAY_PUBLIC_HOST=${XRAY_PUBLIC_HOST}
 XRAY_FRONT_DOMAIN=${XRAY_FRONT_DOMAIN}
 XRAY_FRONT_DOMAINS=${XRAY_FRONT_DOMAINS}
 AUTH_TOKEN=${API_AUTH_TOKEN}
+API_AUTH_TOKEN=${API_AUTH_TOKEN}
 LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
 LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
@@ -11803,6 +11808,7 @@ DOMAIN=${DOMAIN}
 EMAIL=${EMAIL}
 API_PORT=${API_PORT}
 AUTH_TOKEN=${API_AUTH_TOKEN}
+API_AUTH_TOKEN=${API_AUTH_TOKEN}
 LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
 LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
@@ -19659,34 +19665,40 @@ install_summary_api_1forcr() {
 }
 
 sync_zivpn_auth_token_with_api_runtime() {
-  local app_env api_tok api_port
+  local app_env api_tok api_port sql_key
   app_env="/opt/sc-1forcr/.env"
   if [[ ! -f "${app_env}" ]]; then
     app_env="/opt/potato-compat/.env"
   fi
-  if [[ ! -f "${app_env}" ]]; then
-    echo "Skip sync token ZIVPN: app env tidak ditemukan."
-    return 0
-  fi
 
-  api_tok="$(grep -m1 '^API_AUTH_TOKEN=' "${app_env}" 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
-  if [[ -z "${api_tok}" ]]; then
+  # Token yang dibawa installer adalah sumber utama. File runtime lama hanya
+  # boleh menjadi fallback agar token Potato/instalasi sebelumnya tidak menimpa key bot.
+  api_tok="${INSTALL_AUTH_TOKEN:-${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}}"
+  if [[ -z "${api_tok}" && -f "${app_env}" ]]; then
+    api_tok="$(grep -m1 '^API_AUTH_TOKEN=' "${app_env}" 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
+  fi
+  if [[ -z "${api_tok}" && -f "${app_env}" ]]; then
     api_tok="$(grep -m1 '^AUTH_TOKEN=' "${app_env}" 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
   fi
   if [[ -z "${api_tok}" ]]; then
-    echo "Skip sync token ZIVPN: API token runtime kosong."
-    return 0
+    echo "Gagal sinkron token: token installer dan runtime kosong."
+    return 1
   fi
 
-  api_port="$(grep -m1 '^API_PORT=' /etc/sc-1forcr.env 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
-  if [[ -z "${api_port}" ]]; then
+  api_port="${API_PORT:-}"
+  if [[ -z "${api_port}" && -f /etc/sc-1forcr.env ]]; then
+    api_port="$(grep -m1 '^API_PORT=' /etc/sc-1forcr.env 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
+  fi
+  if [[ -z "${api_port}" && -f "${app_env}" ]]; then
     api_port="$(grep -m1 '^API_PORT=' "${app_env}" 2>/dev/null | cut -d= -f2- | tr -d '\r\n ' || true)"
   fi
   [[ -z "${api_port}" ]] && api_port="8088"
 
+  INSTALL_AUTH_TOKEN="${api_tok}"
   ZIVPN_HTTP_AUTH_TOKEN="${api_tok}"
   ZIVPN_HTTP_AUTH_URL="http://127.0.0.1:${api_port}/internal/zivpn-auth?token=${api_tok}"
   API_AUTH_TOKEN="${api_tok}"
+  AUTH_TOKEN="${api_tok}"
   API_PORT="${api_port}"
 
   update_sc_env_var "API_AUTH_TOKEN" "${API_AUTH_TOKEN}"
@@ -19698,6 +19710,17 @@ sync_zivpn_auth_token_with_api_runtime() {
   update_app_env_var "API_AUTH_TOKEN" "${API_AUTH_TOKEN}"
   update_app_env_var "AUTH_TOKEN" "${API_AUTH_TOKEN}"
   update_app_env_var "API_PORT" "${API_PORT}"
+
+  if command -v sqlite3 >/dev/null 2>&1 && [[ -f "${DB_PATH}" ]]; then
+    sql_key="$(printf '%s' "${API_AUTH_TOKEN}" | sed "s/'/''/g")"
+    if ! sqlite3 "${DB_PATH}" "PRAGMA busy_timeout=10000; CREATE TABLE IF NOT EXISTS servers (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE NOT NULL); DELETE FROM servers; INSERT INTO servers(\"key\") VALUES('${sql_key}');" >/dev/null; then
+      echo "Peringatan: gagal menyamakan key tabel servers."
+    fi
+  fi
+
+  if declare -F ensure_zivpn_config_schema >/dev/null 2>&1; then
+    ensure_zivpn_config_schema || true
+  fi
 
   echo "Sinkron token ZIVPN<->API: OK (port ${API_PORT}, token $(mask_secret "${API_AUTH_TOKEN}"))"
 }
@@ -19765,7 +19788,7 @@ persist_pending_install_env() {
   local vars key
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
   vars=(
-    DOMAIN EMAIL API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH
+    DOMAIN EMAIL INSTALL_AUTH_TOKEN API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH
     LICENSE_ENFORCE LICENSE_API_URL LICENSE_API_TOKEN LICENSE_KEY
     UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API SUMMARY_API_SETUP_URL
     WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN WILDCARD_CF_EMAIL WILDCARD_CF_API_KEY
@@ -19996,6 +20019,8 @@ main() {
   run_install_step "33_auto_menu" 96 "Setup auto menu login" setup_auto_menu_login
   run_install_step "34_version_marker" 97 "Tulis marker versi" write_version_marker
   run_install_step "35_sync_token" 98 "Sinkron token ZIVPN dan API" sync_zivpn_auth_token_with_api_runtime
+  # Selalu rekonsiliasi ulang walau checkpoint step 35 berasal dari instalasi lama.
+  sync_zivpn_auth_token_with_api_runtime
   run_install_step "36_sshws_guard" 98 "Terapkan guard SSHWS" apply_sshws_loop_guard_rules
   run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
   run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain

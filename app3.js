@@ -2506,6 +2506,34 @@ async function sendBroadcastToAllUsers(senderCtx, message) {
   return { total: ids.length, ok, fail };
 }
 
+async function sendPhotoBroadcastToAllUsers(senderCtx) {
+  const photos = Array.isArray(senderCtx.message?.photo) ? senderCtx.message.photo : [];
+  const photo = photos[photos.length - 1];
+  const fileId = String(photo?.file_id || '').trim();
+  if (!fileId) return { total: 0, ok: 0, fail: 0 };
+
+  const caption = String(senderCtx.message?.caption || '').trim();
+  const captionEntities = Array.isArray(senderCtx.message?.caption_entities)
+    ? senderCtx.message.caption_entities
+    : [];
+  const extra = {};
+  if (caption) extra.caption = caption;
+  if (caption && captionEntities.length) extra.caption_entities = captionEntities;
+
+  const ids = await listAllUserIds();
+  let ok = 0;
+  let fail = 0;
+  for (const uid of ids) {
+    try {
+      await senderCtx.telegram.sendPhoto(uid, fileId, extra);
+      ok += 1;
+    } catch (_) {
+      fail += 1;
+    }
+  }
+  return { total: ids.length, ok, fail };
+}
+
 function getRangeStartEnd(period) {
   const p = String(period || '').toLowerCase();
   const now = new Date();
@@ -3613,8 +3641,9 @@ bot.action('m_admin_broadcast', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_broadcast_message' });
   return ctx.reply(
-    'Kirim pesan broadcast untuk semua user.\n' +
-    'Pesan akan dikirim apa adanya.\n' +
+    'Kirim teks atau foto untuk broadcast ke semua user.\n' +
+    'Foto boleh menggunakan caption atau tanpa caption.\n' +
+    'Teks dan caption akan dikirim apa adanya.\n' +
     'Ketik "batal" untuk membatalkan.'
   );
 });
@@ -6264,6 +6293,31 @@ bot.on('text', async (ctx) => {
   } catch (err) {
     userState.delete(ctx.chat.id);
     return ctx.reply(`Gagal: ${parseErr(err)}`, mainMenu());
+  }
+});
+
+bot.on('photo', async (ctx) => {
+  const state = userState.get(ctx.chat.id);
+  if (!state || state.step !== 'admin_broadcast_message') return;
+
+  if (!isAdmin(ctx.from.id)) {
+    userState.delete(ctx.chat.id);
+    return ctx.reply('Akses ditolak. Hanya admin.');
+  }
+
+  const photos = Array.isArray(ctx.message?.photo) ? ctx.message.photo : [];
+  if (!photos.length) return ctx.reply('Foto broadcast tidak valid. Silakan kirim ulang.');
+
+  userState.delete(ctx.chat.id);
+  try {
+    await ctx.reply('Broadcast foto sedang dikirim ke semua user...');
+    const result = await sendPhotoBroadcastToAllUsers(ctx);
+    return ctx.reply(
+      `Broadcast foto selesai.\nTotal user: ${result.total}\nBerhasil: ${result.ok}\nGagal: ${result.fail}`,
+      adminMenu()
+    );
+  } catch (err) {
+    return ctx.reply(`Broadcast foto gagal: ${parseErr(err)}`, adminMenu());
   }
 });
 

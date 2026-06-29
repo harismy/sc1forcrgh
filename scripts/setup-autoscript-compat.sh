@@ -1027,16 +1027,20 @@ install_optional_pkg_if_available() {
 }
 
 package_manager_busy() {
-  local proc comm
-  if command -v fuser >/dev/null 2>&1 && \
-     fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
-    return 0
+  local proc comm state
+  if command -v fuser >/dev/null 2>&1; then
+    if fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
   fi
   for proc in /proc/[0-9]*/comm; do
     [[ -r "${proc}" ]] || continue
     IFS= read -r comm < "${proc}" || continue
+    state="$(awk '{print $3}' "${proc%/comm}/stat" 2>/dev/null || true)"
+    [[ "${state}" == "Z" ]] && continue
     case "${comm}" in
-      apt|apt-get|dpkg|unattended-upgrade|packagekitd) return 0 ;;
+      apt|apt-get|dpkg|unattended-upgr*) return 0 ;;
     esac
   done
   return 1

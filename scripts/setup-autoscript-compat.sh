@@ -13272,6 +13272,15 @@ endpoint_unlock() {
     *) echo "" ;;
   esac
 }
+endpoint_lock() {
+  case "$1" in
+    ssh|zivpn) echo "/locksshvpn" ;;
+    vmess) echo "/lockvmess" ;;
+    vless) echo "/lockvless" ;;
+    trojan) echo "/locktrojan" ;;
+    *) echo "" ;;
+  esac
+}
 endpoint_quota() {
   case "$1" in
     ssh|zivpn) echo "/editquotasshvpn" ;;
@@ -14404,6 +14413,28 @@ delete_account() {
   echo "Akun ${type^^} ${label} '${username}' berhasil dihapus permanen."
 }
 
+lock_account() {
+  local type ep username resp code message confirm
+  type="$(pick_type)"
+  [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
+  ep="$(endpoint_lock "$type")"
+  [[ -z "$ep" ]] && { echo "Endpoint lock tidak ada."; return; }
+  echo "LOCK AKUN ${type^^} - AKTIF"
+  username="$(pick_existing_username "$type" "active")" || return
+  printf "%-12s : %s\n" "Username" "${username}"
+  prompt_input confirm "Ketik LOCK untuk konfirmasi: " || return
+  [[ "${confirm^^}" != "LOCK" ]] && { echo "Dibatalkan."; return; }
+  resp="$(api_call "PATCH" "${ep}/${username}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal lock akun ${type^^}: ${message}"
+    return
+  fi
+  echo "Akun ${type^^} '${username}' berhasil di-lock."
+  telegram_notify_action "LOCK" "${type}" "${username}"
+}
+
 unlock_account() {
   local type ep username resp code message username_sql
   type="$(pick_type)"
@@ -14896,14 +14927,16 @@ account_lock_menu() {
   while true; do
     clear
     draw_menu_panel "LOCK & UNLOCK" \
-      "1) Unlock Account" \
-      "2) Unlock Semua Akun" \
+      "1) Lock Account" \
+      "2) Unlock Account" \
+      "3) Unlock Semua Akun" \
       "0) Kembali"
-    prompt_input choice "Pilih menu [0-2]: " || return
+    prompt_input choice "Pilih menu [0-3]: " || return
     clear
     case "${choice}" in
-      1) unlock_account || true ;;
-      2) unlock_all_accounts || true ;;
+      1) lock_account || true ;;
+      2) unlock_account || true ;;
+      3) unlock_all_accounts || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

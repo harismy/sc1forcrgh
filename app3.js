@@ -2314,6 +2314,7 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
   );
 
   const srcKey = await getServerKeyForHost(userId, srcIp);
+  const dstKey = await getServerKeyForHost(userId, dstIp);
   await dbRun('BEGIN IMMEDIATE TRANSACTION');
   try {
     if (dstAny) {
@@ -2350,16 +2351,15 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
       [userId, srcIp, dstIp, now]
     );
 
-    if (srcKey && srcKey.length >= 8) {
+    if (dstKey && dstKey.length >= 8) {
       await dbRun(
         `INSERT INTO sc_server_keys (user_id, vps_ip, server_key, updated_at)
          VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id, vps_ip) DO UPDATE SET
            server_key=excluded.server_key,
            updated_at=excluded.updated_at`,
-        [userId, dstIp, srcKey, now]
+        [userId, dstIp, dstKey, now]
       );
-      await dbRun('DELETE FROM sc_server_keys WHERE user_id = ? AND vps_ip = ?', [userId, srcIp]);
     }
     await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [userId, srcIp]);
     await dbRun('COMMIT');
@@ -2384,7 +2384,19 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
       oldHostLock.ok = false;
       oldHostLock.message = parseErr(err);
     }
-    await unlockScAccessByHost(dstIp, srcKey, userId, 'activate_after_migrate_ip').catch(() => {});
+  }
+
+  let newHostUnlock = { attempted: false, ok: false, message: 'key server baru belum tersimpan' };
+  if (String(dstKey || '').trim().length >= 8) {
+    newHostUnlock.attempted = true;
+    try {
+      await unlockScAccessByHost(dstIp, dstKey, userId, 'activate_after_migrate_ip');
+      newHostUnlock.ok = true;
+      newHostUnlock.message = 'host baru berhasil di-unlock';
+    } catch (err) {
+      newHostUnlock.ok = false;
+      newHostUnlock.message = parseErr(err);
+    }
   }
 
   const usedAfter = used + 1;
@@ -2392,10 +2404,12 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
     oldIp: srcIp,
     newIp: dstIp,
     remaining: Math.max(0, SC_IP_CHANGE_MAX - usedAfter),
-    serverKey: srcKey || '',
+    serverKey: dstKey || '',
+    oldServerKey: srcKey || '',
     clientName: normalizeClientName(src.client_name || srcIp) || srcIp,
     expiresAt: Number(src.expires_at || 0) || 0,
-    oldHostLock
+    oldHostLock,
+    newHostUnlock
   };
 }
 
@@ -3978,6 +3992,7 @@ bot.action('m_admin_unlock_sc_access', async (ctx) => {
     uiBox('BUKA KUNCI AKSES SC VPS', [
       'Masukkan IP VPS yang ingin dibuka kunci akses menunya.',
       'Bot akan gunakan key tersimpan otomatis.',
+      'Jika key tersimpan salah, kirim: IP KEY_SERVER_BENAR.',
       'Ketik "batal" untuk membatalkan.'
     ])
   );
@@ -5373,16 +5388,24 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      const ip = extractIpv4(text) || normalizeHost(text);
+      const raw = String(text || '').trim();
+      const firstToken = raw.split(/\s+/)[0] || '';
+      const foundIp = extractIpv4(raw);
+      const ip = foundIp || normalizeHost(firstToken || raw);
       if (!isIpv4(ip)) {
         return ctx.reply('Format IP tidak valid.');
       }
-      const key = await getServerKeyForHost(ctx.from.id, ip);
+      const manualKey = foundIp
+        ? raw.replace(foundIp, ' ').replace(/^[\s:=,;-]+/, '').trim().split(/\s+/)[0] || ''
+        : raw.split(/\s+/).slice(1).join('').trim();
+      const key = String(manualKey || '').trim().length >= 8
+        ? String(manualKey || '').trim()
+        : await getServerKeyForHost(ctx.from.id, ip);
       if (String(key || '').trim().length < 8) {
         userState.delete(ctx.chat.id);
         return ctx.reply(
           `Gagal unlock akses SC VPS untuk ${ip}: key server belum tersimpan.\n` +
-            'Simpan dulu key lewat fitur yang meminta key (backup/restore/migrasi).',
+            'Kirim ulang dengan format: IP KEY_SERVER_BENAR.',
           adminMenu()
         );
       }
@@ -5392,6 +5415,9 @@ bot.on('text', async (ctx) => {
           reason: 'admin_unlock_sc_access',
           actor: String(ctx.from.id || '')
         });
+        if (String(manualKey || '').trim().length >= 8) {
+          await saveServerKeyForHostAllOwners(ip, key, ctx.from.id).catch(() => {});
+        }
         userState.delete(ctx.chat.id);
         return ctx.reply(
           `Unlock akses SC VPS berhasil.\n` +
@@ -5401,7 +5427,10 @@ bot.on('text', async (ctx) => {
         );
       } catch (unlockErr) {
         userState.delete(ctx.chat.id);
-        return ctx.reply(`Gagal unlock akses SC VPS: ${parseErr(unlockErr)}`, adminMenu());
+        const extra = String(manualKey || '').trim().length >= 8
+          ? ''
+          : '\n\nJika key tersimpan sudah tidak cocok, ulangi dengan format: IP KEY_SERVER_BENAR.';
+        return ctx.reply(`Gagal unlock akses SC VPS: ${parseErr(unlockErr)}${extra}`, adminMenu());
       }
     }
 
@@ -5587,20 +5616,26 @@ bot.on('text', async (ctx) => {
         return ctx.reply(msg);
       }
       userState.delete(ctx.chat.id);
-      await syncKnownServerKeyAfterScRegistration(ctx.from.id, out.newIp).catch(() => {});
-      await syncScRegistrationMetaToHost(out.newIp, out.serverKey, {
-        status: 'active',
-        client_name: out.clientName,
-        expires_at: Number(out.expiresAt || 0)
-      }).catch(() => {});
+      if (String(out.serverKey || '').trim().length >= 8) {
+        await saveServerKeyForHostAllOwners(out.newIp, out.serverKey, ctx.from.id).catch(() => {});
+        await syncScRegistrationMetaToHost(out.newIp, out.serverKey, {
+          status: 'active',
+          client_name: out.clientName,
+          expires_at: Number(out.expiresAt || 0)
+        }).catch(() => {});
+      }
       const lockInfo = out.oldHostLock?.attempted
         ? (out.oldHostLock?.ok ? 'berhasil' : `gagal (${out.oldHostLock?.message || 'unknown'})`)
         : 'skip (key server lama belum tersimpan)';
+      const unlockInfo = out.newHostUnlock?.attempted
+        ? (out.newHostUnlock?.ok ? 'berhasil' : `gagal (${out.newHostUnlock?.message || 'unknown'})`)
+        : 'skip (key server baru belum tersimpan)';
       return ctx.reply(
         `Ganti IP VPS berhasil.\n` +
           `IP lama: ${out.oldIp}\n` +
           `IP baru: ${out.newIp}\n` +
           `Lock host lama: ${lockInfo}\n` +
+          `Unlock host baru: ${unlockInfo}\n` +
           `Sisa kuota ganti IP: ${out.remaining}x`,
         mainMenu()
       );

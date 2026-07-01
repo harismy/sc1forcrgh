@@ -3246,6 +3246,27 @@ async function deleteAccountsByProtocol(host, key, type, usernamesInput) {
   return { requested: usernames.length, deleted };
 }
 
+async function importAccountsByProtocol(host, key, type, accountsInput, options = {}) {
+  const t = String(type || '').trim().toLowerCase();
+  const accounts = Array.isArray(accountsInput) ? accountsInput : [];
+  if (!accounts.length) return { imported: 0, skipped: 0, chunks: 0 };
+
+  const defaultChunkSize = t === 'ssh' ? 40 : 75;
+  const chunkSize = Math.max(1, Math.min(200, Number(options.chunkSize || defaultChunkSize) || defaultChunkSize));
+  const timeoutMs = Math.max(120000, Number(options.timeoutMs || (t === 'ssh' ? 600000 : 300000)) || 120000);
+
+  let imported = 0;
+  let skipped = 0;
+  let chunks = 0;
+  for (const part of chunkArray(accounts, chunkSize)) {
+    const res = await apiPost(host, key, '/internal/import-accounts', { type: t, accounts: part }, timeoutMs);
+    imported += Number(res?.imported || 0);
+    skipped += Number(res?.skipped || 0);
+    chunks += 1;
+  }
+  return { imported, skipped, chunks };
+}
+
 async function executeMigrationRollback(job) {
   const dstHost = normalizeHost(job?.dst_host);
   const key = await getServerKeyForHost(job?.user_id, dstHost);
@@ -3279,7 +3300,7 @@ async function executeMigrationRollback(job) {
         .map((row) => normalizeAccountForImport(t, row, { forceActive: false, ensureNotExpired: false }))
         .filter((row) => String(row?.username || '').trim().length > 0);
       if (restoreRows.length) {
-        const restored = await apiPost(dstHost, key, '/internal/import-accounts', { type: t, accounts: restoreRows });
+        const restored = await importAccountsByProtocol(dstHost, key, t, restoreRows);
         restoredImported = Number(restored?.imported || 0);
         restoredSkipped = Number(restored?.skipped || 0);
         totalRestored += restoredImported;
@@ -6663,8 +6684,8 @@ bot.on('document', async (ctx) => {
         resultLines.push(`${type.toUpperCase()}: 0 akun (skip)`);
         continue;
       }
-      const imported = await apiPost(state.host, state.key, '/internal/import-accounts', { type, accounts });
-      resultLines.push(`${type.toUpperCase()}: imported ${Number(imported.imported || 0)}, skipped ${Number(imported.skipped || 0)}`);
+      const imported = await importAccountsByProtocol(state.host, state.key, type, accounts);
+      resultLines.push(`${type.toUpperCase()}: imported ${Number(imported.imported || 0)}, skipped ${Number(imported.skipped || 0)} (${Number(imported.chunks || 0)} batch)`);
     }
 
     // Paksa sinkronisasi DB -> config Xray untuk setiap protocol Xray.

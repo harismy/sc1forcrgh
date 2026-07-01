@@ -2429,7 +2429,7 @@ function mainMenu() {
     [Markup.button.callback('💳 Top Up Saldo', 'm_topup_saldo'), Markup.button.callback('💰 Cek Saldo', 'm_cek_saldo')],
     [Markup.button.callback('🔗 Link Instalasi', 'm_install_link'), Markup.button.callback('✨ Fitur SC 1FORCR NEXUS', 'm_sc_features')],
     [Markup.button.callback('🚚 Migrasi Akun', 'm_migrate_accounts'), Markup.button.callback('🧹 Hapus Semua Akun', 'm_delete_all_accounts')],
-    [Markup.button.callback('🗂️ Cadangkan SC', 'm_backup_now'), Markup.button.callback('♻️ Pulihkan SC', 'm_restore_upload')],
+    [Markup.button.callback('🗂️ Backup SC', 'm_backup_now'), Markup.button.callback('♻️ Restore SC', 'm_restore_upload')],
     [Markup.button.callback('💼 Jadi Reseller', 'm_become_reseller'), Markup.button.callback('👥 Grup SC 1FORCR', 'm_group_sc_1forcr')],
     [Markup.button.callback('🛠️ Menu Admin', 'm_admin_menu')]
   ]);

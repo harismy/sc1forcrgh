@@ -100,6 +100,7 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const { execFile, execFileSync } = require('child_process');
 const fs = require('fs');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -643,12 +644,32 @@ function getXrayCredentialFromRow(type, row) {
   const fromId = String(r.id || '').trim();
   const fromPassword = String(r.password || '').trim();
   if (type === 'vmess' || type === 'vless') {
-    return fromUuid || fromId || '';
+    return normalizeXrayUuid(type, r.username || r.email || '', fromUuid || fromId);
   }
   if (type === 'trojan') {
     return fromPassword || fromUuid || '';
   }
   return '';
+}
+
+function isValidXrayUuid(input) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(input || '').trim());
+}
+
+function deterministicXrayUuid(seed) {
+  const chars = crypto.createHash('sha256').update(String(seed || '')).digest('hex').slice(0, 32).split('');
+  chars[12] = '4';
+  chars[16] = (8 + (parseInt(chars[16] || '0', 16) % 4)).toString(16);
+  const hex = chars.join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+function normalizeXrayUuid(type, username, value) {
+  const raw = String(value || '').trim();
+  if (isValidXrayUuid(raw)) return raw.toLowerCase();
+  const user = String(username || '').trim();
+  if (!raw && !user) return '';
+  return deterministicXrayUuid(`${String(type || '').trim().toLowerCase()}:${user}:${raw || 'missing'}`);
 }
 
 function numericValue(input, fallback = 0) {
@@ -690,9 +711,7 @@ function normalizeImportedAccountRow(type, rowInput) {
     const uid = String(row.uuid || row.id || row.secret || '').trim();
     if (!pass && uid) row.password = uid;
   } else if (typeKey === 'vmess' || typeKey === 'vless') {
-    const uuid = String(row.uuid || '').trim();
-    const alt = String(row.id || row.password || row.secret || '').trim();
-    if (!uuid && alt) row.uuid = alt;
+    row.uuid = normalizeXrayUuid(typeKey, row.username, row.uuid || row.id || row.password || row.secret);
   }
 
   return row;

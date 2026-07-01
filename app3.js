@@ -8,6 +8,7 @@ const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const { buildPayload, headers, API_URL } = require('./api-cekpayment-orkut');
+const { parseForeignBackupBuffer } = require('./lib/foreign-backup-parser');
 
 const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
 if (!BOT_TOKEN) {
@@ -112,6 +113,10 @@ const SC_POST_REGISTRATION_NOTIFY_UNLOCK = /^(1|true|yes|on)$/i.test(
 const SC_ADMIN_REMOVE_REMOTE_TIMEOUT_MS = Math.max(
   3000,
   Number(process.env.SC_ADMIN_REMOVE_REMOTE_TIMEOUT_MS || 10000) || 10000
+);
+const RESTORE_BACKUP_MAX_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.RESTORE_BACKUP_MAX_BYTES || (50 * 1024 * 1024)) || (50 * 1024 * 1024)
 );
 
 function dbRun(sql, params = []) {
@@ -830,6 +835,10 @@ function normalizeAccountForImport(type, row, opts = {}) {
   const normalizedStatus = normalizeImportedAccountStatus(out.status || out.status_lock || out.type);
   const forceActive = opts.forceActive !== false;
   out.status = forceActive && normalizedStatus === 'AKTIF' ? 'AKTIF' : normalizedStatus;
+
+  if (opts.preserveExpiredByDate === true && out.status === 'AKTIF' && String(out.date_exp || '').trim() && isDateExpExpired(out.date_exp)) {
+    out.status = 'EXPIRED';
+  }
 
   const shouldFixDate = opts.ensureNotExpired !== false;
   if (shouldFixDate && out.status === 'AKTIF') {
@@ -6419,7 +6428,7 @@ bot.on('text', async (ctx) => {
       await saveServerKeyForHost(ctx.from.id, state.host, text);
       state.step = 'restore_wait_file';
       userState.set(ctx.chat.id, state);
-      return ctx.reply('Upload file backup sebagai document (.json).');
+      return ctx.reply('Upload file backup sebagai document (.json backup SC ini, atau .zip backup autoscript lain).');
     }
   } catch (err) {
     userState.delete(ctx.chat.id);
@@ -6566,31 +6575,70 @@ bot.on('document', async (ctx) => {
     }
 
     const doc = ctx.message.document;
-    const fileName = String(doc?.file_name || '').toLowerCase();
-    if (!fileName.endsWith('.json')) {
-      return ctx.reply('File harus .json (backup akun).');
+    const originalFileName = String(doc?.file_name || '').trim();
+    const fileName = originalFileName.toLowerCase();
+    const isJsonBackup = fileName.endsWith('.json');
+    const isForeignZipBackup = fileName.endsWith('.zip');
+    if (!isJsonBackup && !isForeignZipBackup) {
+      return ctx.reply('File harus .json (backup SC ini) atau .zip (backup autoscript lain).');
     }
 
-    await ctx.reply('Memproses restore backup...');
+    const declaredSize = Number(doc?.file_size || 0);
+    if (declaredSize > RESTORE_BACKUP_MAX_BYTES) {
+      return ctx.reply(`File terlalu besar. Maks ${Math.floor(RESTORE_BACKUP_MAX_BYTES / (1024 * 1024))}MB.`);
+    }
+
+    await ctx.reply(isForeignZipBackup ? 'Memproses restore backup ZIP autoscript lain...' : 'Memproses restore backup...');
 
     const fileLink = await ctx.telegram.getFileLink(doc.file_id);
     const fileResp = await axios.get(fileLink.toString(), {
-      timeout: 60000,
-      responseType: 'text'
+      timeout: isForeignZipBackup ? 120000 : 60000,
+      responseType: 'arraybuffer',
+      maxContentLength: RESTORE_BACKUP_MAX_BYTES,
+      maxBodyLength: RESTORE_BACKUP_MAX_BYTES
     });
-    const raw = String(fileResp.data || '').trim();
-    if (!raw) return ctx.reply('Isi file kosong.');
+    const content = Buffer.from(fileResp.data || '');
+    if (!content.length) return ctx.reply('Isi file kosong.');
+    if (content.length > RESTORE_BACKUP_MAX_BYTES) {
+      return ctx.reply(`File terlalu besar. Maks ${Math.floor(RESTORE_BACKUP_MAX_BYTES / (1024 * 1024))}MB.`);
+    }
 
     let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (_) {
-      return ctx.reply('File backup bukan JSON valid.');
+    if (isJsonBackup) {
+      try {
+        parsed = JSON.parse(content.toString('utf8').trim());
+      } catch (_) {
+        return ctx.reply('File backup bukan JSON valid.');
+      }
+    } else {
+      parsed = parseForeignBackupBuffer(content, originalFileName || 'backup.zip');
     }
 
     const backupData = parsed?.data || {};
     const types = ['ssh', 'vmess', 'vless', 'trojan'];
     const resultLines = [];
+    const foreignSummary = isForeignZipBackup ? (parsed?.summary || null) : null;
+    if (foreignSummary) {
+      resultLines.push('Format: ZIP backup autoscript lain');
+      const fmtDetected = (type) => {
+        const total = Number(foreignSummary?.[type] || 0);
+        const active = Number(foreignSummary?.active?.[type] || 0);
+        const expired = Number(foreignSummary?.expired?.[type] || 0);
+        return `${type.toUpperCase()} ${total} (aktif ${active}, expired ${expired})`;
+      };
+      resultLines.push(`Terdeteksi: ${types.map((type) => fmtDetected(type)).join(', ')}`);
+      const warnings = Array.isArray(foreignSummary.warnings) ? foreignSummary.warnings.slice(0, 5) : [];
+      for (const warn of warnings) resultLines.push(`Warning: ${warn}`);
+    }
+
+    const totalBackupAccounts = types.reduce((sum, type) => {
+      const list = Array.isArray(backupData[type]) ? backupData[type] : [];
+      return sum + list.length;
+    }, 0);
+    if (isForeignZipBackup && totalBackupAccounts <= 0) {
+      userState.delete(ctx.chat.id);
+      return ctx.reply('ZIP berhasil dibaca, tapi tidak ada akun SSH/VMESS/VLESS/TROJAN yang dikenali dari backup itu.', mainMenu());
+    }
 
     const runtimeSettings = backupData.settings || backupData.runtime_settings || null;
     if (runtimeSettings && typeof runtimeSettings === 'object' && !Array.isArray(runtimeSettings) && Object.keys(runtimeSettings).length > 0) {
@@ -6608,7 +6656,7 @@ bot.on('document', async (ctx) => {
     for (const type of types) {
       const rawAccounts = Array.isArray(backupData[type]) ? backupData[type] : [];
       const accounts = rawAccounts
-        .map((row) => normalizeAccountForImport(type, row, { forceActive: true, ensureNotExpired: true }))
+        .map((row) => normalizeAccountForImport(type, row, { forceActive: false, ensureNotExpired: false, preserveExpiredByDate: true }))
         .filter((row) => String(row?.username || '').trim().length > 0);
       restoredAccountsByType[type] = accounts;
       if (accounts.length === 0) {
@@ -6641,7 +6689,11 @@ bot.on('document', async (ctx) => {
       }
     }
 
-    resultLines.push('ZIVPN auth: mengikuti akun SSH (mode unified)');
+    if (foreignSummary && Number(foreignSummary.zivpn_auth || 0) > 0) {
+      resultLines.push(`ZIVPN auth ZIP: ${Number(foreignSummary.zivpn_auth || 0)} user terdeteksi; target SC memakai mode unified mengikuti akun SSH.`);
+    } else {
+      resultLines.push('ZIVPN auth: mengikuti akun SSH (mode unified)');
+    }
 
     if (Object.prototype.hasOwnProperty.call(backupData, 'banner_html') || Object.prototype.hasOwnProperty.call(backupData, 'banner_txt')) {
       try {

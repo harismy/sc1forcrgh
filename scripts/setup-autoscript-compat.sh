@@ -4839,6 +4839,34 @@ function quotaToBytesApi(quotaGb) {
   return Math.floor(n * QUOTA_BYTES_PER_GB);
 }
 
+function hasRenewQuotaInput(value) {
+  return value !== undefined && value !== null && String(value).trim() !== '';
+}
+
+function quotaLimitGb(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
+function resolveRenewQuota(currentQuota, requestedQuotaRaw) {
+  const current = quotaLimitGb(currentQuota);
+  if (!hasRenewQuotaInput(requestedQuotaRaw)) return current;
+  const requested = Number(requestedQuotaRaw);
+  if (!Number.isFinite(requested)) return current;
+  if (requested <= 0) return 0;
+  const requestedLimit = Math.floor(requested);
+  if (current <= 0) return requestedLimit;
+  return current + requestedLimit;
+}
+
+function resolveRenewQuotaAdded(requestedQuotaRaw) {
+  if (!hasRenewQuotaInput(requestedQuotaRaw)) return 0;
+  const requested = Number(requestedQuotaRaw);
+  if (!Number.isFinite(requested) || requested <= 0) return 0;
+  return Math.floor(requested);
+}
+
 async function ensureQuotaRuntimeTables() {
   await run(`CREATE TABLE IF NOT EXISTS account_quota_usage (
     account_type TEXT NOT NULL,
@@ -5071,11 +5099,13 @@ async function renewSsh(req, res) {
   try {
     const username = String(req.params.username || '').trim();
     const exp = Number(req.params.exp || 30);
+    const body = req.body || {};
     const row = await get("SELECT password,limitip,quota,date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
-    const owner = getOwnerInfo(req, req.body || {});
-    const bodyPass = String(req.body?.password || '').trim();
-    const bodyQuota = Number(req.body?.kuota);
-    const bodyLimitIp = Number(req.body?.limitip);
+    const owner = getOwnerInfo(req, body);
+    const bodyPass = String(body?.password || '').trim();
+    const bodyQuotaRaw = body?.kuota;
+    const bodyQuota = Number(bodyQuotaRaw);
+    const bodyLimitIp = Number(body?.limitip);
     const fromExp = String(row?.date_exp || '-');
     const baseExp = String(row?.date_exp || '');
     const expDate = dateExpPlusDays(exp, baseExp);
@@ -5112,7 +5142,8 @@ async function renewSsh(req, res) {
     const oldPass = String(row?.password || '').trim();
     const pass = bodyPass || oldPass || username;
     const currentQuota = Number(row?.quota || 0);
-    const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
+    const nextQuota = resolveRenewQuota(currentQuota, bodyQuotaRaw);
+    const quotaAdded = resolveRenewQuotaAdded(bodyQuotaRaw);
     const currentLimitIp = Number(row?.limitip || 0);
     const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : currentLimitIp;
     const quotaUnlock = await canUnlockQuotaAccount('ssh', username, nextQuota);
@@ -5137,6 +5168,8 @@ async function renewSsh(req, res) {
       to: expDate,
       exp: expDate,
       quota: String(nextQuota),
+      quota_before: String(currentQuota),
+      quota_added: String(quotaAdded),
       quota_used_bytes: String(quotaUnlock.usedBytes || 0),
       quota_unlocked: quotaUnlock.ok,
       status: nextStatus,
@@ -5373,7 +5406,8 @@ async function renewXray(table, username, exp, req) {
   if (!secretCol) throw new Error('invalid table');
 
   const row = await get(`SELECT ${secretCol} AS secret, date_exp, quota, limitip FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]).catch(() => null);
-  const bodyQuota = Number(body?.kuota);
+  const bodyQuotaRaw = body?.kuota;
+  const bodyQuota = Number(bodyQuotaRaw);
   const bodyLimitIp = Number(body?.limitip);
   const fromExp = String(row?.date_exp || '-');
   const baseExp = String(row?.date_exp || '');
@@ -5402,7 +5436,8 @@ async function renewXray(table, username, exp, req) {
   }
 
   const currentQuota = Number(row?.quota || 0);
-  const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
+  const nextQuota = resolveRenewQuota(currentQuota, bodyQuotaRaw);
+  const quotaAdded = resolveRenewQuotaAdded(bodyQuotaRaw);
   const currentLimitIp = Number(row?.limitip || 0);
   const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : currentLimitIp;
   const secret = String(row?.secret || '').trim() || crypto.randomUUID();
@@ -5424,6 +5459,8 @@ async function renewXray(table, username, exp, req) {
     to: expDate,
     exp: expDate,
     quota: String(nextQuota),
+    quota_before: String(currentQuota),
+    quota_added: String(quotaAdded),
     quota_used_bytes: String(quotaUnlock.usedBytes || 0),
     quota_unlocked: quotaUnlock.ok,
     status: nextStatus,

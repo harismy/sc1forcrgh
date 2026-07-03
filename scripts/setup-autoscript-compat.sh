@@ -107,6 +107,9 @@ set -euo pipefail
 #   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_VLESS=/vless                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
+#   NETWORK_COMPAT_ENABLE=0                      (opsional, 1=prefer IPv4 + mitigasi MTU black-hole)
+#   NETWORK_TCP_MSS=1360                         (opsional, MSS maksimum koneksi TCP tunnel)
+#   XRAY_OUTBOUND_DOMAIN_STRATEGY=UseIPv4        (opsional: AsIs|UseIP|UseIPv4|UseIPv6)
 #   SSHWS_READER_BUFFER_KB=16                    (opsional, buffer per koneksi SSHWS; 16 hemat RAM, max 64)
 #   SSHWS_TCP_KEEPALIVE_SECONDS=30               (opsional, keepalive TCP mux SSHWS)
 #   SC_API_MEMORY_MAX=auto                       (opsional, batas RAM service API; auto by RAM/vCPU)
@@ -237,6 +240,9 @@ XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
+NETWORK_COMPAT_ENABLE="${NETWORK_COMPAT_ENABLE:-0}"
+NETWORK_TCP_MSS="${NETWORK_TCP_MSS:-1360}"
+XRAY_OUTBOUND_DOMAIN_STRATEGY="${XRAY_OUTBOUND_DOMAIN_STRATEGY:-}"
 SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-auto}"
 SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}"
 DROPBEAR_KEEPALIVE_SECONDS="${DROPBEAR_KEEPALIVE_SECONDS:-30}"
@@ -587,6 +593,24 @@ XRAY_PATHS_TROJAN="$(normalize_xray_paths_csv "${XRAY_PATHS_TROJAN}" "/trojan")"
 XRAY_PATHS_VMESS="/vmess"
 XRAY_PATHS_VLESS="/vless"
 XRAY_PATHS_TROJAN="/trojan"
+
+NETWORK_TCP_MSS="$(echo "${NETWORK_TCP_MSS}" | tr -cd '0-9')"
+if [[ -z "${NETWORK_TCP_MSS}" || "${NETWORK_TCP_MSS}" -lt 536 || "${NETWORK_TCP_MSS}" -gt 1460 ]]; then
+  NETWORK_TCP_MSS="1360"
+fi
+case "${XRAY_OUTBOUND_DOMAIN_STRATEGY,,}" in
+  asis) XRAY_OUTBOUND_DOMAIN_STRATEGY="AsIs" ;;
+  useip) XRAY_OUTBOUND_DOMAIN_STRATEGY="UseIP" ;;
+  useipv4) XRAY_OUTBOUND_DOMAIN_STRATEGY="UseIPv4" ;;
+  useipv6) XRAY_OUTBOUND_DOMAIN_STRATEGY="UseIPv6" ;;
+  *)
+    if flag_enabled "${NETWORK_COMPAT_ENABLE:-0}"; then
+      XRAY_OUTBOUND_DOMAIN_STRATEGY="UseIPv4"
+    else
+      XRAY_OUTBOUND_DOMAIN_STRATEGY="AsIs"
+    fi
+    ;;
+esac
 
 tls_cert_domain() {
   if flag_enabled "${WILDCARD_ENABLE:-0}" && [[ -n "${WILDCARD_BASE_DOMAIN:-}" ]]; then
@@ -1566,6 +1590,105 @@ SQL
   done
 }
 
+network_effective_tcp_mss() {
+  local requested iface mtu route_max
+  requested="$(echo "${NETWORK_TCP_MSS:-1360}" | tr -cd '0-9')"
+  [[ -z "${requested}" || "${requested}" -lt 536 || "${requested}" -gt 1460 ]] && requested="1360"
+  iface="$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')"
+  mtu=""
+  if [[ -n "${iface}" && -r "/sys/class/net/${iface}/mtu" ]]; then
+    mtu="$(tr -cd '0-9' < "/sys/class/net/${iface}/mtu")"
+  fi
+  if [[ -n "${mtu}" && "${mtu}" -gt 576 ]]; then
+    route_max=$((mtu - 40))
+    [[ "${route_max}" -lt "${requested}" ]] && requested="${route_max}"
+  fi
+  [[ "${requested}" -lt 536 ]] && requested="536"
+  printf '%s\n' "${requested}"
+}
+
+clear_network_mss_rules() {
+  local parent
+  command -v iptables >/dev/null 2>&1 || return 0
+  for parent in INPUT OUTPUT FORWARD; do
+    while iptables -w 10 -t mangle -C "${parent}" -p tcp --tcp-flags SYN,RST SYN \
+      -j SC1FORCR_MSS >/dev/null 2>&1; do
+      iptables -w 10 -t mangle -D "${parent}" -p tcp --tcp-flags SYN,RST SYN \
+        -j SC1FORCR_MSS >/dev/null 2>&1 || break
+    done
+  done
+  iptables -w 10 -t mangle -F SC1FORCR_MSS >/dev/null 2>&1 || true
+  iptables -w 10 -t mangle -X SC1FORCR_MSS >/dev/null 2>&1 || true
+}
+
+apply_network_mss_rules() {
+  local effective_mss min_match parent
+  command -v iptables >/dev/null 2>&1 || {
+    log "iptables tidak tersedia, rule MSS compatibility dilewati."
+    return 0
+  }
+
+  effective_mss="$(network_effective_tcp_mss)"
+  min_match=$((effective_mss + 1))
+  clear_network_mss_rules
+  iptables -w 10 -t mangle -N SC1FORCR_MSS >/dev/null 2>&1 || true
+  iptables -w 10 -t mangle -A SC1FORCR_MSS -p tcp --tcp-flags SYN,RST SYN \
+    -m tcpmss --mss "${min_match}:65535" \
+    -j TCPMSS --set-mss "${effective_mss}" >/dev/null 2>&1 || {
+      log "Gagal memasang target TCPMSS; cek dukungan modul netfilter VPS."
+      return 0
+    }
+
+  for parent in INPUT OUTPUT FORWARD; do
+    while iptables -w 10 -t mangle -C "${parent}" -p tcp --tcp-flags SYN,RST SYN \
+      -j SC1FORCR_MSS >/dev/null 2>&1; do
+      iptables -w 10 -t mangle -D "${parent}" -p tcp --tcp-flags SYN,RST SYN \
+        -j SC1FORCR_MSS >/dev/null 2>&1 || break
+    done
+    iptables -w 10 -t mangle -I "${parent}" 1 -p tcp --tcp-flags SYN,RST SYN \
+      -j SC1FORCR_MSS >/dev/null 2>&1 || true
+  done
+  fw_persist_rules
+  log "Network compatibility MSS aktif: ${effective_mss} (interface default mengikuti MTU VPS)."
+}
+
+apply_network_ipv4_preference() {
+  touch /etc/gai.conf
+  sed -i '/^# BEGIN SC-1FORCR NETWORK COMPAT$/,/^# END SC-1FORCR NETWORK COMPAT$/d' /etc/gai.conf
+  cat >> /etc/gai.conf <<'EOF'
+# BEGIN SC-1FORCR NETWORK COMPAT
+precedence ::1/128       50
+precedence ::/0          40
+precedence 2002::/16     30
+precedence ::/96         20
+precedence ::ffff:0:0/96  100
+# END SC-1FORCR NETWORK COMPAT
+EOF
+}
+
+apply_network_compatibility() {
+  if ! flag_enabled "${NETWORK_COMPAT_ENABLE:-0}"; then
+    clear_network_mss_rules
+    fw_persist_rules
+    if [[ -f /etc/gai.conf ]]; then
+      sed -i '/^# BEGIN SC-1FORCR NETWORK COMPAT$/,/^# END SC-1FORCR NETWORK COMPAT$/d' /etc/gai.conf
+    fi
+    rm -f /etc/sysctl.d/99-sc-1forcr-network.conf
+    sysctl -w net.ipv4.tcp_mtu_probing=0 >/dev/null 2>&1 || true
+    log "Network compatibility nonaktif."
+    return 0
+  fi
+
+  log "Apply network compatibility (IPv4 preference + PMTU/MSS)..."
+  cat > /etc/sysctl.d/99-sc-1forcr-network.conf <<'EOF'
+# Pulihkan koneksi TCP saat ICMP packet-too-big diblok oleh jaringan provider.
+net.ipv4.tcp_mtu_probing=1
+EOF
+  sysctl -p /etc/sysctl.d/99-sc-1forcr-network.conf >/dev/null 2>&1 || true
+  apply_network_ipv4_preference
+  apply_network_mss_rules
+}
+
 apply_system_optimizations() {
   log "Apply basic optimization (1GB RAM friendly)..."
 
@@ -1599,6 +1722,7 @@ SystemMaxUse=100M
 RuntimeMaxUse=50M
 EOF
   systemctl restart systemd-journald || true
+  apply_network_compatibility
 }
 
 setup_logrotate_optimizations() {
@@ -2751,6 +2875,9 @@ XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
+NETWORK_COMPAT_ENABLE=${NETWORK_COMPAT_ENABLE}
+NETWORK_TCP_MSS=${NETWORK_TCP_MSS}
+XRAY_OUTBOUND_DOMAIN_STRATEGY=${XRAY_OUTBOUND_DOMAIN_STRATEGY}
 VMESS_BUG_PROFILE_ADDRESS=${VMESS_BUG_PROFILE_ADDRESS}
 VMESS_BUG_PROFILE_SNI=${VMESS_BUG_PROFILE_SNI}
 VMESS_BUG_PROFILE_HOST=${VMESS_BUG_PROFILE_HOST}
@@ -2876,6 +3003,13 @@ function buildXrayFrontTargets() {
   return targets;
 }
 const XRAY_FRONT_TARGETS = buildXrayFrontTargets();
+const XRAY_OUTBOUND_DOMAIN_STRATEGY = (() => {
+  const value = String(process.env.XRAY_OUTBOUND_DOMAIN_STRATEGY || 'AsIs').trim().toLowerCase();
+  if (value === 'asis') return 'AsIs';
+  if (value === 'useip') return 'UseIP';
+  if (value === 'useipv6') return 'UseIPv6';
+  return 'UseIPv4';
+})();
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
@@ -4458,7 +4592,11 @@ async function renderAndReloadXray() {
         streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
-    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
+    outbounds: [{
+      protocol: 'freedom',
+      tag: 'direct',
+      settings: { domainStrategy: XRAY_OUTBOUND_DOMAIN_STRATEGY }
+    }],
     stats: {},
     api: { tag: 'api', services: ['StatsService'] },
     policy: {
@@ -5570,7 +5708,11 @@ async function setStatusXray(table, username, status) {
         streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
-    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
+    outbounds: [{
+      protocol: 'freedom',
+      tag: 'direct',
+      settings: { domainStrategy: XRAY_OUTBOUND_DOMAIN_STRATEGY }
+    }],
     stats: {},
     api: { tag: 'api', services: ['StatsService'] },
     policy: {
@@ -6426,6 +6568,13 @@ function parseXrayPathList(raw, fallback) {
 const XRAY_PATH_VMESS = parseXrayPathList(process.env.XRAY_PATHS_VMESS, '/vmess')[0];
 const XRAY_PATH_VLESS = parseXrayPathList(process.env.XRAY_PATHS_VLESS, '/vless')[0];
 const XRAY_PATH_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/trojan')[0];
+const XRAY_OUTBOUND_DOMAIN_STRATEGY = (() => {
+  const value = String(process.env.XRAY_OUTBOUND_DOMAIN_STRATEGY || 'AsIs').trim().toLowerCase();
+  if (value === 'asis') return 'AsIs';
+  if (value === 'useip') return 'UseIP';
+  if (value === 'useipv6') return 'UseIPv6';
+  return 'UseIPv4';
+})();
 const XRAY_LOG_TAIL_LINES_RAW = Number(process.env.XRAY_LOG_TAIL_LINES || 8000);
 const XRAY_LOG_TAIL_LINES = Number.isFinite(XRAY_LOG_TAIL_LINES_RAW) && XRAY_LOG_TAIL_LINES_RAW >= 1000
   ? Math.min(Math.floor(XRAY_LOG_TAIL_LINES_RAW), 60000)
@@ -8701,7 +8850,11 @@ async function rebuildXrayFromDb() {
         streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
       }
     ],
-    outbounds: [{ protocol: 'freedom', tag: 'direct' }],
+    outbounds: [{
+      protocol: 'freedom',
+      tag: 'direct',
+      settings: { domainStrategy: XRAY_OUTBOUND_DOMAIN_STRATEGY }
+    }],
     stats: {},
     api: { tag: 'api', services: ['StatsService'] },
     policy: {
@@ -11926,6 +12079,9 @@ XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
+NETWORK_COMPAT_ENABLE=${NETWORK_COMPAT_ENABLE}
+NETWORK_TCP_MSS=${NETWORK_TCP_MSS}
+XRAY_OUTBOUND_DOMAIN_STRATEGY=${XRAY_OUTBOUND_DOMAIN_STRATEGY}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_READER_BUFFER_KB=${SSHWS_READER_BUFFER_KB}
 SSHWS_TCP_KEEPALIVE_SECONDS=${SSHWS_TCP_KEEPALIVE_SECONDS}
@@ -12485,6 +12641,226 @@ fw_persist_rules() {
     nft list ruleset >/etc/nftables.conf 2>/dev/null || true
   fi
   return 0
+}
+
+network_effective_tcp_mss() {
+  local requested iface mtu route_max
+  requested="$(echo "${NETWORK_TCP_MSS:-1360}" | tr -cd '0-9')"
+  [[ -z "${requested}" || "${requested}" -lt 536 || "${requested}" -gt 1460 ]] && requested="1360"
+  iface="$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')"
+  mtu=""
+  if [[ -n "${iface}" && -r "/sys/class/net/${iface}/mtu" ]]; then
+    mtu="$(tr -cd '0-9' < "/sys/class/net/${iface}/mtu")"
+  fi
+  if [[ -n "${mtu}" && "${mtu}" -gt 576 ]]; then
+    route_max=$((mtu - 40))
+    [[ "${route_max}" -lt "${requested}" ]] && requested="${route_max}"
+  fi
+  [[ "${requested}" -lt 536 ]] && requested="536"
+  printf '%s\n' "${requested}"
+}
+
+clear_network_mss_rules() {
+  local parent
+  command -v iptables >/dev/null 2>&1 || return 0
+  for parent in INPUT OUTPUT FORWARD; do
+    while iptables -w 10 -t mangle -C "${parent}" -p tcp --tcp-flags SYN,RST SYN \
+      -j SC1FORCR_MSS >/dev/null 2>&1; do
+      iptables -w 10 -t mangle -D "${parent}" -p tcp --tcp-flags SYN,RST SYN \
+        -j SC1FORCR_MSS >/dev/null 2>&1 || break
+    done
+  done
+  iptables -w 10 -t mangle -F SC1FORCR_MSS >/dev/null 2>&1 || true
+  iptables -w 10 -t mangle -X SC1FORCR_MSS >/dev/null 2>&1 || true
+}
+
+apply_network_mss_rules() {
+  local effective_mss min_match parent
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "iptables tidak tersedia, rule MSS dilewati."
+    return 0
+  fi
+  effective_mss="$(network_effective_tcp_mss)"
+  min_match=$((effective_mss + 1))
+  clear_network_mss_rules
+  iptables -w 10 -t mangle -N SC1FORCR_MSS >/dev/null 2>&1 || true
+  if ! iptables -w 10 -t mangle -A SC1FORCR_MSS -p tcp --tcp-flags SYN,RST SYN \
+    -m tcpmss --mss "${min_match}:65535" \
+    -j TCPMSS --set-mss "${effective_mss}" >/dev/null 2>&1; then
+    echo "Gagal memasang TCPMSS. Modul netfilter VPS mungkin tidak tersedia."
+    return 1
+  fi
+  for parent in INPUT OUTPUT FORWARD; do
+    iptables -w 10 -t mangle -I "${parent}" 1 -p tcp --tcp-flags SYN,RST SYN \
+      -j SC1FORCR_MSS >/dev/null 2>&1 || true
+  done
+  fw_persist_rules
+  echo "MSS compatibility aktif: ${effective_mss}."
+}
+
+set_network_ipv4_preference() {
+  touch /etc/gai.conf
+  sed -i '/^# BEGIN SC-1FORCR NETWORK COMPAT$/,/^# END SC-1FORCR NETWORK COMPAT$/d' /etc/gai.conf
+  cat >> /etc/gai.conf <<'EOF'
+# BEGIN SC-1FORCR NETWORK COMPAT
+precedence ::1/128       50
+precedence ::/0          40
+precedence 2002::/16     30
+precedence ::/96         20
+precedence ::ffff:0:0/96  100
+# END SC-1FORCR NETWORK COMPAT
+EOF
+}
+
+clear_network_ipv4_preference() {
+  [[ -f /etc/gai.conf ]] || return 0
+  sed -i '/^# BEGIN SC-1FORCR NETWORK COMPAT$/,/^# END SC-1FORCR NETWORK COMPAT$/d' /etc/gai.conf
+}
+
+patch_xray_outbound_strategy() {
+  local strategy="$1" cfg tmp
+  command -v jq >/dev/null 2>&1 || return 0
+  for cfg in /usr/local/etc/xray/config.json /etc/xray/config.json; do
+    [[ -s "${cfg}" ]] || continue
+    tmp="$(mktemp)"
+    if jq --arg strategy "${strategy}" '
+      .outbounds = ((.outbounds // []) | map(
+        if ((.protocol // "") | ascii_downcase) == "freedom" then
+          .settings = ((.settings // {}) + {domainStrategy: $strategy})
+        else . end
+      ))
+    ' "${cfg}" > "${tmp}"; then
+      install -m 644 "${tmp}" "${cfg}"
+    fi
+    rm -f "${tmp}"
+  done
+  return 0
+}
+
+save_network_mode() {
+  update_sc_env_var "NETWORK_COMPAT_ENABLE" "${NETWORK_COMPAT_ENABLE}"
+  update_sc_env_var "NETWORK_TCP_MSS" "${NETWORK_TCP_MSS}"
+  update_sc_env_var "XRAY_OUTBOUND_DOMAIN_STRATEGY" "${XRAY_OUTBOUND_DOMAIN_STRATEGY}"
+  update_app_env_var "NETWORK_COMPAT_ENABLE" "${NETWORK_COMPAT_ENABLE}"
+  update_app_env_var "NETWORK_TCP_MSS" "${NETWORK_TCP_MSS}"
+  update_app_env_var "XRAY_OUTBOUND_DOMAIN_STRATEGY" "${XRAY_OUTBOUND_DOMAIN_STRATEGY}"
+}
+
+restart_network_compat_services() {
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+  sleep 2
+  if ! systemctl restart xray >/dev/null 2>&1; then
+    echo "Xray gagal restart. Cek: journalctl -u xray -n 50 --no-pager"
+    return 1
+  fi
+  return 0
+}
+
+enable_network_compatibility() {
+  local mss_in
+  if prompt_input mss_in "MSS TCP [${NETWORK_TCP_MSS:-1360}]: "; then
+    mss_in="$(echo "${mss_in:-${NETWORK_TCP_MSS:-1360}}" | tr -cd '0-9')"
+  else
+    return 1
+  fi
+  if [[ -z "${mss_in}" || "${mss_in}" -lt 536 || "${mss_in}" -gt 1460 ]]; then
+    echo "MSS harus 536-1460."
+    return 1
+  fi
+
+  NETWORK_COMPAT_ENABLE="1"
+  NETWORK_TCP_MSS="${mss_in}"
+  XRAY_OUTBOUND_DOMAIN_STRATEGY="UseIPv4"
+  cat > /etc/sysctl.d/99-sc-1forcr-network.conf <<'EOF'
+# Pulihkan koneksi TCP saat ICMP packet-too-big diblok oleh jaringan provider.
+net.ipv4.tcp_mtu_probing=1
+EOF
+  sysctl -p /etc/sysctl.d/99-sc-1forcr-network.conf >/dev/null 2>&1 || true
+  set_network_ipv4_preference
+  apply_network_mss_rules || true
+  patch_xray_outbound_strategy "${XRAY_OUTBOUND_DOMAIN_STRATEGY}"
+  save_network_mode
+  restart_network_compat_services || true
+  echo "Mode kompatibilitas jaringan aktif (Xray IPv4, PMTU probing, MSS ${NETWORK_TCP_MSS})."
+}
+
+disable_network_compatibility() {
+  NETWORK_COMPAT_ENABLE="0"
+  XRAY_OUTBOUND_DOMAIN_STRATEGY="AsIs"
+  clear_network_mss_rules
+  fw_persist_rules
+  clear_network_ipv4_preference
+  rm -f /etc/sysctl.d/99-sc-1forcr-network.conf
+  sysctl -w net.ipv4.tcp_mtu_probing=0 >/dev/null 2>&1 || true
+  patch_xray_outbound_strategy "${XRAY_OUTBOUND_DOMAIN_STRATEGY}"
+  save_network_mode
+  restart_network_compat_services || true
+  echo "Mode kompatibilitas nonaktif; pemilihan IPv4/IPv6 kembali otomatis."
+}
+
+network_http_probe() {
+  local family="$1" label="$2" url="$3" result
+  if result="$(curl "-${family}" -LsS -o /dev/null --connect-timeout 5 --max-time 12 \
+    -w '%{http_code} %{time_total}s' "${url}" 2>/dev/null)"; then
+    echo "- ${label}: OK (${result})"
+  else
+    echo "- ${label}: GAGAL"
+  fi
+}
+
+show_network_diagnostics() {
+  local iface mtu dns4 dns6 strategy
+  iface="$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')"
+  mtu="-"
+  [[ -n "${iface}" && -r "/sys/class/net/${iface}/mtu" ]] && mtu="$(cat "/sys/class/net/${iface}/mtu")"
+  dns4="$(getent ahostsv4 www.youtube.com 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+  dns6="$(getent ahostsv6 www.youtube.com 2>/dev/null | awk 'NR==1 {print $1}' || true)"
+  strategy="$(jq -r '[.outbounds[]? | select(((.protocol // "") | ascii_downcase) == "freedom") | (.settings.domainStrategy // "AsIs")][0] // "tidak ditemukan"' /usr/local/etc/xray/config.json 2>/dev/null || true)"
+
+  echo "=== DIAGNOSA JARINGAN ==="
+  echo "- Default route : $(ip -4 route show default 2>/dev/null | head -n1 || true)"
+  echo "- Interface/MTU : ${iface:--}/${mtu}"
+  echo "- DNS YouTube   : IPv4=${dns4:--} IPv6=${dns6:--}"
+  echo "- TCP MTU probe : $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo '-')"
+  echo "- Xray strategy : ${strategy:--}"
+  if command -v iptables >/dev/null 2>&1 && iptables -w 10 -t mangle -S SC1FORCR_MSS >/dev/null 2>&1; then
+    echo "- MSS rule      : aktif ($(network_effective_tcp_mss))"
+  else
+    echo "- MSS rule      : nonaktif"
+  fi
+  network_http_probe 4 "YouTube IPv4" "https://www.youtube.com/generate_204"
+  network_http_probe 4 "Cloudflare IPv4" "https://1.1.1.1/cdn-cgi/trace"
+  if ip -6 route show default 2>/dev/null | grep -q .; then
+    network_http_probe 6 "YouTube IPv6" "https://www.youtube.com/generate_204"
+  else
+    echo "- IPv6 route    : tidak tersedia"
+  fi
+}
+
+network_compatibility_menu() {
+  local nm
+  while true; do
+    clear
+    draw_menu_panel "ROUTING JARINGAN" \
+      "1) Diagnosa koneksi" \
+      "2) Repair mode kompatibilitas" \
+      "3) Kembali ke dual-stack otomatis" \
+      "0) Kembali"
+    echo
+    if ! prompt_input nm "Pilih menu [0-3]: "; then
+      return
+    fi
+    clear
+    case "${nm}" in
+      1) show_network_diagnostics ;;
+      2) enable_network_compatibility ;;
+      3) disable_network_compatibility ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    echo
+    read -rp "Enter untuk lanjut..." _ || true
+  done
 }
 
 ensure_sshws_firewall_allow_rules() {
@@ -15470,9 +15846,10 @@ tools_menu() {
       "13) Setting Interval Auto Reboot" \
       "14) Setting Auto Update Bot" \
       "15) Setting Wildcard Cloudflare" \
+      "16) Diagnosa/Repair Routing Jaringan" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-15]: "; then
+    if ! prompt_input tm "Pilih menu [0-16]: "; then
       return
     fi
     clear
@@ -15492,6 +15869,7 @@ tools_menu() {
       13) set_auto_reboot_config_menu || true ;;
       14) set_auto_pull_update_config_menu || true ;;
       15) set_wildcard_config_menu || true ;;
+      16) network_compatibility_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -18617,6 +18995,9 @@ Time     : $(date '+%F %T')"
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \
     XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
     XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN}" \
+    NETWORK_COMPAT_ENABLE="${NETWORK_COMPAT_ENABLE:-0}" \
+    NETWORK_TCP_MSS="${NETWORK_TCP_MSS:-1360}" \
+    XRAY_OUTBOUND_DOMAIN_STRATEGY="${XRAY_OUTBOUND_DOMAIN_STRATEGY:-AsIs}" \
     SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-auto}" \
     SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}" \
     SSHWS_LOOP_GUARD_ENABLE="${SSHWS_LOOP_GUARD_ENABLE}" \
@@ -19645,6 +20026,7 @@ post_install_preflight() {
 - zivpn listen     : ${zport} ($(ss -lunp 2>/dev/null | awk -v p=":${zport}" '$5 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
 - udphc listen     : ${uport} ($(ss -lunp 2>/dev/null | awk -v p=":${uport}" '$5 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
 - udpgw listen     : 7200=$(ss -lntup 2>/dev/null | awk '$5 ~ /:7200$/ {ok=1} END{print ok?"YES":"NO"}') 7300=$(ss -lntup 2>/dev/null | awk '$5 ~ /:7300$/ {ok=1} END{print ok?"YES":"NO"}')
+- network compat  : ${NETWORK_COMPAT_ENABLE} (MSS $(network_effective_tcp_mss), Xray ${XRAY_OUTBOUND_DOMAIN_STRATEGY})
 - zivpn cert/key   : $( [[ -s /etc/zivpn/zivpn.crt && -s /etc/zivpn/zivpn.key ]] && echo OK || echo MISSING )
 - dnat ${ZIVPN_DNAT_RANGE:-none}->${zport} : ${nat_ok}
 - extra udp ${ZIVPN_EXTRA_UDP_PORTS:-none}->${zport} : ${extra_nat_ok}
@@ -19887,6 +20269,7 @@ persist_pending_install_env() {
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
     XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP
     XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
+    NETWORK_COMPAT_ENABLE NETWORK_TCP_MSS XRAY_OUTBOUND_DOMAIN_STRATEGY
     VMESS_BUG_PROFILE_ADDRESS VMESS_BUG_PROFILE_SNI VMESS_BUG_PROFILE_HOST VMESS_BUG_PROFILE_ALLOW_INSECURE
     SSH_HC_AUTH_LOOKBACK_HOURS SCRIPT_VERSION
   )

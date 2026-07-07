@@ -1115,7 +1115,8 @@ install_base_packages() {
     haproxy \
     nginx certbot \
     openssh-server dropbear pwgen \
-    build-essential python3 make g++ gcc libc6-dev pkg-config libsqlite3-dev bzip2 zlib1g-dev \
+    build-essential python3 python3-setuptools python3-packaging \
+    make g++ gcc libc6-dev pkg-config libsqlite3-dev bzip2 zlib1g-dev \
     netfilter-persistent iptables-persistent
 
   # Paket opsional (beberapa distro/repo lama tidak selalu menyediakan).
@@ -1418,7 +1419,7 @@ harden_ssh_tunnel_shells() {
   command -v sqlite3 >/dev/null 2>&1 || return 0
   [[ -s "${DB_PATH}" ]] || return 0
   shell="$(ensure_tunnel_shell_allowed)"
-  active_where="UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND (TRIM(COALESCE(date_exp,''))='' OR datetime(REPLACE(TRIM(date_exp),'T',' ')) > datetime('now','localtime'))"
+  active_where="UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND (TRIM(COALESCE(date_exp,''))='' OR (CASE WHEN LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 THEN datetime(date(TRIM(date_exp)),'+1 day') ELSE datetime(REPLACE(TRIM(date_exp),'T',' ')) END) > datetime('now','localtime'))"
   changed=0
   while IFS= read -r user; do
     [[ -z "${user}" || "${user}" == "root" ]] && continue
@@ -4319,7 +4320,7 @@ async function syncSshBackendsFromDb() {
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
       "AND (TRIM(COALESCE(date_exp,''))='' " +
       "OR (LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(REPLACE(TRIM(date_exp),'T',' ')) > datetime('now','localtime')) " +
-      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) > date('now','localtime'))) " +
+      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) >= date('now','localtime'))) " +
       "ORDER BY LOWER(username)"
     );
     const zivpnUsers = [];
@@ -4667,7 +4668,7 @@ function isExpiredDateValue(v) {
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
     const today = ymdLocal(new Date());
-    return s <= today;
+    return s < today;
   }
   const ts = new Date(s).getTime();
   if (!Number.isFinite(ts)) return false;
@@ -4707,6 +4708,65 @@ async function cleanupPurgedAccountState(accountType, username) {
   await run("DELETE FROM account_quota_locks WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
 }
 
+async function repairRenewedAccountStatuses() {
+  const expiredStatusSql = "UPPER(TRIM(COALESCE(status,''))) IN ('EXPIRED','RECOVERY','KADALUARSA')";
+  const repaired = { ssh: 0, vmess: 0, vless: 0, trojan: 0 };
+  let xrayChanged = false;
+
+  const sshRows = await all(
+    "SELECT username, password, date_exp FROM account_sshs " +
+    `WHERE ${expiredStatusSql} AND TRIM(COALESCE(date_exp,'')) <> ''`
+  ).catch(() => []);
+  for (const row of sshRows) {
+    const u = String(row?.username || '').trim();
+    const pass = String(row?.password || '').trim() || u;
+    const exp = String(row?.date_exp || '').trim();
+    if (!u || isExpiredDateValue(exp)) continue;
+    const updated = await run(
+      `UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?) AND date_exp=? AND ${expiredStatusSql}`,
+      [u, exp]
+    ).catch(() => null);
+    if (Number(updated?.changes || 0) < 1) continue;
+    ensureLinuxUser(u, pass, ymdFromDateExp(exp));
+    syncZivpnUser(u, true);
+    syncUdpcustomUser(pass, true);
+    repaired.ssh += 1;
+  }
+
+  const xrayTargets = [
+    { table: 'account_vmesses', type: 'vmess' },
+    { table: 'account_vlesses', type: 'vless' },
+    { table: 'account_trojans', type: 'trojan' }
+  ];
+  for (const item of xrayTargets) {
+    const rows = await all(
+      `SELECT username, date_exp FROM ${item.table} ` +
+      `WHERE ${expiredStatusSql} AND TRIM(COALESCE(date_exp,'')) <> ''`
+    ).catch(() => []);
+    for (const row of rows) {
+      const u = String(row?.username || '').trim();
+      const exp = String(row?.date_exp || '').trim();
+      if (!u || isExpiredDateValue(exp)) continue;
+      const updated = await run(
+        `UPDATE ${item.table} SET status='AKTIF' WHERE LOWER(username)=LOWER(?) AND date_exp=? AND ${expiredStatusSql}`,
+        [u, exp]
+      ).catch(() => null);
+      if (Number(updated?.changes || 0) < 1) continue;
+      repaired[item.type] += 1;
+      xrayChanged = true;
+    }
+  }
+
+  if (xrayChanged) {
+    await renderAndReloadXray().catch(() => {});
+  }
+  const total = Object.values(repaired).reduce((sum, value) => sum + value, 0);
+  if (total > 0) {
+    console.log(`[renew-repair] reactivated=${total} ssh=${repaired.ssh} vmess=${repaired.vmess} vless=${repaired.vless} trojan=${repaired.trojan}`);
+  }
+  return repaired;
+}
+
 async function cleanupExpiredTrialAccounts() {
   let deletedSsh = 0;
   let deletedXray = 0;
@@ -4723,8 +4783,9 @@ async function cleanupExpiredTrialAccounts() {
     const pass = String(row?.password || '').trim();
     const exp = String(row?.date_exp || '').trim();
     if (!u || !isExpiredDateValue(exp)) continue;
+    const deleted = await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?) AND date_exp=?", [u, exp]).catch(() => null);
+    if (Number(deleted?.changes || 0) < 1) continue;
     disableSshSystemAccess(u, pass);
-    await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
     await cleanupPurgedAccountState('ssh', u);
     deletedSsh += 1;
   }
@@ -4745,7 +4806,8 @@ async function cleanupExpiredTrialAccounts() {
       const u = String(row?.username || '').trim();
       const exp = String(row?.date_exp || '').trim();
       if (!u || !isExpiredDateValue(exp)) continue;
-      await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
+      const deleted = await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?) AND date_exp=?`, [u, exp]).catch(() => null);
+      if (Number(deleted?.changes || 0) < 1) continue;
       await cleanupPurgedAccountState(item.type, u);
       deletedXray += 1;
       xrayChanged = true;
@@ -4775,8 +4837,12 @@ async function cleanupExpiredSshAccounts() {
     const pass = String(row?.password || '').trim();
     const exp = String(row?.date_exp || '').trim();
     if (!u || !isExpiredDateValue(exp)) continue;
+    const marked = await run(
+      "UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?) AND date_exp=? AND UPPER(TRIM(COALESCE(status,'')))='AKTIF'",
+      [u, exp]
+    ).catch(() => null);
+    if (Number(marked?.changes || 0) < 1) continue;
     disableSshSystemAccess(u, pass);
-    await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
     await cleanupDeletedAccountState('ssh', u);
     expiredBatch.push({
       username: u,
@@ -4815,12 +4881,16 @@ async function cleanupExpiredXrayAccounts() {
       const u = String(row?.username || '').trim();
       const exp = String(row?.date_exp || '').trim();
       if (!u || !isExpiredDateValue(exp)) continue;
+      const marked = await run(
+        `UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?) AND date_exp=? AND UPPER(TRIM(COALESCE(status,'')))='AKTIF'`,
+        [u, exp]
+      ).catch(() => null);
+      if (Number(marked?.changes || 0) < 1) continue;
       expiredBatch[item.type].push({
         username: u,
         date_exp: exp,
         limitip: String(row?.limitip ?? '0')
       });
-      await run(`UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
       await cleanupDeletedAccountState(item.type, u);
       changed = true;
     }
@@ -5341,9 +5411,15 @@ app.patch('/vps/unlocksshvpn/:username', async (req, res) => {
   const username = String(req.params.username || '').trim();
   const row = await get("SELECT quota, date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
   if (row && isExpiredDateValue(row?.date_exp)) {
-    disableSshSystemAccess(username, '');
-    await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
-    await cleanupDeletedAccountState('ssh', username);
+    const exp = String(row?.date_exp || '').trim();
+    const marked = await run(
+      "UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?) AND date_exp=?",
+      [username, exp]
+    ).catch(() => null);
+    if (Number(marked?.changes || 0) > 0) {
+      disableSshSystemAccess(username, '');
+      await cleanupDeletedAccountState('ssh', username);
+    }
     return fail(res, 409, 'akun sudah expired, renew dulu sebelum unlock');
   }
   const quotaUnlock = await canUnlockQuotaAccount('ssh', username, Number(row?.quota || 0));
@@ -5952,6 +6028,7 @@ app.listen(PORT, '127.0.0.1', () => {
     if (isRuntimeLicenseDenied()) stopApiByLicense('expired-or-rejected');
   }, 30 * 1000);
   ensureApiRuntimeTables()
+    .then(() => repairRenewedAccountStatuses())
     .then(() => cleanupExpiredTrialAccounts())
     .then(() => cleanupExpiredSshAccounts())
     .then(() => cleanupExpiredXrayAccounts())
@@ -6120,9 +6197,12 @@ server.listen(PORT, '127.0.0.1', () => {
 EOF
 
   cd "${APP_DIR}"
-  export npm_config_build_from_source=true
+  # Gunakan prebuilt sqlite3 lebih dulu. Source build tetap menjadi fallback
+  # untuk arsitektur yang tidak menyediakan binary siap pakai.
+  export npm_config_build_from_source=false
+  unset npm_config_update_binary
   export npm_config_fallback_to_build=true
-  export npm_config_update_binary=false
+  export SETUPTOOLS_USE_DISTUTILS=local
   npm config set fund false >/dev/null 2>&1 || true
   npm config set audit false >/dev/null 2>&1 || true
 
@@ -6140,7 +6220,7 @@ EOF
 
   if [[ "${need_npm_install}" == "1" ]]; then
     log "Menyiapkan paket build untuk sqlite3 native binding..."
-    if ! apt_get_safe install -y build-essential python3 make g++ gcc libc6-dev pkg-config libsqlite3-dev >/tmp/sc-1forcr-node-build-deps.log 2>&1; then
+    if ! apt_get_safe install -y build-essential python3 python3-setuptools python3-packaging make g++ gcc libc6-dev pkg-config libsqlite3-dev >/tmp/sc-1forcr-node-build-deps.log 2>&1; then
       log "Install paket build sqlite3 gagal. Cek log: /tmp/sc-1forcr-node-build-deps.log"
       tail -n 80 /tmp/sc-1forcr-node-build-deps.log || true
       exit 1
@@ -7930,7 +8010,7 @@ function isExpiredDate(dateExp, todayYmd = '') {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
   const today = String(todayYmd || ymdLocalNow()).trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) return false;
-  return v <= today;
+  return v < today;
 }
 
 async function ensureTables() {
@@ -8348,6 +8428,11 @@ async function enforceExpiredAccounts() {
     const pass = String(row?.password || '').trim();
     const exp = String(row?.date_exp || '').trim();
     if (!user || !isExpiredDate(exp, today)) continue;
+    const marked = await run(
+      "UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?) AND date_exp=? AND UPPER(TRIM(COALESCE(status,'')))='AKTIF'",
+      [user, exp]
+    ).catch(() => null);
+    if (Number(marked?.changes || 0) < 1) continue;
     expiredBatch['ssh/zivpn/udphc'].push({
       username: user,
       exp,
@@ -8367,7 +8452,6 @@ async function enforceExpiredAccounts() {
     if (removeUdpcustomUser(user)) udphcSecretChanged = true;
     if (udphcSecretChanged) udpcustomChanged = true;
 
-    await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
   }
@@ -8387,12 +8471,16 @@ async function enforceExpiredAccounts() {
       const user = String(row?.username || '').trim();
       const exp = String(row?.date_exp || '').trim();
       if (!user || !isExpiredDate(exp, today)) continue;
+      const marked = await run(
+        `UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?) AND date_exp=? AND UPPER(TRIM(COALESCE(status,'')))='AKTIF'`,
+        [user, exp]
+      ).catch(() => null);
+      if (Number(marked?.changes || 0) < 1) continue;
       expiredBatch[item.type].push({
         username: user,
         exp,
         limitip: Number(row?.limitip || 0)
       });
-      await run(`UPDATE ${item.table} SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       xrayChanged = true;
@@ -8436,6 +8524,13 @@ async function unlockExpired(nowTs) {
       const pass = String(sshRow?.password || '').trim();
       const expDate = String(sshRow?.date_exp || '').trim();
       if (isExpiredDate(expDate)) {
+        const marked = await run(
+          "UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?) AND date_exp=?",
+          [u, expDate]
+        ).catch(() => null);
+        if (Number(marked?.changes || 0) < 1) {
+          continue;
+        }
         if (!safeExec('userdel', ['-r', u])) {
           safeExec('passwd', ['-l', u]);
           safeExec('usermod', ['-s', '/usr/sbin/nologin', u]);
@@ -8445,7 +8540,6 @@ async function unlockExpired(nowTs) {
         if (pass && removeUdpcustomUser(pass)) expiredUdphcChanged = true;
         if (removeUdpcustomUser(u)) expiredUdphcChanged = true;
         if (expiredUdphcChanged) udpcustomChanged = true;
-        await run("UPDATE account_sshs SET status='EXPIRED' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
         await run("DELETE FROM zivpn_live_sessions WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
         await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
         await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
@@ -14295,13 +14389,13 @@ account_remaining_minutes_expr() {
   cat <<'EOF'
 CASE
   WHEN TRIM(COALESCE(date_exp,''))='' THEN 999999999
-  ELSE COALESCE(MAX(0, CAST(((julianday(datetime(REPLACE(TRIM(date_exp),'T',' '))) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), 0)
+  ELSE COALESCE(MAX(0, CAST(((julianday(CASE WHEN LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 THEN datetime(date(TRIM(date_exp)),'+1 day') ELSE datetime(REPLACE(TRIM(date_exp),'T',' ')) END) - julianday(datetime('now','localtime'))) * 24 * 60) AS INTEGER)), 0)
 END
 EOF
 }
 
 account_expire_datetime_expr() {
-  echo "datetime(REPLACE(TRIM(date_exp),'T',' '))"
+  echo "CASE WHEN LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 THEN datetime(date(TRIM(date_exp)),'+1 day') ELSE datetime(REPLACE(TRIM(date_exp),'T',' ')) END"
 }
 
 account_active_where_expr() {

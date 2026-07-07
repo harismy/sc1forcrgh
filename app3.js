@@ -1937,6 +1937,10 @@ async function runNaturalScExpiryJobs() {
   const now = Date.now();
   const remindUntil = now + SC_H2_WINDOW_MS;
   const h2ReminderIntervalMs = await getScH2ReminderIntervalMs();
+  await dbRun(
+    "UPDATE sc_registrations SET status='active', updated_at=? WHERE status='expired' AND expires_at IS NOT NULL AND expires_at > ?",
+    [now, now]
+  ).catch(() => {});
   const activeRows = await dbAll(
     "SELECT user_id, vps_ip, client_name, status, expires_at FROM sc_registrations " +
       "WHERE status='active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
@@ -1967,10 +1971,13 @@ async function runNaturalScExpiryJobs() {
     if (!uid || !isIpv4(host) || !expTs) continue;
 
     if (expTs <= now) {
-      await dbRun(
-        "UPDATE sc_registrations SET status='expired', updated_at=? WHERE user_id=? AND vps_ip=? AND status='active'",
-        [now, uid, host]
+      const expiredUpdate = await dbRun(
+        "UPDATE sc_registrations SET status='expired', updated_at=? WHERE user_id=? AND vps_ip=? AND status='active' AND expires_at=?",
+        [now, uid, host, expTs]
       ).catch(() => {});
+      if (Number(expiredUpdate?.changes || 0) < 1) {
+        continue;
+      }
 
       const canNotifyUser = await shouldSendScNotify(uid, host, 'natural_expired_user', SC_NOTIFY_INTERVAL_MS);
       if (canNotifyUser) {
@@ -2196,6 +2203,7 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
       'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ?, client_name = ? WHERE user_id = ? AND vps_ip = ?',
       ['active', now, nextExpiry, finalClientName, userId, ip]
     );
+    await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [userId, ip]);
 
     await saveTransaction(userId, -totalFee, 'sc_registration', `sc_reg_${userId}_${ip}_${days}d_${now}`);
     await dbRun('COMMIT');
@@ -2255,6 +2263,7 @@ async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
       'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ?, client_name = ? WHERE user_id = ? AND vps_ip = ?',
       ['active', now, 0, finalClientName, userId, ip]
     );
+    await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [userId, ip]);
 
     if (chargeSaldo && totalFee > 0) {
       await saveTransaction(userId, -totalFee, txType, txRef);
@@ -5515,6 +5524,7 @@ bot.on('text', async (ctx) => {
         "UPDATE sc_registrations SET status='active', updated_at=?, expires_at=? WHERE user_id=? AND LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?))",
         [now, newExpires, Number(latest.user_id || 0), ip]
       );
+      await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [Number(latest.user_id || 0), ip]);
       const key = await ensureServerKeyForHost(Number(latest.user_id || 0), ip);
       await syncScRegistrationMetaToHost(ip, key, {
         status: 'active',

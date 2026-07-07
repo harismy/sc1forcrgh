@@ -2850,6 +2850,7 @@ SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 SSHWS_READER_BUFFER_KB=${SSHWS_READER_BUFFER_KB}
 SSHWS_TCP_KEEPALIVE_SECONDS=${SSHWS_TCP_KEEPALIVE_SECONDS}
+SSHWS_QUOTA_STATE_FILE=/var/lib/sc-1forcr/sshws-quota.tsv
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 DROPBEAR_KEEPALIVE_SECONDS=${DROPBEAR_KEEPALIVE_SECONDS}
@@ -3947,7 +3948,7 @@ async function notifyExpiredAccountEvent(service, account = {}, owner = {}) {
 async function notifyExpiredAccountsBatchEvent(service, accounts = []) {
   try {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    const list = Array.isArray(accounts) ? accounts : [];
+    const list = await filterStillExpiredBatchForNotify(service, accounts);
     if (list.length === 0) return;
     const rows = list.slice(0, 30).map((acc, idx) => {
       const user = String(acc?.username || '-').trim() || '-';
@@ -3967,6 +3968,37 @@ async function notifyExpiredAccountsBatchEvent(service, accounts = []) {
       remain;
     await telegramNotify(msg);
   } catch (_) {}
+}
+function expiredNotifyTableForService(service) {
+  const s = String(service || '').trim().toLowerCase();
+  if (s.includes('ssh') || s.includes('zivpn') || s.includes('udphc')) return 'account_sshs';
+  if (s === 'vmess') return 'account_vmesses';
+  if (s === 'vless') return 'account_vlesses';
+  if (s === 'trojan') return 'account_trojans';
+  return '';
+}
+async function filterStillExpiredBatchForNotify(service, accounts = []) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  if (list.length === 0) return [];
+  const table = expiredNotifyTableForService(service);
+  if (!table) return list;
+  const out = [];
+  for (const acc of list) {
+    const username = String(acc?.username || '').trim();
+    const expectedExp = String(acc?.date_exp || acc?.exp || acc?.expired || '').trim();
+    if (!username || !expectedExp) continue;
+    const row = await get(
+      `SELECT status, date_exp FROM ${table} WHERE LOWER(username)=LOWER(?) LIMIT 1`,
+      [username]
+    ).catch(() => null);
+    const status = String(row?.status || '').trim().toUpperCase();
+    const currentExp = String(row?.date_exp || '').trim();
+    if (!row || currentExp !== expectedExp) continue;
+    if (!['EXPIRED', 'RECOVERY', 'KADALUARSA'].includes(status)) continue;
+    if (!isExpiredDateValue(currentExp)) continue;
+    out.push(acc);
+  }
+  return out;
 }
 function ymdLocal(d) {
   const y = d.getFullYear();
@@ -5051,10 +5083,27 @@ function hasRenewQuotaInput(value) {
   return value !== undefined && value !== null && String(value).trim() !== '';
 }
 
+function firstNonEmptyInput(...values) {
+  for (const value of values) {
+    if (hasRenewQuotaInput(value)) return value;
+  }
+  return undefined;
+}
+
+function quotaInputFromBody(body = {}) {
+  return firstNonEmptyInput(body?.kuota, body?.quota, body?.quota_gb, body?.quotaGb);
+}
+
 function quotaLimitGb(value) {
   const n = Number(value || 0);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return Math.floor(n);
+}
+
+function quotaLimitGbFromBody(body = {}, fallback = 0) {
+  const raw = quotaInputFromBody(body);
+  if (!hasRenewQuotaInput(raw)) return quotaLimitGb(fallback);
+  return quotaLimitGb(raw);
 }
 
 function resolveRenewQuota(currentQuota, requestedQuotaRaw) {
@@ -5136,7 +5185,7 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   const requestedPassword = String(body?.password || '').trim();
   const password = requestedPassword || randomAlnum(8);
   const expDays = forcedDays === null ? Number(body?.expired || 30) : Number(forcedDays || 1);
-  const quota = Number(body?.kuota || 0);
+  const quota = quotaLimitGbFromBody(body, 0);
   const limitip = Number(body?.limitip || 0);
   if (!username) throw new Error('username required');
   await ensureUsernameNotExists('account_sshs', username);
@@ -5311,7 +5360,7 @@ async function renewSsh(req, res) {
     const row = await get("SELECT password,limitip,quota,date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
     const owner = getOwnerInfo(req, body);
     const bodyPass = String(body?.password || '').trim();
-    const bodyQuotaRaw = body?.kuota;
+    const bodyQuotaRaw = quotaInputFromBody(body);
     const bodyQuota = Number(bodyQuotaRaw);
     const bodyLimitIp = Number(body?.limitip);
     const fromExp = String(row?.date_exp || '-');
@@ -5561,7 +5610,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
 
 app.post('/vps/vmessall', async (req, res) => {
   try {
-    const data = await createXray(req, 'vmess', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    const data = await createXray(req, 'vmess', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), quotaLimitGbFromBody(req.body || {}, 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -5569,7 +5618,7 @@ app.post('/vps/vmessall', async (req, res) => {
 });
 app.post('/vps/trialvmessall', async (req, res) => {
   try {
-    const data = await createXray(req, 'vmess', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    const data = await createXray(req, 'vmess', String(req.body?.username || '').trim(), 1, quotaLimitGbFromBody(req.body || {}, 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -5577,7 +5626,7 @@ app.post('/vps/trialvmessall', async (req, res) => {
 });
 app.post('/vps/vlessall', async (req, res) => {
   try {
-    const data = await createXray(req, 'vless', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    const data = await createXray(req, 'vless', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), quotaLimitGbFromBody(req.body || {}, 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -5585,7 +5634,7 @@ app.post('/vps/vlessall', async (req, res) => {
 });
 app.post('/vps/trialvlessall', async (req, res) => {
   try {
-    const data = await createXray(req, 'vless', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    const data = await createXray(req, 'vless', String(req.body?.username || '').trim(), 1, quotaLimitGbFromBody(req.body || {}, 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -5593,7 +5642,7 @@ app.post('/vps/trialvlessall', async (req, res) => {
 });
 app.post('/vps/trojanall', async (req, res) => {
   try {
-    const data = await createXray(req, 'trojan', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    const data = await createXray(req, 'trojan', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), quotaLimitGbFromBody(req.body || {}, 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -5601,7 +5650,7 @@ app.post('/vps/trojanall', async (req, res) => {
 });
 app.post('/vps/trialtrojanall', async (req, res) => {
   try {
-    const data = await createXray(req, 'trojan', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    const data = await createXray(req, 'trojan', String(req.body?.username || '').trim(), 1, quotaLimitGbFromBody(req.body || {}, 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -5620,7 +5669,7 @@ async function renewXray(table, username, exp, req) {
   if (!secretCol) throw new Error('invalid table');
 
   const row = await get(`SELECT ${secretCol} AS secret, date_exp, quota, limitip FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]).catch(() => null);
-  const bodyQuotaRaw = body?.kuota;
+  const bodyQuotaRaw = quotaInputFromBody(body);
   const bodyQuota = Number(bodyQuotaRaw);
   const bodyLimitIp = Number(body?.limitip);
   const fromExp = String(row?.date_exp || '-');
@@ -5951,7 +6000,7 @@ async function updateAccountQuota(typeRaw, usernameRaw, body = {}) {
     throw err;
   }
   const currentQuota = Number(row?.quota || 0);
-  const rawQuota = body?.kuota ?? body?.quota ?? body?.quota_gb;
+  const rawQuota = quotaInputFromBody(body);
   const inputQuota = Number(rawQuota);
   if (!Number.isFinite(inputQuota) || inputQuota < 0) {
     const err = new Error('quota harus angka 0 atau lebih');
@@ -6267,11 +6316,36 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+)
+
+type quotaSession struct {
+	ID          string
+	LocalPort   int
+	ClientToSSH uint64
+	SSHToClient uint64
+	UpdatedAt   int64
+	Active      bool
+}
+
+type quotaCountingReader struct {
+	reader    io.Reader
+	session   *quotaSession
+	direction string
+}
+
+var (
+	quotaMu        sync.Mutex
+	quotaSessions  = map[string]*quotaSession{}
+	quotaStateFile = "/var/lib/sc-1forcr/sshws-quota.tsv"
 )
 
 func envOr(key, fallback string) string {
@@ -6327,16 +6401,121 @@ func dialTCP(host string, port int, keepAliveSeconds int) (net.Conn, error) {
 	return conn, nil
 }
 
-func tunnelBoth(a, b net.Conn) {
+func (r *quotaCountingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		addQuotaBytes(r.session, r.direction, uint64(n))
+	}
+	return n, err
+}
+
+func addQuotaBytes(session *quotaSession, direction string, n uint64) {
+	if session == nil || n == 0 {
+		return
+	}
+	if direction == "up" {
+		atomic.AddUint64(&session.ClientToSSH, n)
+	} else {
+		atomic.AddUint64(&session.SSHToClient, n)
+	}
+	atomic.StoreInt64(&session.UpdatedAt, time.Now().Unix())
+}
+
+func localTCPPort(conn net.Conn) int {
+	if conn == nil {
+		return 0
+	}
+	_, rawPort, err := net.SplitHostPort(conn.LocalAddr().String())
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(rawPort)
+	if err != nil || port <= 0 {
+		return 0
+	}
+	return port
+}
+
+func registerQuotaSession(upstream net.Conn) *quotaSession {
+	port := localTCPPort(upstream)
+	if port <= 0 {
+		return nil
+	}
+	now := time.Now()
+	session := &quotaSession{
+		ID:        fmt.Sprintf("%d-%d", now.UnixNano(), port),
+		LocalPort: port,
+		UpdatedAt: now.Unix(),
+		Active:    true,
+	}
+	quotaMu.Lock()
+	quotaSessions[session.ID] = session
+	quotaMu.Unlock()
+	return session
+}
+
+func finishQuotaSession(session *quotaSession) {
+	if session == nil {
+		return
+	}
+	quotaMu.Lock()
+	session.Active = false
+	atomic.StoreInt64(&session.UpdatedAt, time.Now().Unix())
+	quotaMu.Unlock()
+	flushQuotaState()
+}
+
+func flushQuotaState() {
+	path := strings.TrimSpace(quotaStateFile)
+	if path == "" {
+		return
+	}
+	now := time.Now().Unix()
+	cutoff := now - 21600
+	lines := []string{"# session_id\tlocal_port\tclient_to_ssh\tssh_to_client\tupdated_at\tactive"}
+	quotaMu.Lock()
+	for id, session := range quotaSessions {
+		updatedAt := atomic.LoadInt64(&session.UpdatedAt)
+		if !session.Active && updatedAt < cutoff {
+			delete(quotaSessions, id)
+			continue
+		}
+		active := "0"
+		if session.Active {
+			active = "1"
+		}
+		lines = append(lines, fmt.Sprintf("%s\t%d\t%d\t%d\t%d\t%s", session.ID, session.LocalPort, atomic.LoadUint64(&session.ClientToSSH), atomic.LoadUint64(&session.SSHToClient), updatedAt, active))
+	}
+	quotaMu.Unlock()
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	if err := ioutil.WriteFile(tmp, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+}
+
+func startQuotaFlusher() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			flushQuotaState()
+		}
+	}()
+}
+
+func tunnelBoth(a, b net.Conn, session *quotaSession) {
 	defer a.Close()
 	defer b.Close()
+	defer finishQuotaSession(session)
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(a, b)
+		_, _ = io.Copy(a, &quotaCountingReader{reader: b, session: session, direction: "down"})
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(b, a)
+		_, _ = io.Copy(b, &quotaCountingReader{reader: a, session: session, direction: "up"})
 		done <- struct{}{}
 	}()
 	<-done
@@ -6420,7 +6599,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			_ = sshUp.Close()
 			return
 		}
-		tunnelBoth(client, sshUp)
+		tunnelBoth(client, sshUp, registerQuotaSession(sshUp))
 		return
 	}
 
@@ -6451,7 +6630,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 				_ = sshUp.Close()
 				return
 			}
-				tunnelBoth(client, sshUp)
+				tunnelBoth(client, sshUp, registerQuotaSession(sshUp))
 				return
 			}
 
@@ -6469,7 +6648,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 					_ = sshUp.Close()
 					return
 				}
-				tunnelBoth(client, sshUp)
+				tunnelBoth(client, sshUp, registerQuotaSession(sshUp))
 				return
 			}
 
@@ -6488,7 +6667,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 				_ = httpUp.Close()
 				return
 			}
-			tunnelBoth(client, httpUp)
+			tunnelBoth(client, httpUp, nil)
 			return
 		}
 
@@ -6511,7 +6690,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			_ = sshUp.Close()
 			return
 		}
-		tunnelBoth(client, sshUp)
+		tunnelBoth(client, sshUp, registerQuotaSession(sshUp))
 		return
 	}
 }
@@ -6522,6 +6701,7 @@ func main() {
 	sshPort := envInt("SSH_WS_TARGET_PORT", 109)
 	httpHost := envOr("SSH_HTTP_BACKEND_HOST", "127.0.0.1")
 	httpPort := envInt("SSH_HTTP_BACKEND_PORT", 80)
+	quotaStateFile = envOr("SSHWS_QUOTA_STATE_FILE", "/var/lib/sc-1forcr/sshws-quota.tsv")
 	readerBufferKB := envInt("SSHWS_READER_BUFFER_KB", 16)
 	if readerBufferKB < 8 {
 		readerBufferKB = 8
@@ -6543,6 +6723,7 @@ func main() {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
+	startQuotaFlusher()
 	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d, buffer=%dKB, keepalive=%ds\n", port, sshHost, sshPort, httpHost, httpPort, readerBufferKB, keepAliveSeconds)
 
 	for {
@@ -6590,6 +6771,7 @@ const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
+const SSHWS_QUOTA_STATE_FILE = String(process.env.SSHWS_QUOTA_STATE_FILE || '/var/lib/sc-1forcr/sshws-quota.tsv').trim();
 const DEFAULT_TUNNEL_SHELL = '/usr/local/sbin/sc-1forcr-tunnel-shell';
 const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || DEFAULT_TUNNEL_SHELL).trim() || DEFAULT_TUNNEL_SHELL;
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
@@ -6885,7 +7067,7 @@ async function notifyExpiredAccount(service, username, exp, limitip = 0, ownerId
 async function notifyExpiredAccountsBatch(service, accounts = []) {
   try {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    const list = Array.isArray(accounts) ? accounts : [];
+    const list = await filterStillExpiredBatchForNotify(service, accounts);
     if (list.length === 0) return;
     const rows = list.slice(0, 30).map((acc, idx) => {
       const user = String(acc?.username || '-').trim() || '-';
@@ -6904,6 +7086,38 @@ async function notifyExpiredAccountsBatch(service, accounts = []) {
       remain;
     await telegramNotify(msg);
   } catch (_) {}
+}
+function expiredNotifyTableForService(service) {
+  const s = String(service || '').trim().toLowerCase();
+  if (s.includes('ssh') || s.includes('zivpn') || s.includes('udphc')) return 'account_sshs';
+  if (s === 'vmess') return 'account_vmesses';
+  if (s === 'vless') return 'account_vlesses';
+  if (s === 'trojan') return 'account_trojans';
+  return '';
+}
+async function filterStillExpiredBatchForNotify(service, accounts = []) {
+  const list = Array.isArray(accounts) ? accounts : [];
+  if (list.length === 0) return [];
+  const table = expiredNotifyTableForService(service);
+  if (!table) return list;
+  const out = [];
+  const today = ymdLocalNow();
+  for (const acc of list) {
+    const username = String(acc?.username || '').trim();
+    const expectedExp = String(acc?.date_exp || acc?.exp || acc?.expired || '').trim();
+    if (!username || !expectedExp) continue;
+    const row = await get(
+      `SELECT status, date_exp FROM ${table} WHERE LOWER(username)=LOWER(?) LIMIT 1`,
+      [username]
+    ).catch(() => null);
+    const status = String(row?.status || '').trim().toUpperCase();
+    const currentExp = String(row?.date_exp || '').trim();
+    if (!row || currentExp !== expectedExp) continue;
+    if (!['EXPIRED', 'RECOVERY', 'KADALUARSA'].includes(status)) continue;
+    if (!isExpiredDate(currentExp, today)) continue;
+    out.push(acc);
+  }
+  return out;
 }
 
 function run(sql, params = []) {
@@ -8184,7 +8398,63 @@ function readSshProcessQuotaCounters() {
   return map;
 }
 
-async function addQuotaSessionDeltas(type, username, sessionCounters) {
+function readDropbearAuthPortUserMap() {
+  const map = new Map();
+  const readLogs = (args) => {
+    try {
+      return execFileSync('journalctl', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+    } catch (_) {
+      return '';
+    }
+  };
+  const logs = [
+    readLogs(['-u', 'dropbear', '-n', String(DROPBEAR_LOG_MAX_LINES), '--no-pager']),
+    readLogs(['-u', 'dropbear', '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', String(DROPBEAR_RECENT_LOG_MAX_LINES), '--no-pager'])
+  ].join('\n');
+  for (const lineRaw of String(logs || '').split('\n')) {
+    const parsed = parseDropbearAuthLine(lineRaw);
+    if (!parsed) continue;
+    const user = String(parsed.username || '').trim().toLowerCase();
+    const port = String(parsed.port || '').trim();
+    if (!user || !/^[0-9]{1,5}$/.test(port)) continue;
+    map.set(port, user);
+  }
+  return map;
+}
+
+function readSshWsQuotaCounters() {
+  const out = new Map();
+  try {
+    if (!SSHWS_QUOTA_STATE_FILE || !fs.existsSync(SSHWS_QUOTA_STATE_FILE)) return out;
+    const portUser = readDropbearAuthPortUserMap();
+    if (portUser.size < 1) return out;
+    const now = Math.floor(Date.now() / 1000);
+    const maxAge = Math.max(3600, CHECK_INTERVAL_MINUTES * 60 * 12);
+    const raw = fs.readFileSync(SSHWS_QUOTA_STATE_FILE, 'utf8');
+    for (const lineRaw of String(raw || '').split(/\r?\n/)) {
+      const line = String(lineRaw || '').trim();
+      if (!line || line.startsWith('#')) continue;
+      const parts = line.split('\t');
+      if (parts.length < 6) continue;
+      const sessionId = String(parts[0] || '').trim();
+      const port = String(parts[1] || '').trim();
+      const up = Number(parts[2] || 0);
+      const down = Number(parts[3] || 0);
+      const updatedAt = Number(parts[4] || 0);
+      if (!sessionId || !/^[0-9]{1,5}$/.test(port)) continue;
+      if (!Number.isFinite(updatedAt) || updatedAt <= 0 || updatedAt < now - maxAge) continue;
+      const total = Math.max(0, Math.floor((Number.isFinite(up) ? up : 0) + (Number.isFinite(down) ? down : 0)));
+      if (total <= 0) continue;
+      const user = String(portUser.get(port) || '').trim().toLowerCase();
+      if (!user || user === 'root') continue;
+      if (!out.has(user)) out.set(user, new Map());
+      out.get(user).set(`sshws:${sessionId}:${port}`, total);
+    }
+  } catch (_) {}
+  return out;
+}
+
+async function addQuotaSessionDeltas(type, username, sessionCounters, cleanupPrefix = '', countFirstSample = false) {
   const t = String(type || '').trim().toLowerCase();
   const user = String(username || '').trim();
   if (!t || !user || !(sessionCounters instanceof Map) || sessionCounters.size < 1) return 0;
@@ -8201,7 +8471,7 @@ async function addQuotaSessionDeltas(type, username, sessionCounters) {
       [t, user, sessionKey]
     ).catch(() => null);
     const prev = Number(row?.last_counter_bytes || 0);
-    const delta = row ? (counter >= prev ? counter - prev : counter) : 0;
+    const delta = row ? (counter >= prev ? counter - prev : counter) : (countFirstSample ? counter : 0);
     if (delta > 0) totalDelta += delta;
     await run(
       `INSERT INTO account_quota_session_counters(account_type, username, session_key, last_counter_bytes, updated_at)
@@ -8214,10 +8484,13 @@ async function addQuotaSessionDeltas(type, username, sessionCounters) {
   }
   if (activeKeys.length > 0) {
     const placeholders = activeKeys.map(() => '?').join(',');
+    const prefix = String(cleanupPrefix || '').trim();
+    const sqlPrefix = prefix ? ' AND session_key LIKE ?' : '';
+    const params = prefix ? [t, user, `${prefix}%`, ...activeKeys] : [t, user, ...activeKeys];
     await run(
       `DELETE FROM account_quota_session_counters
-       WHERE account_type=? AND LOWER(username)=LOWER(?) AND session_key NOT IN (${placeholders})`,
-      [t, user, ...activeKeys]
+       WHERE account_type=? AND LOWER(username)=LOWER(?)${sqlPrefix} AND session_key NOT IN (${placeholders})`,
+      params
     ).catch(() => {});
   }
   await run("DELETE FROM account_quota_session_counters WHERE updated_at < ?", [now - 86400]).catch(() => {});
@@ -8354,6 +8627,7 @@ async function enforceQuotaLimits() {
   ).catch(() => []);
   const sshCounters = setupSshQuotaAccounting(sshRows);
   const sshProcCounters = readSshProcessQuotaCounters();
+  const sshWsCounters = readSshWsQuotaCounters();
   for (const row of sshRows) {
     const user = String(row?.username || '').trim();
     const key = user.toLowerCase();
@@ -8365,10 +8639,11 @@ async function enforceQuotaLimits() {
     if (current.exists) {
       ownerDelta = counter >= current.lastCounter ? counter - current.lastCounter : counter;
     }
-    const procDelta = await addQuotaSessionDeltas('ssh', user, sshProcCounters.get(key) || new Map());
-    const delta = Math.max(ownerDelta, procDelta);
+    const procDelta = await addQuotaSessionDeltas('ssh', user, sshProcCounters.get(key) || new Map(), 'proc:');
+    const sshWsDelta = await addQuotaSessionDeltas('ssh', user, sshWsCounters.get(key) || new Map(), 'sshws:', true);
+    const delta = Math.max(ownerDelta, procDelta, sshWsDelta);
     const used = await addQuotaDelta('ssh', user, delta, counter);
-    if (IPLIMIT_DEBUG) console.log(`[quota-debug][ssh] user=${user} quota=${quotaBytes} used=${used} delta=${delta} owner_delta=${ownerDelta} proc_delta=${procDelta} counter=${counter}`);
+    if (IPLIMIT_DEBUG) console.log(`[quota-debug][ssh] user=${user} quota=${quotaBytes} used=${used} delta=${delta} owner_delta=${ownerDelta} proc_delta=${procDelta} sshws_delta=${sshWsDelta} counter=${counter}`);
     if (quotaBytes > 0 && used >= quotaBytes) {
       const out = await lockSshForQuota(row, used, quotaBytes);
       if (out.zivpnChanged) zivpnChanged = true;

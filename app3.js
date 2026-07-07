@@ -568,6 +568,74 @@ async function notifyAdminsTopupSuccess(row) {
   }
 }
 
+function cleanNotifyText(value, maxLen = 120) {
+  return String(value || '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLen);
+}
+
+function telegramUserInfoForAdmin(user, fallbackId = 0) {
+  const id = Number(user?.id || fallbackId || 0);
+  const username = cleanNotifyText(user?.username || '', 64).replace(/^@+/, '');
+  const firstName = cleanNotifyText(user?.first_name || '', 80);
+  const lastName = cleanNotifyText(user?.last_name || '', 80);
+  const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+  return {
+    id,
+    username: username ? `@${username}` : '-',
+    fullName: fullName || '-'
+  };
+}
+
+async function notifyAdminsScRegistration(payload = {}) {
+  const adminIds = Array.from(new Set(ADMIN_IDS.map((v) => Number(v || 0)).filter((v) => Number.isInteger(v) && v > 0)));
+  if (!adminIds.length) return;
+
+  const user = telegramUserInfoForAdmin(payload.user, payload.userId || payload.targetUserId);
+  const actor = payload.actorUser ? telegramUserInfoForAdmin(payload.actorUser, 0) : null;
+  const prevStatus = String(payload.prevStatus || '').trim().toLowerCase();
+  const statusText = prevStatus === 'expired' ? 'AKTIFKAN ULANG' : 'BARU';
+  const plan = cleanNotifyText(payload.plan || 'REGULER', 40).toUpperCase();
+  const ip = cleanNotifyText(payload.ip || '-', 64) || '-';
+  const clientName = cleanNotifyText(payload.clientName || '-', 120) || '-';
+  const durationText = payload.unlimited
+    ? 'tanpa batas'
+    : `${Math.max(0, Number(payload.days || 0) || 0)} hari`;
+  const fee = Math.max(0, Number(payload.totalFee || 0) || 0);
+  const saldoNow = Number(payload.saldoNow ?? NaN);
+  const lines = [
+    `REGISTRASI SC ${statusText}`,
+    `Paket: ${plan}`,
+    '',
+    'USER TELEGRAM',
+    `ID Telegram: ${user.id || '-'}`,
+    `Chat ID: ${payload.chatId || user.id || '-'}`,
+    `Username: ${user.username}`,
+    `Nama: ${user.fullName}`,
+    '',
+    'DETAIL SC',
+    `Nama Client: ${clientName}`,
+    `IP VPS: ${ip}`,
+    `Durasi: ${durationText}`,
+    `Biaya: Rp ${fee.toLocaleString('id-ID')}`,
+    `Expired: ${payload.unlimited ? 'tanpa batas' : formatDateTime(payload.expiresAt)}`,
+    Number.isFinite(saldoNow) ? `Saldo User: Rp ${saldoNow.toLocaleString('id-ID')}` : '',
+    prevStatus ? `Status sebelumnya: ${prevStatus}` : 'Status sebelumnya: belum ada',
+    `Waktu: ${formatDateTime(Date.now())}`
+  ].filter((line) => line !== '');
+
+  if (actor) {
+    lines.push('', 'AKTOR ADMIN', `ID Admin: ${actor.id || '-'}`, `Username Admin: ${actor.username}`, `Nama Admin: ${actor.fullName}`);
+  }
+
+  const message = lines.join('\n');
+  for (const aid of adminIds) {
+    await bot.telegram.sendMessage(aid, message).catch(() => {});
+  }
+}
+
 async function getAutoProvisionDomain() {
   const raw = await getDynamicSetting('AUTO_PROVISION_DOMAIN', DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0');
   return parseBool01(raw, DEFAULT_AUTO_PROVISION_DOMAIN);
@@ -1262,6 +1330,38 @@ function formatAdminUserSaldoInfo(info) {
 async function addSaldo(userId, amount) {
   await ensureUser(userId);
   await dbRun('UPDATE users SET saldo = saldo + ? WHERE user_id = ?', [amount, userId]);
+}
+
+async function addSaldoAllUsers(amount, adminId) {
+  const nominal = Math.floor(Number(amount || 0));
+  if (!Number.isFinite(nominal) || nominal < 1) {
+    throw new Error('Nominal tidak valid.');
+  }
+  const countRow = await dbGet('SELECT COUNT(1) AS total FROM users');
+  const totalUsers = Number(countRow?.total || 0);
+  if (totalUsers < 1) return { totalUsers: 0, nominal, totalSaldo: 0 };
+
+  const now = Date.now();
+  const referenceId = `admin_all_${Number(adminId || 0)}_${now}`;
+  await dbRun('BEGIN IMMEDIATE');
+  try {
+    await dbRun('UPDATE users SET saldo = COALESCE(saldo, 0) + ?', [nominal]);
+    await dbRun(
+      `INSERT INTO transactions (user_id, amount, type, reference_id, timestamp)
+       SELECT user_id, ?, 'admin_credit_all', ?, ? FROM users`,
+      [nominal, referenceId, now]
+    );
+    await dbRun('COMMIT');
+  } catch (e) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw e;
+  }
+  return {
+    totalUsers,
+    nominal,
+    totalSaldo: totalUsers * nominal,
+    referenceId
+  };
 }
 
 async function deductSaldoAtomic(userId, amount) {
@@ -2171,20 +2271,33 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
     throw new Error('IP VPS ini sudah terdaftar oleh user lain.');
   }
 
-  const existing = await dbGet(
-    "SELECT id, status, expires_at, client_name FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
-    [userId, ip]
-  );
-
   await dbRun('BEGIN IMMEDIATE TRANSACTION');
   try {
+    const now = Date.now();
+    await dbRun(
+      "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+      [now, now]
+    ).catch(() => {});
+
+    const owner = await dbGet(
+      "SELECT user_id FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND user_id <> ? AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+      [ip, userId, now]
+    );
+    if (owner) {
+      throw new Error('IP VPS ini sudah terdaftar oleh user lain.');
+    }
+
+    const existing = await dbGet(
+      "SELECT id, status, expires_at, client_name FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
+      [userId, ip]
+    );
+
     const ok = await deductSaldoAtomic(userId, totalFee);
     if (!ok) {
       await dbRun('ROLLBACK');
       return { insufficient: true };
     }
 
-    const now = Date.now();
     const prevStatus = String(existing?.status || '').trim().toLowerCase();
     const isCarryForward = prevStatus === 'active';
     const baseExpiry = isCarryForward ? Math.max(now, Number(existing?.expires_at || 0)) : now;
@@ -2227,11 +2340,6 @@ async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
     throw new Error('IP VPS ini sudah terdaftar oleh user lain.');
   }
 
-  const existing = await dbGet(
-    "SELECT id, status, expires_at, client_name FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
-    [userId, ip]
-  );
-
   const chargeSaldo = options?.chargeSaldo === true;
   const totalFee = Math.max(0, Number(options?.totalFee || 0));
   const txType = String(options?.txType || (chargeSaldo ? 'sc_registration_unlimited' : 'sc_registration_unlimited_admin')).trim();
@@ -2239,6 +2347,25 @@ async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
 
   await dbRun('BEGIN IMMEDIATE TRANSACTION');
   try {
+    const now = Date.now();
+    await dbRun(
+      "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+      [now, now]
+    ).catch(() => {});
+
+    const owner = await dbGet(
+      "SELECT user_id FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND user_id <> ? AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+      [ip, userId, now]
+    );
+    if (owner) {
+      throw new Error('IP VPS ini sudah terdaftar oleh user lain.');
+    }
+
+    const existing = await dbGet(
+      "SELECT id, status, expires_at, client_name FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1",
+      [userId, ip]
+    );
+
     if (chargeSaldo) {
       const ok = await deductSaldoAtomic(userId, totalFee);
       if (!ok) {
@@ -2247,7 +2374,6 @@ async function registerScIpUnlimited(userId, ip, clientName, options = {}) {
       }
     }
 
-    const now = Date.now();
     const prevStatus = String(existing?.status || '').trim().toLowerCase();
     const finalClientName = normalizeClientName(clientName || existing?.client_name || ip);
     await dbRun(
@@ -2313,28 +2439,47 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
     throw new Error('IP baru sudah terdaftar oleh user lain.');
   }
 
-  const now = Date.now();
-  const src = await dbGet(
-    "SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, last_used_at, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
-    [userId, srcIp, now]
-  );
-  if (!src) throw new Error('IP lama tidak ditemukan / tidak aktif di akun kamu.');
-
-  const dstActive = await dbGet(
-    "SELECT 1 AS ok FROM sc_registrations WHERE user_id = ? AND vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
-    [userId, dstIp, now]
-  );
-  if (dstActive) throw new Error('IP baru sudah aktif di akun kamu.');
-
-  const dstAny = await dbGet(
-    'SELECT id FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1',
-    [userId, dstIp]
-  );
-
-  const srcKey = await getServerKeyForHost(userId, srcIp);
-  const dstKey = await getServerKeyForHost(userId, dstIp);
+  let src = null;
+  let usedAfter = used + 1;
   await dbRun('BEGIN IMMEDIATE TRANSACTION');
   try {
+    const now = Date.now();
+    await dbRun(
+      "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+      [now, now]
+    ).catch(() => {});
+
+    const usedLocked = await getScIpChangeCountForSourceIp(userId, srcIp);
+    if (usedLocked >= SC_IP_CHANGE_MAX) {
+      throw new Error(`Batas ganti IP untuk ${srcIp} sudah habis (maksimal ${SC_IP_CHANGE_MAX}x per IP).`);
+    }
+    usedAfter = usedLocked + 1;
+
+    const owner = await dbGet(
+      "SELECT user_id FROM sc_registrations WHERE vps_ip = ? AND status = 'active' AND user_id <> ? AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+      [dstIp, userId, now]
+    );
+    if (owner) {
+      throw new Error('IP baru sudah terdaftar oleh user lain.');
+    }
+
+    src = await dbGet(
+      "SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, last_used_at, expires_at FROM sc_registrations WHERE user_id = ? AND vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+      [userId, srcIp, now]
+    );
+    if (!src) throw new Error('IP lama tidak ditemukan / tidak aktif di akun kamu.');
+
+    const dstActive = await dbGet(
+      "SELECT 1 AS ok FROM sc_registrations WHERE user_id = ? AND vps_ip = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) LIMIT 1",
+      [userId, dstIp, now]
+    );
+    if (dstActive) throw new Error('IP baru sudah aktif di akun kamu.');
+
+    const dstAny = await dbGet(
+      'SELECT id FROM sc_registrations WHERE user_id = ? AND vps_ip = ? LIMIT 1',
+      [userId, dstIp]
+    );
+
     if (dstAny) {
       await dbRun(
         `UPDATE sc_registrations
@@ -2369,23 +2514,16 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
       [userId, srcIp, dstIp, now]
     );
 
-    if (dstKey && dstKey.length >= 8) {
-      await dbRun(
-        `INSERT INTO sc_server_keys (user_id, vps_ip, server_key, updated_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(user_id, vps_ip) DO UPDATE SET
-           server_key=excluded.server_key,
-           updated_at=excluded.updated_at`,
-        [userId, dstIp, dstKey, now]
-      );
-    }
     await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [userId, srcIp]);
+    await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [userId, dstIp]);
     await dbRun('COMMIT');
   } catch (e) {
     await dbRun('ROLLBACK').catch(() => {});
     throw e;
   }
 
+  const srcKey = await getServerKeyForHost(userId, srcIp);
+  const dstKey = await getServerKeyForHost(userId, dstIp);
   let oldHostLock = { attempted: false, ok: false, message: 'key server lama belum tersimpan' };
   if (String(srcKey || '').trim().length >= 8) {
     oldHostLock.attempted = true;
@@ -2417,7 +2555,6 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
     }
   }
 
-  const usedAfter = used + 1;
   return {
     oldIp: srcIp,
     newIp: dstIp,
@@ -2495,6 +2632,7 @@ async function registerScMenu() {
 function adminMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('💳 Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('💰 Cek Saldo User', 'm_admin_check_saldo')],
+    [Markup.button.callback('Tambah Saldo Semua User', 'm_admin_add_saldo_all')],
     [Markup.button.callback('📜 Histori TopUp', 'm_admin_topup_history')],
     [Markup.button.callback('📢 Broadcast Semua User', 'm_admin_broadcast'), Markup.button.callback('♾️ Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
 
@@ -4060,6 +4198,18 @@ bot.action('m_admin_add_saldo', async (ctx) => {
   );
 });
 
+bot.action('m_admin_add_saldo_all', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const totalUsers = await dbGet('SELECT COUNT(1) AS total FROM users').then((r) => Number(r?.total || 0)).catch(() => 0);
+  userState.set(ctx.chat.id, { step: 'admin_add_saldo_all_amount' });
+  await ctx.reply(
+    `Total user di database: ${totalUsers}\n` +
+      'Masukkan nominal saldo yang ingin ditambahkan ke SEMUA user (rupiah).\n' +
+      'Ketik "batal" untuk batal.'
+  );
+});
+
 bot.action('m_admin_check_saldo', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
@@ -5087,6 +5237,31 @@ bot.on('text', async (ctx) => {
       );
     }
 
+    if (state.step === 'admin_add_saldo_all_amount') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const amount = Number(String(text || '').replace(/[^0-9]/g, ''));
+      if (!Number.isFinite(amount) || amount < 1) {
+        return ctx.reply('Nominal tidak valid. Minimal Rp 1.');
+      }
+      const nominal = Math.floor(amount);
+      const result = await addSaldoAllUsers(nominal, ctx.from.id);
+      userState.delete(ctx.chat.id);
+      if (result.totalUsers < 1) {
+        return ctx.reply('Belum ada user di database bot. Tidak ada saldo yang ditambahkan.', adminMenu());
+      }
+      return ctx.reply(
+        `Berhasil tambah saldo semua user.\n` +
+          `Total user: ${result.totalUsers}\n` +
+          `Nominal per user: Rp ${result.nominal.toLocaleString('id-ID')}\n` +
+          `Total saldo ditambahkan: Rp ${result.totalSaldo.toLocaleString('id-ID')}\n` +
+          `Ref: ${result.referenceId}`,
+        adminMenu()
+      );
+    }
+
     if (state.step === 'admin_reseller_enable_user') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
@@ -5760,6 +5935,21 @@ bot.on('text', async (ctx) => {
       }
 
       const saldoNow = await getSaldo(ctx.from.id);
+      if (String(result.prevStatus || '').trim().toLowerCase() !== 'active') {
+        notifyAdminsScRegistration({
+          user: ctx.from,
+          userId: ctx.from.id,
+          chatId: ctx.chat.id,
+          ip,
+          clientName: result.clientName || clientName,
+          plan: 'SC Unlimited',
+          unlimited: true,
+          totalFee: unlimitedPrice,
+          saldoNow,
+          expiresAt: 0,
+          prevStatus: result.prevStatus
+        }).catch(() => {});
+      }
       const sendInstaller = shouldSendInstallerAfterRegistration(result);
       const activeServerKey = sendInstaller
         ? await issueRandomServerKeyForHost(ctx.from.id, ip)
@@ -5927,6 +6117,22 @@ bot.on('text', async (ctx) => {
         );
       }
       const saldoNow = await getSaldo(ctx.from.id);
+      if (String(result.prevStatus || '').trim().toLowerCase() !== 'active') {
+        notifyAdminsScRegistration({
+          user: ctx.from,
+          userId: ctx.from.id,
+          chatId: ctx.chat.id,
+          ip,
+          clientName: result.clientName || clientName,
+          plan: 'SC Reguler',
+          days: Math.floor(days),
+          unlimited: false,
+          totalFee,
+          saldoNow,
+          expiresAt: result.expiresAt,
+          prevStatus: result.prevStatus
+        }).catch(() => {});
+      }
       const sendInstaller = shouldSendInstallerAfterRegistration(result);
       const activeServerKey = sendInstaller
         ? await issueRandomServerKeyForHost(ctx.from.id, ip)
@@ -6046,6 +6252,20 @@ bot.on('text', async (ctx) => {
       }
       await syncKnownServerKeyAfterScRegistration(targetUserId, ip).catch(() => {});
       const hostKeyAdminUnl = await getServerKeyForHost(targetUserId, ip);
+      if (String(result.prevStatus || '').trim().toLowerCase() !== 'active') {
+        notifyAdminsScRegistration({
+          userId: targetUserId,
+          targetUserId,
+          actorUser: ctx.from,
+          ip,
+          clientName: result.clientName || clientName,
+          plan: 'SC Unlimited Manual Admin',
+          unlimited: true,
+          totalFee: 0,
+          expiresAt: 0,
+          prevStatus: result.prevStatus
+        }).catch(() => {});
+      }
       const reply = await ctx.reply(
         `SC Unlimited manual berhasil didaftarkan.\n` +
           `Target user ID: ${targetUserId}\n` +

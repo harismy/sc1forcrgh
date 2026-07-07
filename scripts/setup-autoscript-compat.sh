@@ -9056,9 +9056,17 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable sc-1forcr-api
-  systemctl restart sc-1forcr-api
+  if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+    systemctl start sc-1forcr-api || true
+  else
+    systemctl restart sc-1forcr-api
+  fi
   systemctl enable sc-1forcr-sshws
-  systemctl restart sc-1forcr-sshws
+  if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+    systemctl start sc-1forcr-sshws || true
+  else
+    systemctl restart sc-1forcr-sshws
+  fi
 
   cat > /etc/systemd/system/sc-1forcr-iplimit.service <<EOF
 [Unit]
@@ -9095,9 +9103,11 @@ EOF
   systemctl enable --now sc-1forcr-iplimit.timer
 
   systemctl enable ssh || true
-  systemctl restart ssh || true
   systemctl enable dropbear || true
-  systemctl restart dropbear || true
+  if [[ "${UPDATE_SAFE_MODE:-0}" != "1" ]]; then
+    systemctl restart ssh || true
+    systemctl restart dropbear || true
+  fi
 }
 
 setup_resource_autotune_timer() {
@@ -16242,7 +16252,8 @@ restart_update_safe_services() {
 
   systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
-  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+  # Jangan jalankan checker langsung saat update aman; checker bisa rebuild Xray
+  # jika mendeteksi lock/quota/expired, dan itu dapat memutus sesi aktif.
   if [[ "${AUTO_REBOOT_ENABLE:-0}" == "1" ]]; then
     systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
   else
@@ -16266,9 +16277,6 @@ restart_update_safe_services() {
   if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
     systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
     systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
-  fi
-  if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx >/dev/null 2>&1 || true
   fi
 }
 
@@ -19131,6 +19139,7 @@ Time     : $(date '+%F %T')"
     RESOURCE_TARGET_USAGE_PERCENT="${RESOURCE_TARGET_USAGE_PERCENT:-85}" \
     RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}" \
     RESOURCE_CAPACITY_STATE_FILE="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}" \
+    UPDATE_SAFE_MODE="${UPDATE_SAFE_MODE:-0}" \
     ACTIVE_UDP_BACKEND="${active_backend}" \
     bash "${tmp}"; then
     echo "Update script gagal dijalankan."
@@ -20515,6 +20524,31 @@ resume_pending_operation_prompt() {
 
 main() {
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+    log "Mode update aman aktif: update runtime tanpa restart Xray/SSH/SSHWS/HAProxy."
+    check_supported_os
+    install_node_if_missing
+    install_go_if_missing
+    init_db
+    write_api_files
+    write_go_mux_files
+    build_go_files
+    write_iplimit_checker
+    setup_services
+    setup_auto_reboot_timer
+    setup_auto_backup_timer
+    setup_online_notify_timer
+    setup_auto_pull_update_timer
+    setup_resource_autotune_timer
+    write_cli_menu
+    setup_auto_menu_login
+    write_version_marker
+    sync_zivpn_auth_token_with_api_runtime
+    restart_update_safe_services
+    post_install_preflight || true
+    log "Update aman selesai. Service tunnel aktif tidak direstart."
+    return 0
+  fi
   if [[ -f "${SCRIPT_SELF_PATH}" ]]; then
     cp -f "${SCRIPT_SELF_PATH}" "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
     chmod 700 "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true

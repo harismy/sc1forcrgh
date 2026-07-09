@@ -19236,7 +19236,7 @@ update_script_from_repo() {
   local url tmp active_backend downloaded_ok derived_url
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
-  local update_note ts_now new_ver
+  local update_note ts_now new_ver update_log update_tail
   # Undrop rule burst SSHWS lama saat update agar koneksi tidak nyangkut.
   if declare -F clear_sshws_loop_guard_rules >/dev/null 2>&1; then
     clear_sshws_loop_guard_rules
@@ -19259,6 +19259,7 @@ update_script_from_repo() {
   fi
 
   tmp="/tmp/setup-autoscript-compat.sh"
+  update_log="/var/log/sc-1forcr-update.log"
   banner_html="/tmp/sc-1forcr-banner.html.bak"
   banner_txt="/tmp/sc-1forcr-banner.txt.bak"
   had_banner_html="0"
@@ -19322,6 +19323,7 @@ Time     : $(date '+%F %T')"
   fi
 
   echo "Menjalankan update installer..."
+  : > "${update_log}" 2>/dev/null || true
   if ! DOMAIN="${DOMAIN}" \
     EMAIL="${EMAIL:-}" \
     API_AUTH_TOKEN="${AUTH_TOKEN}" \
@@ -19416,13 +19418,16 @@ Time     : $(date '+%F %T')"
     RESOURCE_CAPACITY_STATE_FILE="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}" \
     UPDATE_SAFE_MODE="${UPDATE_SAFE_MODE:-0}" \
     ACTIVE_UDP_BACKEND="${active_backend}" \
-    bash "${tmp}"; then
+    bash "${tmp}" 2>&1 | tee "${update_log}"; then
     echo "Update script gagal dijalankan."
+    update_tail="$(tail -n 20 "${update_log}" 2>/dev/null | tr '\n' ' ' | cut -c1-900)"
+    [[ -z "${update_tail}" ]] && update_tail="cek ${update_log} atau /var/log/sc-1forcr-pull-update.log"
     telegram_notify "SC 1FORCR NOTIF
 Event    : UPDATE_SCRIPT
 Status   : GAGAL
 Domain   : ${DOMAIN}
 Alasan   : installer update exit non-zero
+Log      : ${update_tail}
 Time     : $(date '+%F %T')"
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1

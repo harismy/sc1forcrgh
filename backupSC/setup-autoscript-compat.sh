@@ -1407,47 +1407,22 @@ harden_ssh_tunnel_shells() {
   log "Tunnel-only shell diterapkan ke ${changed} akun SSH/ZIVPN (${shell})."
 }
 
-clear_tunnel_outbound_guard_rules() {
-  local ports pset
-  ports="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}" | tr -cd '0-9,')"
-  [[ -z "${ports}" ]] && ports="22"
-
-  if command -v iptables >/dev/null 2>&1; then
-    for pset in "${ports}" "22,2222" "22"; do
-      [[ -z "${pset}" ]] && continue
-      while iptables -w 10 -D OUTPUT -p tcp -m multiport --dports "${pset}" -m owner ! --uid-owner 0 -m comment --comment sc-1forcr-outbound-ssh-guard -j REJECT >/dev/null 2>&1; do :; done
-      while iptables -w 10 -D OUTPUT -p tcp -m multiport --dports "${pset}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1; do :; done
-    done
-  fi
-
-  if command -v ip6tables >/dev/null 2>&1; then
-    for pset in "${ports}" "22,2222" "22"; do
-      [[ -z "${pset}" ]] && continue
-      while ip6tables -w 10 -D OUTPUT -p tcp -m multiport --dports "${pset}" -m owner ! --uid-owner 0 -m comment --comment sc-1forcr-outbound-ssh-guard -j REJECT >/dev/null 2>&1; do :; done
-      while ip6tables -w 10 -D OUTPUT -p tcp -m multiport --dports "${pset}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1; do :; done
-    done
-  fi
-}
-
 apply_tunnel_outbound_guard_rules() {
   local enabled ports
   enabled="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   if [[ "${enabled}" != "1" && "${enabled}" != "true" && "${enabled}" != "yes" && "${enabled}" != "on" ]]; then
-    clear_tunnel_outbound_guard_rules
-    fw_persist_rules
-    log "Outbound SSH guard nonaktif; rule lama dibersihkan (SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0})."
+    log "Outbound SSH guard nonaktif (SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0})."
     return 0
   fi
   ports="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}" | tr -cd '0-9,')"
   [[ -z "${ports}" ]] && ports="22"
 
   if command -v iptables >/dev/null 2>&1; then
-    clear_tunnel_outbound_guard_rules
-    iptables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -m comment --comment sc-1forcr-outbound-ssh-guard -j REJECT >/dev/null 2>&1 || \
-      iptables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -m comment --comment sc-1forcr-outbound-ssh-guard -j REJECT >/dev/null 2>&1 || true
+    iptables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+      iptables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
     if command -v ip6tables >/dev/null 2>&1; then
-      ip6tables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -m comment --comment sc-1forcr-outbound-ssh-guard -j REJECT >/dev/null 2>&1 || \
-        ip6tables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -m comment --comment sc-1forcr-outbound-ssh-guard -j REJECT >/dev/null 2>&1 || true
+      ip6tables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+        ip6tables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
     fi
     if command -v netfilter-persistent >/dev/null 2>&1; then
       netfilter-persistent save >/dev/null 2>&1 || true

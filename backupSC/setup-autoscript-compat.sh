@@ -11940,7 +11940,7 @@ main_pull_update() {
     ack_update "${base_url}" "${version}" "success" "update selesai" "${vps_ip}"
     log_msg "Update trigger ${version} selesai."
   else
-    msg="$(tail -n 20 /var/log/sc-1forcr-pull-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-500)"
+    msg="$(tail -c 1400 /var/log/sc-1forcr-pull-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
     ack_update "${base_url}" "${version}" "failed" "${msg:-update gagal}" "${vps_ip}"
     log_msg "Update trigger ${version} gagal."
     exit 1
@@ -12124,7 +12124,7 @@ main_pull_summary_update() {
     ack_summary_update "${base_url}" "${version}" "success" "summary update selesai" "${vps_ip}"
     log_msg "Update Summary API trigger ${version} selesai."
   else
-    msg="$(tail -n 20 /var/log/sc-1forcr-pull-summary-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-500)"
+    msg="$(tail -c 1400 /var/log/sc-1forcr-pull-summary-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
     ack_summary_update "${base_url}" "${version}" "failed" "${msg:-summary update gagal}" "${vps_ip}"
     log_msg "Update Summary API trigger ${version} gagal."
     exit 1
@@ -19039,7 +19039,7 @@ Time     : $(date '+%F %T')"
     ACTIVE_UDP_BACKEND="${active_backend}" \
     bash "${tmp}" 2>&1 | tee "${update_log}"; then
     echo "Update script gagal dijalankan."
-    update_tail="$(tail -n 20 "${update_log}" 2>/dev/null | tr '\n' ' ' | cut -c1-900)"
+    update_tail="$(tail -c 1800 "${update_log}" 2>/dev/null | tr '\n' ' ' | cut -c1-1400)"
     [[ -z "${update_tail}" ]] && update_tail="cek ${update_log} atau /var/log/sc-1forcr-pull-update.log"
     telegram_notify "SC 1FORCR NOTIF
 Event    : UPDATE_SCRIPT

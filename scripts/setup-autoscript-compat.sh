@@ -19232,6 +19232,22 @@ normalize_downloaded_script_file() {
   return 0
 }
 
+validate_downloaded_update_payload() {
+  local file="$1" fn missing
+  [[ -f "${file}" ]] || return 1
+  missing=""
+  for fn in mask_secret restart_update_safe_services sync_zivpn_auth_token_with_api_runtime; do
+    if ! grep -qE "^[[:space:]]*${fn}[[:space:]]*\\(\\)[[:space:]]*\\{" "${file}" 2>/dev/null; then
+      missing="${missing}${missing:+,}${fn}"
+    fi
+  done
+  if [[ -n "${missing}" ]]; then
+    echo "Update script tidak lengkap: helper hilang (${missing})."
+    return 1
+  fi
+  return 0
+}
+
 update_script_from_repo() {
   local url tmp active_backend downloaded_ok derived_url
   local udpcustom_svc zstat ustat
@@ -19290,6 +19306,15 @@ Event    : UPDATE_SCRIPT
 Status   : GAGAL
 Domain   : ${DOMAIN}
 Alasan   : validasi syntax script gagal
+Time     : $(date '+%F %T')"
+    return 1
+  fi
+  if ! validate_downloaded_update_payload "${tmp}"; then
+    telegram_notify "SC 1FORCR NOTIF
+Event    : UPDATE_SCRIPT
+Status   : GAGAL
+Domain   : ${DOMAIN}
+Alasan   : payload update tidak lengkap, helper wajib tidak ditemukan
 Time     : $(date '+%F %T')"
     return 1
   fi

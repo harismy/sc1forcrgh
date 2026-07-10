@@ -6732,10 +6732,11 @@ const ZIVPN_AUTH_LOG_UNITS = Array.from(new Set([
 
 const db = new sqlite3.Database(DB_PATH);
 
-function telegramNotify(text) {
+function telegramNotifyTo(chatId, text) {
   return new Promise((resolve) => {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !text) return resolve(false);
-    const payload = `chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&text=${encodeURIComponent(String(text))}`;
+    const target = String(chatId || '').trim();
+    if (!TELEGRAM_BOT_TOKEN || !target || !text) return resolve(false);
+    const payload = `chat_id=${encodeURIComponent(target)}&text=${encodeURIComponent(String(text))}`;
     const req = https.request({
       hostname: 'api.telegram.org',
       path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -6756,6 +6757,10 @@ function telegramNotify(text) {
     req.write(payload);
     req.end();
   });
+}
+
+function telegramNotify(text) {
+  return telegramNotifyTo(TELEGRAM_CHAT_ID, text);
 }
 
 function postJson(urlRaw, payload, token = '') {
@@ -6866,6 +6871,9 @@ async function notifyQuotaLock(service, username, quotaBytes, usedBytes, ownerId
   try {
     const ownerIdNum = Number(ownerId || 0);
     const ownerChatIdNum = Number(ownerChatId || 0);
+    const ownerChatTarget = Number.isInteger(ownerChatIdNum) && ownerChatIdNum !== 0 ? String(ownerChatIdNum) : '';
+    const ownerIdTarget = Number.isInteger(ownerIdNum) && ownerIdNum !== 0 ? String(ownerIdNum) : '';
+    const ownerTarget = ownerChatTarget || ownerIdTarget;
     const event = {
       event: 'QUOTA_EXCEEDED',
       action: 'LOCK_QUOTA',
@@ -6875,7 +6883,7 @@ async function notifyQuotaLock(service, username, quotaBytes, usedBytes, ownerId
       quota_bytes: Number(quotaBytes || 0),
       used_bytes: Number(usedBytes || 0),
       owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
-      owner_telegram_chat_id: ownerChatIdNum > 0 ? ownerChatIdNum : (ownerIdNum > 0 ? ownerIdNum : null),
+      owner_telegram_chat_id: ownerChatTarget ? ownerChatIdNum : (ownerIdNum > 0 ? ownerIdNum : null),
       at: new Date().toISOString()
     };
     await notifyAccountBotMultiLogin(event);
@@ -6890,9 +6898,27 @@ async function notifyQuotaLock(service, username, quotaBytes, usedBytes, ownerId
       `Quota    : ${bytesToGbText(quotaBytes)}\n` +
       `Terpakai : ${bytesToGbText(usedBytes)}\n` +
       `Status   : LOCK sampai admin tambah/edit quota\n` +
+      `TG User  : ${ownerIdNum > 0 ? ownerIdNum : '-'}\n` +
+      `TG Chat  : ${ownerChatTarget ? ownerChatIdNum : '-'}\n` +
       `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n` +
       `==============================`;
     await telegramNotify(msg);
+    if (ownerTarget && ownerTarget !== String(TELEGRAM_CHAT_ID || '').trim()) {
+      const ownerMsg =
+        `SC 1FORCR\n` +
+        `==============================\n` +
+        `Event    : QUOTA HABIS\n` +
+        `Layanan  : ${String(service || '-').toUpperCase()}\n` +
+        `Username : ${username}\n` +
+        `Domain   : ${DOMAIN || '-'}\n` +
+        `Quota    : ${bytesToGbText(quotaBytes)}\n` +
+        `Terpakai : ${bytesToGbText(usedBytes)}\n` +
+        `Status   : Akun dikunci otomatis\n` +
+        `Info     : Hubungi admin untuk tambah quota agar akun bisa dibuka kembali.\n` +
+        `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n` +
+        `==============================`;
+      await telegramNotifyTo(ownerTarget, ownerMsg);
+    }
   } catch (_) {}
 }
 

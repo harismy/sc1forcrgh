@@ -20201,6 +20201,57 @@ restart_update_safe_services() {
   fi
 }
 
+install_legacy_runtime_command_shims() {
+  mkdir -p /usr/local/sbin /usr/local/bin >/dev/null 2>&1 || true
+
+  cat > /usr/local/sbin/dropbear_runtime_args <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -f /etc/sc-1forcr.env ]]; then
+  # shellcheck disable=SC1091
+  source /etc/sc-1forcr.env >/dev/null 2>&1 || true
+fi
+keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
+idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" | tr -cd '0-9')"
+[[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
+[[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
+printf -- '-K %s -I %s' "${keepalive}" "${idle}"
+EOF
+  chmod 755 /usr/local/sbin/dropbear_runtime_args >/dev/null 2>&1 || true
+  ln -sf /usr/local/sbin/dropbear_runtime_args /usr/local/bin/dropbear_runtime_args >/dev/null 2>&1 || true
+
+  cat > /usr/local/sbin/mask_secret <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+value="${1:-}"
+if [[ -z "${value}" ]]; then
+  echo "-"
+elif [[ "${#value}" -le 8 ]]; then
+  echo "****"
+else
+  echo "${value:0:4}****${value: -4}"
+fi
+EOF
+  chmod 755 /usr/local/sbin/mask_secret >/dev/null 2>&1 || true
+  ln -sf /usr/local/sbin/mask_secret /usr/local/bin/mask_secret >/dev/null 2>&1 || true
+
+  cat > /usr/local/sbin/restart_update_safe_services <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+exit 0
+EOF
+  chmod 755 /usr/local/sbin/restart_update_safe_services >/dev/null 2>&1 || true
+  ln -sf /usr/local/sbin/restart_update_safe_services /usr/local/bin/restart_update_safe_services >/dev/null 2>&1 || true
+}
+
 sync_zivpn_auth_token_with_api_runtime() {
   local app_env api_tok api_port sql_key
   app_env="/opt/sc-1forcr/.env"
@@ -20507,6 +20558,7 @@ main() {
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
   if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
     log "Mode update aman aktif: update runtime tanpa restart Xray/SSH/SSHWS/HAProxy."
+    install_legacy_runtime_command_shims
     check_supported_os
     install_node_if_missing
     install_go_if_missing

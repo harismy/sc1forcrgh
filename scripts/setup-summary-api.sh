@@ -59,12 +59,24 @@ install_node_if_missing() {
     return
   fi
 
-  log "Installing Node.js 20.x..."
+  log "Installing Node.js (20.x, fallback 18.x)..."
   apt_get_safe update -y
   apt_get_safe install -y curl ca-certificates gnupg apt-transport-https
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt_get_safe install -y nodejs
-  log "Node.js installed: $(node -v)"
+  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt_get_safe install -y nodejs; then
+    log "Node.js installed: $(node -v)"
+    return
+  fi
+
+  log "Node.js 20.x gagal, fallback ke 18.x..."
+  apt_get_safe purge -y nodejs >/dev/null 2>&1 || true
+  rm -f /etc/apt/sources.list.d/nodesource.list
+  if curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt_get_safe install -y nodejs; then
+    log "Node.js installed: $(node -v)"
+    return
+  fi
+
+  echo "Gagal install Node.js dari NodeSource (20/18)."
+  exit 1
 }
 
 install_pm2_if_missing() {
@@ -2806,26 +2818,62 @@ install_dependencies() {
     npm init -y >/dev/null 2>&1
   fi
 
-  # sqlite3 prebuilt sering gagal di VPS dengan glibc lama,
-  # jadi paksa build from source agar kompatibel dengan sistem.
-  log "Installing build tools for sqlite3 (source build)..."
+  log "Installing build tools for sqlite3 fallback..."
   apt_get_safe update -y
-  apt_get_safe install -y build-essential python3 make g++ gcc libc6-dev pkg-config
+  if ! apt_get_safe install -y \
+    build-essential python3 python3-setuptools python3-packaging \
+    make g++ gcc libc6-dev pkg-config libsqlite3-dev zlib1g-dev \
+    >/tmp/sc-1forcr-summary-build-deps.log 2>&1; then
+    log "Install paket build Summary API gagal. Cek log: /tmp/sc-1forcr-summary-build-deps.log"
+    tail -n 80 /tmp/sc-1forcr-summary-build-deps.log || true
+    exit 1
+  fi
 
-  log "Installing npm dependencies..."
-  # Bersihkan hasil install lama agar sqlite3 binary lama tidak kepakai.
-  rm -rf node_modules package-lock.json
-  npm cache clean --force >/dev/null 2>&1 || true
-
-  npm install express dotenv --omit=dev
-
-  # Paksa compile sqlite3 dari source (jangan ambil prebuilt binary).
-  export npm_config_build_from_source=true
+  export npm_config_build_from_source=false
+  unset npm_config_update_binary
   export npm_config_fallback_to_build=true
-  export npm_config_update_binary=false
-  npm install sqlite3@5.1.7 --unsafe-perm --omit=dev --build-from-source --foreground-scripts --verbose
+  export SETUPTOOLS_USE_DISTUTILS=local
+  npm config set fund false >/dev/null 2>&1 || true
+  npm config set audit false >/dev/null 2>&1 || true
 
-  # Verifikasi binary sqlite3 harus load normal.
+  local node_deps_check="require('sqlite3'); require('express'); require('dotenv');"
+  local need_npm_install="0"
+  if [[ ! -d node_modules ]]; then
+    need_npm_install="1"
+    log "node_modules Summary API belum ada, install dependency..."
+  elif ! node -e "${node_deps_check}" >/dev/null 2>&1; then
+    need_npm_install="1"
+    log "Dependency Summary API rusak/kurang, reinstall dependency..."
+  else
+    log "Dependency Summary API sudah OK."
+  fi
+
+  if [[ "${need_npm_install}" == "1" ]]; then
+    rm -rf node_modules package-lock.json
+    npm cache clean --force >/dev/null 2>&1 || true
+
+    if ! npm install express dotenv sqlite3@5.1.7 --omit=dev --foreground-scripts >/tmp/sc-1forcr-summary-npm-install.log 2>&1; then
+      log "Install npm dependency Summary API gagal. Cek log: /tmp/sc-1forcr-summary-npm-install.log"
+      tail -n 80 /tmp/sc-1forcr-summary-npm-install.log || true
+      exit 1
+    fi
+  fi
+
+  if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-summary-node-check.log 2>&1; then
+    log "sqlite3 Summary API belum bisa diload, coba rebuild native binding..."
+    if ! npm rebuild sqlite3 --build-from-source --foreground-scripts >/tmp/sc-1forcr-summary-npm-rebuild.log 2>&1; then
+      log "Rebuild sqlite3 Summary API gagal. Cek log: /tmp/sc-1forcr-summary-npm-rebuild.log"
+      tail -n 80 /tmp/sc-1forcr-summary-npm-rebuild.log || true
+      exit 1
+    fi
+  fi
+
+  if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-summary-node-check.log 2>&1; then
+    log "Dependency Summary API masih gagal setelah rebuild. Cek log: /tmp/sc-1forcr-summary-node-check.log"
+    cat /tmp/sc-1forcr-summary-node-check.log || true
+    exit 1
+  fi
+
   node -e "require('sqlite3'); console.log('sqlite3 load ok')"
 }
 

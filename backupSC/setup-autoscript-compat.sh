@@ -12538,6 +12538,15 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
 [[ "${QUOTA_LOCK_ENABLE}" != "0" ]] && QUOTA_LOCK_ENABLE="1"
 
 # Compatibility helpers for older runtime files on upgraded VPS.
+dropbear_runtime_args() {
+  local keepalive idle
+  keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
+  idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" | tr -cd '0-9')"
+  [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
+  [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
+  printf -- '-K %s -I %s' "${keepalive}" "${idle}"
+}
+
 flag_enabled() {
   case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
     1|true|yes|on) return 0 ;;

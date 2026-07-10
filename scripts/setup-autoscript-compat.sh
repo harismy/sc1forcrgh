@@ -20524,6 +20524,56 @@ install_summary_api_1forcr() {
   APP_DIR="/root/tunnel-sync" POTATO_DB="${DB_PATH}" bash "${tmp}"
 }
 
+mask_secret() {
+  local s="${1:-}" n
+  n="${#s}"
+  if [[ -z "${s}" ]]; then
+    echo "-"
+    return 0
+  fi
+  if [[ "${n}" -le 8 ]]; then
+    echo "****"
+    return 0
+  fi
+  echo "${s:0:4}****${s:n-4:4}"
+}
+
+restart_update_safe_services() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if declare -F ensure_sshws_firewall_allow_rules >/dev/null 2>&1; then
+    ensure_sshws_firewall_allow_rules || true
+  elif declare -F apply_sshws_loop_guard_rules >/dev/null 2>&1; then
+    apply_sshws_loop_guard_rules || true
+  fi
+
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  if [[ "${AUTO_REBOOT_ENABLE:-0}" == "1" ]]; then
+    systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  else
+    systemctl stop sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  fi
+  if [[ "${AUTO_BACKUP_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  else
+    systemctl stop sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  fi
+  if [[ "${ONLINE_NOTIFY_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+  else
+    systemctl stop sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  fi
+  if [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+  fi
+  if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
+    systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
+  fi
+}
+
 sync_zivpn_auth_token_with_api_runtime() {
   local app_env api_tok api_port sql_key
   app_env="/opt/sc-1forcr/.env"

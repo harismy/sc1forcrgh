@@ -9,12 +9,7 @@ Komponen API:
    Service  : sc-1forcr-api
    Listen   : 127.0.0.1:API_PORT, diproxy lewat Nginx/Haproxy ke /vps/*
 
-2. ZIVPN Auth API
-   Base URL : http://127.0.0.1:API_PORT/internal
-   Service  : sc-1forcr-api
-   Dipakai internal oleh ZIVPN.
-
-3. Summary API
+2. Summary API
    Base URL : http://IP_VPS:8789/internal
    Service  : tunnel-summary / Summary API
    Dipakai bot untuk sync, backup, restore, summary akun, dan kontrol tertentu.
@@ -169,8 +164,8 @@ Response data:
 }
 
 
-SSH / SSHWS / ZIVPN
-===================
+SSH / SSHWS
+===========
 
 Buat Akun SSH
 -------------
@@ -191,7 +186,7 @@ Field:
 - username: wajib
 - password: opsional, jika kosong dibuat random
 - expired: jumlah hari, default 30
-- kuota: quota GB, 0 berarti unlimited
+- kuota/quota/quota_gb/quotaGb: quota GB, 0 berarti unlimited
 - limitip: limit IP/perangkat, 0 berarti tidak dibatasi oleh field ini
 
 Response data utama:
@@ -276,7 +271,7 @@ DELETE /vps/deletesshvpn/:username
 Efek:
 - hapus user Linux
 - hapus data account_sshs
-- hapus dari ZIVPN/UDP Custom auth
+- hapus dari UDP Custom auth
 - kirim notifikasi delete jika notifikasi bot SC aktif
 
 
@@ -303,6 +298,7 @@ Catatan:
 - Jika akun masih ada, expired ditambah dari expired lama.
 - Jika akun tidak ada dan recover_missing=true + password ada, akun akan dibuat ulang.
 - Jika akun sebelumnya LOCK_QUOTA, unlock hanya berhasil jika kuota baru lebih besar dari pemakaian.
+- Field quota yang diterima: kuota, quota, quota_gb, quotaGb.
 
 
 Lock SSH
@@ -340,6 +336,12 @@ Body:
   "telegram_user_id": 123456789,
   "telegram_chat_id": 123456789
 }
+
+Field quota yang diterima untuk VMess/VLESS/Trojan:
+- kuota
+- quota
+- quota_gb
+- quotaGb
 
 Response data umum:
 {
@@ -446,6 +448,12 @@ Body opsional:
   "telegram_chat_id": 123456789
 }
 
+Field quota yang diterima:
+- kuota
+- quota
+- quota_gb
+- quotaGb
+
 
 Perpanjang VLESS
 ----------------
@@ -503,7 +511,7 @@ Edit Quota Generic
 PATCH /vps/quota/:type/:username
 
 Path:
-- type: ssh, sshvpn, zivpn, vmess, vless, trojan
+- type: ssh, sshvpn, vmess, vless, trojan
 - username: username akun
 
 Body set quota:
@@ -527,6 +535,7 @@ Field quota yang diterima:
 - kuota
 - quota
 - quota_gb
+- quotaGb
 
 Response data:
 {
@@ -551,6 +560,29 @@ PATCH /vps/editquotatrojan/:username
 Body sama seperti /vps/quota/:type/:username.
 
 
+Cara Hitung Quota SSHWS
+-----------------------
+Autoscript menghitung pemakaian quota SSH dari beberapa sumber:
+- proses SSH/Dropbear user
+- counter sesi SSHWS dari mux
+- counter runtime quota yang tersimpan di DB
+
+Untuk SSHWS, mux menulis counter traffic ke:
+/var/lib/sc-1forcr/sshws-quota.tsv
+
+Checker quota membaca file tersebut sesuai interval:
+IPLIMIT_CHECK_INTERVAL_MINUTES
+
+Default interval adalah 3 menit, sehingga pembacaan quota SSHWS bersifat near-realtime, bukan per detik.
+
+Jika IPLIMIT_DEBUG=1, log checker akan menampilkan:
+- owner_delta
+- proc_delta
+- sshws_delta
+
+sshws_delta adalah tambahan pemakaian yang berasal dari jalur SSHWS.
+
+
 SYNC / RESTORE EVENT API
 ========================
 
@@ -570,41 +602,6 @@ POST /vps/restore-finished
 Efek:
 - dipanggil setelah restore/import DB selesai
 - sync Xray dari DB
-
-
-ZIVPN AUTH API
-==============
-
-ZIVPN Auth Check
-----------------
-POST /internal/zivpn-auth?token=ZIVPN_HTTP_AUTH_TOKEN
-
-Header alternatif:
-x-auth-token: ZIVPN_HTTP_AUTH_TOKEN
-
-Body:
-{
-  "auth": "username:password",
-  "addr": "1.2.3.4:12345"
-}
-
-Response sukses:
-{
-  "ok": true,
-  "id": "username"
-}
-
-Response gagal:
-{
-  "ok": false,
-  "id": ""
-}
-
-Catatan:
-- Endpoint ini untuk ZIVPN internal.
-- Mengecek akun SSH karena ZIVPN auth memakai akun SSH.
-- Menolak akun expired, LOCK, LOCK_QUOTA, atau password salah.
-- Mencatat live session untuk kebutuhan monitoring/limit IP.
 
 
 SUMMARY API
@@ -680,22 +677,6 @@ Fungsi:
 Export akun untuk backup/migrasi.
 
 
-Export ZIVPN Config
--------------------
-GET /internal/export-zivpn-config
-
-Fungsi:
-Export file konfigurasi ZIVPN.
-
-
-Export ZIVPN Auth
------------------
-GET /internal/export-zivpn-auth
-
-Fungsi:
-Export data auth ZIVPN.
-
-
 Export Banner Config
 --------------------
 GET /internal/export-banner-config
@@ -763,34 +744,6 @@ Type:
 
 Fungsi:
 Hapus semua akun dari type tertentu.
-
-
-Restore ZIVPN Config
---------------------
-POST /internal/restore-zivpn-config
-
-Body:
-{
-  "config": {}
-}
-
-Efek:
-- restore config ZIVPN
-- reload service ZIVPN
-
-
-Restore ZIVPN Auth
-------------------
-POST /internal/restore-zivpn-auth
-
-Body:
-{
-  "users": []
-}
-
-Efek:
-- restore user auth ZIVPN
-- reload service ZIVPN
 
 
 Restore Banner Config
@@ -961,30 +914,6 @@ HTTP 410
 }
 
 
-ZIVPN Service Control
----------------------
-POST /internal/zivpn-service
-
-Body:
-{
-  "action": "status"
-}
-
-Action umum:
-- status
-- start
-- stop
-- restart
-
-Response:
-{
-  "ok": true,
-  "action": "status",
-  "service": "zivpn",
-  "status": "active"
-}
-
-
 CONTOH CURL
 ===========
 
@@ -1026,8 +955,10 @@ curl -s -X POST "http://IP_VPS:8789/internal/sync-xray-from-db" \
 CATATAN KEAMANAN
 ================
 
-- Jangan expose Summary API ke publik tanpa firewall/IP allowlist.
+- Jangan expose Summary API ke publik tanpa firewall/IP allowlist. Idealnya bind lokal/VPN saja.
 - Simpan API_TOKEN dan x-sync-token secara private.
 - Endpoint delete-all, restore-full-backup-url, apply-xray-restart, dan sc-access-lock bersifat sensitif.
 - Jika license runtime expired, endpoint /vps/* akan mengembalikan 403 license expired.
-- Endpoint /internal/zivpn-auth sebaiknya tetap lokal/internal.
+- Gunakan HTTPS untuk semua endpoint /vps/* dari bot/client.
+- Jangan kirim token lewat query string untuk endpoint publik.
+- Rotasi token jika pernah muncul di log, screenshot, atau chat publik.

@@ -16977,12 +16977,13 @@ location = /docs {
 }
 
 location = /docs/ {
-    alias ${web_root}/index.html;
+    root ${web_root};
+    try_files /index.html =404;
 }
 
 location ^~ /docs/ {
     alias ${web_root}/;
-    index index.html;
+    try_files \$uri \$uri/ =404;
 }
 EOF
   else

@@ -16097,33 +16097,68 @@ ensure_api_docs_nginx_include() {
   [[ -f "${conf}" ]] || return 0
   tmp="$(mktemp)"
   awk '
-    BEGIN { in_server=0; brace=0; has_include=0; pending_http2=0 }
+    function brace_delta(text,   tmp, open_count, close_count) {
+      tmp = text
+      open_count = gsub(/\{/, "{", tmp)
+      close_count = gsub(/\}/, "}", tmp)
+      return open_count - close_count
+    }
+    function flush_server_block(   i, line, target, inserted, server_name_idx) {
+      if (block_n < 1) return
+      target = 0
+      server_name_idx = 0
+      for (i = 1; i <= block_n; i++) {
+        line = block[i]
+        if (line ~ /listen[[:space:]]+80;[[:space:]]*$/) target = 1
+        if (line ~ /listen[[:space:]]+\[::\]:80;[[:space:]]*$/) target = 1
+        if (line ~ /listen[[:space:]]+127\.0\.0\.1:8081[[:space:]]+http2;/) target = 1
+        if (server_name_idx == 0 && line ~ /^[[:space:]]*server_name[[:space:]]+.*;[[:space:]]*$/) {
+          server_name_idx = i
+        }
+      }
+
+      inserted = 0
+      for (i = 1; i <= block_n; i++) {
+        line = block[i]
+        if (line ~ /include[[:space:]]+\/etc\/nginx\/snippets\/sc-1forcr-api-docs\.conf;/) {
+          continue
+        }
+        print line
+        if (target && server_name_idx == i) {
+          print "    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;"
+          inserted = 1
+        }
+        if (target && !inserted && server_name_idx == 0 && i == block_n && line ~ /^[[:space:]]*}[[:space:]]*$/) {
+          print "    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;"
+          inserted = 1
+        }
+      }
+      delete block
+      block_n = 0
+    }
     /^[[:space:]]*server[[:space:]]*\{/ {
-      in_server=1
-      brace=1
-      has_include=0
-      pending_http2=0
-      print
+      server_mode = 1
+      brace = 1
+      block_n = 1
+      block[block_n] = $0
       next
     }
-    in_server {
-      if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/sc-1forcr-api-docs\.conf;/) has_include=1
-      if ($0 ~ /listen[[:space:]]+127\.0\.0\.1:8081[[:space:]]+http2;/) pending_http2=1
-      if ($0 ~ /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/ && !has_include) {
-        print "    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;"
-        has_include=1
+    server_mode {
+      block[++block_n] = $0
+      brace += brace_delta($0)
+      if (brace <= 0) {
+        flush_server_block()
+        server_mode = 0
+        brace = 0
       }
-      print
-      if (pending_http2 && !has_include && $0 ~ /^[[:space:]]*server_name[[:space:]]+_;[[:space:]]*$/) {
-        print ""
-        print "    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;"
-        has_include=1
-      }
-      brace += gsub(/\{/, "{") - gsub(/\}/, "}")
-      if (brace <= 0) in_server=0
       next
     }
     { print }
+    END {
+      if (server_mode) {
+        flush_server_block()
+      }
+    }
   ' "${conf}" > "${tmp}" && mv -f "${tmp}" "${conf}"
 }
 

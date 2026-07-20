@@ -16092,13 +16092,9 @@ api_docs_web_root() {
 }
 
 ensure_api_docs_nginx_include() {
-  local conf tmp count
+  local conf tmp
   conf="/etc/nginx/sites-available/sc-1forcr.conf"
   [[ -f "${conf}" ]] || return 0
-  count="$(grep -cF 'include /etc/nginx/snippets/sc-1forcr-api-docs.conf;' "${conf}" 2>/dev/null || echo 0)"
-  if [[ "${count}" -ge 2 ]]; then
-    return 0
-  fi
   tmp="$(mktemp)"
   awk '
     BEGIN { in_server=0; brace=0; has_include=0; pending_http2=0 }
@@ -16567,6 +16563,10 @@ write_api_docs_nginx_snippet() {
 # SC 1FORCR API docs
 location = /docs {
     return 301 /docs/;
+}
+
+location = /docs/ {
+    alias ${web_root}/index.html;
 }
 
 location ^~ /docs/ {

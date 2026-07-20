@@ -32,6 +32,7 @@ set -euo pipefail
 #   XRAY_FRONT_DOMAINS=support.zoom.us          (opsional, bug dipisah koma; TLS pakai SNI bug + Host alias)
 #   UPDATE_SCRIPT_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-autoscript-compat.sh
 #   AUTO_INSTALL_SUMMARY_API=1                   (opsional, 1=auto install summary API saat install SC)
+#   API_DOCS_ENABLE=0                           (opsional, 1=aktifkan web dokumentasi API)
 #   SUMMARY_API_SETUP_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-summary-api.sh
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
@@ -149,6 +150,7 @@ XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
 SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
+API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
 SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
@@ -917,7 +919,7 @@ auto_tune_resource_vars() {
   def_haproxy_thread="1"
   def_sshws_buffer="8"
   def_sshws_conn="30"
-  def_api_mem="256M"
+  def_api_mem="320M"
   def_sshws_mem="192M"
   def_udpgw_clients="128"
   def_udpgw_conn="32"
@@ -930,7 +932,7 @@ auto_tune_resource_vars() {
     def_haproxy_thread="4"
     def_sshws_buffer="16"
     def_sshws_conn="80"
-    def_api_mem="512M"
+    def_api_mem="768M"
     def_sshws_mem="768M"
     def_udpgw_clients="512"
     def_udpgw_conn="64"
@@ -942,7 +944,7 @@ auto_tune_resource_vars() {
     def_haproxy_thread="2"
     def_sshws_buffer="16"
     def_sshws_conn="60"
-    def_api_mem="384M"
+    def_api_mem="512M"
     def_sshws_mem="512M"
     def_udpgw_clients="256"
     def_udpgw_conn="48"
@@ -954,7 +956,7 @@ auto_tune_resource_vars() {
     def_haproxy_thread="1"
     def_sshws_buffer="12"
     def_sshws_conn="45"
-    def_api_mem="300M"
+    def_api_mem="384M"
     def_sshws_mem="320M"
     def_udpgw_clients="192"
     def_udpgw_conn="32"
@@ -1908,6 +1910,8 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
+    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
+
     location /vmess {
         access_log off;
         proxy_redirect off;
@@ -2092,6 +2096,7 @@ server {
 }
 EOF
 
+  prepare_api_docs_site || true
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
   tune_nginx_capacity
@@ -2931,6 +2936,13 @@ try { require('dotenv').config(); } catch (_) {}
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
+process.on('unhandledRejection', (reason) => {
+  console.error('[runtime] unhandledRejection:', reason?.stack || reason?.message || reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[runtime] uncaughtException:', err?.stack || err?.message || err);
+});
+
 const PORT = Number(process.env.PORT || 8088);
 const DB_PATH = process.env.DB_PATH || '/usr/sbin/potatonc/potato.db';
 const DOMAIN = String(process.env.DOMAIN || '').trim();
@@ -3047,6 +3059,9 @@ const EXPIRED_ACCOUNT_RETENTION_DAYS = Math.min(
 const EXPIRED_ACCOUNT_PURGE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 const db = new sqlite3.Database(DB_PATH);
+db.on('error', (err) => {
+  console.error('[sqlite] error:', err?.message || err);
+});
 let licenseApiStopped = false;
 
 function parseLicenseExpiresEpoch(raw) {
@@ -9316,6 +9331,7 @@ setup_services() {
 [Unit]
 Description=SC 1FORCR API
 After=network.target xray.service nginx.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -9325,7 +9341,7 @@ Environment=NODE_ENV=production
 Environment=UV_THREADPOOL_SIZE=2
 ExecStart=/usr/bin/node ${APP_DIR}/api.js
 Restart=always
-RestartSec=2
+RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 TasksMax=256
@@ -9338,6 +9354,7 @@ EOF
 [Unit]
 Description=SC 1FORCR SSH WebSocket Bridge
 After=network.target ssh.service dropbear.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -9345,7 +9362,7 @@ WorkingDirectory=${APP_DIR}
 EnvironmentFile=${APP_DIR}/.env
 ExecStart=${APP_DIR}/bin/ssh-mux
 Restart=always
-RestartSec=2
+RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 TasksMax=4096
@@ -9841,7 +9858,30 @@ setup_udp_bootfix_service() {
 set -euo pipefail
 
 ENV_FILE="/etc/sc-1forcr.env"
-[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+load_env_file "${ENV_FILE}"
 
 ZIVPN_SERVICE="${ZIVPN_SERVICE:-zivpn}"
 UDPCUSTOM_SERVICE="${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
@@ -10110,7 +10150,30 @@ setup_auto_reboot_timer() {
 set -euo pipefail
 
 ENV_FILE="/etc/sc-1forcr.env"
-[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+load_env_file "${ENV_FILE}"
 
 AUTO_REBOOT_ENABLE="${AUTO_REBOOT_ENABLE:-0}"
 AUTO_REBOOT_SCHEDULE_MODE="$(echo "${AUTO_REBOOT_SCHEDULE_MODE:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
@@ -10203,7 +10266,31 @@ setup_auto_backup_timer() {
 set -euo pipefail
 
 ENV_FILE="/etc/sc-1forcr.env"
-[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${line}" == *"="* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+load_env_file "${ENV_FILE}"
 
 DOMAIN="${DOMAIN:-unknown}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
@@ -10536,10 +10623,30 @@ if ! jq -e '.data' "${backup_file}" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ -f /etc/sc-1forcr.env ]]; then
-  # shellcheck disable=SC1091
-  source /etc/sc-1forcr.env || true
-fi
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+load_env_file /etc/sc-1forcr.env
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 mkdir -p "$(dirname "${DB_PATH}")"
 
@@ -10606,10 +10713,7 @@ apply_restored_runtime_units() {
   local iplimit_interval backup_enable backup_mode backup_interval backup_wib_hour
   local auto_reboot_enable auto_reboot_interval auto_reboot_mode auto_reboot_wib_hour pull_enable pull_interval notify_enable notify_interval
 
-  if [[ -f /etc/sc-1forcr.env ]]; then
-    # shellcheck disable=SC1091
-    source /etc/sc-1forcr.env || true
-  fi
+  load_env_file /etc/sc-1forcr.env
 
   iplimit_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
   [[ -z "${iplimit_interval}" || "${iplimit_interval}" -lt 1 || "${iplimit_interval}" -gt 1440 ]] && iplimit_interval="3"
@@ -11328,7 +11432,30 @@ setup_online_notify_timer() {
 set -euo pipefail
 
 ENV_FILE="/etc/sc-1forcr.env"
-[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+load_env_file "${ENV_FILE}"
 
 DOMAIN="${DOMAIN:-unknown}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
@@ -11951,7 +12078,31 @@ setup_auto_pull_update_timer() {
 set -euo pipefail
 
 ENV_FILE="/etc/sc-1forcr.env"
-[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${line}" == *"="* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+load_env_file "${ENV_FILE}"
 
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
@@ -12138,7 +12289,30 @@ EOF
 set -euo pipefail
 
 ENV_FILE="/etc/sc-1forcr.env"
-[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+load_env_file "${ENV_FILE}"
 
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
@@ -12527,11 +12701,28 @@ sanitize_env_file() {
 }
 
 safe_source_env_file() {
-  local file="$1"
+  local file="$1" line key value
   [[ -f "${file}" ]] || return 0
   sanitize_env_file "${file}"
-  # shellcheck disable=SC1090
-  source "${file}"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
 }
 
 safe_source_env_file /etc/sc-1forcr.env
@@ -16241,6 +16432,555 @@ set_wildcard_config_menu() {
   echo "- Front bug       : ${XRAY_FRONT_DOMAINS:-none}"
 }
 
+api_docs_nginx_snippet_path() {
+  echo "/etc/nginx/snippets/sc-1forcr-api-docs.conf"
+}
+
+api_docs_web_root() {
+  echo "/var/www/sc-1forcr-api-docs"
+}
+
+ensure_api_docs_nginx_include() {
+  local conf tmp
+  conf="/etc/nginx/sites-available/sc-1forcr.conf"
+  [[ -f "${conf}" ]] || return 0
+  if grep -qF 'include /etc/nginx/snippets/sc-1forcr-api-docs.conf;' "${conf}" 2>/dev/null; then
+    return 0
+  fi
+  tmp="$(mktemp)"
+  awk '
+    BEGIN { inserted = 0 }
+    /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
+      print "    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;"
+      inserted = 1
+    }
+    { print }
+  ' "${conf}" > "${tmp}" && mv -f "${tmp}" "${conf}"
+}
+
+write_api_docs_index() {
+  local web_root
+  web_root="$(api_docs_web_root)"
+  mkdir -p "${web_root}"
+  cat > "${web_root}/index.html" <<'EOF'
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SC 1FORCR API Docs</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1220;
+      --panel: #111a2b;
+      --panel-2: #0f1727;
+      --line: #223047;
+      --text: #e5eefc;
+      --muted: #8ea2c5;
+      --accent: #4fd1c5;
+      --accent-2: #f59e0b;
+      --danger: #ef4444;
+      --ok: #22c55e;
+      --shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.55 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        linear-gradient(180deg, rgba(79, 209, 197, 0.04), transparent 24%),
+        linear-gradient(180deg, #08101c 0%, #0b1220 100%);
+      color: var(--text);
+    }
+    a { color: inherit; }
+    button, input, code, pre { font: inherit; }
+    .wrap {
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 40px;
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.7fr) minmax(280px, 0.95fr);
+      gap: 20px;
+      align-items: end;
+      margin-bottom: 20px;
+    }
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    h1 {
+      margin: 0;
+      font-size: 36px;
+      line-height: 1.05;
+    }
+    .lede {
+      margin: 10px 0 0;
+      max-width: 68ch;
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(17, 26, 43, 0.84);
+      box-shadow: var(--shadow);
+      padding: 14px;
+    }
+    .meta {
+      display: grid;
+      gap: 10px;
+    }
+    .meta-row {
+      display: grid;
+      gap: 4px;
+    }
+    .meta-row span {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    code, pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    code {
+      padding: 2px 6px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+    }
+    .quick {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 18px;
+    }
+    .chip {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      background: rgba(17, 26, 43, 0.62);
+    }
+    .bar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 18px;
+    }
+    .search {
+      width: 100%;
+      min-width: 0;
+      border-radius: var(--radius);
+      border: 1px solid var(--line);
+      background: rgba(17, 26, 43, 0.84);
+      color: var(--text);
+      padding: 12px 14px;
+      outline: none;
+    }
+    .search:focus { border-color: rgba(79, 209, 197, 0.55); }
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .tab {
+      border: 1px solid var(--line);
+      background: rgba(17, 26, 43, 0.7);
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+    .tab.active {
+      color: var(--text);
+      border-color: rgba(79, 209, 197, 0.45);
+      background: rgba(79, 209, 197, 0.12);
+    }
+    .section {
+      margin-top: 18px;
+    }
+    .section h2 {
+      margin: 0 0 10px;
+      font-size: 18px;
+      line-height: 1.25;
+    }
+    .section p.sub {
+      margin: -2px 0 14px;
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .route {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(17, 26, 43, 0.8);
+      box-shadow: var(--shadow);
+      padding: 14px;
+    }
+    .route-top {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .method {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+      border: 1px solid transparent;
+    }
+    .m-get { background: rgba(34, 197, 94, 0.12); color: #8df0b1; border-color: rgba(34, 197, 94, 0.25); }
+    .m-post { background: rgba(79, 209, 197, 0.12); color: #8ef0ea; border-color: rgba(79, 209, 197, 0.25); }
+    .m-patch { background: rgba(245, 158, 11, 0.12); color: #ffd08a; border-color: rgba(245, 158, 11, 0.25); }
+    .m-delete { background: rgba(239, 68, 68, 0.12); color: #ff9a9a; border-color: rgba(239, 68, 68, 0.25); }
+    .tags {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .path {
+      margin: 0 0 8px;
+      font-size: 15px;
+      font-weight: 700;
+      word-break: break-word;
+    }
+    .desc {
+      margin: 0 0 10px;
+      color: var(--muted);
+    }
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .block .label {
+      margin: 0 0 6px;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    .block pre {
+      min-height: 92px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(8, 16, 28, 0.8);
+      overflow: auto;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .btn {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--text);
+      border-radius: 7px;
+      padding: 8px 11px;
+      cursor: pointer;
+    }
+    .btn:hover { border-color: rgba(79, 209, 197, 0.45); }
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: var(--radius);
+      padding: 16px;
+      color: var(--muted);
+      text-align: center;
+      background: rgba(17, 26, 43, 0.42);
+    }
+    @media (max-width: 920px) {
+      .hero, .bar, .grid, .split { grid-template-columns: 1fr; }
+      .tabs { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">SC 1FORCR</p>
+        <h1>Dokumentasi API</h1>
+        <p class="lede">Endpoint resmi untuk user sewa SC: create akun, trial, renew, lock, quota, dan sinkronisasi konfigurasi server.</p>
+      </div>
+      <aside class="panel meta">
+        <div class="meta-row"><span>Base URL</span><code id="base"></code></div>
+        <div class="meta-row"><span>Docs Path</span><code>/docs/</code></div>
+        <div class="meta-row"><span>Auth Header</span><code>Authorization: Bearer &lt;token&gt;</code></div>
+      </aside>
+    </header>
+    <div class="quick">
+      <span class="chip">HTTPS</span>
+      <span class="chip">Static HTML / CSS / JS</span>
+      <span class="chip">Same domain, isolated path</span>
+      <span class="chip">Default off, toggle via menu</span>
+    </div>
+    <div class="bar">
+      <input id="search" class="search" type="search" placeholder="Cari path, method, atau keterangan endpoint...">
+      <div id="tabs" class="tabs"></div>
+    </div>
+    <main id="content"></main>
+  </div>
+  <script>
+    const BASE = location.origin;
+    document.getElementById('base').textContent = BASE;
+    const TOKEN = '<token>';
+    const authCurl = `-H "Authorization: Bearer ${TOKEN}"`;
+    const q = (v) => String(v || '').trim();
+    const routes = [
+      ['Core', 'GET', '/vps/health', false, 'Cek liveness API dan domain aktif.', '-', `curl -s "${BASE}/vps/health"`, 'Tanpa auth.'],
+      ['Core', 'GET', '/vps/capacity', true, 'Baca state kapasitas server dan auto-tune.', '-', `curl ${authCurl} "${BASE}/vps/capacity"`, 'Auth wajib.'],
+      ['Core', 'GET', '/vps/my-accounts?telegram_user_id=123456789', true, 'Daftar akun milik user Telegram tertentu.', 'Query:\ntelegram_user_id=123456789\ninclude_inactive=1 (opsional)', `curl ${authCurl} "${BASE}/vps/my-accounts?telegram_user_id=123456789"`, 'Auth wajib.'],
+      ['SSH', 'POST', '/vps/sshvpn', true, 'Buat akun SSH / SSHWS reguler.', '{\n  "username": "jengger8844",\n  "password": "Rahasia123!",\n  "expired": 30,\n  "limitip": 2,\n  "kuota": 0\n}', `curl -X POST ${authCurl} -H "Content-Type: application/json" -d '{"username":"jengger8844","password":"Rahasia123!","expired":30,"limitip":2,"kuota":0}' "${BASE}/vps/sshvpn"`, 'Password boleh kosong, server bisa generate otomatis.'],
+      ['SSH', 'POST', '/vps/trialsshvpn', true, 'Buat akun trial SSH / SSHWS.', '{\n  "username": "",\n  "password": "opsional",\n  "limitip": 1\n}', `curl -X POST ${authCurl} -H "Content-Type: application/json" -d '{"username":"","password":"opsional","limitip":1}' "${BASE}/vps/trialsshvpn"`, 'Username trial boleh kosong.'],
+      ['SSH', 'POST / PATCH', '/vps/passwordsshvpn/:username', true, 'Ganti password akun SSH.', '{\n  "password": "password-baru"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"password":"password-baru"}' "${BASE}/vps/passwordsshvpn/jengger8844"`, 'POST dan PATCH sama-sama diterima.'],
+      ['SSH', 'POST / PATCH', '/vps/passwordsshvpn-all', true, 'Ganti password semua akun SSH aktif.', '{\n  "password": "password-baru"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"password":"password-baru"}' "${BASE}/vps/passwordsshvpn-all"`, 'Berlaku untuk semua akun SSH.'],
+      ['SSH', 'DELETE', '/vps/deletesshvpn/:username', true, 'Hapus akun SSH.', '-', `curl -X DELETE ${authCurl} "${BASE}/vps/deletesshvpn/jengger8844"`, 'Akun dan state backend ikut dibersihkan.'],
+      ['SSH', 'POST / PATCH', '/vps/renewsshvpn/:username/:exp', true, 'Perpanjang atau recover akun SSH.', '{\n  "password": "opsional",\n  "limitip": 2,\n  "kuota": 10,\n  "recover_missing": 1\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"password":"opsional","limitip":2,"kuota":10,"recover_missing":1}' "${BASE}/vps/renewsshvpn/jengger8844/30"`, ':exp adalah tambahan hari.'],
+      ['SSH', 'PATCH', '/vps/locksshvpn/:username', true, 'Lock akun SSH.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/locksshvpn/jengger8844"`, 'Memutus akses login lama.'],
+      ['SSH', 'PATCH', '/vps/unlocksshvpn/:username', true, 'Unlock akun SSH jika quota masih cukup.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/unlocksshvpn/jengger8844"`, 'Akan ditolak kalau quota habis.'],
+      ['SSH', 'PATCH', '/vps/unlocksshvpn/:username/pw', true, 'Unlock SSH dengan sinkron password helper.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/unlocksshvpn/jengger8844/pw"`, 'Alias unlock dengan validasi password.'],
+      ['Xray', 'POST', '/vps/vmessall', true, 'Buat akun VMess.', '{\n  "username": "vmess01",\n  "expired": 30,\n  "limitip": 2,\n  "kuota": 0\n}', `curl -X POST ${authCurl} -H "Content-Type: application/json" -d '{"username":"vmess01","expired":30,"limitip":2,"kuota":0}' "${BASE}/vps/vmessall"`, 'UUID dibuat server dan dikirim di response.'],
+      ['Xray', 'POST', '/vps/trialvmessall', true, 'Buat akun trial VMess.', '{\n  "username": "",\n  "limitip": 1\n}', `curl -X POST ${authCurl} -H "Content-Type: application/json" -d '{"username":"","limitip":1}' "${BASE}/vps/trialvmessall"`, 'Username trial boleh kosong.'],
+      ['Xray', 'POST', '/vps/vlessall', true, 'Buat akun VLESS.', '{\n  "username": "vless01",\n  "expired": 30,\n  "limitip": 2,\n  "kuota": 0\n}', `curl -X POST ${authCurl} -H "Content-Type: application/json" -d '{"username":"vless01","expired":30,"limitip":2,"kuota":0}' "${BASE}/vps/vlessall"`, 'UUID dibuat server dan dikirim di response.'],
+      ['Xray', 'POST', '/vps/trialvlessall', true, 'Buat akun trial VLESS.', '{\n  "username": "",\n  "limitip": 1\n}', `curl -X POST ${authCurl} -H "Content-Type: application/json" -d '{"username":"","limitip":1}' "${BASE}/vps/trialvlessall"`, 'Username trial boleh kosong.'],
+      ['Xray', 'POST', '/vps/trojanall', true, 'Buat akun Trojan.', '{\n  "username": "trojan01",\n  "expired": 30,\n  "limitip": 2,\n  "kuota": 0\n}', `curl -X POST ${authCurl} -H "Content-Type: application/json" -d '{"username":"trojan01","expired":30,"limitip":2,"kuota":0}' "${BASE}/vps/trojanall"`, 'Password Trojan dibuat server dan dikirim di response.'],
+      ['Xray', 'POST', '/vps/trialtrojanall', true, 'Buat akun trial Trojan.', '{\n  "username": "",\n  "limitip": 1\n}', `curl -X POST ${authCurl} -H "Content-Type: application/json" -d '{"username":"","limitip":1}' "${BASE}/vps/trialtrojanall"`, 'Username trial boleh kosong.'],
+      ['Xray', 'POST / PATCH', '/vps/renewvmess/:username/:exp', true, 'Perpanjang akun VMess.', '{\n  "limitip": 2,\n  "kuota": 10\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"limitip":2,"kuota":10}' "${BASE}/vps/renewvmess/vmess01/30"`, ':exp adalah tambahan hari.'],
+      ['Xray', 'POST / PATCH', '/vps/renewvless/:username/:exp', true, 'Perpanjang akun VLESS.', '{\n  "limitip": 2,\n  "kuota": 10\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"limitip":2,"kuota":10}' "${BASE}/vps/renewvless/vless01/30"`, ':exp adalah tambahan hari.'],
+      ['Xray', 'POST / PATCH', '/vps/renewtrojan/:username/:exp', true, 'Perpanjang akun Trojan.', '{\n  "limitip": 2,\n  "kuota": 10\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"limitip":2,"kuota":10}' "${BASE}/vps/renewtrojan/trojan01/30"`, ':exp adalah tambahan hari.'],
+      ['Xray', 'DELETE', '/vps/deletevmess/:username', true, 'Hapus akun VMess.', '-', `curl -X DELETE ${authCurl} "${BASE}/vps/deletevmess/vmess01"`, 'State Xray ikut dibersihkan.'],
+      ['Xray', 'DELETE', '/vps/deletevless/:username', true, 'Hapus akun VLESS.', '-', `curl -X DELETE ${authCurl} "${BASE}/vps/deletevless/vless01"`, 'State Xray ikut dibersihkan.'],
+      ['Xray', 'DELETE', '/vps/deletetrojan/:username', true, 'Hapus akun Trojan.', '-', `curl -X DELETE ${authCurl} "${BASE}/vps/deletetrojan/trojan01"`, 'State Xray ikut dibersihkan.'],
+      ['Xray', 'PATCH', '/vps/lockvmess/:username', true, 'Lock akun VMess.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/lockvmess/vmess01"`, 'Menonaktifkan akses account.'],
+      ['Xray', 'PATCH', '/vps/lockvless/:username', true, 'Lock akun VLESS.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/lockvless/vless01"`, 'Menonaktifkan akses account.'],
+      ['Xray', 'PATCH', '/vps/locktrojan/:username', true, 'Lock akun Trojan.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/locktrojan/trojan01"`, 'Menonaktifkan akses account.'],
+      ['Xray', 'PATCH', '/vps/unlockvmess/:username', true, 'Unlock akun VMess.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/unlockvmess/vmess01"`, 'Akan gagal jika quota habis.'],
+      ['Xray', 'PATCH', '/vps/unlockvless/:username', true, 'Unlock akun VLESS.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/unlockvless/vless01"`, 'Akan gagal jika quota habis.'],
+      ['Xray', 'PATCH', '/vps/unlocktrojan/:username', true, 'Unlock akun Trojan.', '-', `curl -X PATCH ${authCurl} "${BASE}/vps/unlocktrojan/trojan01"`, 'Akan gagal jika quota habis.'],
+      ['Quota', 'PATCH', '/vps/quota/:type/:username', true, 'Ubah quota akun SSH/VMess/VLESS/Trojan.', '{\n  "kuota": 10,\n  "mode": "add"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"kuota":10,"mode":"add"}' "${BASE}/vps/quota/ssh/jengger8844"`, 'Gunakan mode add untuk menambah saldo kuota.'],
+      ['Quota', 'PATCH', '/vps/editquotasshvpn/:username', true, 'Alias quota untuk akun SSH.', '{\n  "kuota": 10,\n  "mode": "add"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"kuota":10,"mode":"add"}' "${BASE}/vps/editquotasshvpn/jengger8844"`, 'Alias endpoint quota SSH.'],
+      ['Quota', 'PATCH', '/vps/editquotavmess/:username', true, 'Alias quota untuk akun VMess.', '{\n  "kuota": 10,\n  "mode": "add"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"kuota":10,"mode":"add"}' "${BASE}/vps/editquotavmess/vmess01"`, 'Alias endpoint quota VMess.'],
+      ['Quota', 'PATCH', '/vps/editquotavless/:username', true, 'Alias quota untuk akun VLESS.', '{\n  "kuota": 10,\n  "mode": "add"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"kuota":10,"mode":"add"}' "${BASE}/vps/editquotavless/vless01"`, 'Alias endpoint quota VLESS.'],
+      ['Quota', 'PATCH', '/vps/editquotatrojan/:username', true, 'Alias quota untuk akun Trojan.', '{\n  "kuota": 10,\n  "mode": "add"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"kuota":10,"mode":"add"}' "${BASE}/vps/editquotatrojan/trojan01"`, 'Alias endpoint quota Trojan.'],
+      ['Utility', 'POST', '/vps/sync-xray', true, 'Sinkron ulang konfigurasi Xray dari database.', '-', `curl -X POST ${authCurl} "${BASE}/vps/sync-xray"`, 'Dipakai setelah restore/import DB.'],
+      ['Utility', 'POST', '/vps/restore-finished', true, 'Alias sync-xray setelah restore selesai.', '-', `curl -X POST ${authCurl} "${BASE}/vps/restore-finished"`, 'Dipakai setelah restore/import DB.']
+    ].map(([group, method, path, auth, summary, body, curl, note]) => ({ group, method, path, auth, summary, body, curl, note }));
+    const groups = ['Semua', 'Core', 'SSH', 'Xray', 'Quota', 'Utility'];
+    let activeGroup = 'Semua';
+    const tabs = document.getElementById('tabs');
+    const search = document.getElementById('search');
+    const content = document.getElementById('content');
+
+    const methodClass = (m) => {
+      const key = String(m || '').toLowerCase();
+      if (key.includes('get')) return 'm-get';
+      if (key.includes('post')) return 'm-post';
+      if (key.includes('patch')) return 'm-patch';
+      if (key.includes('delete')) return 'm-delete';
+      return 'm-post';
+    };
+
+    const matches = (item, term, group) => {
+      const hay = [item.group, item.method, item.path, item.summary, item.body, item.note, item.curl].join(' ').toLowerCase();
+      const okGroup = group === 'Semua' || item.group === group;
+      return okGroup && (!term || hay.includes(term));
+    };
+
+    const copy = async (text) => {
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {}
+    };
+
+    const renderTabs = () => {
+      tabs.innerHTML = groups.map((g) => `<button class="tab${g === activeGroup ? ' active' : ''}" data-group="${g}">${g}</button>`).join('');
+      tabs.querySelectorAll('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          activeGroup = btn.dataset.group || 'Semua';
+          render();
+        });
+      });
+    };
+
+    const render = () => {
+      renderTabs();
+      const term = q(search.value).toLowerCase();
+      const filtered = routes.filter((item) => matches(item, term, activeGroup));
+      if (!filtered.length) {
+        content.innerHTML = '<div class="empty">Tidak ada endpoint yang cocok dengan pencarian.</div>';
+        return;
+      }
+      const byGroup = filtered.reduce((acc, item) => {
+        (acc[item.group] ||= []).push(item);
+        return acc;
+      }, {});
+      content.innerHTML = Object.entries(byGroup).map(([group, items]) => `
+        <section class="section">
+          <h2>${group}</h2>
+          <p class="sub">${items.length} endpoint tersedia</p>
+          <div class="grid">
+            ${items.map((item) => `
+              <article class="route">
+                <div class="route-top">
+                  <span class="method ${methodClass(item.method)}">${item.method}</span>
+                  <span class="tags">${item.auth ? 'Auth required' : 'Public'}${item.note ? ' • ' + item.note : ''}</span>
+                </div>
+                <p class="path">${item.path}</p>
+                <p class="desc">${item.summary}</p>
+                <div class="split">
+                  <div class="block">
+                    <div class="label">Request</div>
+                    <pre><code>${item.body}</code></pre>
+                  </div>
+                  <div class="block">
+                    <div class="label">cURL</div>
+                    <pre><code>${item.curl}</code></pre>
+                  </div>
+                </div>
+                <div class="actions">
+                  <button class="btn" data-copy="${item.curl.replace(/"/g, '&quot;')}">Copy cURL</button>
+                </div>
+              </article>
+            `).join('')}
+          </div>
+        </section>
+      `).join('');
+      content.querySelectorAll('[data-copy]').forEach((btn) => {
+        btn.addEventListener('click', () => copy(btn.dataset.copy || ''));
+      });
+    };
+
+    search.addEventListener('input', render);
+    render();
+  </script>
+</body>
+</html>
+EOF
+  chmod 644 "${web_root}/index.html" >/dev/null 2>&1 || true
+}
+
+write_api_docs_nginx_snippet() {
+  local snippet enabled web_root
+  snippet="$(api_docs_nginx_snippet_path)"
+  web_root="$(api_docs_web_root)"
+  enabled="$(normalize_bool_01 "${API_DOCS_ENABLE:-0}")"
+  mkdir -p "$(dirname "${snippet}")"
+  if [[ "${enabled}" == "1" ]]; then
+    cat > "${snippet}" <<EOF
+# SC 1FORCR API docs
+location = /docs {
+    return 301 /docs/;
+}
+
+location ^~ /docs/ {
+    alias ${web_root}/;
+    index index.html;
+}
+EOF
+  else
+    cat > "${snippet}" <<'EOF'
+# SC 1FORCR API docs disabled
+location = /docs {
+    return 404;
+}
+
+location ^~ /docs/ {
+    return 404;
+}
+EOF
+  fi
+  chmod 644 "${snippet}" >/dev/null 2>&1 || true
+}
+
+prepare_api_docs_site() {
+  local enabled web_root
+  enabled="$(normalize_bool_01 "${API_DOCS_ENABLE:-0}")"
+  web_root="$(api_docs_web_root)"
+  ensure_api_docs_nginx_include
+  write_api_docs_nginx_snippet
+  if [[ "${enabled}" == "1" ]]; then
+    write_api_docs_index
+  else
+    rm -rf "${web_root}" >/dev/null 2>&1 || true
+  fi
+}
+
+apply_api_docs_site() {
+  prepare_api_docs_site
+  if ! command -v nginx >/dev/null 2>&1; then
+    echo "nginx tidak ditemukan, docs site belum bisa diaktifkan."
+    return 1
+  fi
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "Konfigurasi nginx tidak valid saat menerapkan docs site."
+    return 1
+  fi
+  systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+  return 0
+}
+
+set_api_docs_config_menu() {
+  local current_enable enable_in desired_state current_url
+  current_enable="$(normalize_bool_01 "${API_DOCS_ENABLE:-0}")"
+  current_url="https://${DOMAIN}/docs/"
+  echo "SETTING WEB DOKUMENTASI API"
+  echo "Status sekarang : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "URL saat aktif  : ${current_url}"
+  echo "Path isolasi    : /docs/ (tidak menabrak routing SSH/Xray)"
+  echo
+  prompt_input enable_in "Aktifkan web dokumentasi API? [1/0, enter=keep]: " || return
+  enable_in="$(echo "${enable_in:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${enable_in}" in
+    1|true|yes|on) desired_state="1" ;;
+    0|false|no|off) desired_state="0" ;;
+    "") desired_state="${current_enable}" ;;
+    *) echo "Input tidak valid, status lama dipakai."; desired_state="${current_enable}" ;;
+  esac
+
+  API_DOCS_ENABLE="${desired_state}"
+  if ! apply_api_docs_site; then
+    API_DOCS_ENABLE="${current_enable}"
+    echo "Gagal menerapkan web dokumentasi API."
+    return 1
+  fi
+
+  update_sc_env_var "API_DOCS_ENABLE" "${API_DOCS_ENABLE}"
+  update_app_env_var "API_DOCS_ENABLE" "${API_DOCS_ENABLE}"
+
+  echo
+  echo "Berhasil update web dokumentasi API:"
+  echo "- Status : $([[ "${API_DOCS_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  if [[ "${API_DOCS_ENABLE}" == "1" ]]; then
+    echo "- URL    : ${current_url}"
+  else
+    echo "- URL    : nonaktif"
+  fi
+}
+
 tools_menu() {
   while true; do
     clear
@@ -16261,9 +17001,10 @@ tools_menu() {
       "14) Setting Auto Update Bot" \
       "15) Setting Wildcard Cloudflare" \
       "16) Diagnosa/Repair Routing Jaringan" \
+      "17) Setting Web Dokumentasi API" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-16]: "; then
+    if ! prompt_input tm "Pilih menu [0-17]: "; then
       return
     fi
     clear
@@ -16284,6 +17025,7 @@ tools_menu() {
       14) set_auto_pull_update_config_menu || true ;;
       15) set_wildcard_config_menu || true ;;
       16) network_compatibility_menu || true ;;
+      17) set_api_docs_config_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -16892,6 +17634,8 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
+    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
+
     location /vmess {
         access_log off;
         proxy_redirect off;
@@ -17239,6 +17983,7 @@ EOF
   update_app_env_var "XRAY_FRONT_DOMAIN" "${XRAY_FRONT_DOMAIN:-}"
   update_app_env_var "XRAY_FRONT_DOMAINS" "${XRAY_FRONT_DOMAINS:-}"
 
+  prepare_api_docs_site || true
   systemctl restart sc-1forcr-api sc-1forcr-sshws haproxy nginx
   echo "Domain berhasil diubah ke ${new_domain}"
 }
@@ -20616,8 +21361,25 @@ install_legacy_runtime_command_shims() {
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ -f /etc/sc-1forcr.env ]]; then
-  # shellcheck disable=SC1091
-  source /etc/sc-1forcr.env >/dev/null 2>&1 || true
+  while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < /etc/sc-1forcr.env
 fi
 keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
 idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" | tr -cd '0-9')"

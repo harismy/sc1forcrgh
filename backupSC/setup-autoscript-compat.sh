@@ -1942,6 +1942,8 @@ server {
     listen 127.0.0.1:8081 http2;
     server_name _;
 
+    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
+
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
@@ -16090,18 +16092,40 @@ api_docs_web_root() {
 }
 
 ensure_api_docs_nginx_include() {
-  local conf tmp
+  local conf tmp count
   conf="/etc/nginx/sites-available/sc-1forcr.conf"
   [[ -f "${conf}" ]] || return 0
-  if grep -qF 'include /etc/nginx/snippets/sc-1forcr-api-docs.conf;' "${conf}" 2>/dev/null; then
+  count="$(grep -cF 'include /etc/nginx/snippets/sc-1forcr-api-docs.conf;' "${conf}" 2>/dev/null || echo 0)"
+  if [[ "${count}" -ge 2 ]]; then
     return 0
   fi
   tmp="$(mktemp)"
   awk '
-    BEGIN { inserted = 0 }
-    /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/ && inserted == 0 {
-      print "    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;"
-      inserted = 1
+    BEGIN { in_server=0; brace=0; has_include=0; pending_http2=0 }
+    /^[[:space:]]*server[[:space:]]*\{/ {
+      in_server=1
+      brace=1
+      has_include=0
+      pending_http2=0
+      print
+      next
+    }
+    in_server {
+      if ($0 ~ /include[[:space:]]+\/etc\/nginx\/snippets\/sc-1forcr-api-docs\.conf;/) has_include=1
+      if ($0 ~ /listen[[:space:]]+127\.0\.0\.1:8081[[:space:]]+http2;/) pending_http2=1
+      if ($0 ~ /^[[:space:]]*location[[:space:]]+\/[[:space:]]*\{/ && !has_include) {
+        print "    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;"
+        has_include=1
+      }
+      print
+      if (pending_http2 && !has_include && $0 ~ /^[[:space:]]*server_name[[:space:]]+_;[[:space:]]*$/) {
+        print ""
+        print "    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;"
+        has_include=1
+      }
+      brace += gsub(/\{/, "{") - gsub(/\}/, "}")
+      if (brace <= 0) in_server=0
+      next
     }
     { print }
   ' "${conf}" > "${tmp}" && mv -f "${tmp}" "${conf}"
@@ -17436,6 +17460,8 @@ ${sshws_nginx_limit_rules}
 server {
     listen 127.0.0.1:8081 http2;
     server_name _;
+
+    include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
 
     location /vmess-grpc {
         access_log off;

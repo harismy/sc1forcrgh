@@ -12785,6 +12785,15 @@ flag_enabled() {
   esac
 }
 
+normalize_bool_01() {
+  local raw
+  raw="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${raw}" in
+    1|true|yes|on) echo "1" ;;
+    *) echo "0" ;;
+  esac
+}
+
 trim_env_value() {
   local value
   value="$(printf '%s' "${1:-}" | tr -d '\r' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"

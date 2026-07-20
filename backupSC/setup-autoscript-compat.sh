@@ -2717,6 +2717,7 @@ EOF
 PORT=${API_PORT}
 DB_PATH=${DB_PATH}
 DOMAIN=${DOMAIN}
+API_DOCS_ENABLE=${API_DOCS_ENABLE}
 WILDCARD_BUG_PREFIX=${WILDCARD_BUG_PREFIX}
 WILDCARD_BUG_PREFIXES=${WILDCARD_BUG_PREFIXES}
 WILDCARD_XRAY_HOST=${WILDCARD_XRAY_HOST}
@@ -12457,6 +12458,7 @@ XRAY_FRONT_DOMAIN=${XRAY_FRONT_DOMAIN}
 XRAY_FRONT_DOMAINS=${XRAY_FRONT_DOMAINS}
 UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
 AUTO_INSTALL_SUMMARY_API=${AUTO_INSTALL_SUMMARY_API}
+API_DOCS_ENABLE=${API_DOCS_ENABLE}
 SUMMARY_API_SETUP_URL=${SUMMARY_API_SETUP_URL}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
@@ -19856,6 +19858,7 @@ Time     : $(date '+%F %T')"
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}" \
     AUTO_INSTALL_SUMMARY_API="0" \
+    API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}" \
     SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-}" \
     AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
     AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR}" \
@@ -20535,6 +20538,11 @@ if [[ "${1:-}" == "update-summary" || "${1:-}" == "summary-update" ]]; then
   exit $?
 fi
 
+if [[ "${1:-}" == "apply-api-docs" || "${1:-}" == "api-docs-apply" ]]; then
+  apply_api_docs_site
+  exit $?
+fi
+
 while true; do
   normalize_pending_operation
   if has_pending_install_only; then
@@ -20783,6 +20791,14 @@ if [[ $- == *i* ]] && [[ "${EUID:-$(id -u)}" -eq 0 ]] && [[ -t 0 && -t 1 ]]; the
 fi
 # <<< sc-1forcr-auto-menu-login <<<
 EOF
+}
+
+reapply_api_docs_site_runtime() {
+  local menu_runtime
+  menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
+  [[ "$(normalize_bool_01 "${API_DOCS_ENABLE:-0}")" == "1" ]] || return 0
+  [[ -x "${menu_runtime}" ]] || return 0
+  "${menu_runtime}" apply-api-docs >/dev/null 2>&1 || true
 }
 
 write_version_marker() {
@@ -21203,7 +21219,7 @@ persist_pending_install_env() {
   vars=(
     DOMAIN EMAIL INSTALL_AUTH_TOKEN API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH
     LICENSE_ENFORCE LICENSE_API_URL LICENSE_API_TOKEN LICENSE_KEY
-    UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API SUMMARY_API_SETUP_URL
+    UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API API_DOCS_ENABLE SUMMARY_API_SETUP_URL
     WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN WILDCARD_CF_EMAIL WILDCARD_CF_API_KEY
     WILDCARD_BUG_PREFIX WILDCARD_BUG_PREFIXES WILDCARD_XRAY_HOST WILDCARD_XRAY_HOSTS XRAY_PUBLIC_HOST
     XRAY_FRONT_DOMAIN XRAY_FRONT_DOMAINS
@@ -21399,6 +21415,7 @@ main() {
     setup_auto_pull_update_timer
     setup_resource_autotune_timer
     write_cli_menu
+    reapply_api_docs_site_runtime
     setup_auto_menu_login
     write_version_marker
     sync_zivpn_auth_token_with_api_runtime
@@ -21455,6 +21472,7 @@ main() {
   run_install_step "31_summary_api" 93 "Install Summary API 1FORCR" install_summary_api_optional
 
   run_install_step "32_cli_menu" 95 "Tulis menu CLI" write_cli_menu
+  reapply_api_docs_site_runtime
   run_install_step "33_auto_menu" 96 "Setup auto menu login" setup_auto_menu_login
   run_install_step "34_version_marker" 97 "Tulis marker versi" write_version_marker
   run_install_step "35_sync_token" 98 "Sinkron token ZIVPN dan API" sync_zivpn_auth_token_with_api_runtime

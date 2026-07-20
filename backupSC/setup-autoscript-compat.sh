@@ -62,6 +62,8 @@ set -euo pipefail
 #   SSH_TUNNEL_SHELL=/usr/local/sbin/sc-1forcr-tunnel-shell (tunnel-only, tahan sesi HTTP Custom tanpa shell VPS)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1            (blok akun tunnel konek keluar ke port SSH)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=22,2222     (port keluar yang diblok untuk UID non-root)
+#   TUNNEL_ABUSE_GUARD_ENABLE=1                (blok port abuse untuk UID non-root: RDP/VNC/SMB/SMTP)
+#   TUNNEL_ABUSE_BLOCK_TCP_PORTS=3389,5900,5901,5902,445,135,139,25,465,587
 #   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
@@ -180,6 +182,8 @@ SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-auto}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}"
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}"
+TUNNEL_ABUSE_GUARD_ENABLE="${TUNNEL_ABUSE_GUARD_ENABLE:-1}"
+TUNNEL_ABUSE_BLOCK_TCP_PORTS="${TUNNEL_ABUSE_BLOCK_TCP_PORTS:-3389,5900,5901,5902,445,135,139,25,465,587}"
 ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
@@ -1410,28 +1414,47 @@ harden_ssh_tunnel_shells() {
 }
 
 apply_tunnel_outbound_guard_rules() {
-  local enabled ports
-  enabled="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-  if [[ "${enabled}" != "1" && "${enabled}" != "true" && "${enabled}" != "yes" && "${enabled}" != "on" ]]; then
-    log "Outbound SSH guard nonaktif (SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0})."
-    return 0
-  fi
-  ports="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}" | tr -cd '0-9,')"
-  [[ -z "${ports}" ]] && ports="22"
-
+  local ssh_enabled abuse_enabled ssh_ports abuse_ports applied
   if command -v iptables >/dev/null 2>&1; then
-    iptables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
-      iptables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
-    if command -v ip6tables >/dev/null 2>&1; then
-      ip6tables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
-        ip6tables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+    ssh_enabled="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    abuse_enabled="$(echo "${TUNNEL_ABUSE_GUARD_ENABLE:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    ssh_ports="$(echo "${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}" | tr -cd '0-9,')"
+    abuse_ports="$(echo "${TUNNEL_ABUSE_BLOCK_TCP_PORTS:-3389,5900,5901,5902,445,135,139,25,465,587}" | tr -cd '0-9,')"
+    [[ -z "${ssh_ports}" ]] && ssh_ports="22"
+    [[ -z "${abuse_ports}" ]] && abuse_ports="3389"
+    applied=0
+
+    if [[ "${ssh_enabled}" == "1" || "${ssh_enabled}" == "true" || "${ssh_enabled}" == "yes" || "${ssh_enabled}" == "on" ]]; then
+      iptables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ssh_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+        iptables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ssh_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+      if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ssh_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+          ip6tables -w 10 -I OUTPUT -p tcp -m multiport --dports "${ssh_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+      fi
+      applied=1
+      log "Outbound SSH guard aktif untuk UID non-root: tcp/${ssh_ports}."
+    else
+      log "Outbound SSH guard nonaktif (SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0})."
     fi
-    if command -v netfilter-persistent >/dev/null 2>&1; then
+
+    if [[ "${abuse_enabled}" == "1" || "${abuse_enabled}" == "true" || "${abuse_enabled}" == "yes" || "${abuse_enabled}" == "on" ]]; then
+      iptables -w 10 -C OUTPUT -p tcp -m multiport --dports "${abuse_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+        iptables -w 10 -I OUTPUT -p tcp -m multiport --dports "${abuse_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+      if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -w 10 -C OUTPUT -p tcp -m multiport --dports "${abuse_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
+          ip6tables -w 10 -I OUTPUT -p tcp -m multiport --dports "${abuse_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || true
+      fi
+      applied=1
+      log "Tunnel abuse guard aktif untuk UID non-root: tcp/${abuse_ports}."
+    else
+      log "Tunnel abuse guard nonaktif (TUNNEL_ABUSE_GUARD_ENABLE=${TUNNEL_ABUSE_GUARD_ENABLE:-0})."
+    fi
+
+    if [[ "${applied}" == "1" ]] && command -v netfilter-persistent >/dev/null 2>&1; then
       netfilter-persistent save >/dev/null 2>&1 || true
     fi
-    log "Outbound SSH guard aktif untuk UID non-root: tcp/${ports}."
   else
-    log "iptables tidak tersedia, outbound SSH guard dilewati."
+    log "iptables tidak tersedia, outbound tunnel guard dilewati."
   fi
 }
 
@@ -2787,6 +2810,8 @@ SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
 SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH}
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS}
+TUNNEL_ABUSE_GUARD_ENABLE=${TUNNEL_ABUSE_GUARD_ENABLE}
+TUNNEL_ABUSE_BLOCK_TCP_PORTS=${TUNNEL_ABUSE_BLOCK_TCP_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -10309,6 +10334,8 @@ SETTINGS_KEYS = [
     "SSH_TUNNEL_SHELL",
     "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
     "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
+    "TUNNEL_ABUSE_GUARD_ENABLE",
+    "TUNNEL_ABUSE_BLOCK_TCP_PORTS",
     "SSHWS_LOOP_GUARD_ENABLE",
     "SSHWS_LOOP_GUARD_PORTS",
     "SSHWS_LOOP_GUARD_NEW_ABOVE",
@@ -11080,6 +11107,8 @@ SETTINGS_KEYS = [
     "SSH_TUNNEL_SHELL",
     "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
     "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
+    "TUNNEL_ABUSE_GUARD_ENABLE",
+    "TUNNEL_ABUSE_BLOCK_TCP_PORTS",
     "SSHWS_LOOP_GUARD_ENABLE",
     "SSHWS_LOOP_GUARD_PORTS",
     "SSHWS_LOOP_GUARD_NEW_ABOVE",
@@ -12474,6 +12503,11 @@ SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
 SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
 SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
+SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
+SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH}
+SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS}
+TUNNEL_ABUSE_GUARD_ENABLE=${TUNNEL_ABUSE_GUARD_ENABLE}
+TUNNEL_ABUSE_BLOCK_TCP_PORTS=${TUNNEL_ABUSE_BLOCK_TCP_PORTS}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 DROPBEAR_VERSION=${DROPBEAR_VERSION}
@@ -19884,6 +19918,11 @@ Time     : $(date '+%F %T')"
     SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-auto}" \
     SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-auto}" \
     SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-auto}" \
+    SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}" \
+    SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}" \
+    SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}" \
+    TUNNEL_ABUSE_GUARD_ENABLE="${TUNNEL_ABUSE_GUARD_ENABLE:-1}" \
+    TUNNEL_ABUSE_BLOCK_TCP_PORTS="${TUNNEL_ABUSE_BLOCK_TCP_PORTS:-3389,5900,5901,5902,445,135,139,25,465,587}" \
     DROPBEAR_PORT="${DROPBEAR_PORT}" \
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
     DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
@@ -21293,7 +21332,7 @@ persist_pending_install_env() {
     UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
     SSHWS_UDPGW_PORTS SSHWS_UDPGW_MAX_CLIENTS SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT SSHWS_UDPGW_MEMORY_MAX
     SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
-    SSH_TUNNEL_BLOCK_OUTBOUND_PORTS ACTIVE_UDP_BACKEND
+    SSH_TUNNEL_BLOCK_OUTBOUND_PORTS TUNNEL_ABUSE_GUARD_ENABLE TUNNEL_ABUSE_BLOCK_TCP_PORTS ACTIVE_UDP_BACKEND
     DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION DROPBEAR_KEEPALIVE_SECONDS DROPBEAR_IDLE_TIMEOUT_SECONDS
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
@@ -21481,6 +21520,7 @@ main() {
     setup_auto_menu_login
     write_version_marker
     sync_zivpn_auth_token_with_api_runtime
+    apply_tunnel_outbound_guard_rules
     restart_update_safe_services
     post_install_preflight || true
     log "Update aman selesai. Service tunnel aktif tidak direstart."

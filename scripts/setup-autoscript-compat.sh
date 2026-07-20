@@ -2096,7 +2096,21 @@ server {
 }
 EOF
 
-  prepare_api_docs_site || true
+  if declare -F prepare_api_docs_site >/dev/null 2>&1; then
+    prepare_api_docs_site || true
+  else
+    mkdir -p /etc/nginx/snippets
+    cat > /etc/nginx/snippets/sc-1forcr-api-docs.conf <<'EOF'
+# SC 1FORCR API docs disabled
+location = /docs {
+    return 404;
+}
+
+location ^~ /docs/ {
+    return 404;
+}
+EOF
+  fi
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
   tune_nginx_capacity
@@ -17983,7 +17997,21 @@ EOF
   update_app_env_var "XRAY_FRONT_DOMAIN" "${XRAY_FRONT_DOMAIN:-}"
   update_app_env_var "XRAY_FRONT_DOMAINS" "${XRAY_FRONT_DOMAINS:-}"
 
-  prepare_api_docs_site || true
+  if declare -F prepare_api_docs_site >/dev/null 2>&1; then
+    prepare_api_docs_site || true
+  else
+    mkdir -p /etc/nginx/snippets
+    cat > /etc/nginx/snippets/sc-1forcr-api-docs.conf <<'EOF'
+# SC 1FORCR API docs disabled
+location = /docs {
+    return 404;
+}
+
+location ^~ /docs/ {
+    return 404;
+}
+EOF
+  fi
   systemctl restart sc-1forcr-api sc-1forcr-sshws haproxy nginx
   echo "Domain berhasil diubah ke ${new_domain}"
 }

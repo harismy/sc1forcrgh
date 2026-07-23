@@ -1704,6 +1704,7 @@ issue_letsencrypt_cert() {
       --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
       --dns-cloudflare-propagation-seconds 30 \
       --cert-name "${WILDCARD_BASE_DOMAIN}" \
+      --expand \
       -d "${WILDCARD_BASE_DOMAIN}" \
       -d "*.${WILDCARD_BASE_DOMAIN}" \
       "${cert_extra_args[@]}" \
@@ -1719,7 +1720,11 @@ issue_letsencrypt_cert() {
     log "Tambahkan SAN exact untuk alias Xray: ${alias_host}"
   done
   log "Issue cert Let's Encrypt (webroot) untuk ${DOMAIN}..."
-  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" "${cert_extra_args[@]}" --non-interactive --agree-tos ${certbot_email_arg}
+  certbot certonly --webroot -w /var/www/html \
+    --cert-name "${cert_domain}" \
+    --expand \
+    -d "${DOMAIN}" "${cert_extra_args[@]}" \
+    --non-interactive --agree-tos ${certbot_email_arg}
 }
 
 prepare_haproxy_pem() {
@@ -13098,6 +13103,7 @@ issue_letsencrypt_cert() {
       --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
       --dns-cloudflare-propagation-seconds 30 \
       --cert-name "${WILDCARD_BASE_DOMAIN}" \
+      --expand \
       -d "${WILDCARD_BASE_DOMAIN}" \
       -d "*.${WILDCARD_BASE_DOMAIN}" \
       "${cert_extra_args[@]}" \
@@ -13112,7 +13118,11 @@ issue_letsencrypt_cert() {
     cert_extra_args+=(-d "${alias_host}")
     echo "Tambahkan SAN exact untuk alias Xray: ${alias_host}"
   done
-  certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" "${cert_extra_args[@]}" --non-interactive --agree-tos ${certbot_email_arg}
+  certbot certonly --webroot -w /var/www/html \
+    --cert-name "${cert_domain}" \
+    --expand \
+    -d "${DOMAIN}" "${cert_extra_args[@]}" \
+    --non-interactive --agree-tos ${certbot_email_arg}
 }
 
 prepare_haproxy_pem() {

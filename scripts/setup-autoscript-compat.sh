@@ -59,6 +59,9 @@ set -euo pipefail
 #   SSHWS_UDPGW_MAX_CLIENTS=auto               (opsional, hemat RAM; auto by RAM/vCPU)
 #   SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=auto (opsional, koneksi UDP per client badvpn)
 #   SSHWS_UDPGW_MEMORY_MAX=auto                (opsional, batas RAM per service badvpn)
+#   SSHWS_UDPGW_BIND_ADDR=127.0.0.1             (opsional, jangan buka protokol UDPGW mentah ke publik)
+#   SSHWS_UDPGW_CLIENT_SNDBUF=262144            (opsional, buffer TCP per client untuk kurangi backpressure)
+#   SSHWS_ACCOUNT_SESSION_HARD_LIMIT=auto       (opsional, batas sesi SSHWS per akun termasuk limitip=0)
 #   SSH_TUNNEL_SHELL=/usr/local/sbin/sc-1forcr-tunnel-shell (tunnel-only, tahan sesi HTTP Custom tanpa shell VPS)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1            (blok akun tunnel konek keluar ke port SSH)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=22,2222     (port keluar yang diblok untuk UID non-root)
@@ -182,6 +185,9 @@ SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
 SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-auto}"
 SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-auto}"
 SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-auto}"
+SSHWS_UDPGW_BIND_ADDR="${SSHWS_UDPGW_BIND_ADDR:-127.0.0.1}"
+SSHWS_UDPGW_CLIENT_SNDBUF="${SSHWS_UDPGW_CLIENT_SNDBUF:-262144}"
+SSHWS_ACCOUNT_SESSION_HARD_LIMIT="${SSHWS_ACCOUNT_SESSION_HARD_LIMIT:-auto}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}"
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}"
@@ -900,7 +906,7 @@ sanitize_percent_value() {
 auto_tune_resource_vars() {
   local enabled ram_mib cores tier target interval
   local def_nginx_conn def_nofile def_haproxy_maxconn def_haproxy_thread
-  local def_sshws_buffer def_sshws_conn def_api_mem def_sshws_mem def_udpgw_clients def_udpgw_conn def_udpgw_mem
+  local def_sshws_buffer def_sshws_conn def_api_mem def_sshws_mem def_udpgw_clients def_udpgw_conn def_udpgw_mem def_sshws_session_hard
 
   enabled="$(normalize_bool_01 "${RESOURCE_AUTOTUNE_ENABLE}")"
   RESOURCE_AUTOTUNE_ENABLE="${enabled}"
@@ -925,9 +931,10 @@ auto_tune_resource_vars() {
   def_sshws_conn="30"
   def_api_mem="320M"
   def_sshws_mem="192M"
-  def_udpgw_clients="128"
-  def_udpgw_conn="32"
+  def_udpgw_clients="64"
+  def_udpgw_conn="16"
   def_udpgw_mem="128M"
+  def_sshws_session_hard="8"
 
   if (( tier >= 8 )); then
     def_nginx_conn="16384"
@@ -938,9 +945,10 @@ auto_tune_resource_vars() {
     def_sshws_conn="80"
     def_api_mem="768M"
     def_sshws_mem="768M"
-    def_udpgw_clients="512"
-    def_udpgw_conn="64"
-    def_udpgw_mem="256M"
+    def_udpgw_clients="256"
+    def_udpgw_conn="32"
+    def_udpgw_mem="320M"
+    def_sshws_session_hard="16"
   elif (( tier >= 4 )); then
     def_nginx_conn="8192"
     def_nofile="200000"
@@ -950,9 +958,10 @@ auto_tune_resource_vars() {
     def_sshws_conn="60"
     def_api_mem="512M"
     def_sshws_mem="512M"
-    def_udpgw_clients="256"
-    def_udpgw_conn="48"
-    def_udpgw_mem="192M"
+    def_udpgw_clients="160"
+    def_udpgw_conn="24"
+    def_udpgw_mem="256M"
+    def_sshws_session_hard="12"
   elif (( tier >= 2 )); then
     def_nginx_conn="4096"
     def_nofile="100000"
@@ -962,9 +971,10 @@ auto_tune_resource_vars() {
     def_sshws_conn="45"
     def_api_mem="384M"
     def_sshws_mem="320M"
-    def_udpgw_clients="192"
-    def_udpgw_conn="32"
+    def_udpgw_clients="96"
+    def_udpgw_conn="20"
     def_udpgw_mem="160M"
+    def_sshws_session_hard="10"
   fi
 
   if [[ "${enabled}" == "1" ]]; then
@@ -981,6 +991,7 @@ auto_tune_resource_vars() {
     is_auto_value "${SSHWS_UDPGW_MAX_CLIENTS}" && SSHWS_UDPGW_MAX_CLIENTS="${def_udpgw_clients}"
     is_auto_value "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}" && SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${def_udpgw_conn}"
     is_auto_value "${SSHWS_UDPGW_MEMORY_MAX}" && SSHWS_UDPGW_MEMORY_MAX="${def_udpgw_mem}"
+    is_auto_value "${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}" && SSHWS_ACCOUNT_SESSION_HARD_LIMIT="${def_sshws_session_hard}"
     log "Resource auto-tune aktif: RAM=${ram_mib}MiB vCPU=${cores} tier=${tier} target=${target}% interval=${interval}m"
   fi
 
@@ -997,6 +1008,13 @@ auto_tune_resource_vars() {
   SSHWS_UDPGW_MAX_CLIENTS="$(echo "${SSHWS_UDPGW_MAX_CLIENTS:-${def_udpgw_clients}}" | tr -cd '0-9')"
   SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="$(echo "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-${def_udpgw_conn}}" | tr -cd '0-9')"
   SSHWS_UDPGW_MEMORY_MAX="$(sanitize_memory_max_value "${SSHWS_UDPGW_MEMORY_MAX}" "${def_udpgw_mem}")"
+  SSHWS_UDPGW_CLIENT_SNDBUF="$(echo "${SSHWS_UDPGW_CLIENT_SNDBUF:-262144}" | tr -cd '0-9')"
+  SSHWS_ACCOUNT_SESSION_HARD_LIMIT="$(echo "${SSHWS_ACCOUNT_SESSION_HARD_LIMIT:-${def_sshws_session_hard}}" | tr -cd '0-9')"
+
+  case "${SSHWS_UDPGW_BIND_ADDR:-127.0.0.1}" in
+    127.0.0.1|0.0.0.0) ;;
+    *) SSHWS_UDPGW_BIND_ADDR="127.0.0.1" ;;
+  esac
 
   [[ -z "${NGINX_WORKER_CONNECTIONS}" || "${NGINX_WORKER_CONNECTIONS}" -lt 1024 ]] && NGINX_WORKER_CONNECTIONS="${def_nginx_conn}"
   [[ -z "${NGINX_WORKER_RLIMIT_NOFILE}" || "${NGINX_WORKER_RLIMIT_NOFILE}" -lt 32768 ]] && NGINX_WORKER_RLIMIT_NOFILE="${def_nofile}"
@@ -1009,6 +1027,14 @@ auto_tune_resource_vars() {
   [[ -z "${SSHWS_NGINX_LIMIT_CONN}" || "${SSHWS_NGINX_LIMIT_CONN}" -lt 10 ]] && SSHWS_NGINX_LIMIT_CONN="${def_sshws_conn}"
   [[ -z "${SSHWS_UDPGW_MAX_CLIENTS}" || "${SSHWS_UDPGW_MAX_CLIENTS}" -lt 16 ]] && SSHWS_UDPGW_MAX_CLIENTS="${def_udpgw_clients}"
   [[ -z "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}" || "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}" -lt 4 ]] && SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${def_udpgw_conn}"
+  [[ -z "${SSHWS_UDPGW_CLIENT_SNDBUF}" || "${SSHWS_UDPGW_CLIENT_SNDBUF}" -lt 65536 || "${SSHWS_UDPGW_CLIENT_SNDBUF}" -gt 4194304 ]] && SSHWS_UDPGW_CLIENT_SNDBUF="262144"
+  [[ -z "${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}" || "${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}" -lt 4 ]] && SSHWS_ACCOUNT_SESSION_HARD_LIMIT="${def_sshws_session_hard}"
+  [[ "${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}" -gt 64 ]] && SSHWS_ACCOUNT_SESSION_HARD_LIMIT="64"
+  if [[ "${enabled}" == "1" ]]; then
+    (( SSHWS_UDPGW_MAX_CLIENTS > def_udpgw_clients )) && SSHWS_UDPGW_MAX_CLIENTS="${def_udpgw_clients}"
+    (( SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT > def_udpgw_conn )) && SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${def_udpgw_conn}"
+    (( SSHWS_ACCOUNT_SESSION_HARD_LIMIT > def_sshws_session_hard )) && SSHWS_ACCOUNT_SESSION_HARD_LIMIT="${def_sshws_session_hard}"
+  fi
   return 0
 }
 
@@ -2939,6 +2965,9 @@ SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
 SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
 SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
+SSHWS_UDPGW_BIND_ADDR=${SSHWS_UDPGW_BIND_ADDR}
+SSHWS_UDPGW_CLIENT_SNDBUF=${SSHWS_UDPGW_CLIENT_SNDBUF}
+SSHWS_ACCOUNT_SESSION_HARD_LIMIT=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}
 SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH}
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS}
@@ -6854,6 +6883,10 @@ const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
 const AUTO_LOCK_ENABLED = !/^(0|false|off|no)$/i.test(String(process.env.IPLIMIT_AUTO_LOCK_ENABLE || '1').trim());
 const LOCK_SECONDS = LOCK_MINUTES * 60;
+const SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW = Number(process.env.SSHWS_ACCOUNT_SESSION_HARD_LIMIT || 8);
+const SSHWS_ACCOUNT_SESSION_HARD_LIMIT = Number.isFinite(SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW)
+  ? Math.min(64, Math.max(4, Math.floor(SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW)))
+  : 8;
 const LOCK_RECHECK_GRACE_SECONDS = Math.max(180, CHECK_INTERVAL_MINUTES * 120);
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
   .split(',')
@@ -7033,6 +7066,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
     const rawDetected = Number(extra?.detected_raw || 0);
     const effectiveDetected = Number(extra?.detected_effective || Number(detected || 0));
     const deviceDetectedLabel = String(extra?.device_detected_label || '').trim();
+    const lockReason = String(extra?.lock_reason || '').trim();
     const event = {
       event: 'MULTI_LOGIN',
       action: 'LOCK_TMP',
@@ -7044,6 +7078,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       detected_raw: rawDetected > 0 ? rawDetected : null,
       detected_effective: effectiveDetected > 0 ? effectiveDetected : Number(detected || 0),
       device_detected_label: deviceDetectedLabel || null,
+      lock_reason: lockReason || null,
       ips: list,
       unlock_minutes: Number(LOCK_MINUTES || 15),
       owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
@@ -7063,6 +7098,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       `Username : ${String(username || '-')}\n` +
       `Limit IP : ${Number(limitip || 0)}\n` +
       `Detected : ${Number(detected || 0)}\n` +
+      `${lockReason ? `Reason   : ${lockReason}\n` : ''}` +
       `${deviceDetectedLabel ? `Info     : ${deviceDetectedLabel}\n` : ''}` +
       `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
       `Unlock   : ${Number(LOCK_MINUTES || 15)} menit\n` +
@@ -9000,7 +9036,7 @@ async function lockIfExceeded(nowTs) {
 
   const sshRows = await all(
     "SELECT username, password, limitip, owner_telegram_id, owner_telegram_chat_id " +
-    "FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0"
+    "FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'"
   );
   for (const r of sshRows) {
     const user = String(r.username || '').trim();
@@ -9067,10 +9103,12 @@ async function lockIfExceeded(nowTs) {
     const cnt = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
       ? cntActive
       : Math.max(cntActive, cntHint);
+    const hardSessionExceeded = cntWsPorts > SSHWS_ACCOUNT_SESSION_HARD_LIMIT;
+    const accountLimitExceeded = lim > 0 && cnt > lim;
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
     }
-    if (cnt <= lim) continue;
+    if (!accountLimitExceeded && !hardSessionExceeded) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
@@ -9120,17 +9158,20 @@ async function lockIfExceeded(nowTs) {
       zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
     }
     await notifyMultiLoginLock(
-      'ssh/zivpn',
+      hardSessionExceeded ? 'sshws/udpgw' : 'ssh/zivpn',
       user,
-      lim,
-      cnt,
+      accountLimitExceeded ? lim : SSHWS_ACCOUNT_SESSION_HARD_LIMIT,
+      hardSessionExceeded ? cntWsPorts : cnt,
       lockIps,
       Number(r.owner_telegram_id || 0) || null,
       Number(r.owner_telegram_chat_id || 0) || null,
       {
         detected_raw: cntZivpnRaw,
         detected_effective: cntZivpnEffective,
-        device_detected_label: zivpnNotifyLabel
+        device_detected_label: zivpnNotifyLabel,
+        lock_reason: hardSessionExceeded
+          ? `sesi SSHWS aktif melewati batas aman ${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}`
+          : 'pemakaian perangkat/IP melewati limit akun'
       }
     );
   }
@@ -9798,7 +9839,8 @@ EOF
 }
 
 setup_udpgw_service_if_possible() {
-  local udpgw_bin udpgw_ports_raw udpgw_ports udpgw_max_clients udpgw_max_connections_per_client udpgw_memory_max p
+  local udpgw_bin udpgw_ports_raw udpgw_ports udpgw_max_clients udpgw_max_connections_per_client
+  local udpgw_memory_max udpgw_bind_addr udpgw_client_sndbuf unit_file unit_tmp unit_changed p
   udpgw_bin=""
   for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
     if [[ -x "${p}" ]]; then
@@ -9848,43 +9890,71 @@ setup_udpgw_service_if_possible() {
   udpgw_ports="$(echo "${udpgw_ports_raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 {print $1}' | awk '!seen[$0]++')"
   [[ -z "${udpgw_ports}" ]] && udpgw_ports="7300"$'\n'"7200"
 
-  udpgw_max_clients="$(echo "${SSHWS_UDPGW_MAX_CLIENTS:-128}" | tr -cd '0-9')"
-  [[ -z "${udpgw_max_clients}" || "${udpgw_max_clients}" -lt 16 || "${udpgw_max_clients}" -gt 2048 ]] && udpgw_max_clients="128"
-  udpgw_max_connections_per_client="$(echo "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-32}" | tr -cd '0-9')"
-  [[ -z "${udpgw_max_connections_per_client}" || "${udpgw_max_connections_per_client}" -lt 4 || "${udpgw_max_connections_per_client}" -gt 256 ]] && udpgw_max_connections_per_client="32"
+  udpgw_max_clients="$(echo "${SSHWS_UDPGW_MAX_CLIENTS:-64}" | tr -cd '0-9')"
+  [[ -z "${udpgw_max_clients}" || "${udpgw_max_clients}" -lt 16 || "${udpgw_max_clients}" -gt 2048 ]] && udpgw_max_clients="64"
+  udpgw_max_connections_per_client="$(echo "${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-16}" | tr -cd '0-9')"
+  [[ -z "${udpgw_max_connections_per_client}" || "${udpgw_max_connections_per_client}" -lt 4 || "${udpgw_max_connections_per_client}" -gt 256 ]] && udpgw_max_connections_per_client="16"
   udpgw_memory_max="$(printf '%s' "${SSHWS_UDPGW_MEMORY_MAX:-128M}" | tr '[:lower:]' '[:upper:]' | tr -cd '0-9KMG')"
   [[ -z "${udpgw_memory_max}" ]] && udpgw_memory_max="128M"
+  udpgw_bind_addr="${SSHWS_UDPGW_BIND_ADDR:-127.0.0.1}"
+  case "${udpgw_bind_addr}" in
+    127.0.0.1|0.0.0.0) ;;
+    *) udpgw_bind_addr="127.0.0.1" ;;
+  esac
+  udpgw_client_sndbuf="$(echo "${SSHWS_UDPGW_CLIENT_SNDBUF:-262144}" | tr -cd '0-9')"
+  [[ -z "${udpgw_client_sndbuf}" || "${udpgw_client_sndbuf}" -lt 65536 || "${udpgw_client_sndbuf}" -gt 4194304 ]] && udpgw_client_sndbuf="262144"
 
-  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//') limit=${udpgw_max_clients}/${udpgw_max_connections_per_client} mem=${udpgw_memory_max}"
-  cat > /etc/systemd/system/sc-1forcr-udpgw@.service <<EOF
+  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//') bind=${udpgw_bind_addr} limit=${udpgw_max_clients}/${udpgw_max_connections_per_client} mem=${udpgw_memory_max}"
+  unit_file="/etc/systemd/system/sc-1forcr-udpgw@.service"
+  unit_tmp="$(mktemp)"
+  cat > "${unit_tmp}" <<EOF
 [Unit]
-Description=SC 1FORCR UDPGW on 0.0.0.0:%i
+Description=SC 1FORCR UDPGW on ${udpgw_bind_addr}:%i
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=${udpgw_bin} --listen-addr 0.0.0.0:%i --max-clients ${udpgw_max_clients} --max-connections-for-client ${udpgw_max_connections_per_client}
-Restart=always
-RestartSec=1
+ExecStart=${udpgw_bin} --listen-addr ${udpgw_bind_addr}:%i --max-clients ${udpgw_max_clients} --max-connections-for-client ${udpgw_max_connections_per_client} --client-socket-sndbuf ${udpgw_client_sndbuf} --loglevel none
+Restart=on-failure
+RestartSec=5
+Nice=5
+CPUWeight=20
 NoNewPrivileges=true
 PrivateTmp=true
 MemoryAccounting=true
 MemoryMax=${udpgw_memory_max}
-TasksMax=1024
-LimitNOFILE=32768
+TasksMax=512
+LimitNOFILE=16384
+StandardOutput=null
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
+  unit_changed="0"
+  if [[ ! -f "${unit_file}" ]] || ! cmp -s "${unit_tmp}" "${unit_file}"; then
+    install -m 644 "${unit_tmp}" "${unit_file}"
+    unit_changed="1"
+  fi
+  rm -f "${unit_tmp}" >/dev/null 2>&1 || true
+  if [[ "${unit_changed}" == "1" ]]; then
+    systemctl daemon-reload
+  fi
   for p in ${udpgw_ports}; do
     systemctl enable "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
-    systemctl restart "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
-    if command -v iptables >/dev/null 2>&1; then
+    if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+      if [[ "${unit_changed}" == "1" ]]; then
+        systemctl try-restart "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+      fi
+      systemctl start "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    else
+      systemctl restart "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    fi
+    if [[ "${udpgw_bind_addr}" == "0.0.0.0" ]] && command -v iptables >/dev/null 2>&1; then
       iptables -w 10 -C INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1 || \
         iptables -w 10 -I INPUT -p tcp --dport "${p}" -j ACCEPT
-    elif command -v nft >/dev/null 2>&1; then
+    elif [[ "${udpgw_bind_addr}" == "0.0.0.0" ]] && command -v nft >/dev/null 2>&1; then
       if nft list chain inet filter input >/dev/null 2>&1; then
         nft list chain inet filter input | grep -F -- "tcp dport ${p} accept" >/dev/null 2>&1 || \
           nft add rule inet filter input tcp dport "${p}" accept
@@ -10489,6 +10559,9 @@ SETTINGS_KEYS = [
     "SSHWS_UDPGW_MAX_CLIENTS",
     "SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT",
     "SSHWS_UDPGW_MEMORY_MAX",
+    "SSHWS_UDPGW_BIND_ADDR",
+    "SSHWS_UDPGW_CLIENT_SNDBUF",
+    "SSHWS_ACCOUNT_SESSION_HARD_LIMIT",
     "SSH_TUNNEL_SHELL",
     "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
     "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
@@ -11262,6 +11335,12 @@ SETTINGS_KEYS = [
     "SSH_HC_AUTH_LOOKBACK_HOURS",
     "SSHWS_TCP_KEEPALIVE_SECONDS",
     "SSHWS_UDPGW_PORTS",
+    "SSHWS_UDPGW_MAX_CLIENTS",
+    "SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT",
+    "SSHWS_UDPGW_MEMORY_MAX",
+    "SSHWS_UDPGW_BIND_ADDR",
+    "SSHWS_UDPGW_CLIENT_SNDBUF",
+    "SSHWS_ACCOUNT_SESSION_HARD_LIMIT",
     "SSH_TUNNEL_SHELL",
     "SSH_TUNNEL_BLOCK_OUTBOUND_SSH",
     "SSH_TUNNEL_BLOCK_OUTBOUND_PORTS",
@@ -12661,6 +12740,9 @@ SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
 SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
 SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
 SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
+SSHWS_UDPGW_BIND_ADDR=${SSHWS_UDPGW_BIND_ADDR}
+SSHWS_UDPGW_CLIENT_SNDBUF=${SSHWS_UDPGW_CLIENT_SNDBUF}
+SSHWS_ACCOUNT_SESSION_HARD_LIMIT=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}
 SSH_TUNNEL_SHELL=${SSH_TUNNEL_SHELL}
 SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH}
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS}
@@ -20306,6 +20388,9 @@ Time     : $(date '+%F %T')"
     SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-auto}" \
     SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-auto}" \
     SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-auto}" \
+    SSHWS_UDPGW_BIND_ADDR="${SSHWS_UDPGW_BIND_ADDR:-127.0.0.1}" \
+    SSHWS_UDPGW_CLIENT_SNDBUF="${SSHWS_UDPGW_CLIENT_SNDBUF:-262144}" \
+    SSHWS_ACCOUNT_SESSION_HARD_LIMIT="${SSHWS_ACCOUNT_SESSION_HARD_LIMIT:-auto}" \
     SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}" \
     SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}" \
     SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}" \
@@ -21723,6 +21808,7 @@ persist_pending_install_env() {
     UDPCUSTOM_BIN_URL UDPCUSTOM_SERVICE_NAME UDPCUSTOM_LISTEN_PORT
     UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
     SSHWS_UDPGW_PORTS SSHWS_UDPGW_MAX_CLIENTS SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT SSHWS_UDPGW_MEMORY_MAX
+    SSHWS_UDPGW_BIND_ADDR SSHWS_UDPGW_CLIENT_SNDBUF SSHWS_ACCOUNT_SESSION_HARD_LIMIT
     SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
     SSH_TUNNEL_BLOCK_OUTBOUND_PORTS TUNNEL_ABUSE_GUARD_ENABLE TUNNEL_ABUSE_BLOCK_TCP_PORTS ACTIVE_UDP_BACKEND
     DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION DROPBEAR_KEEPALIVE_SECONDS DROPBEAR_IDLE_TIMEOUT_SECONDS
@@ -21892,12 +21978,13 @@ resume_pending_operation_prompt() {
 main() {
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
   if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
-    log "Mode update aman aktif: update runtime tanpa restart Xray/SSH/SSHWS/HAProxy."
+    log "Mode update aman aktif: Xray/SSH/SSHWS/HAProxy tidak direstart; UDPGW hanya direstart jika unit berubah."
     install_legacy_runtime_command_shims
     check_supported_os
     install_node_if_missing
     install_go_if_missing
     init_db
+    setup_udpgw_service_if_possible
     write_api_files
     write_go_mux_files
     build_go_files
@@ -21916,7 +22003,7 @@ main() {
     apply_tunnel_outbound_guard_rules
     restart_update_safe_services
     post_install_preflight || true
-    log "Update aman selesai. Service tunnel aktif tidak direstart."
+    log "Update aman selesai. Xray/SSH/SSHWS/HAProxy aktif tidak direstart."
     return 0
   fi
   if [[ -f "${SCRIPT_SELF_PATH}" ]]; then

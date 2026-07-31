@@ -325,43 +325,170 @@ async function ensureOrderKuotaAmountLockSchema() {
 
 async function seedDefaultSettings() {
   const now = Date.now();
+  const scFeaturesVersion = '2026-07-31.1';
   const defaultScFeaturesText = [
-    'SERVICE DI SC (VPS):',
-    '- SSH/OpenSSH',
-    '- Dropbear',
-    '- Nginx',
-    '- HAProxy (TLS 443 mux)',
-    '- Xray',
-    '- SSH-WS bridge (sc-1forcr-sshws)',
-    '- UDP backend (ZIVPN/UDPHC tergantung mode)',
+    'KOMPATIBILITAS & CORE',
+    '- Debian 11, 12, dan 13',
+    '- Ubuntu 22.04 dan 24.04',
+    '- SSH / OpenSSH dan Dropbear',
+    '- Nginx dan HAProxy TLS 443 mux',
+    '- Xray Core',
+    '- SSH WebSocket bridge sc-1forcr-sshws',
+    '- API 1FORCR dan SQLite database',
+    '- Summary API 1FORCR opsional',
+    '- Certbot / Let\'s Encrypt',
     '',
-    'SUPPORT PROTOKOL/AKUN:',
-    '- SSH + SSHWS',
-    '- VMESS WS',
-    '- VLESS WS',
-    '- TROJAN WS',
+    'PROTOKOL & AKUN',
+    '- SSH direct, SSH WS, dan SSH SSL',
+    '- VMess WS dan gRPC',
+    '- VLESS WS dan gRPC',
+    '- Trojan WS dan gRPC',
+    '- ZIVPN atau UDP Custom / UDPHC',
+    '- BadVPN UDPGW melalui tunnel SSH',
+    '- Akun SSH tunnel-only tanpa shell VPS',
+    '- Akun trial berbasis menit',
+    '- Akun reguler berbasis tanggal dan jam',
     '',
-    'PORT & PATH UMUM (DEFAULT):',
-    '- TLS/SSL: 443',
-    '- HTTP: 80',
+    'PORT & PATH DEFAULT',
+    '- HTTP / non-TLS: 80',
+    '- TLS / SSL mux: 443',
+    '- OpenSSH: 22',
     '- Dropbear: 109 dan 143',
+    '- SSHWS backend internal: 2082',
     '- SSHWS path: /ssh-ws, /ws, /ws-ssh, /ssh',
-    '- Xray WS path: /vmess, /vless, /trojan',
+    '- VMess WS: /vmess',
+    '- VLESS WS: /vless',
+    '- Trojan WS: /trojan',
+    '- Xray gRPC: /vmess-grpc, /vless-grpc, /trojan-grpc',
+    '- ZIVPN / UDPHC listen default: 5667',
+    '- ZIVPN DNAT default: 6000-19999 dan UDP 553',
+    '- UDPGW TCP internal: 7300 dan 7200',
+    '- API internal: 127.0.0.1:8088',
     '',
-    'MENU DI SC (VPS):',
-    '- Kelola akun SSH/VMESS/VLESS/TROJAN',
-    '- Monitor user online/lock',
-    '- Tools update script',
-    '- Change domain',
-    '- Backup/restore',
+    '1. KELOLA AKUN',
+    '- Tambah akun SSH, VMess, VLESS, dan Trojan',
+    '- Buat akun trial',
+    '- Renew akun aktif atau recovery akun expired',
+    '- Tambah masa aktif semua akun',
+    '- Edit limit IP per akun atau semua akun',
+    '- Edit quota per akun atau semua akun',
+    '- Edit password SSH dan UUID akun Xray',
+    '- Hapus, list, dan lihat detail akun',
+    '- Unlock akun atau unlock semua akun',
+    '- Owner Telegram User ID dan Chat ID per akun',
+    '- Sinkron akun SSH dengan ZIVPN / UDPHC',
     '',
-    'MENU DI BOT:',
-    '- Registrasi/Perpanjang/Unlimited SC',
-    '- Top Up Saldo + cek status',
-    '- Cek saldo, SC saya, cek expired',
-    '- Backup/restore akun, migrasi akun, hapus akun',
-    '- Fitur reseller dan admin panel'
+    '2. LIMIT IP, SESI & QUOTA',
+    '- Deteksi IP dan sesi aktif SSH / SSHWS',
+    '- Deteksi IP aktif VMess, VLESS, dan Trojan',
+    '- Deteksi sesi ZIVPN dan UDPHC',
+    '- Lock sementara saat limit perangkat terlampaui',
+    '- Hard limit sesi SSHWS untuk mencegah reconnect loop',
+    '- Auto unlock setelah durasi lock',
+    '- Quota realtime SSHWS dari counter mux',
+    '- Quota Xray dari statistik user Xray',
+    '- Lock otomatis ketika quota habis',
+    '- Renew quota mode tambah dan unlock setelah quota cukup',
+    '',
+    '3. KEAMANAN TUNNEL',
+    '- Tunnel-only shell untuk akun SSH pelanggan',
+    '- Blok koneksi SSH keluar untuk akun non-root (opsional)',
+    '- Abuse guard RDP, VNC, SMB, dan SMTP',
+    '- UDPGW listen loopback agar tidak terbuka langsung ke publik',
+    '- Batas client, koneksi, RAM, dan CPUWeight UDPGW adaptif',
+    '- Rate limit Nginx untuk jalur SSHWS',
+    '- Firewall allow dan heal rule SSHWS / Xray',
+    '- API memakai token autentikasi',
+    '',
+    '4. SERVICE & UDP TOOLS',
+    '- Cek status SSH, Dropbear, Nginx, HAProxy, Xray, API, dan SSHWS',
+    '- Cek status ZIVPN, UDPHC, dan UDPGW',
+    '- Restart semua service atau service terkait',
+    '- Switch backend aktif ZIVPN / UDPHC',
+    '- Hanya satu backend UDP utama aktif',
+    '- Diagnose port listen dan NAT PREROUTING',
+    '- Auto repair backend UDP',
+    '- Cleanup DNAT lama saat ganti backend',
+    '- UDP bootfix setelah reboot',
+    '',
+    '5. EXPIRED & RECOVERY',
+    '- Expired mengikuti tanggal dan jam pembuatan akun',
+    '- Akun expired dinonaktifkan dari Linux / Xray / UDP',
+    '- Trial expired dihapus otomatis',
+    '- Akun reguler masuk masa recovery',
+    '- Auto repair akun yang sudah diperpanjang tetapi status masih expired',
+    '- Hapus permanen setelah retention default 30 hari',
+    '- Guard agar akun yang sudah renew tidak mendapat notif expired lama',
+    '',
+    '6. BACKUP & RESTORE',
+    '- Backup akun dan pengaturan ke satu file JSON',
+    '- Backup database dan auth backend UDP',
+    '- Kirim hasil backup ke Telegram',
+    '- Restore SSH, VMess, VLESS, dan Trojan',
+    '- Restore status lock dan pemakaian quota',
+    '- Restore melalui file lokal atau BotVPN',
+    '- Auto backup interval atau jadwal harian WIB',
+    '- Direktori backup dan retention dapat diatur',
+    '',
+    '7. DOMAIN, TLS & BUG HOST',
+    '- Ganti domain dari menu',
+    '- Regenerate Nginx, HAProxy, environment, dan link akun',
+    '- Issue atau reuse sertifikat TLS',
+    '- Self-signed sementara jika issue sertifikat gagal',
+    '- Wildcard SSL Cloudflare DNS-01',
+    '- Multi alias wildcard dan exact Xray host',
+    '- Multi front / bug domain',
+    '- VMess bug profile address, SNI, dan Host custom',
+    '',
+    '8. API & DOKUMENTASI WEB',
+    '- Endpoint BotVPN pada /vps/*',
+    '- Create, trial, renew, edit, delete, lock, dan unlock akun',
+    '- Endpoint quota, capacity, account owner, dan sync Xray',
+    '- Web dokumentasi API native HTML/CSS/JS',
+    '- Dokumentasi default nonaktif dan dapat diaktifkan dari Tools',
+    '- URL dokumentasi memakai /docs/ pada domain SC',
+    '- Route docs terisolasi tanpa mengubah route tunnel',
+    '',
+    '9. OTOMATISASI & RESOURCE',
+    '- Auto update dari trigger bot dengan mode update aman',
+    '- Cooldown update gagal agar tidak restart berulang',
+    '- Xray, SSH, SSHWS, dan HAProxy tidak direstart saat safe update',
+    '- Auto reboot interval atau harian WIB (opsional)',
+    '- Notifikasi akun online berkala',
+    '- Resource auto-tune berdasarkan RAM dan vCPU',
+    '- Capacity analyzer RAM, CPU, koneksi, IP, dan user aktif',
+    '- Network compatibility IPv4 preference dan TCP MSS (opsional)',
+    '- Logrotate dan pembatasan journald',
+    '',
+    '10. NOTIFIKASI',
+    '- Notif create, trial, delete, dan expired akun',
+    '- Notif quota habis ke admin dan owner akun',
+    '- Notif multi-login / hard session lock',
+    '- Notif akun online berkala',
+    '- Notif backup, update script, dan status lisensi',
+    '- Detail username, layanan, limit, quota, dan Telegram owner',
+    '',
+    '11. INTEGRASI BOT',
+    '- Registrasi, perpanjang, ganti IP, dan Unlimited SC',
+    '- Top up saldo dan pengecekan pembayaran',
+    '- Cek saldo, daftar SC, dan cek expired IP',
+    '- Backup, restore, migrasi, dan hapus akun melalui bot',
+    '- Fitur reseller dan panel admin',
+    '- Trigger update autoscript dan Summary API',
+    '',
+    'CATATAN',
+    '- Port dan fitur dapat berubah mengikuti environment server',
+    '- ZIVPN dan UDPHC dipilih sebagai backend utama, bukan dijalankan bersamaan',
+    '- UDPGW 7300/7200 digunakan melalui tunnel SSH, bukan akses publik langsung'
   ].join('\n');
+  const previousFeatures = await dbGet(
+    'SELECT value, updated_by FROM app_settings WHERE key = ? LIMIT 1',
+    ['SC_FEATURES_INFO_TEXT']
+  ).catch(() => null);
+  const previousFeaturesVersion = await dbGet(
+    'SELECT value FROM app_settings WHERE key = ? LIMIT 1',
+    ['SC_FEATURES_INFO_VERSION']
+  ).catch(() => null);
   const defaults = {
     SC_REGISTRATION_PRICE_PER_DAY: String(DEFAULT_SC_REGISTRATION_PRICE_PER_DAY),
     SC_RESELLER_PRICE_PER_DAY: String(DEFAULT_SC_REGISTRATION_PRICE_PER_DAY),
@@ -374,6 +501,7 @@ async function seedDefaultSettings() {
     SC_H2_REMINDER_INTERVAL_MINUTES: String(DEFAULT_SC_H2_REMINDER_INTERVAL_MINUTES),
     RESELLER_ADMIN_WA: '089612745096',
     SC_FEATURES_INFO_TEXT: defaultScFeaturesText,
+    SC_FEATURES_INFO_VERSION: scFeaturesVersion,
     AUTO_PROVISION_DOMAIN: DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0',
     CERTBOT_EMAIL: DEFAULT_CERTBOT_EMAIL,
     SC_INSTALLER_LOCAL_PATH: DEFAULT_SC_INSTALLER_LOCAL_PATH
@@ -382,6 +510,28 @@ async function seedDefaultSettings() {
     await dbRun(
       'INSERT OR IGNORE INTO app_settings (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)',
       [key, String(value), now, 0]
+    );
+  }
+
+  const previousText = String(previousFeatures?.value || '');
+  const previousVersion = String(previousFeaturesVersion?.value || '').trim();
+  const looksLikeLegacyCatalog =
+    previousText.includes('SERVICE DI SC (VPS)') &&
+    previousText.includes('PORT & PATH UMUM') &&
+    (previousText.includes('Support Custom Xray Public Host') || previousText.includes('MENU DI SC (VPS)'));
+  const isManagedCatalog = Number(previousFeatures?.updated_by || 0) === 0 || looksLikeLegacyCatalog;
+  if (previousFeatures && previousVersion !== scFeaturesVersion && isManagedCatalog) {
+    await dbRun(
+      'UPDATE app_settings SET value = ?, updated_at = ?, updated_by = ? WHERE key = ?',
+      [defaultScFeaturesText, now, 0, 'SC_FEATURES_INFO_TEXT']
+    );
+  }
+  if (previousVersion !== scFeaturesVersion) {
+    await dbRun(
+      `INSERT INTO app_settings (key, value, updated_at, updated_by)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by`,
+      ['SC_FEATURES_INFO_VERSION', scFeaturesVersion, now, 0]
     );
   }
 
@@ -760,6 +910,15 @@ function uiBox(title, lines = []) {
     BOT
   ];
   return out.join('\n');
+}
+
+function uiDocumentBox(title, textInput) {
+  const marker = '__SC_DOCUMENT_BODY__';
+  const body = String(textInput || '').trim() || '-';
+  return uiBox(title, [marker])
+    .split('\n')
+    .map((line) => (line.includes(marker) ? body : line))
+    .join('\n');
 }
 
 function splitTelegramText(textInput, maxLen = 3800) {
@@ -4508,7 +4667,7 @@ bot.action('m_sc_features', async (ctx) => {
   const info = await getScFeaturesInfoText();
   await replyTelegramTextChunks(
     ctx,
-    uiBox('FITUR-FITUR SC 1FORCR NEXUS', String(info || '').split('\n')),
+    uiDocumentBox('FITUR SC 1FORCR NEXUS', info),
     mainMenu()
   );
 });

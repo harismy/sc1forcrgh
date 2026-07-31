@@ -325,7 +325,7 @@ async function ensureOrderKuotaAmountLockSchema() {
 
 async function seedDefaultSettings() {
   const now = Date.now();
-  const scFeaturesVersion = '2026-07-31.1';
+  const scFeaturesVersion = '2026-08-01.1';
   const defaultScFeaturesText = [
     'KOMPATIBILITAS & CORE',
     '- Debian 11, 12, dan 13',
@@ -374,6 +374,7 @@ async function seedDefaultSettings() {
     '- Edit quota per akun atau semua akun',
     '- Edit password SSH dan UUID akun Xray',
     '- Hapus, list, dan lihat detail akun',
+    '- Hapus semua akun expired sekaligus dengan konfirmasi',
     '- Unlock akun atau unlock semua akun',
     '- Owner Telegram User ID dan Chat ID per akun',
     '- Sinkron akun SSH dengan ZIVPN / UDPHC',
@@ -418,6 +419,7 @@ async function seedDefaultSettings() {
     '- Akun reguler masuk masa recovery',
     '- Auto repair akun yang sudah diperpanjang tetapi status masih expired',
     '- Hapus permanen setelah retention default 30 hari',
+    '- Hapus massal akun expired dengan satu kali sinkron backend',
     '- Guard agar akun yang sudah renew tidak mendapat notif expired lama',
     '',
     '6. BACKUP & RESTORE',

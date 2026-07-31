@@ -4162,7 +4162,7 @@ function deleteLinuxUser(username) {
   safeExec('userdel', ['-r', username]);
 }
 
-function disableSshSystemAccess(username, password = '') {
+function disableSshSystemAccess(username, password = '', syncBackends = true) {
   const user = String(username || '').trim();
   const pass = String(password || '').trim();
   if (!user || user === 'root') return false;
@@ -4174,9 +4174,11 @@ function disableSshSystemAccess(username, password = '') {
     safeExec('passwd', ['-l', user]);
     safeExec('usermod', ['-s', '/usr/sbin/nologin', user]);
   }
-  syncZivpnUser(user, false);
-  if (pass) syncUdpcustomUser(pass, false);
-  syncUdpcustomUser(user, false);
+  if (syncBackends) {
+    syncZivpnUser(user, false);
+    if (pass) syncUdpcustomUser(pass, false);
+    syncUdpcustomUser(user, false);
+  }
   return true;
 }
 
@@ -4691,6 +4693,144 @@ async function cleanupPurgedAccountState(accountType, username) {
   await run("DELETE FROM account_quota_usage WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
   await run("DELETE FROM account_quota_session_counters WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
   await run("DELETE FROM account_quota_locks WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
+}
+
+let deleteAllExpiredAccountsRunning = false;
+const ACCOUNT_EXPIRES_AT_SQL = `(
+  CASE
+    WHEN LENGTH(TRIM(COALESCE(date_exp,''))) <= 10
+      THEN datetime(date(TRIM(date_exp)), '+1 day')
+    ELSE datetime(REPLACE(TRIM(date_exp), 'T', ' '))
+  END
+)`;
+const EFFECTIVE_EXPIRED_ACCOUNT_SQL = `(
+  (
+    TRIM(COALESCE(date_exp,'')) <> ''
+    AND ${ACCOUNT_EXPIRES_AT_SQL} <= datetime('now','localtime')
+  )
+  OR (
+    UPPER(TRIM(COALESCE(status,''))) IN ('EXPIRED','RECOVERY','KADALUARSA')
+    AND (
+      TRIM(COALESCE(date_exp,'')) = ''
+      OR ${ACCOUNT_EXPIRES_AT_SQL} IS NULL
+    )
+  )
+)`;
+
+async function notifyDeletedExpiredAccountsBatch(removedRows) {
+  try {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    const counts = {};
+    const names = [];
+    for (const type of ['ssh', 'vmess', 'vless', 'trojan']) {
+      const rows = Array.isArray(removedRows?.[type]) ? removedRows[type] : [];
+      counts[type] = rows.length;
+      for (const row of rows) {
+        if (names.length >= 30) break;
+        const username = String(row?.username || '').trim();
+        if (username) names.push(`${type.toUpperCase()}: ${username}`);
+      }
+    }
+    const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+    if (total < 1) return;
+    const remaining = Math.max(0, total - names.length);
+    const detail = names.length > 0 ? `\n\n${names.join('\n')}` : '';
+    const suffix = remaining > 0 ? `\n... +${remaining} akun lainnya` : '';
+    await telegramNotify(
+      `SC 1FORCR NOTIF\n` +
+      `Event    : DELETE_EXPIRED_ALL\n` +
+      `Domain   : ${DOMAIN || '-'}\n` +
+      `Total    : ${total}\n` +
+      `SSH      : ${counts.ssh}\n` +
+      `VMESS    : ${counts.vmess}\n` +
+      `VLESS    : ${counts.vless}\n` +
+      `TROJAN   : ${counts.trojan}\n` +
+      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}` +
+      detail + suffix
+    );
+  } catch (_) {}
+}
+
+async function deleteAllExpiredAccounts() {
+  if (deleteAllExpiredAccountsRunning) {
+    const e = new Error('penghapusan semua akun expired sedang berjalan');
+    e.statusCode = 409;
+    throw e;
+  }
+  deleteAllExpiredAccountsRunning = true;
+  const targets = [
+    { table: 'account_sshs', type: 'ssh' },
+    { table: 'account_vmesses', type: 'vmess' },
+    { table: 'account_vlesses', type: 'vless' },
+    { table: 'account_trojans', type: 'trojan' }
+  ];
+  const removedRows = { ssh: [], vmess: [], vless: [], trojan: [] };
+  let transactionOpen = false;
+
+  try {
+    await run('BEGIN IMMEDIATE TRANSACTION');
+    transactionOpen = true;
+    for (const item of targets) {
+      const rows = await all(
+        `SELECT username FROM ${item.table} WHERE ${EFFECTIVE_EXPIRED_ACCOUNT_SQL} ORDER BY LOWER(username)`
+      );
+      removedRows[item.type] = Array.isArray(rows) ? rows.filter((row) => String(row?.username || '').trim()) : [];
+      if (removedRows[item.type].length > 0) {
+        await run(`DELETE FROM ${item.table} WHERE ${EFFECTIVE_EXPIRED_ACCOUNT_SQL}`);
+      }
+    }
+    await run('COMMIT');
+    transactionOpen = false;
+
+    for (const row of removedRows.ssh) {
+      const username = String(row?.username || '').trim();
+      if (!username) continue;
+      disableSshSystemAccess(username, '', false);
+      await cleanupPurgedAccountState('ssh', username);
+    }
+    for (const type of ['vmess', 'vless', 'trojan']) {
+      for (const row of removedRows[type]) {
+        const username = String(row?.username || '').trim();
+        if (username) await cleanupPurgedAccountState(type, username);
+      }
+    }
+
+    const sync = { ssh_backends: true, xray: true };
+    if (removedRows.ssh.length > 0) {
+      try {
+        await syncSshBackendsFromDb();
+      } catch (_) {
+        sync.ssh_backends = false;
+      }
+    }
+    const xrayTotal = removedRows.vmess.length + removedRows.vless.length + removedRows.trojan.length;
+    if (xrayTotal > 0) {
+      try {
+        await renderAndReloadXray();
+      } catch (_) {
+        sync.xray = false;
+      }
+    }
+    await notifyDeletedExpiredAccountsBatch(removedRows);
+
+    const removed = {
+      ssh: removedRows.ssh.length,
+      vmess: removedRows.vmess.length,
+      vless: removedRows.vless.length,
+      trojan: removedRows.trojan.length
+    };
+    const total = Object.values(removed).reduce((sum, value) => sum + value, 0);
+    console.log(
+      `[delete-expired-all] total=${total} ssh=${removed.ssh} vmess=${removed.vmess} ` +
+      `vless=${removed.vless} trojan=${removed.trojan}`
+    );
+    return { total, removed, sync };
+  } catch (e) {
+    if (transactionOpen) await run('ROLLBACK').catch(() => {});
+    throw e;
+  } finally {
+    deleteAllExpiredAccountsRunning = false;
+  }
 }
 
 async function repairRenewedAccountStatuses() {
@@ -5260,6 +5400,14 @@ app.patch('/vps/passwordsshvpn-all', async (req, res) => {
 app.post('/vps/passwordsshvpn-all', async (req, res) => {
   try {
     return ok(res, await changeAllSshPasswords(req.body?.password));
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e.message);
+  }
+});
+
+app.delete('/vps/delete-expired-all', async (_req, res) => {
+  try {
+    return ok(res, await deleteAllExpiredAccounts());
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
   }
@@ -15208,6 +15356,68 @@ delete_account() {
   echo "Akun ${type^^} ${label} '${username}' berhasil dihapus permanen."
 }
 
+delete_all_expired_accounts() {
+  local expire_expr expired_where ssh_count vmess_count vless_count trojan_count total confirm resp code message
+  local deleted_total deleted_ssh deleted_vmess deleted_vless deleted_trojan sync_ssh sync_xray
+  expire_expr="$(account_expire_datetime_expr)"
+  expired_where="((TRIM(COALESCE(date_exp,''))<>'' AND (${expire_expr}) <= datetime('now','localtime')) OR (UPPER(TRIM(COALESCE(status,''))) IN ('EXPIRED','RECOVERY','KADALUARSA') AND (TRIM(COALESCE(date_exp,''))='' OR (${expire_expr}) IS NULL)))"
+  ssh_count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_sshs WHERE ${expired_where};" 2>/dev/null || echo 0)"
+  vmess_count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_vmesses WHERE ${expired_where};" 2>/dev/null || echo 0)"
+  vless_count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_vlesses WHERE ${expired_where};" 2>/dev/null || echo 0)"
+  trojan_count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_trojans WHERE ${expired_where};" 2>/dev/null || echo 0)"
+  [[ "${ssh_count}" =~ ^[0-9]+$ ]] || ssh_count=0
+  [[ "${vmess_count}" =~ ^[0-9]+$ ]] || vmess_count=0
+  [[ "${vless_count}" =~ ^[0-9]+$ ]] || vless_count=0
+  [[ "${trojan_count}" =~ ^[0-9]+$ ]] || trojan_count=0
+  total=$((ssh_count + vmess_count + vless_count + trojan_count))
+
+  echo "HAPUS SEMUA ACCOUNT EXPIRED"
+  echo "Akun trial expired yang masih tersisa juga akan dihapus."
+  printf "%-12s : %s\n" "SSH/ZIVPN" "${ssh_count}"
+  printf "%-12s : %s\n" "VMESS" "${vmess_count}"
+  printf "%-12s : %s\n" "VLESS" "${vless_count}"
+  printf "%-12s : %s\n" "TROJAN" "${trojan_count}"
+  printf "%-12s : %s\n" "TOTAL" "${total}"
+  if [[ "${total}" -lt 1 ]]; then
+    echo "Tidak ada akun expired yang perlu dihapus."
+    return
+  fi
+
+  echo
+  echo "Tindakan ini permanen dan tidak dapat dibatalkan."
+  prompt_input confirm "Ketik HAPUS SEMUA EXPIRED untuk konfirmasi: " || return
+  [[ "${confirm^^}" != "HAPUS SEMUA EXPIRED" ]] && { echo "Dibatalkan."; return; }
+
+  resp="$(api_call "DELETE" "/delete-expired-all")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal menghapus semua akun expired: ${message}"
+    return
+  fi
+
+  deleted_total="$(echo "${resp}" | jq -r '.data.total // 0' 2>/dev/null || echo 0)"
+  deleted_ssh="$(echo "${resp}" | jq -r '.data.removed.ssh // 0' 2>/dev/null || echo 0)"
+  deleted_vmess="$(echo "${resp}" | jq -r '.data.removed.vmess // 0' 2>/dev/null || echo 0)"
+  deleted_vless="$(echo "${resp}" | jq -r '.data.removed.vless // 0' 2>/dev/null || echo 0)"
+  deleted_trojan="$(echo "${resp}" | jq -r '.data.removed.trojan // 0' 2>/dev/null || echo 0)"
+  sync_ssh="$(echo "${resp}" | jq -r '.data.sync.ssh_backends // true' 2>/dev/null || echo true)"
+  sync_xray="$(echo "${resp}" | jq -r '.data.sync.xray // true' 2>/dev/null || echo true)"
+  echo "Semua akun yang masih berstatus expired berhasil diproses."
+  printf "%-12s : %s\n" "SSH/ZIVPN" "${deleted_ssh}"
+  printf "%-12s : %s\n" "VMESS" "${deleted_vmess}"
+  printf "%-12s : %s\n" "VLESS" "${deleted_vless}"
+  printf "%-12s : %s\n" "TROJAN" "${deleted_trojan}"
+  printf "%-12s : %s\n" "TOTAL" "${deleted_total}"
+  if [[ "${sync_ssh}" != "true" ]]; then
+    echo "Peringatan: sinkronisasi backend SSH/UDP perlu dijalankan ulang."
+  fi
+  if [[ "${sync_xray}" != "true" ]]; then
+    echo "Peringatan: akun sudah terhapus dari DB, tetapi reload Xray gagal."
+    echo "Jalankan menu restart Xray agar konfigurasi aktif ikut tersinkron."
+  fi
+}
+
 lock_account() {
   local type ep username resp code message confirm
   type="$(pick_type)"
@@ -15682,12 +15892,14 @@ account_delete_menu() {
     draw_menu_panel "HAPUS ACCOUNT" \
       "1) Hapus Account Aktif" \
       "2) Hapus Account Expired" \
+      "3) Hapus Semua Account Expired" \
       "0) Kembali"
-    prompt_input choice "Pilih menu [0-2]: " || return
+    prompt_input choice "Pilih menu [0-3]: " || return
     clear
     case "${choice}" in
       1) delete_account "nonexpired" || true ;;
       2) delete_account "expired" || true ;;
+      3) delete_all_expired_accounts || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

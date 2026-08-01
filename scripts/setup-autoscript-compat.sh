@@ -9754,7 +9754,7 @@ mem_used_pct="$(awk -v u="${mem_used_mib}" -v t="${mem_total_mib}" 'BEGIN{if(t<=
 # Kolom /proc/stat: cpu user nice system idle iowait irq softirq steal guest guest_nice
 # guest/guest_nice sudah termasuk di user/nice — kolom 10-11 diabaikan.
 tmp_cpu_s1="$(mktemp)"
-awk '/^cpu /{u=$2+$3+$4; t=u+$5+$6+$7+$8+$9; i=$5+$6; print t,i; exit}' /proc/stat > "${tmp_cpu_s1}"
+awk '/^cpu /{u=$2+$3+$4; t=u+$5+$6+$7+$8+$9; i=$5+$6; printf "%.0f %.0f\n",t,i; exit}' /proc/stat > "${tmp_cpu_s1}"
 sleep 1
 cpu_used_pct="$(awk 'NR==FNR{t1=$1;i1=$2;next} /^cpu /{
   u=$2+$3+$4; t=u+$5+$6+$7+$8+$9; i=$5+$6;

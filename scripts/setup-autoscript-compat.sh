@@ -18988,17 +18988,26 @@ draw_dashboard() {
     printf '%s%*s' "$t" "$pad" ""
   }
 
-  # Simple horizontal line (no gradient, mobile-safe)
-  hline() { local c="${1:--}" w="${2:-$W}"; printf '%*s\n' "$w" "" | tr ' ' "$c"; }
+  # Simple horizontal line (safe for all terminals, uses for-loop not tr)
+  hline() {
+    local c="${1:--}" w="${2:-$W}" i
+    for ((i=0; i<w; i++)); do printf '%s' "$c"; done
+    printf '\n'
+  }
 
-  # Top border
+  # Top border with optional title
   block_top() {
-    local title="$1" tw=$((W - ${#title} - 4))
-    printf ' %s┌%s%s%s┐%s\n' "${C}" "$(printf '%*s' "$tw" "" | tr ' ' '─')" " ${title} " "${C}" "${NC}"
+    local title="$1" tw
+    if [[ -n "${title}" ]]; then
+      tw=$((W - ${#title} - 4))
+      printf ' %s┌%s %s %s┐%s\n' "${C}" "$(hline '─' "$tw")" "${title}" "$(hline '─' 0)" "${C}" "${NC}"
+    else
+      printf ' %s┌%s┐%s\n' "${C}" "$(hline '─' "$W")" "${C}" "${NC}"
+    fi
   }
 
   # Bottom border
-  block_bot() { printf ' %s└%s┘%s\n' "${C}" "$(hline '─' "$W")" "${NC}"; }
+  block_bot() { printf ' %s└%s┘%s\n' "${C}" "$(hline '─' "$W")" "${C}" "${NC}"; }
 
   # Single row
   row() { local t="$1"; printf ' %s│%s %s %s│%s\n' "${C}" "${NC}" "$(pad_right "$t" "$W")" "${C}" "${NC}"; }
@@ -19019,11 +19028,10 @@ draw_dashboard() {
     printf ' %s│%s %*s%s%*s %s│%s\n' "${C}" "${NC}" "$left" "" "$t" "$right" "" "${C}" "${NC}"
   }
 
-  # Section header with colored background
+  # Section header
   sec() {
     local t="$1"
-    printf ' %s│%s %s%s %s%s %s│%s\n' "${C}" "${NC}" "${C}" "▸" "${WH}${BOLD}" "${t}" "${NC}" "${C}" "${NC}"
-    printf ' %s│%s %s %s│%s\n' "${C}" "${NC}" "$(hline '─' "$W")" "${C}" "${NC}"
+    printf ' %s│%s %s %s %s│%s\n' "${C}" "${NC}" "${C}▸${NC} ${WH}${BOLD}${t}${NC}" "$(hline '─' "$((W - ${#t} - 5))")" "${C}" "${NC}"
   }
 
   # Data collection
@@ -21131,29 +21139,14 @@ monitor_online_menu() {
 
 SHOW_FULL_MENU=1
 MENU_ESC=$'\033'
-MENU_AQUA="${MENU_ESC}[38;5;51m"
-MENU_AQUA2="${MENU_ESC}[38;5;45m"
-MENU_PURPLE="${MENU_ESC}[38;5;141m"
-MENU_WHITE="${MENU_ESC}[38;5;255m"
+MENU_C="${MENU_ESC}[36m"    # cyan
 MENU_DIM="${MENU_ESC}[2m"
 MENU_BOLD="${MENU_ESC}[1m"
 MENU_NC="${MENU_ESC}[0m"
 
-menu_gradient_line() {
-  local char="${1:-=}"
-  local count="${2:-62}"
-  local i color
-  for ((i=0; i<count; i++)); do
-    if (( i < count / 3 )); then
-      color="${MENU_AQUA}"
-    elif (( i < (count * 2) / 3 )); then
-      color="${MENU_AQUA2}"
-    else
-      color="${MENU_PURPLE}"
-    fi
-    printf '%s%s' "${color}" "${char}"
-  done
-  printf '%s' "${MENU_NC}"
+menu_hline() {
+  local char="${1:--}" count="${2:-58}" i
+  for ((i=0; i<count; i++)); do printf '%s' "$char"; done
 }
 
 menu_strip_ansi() {
@@ -21161,14 +21154,11 @@ menu_strip_ansi() {
 }
 
 menu_visible_len() {
-  local text="$1"
-  printf '%s' "${text}" | menu_strip_ansi | awk '{ print length }'
+  printf '%s' "${1}" | menu_strip_ansi | awk '{ print length }'
 }
 
 menu_pad_right() {
-  local text="$1"
-  local width="$2"
-  local vlen pad
+  local text="$1" width="$2" vlen pad
   vlen="$(menu_visible_len "${text}")"
   pad=$((width - vlen))
   (( pad < 0 )) && pad=0
@@ -21176,28 +21166,22 @@ menu_pad_right() {
 }
 
 menu_print_line() {
-  local text="$1"
-  local width="${2:-58}"
-  local padded
+  local text="$1" width="${2:-58}" padded
   padded="$(menu_pad_right "${text}" "${width}")"
-  printf ' %s┃%s%s%s┃%s\n' "${MENU_AQUA}" "${MENU_NC}" "${padded}" "${MENU_PURPLE}" "${MENU_NC}"
+  printf ' %s│%s%s%s│%s\n' "${MENU_C}" "${MENU_NC}" "${padded}" "${MENU_C}" "${MENU_NC}"
 }
 
 draw_menu_header() {
-  local title="$1"
-  local width="${2:-58}"
-  local title_len
+  local title="$1" width="${2:-58}" title_len
   title_len="$(menu_visible_len "  ${title}")"
   (( title_len > width )) && width="${title_len}"
-  printf ' %s┏%s┓%s\n' "${MENU_AQUA}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
-  menu_print_line "  ${MENU_AQUA}${MENU_BOLD}${title}${MENU_NC}" "${width}"
-  printf ' %s┣%s┫%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
+  printf ' %s┌%s┐%s\n' "${MENU_C}" "$(menu_hline '─' "${width}")" "${MENU_NC}"
+  menu_print_line "  ${MENU_BOLD}${title}${MENU_NC}" "${width}"
 }
 
 draw_menu_panel() {
-  local title="$1"
+  local title="$1" width=58 item item_len title_len
   shift || true
-  local width=58 item item_len title_len
   title_len="$(menu_visible_len "  ${title}")"
   (( title_len > width )) && width="${title_len}"
   for item in "$@"; do
@@ -21205,22 +21189,22 @@ draw_menu_panel() {
     (( item_len > width )) && width="${item_len}"
   done
   draw_menu_header "${title}" "${width}"
-  local item
   for item in "$@"; do
-    menu_print_line "  ${MENU_WHITE}${item}${MENU_NC}" "${width}"
+    menu_print_line "  ${item}" "${width}"
   done
-  printf ' %s┗%s┛%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' "${width}")" "${MENU_NC}"
+  printf ' %s└%s┘%s\n' "${MENU_C}" "$(menu_hline '─' "${width}")" "${MENU_NC}"
 }
 
 draw_main_options() {
-  printf ' %s┏%s┓%s\n' "${MENU_AQUA}" "$(menu_gradient_line '━' 58)" "${MENU_NC}"
-  menu_print_line "  ${MENU_WHITE}1.) > MENU AKUN         5.) > MONITOR USER LOCK${MENU_NC}"
-  menu_print_line "  ${MENU_WHITE}2.) > SERVICE MENU      6.) > MONITOR USER LOGIN${MENU_NC}"
-  menu_print_line "  ${MENU_WHITE}3.) > BACKUP/RESTORE    7.) > TOOLS${MENU_NC}"
-  menu_print_line "  ${MENU_WHITE}4.) > CHANGE DOMAIN${MENU_NC}"
-  menu_print_line "  ${MENU_WHITE}m.) > MENU UTAMA${MENU_NC}"
-  menu_print_line "  ${MENU_WHITE}x.) > EXIT${MENU_NC}"
-  printf ' %s┗%s┛%s\n' "${MENU_PURPLE}" "$(menu_gradient_line '━' 58)" "${MENU_NC}"
+  local W=56
+  printf ' %s┌%s┐%s\n' "${MENU_C}" "$(menu_hline '─' "$W")" "${MENU_NC}"
+  menu_print_line "  ${MENU_DIM}1)${MENU_NC} MENU AKUN         ${MENU_DIM}5)${MENU_NC} MONITOR USER LOCK"  "$W"
+  menu_print_line "  ${MENU_DIM}2)${MENU_NC} SERVICE MENU      ${MENU_DIM}6)${MENU_NC} MONITOR USER LOGIN" "$W"
+  menu_print_line "  ${MENU_DIM}3)${MENU_NC} BACKUP/RESTORE    ${MENU_DIM}7)${MENU_NC} TOOLS"             "$W"
+  menu_print_line "  ${MENU_DIM}4)${MENU_NC} CHANGE DOMAIN"   "$W"
+  menu_print_line "  ${MENU_DIM}m)${MENU_NC} MENU UTAMA"       "$W"
+  menu_print_line "  ${MENU_DIM}x)${MENU_NC} EXIT"             "$W"
+  printf ' %s└%s┘%s\n' "${MENU_C}" "$(menu_hline '─' "$W")" "${MENU_NC}"
 }
 
 if [[ "${1:-}" == "update" ]]; then

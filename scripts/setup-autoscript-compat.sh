@@ -20580,10 +20580,14 @@ Time     : $(date '+%F %T')"
     update_sc_env_var "DROPBEAR_IDLE_TIMEOUT_SECONDS" "300"
     echo "Migrasi: DROPBEAR_IDLE_TIMEOUT_SECONDS 0 -> 300 (cegah zombie proses)"
   fi
-  if [[ "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" == "3" ]]; then
+  # IPLIMIT interval: paksa minimal 5 menit untuk cegah CPU spike.
+  # Nilai 1-4 terlalu agresif di VPS kecil-menengah.
+  local _iplimit_cur
+  _iplimit_cur="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
+  if [[ -z "${_iplimit_cur}" || "${_iplimit_cur}" -lt 5 ]]; then
     IPLIMIT_CHECK_INTERVAL_MINUTES="5"
     update_sc_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "5"
-    echo "Migrasi: IPLIMIT_CHECK_INTERVAL_MINUTES 3 -> 5 (kurangi beban CPU checker)"
+    echo "Migrasi: IPLIMIT_CHECK_INTERVAL_MINUTES ${_iplimit_cur:-?} -> 5 (minimal 5 menit, cegah CPU spike)"
   fi
 
   echo "Menjalankan update installer..."

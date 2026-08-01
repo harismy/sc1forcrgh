@@ -18971,11 +18971,11 @@ draw_dashboard() {
   local DIM="${ESC}[2m" BOLD="${ESC}[1m" NC="${ESC}[0m"
   local BG_BLUE="${ESC}[44m" BG_RESET="${ESC}[49m"
 
-  # Responsive width: auto-detect, max 66 untuk mobile-friendly
+  # Responsive width: auto-detect, fallback 58, max 62 (mobile-safe)
   local TW
   TW="$(tput cols 2>/dev/null || echo 80)"
   [[ -z "${TW}" || "${TW}" -lt 40 ]] && TW=58
-  (( TW > 66 )) && TW=66
+  (( TW > 62 )) && TW=62
   local W=$((TW - 4))  # inner content width
   local HW=$(((W - 2) / 2))  # half width for side-by-side
 

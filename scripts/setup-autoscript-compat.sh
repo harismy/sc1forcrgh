@@ -19948,10 +19948,10 @@ show_ssh_only_online() {
       END {
         for (pid in auth_by_pid) {
           if (pid in closed_pid) continue;
-          seen[auth_by_pid[pid]]=1;
+          seen[auth_by_pid[pid]]++;
         }
-        for (u in auth_no_pid) seen[u]=1;
-        for (u in seen) print u, 1;
+        for (u in auth_no_pid) seen[u]++;
+        for (u in seen) print u, seen[u];
       }' > "${tmp_ip_count}" || true
   fi
 

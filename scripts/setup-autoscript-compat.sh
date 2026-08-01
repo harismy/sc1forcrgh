@@ -19123,42 +19123,60 @@ draw_dashboard() {
   [[ "$zivpn_on" != "ON" ]] && sz="${off}"
   [[ "$udphc_on" == "ON" ]] && su="${on}"
 
+  # ── Top border helper ──
+  local btop bsep bbot
+  btop="$(printf ' %s┌%s┐%s' "${C}" "$(hline '─' "$W")" "${NC}")"
+  bsep="$(printf ' %s├%s┤%s' "${C}" "$(hline '─' "$W")" "${NC}")"
+  bbot="$(printf ' %s└%s┘%s' "${C}" "$(hline '─' "$W")" "${NC}")"
+
   # === RENDER DASHBOARD ===
   clear
+  printf '\n'
 
   # ── HEADER ──
-  local header="SC 1FORCR NEXUS"
-  printf '\n %s%s%s%s%s\n' "${C}" "${BOLD}" "$(hline '▄' "$W")" "${NC}"
-  crow "${WH}${BOLD}${header}${NC}"
+  printf '%s\n' "${btop}"
+  crow "${WH}${BOLD}SC 1FORCR NEXUS${NC}"
   local sub="${license_client_name}  |  ${SCRIPT_VERSION:-V.1FSC}  |  ${expiry_in_text}"
   crow "${DIM}${sub}${NC}"
-  printf ' %s%s%s%s%s\n' "${C}" "${BOLD}" "$(hline '▀' "$W")" "${NC}"
+  printf '%s\n' "${bbot}"
+  printf '\n'
 
   # ── SYSTEM ──
-  sec "SYSTEM"
+  printf '%s\n' "${btop}"
+  row "  ${WH}${BOLD}▸ SYSTEM${NC}"
+  printf '%s\n' "${bsep}"
   kv "OS" "${os_name}"
   kv "RAM" "${ram_mb:-"-"}  ${DIM}SWAP${NC} ${swap_mb:-"-"}"
   kv "Uptime" "${uptime_h}h ${uptime_m}m  ${DIM}Spec${NC} ${cap_ram_gb}GB / ${cap_cores}vCPU (tier ${cap_tier})"
   kv "Capacity" "${cap_mode}  ${estimate_text}"
   kv "Realtime" "${live_capacity_text}"
-  block_bot
+  printf '%s\n' "${bbot}"
+  printf '\n'
 
   # ── NETWORK ──
-  sec "NETWORK"
+  printf '%s\n' "${btop}"
+  row "  ${WH}${BOLD}▸ NETWORK${NC}"
+  printf '%s\n' "${bsep}"
   kv "IP" "${ip}  ${DIM}${city}${NC}"
   kv "ISP" "${isp}"
   kv "Domain" "${DOMAIN:-"-"}"
-  block_bot
+  printf '%s\n' "${bbot}"
+  printf '\n'
 
   # ── TRAFFIC ──
-  sec "TRAFFIC"
+  printf '%s\n' "${btop}"
+  row "  ${WH}${BOLD}▸ TRAFFIC${NC}"
+  printf '%s\n' "${bsep}"
   kv "Month" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]  ${DIM}▼${NC}${VNSTAT_MONTH_RX}  ${DIM}▲${NC}${VNSTAT_MONTH_TX}"
   kv "Day"   "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]  ${DIM}▼${NC}${VNSTAT_DAY_RX}  ${DIM}▲${NC}${VNSTAT_DAY_TX}"
   kv "Now"   "${VNSTAT_RATE}"
-  block_bot
+  printf '%s\n' "${bbot}"
+  printf '\n'
 
   # ── SERVICES ──
-  sec "SERVICES"
+  printf '%s\n' "${btop}"
+  row "  ${WH}${BOLD}▸ SERVICES${NC}"
+  printf '%s\n' "${bsep}"
   if (( W >= 58 )); then
     row "  ${so} SSH      ${sz} ZIVPN    ${sl} LOADBLC   ${DIM}Health${NC} ${health_d}"
     row "  ${sx} XRAY     ${su} UDPHC    ${sw} SSH-WS"
@@ -19167,15 +19185,18 @@ draw_dashboard() {
     row "  ${sw} SSH-WS     ${su} UDPHC       ${sl} LOADBLC"
     row "  ${DIM}Health${NC} ${health_d}"
   fi
-  block_bot
+  printf '%s\n' "${bbot}"
+  printf '\n'
 
   # ── ACCOUNTS ──
-  sec "ACCOUNTS"
+  printf '%s\n' "${btop}"
+  row "  ${WH}${BOLD}▸ ACCOUNTS${NC}"
+  printf '%s\n' "${bsep}"
   row "  SSH/OVPN ${WH}${c_ssh}${NC}    VMESS ${WH}${c_vmess}${NC}    VLESS ${WH}${c_vless}${NC}    TROJAN ${WH}${c_trojan}${NC}"
-  block_bot
+  printf '%s\n' "${bbot}"
+  printf '\n'
 
   # ── FOOTER ──
-  printf '\n'
   crow "${DIM}ketik ${WH}'menu'${NC}${DIM} untuk akses menu utama${NC}"
   printf '\n'
 }

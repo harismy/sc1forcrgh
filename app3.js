@@ -2425,6 +2425,88 @@ async function getUserRegistration(userId, ip) {
   );
 }
 
+async function markExpiredScRegistrations(now = Date.now()) {
+  await dbRun(
+    "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
+    [now, now]
+  ).catch(() => {});
+}
+
+async function getActiveScRegistrationByIp(ip, now = Date.now()) {
+  const host = normalizeHost(ip);
+  if (!isIpv4(host)) return null;
+  return dbGet(
+    "SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, expires_at " +
+      "FROM sc_registrations " +
+      "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      "AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) " +
+      "ORDER BY updated_at DESC LIMIT 1",
+    [host, now]
+  );
+}
+
+async function getLatestScRegistrationByIp(ip) {
+  const host = normalizeHost(ip);
+  if (!isIpv4(host)) return null;
+  return dbGet(
+    "SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, expires_at " +
+      "FROM sc_registrations " +
+      "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      "ORDER BY updated_at DESC LIMIT 1",
+    [host]
+  );
+}
+
+async function getScRenewTargetByIp(actorId, ip) {
+  const uid = Number(actorId || 0);
+  const host = normalizeHost(ip);
+  if (!uid || !isIpv4(host)) return null;
+  const now = Date.now();
+  await markExpiredScRegistrations(now);
+
+  const active = await getActiveScRegistrationByIp(host, now);
+  if (active) {
+    if (Number(active.user_id || 0) === uid || isAdmin(uid)) {
+      return { registration: active, ownerVerificationRequired: false };
+    }
+    return { registration: active, ownerVerificationRequired: true };
+  }
+
+  const own = await dbGet(
+    "SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, expires_at " +
+      "FROM sc_registrations " +
+      "WHERE user_id = ? AND LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      "ORDER BY updated_at DESC LIMIT 1",
+    [uid, host]
+  );
+  if (own) return { registration: own, ownerVerificationRequired: false };
+
+  const latest = await getLatestScRegistrationByIp(host);
+  if (!latest) return null;
+
+  if (isAdmin(uid)) return { registration: latest, ownerVerificationRequired: false };
+  return { registration: latest, ownerVerificationRequired: true };
+}
+
+async function getScRenewTargetByOwnerId(ip, ownerId) {
+  const host = normalizeHost(ip);
+  const uid = Number(ownerId || 0);
+  if (!uid || !isIpv4(host)) return null;
+  const now = Date.now();
+  await markExpiredScRegistrations(now);
+
+  const active = await getActiveScRegistrationByIp(host, now);
+  if (active && Number(active.user_id || 0) !== uid) return null;
+
+  return dbGet(
+    "SELECT id, user_id, vps_ip, client_name, status, created_at, updated_at, expires_at " +
+      "FROM sc_registrations " +
+      "WHERE user_id = ? AND LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      "ORDER BY updated_at DESC LIMIT 1",
+    [uid, host]
+  );
+}
+
 async function registerScIp(userId, ip, clientName, days, totalFee) {
   await ensureUser(userId);
 
@@ -2483,6 +2565,68 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
     await dbRun('COMMIT');
     return {
       success: true,
+      expiresAt: nextExpiry,
+      clientName: finalClientName,
+      prevStatus,
+      reactivatedFromExpired: prevStatus === 'expired'
+    };
+  } catch (e) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
+async function extendScRegistration(actorId, targetUserId, ip, clientName, days, totalFee) {
+  const payerId = Number(actorId || 0);
+  const ownerId = Number(targetUserId || 0);
+  const host = normalizeHost(ip);
+  if (!payerId || !ownerId || !isIpv4(host)) throw new Error('State perpanjangan tidak valid.');
+
+  await ensureUser(payerId);
+  await ensureUser(ownerId);
+
+  await dbRun('BEGIN IMMEDIATE TRANSACTION');
+  try {
+    const now = Date.now();
+    await markExpiredScRegistrations(now);
+
+    const active = await getActiveScRegistrationByIp(host, now);
+    if (active && Number(active.user_id || 0) !== ownerId) {
+      throw new Error('IP VPS ini sedang aktif di owner lain. Masukkan ID Telegram owner yang benar.');
+    }
+
+    const existing = await dbGet(
+      "SELECT id, user_id, status, expires_at, client_name FROM sc_registrations " +
+        "WHERE user_id = ? AND LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+        "ORDER BY updated_at DESC LIMIT 1",
+      [ownerId, host]
+    );
+    if (!existing) {
+      throw new Error('IP VPS tidak ditemukan untuk Telegram ID owner tersebut.');
+    }
+
+    const ok = await deductSaldoAtomic(payerId, totalFee);
+    if (!ok) {
+      await dbRun('ROLLBACK');
+      return { insufficient: true };
+    }
+
+    const prevStatus = String(existing?.status || '').trim().toLowerCase();
+    const baseExpiry = Math.max(now, Number(existing?.expires_at || 0));
+    const nextExpiry = baseExpiry + (days * DAY_MS);
+    const finalClientName = normalizeClientName(clientName || existing?.client_name || host) || host;
+
+    await dbRun(
+      'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ?, client_name = ?, vps_ip = ? WHERE id = ? AND user_id = ?',
+      ['active', now, nextExpiry, finalClientName, host, Number(existing.id || 0), ownerId]
+    );
+    await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [ownerId, host]);
+    await saveTransaction(payerId, -totalFee, 'sc_renewal', `sc_renew_${payerId}_owner_${ownerId}_${host}_${days}d_${now}`);
+    await dbRun('COMMIT');
+    return {
+      success: true,
+      actorId: payerId,
+      targetUserId: ownerId,
       expiresAt: nextExpiry,
       clientName: finalClientName,
       prevStatus,
@@ -4785,8 +4929,8 @@ bot.action('m_register_sc_extend', async (ctx) => {
       uiBox('PERPANJANG SC', [
         'Masukkan IP VPS yang ingin diperpanjang.',
         '',
-        'IP harus sudah terdaftar di akun kamu.',
-        'Setelah itu bot langsung minta jumlah hari.',
+        'Kalau IP milik akun lain, user biasa wajib memasukkan Telegram User ID owner IP.',
+        'Admin bisa perpanjang semua IP tanpa input owner ID.',
         '',
         'Ketik "batal" untuk membatalkan.'
       ])
@@ -6465,31 +6609,92 @@ bot.on('text', async (ctx) => {
         );
       }
 
-      const [{ pricePerDay }, minDays, reg, ownedByOther] = await Promise.all([
+      const [{ pricePerDay }, minDays, renewTarget] = await Promise.all([
         getRegistrationPricePerDayForUser(ctx.from.id),
         getRegistrationMinDays(),
-        getUserRegistration(ctx.from.id, ip),
-        isIpOwnedByOther(ip, ctx.from.id)
+        getScRenewTargetByIp(ctx.from.id, ip)
       ]);
 
+      const reg = renewTarget?.registration || null;
       if (!reg) {
-        if (ownedByOther) {
-          userState.delete(ctx.chat.id);
-          return ctx.reply(`IP ${ip} terdaftar di user lain dan tidak bisa diperpanjang dari akun ini.`, mainMenu());
-        }
         userState.delete(ctx.chat.id);
-        return ctx.reply(`IP ${ip} belum pernah terdaftar di akun kamu. Gunakan menu "Registrasi Baru".`, mainMenu());
+        return ctx.reply(`IP ${ip} belum pernah terdaftar di database SC. Gunakan menu "Registrasi Baru" jika IP ini milik kamu.`, mainMenu());
+      }
+
+      const targetUserId = Number(reg.user_id || 0);
+      if (renewTarget.ownerVerificationRequired) {
+        state.step = 'extend_sc_owner_id';
+        state.ip = ip;
+        userState.set(ctx.chat.id, state);
+        return ctx.reply(
+          uiBox('VERIFIKASI OWNER IP', [
+            `IP VPS : ${ip}`,
+            '',
+            'IP ini terdaftar di akun Telegram lain.',
+            'Masukkan Telegram User ID pemilik IP VPS untuk melanjutkan perpanjangan.',
+            '',
+            'Ketik "batal" untuk membatalkan.'
+          ])
+        );
       }
 
       const clientName = normalizeClientName(reg.client_name || ctx.from.first_name || ip) || ip;
       state.step = 'extend_sc_days';
       state.ip = ip;
       state.clientName = clientName;
+      state.targetUserId = targetUserId;
+      state.crossOwnerRenew = targetUserId !== Number(ctx.from.id || 0);
       userState.set(ctx.chat.id, state);
       return ctx.reply(
         uiBox('INPUT DURASI PERPANJANGAN', [
           `Nama Client   : ${clientName}`,
           `IP VPS        : ${ip}`,
+          state.crossOwnerRenew ? `Owner ID      : ${targetUserId}` : null,
+          `Expired Saat Ini : ${formatDateTime(reg.expires_at)}`,
+          `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
+          `Minimal Hari  : ${minDays}`,
+          `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
+          '',
+          'Masukkan jumlah hari perpanjangan.'
+        ].filter((line) => line !== null))
+      );
+    }
+
+    if (state.step === 'extend_sc_owner_id') {
+      const ip = String(state.ip || '').trim();
+      if (!isIpv4(ip)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('State perpanjangan tidak valid. Ulangi dari menu perpanjang.', mainMenu());
+      }
+      const ownerId = parseTelegramUserId(text);
+      if (!ownerId) {
+        return ctx.reply('Telegram User ID owner tidak valid. Masukkan angka ID Telegram pemilik IP VPS.');
+      }
+
+      const reg = await getScRenewTargetByOwnerId(ip, ownerId);
+      if (!reg) {
+        return ctx.reply(
+          uiBox('OWNER TIDAK COCOK', [
+            `IP VPS : ${ip}`,
+            '',
+            'Telegram User ID yang dimasukkan bukan owner aktif/terakhir untuk IP ini.',
+            'Masukkan ID yang benar, atau ketik "batal".'
+          ])
+        );
+      }
+
+      const [{ pricePerDay }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
+      const clientName = normalizeClientName(reg.client_name || ip) || ip;
+      state.step = 'extend_sc_days';
+      state.clientName = clientName;
+      state.targetUserId = ownerId;
+      state.crossOwnerRenew = ownerId !== Number(ctx.from.id || 0);
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('INPUT DURASI PERPANJANGAN', [
+          `Nama Client   : ${clientName}`,
+          `IP VPS        : ${ip}`,
+          `Owner ID      : ${ownerId}`,
           `Expired Saat Ini : ${formatDateTime(reg.expires_at)}`,
           `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
           `Minimal Hari  : ${minDays}`,
@@ -6511,6 +6716,8 @@ bot.on('text', async (ctx) => {
         return ctx.reply('Key server tidak valid. Minimal 8 karakter.');
       }
       const [{ pricePerDay }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(ctx.from.id), getRegistrationMinDays()]);
+      state.targetUserId = Number(state.targetUserId || ctx.from.id);
+      state.crossOwnerRenew = Number(state.targetUserId || 0) !== Number(ctx.from.id || 0);
       state.serverKey = serverKey;
       state.step = 'extend_sc_days';
       userState.set(ctx.chat.id, state);
@@ -6518,12 +6725,13 @@ bot.on('text', async (ctx) => {
         uiBox('INPUT DURASI PERPANJANGAN', [
           `Nama Client   : ${state.clientName || ip}`,
           `IP VPS        : ${ip}`,
+          state.crossOwnerRenew ? `Owner ID      : ${state.targetUserId}` : null,
           `Harga / Hari  : Rp ${pricePerDay.toLocaleString('id-ID')}`,
           `Minimal Hari  : ${minDays}`,
           `Contoh        : ${minDays} hari = Rp ${(minDays * pricePerDay).toLocaleString('id-ID')}`,
           '',
           'Masukkan jumlah hari perpanjangan.'
-        ])
+        ].filter((line) => line !== null))
       );
     }
 
@@ -6542,7 +6750,8 @@ bot.on('text', async (ctx) => {
       const totalFee = Math.floor(days) * pricePerDay;
       const clientName = normalizeClientName(state.clientName || ip) || ip;
       const serverKey = String(state.serverKey || '').trim();
-      const result = await registerScIp(ctx.from.id, ip, clientName, Math.floor(days), totalFee);
+      const targetUserId = Number(state.targetUserId || ctx.from.id);
+      const result = await extendScRegistration(ctx.from.id, targetUserId, ip, clientName, Math.floor(days), totalFee);
       if (result.insufficient) {
         const saldo = await getSaldo(ctx.from.id);
         userState.delete(ctx.chat.id);
@@ -6550,6 +6759,7 @@ bot.on('text', async (ctx) => {
           `Saldo tidak cukup untuk perpanjang SC.\n` +
             `Nama Client: ${clientName}\n` +
             `IP: ${ip}\n` +
+            `${targetUserId !== Number(ctx.from.id || 0) ? `Owner ID: ${targetUserId}\n` : ''}` +
             `Durasi: ${Math.floor(days)} hari\n` +
             `Total biaya: Rp ${totalFee.toLocaleString('id-ID')}\n` +
             `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n\n` +
@@ -6559,12 +6769,13 @@ bot.on('text', async (ctx) => {
       }
 
       const saldoNow = await getSaldo(ctx.from.id);
-      const activeServerKey = await ensureServerKeyForHost(ctx.from.id, ip, serverKey);
+      const activeServerKey = await ensureServerKeyForHost(targetUserId, ip, serverKey);
       userState.delete(ctx.chat.id);
       await ctx.reply(
         `Perpanjang SC berhasil.\n` +
           `Nama Client: ${result.clientName || clientName}\n` +
           `IP: ${ip}\n` +
+          `${targetUserId !== Number(ctx.from.id || 0) ? `Owner ID: ${targetUserId}\n` : ''}` +
           `Durasi tambah: ${Math.floor(days)} hari\n` +
           `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
           `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
@@ -6575,7 +6786,7 @@ bot.on('text', async (ctx) => {
         mainMenu()
       );
       schedulePostRegistrationHostSync({
-        userId: ctx.from.id,
+        userId: targetUserId,
         chatId: ctx.chat.id,
         ip,
         key: activeServerKey,

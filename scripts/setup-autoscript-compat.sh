@@ -18975,7 +18975,7 @@ draw_dashboard() {
   local W=58  # inner content width
   local HW=27  # half width for side-by-side
 
-  strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
+  strip_ansi() { sed -r "s/${ESC}\[[0-9;]*[mK]//g"; }
   visible_len() { printf '%s' "$1" | strip_ansi | awk '{print length}'; }
 
   pad_right() {
@@ -21164,7 +21164,7 @@ menu_hline() {
 }
 
 menu_strip_ansi() {
-  sed -r 's/\x1B\[[0-9;]*[mK]//g'
+  sed -r "s/${MENU_ESC}\[[0-9;]*[mK]//g"
 }
 
 menu_visible_len() {

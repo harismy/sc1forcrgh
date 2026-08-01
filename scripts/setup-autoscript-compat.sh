@@ -18975,8 +18975,13 @@ draw_dashboard() {
   local W=58  # inner content width
   local HW=27  # half width for side-by-side
 
-  strip_ansi() { sed -r "s/${ESC}\[[0-9;]*[mK]//g"; }
-  visible_len() { printf '%s' "$1" | strip_ansi | awk '{print length}'; }
+  # Hitung lebar teks tanpa kode ANSI (pakai ESC byte asli via printf)
+  visible_len() {
+    local esc cleaned
+    printf -v esc '\033'
+    cleaned="$(printf '%s' "$1" | sed "s/${esc}\[[0-9;]*[mK]//g")"
+    echo "${#cleaned}"
+  }
 
   pad_right() {
     local t="$1" w="$2" vl pad
@@ -21163,12 +21168,11 @@ menu_hline() {
   for ((i=0; i<count; i++)); do printf '%s' "$char"; done
 }
 
-menu_strip_ansi() {
-  sed -r "s/${MENU_ESC}\[[0-9;]*[mK]//g"
-}
-
 menu_visible_len() {
-  printf '%s' "${1}" | menu_strip_ansi | awk '{ print length }'
+  local esc cleaned
+  printf -v esc '\033'
+  cleaned="$(printf '%s' "${1}" | sed "s/${esc}\[[0-9;]*[mK]//g")"
+  echo "${#cleaned}"
 }
 
 menu_pad_right() {

@@ -20573,6 +20573,19 @@ Time     : $(date '+%F %T')"
     [[ -s "${banner_txt}" ]] && had_banner_txt="1"
   fi
 
+  # Migrasi: upgrade default lama ke nilai baru yang lebih optimal.
+  # Hanya sentuh jika nilai masih default lama (bukan custom user).
+  if [[ "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" == "0" ]]; then
+    DROPBEAR_IDLE_TIMEOUT_SECONDS="300"
+    update_sc_env_var "DROPBEAR_IDLE_TIMEOUT_SECONDS" "300"
+    echo "Migrasi: DROPBEAR_IDLE_TIMEOUT_SECONDS 0 -> 300 (cegah zombie proses)"
+  fi
+  if [[ "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" == "3" ]]; then
+    IPLIMIT_CHECK_INTERVAL_MINUTES="5"
+    update_sc_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "5"
+    echo "Migrasi: IPLIMIT_CHECK_INTERVAL_MINUTES 3 -> 5 (kurangi beban CPU checker)"
+  fi
+
   echo "Menjalankan update installer..."
   : > "${update_log}" 2>/dev/null || true
   if ! DOMAIN="${DOMAIN}" \

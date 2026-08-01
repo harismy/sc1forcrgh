@@ -19123,11 +19123,12 @@ draw_dashboard() {
   [[ "$zivpn_on" != "ON" ]] && sz="${off}"
   [[ "$udphc_on" == "ON" ]] && su="${on}"
 
-  # ── Top border helper ──
-  local btop bsep bbot
-  btop="$(printf ' %s┌%s┐%s' "${C}" "$(hline '─' "$W")" "${NC}")"
-  bsep="$(printf ' %s├%s┤%s' "${C}" "$(hline '─' "$W")" "${NC}")"
-  bbot="$(printf ' %s└%s┘%s' "${C}" "$(hline '─' "$W")" "${NC}")"
+  # ── Pre-compute borders (W+2 lebar baris horizontal agar sejajar dengan row) ──
+  local btop bsep bbot BW
+  BW=$((W + 2))
+  btop="$(printf ' %s┌%s┐%s' "${C}" "$(hline '─' "$BW")" "${NC}")"
+  bsep="$(printf ' %s├%s┤%s' "${C}" "$(hline '─' "$BW")" "${NC}")"
+  bbot="$(printf ' %s└%s┘%s' "${C}" "$(hline '─' "$BW")" "${NC}")"
 
   # === RENDER DASHBOARD ===
   clear
@@ -19194,10 +19195,6 @@ draw_dashboard() {
   printf '%s\n' "${bsep}"
   row "  SSH/OVPN ${WH}${c_ssh}${NC}    VMESS ${WH}${c_vmess}${NC}    VLESS ${WH}${c_vless}${NC}    TROJAN ${WH}${c_trojan}${NC}"
   printf '%s\n' "${bbot}"
-  printf '\n'
-
-  # ── FOOTER ──
-  crow "${DIM}ketik ${WH}'menu'${NC}${DIM} untuk akses menu utama${NC}"
   printf '\n'
 }
 show_combined_online() {

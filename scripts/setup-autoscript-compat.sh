@@ -9709,11 +9709,14 @@ mem_used_mib="$((mem_total_mib - mem_avail_mib))"
 mem_used_pct="$(awk -v u="${mem_used_mib}" -v t="${mem_total_mib}" 'BEGIN{if(t<=0) printf "0.0"; else printf "%.1f", (u/t)*100}')"
 
 read_cpu_totals() {
+  # Hanya jumlahkan kolom standar (user→steal), hindari guest/guest_nice
+  # yang sudah termasuk di user/nice (kernel ≥2.6.24).
   awk '/^cpu / {
-    total=0;
-    for (i=2;i<=NF;i++) total+=$i;
-    idle=$5+$6;
-    print total, idle;
+    user=$2; nice=$3; system=$4; idle=$5; iowait=$6;
+    irq=$7; softirq=$8; steal=$9;
+    total = user + nice + system + idle + iowait + irq + softirq + steal;
+    idle_total = idle + iowait;
+    printf "%.0f %.0f", total, idle_total;
     exit;
   }' /proc/stat
 }

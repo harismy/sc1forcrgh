@@ -8553,6 +8553,15 @@ async function ensureTables() {
     locked_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`);
+  // Long-term IP tracker (24h window) untuk deteksi sharing akun.
+  await run(`CREATE TABLE IF NOT EXISTS temp_ip_long_history (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    first_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    last_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username, ip)
+  )`).catch(() => {});
 }
 
 function quotaToBytes(quotaGb) {
@@ -8951,6 +8960,9 @@ async function enforceQuotaLimits() {
 
 async function cleanupExpiredGrace(nowTs) {
   await run("DELETE FROM temp_ip_lock_grace WHERE grace_until <= ?", [nowTs]).catch(() => {});
+  // Bersihkan long-term IP history lebih dari 24 jam.
+  const longTermCutoff = nowTs - (24 * 3600);
+  await run("DELETE FROM temp_ip_long_history WHERE last_seen < ?", [longTermCutoff]).catch(() => {});
 }
 
 async function enforceExpiredAccounts() {
@@ -9001,6 +9013,7 @@ async function enforceExpiredAccounts() {
 
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
+    await run("DELETE FROM temp_ip_long_history WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
   }
 
   const xrayTargets = [
@@ -9127,6 +9140,8 @@ async function unlockExpired(nowTs) {
     }
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+    // Reset long-term IP history saat unlock (beri kesempatan bersih).
+    await run("DELETE FROM temp_ip_long_history WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run(
       "INSERT OR REPLACE INTO temp_ip_lock_grace(account_type, username, grace_until) VALUES(?, ?, ?)",
       [t, u, nowTs + LOCK_RECHECK_GRACE_SECONDS]
@@ -9241,10 +9256,12 @@ async function lockIfExceeded(nowTs) {
     // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
     // - udphcSessionMap/udphcIpMap untuk jalur UDPHC native.
     const cntActive = Math.max(cntIp, cntSession, cntWsPorts, cntUdphc, cntUdphcIp, cntZivpnEffective);
-    // proc/recent dipakai sebagai fallback kuantitatif ringan (cap) agar kasus 2 HP tetap terdeteksi.
+    // proc/recent dipakai sebagai fallback kuantitatif (cap proportional terhadap limitip).
     // recent sudah dedup berdasarkan source IP, jadi tidak overcount karena port reconnect.
-    const cntProcHint = Math.min(Math.max(cntProc, 0), 3);
-    const cntRecentHint = Math.min(Math.max(cntRecent, 0), 3);
+    // Cap = max(3, min(limitip*2, 10)) — minimal 3, maksimal 10, proporsional limit.
+    const hintCap = Math.max(3, Math.min((lim > 0 ? lim : 1) * 2, 10));
+    const cntProcHint = Math.min(Math.max(cntProc, 0), hintCap);
+    const cntRecentHint = Math.min(Math.max(cntRecent, 0), hintCap);
     // Untuk mode ZIVPN HTTP, hitung final diprioritaskan dari sesi aktif realtime
     // agar mobile handoff 1 HP (IP cepat berganti) tidak false multi-login karena hint historis.
     const cntHint = Math.max(cntProcHint, cntRecentHint);
@@ -9252,9 +9269,29 @@ async function lockIfExceeded(nowTs) {
       ? cntActive
       : Math.max(cntActive, cntHint);
     const hardSessionExceeded = cntWsPorts > SSHWS_ACCOUNT_SESSION_HARD_LIMIT;
-    const accountLimitExceeded = lim > 0 && cnt > lim;
+    // Long-term IP tracker: deteksi sharing akun dalam 24 jam.
+    // Track semua IP yang pernah terlihat dalam 24 jam — kalau > limitip * 3 → abuse.
+    const LONG_TERM_HOURS = 24;
+    const longTermCutoff = nowTs - (LONG_TERM_HOURS * 3600);
+    const currentUserIps = setUnionValues(sshIpMap);
+    for (const ip of currentUserIps) {
+      if (isLoopbackIp(ip)) continue;
+      await run(
+        `INSERT OR REPLACE INTO temp_ip_long_history(account_type, username, ip, first_seen, last_seen)
+         VALUES('ssh', ?, ?, COALESCE((SELECT first_seen FROM temp_ip_long_history WHERE account_type='ssh' AND username=? AND ip=?), ?), ?)`,
+        [user, ip, userKey, ip, nowTs, nowTs]
+      ).catch(() => {});
+    }
+    // Hitung unique IP 24 jam.
+    const longTermRow = await get(
+      "SELECT COUNT(*) AS cnt FROM temp_ip_long_history WHERE account_type='ssh' AND LOWER(username)=LOWER(?) AND last_seen >= ?",
+      [user, longTermCutoff]
+    ).catch(() => ({ cnt: 0 }));
+    const longTermIpCount = Number(longTermRow?.cnt || 0);
+    const longTermAbuse = lim > 0 && longTermIpCount > lim * 3;
+    const accountLimitExceeded = (lim > 0 && cnt > lim) || longTermAbuse;
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt} hintCap=${hintCap} cnt24h=${longTermIpCount} longTermAbuse=${longTermAbuse ? 1 : 0}`);
     }
     if (!accountLimitExceeded && !hardSessionExceeded) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;
@@ -9305,6 +9342,12 @@ async function lockIfExceeded(nowTs) {
     if (ZIVPN_AUTH_MODE === 'http' && lim === 1 && cntZivpnRaw >= 4 && cntZivpnEffective === 2) {
       zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
     }
+    let lockReasonText = hardSessionExceeded
+      ? `sesi SSHWS aktif melewati batas aman ${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}`
+      : 'pemakaian perangkat/IP melewati limit akun';
+    if (longTermAbuse && !hardSessionExceeded) {
+      lockReasonText = `sharing akun terdeteksi: ${longTermIpCount} IP berbeda dalam ${LONG_TERM_HOURS} jam (limit=${lim}, max=${lim * 3})`;
+    }
     await notifyMultiLoginLock(
       hardSessionExceeded ? 'sshws/udpgw' : 'ssh/zivpn',
       user,
@@ -9317,9 +9360,7 @@ async function lockIfExceeded(nowTs) {
         detected_raw: cntZivpnRaw,
         detected_effective: cntZivpnEffective,
         device_detected_label: zivpnNotifyLabel,
-        lock_reason: hardSessionExceeded
-          ? `sesi SSHWS aktif melewati batas aman ${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}`
-          : 'pemakaian perangkat/IP melewati limit akun'
+        lock_reason: lockReasonText
       }
     );
   }

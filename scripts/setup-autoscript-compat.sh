@@ -222,7 +222,7 @@ EXPIRED_ACCOUNT_RETENTION_DAYS="${EXPIRED_ACCOUNT_RETENTION_DAYS:-30}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
-IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}"
+IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-5}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 QUOTA_LOCK_ENABLE="${QUOTA_LOCK_ENABLE:-1}"
@@ -258,7 +258,7 @@ XRAY_OUTBOUND_DOMAIN_STRATEGY="${XRAY_OUTBOUND_DOMAIN_STRATEGY:-}"
 SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-auto}"
 SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}"
 DROPBEAR_KEEPALIVE_SECONDS="${DROPBEAR_KEEPALIVE_SECONDS:-30}"
-DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}"
+DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}"
 SC_API_MEMORY_MAX="${SC_API_MEMORY_MAX:-auto}"
 SSHWS_SERVICE_MEMORY_MAX="${SSHWS_SERVICE_MEMORY_MAX:-auto}"
 HAPROXY_TCPLOG_ENABLE="${HAPROXY_TCPLOG_ENABLE:-0}"
@@ -1270,7 +1270,7 @@ EOF
 dropbear_runtime_args() {
   local keepalive idle
   keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
-  idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" | tr -cd '0-9')"
+  idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
   [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
   [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
   printf -- '-K %s -I %s' "${keepalive}" "${idle}"
@@ -9632,7 +9632,11 @@ Type=oneshot
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=${APP_DIR}/.env
 Environment=NODE_ENV=production
+Environment=UV_THREADPOOL_SIZE=2
 ExecStart=/usr/bin/node ${APP_DIR}/iplimit-checker.js
+Nice=10
+CPUQuota=50%
+MemoryMax=256M
 NoNewPrivileges=true
 PrivateTmp=true
 EOF
@@ -10985,8 +10989,8 @@ apply_restored_runtime_units() {
 
   load_env_file /etc/sc-1forcr.env
 
-  iplimit_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
-  [[ -z "${iplimit_interval}" || "${iplimit_interval}" -lt 1 || "${iplimit_interval}" -gt 1440 ]] && iplimit_interval="3"
+  iplimit_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
+  [[ -z "${iplimit_interval}" || "${iplimit_interval}" -lt 1 || "${iplimit_interval}" -gt 1440 ]] && iplimit_interval="5"
   cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<EOF_TIMER
 [Unit]
 Description=Run SC 1FORCR IP Limit Checker every ${iplimit_interval} minutes
@@ -11826,7 +11830,7 @@ refresh_zivpn_live_from_api_log() {
   if [[ "${lookback}" -lt 300 ]]; then lookback="300"; fi
   if [[ "${lookback}" -gt 3600 ]]; then lookback="3600"; fi
 
-  journalctl -u sc-1forcr-api --since "-${lookback} seconds" -n 4000 -o short-unix --no-pager 2>/dev/null \
+  journalctl -u sc-1forcr-api --since "-${lookback} seconds" -n 1000 -o short-unix --no-pager 2>/dev/null \
     | awk '
       /\[zivpn-auth\]/ && /result=allow/ {
         ts=0; u=""; ip="";
@@ -12038,7 +12042,7 @@ xray_cnt=0
 if [[ -f /var/log/xray/access.log ]]; then
   xray_cutoff="$(date -d "-${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} seconds" '+%Y/%m/%d %H:%M:%S' 2>/dev/null || true)"
   [[ -z "${xray_cutoff}" ]] && xray_cutoff="1970/01/01 00:00:00"
-  xray_users="$(tail -n 25000 /var/log/xray/access.log 2>/dev/null \
+  xray_users="$(tail -n 5000 /var/log/xray/access.log 2>/dev/null \
     | awk -v cutoff="${xray_cutoff}" '
       function clean(v) {
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
@@ -12101,7 +12105,7 @@ fi
 udphc_service="$(detect_udphc_service)"
 udphc_now="$(date +%s 2>/dev/null || echo 0)"
 [[ -z "${udphc_now}" || ! "${udphc_now}" =~ ^[0-9]+$ ]] && udphc_now="0"
-udphc_users="$(journalctl -u "${udphc_service}" -n 12000 -o short-unix --no-pager 2>/dev/null \
+udphc_users="$(journalctl -u "${udphc_service}" -n 4000 -o short-unix --no-pager 2>/dev/null \
   | awk -v now="${udphc_now}" -v win="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" '
     {
       ts=0
@@ -12306,6 +12310,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/sc-1forcr-online-notify
+Nice=10
+CPUQuota=50%
+MemoryMax=256M
 NoNewPrivileges=true
 PrivateTmp=true
 EOF
@@ -13201,7 +13208,7 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
 dropbear_runtime_args() {
   local keepalive idle
   keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
-  idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" | tr -cd '0-9')"
+  idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
   [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
   [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
   printf -- '-K %s -I %s' "${keepalive}" "${idle}"
@@ -16353,9 +16360,9 @@ akun_menu() {
 
 set_iplimit_checker_config_menu() {
   local current_interval current_lock interval_in lock_in
-  current_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
+  current_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
   current_lock="$(echo "${IPLIMIT_LOCK_MINUTES:-15}" | tr -cd '0-9')"
-  [[ -z "${current_interval}" ]] && current_interval="3"
+  [[ -z "${current_interval}" ]] && current_interval="5"
   [[ -z "${current_lock}" ]] && current_lock="15"
 
   draw_menu_header "SETTING IP LIMIT CHECKER"
@@ -16419,7 +16426,7 @@ set_autolock_realtime_tuning_menu() {
   def_zivpn_active="90"
   def_zivpn_handoff="90"
 
-  cur_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
+  cur_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
   cur_lock="$(echo "${IPLIMIT_LOCK_MINUTES:-15}" | tr -cd '0-9')"
   cur_xray_recent="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
   cur_xray_active="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
@@ -20089,7 +20096,7 @@ xray_log_snapshot() {
     : > "${dst}"
     return
   fi
-  tail -n 25000 /var/log/xray/access.log | awk -v cutoff="${cutoff_ts}" -v active_cutoff="${active_cutoff_ts}" -v min_hits="${xray_min_hits_per_ip}" '
+  tail -n 5000 /var/log/xray/access.log | awk -v cutoff="${cutoff_ts}" -v active_cutoff="${active_cutoff_ts}" -v min_hits="${xray_min_hits_per_ip}" '
     function norm_ip(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
       gsub(/^\[/, "", v);
@@ -20234,7 +20241,7 @@ show_udpcustom_online() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
   draw_menu_header "UDP CUSTOM ONLINE (log terbaru)"
-  journalctl -u "${udpcustom}" -n 1200 --no-pager 2>/dev/null | \
+  journalctl -u "${udpcustom}" -n 600 --no-pager 2>/dev/null | \
     sed -nE '
       s/.*\[src:([^]]+)\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected.*/\2|\1/p;
       s/.*user[=: ]([^ ,]+).*src[=: ]([^ ,]+).*/\1|\2/p;
@@ -20269,7 +20276,7 @@ refresh_zivpn_live_from_api_log_menu() {
   has_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
   [[ "${has_live_table}" == "1" ]] || return 0
 
-  journalctl -u sc-1forcr-api --since "-${lookback} seconds" -n 4000 -o short-unix --no-pager 2>/dev/null \
+  journalctl -u sc-1forcr-api --since "-${lookback} seconds" -n 1000 -o short-unix --no-pager 2>/dev/null \
     | awk '
       /\[zivpn-auth\]/ && /result=allow/ {
         ts=0; u=""; ip="";
@@ -20612,7 +20619,7 @@ Time     : $(date '+%F %T')"
     DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
     DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}" \
     DROPBEAR_KEEPALIVE_SECONDS="${DROPBEAR_KEEPALIVE_SECONDS:-30}" \
-    DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" \
+    DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" \
     IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
     IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
     IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}" \
@@ -21843,7 +21850,7 @@ if [[ -f /etc/sc-1forcr.env ]]; then
   done < /etc/sc-1forcr.env
 fi
 keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
-idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" | tr -cd '0-9')"
+idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
 [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
 [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
 printf -- '-K %s -I %s' "${keepalive}" "${idle}"

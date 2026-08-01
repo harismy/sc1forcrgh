@@ -1272,7 +1272,7 @@ dropbear_runtime_args() {
   keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
   idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
   [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
-  [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
+  [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="300"
   printf -- '-K %s -I %s' "${keepalive}" "${idle}"
 }
 
@@ -13210,7 +13210,7 @@ dropbear_runtime_args() {
   keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
   idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
   [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
-  [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
+  [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="300"
   printf -- '-K %s -I %s' "${keepalive}" "${idle}"
 }
 
@@ -21865,7 +21865,7 @@ fi
 keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
 idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
 [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
-[[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="0"
+[[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="300"
 printf -- '-K %s -I %s' "${keepalive}" "${idle}"
 EOF
   chmod 755 /usr/local/sbin/dropbear_runtime_args >/dev/null 2>&1 || true

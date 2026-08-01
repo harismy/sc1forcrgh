@@ -13020,6 +13020,25 @@ safe_source_env_file() {
 }
 
 safe_source_env_file /etc/sc-1forcr.env
+
+# --- MIGRASI: upgrade default lama ke nilai optimal (dijalankan saat install & update) ---
+if [[ "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" == "0" ]]; then
+  DROPBEAR_IDLE_TIMEOUT_SECONDS="300"
+  if [[ -f /etc/sc-1forcr.env ]]; then
+    sed -i 's/^DROPBEAR_IDLE_TIMEOUT_SECONDS=.*/DROPBEAR_IDLE_TIMEOUT_SECONDS=300/' /etc/sc-1forcr.env
+  fi
+  log "Migrasi: DROPBEAR_IDLE_TIMEOUT_SECONDS 0 -> 300 (cegah zombie proses)"
+fi
+_iplimit_cur="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-3}" | tr -cd '0-9')"
+if [[ -z "${_iplimit_cur}" || "${_iplimit_cur}" -lt 5 ]]; then
+  IPLIMIT_CHECK_INTERVAL_MINUTES="5"
+  if [[ -f /etc/sc-1forcr.env ]]; then
+    sed -i 's/^IPLIMIT_CHECK_INTERVAL_MINUTES=.*/IPLIMIT_CHECK_INTERVAL_MINUTES=5/' /etc/sc-1forcr.env
+  fi
+  log "Migrasi: IPLIMIT_CHECK_INTERVAL_MINUTES ${_iplimit_cur:-?} -> 5 (minimal 5 menit)"
+fi
+# --- END MIGRASI ---
+
 AUTH_TOKEN="${AUTH_TOKEN:-${API_AUTH_TOKEN:-}}"
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
 PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"

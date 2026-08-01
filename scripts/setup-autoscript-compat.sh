@@ -18598,6 +18598,23 @@ parse_license_expire_epoch() {
   echo "${ts}"
 }
 
+format_expiry_in() {
+  local raw="$1" ts now rem d h m
+  raw="$(echo "${raw}" | tr -cd '0-9')"
+  if [[ -z "${raw}" || "${raw}" == "0" ]]; then echo "Unlimited"; return; fi
+  ts="${raw}"
+  [[ "${#ts}" -ge 13 ]] && ts="$((ts / 1000))"
+  now="$(date +%s)"
+  rem="$((ts - now))"
+  if (( rem <= 0 )); then echo "Expired"; return; fi
+  d="$((rem / 86400))"
+  h="$(((rem % 86400) / 3600))"
+  m="$(((rem % 3600) / 60))"
+  if (( d > 0 )); then echo "${d}d ${h}h ${m}m"
+  elif (( h > 0 )); then echo "${h}h ${m}m"
+  else echo "${m}m"; fi
+}
+
 sc_access_state_is_valid() {
   local status_raw expires_raw status expires_epoch now_epoch
   status_raw="${1:-}"
@@ -18947,271 +18964,93 @@ draw_dashboard() {
   local live_status live_active live_cap live_add live_ram live_cpu
   local estimate_text live_capacity_text
 
-  # ANSI colors (aman untuk bash di Linux)
+  # Standard ANSI colors (compatible all terminals incl mobile)
   local ESC=$'\033'
-  local RED="${ESC}[0;31m"
-  local GREEN="${ESC}[0;32m"
-  local YELLOW="${ESC}[0;33m"
-  local AQUA="${ESC}[38;5;51m"
-  local AQUA2="${ESC}[38;5;45m"
-  local PURPLE="${ESC}[38;5;141m"
-  local VIOLET="${ESC}[38;5;99m"
-  local WHITE="${ESC}[38;5;255m"
-  local DIM="${ESC}[2m"
-  local BOLD="${ESC}[1m"
-  local NC="${ESC}[0m"
+  local R="${ESC}[31m" G="${ESC}[32m" Y="${ESC}[33m"
+  local B="${ESC}[34m" C="${ESC}[36m" M="${ESC}[35m" W="${ESC}[37m"
+  local DIM="${ESC}[2m" BOLD="${ESC}[1m" NC="${ESC}[0m"
+  local BG_BLUE="${ESC}[44m" BG_RESET="${ESC}[49m"
 
-  local BOX_W=58
+  # Responsive width: detect terminal, fallback 58, min 42
+  local TW
+  TW="$(tput cols 2>/dev/null || echo 80)"
+  [[ -z "${TW}" || "${TW}" -lt 42 ]] && TW=58
+  (( TW > 100 )) && TW=80
+  local W=$((TW - 4))  # inner content width
+  local HW=$(((W - 2) / 2))  # half width for side-by-side
 
-  strip_ansi() {
-    sed -r 's/\x1B\[[0-9;]*[mK]//g'
-  }
-
-  visible_len() {
-    local text="$1"
-    printf '%s' "$text" | strip_ansi | awk '{ print length }'
-  }
+  strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
+  visible_len() { printf '%s' "$1" | strip_ansi | awk '{print length}'; }
 
   pad_right() {
-    local text="$1"
-    local width="$2"
-    local vlen pad
-    vlen="$(visible_len "$text")"
-    pad=$((width - vlen))
-    [ "$pad" -lt 0 ] && pad=0
-    printf '%s%*s' "$text" "$pad" ""
+    local t="$1" w="$2" vl pad
+    vl="$(visible_len "$t")"; pad=$((w - vl)); [[ $pad -lt 0 ]] && pad=0
+    printf '%s%*s' "$t" "$pad" ""
   }
 
-  gradient_fill() {
-    local char="$1"
-    local count="$2"
-    local i color
-    for ((i=0; i<count; i++)); do
-      if (( i < count / 3 )); then
-        color="${AQUA}"
-      elif (( i < (count * 2) / 3 )); then
-        color="${AQUA2}"
-      else
-        color="${PURPLE}"
-      fi
-      printf '%s%s' "${color}" "${char}"
-    done
-    printf '%s' "${NC}"
+  # Simple horizontal line (no gradient, mobile-safe)
+  hline() { local c="${1:--}" w="${2:-$W}"; printf '%*s\n' "$w" "" | tr ' ' "$c"; }
+
+  # Top border
+  block_top() {
+    local title="$1" tw=$((W - ${#title} - 4))
+    printf ' %s┌%s%s%s┐%s\n' "${C}" "$(printf '%*s' "$tw" "" | tr ' ' '─')" " ${title} " "${C}" "${NC}"
   }
 
-  print_top() {
-    printf '%s┏%s┓%s\n' "${AQUA}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
+  # Bottom border
+  block_bot() { printf ' %s└%s┘%s\n' "${C}" "$(hline '─' "$W")" "${NC}"; }
+
+  # Single row
+  row() { local t="$1"; printf ' %s│%s %s %s│%s\n' "${C}" "${NC}" "$(pad_right "$t" "$W")" "${C}" "${NC}"; }
+
+  # Key-value row: "  key : value"
+  kv() {
+    local k="$1" v="$2" kw=14
+    if (( W < 55 )); then kw=10; fi
+    row "  ${DIM}$(printf "%-${kw}s" "$k")${NC} ${C}:${NC} ${W}${v}${NC}"
   }
 
-  print_mid() {
-    printf '%s┣%s┫%s\n' "${VIOLET}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
+  # Center row
+  crow() {
+    local t="$1" vl left right
+    vl="$(visible_len "$t")"
+    if (( vl >= W )); then row "$t"; return; fi
+    left=$(((W - vl) / 2)); right=$((W - vl - left))
+    printf ' %s│%s %*s%s%*s %s│%s\n' "${C}" "${NC}" "$left" "" "$t" "$right" "" "${C}" "${NC}"
   }
 
-  print_bottom() {
-    printf '%s┗%s┛%s\n' "${PURPLE}" "$(gradient_fill '━' "$((BOX_W + 2))")" "${NC}"
-  }
-
-  print_line() {
-    local text="$1"
-    local padded
-    padded="$(pad_right "$text" "$BOX_W")"
-    printf '%s┃%s %s %s┃%s\n' "${AQUA}" "${NC}" "$padded" "${PURPLE}" "${NC}"
-  }
-
-  print_center() {
-    local text="$1"
-    local vlen left right
-    vlen="$(visible_len "$text")"
-    if [ "$vlen" -ge "$BOX_W" ]; then
-      print_line "$text"
-      return
-    fi
-    left=$(( (BOX_W - vlen) / 2 ))
-    right=$(( BOX_W - vlen - left ))
-    printf '%s┃%s %*s%s%*s %s┃%s\n' "${AQUA}" "${NC}" "$left" "" "$text" "$right" "" "${PURPLE}" "${NC}"
-  }
-
-  kv_line() {
-    local key="$1"
-    local value="$2"
-    print_line "  ${DIM}$(printf '%-13s' "$key")${NC} ${PURPLE}:${NC} ${WHITE}$value${NC}"
-  }
-
-  section_title() {
-    local title="$1"
-    print_line " ${PURPLE}${BOLD}<>${NC} ${AQUA}${BOLD}${title}${NC} ${PURPLE}${BOLD}<>${NC}"
-  }
-
-  read_license_value() {
-    local key="$1"
-    local file="/etc/sc-1forcr-license"
-    if [[ ! -f "${file}" ]]; then
-      echo ""
-      return
-    fi
-    sed -n "s/^${key}=//p" "${file}" | head -n1
-  }
-
-  read_sc_meta_value() {
-    local key="$1"
-    local file="/etc/sc-1forcr-registration.env"
-    if [[ ! -f "${file}" ]]; then
-      echo ""
-      return
-    fi
-    sed -n "s/^${key}=//p" "${file}" | head -n1
-  }
-
-  read_update_info_value() {
-    local key="$1"
-    local file="/etc/sc-1forcr/update-info.env"
-    if [[ ! -f "${file}" ]]; then
-      echo ""
-      return
-    fi
-    sed -n "s/^${key}=//p" "${file}" | head -n1
-  }
-
-  truncate_text() {
-    local txt="$1"
-    local max="${2:-70}"
-    local len
-    len="${#txt}"
-    if (( len <= max )); then
-      printf '%s' "${txt}"
-      return
-    fi
-    if (( max <= 3 )); then
-      printf '%s' "${txt:0:max}"
-      return
-    fi
-    printf '%s...' "${txt:0:$((max - 3))}"
-  }
-
-  format_expiry_in() {
-    local raw="$1"
-    local ts now rem d h m
-    raw="$(echo "${raw}" | tr -cd '0-9')"
-    if [[ -z "${raw}" || "${raw}" == "0" ]]; then
-      echo "Unlimited"
-      return
-    fi
-    ts="${raw}"
-    if [[ "${#ts}" -ge 13 ]]; then
-      ts="$((ts / 1000))"
-    fi
-    now="$(date +%s)"
-    rem="$((ts - now))"
-    if (( rem <= 0 )); then
-      echo "Expired"
-      return
-    fi
-    d="$((rem / 86400))"
-    h="$(((rem % 86400) / 3600))"
-    m="$(((rem % 3600) / 60))"
-    if (( d > 0 )); then
-      echo "${d}d ${h}h ${m}m"
-    elif (( h > 0 )); then
-      echo "${h}h ${m}m"
-    else
-      echo "${m}m"
-    fi
-  }
-
-  refresh_license_cache() {
-    local enabled now_s last_s stamp_file
-    local resp status msg bound_ip expires distribution client_name key_hash
-    enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
-    [[ "${enabled}" != "1" ]] && return 0
-    [[ -z "${LICENSE_API_URL:-}" || -z "${LICENSE_API_TOKEN:-}" || -z "${LICENSE_KEY:-}" ]] && return 0
-    command -v jq >/dev/null 2>&1 || return 0
-
-    stamp_file="/tmp/sc-1forcr-license-refresh.ts"
-    now_s="$(date +%s)"
-    last_s=0
-    if [[ -f "${stamp_file}" ]]; then
-      last_s="$(tr -cd '0-9' < "${stamp_file}" 2>/dev/null || echo 0)"
-      [[ -z "${last_s}" ]] && last_s=0
-    fi
-    # Hindari spam API saat user bolak-balik menu.
-    if (( now_s - last_s < 60 )); then
-      return 0
-    fi
-    printf '%s' "${now_s}" > "${stamp_file}" 2>/dev/null || true
-
-    resp="$(curl -4fsS --connect-timeout 8 --max-time 20 \
-      -X POST "${LICENSE_API_URL}" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      --data-urlencode "license_key=${LICENSE_KEY}" \
-      --data-urlencode "ip=${ip}" 2>/dev/null ||
-    curl -fsS --connect-timeout 8 --max-time 20 \
-      -X POST "${LICENSE_API_URL}" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "Content-Type: application/x-www-form-urlencoded" \
-      --data-urlencode "license_key=${LICENSE_KEY}" \
-      --data-urlencode "ip=${ip}" 2>/dev/null ||
-    true)"
-    [[ -z "${resp}" ]] && return 0
-    echo "${resp}" | jq . >/dev/null 2>&1 || return 0
-
-    status="$(echo "${resp}" | jq -r '.status // (if .allowed==true then "active" else "rejected" end) // "rejected"' 2>/dev/null || echo "rejected")"
-    msg="$(echo "${resp}" | jq -r '.message // "-" ' 2>/dev/null || echo "-")"
-    bound_ip="$(echo "${resp}" | jq -r '.bound_ip // .ip // empty' 2>/dev/null || echo "")"
-    expires="$(echo "${resp}" | jq -r '.expires_at // .expired_at // .expired // "-" ' 2>/dev/null || echo "-")"
-    distribution="$(echo "${resp}" | jq -r '.distribution // "BOT 1FORCR NEXUS"' 2>/dev/null || echo "BOT 1FORCR NEXUS")"
-    client_name="$(echo "${resp}" | jq -r '.client_name // .client // .name // empty' 2>/dev/null || echo "")"
-    [[ -z "${bound_ip}" || "${bound_ip}" == "null" ]] && bound_ip="${ip}"
-    [[ -z "${client_name}" || "${client_name}" == "null" ]] && client_name="${bound_ip}"
-    key_hash="$(printf '%s' "${LICENSE_KEY}" | sha256sum | awk '{print $1}')"
-
-    cat > /etc/sc-1forcr-license <<EOF
-LICENSE_STATUS=${status}
-LICENSE_MESSAGE=${msg}
-LICENSE_BOUND_IP=${bound_ip}
-LICENSE_EXPIRES_AT=${expires}
-LICENSE_DISTRIBUTION=${distribution}
-LICENSE_CLIENT_NAME=${client_name}
-LICENSE_KEY_HASH=${key_hash}
-LICENSE_CHECK_AT=$(date '+%F %T')
-EOF
-    chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
+  # Section header with colored background
+  sec() {
+    local t="$1"
+    printf ' %s│%s %s%s %s%s %s│%s\n' "${C}" "${NC}" "${C}" "▸" "${W}${BOLD}" "${t}" "${NC}" "${C}" "${NC}"
+    printf ' %s│%s %s %s│%s\n' "${C}" "${NC}" "$(hline '─' "$W")" "${C}" "${NC}"
   }
 
   # Data collection
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
-  ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
-  swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M"}')"
+  ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {printf "%dM / %dM", $3, $2}')"
+  swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {printf "%dM / %dM", $3, $2}')"
   uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
   uptime_h="$((uptime_s / 3600))"
   uptime_m="$(((uptime_s % 3600) / 60))"
 
   ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip="${ip:-unknown}"
-  refresh_license_cache
+  refresh_license_cache_guard
   city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
   isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
   local license_distribution license_client_name license_status license_expires_raw expiry_in_text
   local sc_meta_status sc_meta_client sc_meta_expires
-  local update_component update_version update_desc update_time update_desc_short
-  license_distribution="$(read_license_value "LICENSE_DISTRIBUTION")"
-  license_client_name="$(read_license_value "LICENSE_CLIENT_NAME")"
-  license_status="$(echo "$(read_license_value "LICENSE_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
-  license_expires_raw="$(read_license_value "LICENSE_EXPIRES_AT")"
-  sc_meta_status="$(echo "$(read_sc_meta_value "SC_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
-  sc_meta_client="$(read_sc_meta_value "SC_CLIENT_NAME")"
-  sc_meta_expires="$(read_sc_meta_value "SC_EXPIRES_AT")"
-  update_component="$(read_update_info_value "UPDATE_COMPONENT")"
-  update_version="$(read_update_info_value "UPDATE_VERSION")"
-  update_desc="$(read_update_info_value "UPDATE_DESC")"
-  update_time="$(read_update_info_value "UPDATE_AT_LOCAL")"
-  update_desc_short="$(truncate_text "${update_desc:-"-"}" 80)"
+  license_distribution="$(read_license_value_global "LICENSE_DISTRIBUTION")"
+  license_client_name="$(read_license_value_global "LICENSE_CLIENT_NAME")"
+  license_status="$(echo "$(read_license_value_global "LICENSE_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
+  license_expires_raw="$(read_license_value_global "LICENSE_EXPIRES_AT")"
+  sc_meta_status="$(echo "$(read_sc_meta_value_global "SC_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
+  sc_meta_client="$(read_sc_meta_value_global "SC_CLIENT_NAME")"
+  sc_meta_expires="$(read_sc_meta_value_global "SC_EXPIRES_AT")"
   [[ -z "${license_distribution}" ]] && license_distribution="Community / Open Source"
-  if [[ -n "${sc_meta_client}" ]]; then
-    license_client_name="${sc_meta_client}"
-  elif [[ -z "${license_client_name}" ]]; then
-    license_client_name="${ip}"
-  fi
+  if [[ -n "${sc_meta_client}" ]]; then license_client_name="${sc_meta_client}"
+  elif [[ -z "${license_client_name}" ]]; then license_client_name="${ip}"; fi
   if sc_access_state_is_valid "${sc_meta_status}" "${sc_meta_expires}"; then
     expiry_in_text="$(format_expiry_in "${sc_meta_expires}")"
   elif sc_access_state_is_valid "${license_status}" "${license_expires_raw}"; then
@@ -19221,10 +19060,6 @@ EOF
   else
     expiry_in_text="$(format_expiry_in "${sc_meta_expires}")"
   fi
-  [[ -z "${update_component}" ]] && update_component="-"
-  [[ -z "${update_version}" ]] && update_version="-"
-  [[ -z "${update_desc_short}" ]] && update_desc_short="-"
-  [[ -z "${update_time}" ]] && update_time="-"
 
   udpcustom="$(detect_udpcustom_service)"
   ssh_on="$(onoff_word ssh)"
@@ -19235,12 +19070,8 @@ EOF
   udphc_on="$(onoff_word "${udpcustom}")"
 
   health="CHECK"
-  if [[ "${xray_on}" == "ON" && "${ws_on}" == "ON" && "${loadblc_on}" == "ON" ]]; then
-    health="GOOD"
-  fi
-
-  local health_display="${YELLOW}CHECK${NC}"
-  [[ "${health}" == "GOOD" ]] && health_display="${GREEN}GOOD${NC}"
+  [[ "${xray_on}" == "ON" && "${ws_on}" == "ON" && "${loadblc_on}" == "ON" ]] && health="GOOD"
+  local health_d="${Y}CHECK${NC}"; [[ "${health}" == "GOOD" ]] && health_d="${G}GOOD${NC}"
 
   local active_account_where
   active_account_where="$(account_active_where_expr)"
@@ -19264,84 +19095,81 @@ EOF
   [[ -z "${live_add}" ]] && live_add="0"
   [[ -z "${live_ram}" ]] && live_ram="-"
   [[ -z "${live_cpu}" ]] && live_cpu="-"
-  estimate_text="sekitar ${cap_est} user aktif"
+  estimate_text="~${cap_est} user"
   if [[ "${live_status}" != "WAIT" && "${live_cap}" =~ ^[0-9]+$ ]]; then
-    estimate_text="sekitar ${live_cap} user aktif"
-    if [[ "${live_add}" =~ ^[0-9]+$ && "${live_add}" -gt 0 ]]; then
-      estimate_text="${estimate_text} | add+${live_add}"
-    fi
+    estimate_text="~${live_cap} user"
+    [[ "${live_add}" =~ ^[0-9]+$ && "${live_add}" -gt 0 ]] && estimate_text="${estimate_text} +${live_add}"
   fi
-  live_capacity_text="${live_status} Online: ${live_active} RAM ${live_ram}% CPU ${live_cpu}%"
+  live_capacity_text="${live_status} | Online:${live_active} | RAM:${live_ram}% | CPU:${live_cpu}%"
 
-  if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" == "1" ]]; then
-    cap_mode="AUTO"
-  else
-    cap_mode="MANUAL"
-  fi
+  cap_mode="AUTO"
+  [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" != "1" ]] && cap_mode="MANUAL"
 
-  local xray_color="${GREEN}ON${NC}";  [[ "$xray_on" != "ON" ]] && xray_color="${RED}OFF${NC}"
-  local ws_color="${GREEN}ON${NC}";    [[ "$ws_on" != "ON" ]] && ws_color="${RED}OFF${NC}"
-  local lb_color="${GREEN}ON${NC}";    [[ "$loadblc_on" != "ON" ]] && lb_color="${RED}OFF${NC}"
-  local zivpn_color="${GREEN}ON${NC}"; [[ "$zivpn_on" != "ON" ]] && zivpn_color="${RED}OFF${NC}"
-  local udphc_color="${GREEN}ON${NC}"; [[ "$udphc_on" != "ON" ]] && udphc_color="${RED}OFF${NC}"
-  local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
+  # Service status with ON/OFF colors
+  local on="${G}●${NC}" off="${R}○${NC}"
+  local so="${on}" sx="${on}" sw="${on}" sl="${on}" sz="${on}" su="${off}"
+  [[ "$ssh_on" != "ON" ]] && so="${off}"
+  [[ "$xray_on" != "ON" ]] && sx="${off}"
+  [[ "$ws_on" != "ON" ]] && sw="${off}"
+  [[ "$loadblc_on" != "ON" ]] && sl="${off}"
+  [[ "$zivpn_on" != "ON" ]] && sz="${off}"
+  [[ "$udphc_on" == "ON" ]] && su="${on}"
 
+  # === RENDER DASHBOARD ===
   clear
-  print_top
-  print_center "${AQUA}${BOLD}SC 1FORCR${NC} ${PURPLE}${BOLD}NEXUS${NC} ${WHITE}${BOLD}DASHBOARD${NC}"
-  print_mid
 
-  section_title "SYSTEM & NETWORK"
-  kv_line "OS"  "${os_name}"
-  kv_line "RAM"  "${ram_mb:-"-"} | SWAP : ${swap_mb:-"-"}"
-  kv_line "UPTIME"  "${uptime_h}h ${uptime_m}m"
-  kv_line "Spesifikasi"  "${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
-  kv_line "Auto tuningSC" "${cap_mode} (tier ${cap_tier})"
-  kv_line "Estimasi akun"  "${estimate_text}"
-  kv_line "Info Realtime" "${live_capacity_text}"
-  print_mid
+  # ── HEADER ──
+  local header="SC 1FORCR NEXUS"
+  printf '\n %s%s%s%s%s\n' "${C}" "${BOLD}" "$(hline '▄' "$W")" "${NC}"
+  crow "${W}${BOLD}${header}${NC}"
+  local sub="${license_client_name}  |  ${SCRIPT_VERSION:-V.1FSC}  |  ${expiry_in_text}"
+  crow "${DIM}${sub}${NC}"
+  printf ' %s%s%s%s%s\n' "${C}" "${BOLD}" "$(hline '▀' "$W")" "${NC}"
 
-  section_title "LOCATION & ISP"
-  kv_line "IP" "${ip}"
-  kv_line "CITY" "${city}"
-  kv_line "ISP" "${isp}"
-  kv_line "DOMAIN" "${DOMAIN:-"-"}"
-  print_mid
+  # ── SYSTEM ──
+  sec "SYSTEM"
+  kv "OS" "${os_name}"
+  kv "RAM" "${ram_mb:-"-"}  ${DIM}SWAP${NC} ${swap_mb:-"-"}"
+  kv "Uptime" "${uptime_h}h ${uptime_m}m  ${DIM}Spec${NC} ${cap_ram_gb}GB / ${cap_cores}vCPU (tier ${cap_tier})"
+  kv "Capacity" "${cap_mode}  ${estimate_text}"
+  kv "Realtime" "${live_capacity_text}"
+  block_bot
 
-  section_title "TRAFFIC STATS"
-  kv_line "MONTH" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
-  kv_line "RX" "${VNSTAT_MONTH_RX}"
-  kv_line "TX" "${VNSTAT_MONTH_TX}"
-  kv_line "DAY" "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]"
-  kv_line "RX" "${VNSTAT_DAY_RX}"
-  kv_line "TX" "${VNSTAT_DAY_TX}"
-  kv_line "CURRENT" "${VNSTAT_RATE}"
-  print_mid
+  # ── NETWORK ──
+  sec "NETWORK"
+  kv "IP" "${ip}  ${DIM}${city}${NC}"
+  kv "ISP" "${isp}"
+  kv "Domain" "${DOMAIN:-"-"}"
+  block_bot
 
-  section_title "SERVICES STATUS"
-  print_line "  ${DIM}XRAY   ${NC} ${PURPLE}:${NC} ${xray_color}   ${VIOLET}|${NC} ${DIM}SSH-WS${NC} ${PURPLE}:${NC} ${ws_color}   ${VIOLET}|${NC} ${DIM}LOADBLC${NC} ${PURPLE}:${NC} ${lb_color}"
-  print_line "  ${DIM}ZIVPN  ${NC} ${PURPLE}:${NC} ${zivpn_color}   ${VIOLET}|${NC} ${DIM}UDPHC ${NC} ${PURPLE}:${NC} ${udphc_color}  ${VIOLET}|${NC} ${DIM}SSH    ${NC} ${PURPLE}:${NC} ${ssh_color}"
-  print_line "  ${DIM}HEALTH ${NC} ${PURPLE}:${NC} ${health_display}"
-  print_mid
+  # ── TRAFFIC ──
+  sec "TRAFFIC"
+  kv "Month" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]  ${DIM}▼${NC}${VNSTAT_MONTH_RX}  ${DIM}▲${NC}${VNSTAT_MONTH_TX}"
+  kv "Day"   "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]  ${DIM}▼${NC}${VNSTAT_DAY_RX}  ${DIM}▲${NC}${VNSTAT_DAY_TX}"
+  kv "Now"   "${VNSTAT_RATE}"
+  block_bot
 
-  section_title "ACCOUNT SUMMARY"
-  print_line "  ${DIM}SSH/OpenVPN${NC} ${PURPLE}:${NC} ${WHITE}${c_ssh}${NC}  ${VIOLET}|${NC} ${DIM}VMESS ${NC} ${PURPLE}:${NC} ${WHITE}${c_vmess}${NC}"
-  print_line "  ${DIM}VLESS      ${NC} ${PURPLE}:${NC} ${WHITE}${c_vless}${NC}  ${VIOLET}|${NC} ${DIM}TROJAN${NC} ${PURPLE}:${NC} ${WHITE}${c_trojan}${NC}"
-  print_mid
+  # ── SERVICES ──
+  sec "SERVICES"
+  if (( W >= 58 )); then
+    row "  ${so} SSH      ${sz} ZIVPN    ${sl} LOADBLC   ${DIM}Health${NC} ${health_d}"
+    row "  ${sx} XRAY     ${su} UDPHC    ${sw} SSH-WS"
+  else
+    row "  ${so} SSH        ${sz} ZIVPN       ${sx} XRAY"
+    row "  ${sw} SSH-WS     ${su} UDPHC       ${sl} LOADBLC"
+    row "  ${DIM}Health${NC} ${health_d}"
+  fi
+  block_bot
 
-  section_title "VERSION & CLIENT"
-  kv_line "Version" "${SCRIPT_VERSION:-unknown}"
-  kv_line "Distribusi" "${license_distribution}"
-  kv_line "Client Name" "${license_client_name}"
-  kv_line "Expiry In" "${expiry_in_text}"
-  print_mid
+  # ── ACCOUNTS ──
+  sec "ACCOUNTS"
+  row "  SSH/OVPN ${W}${c_ssh}${NC}    VMESS ${W}${c_vmess}${NC}    VLESS ${W}${c_vless}${NC}    TROJAN ${W}${c_trojan}${NC}"
+  block_bot
 
-  print_bottom
-
+  # ── FOOTER ──
   printf '\n'
-  printf ' %s┏%s┓%s\n' "${AQUA}" "$(gradient_fill '━' 36)" "${NC}"
-  printf " ${AQUA}┃${NC} ${BOLD}${WHITE}to access use${NC} ${AQUA}'menu'${NC} ${BOLD}${WHITE}command${NC}      ${PURPLE}┃${NC}\n"
-  printf ' %s┗%s┛%s\n' "${PURPLE}" "$(gradient_fill '━' 36)" "${NC}"
+  crow "${DIM}ketik ${W}'menu'${NC}${DIM} untuk akses menu utama${NC}"
+  printf '\n'
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h

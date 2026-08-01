@@ -18975,7 +18975,7 @@ draw_dashboard() {
   local W=58  # inner content width
   local HW=27  # half width for side-by-side
 
-  strip_ansi() { if [[ -n "${1:-}" ]]; then printf '%s' "${1:-}"; else cat; fi | sed $'s/\033\[[0-9;]*[a-zA-Z]//g'; }
+  strip_ansi() { if [[ -n "${1:-}" ]]; then printf '%s' "${1:-}"; else cat; fi | awk '{gsub(/\033\[[0-9;]*[a-zA-Z]/,"");print}'; }
   visible_len() { printf '%s' "$1" | strip_ansi | awk '{print length}'; }
 
   pad_right() {
@@ -21164,7 +21164,7 @@ menu_hline() {
 }
 
 menu_strip_ansi() {
-  if [[ -n "${1:-}" ]]; then printf '%s' "${1:-}"; else cat; fi | sed $'s/\033\[[0-9;]*[a-zA-Z]//g'
+  if [[ -n "${1:-}" ]]; then printf '%s' "${1:-}"; else cat; fi | awk '{gsub(/\033\[[0-9;]*[a-zA-Z]/,"");print}'
 }
 
 menu_visible_len() {

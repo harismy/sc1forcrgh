@@ -9708,20 +9708,19 @@ mem_used_mib="$((mem_total_mib - mem_avail_mib))"
 (( mem_used_mib < 0 )) && mem_used_mib="0"
 mem_used_pct="$(awk -v u="${mem_used_mib}" -v t="${mem_total_mib}" 'BEGIN{if(t<=0) printf "0.0"; else printf "%.1f", (u/t)*100}')"
 
-read_cpu_totals() {
-  # Hanya jumlahkan kolom standar (user s/d steal), hindari guest/guest_nice
-  # yang sudah termasuk di user/nice (kernel >=2.6.24).
-  # Format /proc/stat: cpu user nice system idle iowait irq softirq steal guest guest_nice
-  awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8+$9, $5+$6; exit}' /proc/stat
-}
-
-read -r cpu_total_1 cpu_idle_1 < <(read_cpu_totals)
+# Baca CPU usage: dua sample /proc/stat dalam 1 detik via temp file
+# Hindari presisi hilang saat passing bilangan besar antar bash variable.
+# Kolom /proc/stat: cpu user nice system idle iowait irq softirq steal guest guest_nice
+# guest/guest_nice sudah termasuk di user/nice — kolom 10-11 diabaikan.
+tmp_cpu_s1="$(mktemp)"
+awk '/^cpu /{u=$2+$3+$4; t=u+$5+$6+$7+$8+$9; i=$5+$6; print t,i; exit}' /proc/stat > "${tmp_cpu_s1}"
 sleep 1
-read -r cpu_total_2 cpu_idle_2 < <(read_cpu_totals)
-cpu_used_pct="$(awk -v t1="${cpu_total_1:-0}" -v i1="${cpu_idle_1:-0}" -v t2="${cpu_total_2:-0}" -v i2="${cpu_idle_2:-0}" 'BEGIN{
-  dt=t2-t1; di=i2-i1;
-  if (dt<=0) printf "0.0"; else printf "%.1f", ((dt-di)/dt)*100;
-}')"
+cpu_used_pct="$(awk 'NR==FNR{t1=$1;i1=$2;next} /^cpu /{
+  u=$2+$3+$4; t=u+$5+$6+$7+$8+$9; i=$5+$6;
+  dt=t-t1; di=i-i1;
+  printf "%.1f",(dt>0?(dt-di)/dt*100:0.0); exit
+}' "${tmp_cpu_s1}" /proc/stat)"
+rm -f "${tmp_cpu_s1}"
 
 tmp_conn="$(mktemp)"
 trap 'rm -f "${tmp_conn:-}"' EXIT

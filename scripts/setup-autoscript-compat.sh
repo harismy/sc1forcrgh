@@ -18567,7 +18567,7 @@ menu_bool_01() {
 }
 
 read_license_value_global() {
-  local key="$1"
+  local key="${1:-}"
   local file="/etc/sc-1forcr-license"
   if [[ ! -f "${file}" ]]; then
     echo ""
@@ -18577,7 +18577,7 @@ read_license_value_global() {
 }
 
 read_sc_meta_value_global() {
-  local key="$1"
+  local key="${1:-}"
   local file="/etc/sc-1forcr-registration.env"
   if [[ ! -f "${file}" ]]; then
     echo ""
@@ -18599,7 +18599,7 @@ parse_license_expire_epoch() {
 }
 
 format_expiry_in() {
-  local raw="$1" ts now rem d h m
+  local raw="${1:-}" ts now rem d h m
   raw="$(echo "${raw}" | tr -cd '0-9')"
   if [[ -z "${raw}" || "${raw}" == "0" ]]; then echo "Unlimited"; return; fi
   ts="${raw}"

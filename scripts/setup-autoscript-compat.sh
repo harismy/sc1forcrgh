@@ -18967,7 +18967,7 @@ draw_dashboard() {
   # Standard ANSI colors (compatible all terminals incl mobile)
   local ESC=$'\033'
   local R="${ESC}[31m" G="${ESC}[32m" Y="${ESC}[33m"
-  local B="${ESC}[34m" C="${ESC}[36m" M="${ESC}[35m" W="${ESC}[37m"
+  local B="${ESC}[34m" C="${ESC}[36m" M="${ESC}[35m" WH="${ESC}[37m"
   local DIM="${ESC}[2m" BOLD="${ESC}[1m" NC="${ESC}[0m"
   local BG_BLUE="${ESC}[44m" BG_RESET="${ESC}[49m"
 
@@ -19007,7 +19007,7 @@ draw_dashboard() {
   kv() {
     local k="$1" v="$2" kw=14
     if (( W < 55 )); then kw=10; fi
-    row "  ${DIM}$(printf "%-${kw}s" "$k")${NC} ${C}:${NC} ${W}${v}${NC}"
+    row "  ${DIM}$(printf "%-${kw}s" "$k")${NC} ${C}:${NC} ${WH}${v}${NC}"
   }
 
   # Center row
@@ -19022,7 +19022,7 @@ draw_dashboard() {
   # Section header with colored background
   sec() {
     local t="$1"
-    printf ' %s│%s %s%s %s%s %s│%s\n' "${C}" "${NC}" "${C}" "▸" "${W}${BOLD}" "${t}" "${NC}" "${C}" "${NC}"
+    printf ' %s│%s %s%s %s%s %s│%s\n' "${C}" "${NC}" "${C}" "▸" "${WH}${BOLD}" "${t}" "${NC}" "${C}" "${NC}"
     printf ' %s│%s %s %s│%s\n' "${C}" "${NC}" "$(hline '─' "$W")" "${C}" "${NC}"
   }
 
@@ -19121,7 +19121,7 @@ draw_dashboard() {
   # ── HEADER ──
   local header="SC 1FORCR NEXUS"
   printf '\n %s%s%s%s%s\n' "${C}" "${BOLD}" "$(hline '▄' "$W")" "${NC}"
-  crow "${W}${BOLD}${header}${NC}"
+  crow "${WH}${BOLD}${header}${NC}"
   local sub="${license_client_name}  |  ${SCRIPT_VERSION:-V.1FSC}  |  ${expiry_in_text}"
   crow "${DIM}${sub}${NC}"
   printf ' %s%s%s%s%s\n' "${C}" "${BOLD}" "$(hline '▀' "$W")" "${NC}"
@@ -19163,12 +19163,12 @@ draw_dashboard() {
 
   # ── ACCOUNTS ──
   sec "ACCOUNTS"
-  row "  SSH/OVPN ${W}${c_ssh}${NC}    VMESS ${W}${c_vmess}${NC}    VLESS ${W}${c_vless}${NC}    TROJAN ${W}${c_trojan}${NC}"
+  row "  SSH/OVPN ${WH}${c_ssh}${NC}    VMESS ${WH}${c_vmess}${NC}    VLESS ${WH}${c_vless}${NC}    TROJAN ${WH}${c_trojan}${NC}"
   block_bot
 
   # ── FOOTER ──
   printf '\n'
-  crow "${DIM}ketik ${W}'menu'${NC}${DIM} untuk akses menu utama${NC}"
+  crow "${DIM}ketik ${WH}'menu'${NC}${DIM} untuk akses menu utama${NC}"
   printf '\n'
 }
 show_combined_online() {

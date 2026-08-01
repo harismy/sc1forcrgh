@@ -18971,15 +18971,15 @@ draw_dashboard() {
   local DIM="${ESC}[2m" BOLD="${ESC}[1m" NC="${ESC}[0m"
   local BG_BLUE="${ESC}[44m" BG_RESET="${ESC}[49m"
 
-  # Responsive width: detect terminal, fallback 58, min 42
+  # Responsive width: auto-detect, max 66 untuk mobile-friendly
   local TW
   TW="$(tput cols 2>/dev/null || echo 80)"
-  [[ -z "${TW}" || "${TW}" -lt 42 ]] && TW=58
-  (( TW > 100 )) && TW=80
+  [[ -z "${TW}" || "${TW}" -lt 40 ]] && TW=58
+  (( TW > 66 )) && TW=66
   local W=$((TW - 4))  # inner content width
   local HW=$(((W - 2) / 2))  # half width for side-by-side
 
-  strip_ansi() { sed -r 's/\x1B\[[0-9;]*[mK]//g'; }
+  strip_ansi() { printf '%s' "$1" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'; }
   visible_len() { printf '%s' "$1" | strip_ansi | awk '{print length}'; }
 
   pad_right() {
@@ -21168,7 +21168,7 @@ menu_hline() {
 }
 
 menu_strip_ansi() {
-  sed -r 's/\x1B\[[0-9;]*[mK]//g'
+  sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'
 }
 
 menu_visible_len() {

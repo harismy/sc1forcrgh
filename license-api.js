@@ -7,6 +7,7 @@ const sqlite3 = require('sqlite3').verbose();
 
 const DB_PATH = String(process.env.DB_PATH || path.join(__dirname, 'sc1forcrnexus.db')).trim();
 const PORT = Math.max(1, Number(process.env.LICENSE_API_PORT || 8099) || 8099);
+const HOST = String(process.env.LICENSE_API_HOST || '127.0.0.1').trim() || '127.0.0.1';
 const LICENSE_API_TOKEN = String(process.env.LICENSE_API_TOKEN || '').trim();
 const DEFAULT_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'scripts', 'setup-autoscript-compat.sh');
 const LEGACY_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'payload', 'setup-autoscript-compat.sh');
@@ -79,6 +80,7 @@ async function initDb() {
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     version TEXT NOT NULL UNIQUE,
     note TEXT,
+    target_ip TEXT,
     created_at INTEGER NOT NULL,
     triggered_by INTEGER,
     status TEXT DEFAULT 'active'
@@ -108,6 +110,7 @@ async function initDb() {
     PRIMARY KEY (vps_ip, version)
   )`);
   await ensureScRegistrationSchema();
+  await ensureScUpdateTriggerSchema();
 }
 
 async function ensureScRegistrationSchema() {
@@ -119,6 +122,16 @@ async function ensureScRegistrationSchema() {
   }
   if (!hasClientName) {
     await dbRun('ALTER TABLE sc_registrations ADD COLUMN client_name TEXT');
+  }
+}
+
+async function ensureScUpdateTriggerSchema() {
+  const cols = await dbAll('PRAGMA table_info(sc_update_triggers)');
+  const hasTargetIp = cols.some((c) => String(c?.name || '').toLowerCase() === 'target_ip');
+  if (!hasTargetIp) {
+    await dbRun('ALTER TABLE sc_update_triggers ADD COLUMN target_ip TEXT').catch((e) => {
+      if (!/duplicate column name/i.test(String(e?.message || ''))) throw e;
+    });
   }
 }
 
@@ -259,6 +272,36 @@ function requireBearer(req, res, next) {
   return next();
 }
 
+async function requireUpdateClient(req, res, next) {
+  try {
+    const serverKey = String(req.headers['x-sc-key'] || '').trim();
+    if (serverKey) {
+      const now = Date.now();
+      const reg = await dbGet(
+        "SELECT r.user_id, r.vps_ip, r.client_name, r.status, r.updated_at, r.expires_at " +
+          'FROM sc_server_keys k JOIN sc_registrations r ON r.user_id = k.user_id AND r.vps_ip = k.vps_ip ' +
+          "WHERE k.server_key = ? AND r.status = 'active' " +
+          'AND (r.expires_at IS NULL OR r.expires_at <= 0 OR r.expires_at > ?) ' +
+          'ORDER BY k.updated_at DESC LIMIT 1',
+        [serverKey, now]
+      );
+      if (reg) {
+        req.scUpdateRegistration = reg;
+        req.scUpdateAuth = 'vps-key';
+        return next();
+      }
+    }
+
+    // Kompatibilitas sementara untuk VPS lama. Klien baru selalu memakai X-SC-Key.
+    return requireBearer(req, res, () => {
+      req.scUpdateAuth = 'legacy-bearer';
+      next();
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+}
+
 async function isDomainAllowed(req) {
   const domains = await dbAll('SELECT domain FROM api_domains WHERE is_active = 1');
   if (!domains.length) return true;
@@ -315,9 +358,14 @@ async function ensureServerKeyForRegistration(reg) {
   return serverKey;
 }
 
-async function getLatestActiveUpdateTrigger() {
+async function getLatestActiveUpdateTrigger(ip) {
+  const safeIp = cleanIp(ip);
+  if (!safeIp) return null;
   return dbGet(
-    "SELECT version, note, created_at, triggered_by FROM sc_update_triggers WHERE status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1"
+    "SELECT version, note, target_ip, created_at, triggered_by FROM sc_update_triggers " +
+      "WHERE status = 'active' AND (target_ip IS NULL OR TRIM(target_ip) = '' OR target_ip = ?) " +
+      'ORDER BY created_at DESC, id DESC LIMIT 1',
+    [safeIp]
   );
 }
 
@@ -654,10 +702,11 @@ app.post('/sc1forcr/license/activate', requireBearer, async (req, res) => {
   }
 });
 
-app.post('/sc1forcr/update/check', requireBearer, async (req, res) => {
+app.post('/sc1forcr/update/check', requireUpdateClient, async (req, res) => {
   try {
-    const ip = cleanIp(req.body?.ip) || getClientIp(req);
-    const reg = await findActiveRegistrationByIp(ip);
+    const keyedReg = req.scUpdateRegistration || null;
+    const ip = cleanIp(keyedReg?.vps_ip) || cleanIp(req.body?.ip) || getClientIp(req);
+    const reg = keyedReg || (await findActiveRegistrationByIp(ip));
     if (!reg) {
       const latest = await findLatestRegistrationByIp(ip);
       const isExpired = Number(latest?.expires_at || 0) > 0 && Date.now() > Number(latest.expires_at);
@@ -678,7 +727,7 @@ app.post('/sc1forcr/update/check', requireBearer, async (req, res) => {
       reg.vps_ip
     ]).catch(() => {});
 
-    const trigger = await getLatestActiveUpdateTrigger();
+    const trigger = await getLatestActiveUpdateTrigger(reg.vps_ip);
     if (!trigger?.version) {
       return res.json({ ok: true, allowed: true, update_required: false, ip: reg.vps_ip });
     }
@@ -702,6 +751,7 @@ app.post('/sc1forcr/update/check', requireBearer, async (req, res) => {
       update_required: hasInstaller && !alreadySucceeded && currentVersion !== triggerVersion,
       version: triggerVersion,
       note: String(trigger.note || ''),
+      target_ip: cleanIp(trigger.target_ip) || null,
       created_at: Number(trigger.created_at || 0) || null,
       script_url: hasInstaller ? scriptUrl : '',
       summary_api_url: summaryApiUrl,
@@ -713,10 +763,11 @@ app.post('/sc1forcr/update/check', requireBearer, async (req, res) => {
   }
 });
 
-app.post('/sc1forcr/update/ack', requireBearer, async (req, res) => {
+app.post('/sc1forcr/update/ack', requireUpdateClient, async (req, res) => {
   try {
-    const ip = cleanIp(req.body?.ip) || getClientIp(req);
-    const reg = await findActiveRegistrationByIp(ip);
+    const keyedReg = req.scUpdateRegistration || null;
+    const ip = cleanIp(keyedReg?.vps_ip) || cleanIp(req.body?.ip) || getClientIp(req);
+    const reg = keyedReg || (await findActiveRegistrationByIp(ip));
     if (!reg) {
       return res.status(403).json({ ok: false, allowed: false, message: 'IP belum terdaftar atau expired', ip });
     }
@@ -733,10 +784,11 @@ app.post('/sc1forcr/update/ack', requireBearer, async (req, res) => {
   }
 });
 
-app.post('/sc1forcr/summary-update/check', requireBearer, async (req, res) => {
+app.post('/sc1forcr/summary-update/check', requireUpdateClient, async (req, res) => {
   try {
-    const ip = cleanIp(req.body?.ip) || getClientIp(req);
-    const reg = await findActiveRegistrationByIp(ip);
+    const keyedReg = req.scUpdateRegistration || null;
+    const ip = cleanIp(keyedReg?.vps_ip) || cleanIp(req.body?.ip) || getClientIp(req);
+    const reg = keyedReg || (await findActiveRegistrationByIp(ip));
     if (!reg) {
       const latest = await findLatestRegistrationByIp(ip);
       const isExpired = Number(latest?.expires_at || 0) > 0 && Date.now() > Number(latest.expires_at);
@@ -787,10 +839,11 @@ app.post('/sc1forcr/summary-update/check', requireBearer, async (req, res) => {
   }
 });
 
-app.post('/sc1forcr/summary-update/ack', requireBearer, async (req, res) => {
+app.post('/sc1forcr/summary-update/ack', requireUpdateClient, async (req, res) => {
   try {
-    const ip = cleanIp(req.body?.ip) || getClientIp(req);
-    const reg = await findActiveRegistrationByIp(ip);
+    const keyedReg = req.scUpdateRegistration || null;
+    const ip = cleanIp(keyedReg?.vps_ip) || cleanIp(req.body?.ip) || getClientIp(req);
+    const reg = keyedReg || (await findActiveRegistrationByIp(ip));
     if (!reg) {
       return res.status(403).json({ ok: false, allowed: false, message: 'IP belum terdaftar atau expired', ip });
     }
@@ -813,8 +866,8 @@ app.use((_req, res) => {
 
 initDb()
   .then(() => {
-    app.listen(PORT, '0.0.0.0', () => {
-      console.log(`sc1forcr-license-api listening on :${PORT}`);
+    app.listen(PORT, HOST, () => {
+      console.log(`sc1forcr-license-api listening on ${HOST}:${PORT}`);
     });
   })
   .catch((e) => {

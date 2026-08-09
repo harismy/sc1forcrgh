@@ -1640,6 +1640,7 @@ SQL
       sqlite3 "${DB_PATH}" "ALTER TABLE ${t} ADD COLUMN owner_telegram_chat_id INTEGER;" >/dev/null 2>&1 || true
     fi
   done
+  chmod 600 "${DB_PATH}" "${DB_PATH}-wal" "${DB_PATH}-shm" >/dev/null 2>&1 || true
 }
 
 network_effective_tcp_mss() {
@@ -4283,13 +4284,23 @@ function ensureTunnelShellAllowed() {
 }
 
 function ensureLinuxUser(username, password, expDate) {
+  username = validateSshUsername(username);
+  password = validateSshPassword(password);
   const shell = ensureTunnelShellAllowed();
   const exists = safeExec('id', ['-u', username]);
-  if (!exists) safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', shell, username]);
-  safeExec('chpasswd', [], `${username}:${password}\n`);
-  safeExec('usermod', ['-d', `/home/${username}`, '-s', shell, username]);
+  if (!exists && !safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', shell, username])) {
+    throw new Error(`gagal membuat Linux user ${username}`);
+  }
+  if (!safeExec('chpasswd', [], `${username}:${password}\n`)) {
+    throw new Error(`gagal mengubah password Linux user ${username}`);
+  }
+  if (!safeExec('usermod', ['-d', `/home/${username}`, '-s', shell, username])) {
+    throw new Error(`gagal mengamankan shell Linux user ${username}`);
+  }
   const linuxExpDate = ymdFromDateExp(expDate);
-  if (linuxExpDate) safeExec('chage', ['-E', linuxExpDate, username]);
+  if (linuxExpDate && !safeExec('chage', ['-E', linuxExpDate, username])) {
+    throw new Error(`gagal mengatur expired Linux user ${username}`);
+  }
 }
 
 function deleteLinuxUser(username) {
@@ -5406,6 +5417,21 @@ function randomAlnum(length = 8) {
   return out;
 }
 
+const RESERVED_SSH_USERNAMES = new Set([
+  'root', 'daemon', 'bin', 'sys', 'sync', 'games', 'man', 'lp', 'mail', 'news', 'uucp',
+  'proxy', 'www-data', 'backup', 'list', 'irc', 'gnats', 'nobody', 'systemd-network',
+  'systemd-resolve', 'messagebus', 'systemd-timesync', 'sshd', 'postgres', 'mysql', 'redis'
+]);
+
+function validateSshUsername(usernameRaw) {
+  const username = String(usernameRaw || '').trim().toLowerCase();
+  if (!/^[a-z][a-z0-9_-]{0,31}$/.test(username)) {
+    throw new Error('username SSH harus diawali huruf, hanya a-z/0-9/_/-, maksimal 32 karakter');
+  }
+  if (RESERVED_SSH_USERNAMES.has(username)) throw new Error('username sistem tidak boleh dipakai');
+  return username;
+}
+
 async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   const isTrial = forcedDays !== null;
   let username = String(body?.username || '').trim().toLowerCase();
@@ -5413,13 +5439,14 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
     username = await generateTrialUsername('account_sshs', 'trial');
   }
   const owner = getOwnerInfo(req, body || {});
+  username = validateSshUsername(username);
   const requestedPassword = String(body?.password || '').trim();
-  const password = requestedPassword || randomAlnum(8);
+  const password = validateSshPassword(requestedPassword || randomAlnum(8));
   const expDays = forcedDays === null ? Number(body?.expired || 30) : Number(forcedDays || 1);
   const quota = quotaLimitGbFromBody(body, 0);
   const limitip = Number(body?.limitip || 0);
-  if (!username) throw new Error('username required');
   await ensureUsernameNotExists('account_sshs', username);
+  if (safeExec('id', ['-u', username])) throw new Error('username sudah dipakai oleh Linux system');
   const expDate = isTrial ? dateExpPlusMinutes(60) : dateExpPlusDays(expDays);
   const linuxExpDate = ymdFromDateExp(expDate);
   ensureLinuxUser(username, password, linuxExpDate);
@@ -5445,9 +5472,8 @@ function validateSshPassword(password) {
 }
 
 async function changeSshPassword(usernameRaw, passwordRaw) {
-  const username = String(usernameRaw || '').trim().toLowerCase();
+  const username = validateSshUsername(usernameRaw);
   const password = validateSshPassword(passwordRaw);
-  if (!username) throw new Error('username required');
   const row = await get(
     "SELECT username, password, date_exp, quota, limitip FROM account_sshs WHERE LOWER(username)=LOWER(?) LIMIT 1",
     [username]
@@ -5593,12 +5619,13 @@ app.delete('/vps/deletesshvpn/:username', async (req, res) => {
 
 async function renewSsh(req, res) {
   try {
-    const username = String(req.params.username || '').trim();
+    const username = validateSshUsername(req.params.username);
     const exp = Number(req.params.exp || 30);
     const body = req.body || {};
     const row = await get("SELECT password,limitip,quota,date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
     const owner = getOwnerInfo(req, body);
-    const bodyPass = String(body?.password || '').trim();
+    const bodyPassRaw = String(body?.password || '').trim();
+    const bodyPass = bodyPassRaw ? validateSshPassword(bodyPassRaw) : '';
     const bodyQuotaRaw = quotaInputFromBody(body);
     const bodyQuota = Number(bodyQuotaRaw);
     const bodyLimitIp = Number(body?.limitip);
@@ -5614,7 +5641,8 @@ async function renewSsh(req, res) {
       const pass = bodyPass || username;
       const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : 0;
       const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : 0;
-      ensureLinuxUser(username, pass, linuxExpDate);
+      if (safeExec('id', ['-u', username])) return fail(res, 409, 'username sudah dipakai oleh Linux system');
+      ensureLinuxUser(username, validateSshPassword(pass), linuxExpDate);
       await run(
         "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
         [username, pass, expDate, 'AKTIF', nextQuota, nextLimitIp, owner.ownerTelegramId, owner.ownerTelegramChatId]
@@ -5636,7 +5664,7 @@ async function renewSsh(req, res) {
     }
 
     const oldPass = String(row?.password || '').trim();
-    const pass = bodyPass || oldPass || username;
+    const pass = validateSshPassword(bodyPass || oldPass || username);
     const currentQuota = Number(row?.quota || 0);
     const nextQuota = resolveRenewQuota(currentQuota, bodyQuotaRaw);
     const quotaAdded = resolveRenewQuotaAdded(bodyQuotaRaw);
@@ -12430,6 +12458,7 @@ AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
+SC_UPDATE_KEY="${SC_UPDATE_KEY:-${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}}"
 VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
 export HOME="${HOME:-/root}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
@@ -12516,11 +12545,13 @@ ack_update() {
   curl -4fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
     -X POST "${base_url}/sc1forcr/update/ack" \
     -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "X-SC-Key: ${SC_UPDATE_KEY}" \
     -H "Content-Type: application/json" \
     --data "${payload}" >/dev/null 2>&1 || \
   curl -fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
     -X POST "${base_url}/sc1forcr/update/ack" \
     -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "X-SC-Key: ${SC_UPDATE_KEY}" \
     -H "Content-Type: application/json" \
     --data "${payload}" >/dev/null 2>&1 || true
 }
@@ -12529,7 +12560,7 @@ main_pull_update() {
   if [[ "${AUTO_PULL_UPDATE_ENABLE}" != "1" ]]; then
     exit 0
   fi
-  if [[ -z "${LICENSE_API_URL}" || -z "${LICENSE_API_TOKEN}" ]]; then
+  if [[ -z "${LICENSE_API_URL}" || ( -z "${LICENSE_API_TOKEN}" && -z "${SC_UPDATE_KEY}" ) ]]; then
     exit 0
   fi
   if ! command -v jq >/dev/null 2>&1; then
@@ -12539,7 +12570,7 @@ main_pull_update() {
 
   mkdir -p "${STATE_DIR}"
   mkdir -p "${GOCACHE}" >/dev/null 2>&1 || true
-  local base_url current_version payload resp ok required version note summary_url msg vps_ip
+  local base_url current_version payload resp ok required version note summary_url msg vps_ip rollback_snapshot
   base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
   if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
     base_url="$(echo "${LICENSE_API_URL}" | sed 's|/license/activate$||')"
@@ -12558,11 +12589,13 @@ main_pull_update() {
     curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
       -X POST "${base_url}/sc1forcr/update/check" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
       -H "Content-Type: application/json" \
       --data "${payload}" 2>/dev/null ||
     curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
       -X POST "${base_url}/sc1forcr/update/check" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
       -H "Content-Type: application/json" \
       --data "${payload}" 2>/dev/null || true
   )"
@@ -12589,7 +12622,8 @@ main_pull_update() {
   if UPDATE_SAFE_MODE=1 /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
     clear_attempt
-    ack_update "${base_url}" "${version}" "success" "update selesai" "${vps_ip}"
+    rollback_snapshot="$(/usr/local/sbin/sc-1forcr-update-manager latest 2>/dev/null || true)"
+    ack_update "${base_url}" "${version}" "success" "update selesai; rollback=${rollback_snapshot:-tidak-ada}" "${vps_ip}"
     log_msg "Update trigger ${version} selesai."
   else
     msg="$(tail -c 1400 /var/log/sc-1forcr-pull-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
@@ -12640,6 +12674,7 @@ AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
+SC_UPDATE_KEY="${SC_UPDATE_KEY:-${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}}"
 VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
 STATE_DIR="/var/lib/sc-1forcr"
 LAST_VERSION_FILE="${STATE_DIR}/last-summary-update.version"
@@ -12723,11 +12758,13 @@ ack_summary_update() {
   curl -4fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
     -X POST "${base_url}/sc1forcr/summary-update/ack" \
     -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "X-SC-Key: ${SC_UPDATE_KEY}" \
     -H "Content-Type: application/json" \
     --data "${payload}" >/dev/null 2>&1 || \
   curl -fsS --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
     -X POST "${base_url}/sc1forcr/summary-update/ack" \
     -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+    -H "X-SC-Key: ${SC_UPDATE_KEY}" \
     -H "Content-Type: application/json" \
     --data "${payload}" >/dev/null 2>&1 || true
 }
@@ -12736,7 +12773,7 @@ main_pull_summary_update() {
   if [[ "${AUTO_PULL_UPDATE_ENABLE}" != "1" ]]; then
     exit 0
   fi
-  if [[ -z "${LICENSE_API_URL}" || -z "${LICENSE_API_TOKEN}" ]]; then
+  if [[ -z "${LICENSE_API_URL}" || ( -z "${LICENSE_API_TOKEN}" && -z "${SC_UPDATE_KEY}" ) ]]; then
     exit 0
   fi
   if ! command -v jq >/dev/null 2>&1; then
@@ -12764,11 +12801,13 @@ main_pull_summary_update() {
     curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
       -X POST "${base_url}/sc1forcr/summary-update/check" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
       -H "Content-Type: application/json" \
       --data "${payload}" 2>/dev/null ||
     curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
       -X POST "${base_url}/sc1forcr/summary-update/check" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
       -H "Content-Type: application/json" \
       --data "${payload}" 2>/dev/null || true
   )"
@@ -13116,7 +13155,7 @@ resume_pending_operation_prompt() {
   [[ "${ans,,}" == "skip" ]] && return 0
   rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
   if [[ "${type}" == "update" ]]; then
-    if ! update_script_from_repo; then
+    if ! update_script_locked; then
       set_pending_operation "${type}" "${cmd}" "${note}"
       echo "Proses pending masih gagal. Akan ditawarkan lagi saat login berikutnya."
     fi
@@ -17498,7 +17537,7 @@ tools_menu() {
       1) show_sc_key_info || true ;;
       2) install_summary_api_1forcr || true ;;
       3) set_html_banner_menu || true ;;
-      4) update_script_from_repo || true ;;
+      4) update_script_locked || true ;;
       5) set_telegram_notif_config || true ;;
       6) set_iplimit_checker_config_menu || true ;;
       7) set_autolock_realtime_tuning_menu || true ;;
@@ -19948,10 +19987,10 @@ show_ssh_only_online() {
       END {
         for (pid in auth_by_pid) {
           if (pid in closed_pid) continue;
-          seen[auth_by_pid[pid]]++;
+          seen[auth_by_pid[pid]]=1;
         }
-        for (u in auth_no_pid) seen[u]++;
-        for (u in seen) print u, seen[u];
+        for (u in auth_no_pid) seen[u]=1;
+        for (u in seen) print u, 1;
       }' > "${tmp_ip_count}" || true
   fi
 
@@ -20386,7 +20425,7 @@ validate_downloaded_update_payload() {
 }
 
 update_script_from_repo() {
-  local url tmp active_backend downloaded_ok derived_url
+  local url tmp active_backend downloaded_ok derived_url update_snapshot
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver update_log update_tail
@@ -20411,10 +20450,11 @@ update_script_from_repo() {
     return 1
   fi
 
-  tmp="/tmp/setup-autoscript-compat.sh"
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  tmp="$(mktemp /var/lib/sc-1forcr/setup-autoscript-compat.XXXXXX.sh)"
   update_log="/var/log/sc-1forcr-update.log"
-  banner_html="/tmp/sc-1forcr-banner.html.bak"
-  banner_txt="/tmp/sc-1forcr-banner.txt.bak"
+  banner_html="$(mktemp /var/lib/sc-1forcr/banner-html.XXXXXX.bak)"
+  banner_txt="$(mktemp /var/lib/sc-1forcr/banner-txt.XXXXXX.bak)"
   had_banner_html="0"
   had_banner_txt="0"
   downloaded_ok=0
@@ -20431,6 +20471,7 @@ Status   : GAGAL
 Domain   : ${DOMAIN}
 Alasan   : gagal download script update
 Time     : $(date '+%F %T')"
+    rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
   fi
   chmod +x "${tmp}"
@@ -20444,6 +20485,7 @@ Status   : GAGAL
 Domain   : ${DOMAIN}
 Alasan   : validasi syntax script gagal
 Time     : $(date '+%F %T')"
+    rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
   fi
   if ! validate_downloaded_update_payload "${tmp}"; then
@@ -20453,7 +20495,20 @@ Status   : GAGAL
 Domain   : ${DOMAIN}
 Alasan   : payload update tidak lengkap, helper wajib tidak ditemukan
 Time     : $(date '+%F %T')"
+    rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
+  fi
+
+  update_snapshot=""
+  if [[ -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+    if ! update_snapshot="$(/usr/local/sbin/sc-1forcr-update-manager snapshot "pre-update-${SCRIPT_VERSION:-unknown}")"; then
+      echo "Gagal membuat snapshot. Update dibatalkan sebelum ada perubahan."
+      rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    echo "Snapshot rollback: ${update_snapshot}"
+  else
+    echo "Bootstrap update pertama: installer baru akan membuat snapshot sebelum mengubah runtime."
   fi
 
   active_backend="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
@@ -20522,7 +20577,7 @@ Time     : $(date '+%F %T')"
     XRAY_PUBLIC_HOST="$(build_xray_public_host)" \
     XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}" \
     XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}" \
-    UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
+    UPDATE_SCRIPT_URL="${url}" \
     DB_PATH="${DB_PATH}" \
     APP_DIR="/opt/sc-1forcr" \
     ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE}" \
@@ -20605,6 +20660,7 @@ Time     : $(date '+%F %T')"
     RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}" \
     RESOURCE_CAPACITY_STATE_FILE="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}" \
     UPDATE_SAFE_MODE="${UPDATE_SAFE_MODE:-0}" \
+    UPDATE_TRANSACTION_SNAPSHOT="${update_snapshot}" \
     ACTIVE_UDP_BACKEND="${active_backend}" \
     bash "${tmp}" 2>&1 | tee "${update_log}"; then
     echo "Update script gagal dijalankan."
@@ -20680,6 +20736,100 @@ Online   : ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h win=${ONLINE
 
   rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
   return 0
+}
+
+update_script_locked() (
+  mkdir -p /run >/dev/null 2>&1 || true
+  flock -n 9 || {
+    echo "Update lain masih berjalan. Coba lagi setelah proses tersebut selesai."
+    exit 1
+  }
+  update_script_from_repo
+) 9>/run/sc-1forcr-update.lock
+
+manual_update_sc() {
+  local confirm
+  draw_menu_header "UPDATE SC AMAN"
+  echo "Mode       : aman (backup + health-check + rollback otomatis)"
+  echo "Sumber     : ${UPDATE_SCRIPT_URL:-otomatis dari VPS bot}"
+  echo "Database   : ${DB_PATH}"
+  echo
+  echo "Update tidak akan dimulai jika snapshot gagal dibuat."
+  if ! prompt_input confirm "Ketik UPDATE untuk melanjutkan: "; then
+    return 0
+  fi
+  [[ "${confirm}" == "UPDATE" ]] || {
+    echo "Update dibatalkan."
+    return 0
+  }
+  UPDATE_SAFE_MODE=1 update_script_locked
+}
+
+manual_rollback_latest_update() {
+  local confirm latest_snapshot
+  draw_menu_header "ROLLBACK UPDATE TERAKHIR"
+  if [[ ! -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+    echo "Update manager belum terpasang. Jalankan satu kali update aman terlebih dahulu."
+    return 1
+  fi
+  latest_snapshot="$(/usr/local/sbin/sc-1forcr-update-manager latest 2>/dev/null || true)"
+  if [[ -z "${latest_snapshot}" ]]; then
+    echo "Belum ada snapshot update yang dapat dipakai."
+    return 1
+  fi
+  echo "Snapshot : ${latest_snapshot}"
+  echo
+  /usr/local/sbin/sc-1forcr-update-manager list | head -n 7 || true
+  echo
+  echo "Rollback memulihkan database, konfigurasi, runtime SC, dan unit service."
+  echo "SSH utama/network tidak dihentikan agar akses root tetap tersedia."
+  if ! prompt_input confirm "Ketik ROLLBACK untuk memulihkan snapshot terbaru: "; then
+    return 0
+  fi
+  [[ "${confirm}" == "ROLLBACK" ]] || {
+    echo "Rollback dibatalkan."
+    return 0
+  }
+  /usr/local/sbin/sc-1forcr-update-manager rollback "${latest_snapshot}"
+}
+
+update_rollback_menu() {
+  local choice latest_snapshot
+  while true; do
+    draw_menu_header "UPDATE / ROLLBACK SC"
+    latest_snapshot="-"
+    if [[ -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+      latest_snapshot="$(/usr/local/sbin/sc-1forcr-update-manager latest 2>/dev/null || echo '-')"
+    fi
+    echo "Snapshot terbaru: ${latest_snapshot}"
+    echo
+    echo "1) Update SC aman (backup otomatis)"
+    echo "2) Rollback update terakhir"
+    echo "3) Daftar snapshot update"
+    echo "4) Buka menu Tools lama"
+    echo "0) Kembali"
+    echo
+    if ! prompt_input choice "Pilih [0-4]: "; then
+      return 0
+    fi
+    case "${choice}" in
+      1) manual_update_sc || true ;;
+      2) manual_rollback_latest_update || true ;;
+      3)
+        if [[ -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+          /usr/local/sbin/sc-1forcr-update-manager list || true
+        else
+          echo "Belum ada snapshot update."
+        fi
+        ;;
+      4) tools_menu || true ;;
+      0) return 0 ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    echo
+    read -rp "Enter untuk lanjut..." _ || true
+    clear >/dev/null 2>&1 || true
+  done
 }
 
 show_sc_key_info() {
@@ -21218,7 +21368,7 @@ draw_main_options() {
   printf ' %s┌%s┐%s\n' "${MENU_C}" "$(menu_hline '─' "$W")" "${MENU_NC}"
   menu_print_line "  ${MENU_DIM}1)${MENU_NC} MENU AKUN         ${MENU_DIM}5)${MENU_NC} MONITOR USER LOCK"  "$W"
   menu_print_line "  ${MENU_DIM}2)${MENU_NC} SERVICE MENU      ${MENU_DIM}6)${MENU_NC} MONITOR USER LOGIN" "$W"
-  menu_print_line "  ${MENU_DIM}3)${MENU_NC} BACKUP/RESTORE    ${MENU_DIM}7)${MENU_NC} TOOLS"             "$W"
+  menu_print_line "  ${MENU_DIM}3)${MENU_NC} BACKUP/RESTORE    ${MENU_DIM}7)${MENU_NC} UPDATE/ROLLBACK"   "$W"
   menu_print_line "  ${MENU_DIM}4)${MENU_NC} CHANGE DOMAIN"   "$W"
   menu_print_line "  ${MENU_DIM}m)${MENU_NC} MENU UTAMA"       "$W"
   menu_print_line "  ${MENU_DIM}x)${MENU_NC} EXIT"             "$W"
@@ -21227,7 +21377,16 @@ draw_main_options() {
 
 if [[ "${1:-}" == "update" ]]; then
   clear >/dev/null 2>&1 || true
-  update_script_from_repo
+  UPDATE_SAFE_MODE="${UPDATE_SAFE_MODE:-1}" update_script_locked
+  exit $?
+fi
+
+if [[ "${1:-}" == "rollback" ]]; then
+  [[ -x /usr/local/sbin/sc-1forcr-update-manager ]] || {
+    echo "Update manager belum tersedia."
+    exit 1
+  }
+  /usr/local/sbin/sc-1forcr-update-manager rollback "${2:-latest}"
   exit $?
 fi
 
@@ -21278,7 +21437,7 @@ while true; do
     4) change_domain_menu || true ;;
     5) monitor_temp_lock_menu || true ;;
     6) monitor_online_menu || true ;;
-    7) tools_menu || true ;;
+    7) update_rollback_menu || true ;;
     m|M)
       SHOW_FULL_MENU=1
       continue
@@ -22097,9 +22256,401 @@ resume_pending_operation_prompt() {
   fi
 }
 
+install_update_manager() {
+  mkdir -p /usr/local/sbin /var/lib/sc-1forcr/update-snapshots
+  chmod 700 /var/lib/sc-1forcr/update-snapshots >/dev/null 2>&1 || true
+  cat > /usr/local/sbin/sc-1forcr-update-manager <<'UPDATE_MANAGER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SNAPSHOT_ROOT="/var/lib/sc-1forcr/update-snapshots"
+SNAPSHOT_KEEP="${SC_UPDATE_SNAPSHOT_KEEP:-5}"
+ENV_FILE="/etc/sc-1forcr.env"
+
+log_update_manager() {
+  printf '[sc-update] %s\n' "$*" >&2
+}
+
+load_update_env() {
+  local line key value
+  [[ -f "${ENV_FILE}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${ENV_FILE}"
+}
+
+load_update_env
+DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+API_PORT="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
+[[ -z "${API_PORT}" ]] && API_PORT="8088"
+
+add_snapshot_path() {
+  local list_file="$1" source_path="$2" relative
+  [[ -e "${source_path}" || -L "${source_path}" ]] || return 0
+  relative="${source_path#/}"
+  [[ -n "${relative}" && "${relative}" != "${source_path}" ]] || return 0
+  printf '%s\0' "${relative}" >> "${list_file}"
+}
+
+prune_snapshots() {
+  local keep index name target root_real target_real
+  keep="$(printf '%s' "${SNAPSHOT_KEEP}" | tr -cd '0-9')"
+  [[ -z "${keep}" || "${keep}" -lt 2 || "${keep}" -gt 20 ]] && keep="5"
+  root_real="$(readlink -f -- "${SNAPSHOT_ROOT}")"
+  index=0
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    index=$((index + 1))
+    [[ "${index}" -le "${keep}" ]] && continue
+    [[ "${name}" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] || continue
+    target="${SNAPSHOT_ROOT}/${name}"
+    target_real="$(readlink -f -- "${target}" 2>/dev/null || true)"
+    [[ -n "${target_real}" && "${target_real}" == "${root_real}/"* && "${target_real}" != "${root_real}" ]] || continue
+    rm -rf -- "${target_real}"
+  done < <(find "${SNAPSHOT_ROOT}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r)
+}
+
+create_snapshot() {
+  local reason="${1:-manual}" snapshot_id snapshot_dir list_file current_version path
+  mkdir -p "${SNAPSHOT_ROOT}"
+  chmod 700 "${SNAPSHOT_ROOT}" >/dev/null 2>&1 || true
+  snapshot_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  snapshot_dir="${SNAPSHOT_ROOT}/${snapshot_id}"
+  mkdir -m 700 "${snapshot_dir}"
+  list_file="${snapshot_dir}/files.list"
+  : > "${list_file}"
+
+  for path in \
+    /etc/sc-1forcr.env \
+    /etc/sc-1forcr \
+    /opt/sc-1forcr \
+    /opt/potato-compat \
+    /etc/xray \
+    /usr/local/etc/xray \
+    /etc/zivpn \
+    /root/udp/config.json \
+    /etc/nginx/nginx.conf \
+    /etc/nginx/conf.d \
+    /etc/nginx/sites-available/sc-1forcr \
+    /etc/nginx/sites-available/sc-1forcr.conf \
+    /etc/nginx/sites-enabled/sc-1forcr \
+    /etc/nginx/sites-enabled/sc-1forcr.conf \
+    /etc/haproxy/haproxy.cfg \
+    /usr/local/sbin/menu-sc-1forcr \
+    /usr/local/sbin/update; do
+    add_snapshot_path "${list_file}" "${path}"
+  done
+  while IFS= read -r -d '' path; do
+    add_snapshot_path "${list_file}" "${path}"
+  done < <(find /etc/systemd/system /usr/local/sbin -maxdepth 1 \
+    \( -name 'sc-1forcr-*' -o -name 'zivpn.service' -o -name 'xray.service' \) -print0 2>/dev/null)
+
+  if [[ -s "${list_file}" ]]; then
+    tar --create --gzip --file="${snapshot_dir}/files.tar.gz" --directory=/ \
+      --numeric-owner --acls --xattrs --null --files-from="${list_file}"
+  else
+    tar --create --gzip --file="${snapshot_dir}/files.tar.gz" --directory=/ --files-from=/dev/null
+  fi
+  rm -f "${list_file}"
+
+  if [[ -f "${DB_PATH}" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      log_update_manager "python3 tidak tersedia; snapshot database dibatalkan."
+      rm -rf -- "${snapshot_dir}"
+      return 1
+    fi
+    python3 - "${DB_PATH}" "${snapshot_dir}/database.sqlite" <<'PY'
+import sqlite3
+import sys
+
+source = sqlite3.connect(sys.argv[1], timeout=30)
+target = sqlite3.connect(sys.argv[2], timeout=30)
+try:
+    source.execute("PRAGMA busy_timeout=30000")
+    with target:
+        source.backup(target)
+    row = target.execute("PRAGMA quick_check").fetchone()
+    if not row or str(row[0]).lower() != "ok":
+        raise RuntimeError("quick_check snapshot database gagal")
+finally:
+    target.close()
+    source.close()
+PY
+    chmod 600 "${snapshot_dir}/database.sqlite"
+  fi
+
+  current_version="$(awk -F= '/^SCRIPT_VERSION=/{print $2; exit}' /etc/sc-1forcr-version 2>/dev/null || true)"
+  {
+    printf 'SNAPSHOT_ID=%q\n' "${snapshot_id}"
+    printf 'CREATED_AT=%q\n' "$(date -Iseconds 2>/dev/null || date '+%F %T%z')"
+    printf 'REASON=%q\n' "${reason}"
+    printf 'FROM_VERSION=%q\n' "${current_version:-unknown}"
+    printf 'DB_PATH=%q\n' "${DB_PATH}"
+  } > "${snapshot_dir}/state.env"
+  chmod 600 "${snapshot_dir}/state.env"
+  (
+    cd "${snapshot_dir}"
+    if [[ -f database.sqlite ]]; then
+      sha256sum files.tar.gz database.sqlite state.env > SHA256SUMS
+    else
+      sha256sum files.tar.gz state.env > SHA256SUMS
+    fi
+  )
+  chmod 600 "${snapshot_dir}/SHA256SUMS"
+  ln -sfn "${snapshot_id}" "${SNAPSHOT_ROOT}/latest"
+  prune_snapshots
+  log_update_manager "Snapshot siap: ${snapshot_dir}"
+  printf '%s\n' "${snapshot_dir}"
+}
+
+resolve_snapshot() {
+  local input="${1:-latest}" root_real target_real
+  mkdir -p "${SNAPSHOT_ROOT}"
+  [[ "${input}" == "latest" ]] && input="${SNAPSHOT_ROOT}/latest"
+  [[ "${input}" != /* ]] && input="${SNAPSHOT_ROOT}/${input}"
+  root_real="$(readlink -f -- "${SNAPSHOT_ROOT}")"
+  target_real="$(readlink -f -- "${input}" 2>/dev/null || true)"
+  [[ -n "${target_real}" && -d "${target_real}" ]] || return 1
+  [[ "${target_real}" == "${root_real}/"* && "${target_real}" != "${root_real}" ]] || return 1
+  [[ -f "${target_real}/state.env" && -f "${target_real}/files.tar.gz" && -f "${target_real}/SHA256SUMS" ]] || return 1
+  printf '%s\n' "${target_real}"
+}
+
+verify_snapshot() {
+  local snapshot_dir
+  snapshot_dir="$(resolve_snapshot "${1:-latest}")" || {
+    log_update_manager "Snapshot tidak valid atau tidak ditemukan."
+    return 1
+  }
+  (cd "${snapshot_dir}" && sha256sum -c --status SHA256SUMS) || {
+    log_update_manager "Checksum snapshot tidak cocok: ${snapshot_dir}"
+    return 1
+  }
+  if tar -tzf "${snapshot_dir}/files.tar.gz" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+    log_update_manager "Archive snapshot mengandung path tidak aman."
+    return 1
+  fi
+  printf '%s\n' "${snapshot_dir}"
+}
+
+unit_is_installed() {
+  systemctl cat "$1" >/dev/null 2>&1
+}
+
+health_check() {
+  local failures=() unit check_result api_ok attempt
+  load_update_env
+  DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+  API_PORT="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
+  [[ -z "${API_PORT}" ]] && API_PORT="8088"
+
+  if [[ -f "${DB_PATH}" ]]; then
+    check_result="$(python3 - "${DB_PATH}" <<'PY' 2>/dev/null || true
+import sqlite3
+import sys
+conn = sqlite3.connect(sys.argv[1], timeout=15)
+try:
+    row = conn.execute("PRAGMA quick_check").fetchone()
+    print(row[0] if row else "failed")
+finally:
+    conn.close()
+PY
+)"
+    [[ "${check_result}" == "ok" ]] || failures+=("database quick_check")
+  else
+    failures+=("database tidak ditemukan")
+  fi
+
+  for unit in sc-1forcr-api.service sc-1forcr-sshws.service; do
+    if unit_is_installed "${unit}" && ! systemctl is-active --quiet "${unit}"; then
+      failures+=("${unit} tidak aktif")
+    fi
+  done
+  if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
+    failures+=("nginx -t")
+  fi
+  if command -v haproxy >/dev/null 2>&1 && [[ -f /etc/haproxy/haproxy.cfg ]] && \
+    ! haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1; then
+    failures+=("haproxy config")
+  fi
+
+  api_ok="0"
+  if unit_is_installed sc-1forcr-api.service; then
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      if curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${API_PORT}/vps/health" >/dev/null 2>&1; then
+        api_ok="1"
+        break
+      fi
+      sleep 1
+    done
+    [[ "${api_ok}" == "1" ]] || failures+=("API /vps/health")
+  fi
+
+  if [[ "${#failures[@]}" -gt 0 ]]; then
+    log_update_manager "Health-check gagal: $(IFS=', '; echo "${failures[*]}")"
+    return 1
+  fi
+  log_update_manager "Health-check SC berhasil."
+  return 0
+}
+
+restart_after_restore() {
+  local unit backend
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  for unit in sc-1forcr-api.service sc-1forcr-sshws.service; do
+    unit_is_installed "${unit}" && systemctl restart "${unit}" >/dev/null 2>&1 || true
+  done
+  for unit in xray.service nginx.service haproxy.service; do
+    unit_is_installed "${unit}" && systemctl reload-or-restart "${unit}" >/dev/null 2>&1 || true
+  done
+  load_update_env
+  backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
+    unit_is_installed sc-1forcr-udpcustom.service && systemctl restart sc-1forcr-udpcustom.service >/dev/null 2>&1 || true
+  else
+    unit_is_installed zivpn.service && systemctl restart zivpn.service >/dev/null 2>&1 || true
+  fi
+}
+
+rollback_snapshot() {
+  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name
+  snapshot_dir="$(verify_snapshot "${1:-latest}")" || return 1
+  snapshot_name="$(basename "${snapshot_dir}")"
+  log_update_manager "Menyiapkan rollback ke ${snapshot_name}..."
+  pre_snapshot="$(create_snapshot "pre-rollback-to-${snapshot_name}" 2>/dev/null || true)"
+
+  systemctl stop sc-1forcr-api.service sc-1forcr-sshws.service >/dev/null 2>&1 || true
+  tar --extract --gzip --file="${snapshot_dir}/files.tar.gz" --directory=/ \
+    --numeric-owner --acls --xattrs
+
+  # shellcheck disable=SC1090
+  source "${snapshot_dir}/state.env"
+  rollback_db="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+  if [[ -f "${snapshot_dir}/database.sqlite" ]]; then
+    db_dir="$(dirname "${rollback_db}")"
+    mkdir -p "${db_dir}"
+    db_tmp="$(mktemp "${db_dir}/.sc1forcr-rollback.XXXXXX")"
+    install -m 600 "${snapshot_dir}/database.sqlite" "${db_tmp}"
+    mv -f "${db_tmp}" "${rollback_db}"
+    rm -f "${rollback_db}-wal" "${rollback_db}-shm" >/dev/null 2>&1 || true
+  fi
+  chmod 600 /etc/sc-1forcr.env "${rollback_db}" >/dev/null 2>&1 || true
+  restart_after_restore
+  ln -sfn "${snapshot_name}" "${SNAPSHOT_ROOT}/latest"
+  ln -sfn "${snapshot_name}" "${SNAPSHOT_ROOT}/latest-rollback"
+  {
+    printf 'ROLLED_BACK_AT=%q\n' "$(date -Iseconds 2>/dev/null || date '+%F %T%z')"
+    printf 'PRE_ROLLBACK_SNAPSHOT=%q\n' "${pre_snapshot:-}"
+  } > "${snapshot_dir}/rollback.env"
+  chmod 600 "${snapshot_dir}/rollback.env"
+  if ! health_check; then
+    log_update_manager "Rollback selesai tetapi health-check masih gagal. Periksa service secara manual."
+    return 1
+  fi
+  log_update_manager "Rollback berhasil: ${snapshot_dir}"
+}
+
+commit_snapshot() {
+  local snapshot_dir version
+  snapshot_dir="$(verify_snapshot "${1:-latest}")" || return 1
+  version="${2:-unknown}"
+  {
+    printf 'COMMITTED_AT=%q\n' "$(date -Iseconds 2>/dev/null || date '+%F %T%z')"
+    printf 'TO_VERSION=%q\n' "${version}"
+  } > "${snapshot_dir}/committed.env"
+  chmod 600 "${snapshot_dir}/committed.env"
+  ln -sfn "$(basename "${snapshot_dir}")" "${SNAPSHOT_ROOT}/latest-success"
+}
+
+list_snapshots() {
+  local dir state reason created version status
+  printf '%-24s %-10s %-20s %s\n' 'SNAPSHOT' 'STATUS' 'FROM' 'REASON'
+  while IFS= read -r dir; do
+    [[ -f "${dir}/state.env" ]] || continue
+    reason='-'; created='-'; version='-'; status='ready'
+    # shellcheck disable=SC1090
+    source "${dir}/state.env"
+    reason="${REASON:-${reason}}"
+    version="${FROM_VERSION:-${version}}"
+    [[ -f "${dir}/committed.env" ]] && status='success'
+    [[ -f "${dir}/rollback.env" ]] && status='rollback'
+    printf '%-24s %-10s %-20s %s\n' "$(basename "${dir}")" "${status}" "${version}" "${reason}"
+  done < <(find "${SNAPSHOT_ROOT}" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort -r)
+}
+
+case "${1:-}" in
+  snapshot)
+    shift
+    create_snapshot "${*:-manual}"
+    ;;
+  verify)
+    verify_snapshot "${2:-latest}"
+    ;;
+  rollback)
+    rollback_snapshot "${2:-latest}"
+    ;;
+  health)
+    health_check
+    ;;
+  commit)
+    commit_snapshot "${2:-latest}" "${3:-unknown}"
+    ;;
+  list)
+    list_snapshots
+    ;;
+  latest)
+    resolve_snapshot latest
+    ;;
+  *)
+    echo "Usage: sc-1forcr-update-manager {snapshot [reason]|verify [snapshot]|rollback [snapshot]|health|commit <snapshot> [version]|list|latest}"
+    exit 1
+    ;;
+esac
+UPDATE_MANAGER_EOF
+  chmod 700 /usr/local/sbin/sc-1forcr-update-manager
+}
+
+UPDATE_TRANSACTION_SNAPSHOT="${UPDATE_TRANSACTION_SNAPSHOT:-}"
+UPDATE_TRANSACTION_COMMITTED="0"
+
+rollback_update_transaction_on_exit() {
+  local rc="$?"
+  trap - EXIT
+  if [[ "${UPDATE_TRANSACTION_COMMITTED:-0}" != "1" && -n "${UPDATE_TRANSACTION_SNAPSHOT:-}" && \
+        -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+    log "Update gagal; menjalankan rollback otomatis dari ${UPDATE_TRANSACTION_SNAPSHOT}."
+    /usr/local/sbin/sc-1forcr-update-manager rollback "${UPDATE_TRANSACTION_SNAPSHOT}" || \
+      log "PERINGATAN: rollback otomatis belum sehat. Gunakan: sc-1forcr-update-manager rollback '${UPDATE_TRANSACTION_SNAPSHOT}'"
+  fi
+  exit "${rc}"
+}
+
 main() {
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
   if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+    install_update_manager
+    if [[ -n "${UPDATE_TRANSACTION_SNAPSHOT}" ]]; then
+      UPDATE_TRANSACTION_SNAPSHOT="$(/usr/local/sbin/sc-1forcr-update-manager verify "${UPDATE_TRANSACTION_SNAPSHOT}")"
+    else
+      UPDATE_TRANSACTION_SNAPSHOT="$(/usr/local/sbin/sc-1forcr-update-manager snapshot "safe-update-${SCRIPT_VERSION}")"
+    fi
+    trap rollback_update_transaction_on_exit EXIT
     log "Mode update aman aktif: Xray/SSH/SSHWS/HAProxy tidak direstart; UDPGW hanya direstart jika unit berubah."
     install_legacy_runtime_command_shims
     check_supported_os
@@ -22125,6 +22676,13 @@ main() {
     apply_tunnel_outbound_guard_rules
     restart_update_safe_services
     post_install_preflight || true
+    if ! /usr/local/sbin/sc-1forcr-update-manager health; then
+      log "Health-check pasca-update gagal. Rollback otomatis akan dijalankan."
+      return 1
+    fi
+    /usr/local/sbin/sc-1forcr-update-manager commit "${UPDATE_TRANSACTION_SNAPSHOT}" "${SCRIPT_VERSION}"
+    UPDATE_TRANSACTION_COMMITTED="1"
+    trap - EXIT
     log "Update aman selesai. Xray/SSH/SSHWS/HAProxy aktif tidak direstart."
     return 0
   fi
@@ -22173,6 +22731,7 @@ main() {
   run_install_step "29_online_notify" 90 "Setup notifikasi online" setup_online_notify_timer
   run_install_step "30_auto_update" 91 "Setup auto pull update" setup_auto_pull_update_timer
   run_install_step "30b_resource_autotune" 92 "Setup resource auto tune" setup_resource_autotune_timer
+  run_install_step "30c_update_manager" 92 "Setup snapshot dan rollback update" install_update_manager
   run_install_step "31_summary_api" 93 "Install Summary API 1FORCR" install_summary_api_optional
 
   run_install_step "32_cli_menu" 95 "Tulis menu CLI" write_cli_menu
@@ -22186,7 +22745,7 @@ main() {
   run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
   run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
   run_install_step "39_preflight" 100 "Preflight akhir" post_install_preflight
-  show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."
+  show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. GASSS LANGSUNG TESTTT BANGGG."
 
   cat <<EOF
 
@@ -22199,12 +22758,6 @@ Email LE       : ${EMAIL:-without-email}
 API Token      : ${API_AUTH_TOKEN}
 API Base       : https://${DOMAIN}/vps
 Summary DB key : tabel servers kolom key = token di atas
-
-Contoh test:
-curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
-  -H "Authorization: ${API_AUTH_TOKEN}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"username":"test123","password":"test123","expired":3,"limitip":"2","kuota":"0"}'
 
 EOF
 

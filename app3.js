@@ -218,6 +218,7 @@ async function initDb() {
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     version TEXT NOT NULL UNIQUE,
     note TEXT,
+    target_ip TEXT,
     created_at INTEGER NOT NULL,
     triggered_by INTEGER,
     status TEXT DEFAULT 'active'
@@ -264,11 +265,22 @@ async function initDb() {
     [Date.now(), Date.now() - DAY_MS]
   ).catch(() => {});
   await ensureScRegistrationSchema();
+  await ensureScUpdateTriggerSchema();
   await ensureUsersSchema();
   await ensurePendingDepositSchema();
   await ensureOrderKuotaAmountLockSchema();
   await seedDefaultSettings();
   await autoMigrateLegacyInstallerPathSetting();
+}
+
+async function ensureScUpdateTriggerSchema() {
+  const cols = await dbAll('PRAGMA table_info(sc_update_triggers)');
+  const hasTargetIp = cols.some((c) => String(c?.name || '').toLowerCase() === 'target_ip');
+  if (!hasTargetIp) {
+    await dbRun('ALTER TABLE sc_update_triggers ADD COLUMN target_ip TEXT').catch((e) => {
+      if (!/duplicate column name/i.test(String(e?.message || ''))) throw e;
+    });
+  }
 }
 
 async function ensureUsersSchema() {
@@ -1904,21 +1916,59 @@ async function countActiveScRegistrations() {
   return Number(row?.total || 0);
 }
 
-async function getLatestScUpdateTrigger() {
+async function listActiveScUpdateTargets(page = 0, pageSize = 8) {
+  const now = Date.now();
+  const size = Math.max(4, Math.min(12, Number(pageSize) || 8));
+  const total = await countActiveScRegistrations();
+  const totalPages = Math.max(1, Math.ceil(total / size));
+  const safePage = Math.min(Math.max(0, Number(page) || 0), totalPages - 1);
+  const rows = await dbAll(
+    "SELECT vps_ip, MAX(COALESCE(NULLIF(TRIM(client_name), ''), vps_ip)) AS client_name, MAX(updated_at) AS last_updated " +
+      "FROM sc_registrations WHERE status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) " +
+      'GROUP BY vps_ip ORDER BY last_updated DESC LIMIT ? OFFSET ?',
+    [now, size, safePage * size]
+  );
+  return { rows: rows || [], page: safePage, totalPages, total };
+}
+
+async function getActiveScUpdateTarget(ipInput) {
+  const ip = normalizeHost(ipInput);
+  if (!isIpv4(ip)) return null;
+  const now = Date.now();
   return dbGet(
-    "SELECT version, note, created_at, triggered_by, status FROM sc_update_triggers WHERE status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1"
+    "SELECT vps_ip, COALESCE(NULLIF(TRIM(client_name), ''), vps_ip) AS client_name, user_id, expires_at " +
+      "FROM sc_registrations WHERE vps_ip = ? AND status = 'active' " +
+      'AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) ORDER BY updated_at DESC LIMIT 1',
+    [ip, now]
   );
 }
 
-async function createScUpdateTrigger(adminId, noteInput = '') {
+async function getLatestScUpdateTrigger() {
+  return dbGet(
+    "SELECT version, note, target_ip, created_at, triggered_by, status FROM sc_update_triggers WHERE status = 'active' ORDER BY created_at DESC, id DESC LIMIT 1"
+  );
+}
+
+async function createScUpdateTrigger(adminId, noteInput = '', targetIpInput = '') {
   const now = Date.now();
   const version = `bot-${now}`;
   const note = String(noteInput || '').replace(/\s+/g, ' ').trim().slice(0, 160) || 'manual bot trigger';
-  await dbRun(
-    'INSERT INTO sc_update_triggers (version, note, created_at, triggered_by, status) VALUES (?, ?, ?, ?, ?)',
-    [version, note, now, Number(adminId || 0) || null, 'active']
-  );
-  return { version, note, created_at: now };
+  const targetIp = normalizeHost(targetIpInput);
+  if (targetIpInput && !isIpv4(targetIp)) throw new Error('Target IP update tidak valid.');
+  await dbRun('BEGIN IMMEDIATE');
+  try {
+    // Hanya satu campaign update aktif agar trigger lama/global tidak bocor ke VPS non-target.
+    await dbRun("UPDATE sc_update_triggers SET status = 'superseded' WHERE status = 'active'");
+    await dbRun(
+      'INSERT INTO sc_update_triggers (version, note, target_ip, created_at, triggered_by, status) VALUES (?, ?, ?, ?, ?, ?)',
+      [version, note, targetIp || null, now, Number(adminId || 0) || null, 'active']
+    );
+    await dbRun('COMMIT');
+  } catch (e) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw e;
+  }
+  return { version, note, target_ip: targetIp || null, created_at: now };
 }
 
 async function getScUpdateTriggerAckSummary(version) {
@@ -2951,13 +3001,28 @@ function adminMenu() {
     [Markup.button.callback('🌐 Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('📚 Daftar Domain', 'm_admin_list_domains')],
     [Markup.button.callback('❌ Hapus Domain', 'm_admin_remove_domain')],
     [Markup.button.callback('⬆️ Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('⬆️ Unggah Script Summary API', 'm_admin_upload_summary_api')],
-    [Markup.button.callback('🚀 Trigger Update Semua SC', 'm_admin_trigger_sc_update')],
+    [Markup.button.callback('🚀 Update SC (Pilih Target)', 'm_admin_trigger_sc_update')],
     [Markup.button.callback('🚀 Trigger Update Summary API', 'm_admin_trigger_summary_update')],
 
     [Markup.button.callback('💸 Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
     [Markup.button.callback('⚙️ Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('🛠️ Ubah Pengaturan', 'm_admin_env_set')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
+}
+
+function adminScUpdateTargetKeyboard(rows, page, totalPages) {
+  const buttons = (rows || []).map((row) => {
+    const ip = normalizeHost(row?.vps_ip || '');
+    const name = String(row?.client_name || '').trim();
+    const label = name && name !== ip ? `${ip} | ${name}`.slice(0, 50) : ip;
+    return [Markup.button.callback(label, `m_admin_trigger_sc_update_ip_${ip}`)];
+  });
+  const nav = [];
+  if (page > 0) nav.push(Markup.button.callback('Prev', `m_admin_trigger_sc_update_targets_${page - 1}`));
+  if (page < totalPages - 1) nav.push(Markup.button.callback('Next', `m_admin_trigger_sc_update_targets_${page + 1}`));
+  if (nav.length) buttons.push(nav);
+  buttons.push([Markup.button.callback('Kembali', 'm_admin_trigger_sc_update')]);
+  return Markup.inlineKeyboard(buttons);
 }
 
 async function listAllUserIds() {
@@ -4713,15 +4778,84 @@ bot.action('m_admin_trigger_sc_update', async (ctx) => {
     latest ? `Trigger terakhir: ${latest.version} (${formatDateTime(latest.created_at)})` : 'Trigger terakhir: belum ada',
     ack ? `Ack terakhir: success=${ack.success} running=${ack.running} failed=${ack.failed}` : '',
     '',
-    'VPS akan mengambil update via timer auto-pull tanpa perlu key tersimpan di bot.',
-    'Lanjut trigger update sekarang?'
+    'Untuk uji awal, pilih satu IP VPS. Trigger bertarget tidak akan diberikan ke IP lain.',
+    'Update semua VPS tetap tersedia setelah uji satu VPS berhasil.'
   ];
   return ctx.reply(
     uiBox('UPDATE SC', lines),
     Markup.inlineKeyboard([
-      [Markup.button.callback('Ya, trigger sekarang', 'm_admin_trigger_sc_update_confirm')],
+      [Markup.button.callback('Pilih 1 IP VPS (Uji Aman)', 'm_admin_trigger_sc_update_targets_0')],
+      [Markup.button.callback('Update Semua VPS', 'm_admin_trigger_sc_update_confirm')],
       [Markup.button.callback('Batal', 'm_admin_menu')]
     ])
+  );
+});
+
+bot.action(/^m_admin_trigger_sc_update_targets_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const targetPage = await listActiveScUpdateTargets(Number(ctx.match?.[1] || 0), 8);
+  const lines = targetPage.rows.length
+    ? [
+        `Page     : ${targetPage.page + 1}/${targetPage.totalPages}`,
+        `Total    : ${targetPage.total} IP VPS aktif`,
+        '',
+        'Pilih IP VPS yang akan menerima update. Hanya IP tersebut yang diberi trigger.'
+      ]
+    : ['Belum ada IP VPS aktif yang bisa dipilih.'];
+  return ctx.reply(
+    uiBox('PILIH TARGET UPDATE SC', lines),
+    adminScUpdateTargetKeyboard(targetPage.rows, targetPage.page, targetPage.totalPages)
+  );
+});
+
+bot.action(/^m_admin_trigger_sc_update_ip_((?:\d{1,3}\.){3}\d{1,3})$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const ip = normalizeHost(ctx.match?.[1] || '');
+  const target = await getActiveScUpdateTarget(ip).catch(() => null);
+  if (!target) return ctx.reply(`Target ${ip || '-'} tidak aktif atau sudah expired.`, adminMenu());
+  return ctx.reply(
+    uiBox('KONFIRMASI UPDATE 1 VPS', [
+      `Target IP : ${target.vps_ip}`,
+      `Nama      : ${target.client_name || target.vps_ip}`,
+      `User ID   : ${target.user_id}`,
+      '',
+      'Sebelum memasang update, VPS akan membuat snapshot lokal. Jika update/health-check gagal, rollback berjalan otomatis.'
+    ]),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Ya, Update IP Ini', `m_admin_trigger_sc_update_confirm_ip_${target.vps_ip}`)],
+      [Markup.button.callback('Ganti Target', 'm_admin_trigger_sc_update_targets_0')],
+      [Markup.button.callback('Batal', 'm_admin_menu')]
+    ])
+  );
+});
+
+bot.action(/^m_admin_trigger_sc_update_confirm_ip_((?:\d{1,3}\.){3}\d{1,3})$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const ip = normalizeHost(ctx.match?.[1] || '');
+  const target = await getActiveScUpdateTarget(ip).catch(() => null);
+  if (!target) return ctx.reply(`Target ${ip || '-'} tidak aktif atau sudah expired.`, adminMenu());
+  const installerPath = await getScInstallerLocalPath().catch(() => DEFAULT_SC_INSTALLER_LOCAL_PATH);
+  if (!fs.existsSync(installerPath)) {
+    return ctx.reply(`File installer belum ada: ${installerPath}\nUpload dulu dari menu admin.`, adminMenu());
+  }
+  const trigger = await createScUpdateTrigger(
+    ctx.from.id,
+    `targeted update ${target.vps_ip} by ${ctx.from.id}`,
+    target.vps_ip
+  );
+  return ctx.reply(
+    uiBox('UPDATE SC BERTARGET DIKIRIM', [
+      `Version  : ${trigger.version}`,
+      `Target   : ${target.vps_ip}`,
+      `Nama     : ${target.client_name || target.vps_ip}`,
+      `Waktu    : ${formatDateTime(trigger.created_at)}`,
+      '',
+      'Hanya VPS target yang menerima trigger. Status hasil akan masuk melalui ACK update.'
+    ]),
+    adminMenu()
   );
 });
 
@@ -4737,12 +4871,12 @@ bot.action('m_admin_trigger_sc_update_confirm', async (ctx) => {
     createScUpdateTrigger(ctx.from.id, `manual trigger by ${ctx.from.id}`)
   ]);
   return ctx.reply(
-    uiBox('UPDATE SC DIKIRIM', [
+    uiBox('UPDATE SEMUA SC DIKIRIM', [
       `Version  : ${trigger.version}`,
       `Target   : ${activeCount} IP VPS aktif`,
       `Waktu    : ${formatDateTime(trigger.created_at)}`,
       '',
-      'VPS yang sudah punya auto-pull akan update saat timer berikutnya.',
+      'Semua VPS yang sudah punya auto-pull akan update saat timer berikutnya.',
       'Default interval auto-pull: 360 menit. Bisa diubah dari menu SC.'
     ]),
     adminMenu()

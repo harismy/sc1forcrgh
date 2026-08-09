@@ -572,7 +572,7 @@ async function requireUpdateClient(req, res, next) {
     if (!LICENSE_ALLOW_LEGACY_BEARER) {
       return res.status(401).json({ ok: false, message: 'per-VPS X-SC-Key required' });
     }
-    // Kompatibilitas sementara untuk VPS lama. Matikan setelah seluruh VPS memakai V.1FSC.6.
+    // Kompatibilitas sementara untuk VPS lama. Matikan setelah seluruh VPS memakai V.1FSC.7.
     return requireBearer(req, res, () => {
       req.scUpdateAuth = 'legacy-bearer';
       next();
@@ -1031,7 +1031,13 @@ app.get('/sc1forcr/payload/manifest', requireUpdateClient, async (req, res) => {
 app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) => {
   try {
     const keyedReg = req.scLicenseRegistration || null;
-    const ip = cleanIp(keyedReg?.vps_ip) || cleanIp(req.body?.ip) || getClientIp(req);
+    // Klien legacy membawa bearer global dan karena itu tidak boleh memilih IP
+    // dari body. Migrasi key hanya boleh mengikuti IP sumber yang dilihat server.
+    const ip = cleanIp(keyedReg?.vps_ip) || (
+      req.scLicenseAuth === 'legacy-bearer'
+        ? cleanIp(getClientIp(req))
+        : (cleanIp(req.body?.ip) || cleanIp(getClientIp(req)))
+    );
     const latest = keyedReg || (await findLatestRegistrationByIp(ip));
     const reg = registrationIsActive(latest) ? latest : null;
     const machineId = normalizeMachineId(req.body?.machine_id);
@@ -1122,7 +1128,10 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
       client_name: String(reg.client_name || reg.vps_ip || ip).trim(),
       bound_ip: reg.vps_ip,
       user_id: reg.user_id,
-      expires_at: Number(reg.expires_at || 0) || null
+      expires_at: Number(reg.expires_at || 0) || null,
+      ...(req.scLicenseAuth === 'legacy-bearer'
+        ? { sc_update_key: serverKey, key_migrated: true }
+        : {})
     }, {
       reg,
       requestedIp: ip,

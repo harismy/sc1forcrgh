@@ -17,7 +17,7 @@ set -euo pipefail
 #   API_AUTH_TOKEN=token-rahasia
 #   LICENSE_ENFORCE=1                            (opsional, 1=wajib validasi lisensi sebelum install)
 #   LICENSE_API_URL=https://license.example.com/api/v1/activate
-#   LICENSE_API_TOKEN=server-secret-token              (legacy migrasi; V.1FSC.6 memakai SC_UPDATE_KEY unik)
+#   LICENSE_API_TOKEN=server-secret-token              (legacy migrasi; V.1FSC.7 memakai SC_UPDATE_KEY unik)
 #   LICENSE_KEY=LSC-XXXX-XXXX-XXXX
 #   LICENSE_LEASE_REQUIRED=1                           (wajib signed lease Ed25519)
 #   LICENSE_LEASE_REFRESH_MINUTES=15                   (refresh lease oleh timer)
@@ -162,7 +162,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.6}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.7}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -677,7 +677,7 @@ license_check_enabled() {
 
 enforce_install_license() {
   local enabled vps_ip machine_id resp ok msg status expires bound_ip key_hash distribution client_name
-  local lease public_key_b64 bootstrap_public_key_b64 key_fingerprint lease_tmp public_key_tmp bootstrap_key_tmp current_key_fingerprint new_key_fingerprint bootstrap_key_fingerprint
+  local lease migrated_sc_update_key public_key_b64 bootstrap_public_key_b64 key_fingerprint lease_tmp public_key_tmp bootstrap_key_tmp current_key_fingerprint new_key_fingerprint bootstrap_key_fingerprint
   enabled="$(license_check_enabled)"
   if [[ "${enabled}" != "1" ]]; then
     log "License gate nonaktif (LICENSE_ENFORCE=0)."
@@ -758,6 +758,7 @@ enforce_install_license() {
   distribution="Community / Open Source"
   client_name="${vps_ip}"
   lease=""
+  migrated_sc_update_key=""
   bootstrap_public_key_b64="${LICENSE_PUBLIC_KEY_B64:-}"
   public_key_b64="${bootstrap_public_key_b64}"
   key_fingerprint=""
@@ -770,6 +771,7 @@ enforce_install_license() {
     distribution="$(echo "${resp}" | jq -r '.distribution // .source // "Community / Open Source"' 2>/dev/null || echo "Community / Open Source")"
     client_name="$(echo "${resp}" | jq -r '.client_name // .client // .name // empty' 2>/dev/null || echo "")"
     lease="$(echo "${resp}" | jq -r '.license_lease // empty' 2>/dev/null || echo "")"
+    migrated_sc_update_key="$(echo "${resp}" | jq -r '.sc_update_key // empty' 2>/dev/null || echo "")"
     public_key_b64="$(echo "${resp}" | jq -r '.license_public_key_b64 // empty' 2>/dev/null || echo "${public_key_b64}")"
     key_fingerprint="$(echo "${resp}" | jq -r '.license_key_fingerprint // empty' 2>/dev/null || echo "")"
     [[ -z "${bound_ip}" ]] && bound_ip="${vps_ip}"
@@ -788,6 +790,17 @@ enforce_install_license() {
   if [[ "${ok}" != "1" ]]; then
     echo "Install ditolak: ${msg}"
     exit 1
+  fi
+
+  if [[ -n "${migrated_sc_update_key}" ]]; then
+    if [[ ! "${migrated_sc_update_key}" =~ ^[A-Za-z0-9._:-]{16,256}$ ]]; then
+      echo "Install ditolak: format key migrasi dari server tidak valid."
+      exit 1
+    fi
+    SC_UPDATE_KEY="${migrated_sc_update_key}"
+    API_AUTH_TOKEN="${migrated_sc_update_key}"
+    AUTH_TOKEN="${migrated_sc_update_key}"
+    log "Key unik VPS lama berhasil dimigrasikan."
   fi
 
   if [[ "${LICENSE_LEASE_REQUIRED:-1}" == "1" ]]; then
@@ -876,7 +889,7 @@ LICENSE_KEY_HASH=${key_hash}
 LICENSE_CHECK_AT=$(date '+%F %T')
 EOF
   chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
-  # Klien V.1FSC.6 memakai key unik per VPS; jangan sebarkan bearer global lagi.
+  # Klien V.1FSC.7 memakai key unik per VPS; jangan sebarkan bearer global lagi.
   LICENSE_API_TOKEN=""
   log "Lisensi valid untuk IP ${bound_ip}. Expired: ${expires}"
 }

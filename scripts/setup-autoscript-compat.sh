@@ -152,7 +152,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC.1}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.2}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -2854,14 +2854,22 @@ enforce_single_udp_backend() {
     udpcustom|udp-custom|udphc)
       systemctl disable --now "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
       systemctl enable "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
-      systemctl restart "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+      if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]] && systemctl is-active --quiet "${UDPCUSTOM_SERVICE_NAME}"; then
+        systemctl start "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+      else
+        systemctl restart "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+      fi
       setup_udpcustom_udp_nat_rules
       log "Backend UDP aktif: UDP Custom (${UDPCUSTOM_SERVICE_NAME})"
       ;;
     zivpn|*)
       systemctl disable --now "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
       systemctl enable "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
-      systemctl restart "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
+      if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]] && systemctl is-active --quiet "${ZIVPN_SERVICE_NAME}"; then
+        systemctl start "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
+      else
+        systemctl restart "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
+      fi
       setup_zivpn_udp_nat_rules
       log "Backend UDP aktif: ZIVPN (${ZIVPN_SERVICE_NAME})"
       ;;
@@ -12408,7 +12416,7 @@ EOF
 }
 
 setup_auto_pull_update_timer() {
-  local pull_interval_min pull_fail_cooldown_min
+  local pull_interval_min pull_fail_cooldown_min pull_script_tmp summary_script_tmp
   pull_interval_min="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}" | tr -cd '0-9')"
   if [[ -z "${pull_interval_min}" || "${pull_interval_min}" -lt 1 || "${pull_interval_min}" -gt 1440 ]]; then
     pull_interval_min="360"
@@ -12423,7 +12431,8 @@ setup_auto_pull_update_timer() {
 
   log "Setup auto pull update dari trigger bot tiap ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} menit..."
 
-  cat > /usr/local/sbin/sc-1forcr-pull-update <<'EOF'
+  pull_script_tmp="$(mktemp /usr/local/sbin/.sc-1forcr-pull-update.XXXXXX)"
+  cat > "${pull_script_tmp}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -12638,9 +12647,16 @@ main_pull_update() {
   main_pull_update "$@"
 ) 9>"${LOCK_FILE}"
 EOF
-  chmod +x /usr/local/sbin/sc-1forcr-pull-update
+  if ! bash -n "${pull_script_tmp}"; then
+    rm -f "${pull_script_tmp}" >/dev/null 2>&1 || true
+    log "Generated pull-update gagal validasi syntax."
+    return 1
+  fi
+  chmod 755 "${pull_script_tmp}"
+  mv -f "${pull_script_tmp}" /usr/local/sbin/sc-1forcr-pull-update
 
-  cat > /usr/local/sbin/sc-1forcr-pull-summary-update <<'EOF'
+  summary_script_tmp="$(mktemp /usr/local/sbin/.sc-1forcr-pull-summary-update.XXXXXX)"
+  cat > "${summary_script_tmp}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -12850,7 +12866,13 @@ main_pull_summary_update() {
   main_pull_summary_update "$@"
 ) 9>"${LOCK_FILE}"
 EOF
-  chmod +x /usr/local/sbin/sc-1forcr-pull-summary-update
+  if ! bash -n "${summary_script_tmp}"; then
+    rm -f "${summary_script_tmp}" >/dev/null 2>&1 || true
+    log "Generated pull-summary-update gagal validasi syntax."
+    return 1
+  fi
+  chmod 755 "${summary_script_tmp}"
+  mv -f "${summary_script_tmp}" /usr/local/sbin/sc-1forcr-pull-summary-update
 
   cat > /etc/systemd/system/sc-1forcr-pull-update.service <<'EOF'
 [Unit]
@@ -12927,7 +12949,7 @@ EOF
 }
 
 write_cli_menu() {
-  local menu_runtime
+  local menu_runtime menu_runtime_tmp menu_wrapper_tmp update_cmd_tmp
   menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
 
   log "Menulis CLI menu..."
@@ -13049,7 +13071,8 @@ EOF
   chmod 600 /etc/sc-1forcr.env
 
   mkdir -p "${APP_DIR}"
-  cat > "${menu_runtime}" <<'MENU_SCRIPT_EOF'
+  menu_runtime_tmp="$(mktemp "${APP_DIR}/.menu-sc-1forcr.XXXXXX.sh")"
+  cat > "${menu_runtime_tmp}" <<'MENU_SCRIPT_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -21451,22 +21474,34 @@ while true; do
 done
 MENU_SCRIPT_EOF
 
-  chmod +x "${menu_runtime}"
+  if ! bash -n "${menu_runtime_tmp}"; then
+    rm -f "${menu_runtime_tmp}" >/dev/null 2>&1 || true
+    log "Generated menu runtime gagal validasi syntax."
+    return 1
+  fi
+  chmod 755 "${menu_runtime_tmp}"
+  mv -f "${menu_runtime_tmp}" "${menu_runtime}"
 
-  cat > /usr/local/sbin/menu-sc-1forcr <<EOF
+  menu_wrapper_tmp="$(mktemp /usr/local/sbin/.menu-sc-1forcr.XXXXXX)"
+  cat > "${menu_wrapper_tmp}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 exec "${menu_runtime}" "\$@"
 EOF
-  chmod +x /usr/local/sbin/menu-sc-1forcr
+  bash -n "${menu_wrapper_tmp}"
+  chmod 755 "${menu_wrapper_tmp}"
+  mv -f "${menu_wrapper_tmp}" /usr/local/sbin/menu-sc-1forcr
   ln -sf /usr/local/sbin/menu-sc-1forcr /usr/local/sbin/menu
 
-  cat > /usr/local/sbin/update <<'EOF'
+  update_cmd_tmp="$(mktemp /usr/local/sbin/.sc-1forcr-update-command.XXXXXX)"
+  cat > "${update_cmd_tmp}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 exec /usr/local/sbin/menu-sc-1forcr update "$@"
 EOF
-  chmod +x /usr/local/sbin/update
+  bash -n "${update_cmd_tmp}"
+  chmod 755 "${update_cmd_tmp}"
+  mv -f "${update_cmd_tmp}" /usr/local/sbin/update
 
   cat > /usr/local/sbin/lanjut-install <<'EOF'
 #!/usr/bin/env bash
@@ -22357,13 +22392,21 @@ create_snapshot() {
     add_snapshot_path "${list_file}" "${path}"
   done
   while IFS= read -r -d '' path; do
+    case "${path}" in
+      /usr/local/sbin/sc-1forcr-update-manager|/usr/local/sbin/sc-1forcr-pull-update|/usr/local/sbin/sc-1forcr-pull-summary-update)
+        continue
+        ;;
+    esac
     add_snapshot_path "${list_file}" "${path}"
   done < <(find /etc/systemd/system /usr/local/sbin -maxdepth 1 \
     \( -name 'sc-1forcr-*' -o -name 'zivpn.service' -o -name 'xray.service' \) -print0 2>/dev/null)
 
   if [[ -s "${list_file}" ]]; then
     tar --create --gzip --file="${snapshot_dir}/files.tar.gz" --directory=/ \
-      --numeric-owner --acls --xattrs --null --files-from="${list_file}"
+      --numeric-owner --acls --xattrs \
+      --exclude='opt/sc-1forcr/menu-sc-1forcr.sh' \
+      --exclude='opt/potato-compat/menu-sc-1forcr.sh' \
+      --null --files-from="${list_file}"
   else
     tar --create --gzip --file="${snapshot_dir}/files.tar.gz" --directory=/ --files-from=/dev/null
   fi
@@ -22453,8 +22496,14 @@ unit_is_installed() {
   systemctl cat "$1" >/dev/null 2>&1
 }
 
+service_unit_name() {
+  local name="${1:-}"
+  [[ "${name}" == *.service ]] || name="${name}.service"
+  printf '%s\n' "${name}"
+}
+
 health_check() {
-  local failures=() unit check_result api_ok attempt
+  local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok
   load_update_env
   DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
   API_PORT="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
@@ -22502,6 +22551,42 @@ PY
     [[ "${api_ok}" == "1" ]] || failures+=("API /vps/health")
   fi
 
+  backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+  zivpn_unit="$(service_unit_name "${ZIVPN_SERVICE:-zivpn}")"
+  udpcustom_unit="$(service_unit_name "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}")"
+  udp_ok="0"
+  if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
+    udp_port="$(printf '%s' "${UDPCUSTOM_LISTEN_PORT:-5667}" | tr -cd '0-9')"
+    [[ -z "${udp_port}" ]] && udp_port="5667"
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      if systemctl is-active --quiet "${udpcustom_unit}" && \
+        ss -H -lunp 2>/dev/null | grep -Eq ":${udp_port}[[:space:]]"; then
+        udp_ok="1"
+        break
+      fi
+      sleep 1
+    done
+    [[ "${udp_ok}" == "1" ]] || failures+=("UDP Custom tidak sehat/listen ${udp_port}")
+    if systemctl is-active --quiet "${zivpn_unit}"; then
+      failures+=("konflik UDP: ZIVPN ikut aktif")
+    fi
+  else
+    udp_port="$(printf '%s' "${ZIVPN_LISTEN_PORT:-5667}" | tr -cd '0-9')"
+    [[ -z "${udp_port}" ]] && udp_port="5667"
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      if systemctl is-active --quiet "${zivpn_unit}" && \
+        ss -H -lunp 2>/dev/null | grep -Eq ":${udp_port}[[:space:]]"; then
+        udp_ok="1"
+        break
+      fi
+      sleep 1
+    done
+    [[ "${udp_ok}" == "1" ]] || failures+=("ZIVPN tidak sehat/listen ${udp_port}")
+    if systemctl is-active --quiet "${udpcustom_unit}"; then
+      failures+=("konflik UDP: UDP Custom ikut aktif")
+    fi
+  fi
+
   if [[ "${#failures[@]}" -gt 0 ]]; then
     log_update_manager "Health-check gagal: $(IFS=', '; echo "${failures[*]}")"
     return 1
@@ -22511,7 +22596,7 @@ PY
 }
 
 restart_after_restore() {
-  local unit backend
+  local unit backend zivpn_unit udpcustom_unit
   systemctl daemon-reload >/dev/null 2>&1 || true
   for unit in sc-1forcr-api.service sc-1forcr-sshws.service; do
     unit_is_installed "${unit}" && systemctl restart "${unit}" >/dev/null 2>&1 || true
@@ -22521,10 +22606,20 @@ restart_after_restore() {
   done
   load_update_env
   backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+  zivpn_unit="$(service_unit_name "${ZIVPN_SERVICE:-zivpn}")"
+  udpcustom_unit="$(service_unit_name "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}")"
   if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
-    unit_is_installed sc-1forcr-udpcustom.service && systemctl restart sc-1forcr-udpcustom.service >/dev/null 2>&1 || true
+    systemctl disable --now "${zivpn_unit}" >/dev/null 2>&1 || true
+    if unit_is_installed "${udpcustom_unit}"; then
+      systemctl enable "${udpcustom_unit}" >/dev/null 2>&1 || true
+      systemctl restart "${udpcustom_unit}" >/dev/null 2>&1 || true
+    fi
   else
-    unit_is_installed zivpn.service && systemctl restart zivpn.service >/dev/null 2>&1 || true
+    systemctl disable --now "${udpcustom_unit}" >/dev/null 2>&1 || true
+    if unit_is_installed "${zivpn_unit}"; then
+      systemctl enable "${zivpn_unit}" >/dev/null 2>&1 || true
+      systemctl restart "${zivpn_unit}" >/dev/null 2>&1 || true
+    fi
   fi
 }
 
@@ -22537,7 +22632,12 @@ rollback_snapshot() {
 
   systemctl stop sc-1forcr-api.service sc-1forcr-sshws.service >/dev/null 2>&1 || true
   tar --extract --gzip --file="${snapshot_dir}/files.tar.gz" --directory=/ \
-    --numeric-owner --acls --xattrs
+    --numeric-owner --acls --xattrs \
+    --exclude='usr/local/sbin/sc-1forcr-update-manager' \
+    --exclude='usr/local/sbin/sc-1forcr-pull-update' \
+    --exclude='usr/local/sbin/sc-1forcr-pull-summary-update' \
+    --exclude='opt/sc-1forcr/menu-sc-1forcr.sh' \
+    --exclude='opt/potato-compat/menu-sc-1forcr.sh'
 
   # shellcheck disable=SC1090
   source "${snapshot_dir}/state.env"
@@ -22673,6 +22773,7 @@ main() {
     setup_auto_menu_login
     write_version_marker
     sync_zivpn_auth_token_with_api_runtime
+    enforce_single_udp_backend
     apply_tunnel_outbound_guard_rules
     restart_update_safe_services
     post_install_preflight || true

@@ -572,7 +572,7 @@ async function requireUpdateClient(req, res, next) {
     if (!LICENSE_ALLOW_LEGACY_BEARER) {
       return res.status(401).json({ ok: false, message: 'per-VPS X-SC-Key required' });
     }
-    // Kompatibilitas sementara untuk VPS lama. Matikan setelah seluruh VPS memakai V.1FSC.7.
+    // Kompatibilitas sementara untuk VPS lama. Matikan setelah seluruh VPS memakai V.1FSC.8.
     return requireBearer(req, res, () => {
       req.scUpdateAuth = 'legacy-bearer';
       next();
@@ -636,6 +636,35 @@ async function ensureServerKeyForRegistration(reg) {
     [userId, ip, serverKey, Date.now()]
   );
   return serverKey;
+}
+
+async function ensureModernServerKeyForLegacyMigration(reg, currentKey) {
+  const userId = Number(reg?.user_id || 0);
+  const ip = cleanIp(reg?.vps_ip);
+  let key = String(currentKey || '').trim();
+  if (!userId || !ip) throw new Error('registrasi migrasi key tidak valid');
+  if (/^[a-f0-9]{48}$/.test(key)) return { key, rotated: false };
+
+  // Key lama dapat berupa token manual/base64 yang tidak aman ditulis mentah ke
+  // file env. Rotasi atomik ke 48 hex; CAS mencegah dua aktivasi bersamaan
+  // menghasilkan key berbeda untuk VPS yang sama.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const nextKey = crypto.randomBytes(24).toString('hex');
+    const result = await dbRun(
+      `UPDATE sc_server_keys
+       SET server_key = ?, updated_at = ?
+       WHERE user_id = ? AND vps_ip = ? AND server_key = ?`,
+      [nextKey, Date.now(), userId, ip, key]
+    );
+    if (Number(result?.changes || 0) === 1) return { key: nextKey, rotated: true };
+    const latest = await dbGet(
+      'SELECT server_key FROM sc_server_keys WHERE user_id = ? AND vps_ip = ? LIMIT 1',
+      [userId, ip]
+    );
+    key = String(latest?.server_key || '').trim();
+    if (/^[a-f0-9]{48}$/.test(key)) return { key, rotated: true };
+  }
+  throw new Error('rotasi key legacy gagal karena perubahan bersamaan');
 }
 
 async function bindMachineIdForRegistration(reg, serverKey, rawMachineId) {
@@ -1042,7 +1071,8 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
     const reg = registrationIsActive(latest) ? latest : null;
     const machineId = normalizeMachineId(req.body?.machine_id);
     const scriptVersion = String(req.body?.script_version || '').trim();
-    const serverKey = String(req.scLicenseServerKey || (reg ? await ensureServerKeyForRegistration(reg) : '')).trim();
+    let serverKey = String(req.scLicenseServerKey || (reg ? await ensureServerKeyForRegistration(reg) : '')).trim();
+    let legacyKeyRotated = false;
 
     if (!reg) {
       const isExpired = Boolean(latest) && (
@@ -1088,6 +1118,12 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
       }));
     }
 
+    if (req.scLicenseAuth === 'legacy-bearer') {
+      const migratedKey = await ensureModernServerKeyForLegacyMigration(reg, serverKey);
+      serverKey = migratedKey.key;
+      legacyKeyRotated = migratedKey.rotated;
+    }
+
     const machineBinding = req.scLicenseAuth === 'legacy-bearer' && !machineId
       ? { ok: true, reason: 'legacy-machine-id-unbound', machineIdHash: '' }
       : await bindMachineIdForRegistration(reg, serverKey, machineId);
@@ -1130,7 +1166,7 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
       user_id: reg.user_id,
       expires_at: Number(reg.expires_at || 0) || null,
       ...(req.scLicenseAuth === 'legacy-bearer'
-        ? { sc_update_key: serverKey, key_migrated: true }
+        ? { sc_update_key: serverKey, key_migrated: true, key_rotated: legacyKeyRotated }
         : {})
     }, {
       reg,

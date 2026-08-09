@@ -17,7 +17,7 @@ set -euo pipefail
 #   API_AUTH_TOKEN=token-rahasia
 #   LICENSE_ENFORCE=1                            (opsional, 1=wajib validasi lisensi sebelum install)
 #   LICENSE_API_URL=https://license.example.com/api/v1/activate
-#   LICENSE_API_TOKEN=server-secret-token              (legacy migrasi; V.1FSC.7 memakai SC_UPDATE_KEY unik)
+#   LICENSE_API_TOKEN=server-secret-token              (legacy migrasi; V.1FSC.8 memakai SC_UPDATE_KEY unik)
 #   LICENSE_KEY=LSC-XXXX-XXXX-XXXX
 #   LICENSE_LEASE_REQUIRED=1                           (wajib signed lease Ed25519)
 #   LICENSE_LEASE_REFRESH_MINUTES=15                   (refresh lease oleh timer)
@@ -162,7 +162,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.7}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.8}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -889,7 +889,7 @@ LICENSE_KEY_HASH=${key_hash}
 LICENSE_CHECK_AT=$(date '+%F %T')
 EOF
   chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
-  # Klien V.1FSC.7 memakai key unik per VPS; jangan sebarkan bearer global lagi.
+  # Klien V.1FSC.8 memakai key unik per VPS; jangan sebarkan bearer global lagi.
   LICENSE_API_TOKEN=""
   log "Lisensi valid untuk IP ${bound_ip}. Expired: ${expires}"
 }

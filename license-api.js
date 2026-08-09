@@ -572,7 +572,7 @@ async function requireUpdateClient(req, res, next) {
     if (!LICENSE_ALLOW_LEGACY_BEARER) {
       return res.status(401).json({ ok: false, message: 'per-VPS X-SC-Key required' });
     }
-    // Kompatibilitas sementara untuk VPS lama. Matikan setelah seluruh VPS memakai V.1FSC.5.
+    // Kompatibilitas sementara untuk VPS lama. Matikan setelah seluruh VPS memakai V.1FSC.6.
     return requireBearer(req, res, () => {
       req.scUpdateAuth = 'legacy-bearer';
       next();

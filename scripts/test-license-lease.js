@@ -120,7 +120,10 @@ function main() {
       'lease dari machine-id lain harus ditolak'
     );
 
-    const tampered = `${activeToken.slice(0, -1)}${activeToken.endsWith('a') ? 'b' : 'a'}`;
+    const [tamperedPayload, tamperedSignatureText] = activeToken.split('.');
+    const tamperedSignature = Buffer.from(tamperedSignatureText, 'base64url');
+    tamperedSignature[0] ^= 0x01;
+    const tampered = `${tamperedPayload}.${tamperedSignature.toString('base64url')}`;
     fs.writeFileSync(leasePath, `${tampered}\n`);
     assertExit(runGuard(guardPath, ['check', '--json'], baseEnv), 1, 'tampered lease harus ditolak');
 

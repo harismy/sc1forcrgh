@@ -17,7 +17,7 @@ set -euo pipefail
 #   API_AUTH_TOKEN=token-rahasia
 #   LICENSE_ENFORCE=1                            (opsional, 1=wajib validasi lisensi sebelum install)
 #   LICENSE_API_URL=https://license.example.com/api/v1/activate
-#   LICENSE_API_TOKEN=server-secret-token              (legacy migrasi; V.1FSC.5 memakai SC_UPDATE_KEY unik)
+#   LICENSE_API_TOKEN=server-secret-token              (legacy migrasi; V.1FSC.6 memakai SC_UPDATE_KEY unik)
 #   LICENSE_KEY=LSC-XXXX-XXXX-XXXX
 #   LICENSE_LEASE_REQUIRED=1                           (wajib signed lease Ed25519)
 #   LICENSE_LEASE_REFRESH_MINUTES=15                   (refresh lease oleh timer)
@@ -162,7 +162,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.5}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.6}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -876,7 +876,7 @@ LICENSE_KEY_HASH=${key_hash}
 LICENSE_CHECK_AT=$(date '+%F %T')
 EOF
   chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
-  # Klien V.1FSC.5 memakai key unik per VPS; jangan sebarkan bearer global lagi.
+  # Klien V.1FSC.6 memakai key unik per VPS; jangan sebarkan bearer global lagi.
   LICENSE_API_TOKEN=""
   log "Lisensi valid untuk IP ${bound_ip}. Expired: ${expires}"
 }
@@ -9854,7 +9854,7 @@ EOF
 }
 
 setup_license_guard() {
-  local refresh_min guard_tmp wrapper_tmp unit dropin_dir
+  local refresh_min guard_tmp wrapper_tmp unit dropin_dir guard_check_output
   refresh_min="$(echo "${LICENSE_LEASE_REFRESH_MINUTES:-15}" | tr -cd '0-9')"
   if [[ -z "${refresh_min}" || "${refresh_min}" -lt 5 || "${refresh_min}" -gt 1440 ]]; then
     refresh_min="15"
@@ -9896,9 +9896,11 @@ function parseEnvFile(file) {
 }
 
 const fileEnv = {
-  ...parseEnvFile('/etc/sc-1forcr.env'),
+  // File kompatibilitas lama memiliki prioritas terendah. Konfigurasi modern
+  // /opt/sc dan /etc tidak boleh tertimpa token lama dari potato-compat.
+  ...parseEnvFile('/opt/potato-compat/.env'),
   ...parseEnvFile('/opt/sc-1forcr/.env'),
-  ...parseEnvFile('/opt/potato-compat/.env')
+  ...parseEnvFile('/etc/sc-1forcr.env')
 };
 const env = { ...fileEnv, ...process.env };
 const LEASE_FILE = String(env.LICENSE_LEASE_FILE || '/etc/sc-1forcr-license.lease').trim();
@@ -10275,8 +10277,18 @@ LICENSE_GUARD_WRAPPER_EOF
   chmod 700 "${wrapper_tmp}"
   mv -f "${wrapper_tmp}" /usr/local/sbin/sc-1forcr-license-guard
 
-  if ! /usr/local/sbin/sc-1forcr-license-guard check >/dev/null; then
-    log "Signed license lease gagal diverifikasi; guard tidak diaktifkan."
+  if ! guard_check_output="$(
+    SC_UPDATE_KEY="${SC_UPDATE_KEY}" \
+    API_AUTH_TOKEN="${API_AUTH_TOKEN}" \
+    LICENSE_API_URL="${LICENSE_API_URL}" \
+    LICENSE_KEY="${LICENSE_KEY}" \
+    LICENSE_LEASE_FILE="${LICENSE_LEASE_FILE}" \
+    LICENSE_PUBLIC_KEY_FILE="${LICENSE_PUBLIC_KEY_FILE}" \
+    LICENSE_REQUIRED_MARKER="${LICENSE_REQUIRED_MARKER}" \
+      /usr/local/sbin/sc-1forcr-license-guard check --json 2>&1
+  )"; then
+    guard_check_output="$(printf '%s' "${guard_check_output}" | tr '\r\n' ' ' | cut -c1-900)"
+    log "Signed license lease gagal diverifikasi: ${guard_check_output:-alasan tidak tersedia}"
     return 1
   fi
   printf 'required=1\nversion=1\n' > "${LICENSE_REQUIRED_MARKER}"

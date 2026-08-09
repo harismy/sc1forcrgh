@@ -265,12 +265,16 @@ async function initDb() {
     [Date.now(), Date.now() - DAY_MS]
   ).catch(() => {});
   await ensureScRegistrationSchema();
+  await ensureScServerKeySchema();
   await ensureScUpdateTriggerSchema();
   await ensureUsersSchema();
   await ensurePendingDepositSchema();
   await ensureOrderKuotaAmountLockSchema();
   await seedDefaultSettings();
   await autoMigrateLegacyInstallerPathSetting();
+  for (const file of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
+    try { if (fs.existsSync(file)) fs.chmodSync(file, 0o600); } catch (_) {}
+  }
 }
 
 async function ensureScUpdateTriggerSchema() {
@@ -300,6 +304,22 @@ async function ensureScRegistrationSchema() {
   }
   if (!hasClientName) {
     await dbRun('ALTER TABLE sc_registrations ADD COLUMN client_name TEXT');
+  }
+}
+
+async function ensureScServerKeySchema() {
+  const cols = await dbAll('PRAGMA table_info(sc_server_keys)');
+  const names = new Set(cols.map((c) => String(c?.name || '').toLowerCase()));
+  const additions = [
+    ['machine_id_hash', 'TEXT'],
+    ['machine_bound_at', 'INTEGER'],
+    ['last_lease_at', 'INTEGER']
+  ];
+  for (const [name, type] of additions) {
+    if (names.has(name)) continue;
+    await dbRun(`ALTER TABLE sc_server_keys ADD COLUMN ${name} ${type}`).catch((e) => {
+      if (!/duplicate column name/i.test(String(e?.message || ''))) throw e;
+    });
   }
 }
 
@@ -2996,6 +3016,7 @@ function adminMenu() {
 
     [Markup.button.callback('🧾 Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0'), Markup.button.callback('🗑️ Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('🔓 Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('ℹ️ Info Detail IP VPS', 'm_admin_ip_info')],
+    [Markup.button.callback('🔄 Reset Binding VPS', 'm_admin_reset_machine_binding')],
     [Markup.button.callback('⏱️ Set Masa Aktif IP (Jam)', 'm_admin_set_sc_expiry_ip')],
 
     [Markup.button.callback('🌐 Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('📚 Daftar Domain', 'm_admin_list_domains')],
@@ -3464,7 +3485,7 @@ async function listServerKeysForAdminPage(page = 0, pageSize = 12) {
   const size = Math.max(5, Math.min(30, Number(pageSize) || 12));
   const offset = p * size;
   return dbAll(
-    'SELECT user_id, vps_ip, server_key, updated_at FROM sc_server_keys ORDER BY updated_at DESC LIMIT ? OFFSET ?',
+    'SELECT user_id, vps_ip, server_key, updated_at, machine_id_hash, machine_bound_at, last_lease_at FROM sc_server_keys ORDER BY updated_at DESC LIMIT ? OFFSET ?',
     [size, offset]
   );
 }
@@ -3480,12 +3501,41 @@ async function adminGetScIpDetails(ip) {
     [host]
   );
   const keys = await dbAll(
-    "SELECT user_id, vps_ip, server_key, updated_at FROM sc_server_keys " +
+    "SELECT user_id, vps_ip, server_key, updated_at, machine_id_hash, machine_bound_at, last_lease_at FROM sc_server_keys " +
       "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
       'ORDER BY updated_at DESC',
     [host]
   );
   return { host, rows: rows || [], keys: keys || [] };
+}
+
+async function adminResetMachineBindingForIp(ip) {
+  const host = normalizeHost(ip);
+  if (!isIpv4(host)) return { changed: 0 };
+  const rows = await dbAll(
+    "SELECT user_id, vps_ip FROM sc_server_keys " +
+      "WHERE LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?))",
+    [host]
+  );
+  if (!rows.length) return { changed: 0 };
+  await dbRun('BEGIN IMMEDIATE');
+  try {
+    const now = Date.now();
+    for (const row of rows) {
+      await dbRun(
+        `UPDATE sc_server_keys
+         SET server_key = ?, machine_id_hash = NULL, machine_bound_at = NULL,
+             last_lease_at = NULL, updated_at = ?
+         WHERE user_id = ? AND vps_ip = ?`,
+        [crypto.randomBytes(24).toString('hex'), now, Number(row.user_id || 0), String(row.vps_ip || host)]
+      );
+    }
+    await dbRun('COMMIT');
+    return { changed: rows.length };
+  } catch (error) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw error;
+  }
 }
 
 function getSettingLabel(key) {
@@ -4541,6 +4591,21 @@ bot.action('m_admin_unlock_sc_access', async (ctx) => {
       'Bot akan gunakan key tersimpan otomatis.',
       'Jika key tersimpan salah, kirim: IP KEY_SERVER_BENAR.',
       'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action('m_admin_reset_machine_binding', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_reset_machine_binding_ip' });
+  return ctx.reply(
+    uiBox('RESET BINDING LISENSI VPS', [
+      'Gunakan hanya setelah VPS di-reinstall tetapi IP publik tetap sama.',
+      'Tindakan ini juga merotasi key unik VPS agar salinan key lama tidak dapat refresh lisensi.',
+      'Setelah reset, jalankan installer baru dari VPS tersebut untuk binding ulang.',
+      '',
+      'Masukkan IP VPS target atau ketik "batal".'
     ])
   );
 });
@@ -6087,6 +6152,49 @@ bot.on('text', async (ctx) => {
       }
     }
 
+    if (state.step === 'admin_reset_machine_binding_ip') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = extractIpv4(text) || normalizeHost(text);
+      if (!isIpv4(ip)) return ctx.reply('Format IP tidak valid.');
+      const detail = await adminGetScIpDetails(ip);
+      if (!detail || !detail.rows.length || !detail.keys.length) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`IP ${ip} atau key VPS tidak ditemukan di database.`, adminMenu());
+      }
+      state.step = 'admin_reset_machine_binding_confirm';
+      state.targetIp = ip;
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        `PERINGATAN: key VPS ${ip} akan dirotasi dan binding machine-id lama dihapus.\n` +
+        'VPS harus menjalankan installer terbaru lagi setelah reset.\n\n' +
+        `Ketik tepat: RESET ${ip}`
+      );
+    }
+
+    if (state.step === 'admin_reset_machine_binding_confirm') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const ip = normalizeHost(state.targetIp);
+      if (text !== `RESET ${ip}`) {
+        return ctx.reply(`Konfirmasi tidak cocok. Ketik tepat: RESET ${ip}\nAtau ketik "batal".`);
+      }
+      const result = await adminResetMachineBindingForIp(ip);
+      userState.delete(ctx.chat.id);
+      if (!result.changed) return ctx.reply(`Tidak ada binding/key yang diubah untuk ${ip}.`, adminMenu());
+      console.warn(`[license-admin] machine binding reset and server key rotated ip=${ip} rows=${result.changed} actor=${ctx.from.id}`);
+      return ctx.reply(
+        `Reset binding dan rotasi key berhasil.\n` +
+        `IP: ${ip}\nBaris key: ${result.changed}\n\n` +
+        'Sekarang jalankan installer terbaru dari VPS itu agar key dan machine-id baru terikat kembali.',
+        adminMenu()
+      );
+    }
+
     if (state.step === 'admin_set_sc_expiry_ip') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
@@ -6181,7 +6289,11 @@ bot.on('text', async (ctx) => {
         .join('\n');
       const keyText = detail.keys.length
         ? detail.keys
-            .map((k, i) => `${i + 1}. user_id=${Number(k.user_id || 0)} key=${String(k.server_key || '-')}\n   updated=${formatDateTime(k.updated_at)}`)
+            .map((k, i) =>
+              `${i + 1}. user_id=${Number(k.user_id || 0)} key=${String(k.server_key || '-')}\n` +
+              `   signed_lease=${String(k.machine_id_hash || '').trim() ? 'BOUND' : 'BELUM MIGRASI'}\n` +
+              `   last_lease=${formatDateTime(k.last_lease_at)} updated=${formatDateTime(k.updated_at)}`
+            )
             .join('\n')
         : '(tidak ada key tersimpan)';
       return ctx.reply(

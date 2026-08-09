@@ -17,8 +17,10 @@ set -euo pipefail
 #   API_AUTH_TOKEN=token-rahasia
 #   LICENSE_ENFORCE=1                            (opsional, 1=wajib validasi lisensi sebelum install)
 #   LICENSE_API_URL=https://license.example.com/api/v1/activate
-#   LICENSE_API_TOKEN=server-secret-token
+#   LICENSE_API_TOKEN=server-secret-token              (legacy migrasi; V.1FSC.5 memakai SC_UPDATE_KEY unik)
 #   LICENSE_KEY=LSC-XXXX-XXXX-XXXX
+#   LICENSE_LEASE_REQUIRED=1                           (wajib signed lease Ed25519)
+#   LICENSE_LEASE_REFRESH_MINUTES=15                   (refresh lease oleh timer)
 #   WILDCARD_ENABLE=0                           (opsional, 1=aktif wildcard cert DNS-01)
 #   WILDCARD_BASE_DOMAIN=example.com            (opsional, wajib saat wildcard aktif)
 #   WILDCARD_CF_EMAIL=                          (opsional, email Cloudflare untuk Global API Key)
@@ -140,6 +142,14 @@ LICENSE_ENFORCE="${LICENSE_ENFORCE:-1}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
 LICENSE_KEY="${LICENSE_KEY:-}"
+SC_UPDATE_KEY="${SC_UPDATE_KEY:-${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}}"
+LICENSE_LEASE_REQUIRED="${LICENSE_LEASE_REQUIRED:-1}"
+LICENSE_PUBLIC_KEY_B64="${LICENSE_PUBLIC_KEY_B64:-}"
+LICENSE_LEASE_REFRESH_MINUTES="${LICENSE_LEASE_REFRESH_MINUTES:-15}"
+LICENSE_LEASE_FILE="${LICENSE_LEASE_FILE:-/etc/sc-1forcr-license.lease}"
+LICENSE_PUBLIC_KEY_FILE="${LICENSE_PUBLIC_KEY_FILE:-/etc/sc-1forcr-license-public.pem}"
+LICENSE_REQUIRED_MARKER="${LICENSE_REQUIRED_MARKER:-/etc/sc-1forcr-license-required}"
+SC_DISTRIBUTION_ID="${SC_DISTRIBUTION_ID:-}"
 WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}"
 WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}"
 WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}"
@@ -152,7 +162,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.4}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.5}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -654,6 +664,10 @@ detect_public_ipv4() {
 
 license_check_enabled() {
   local raw
+  if [[ "${LICENSE_LEASE_REQUIRED:-1}" == "1" ]]; then
+    echo "1"
+    return 0
+  fi
   raw="$(echo "${LICENSE_ENFORCE:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   case "${raw}" in
     0|false|no|off) echo "0" ;;
@@ -663,6 +677,7 @@ license_check_enabled() {
 
 enforce_install_license() {
   local enabled vps_ip machine_id resp ok msg status expires bound_ip key_hash distribution client_name
+  local lease public_key_b64 bootstrap_public_key_b64 key_fingerprint lease_tmp public_key_tmp bootstrap_key_tmp current_key_fingerprint new_key_fingerprint bootstrap_key_fingerprint
   enabled="$(license_check_enabled)"
   if [[ "${enabled}" != "1" ]]; then
     log "License gate nonaktif (LICENSE_ENFORCE=0)."
@@ -674,8 +689,8 @@ enforce_install_license() {
     echo "Isi env LICENSE_API_URL dan LICENSE_API_TOKEN."
     exit 1
   fi
-  if [[ -z "${LICENSE_API_TOKEN}" ]]; then
-    echo "Install ditolak: LICENSE_API_TOKEN belum diisi."
+  if [[ -z "${SC_UPDATE_KEY}" && -z "${LICENSE_API_TOKEN}" ]]; then
+    echo "Install ditolak: key unik VPS belum tersedia."
     exit 1
   fi
   if [[ -z "${LICENSE_KEY}" ]]; then
@@ -697,12 +712,19 @@ enforce_install_license() {
     echo "Install ditolak: butuh curl untuk validasi lisensi."
     exit 1
   fi
+  if [[ "${LICENSE_LEASE_REQUIRED:-1}" == "1" ]] && \
+     { ! command -v jq >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v base64 >/dev/null 2>&1; }; then
+    log "Menyiapkan dependency verifikasi signed license..."
+    apt_get_safe update -y >/dev/null
+    apt_get_safe install -y jq openssl coreutils ca-certificates >/dev/null
+  fi
 
   log "Validasi lisensi ke server..."
   resp="$(
     curl -4fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
       -X POST "${LICENSE_API_URL}" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
       -H "Accept: application/json" \
       --data-urlencode "license_key=${LICENSE_KEY}" \
       --data-urlencode "ip=${vps_ip}" \
@@ -713,6 +735,7 @@ enforce_install_license() {
     curl -fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
       -X POST "${LICENSE_API_URL}" \
       -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
       -H "Accept: application/json" \
       --data-urlencode "license_key=${LICENSE_KEY}" \
       --data-urlencode "ip=${vps_ip}" \
@@ -734,6 +757,10 @@ enforce_install_license() {
   bound_ip="${vps_ip}"
   distribution="Community / Open Source"
   client_name="${vps_ip}"
+  lease=""
+  bootstrap_public_key_b64="${LICENSE_PUBLIC_KEY_B64:-}"
+  public_key_b64="${bootstrap_public_key_b64}"
+  key_fingerprint=""
   if command -v jq >/dev/null 2>&1; then
     ok="$(echo "${resp}" | jq -r 'if (.ok == true or .allowed == true or ((.status // "")|ascii_downcase) == "active") then "1" else "0" end' 2>/dev/null || echo "0")"
     msg="$(echo "${resp}" | jq -r '.message // .msg // .reason // "License rejected"' 2>/dev/null || echo "License rejected")"
@@ -742,6 +769,9 @@ enforce_install_license() {
     bound_ip="$(echo "${resp}" | jq -r '.bound_ip // .ip // empty' 2>/dev/null || echo "${vps_ip}")"
     distribution="$(echo "${resp}" | jq -r '.distribution // .source // "Community / Open Source"' 2>/dev/null || echo "Community / Open Source")"
     client_name="$(echo "${resp}" | jq -r '.client_name // .client // .name // empty' 2>/dev/null || echo "")"
+    lease="$(echo "${resp}" | jq -r '.license_lease // empty' 2>/dev/null || echo "")"
+    public_key_b64="$(echo "${resp}" | jq -r '.license_public_key_b64 // empty' 2>/dev/null || echo "${public_key_b64}")"
+    key_fingerprint="$(echo "${resp}" | jq -r '.license_key_fingerprint // empty' 2>/dev/null || echo "")"
     [[ -z "${bound_ip}" ]] && bound_ip="${vps_ip}"
     [[ -z "${client_name}" || "${client_name}" == "null" ]] && client_name="${bound_ip}"
     [[ -z "${distribution}" || "${distribution}" == "null" ]] && distribution="Community / Open Source"
@@ -760,6 +790,80 @@ enforce_install_license() {
     exit 1
   fi
 
+  if [[ "${LICENSE_LEASE_REQUIRED:-1}" == "1" ]]; then
+    if [[ ! "${lease}" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+      echo "Install ditolak: server tidak memberikan signed license lease yang valid."
+      exit 1
+    fi
+    if [[ -z "${public_key_b64}" ]]; then
+      echo "Install ditolak: public key verifikasi lisensi tidak tersedia."
+      exit 1
+    fi
+
+    mkdir -p "$(dirname "${LICENSE_LEASE_FILE}")" "$(dirname "${LICENSE_PUBLIC_KEY_FILE}")"
+    public_key_tmp="$(mktemp "$(dirname "${LICENSE_PUBLIC_KEY_FILE}")/.sc-license-key.XXXXXX")"
+    if ! printf '%s' "${public_key_b64}" | base64 -d > "${public_key_tmp}" 2>/dev/null; then
+      rm -f "${public_key_tmp}" >/dev/null 2>&1 || true
+      echo "Install ditolak: public key lisensi gagal didekode."
+      exit 1
+    fi
+    if ! grep -q '^-----BEGIN PUBLIC KEY-----$' "${public_key_tmp}" || \
+       ! grep -q '^-----END PUBLIC KEY-----$' "${public_key_tmp}"; then
+      rm -f "${public_key_tmp}" >/dev/null 2>&1 || true
+      echo "Install ditolak: format public key lisensi tidak valid."
+      exit 1
+    fi
+    if ! openssl pkey -pubin -in "${public_key_tmp}" -noout >/dev/null 2>&1; then
+      rm -f "${public_key_tmp}" >/dev/null 2>&1 || true
+      echo "Install ditolak: public key lisensi tidak dapat diverifikasi OpenSSL."
+      exit 1
+    fi
+    new_key_fingerprint="$(openssl pkey -pubin -in "${public_key_tmp}" -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+    if [[ -z "${new_key_fingerprint}" || ( -n "${key_fingerprint}" && "${new_key_fingerprint}" != "${key_fingerprint}" ) ]]; then
+      rm -f "${public_key_tmp}" >/dev/null 2>&1 || true
+      echo "Install ditolak: fingerprint public key lisensi tidak cocok."
+      exit 1
+    fi
+    if [[ -n "${bootstrap_public_key_b64}" ]]; then
+      bootstrap_key_tmp="$(mktemp "$(dirname "${LICENSE_PUBLIC_KEY_FILE}")/.sc-license-bootstrap-key.XXXXXX")"
+      if ! printf '%s' "${bootstrap_public_key_b64}" | base64 -d > "${bootstrap_key_tmp}" 2>/dev/null || \
+         ! openssl pkey -pubin -in "${bootstrap_key_tmp}" -noout >/dev/null 2>&1; then
+        rm -f "${public_key_tmp}" "${bootstrap_key_tmp}" >/dev/null 2>&1 || true
+        echo "Install ditolak: public key bootstrap installer tidak valid."
+        exit 1
+      fi
+      bootstrap_key_fingerprint="$(openssl pkey -pubin -in "${bootstrap_key_tmp}" -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+      rm -f "${bootstrap_key_tmp}" >/dev/null 2>&1 || true
+      if [[ -z "${bootstrap_key_fingerprint}" || "${bootstrap_key_fingerprint}" != "${new_key_fingerprint}" ]]; then
+        rm -f "${public_key_tmp}" >/dev/null 2>&1 || true
+        echo "Install ditolak: public key server berbeda dari key bootstrap installer."
+        exit 1
+      fi
+    fi
+    if [[ -s "${LICENSE_PUBLIC_KEY_FILE}" ]]; then
+      if ! openssl pkey -pubin -in "${LICENSE_PUBLIC_KEY_FILE}" -noout >/dev/null 2>&1; then
+        rm -f "${public_key_tmp}" >/dev/null 2>&1 || true
+        echo "Install ditolak: pinned public key lokal rusak."
+        exit 1
+      fi
+      current_key_fingerprint="$(openssl pkey -pubin -in "${LICENSE_PUBLIC_KEY_FILE}" -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+      if [[ -n "${current_key_fingerprint}" && "${current_key_fingerprint}" != "${new_key_fingerprint}" && \
+            "${LICENSE_ALLOW_SIGNING_KEY_ROTATION:-0}" != "1" ]]; then
+        rm -f "${public_key_tmp}" >/dev/null 2>&1 || true
+        echo "Install ditolak: signing key server berubah tanpa izin rotasi."
+        exit 1
+      fi
+    fi
+    chmod 644 "${public_key_tmp}"
+    mv -f "${public_key_tmp}" "${LICENSE_PUBLIC_KEY_FILE}"
+
+    lease_tmp="$(mktemp "$(dirname "${LICENSE_LEASE_FILE}")/.sc-license-lease.XXXXXX")"
+    printf '%s\n' "${lease}" > "${lease_tmp}"
+    chmod 600 "${lease_tmp}"
+    mv -f "${lease_tmp}" "${LICENSE_LEASE_FILE}"
+    LICENSE_PUBLIC_KEY_B64="${public_key_b64}"
+  fi
+
   key_hash="$(printf '%s' "${LICENSE_KEY}" | sha256sum | awk '{print $1}')"
   cat > /etc/sc-1forcr-license <<EOF
 LICENSE_STATUS=${status}
@@ -772,6 +876,8 @@ LICENSE_KEY_HASH=${key_hash}
 LICENSE_CHECK_AT=$(date '+%F %T')
 EOF
   chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
+  # Klien V.1FSC.5 memakai key unik per VPS; jangan sebarkan bearer global lagi.
+  LICENSE_API_TOKEN=""
   log "Lisensi valid untuk IP ${bound_ip}. Expired: ${expires}"
 }
 
@@ -2920,6 +3026,13 @@ LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
 LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
 LICENSE_KEY=${LICENSE_KEY}
+SC_UPDATE_KEY=${SC_UPDATE_KEY}
+LICENSE_LEASE_REQUIRED=${LICENSE_LEASE_REQUIRED}
+LICENSE_LEASE_REFRESH_MINUTES=${LICENSE_LEASE_REFRESH_MINUTES}
+LICENSE_LEASE_FILE=${LICENSE_LEASE_FILE}
+LICENSE_PUBLIC_KEY_FILE=${LICENSE_PUBLIC_KEY_FILE}
+LICENSE_REQUIRED_MARKER=${LICENSE_REQUIRED_MARKER}
+SC_DISTRIBUTION_ID=${SC_DISTRIBUTION_ID}
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 ZIVPN_RELOAD_ON_AUTH_CHANGE=${ZIVPN_RELOAD_ON_AUTH_CHANGE}
@@ -3008,6 +3121,7 @@ HAPROXY_NBTHREAD=${HAPROXY_NBTHREAD}
 SC_API_MEMORY_MAX=${SC_API_MEMORY_MAX}
 SSHWS_SERVICE_MEMORY_MAX=${SSHWS_SERVICE_MEMORY_MAX}
 EOF
+  chmod 600 "${APP_DIR}/.env"
 
   cat > "${APP_DIR}/api.js" <<'EOF'
 const express = require('express');
@@ -3237,6 +3351,16 @@ function readCapacityState() {
   };
 }
 function isRuntimeLicenseDenied() {
+  if (fs.existsSync('/etc/sc-1forcr-license-required')) {
+    try {
+      const signedGuard = require('/usr/local/lib/sc-1forcr/license-guard.js');
+      const signedState = signedGuard.checkLocalLease();
+      return signedState?.allowed !== true;
+    } catch (err) {
+      console.error('[license-guard] signed lease verification failed:', err?.message || err);
+      return true;
+    }
+  }
   if (LICENSE_ENFORCE === '0' || LICENSE_ENFORCE === 'false' || LICENSE_ENFORCE === 'no' || LICENSE_ENFORCE === 'off') {
     return false;
   }
@@ -3319,6 +3443,27 @@ function auth(req, res, next) {
     rawAuth;
   if (!token || token !== AUTH_TOKEN) return fail(res, 401, 'unauthorized');
   next();
+}
+function atomicWriteControlFile(filePath, content, mode = 0o600) {
+  const dir = require('path').dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(5).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, content, { encoding: 'utf8', mode });
+    fs.renameSync(tmp, filePath);
+    try { fs.chmodSync(filePath, mode); } catch (_) {}
+  } finally {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+  }
+}
+function safeControlValue(raw, maxLen = 180) {
+  return String(raw ?? '').replace(/[\r\n=]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maxLen);
+}
+function systemctlControl(action, units) {
+  try {
+    execFileSync('/bin/systemctl', [action, ...units], { stdio: 'ignore', timeout: 30000 });
+    return true;
+  } catch (_) { return false; }
 }
 let vpsLocationCache = { at: 0, data: { city: '-', isp: '-' } };
 function sanitizeInfoText(raw, maxLen = 96) {
@@ -5243,6 +5388,82 @@ async function cleanupStaleExpiredAccounts() {
 }
 
 app.get('/vps/health', (_req, res) => ok(res, { ok: true, domain: DOMAIN }));
+
+app.post('/internal/sc-registration-meta', auth, (req, res) => {
+  try {
+    const status = safeControlValue(req.body?.status || 'active', 40).toLowerCase() || 'active';
+    const clientName = safeControlValue(req.body?.client_name || req.body?.client || DOMAIN, 160);
+    const expiresAt = Math.max(0, Number(req.body?.expires_at || 0) || 0);
+    const updatedAt = Math.max(0, Number(req.body?.updated_at || Date.now()) || Date.now());
+    atomicWriteControlFile('/etc/sc-1forcr-registration.env', [
+      `SC_STATUS=${status}`,
+      `SC_CLIENT_NAME=${clientName}`,
+      `SC_EXPIRES_AT=${Math.floor(expiresAt)}`,
+      `SC_UPDATED_AT=${Math.floor(updatedAt)}`,
+      ''
+    ].join('\n'));
+    let licenseRefresh = 'legacy';
+    if (fs.existsSync('/etc/sc-1forcr-license-required')) {
+      try {
+        execFileSync('/usr/local/sbin/sc-1forcr-license-guard', ['refresh-enforce', '--force'], {
+          stdio: 'ignore', timeout: 30000
+        });
+        licenseRefresh = 'ok';
+      } catch (_) {
+        licenseRefresh = 'pending-or-denied';
+      }
+    }
+    return res.json({ ok: true, status, client_name: clientName, expires_at: expiresAt, license_refresh: licenseRefresh });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+app.post('/internal/sc-access-lock', auth, (req, res) => {
+  try {
+    const blocked = req.body?.blocked === true || String(req.body?.blocked || '').toLowerCase() === 'true' || String(req.body?.blocked || '') === '1';
+    const reason = safeControlValue(req.body?.reason || (blocked ? 'locked-by-control-plane' : 'unlocked-by-control-plane'), 120);
+    const actor = safeControlValue(req.body?.actor || '', 80);
+    if (blocked) {
+      atomicWriteControlFile('/etc/sc-1forcr-access.lock', [
+        'blocked=1',
+        `reason=${reason}`,
+        'managed_by=control-plane',
+        `actor=${actor}`,
+        `at=${Math.floor(Date.now() / 1000)}`,
+        ''
+      ].join('\n'));
+      systemctlControl('stop', [
+        'sc-1forcr-sshws.service', 'dropbear.service', 'xray.service', 'zivpn.service', 'sc-1forcr-udpcustom.service',
+        'sc-1forcr-udpgw@7200.service', 'sc-1forcr-udpgw@7300.service'
+      ]);
+      return res.json({ ok: true, blocked: true, reason });
+    }
+
+    if (fs.existsSync('/etc/sc-1forcr-license-required')) {
+      try {
+        execFileSync('/usr/local/sbin/sc-1forcr-license-guard', ['refresh-enforce', '--force'], {
+          stdio: 'ignore', timeout: 30000
+        });
+      } catch (_) {
+        return res.status(409).json({ ok: false, blocked: true, message: 'signed license belum aktif; unlock ditolak' });
+      }
+    }
+    try { fs.unlinkSync('/etc/sc-1forcr-access.lock'); } catch (_) {}
+    const backend = String(process.env.ACTIVE_UDP_BACKEND || 'zivpn').trim().toLowerCase();
+    const udpUnit = ['udpcustom', 'udp-custom', 'udphc'].includes(backend)
+      ? 'sc-1forcr-udpcustom.service'
+      : 'zivpn.service';
+    systemctlControl('start', [
+      'xray.service', 'dropbear.service', 'sc-1forcr-sshws.service', udpUnit,
+      'sc-1forcr-udpgw@7200.service', 'sc-1forcr-udpgw@7300.service'
+    ]);
+    return res.json({ ok: true, blocked: false, reason });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
 app.use('/vps', runtimeLicenseGuard, auth);
 
 app.get('/vps/capacity', (_req, res) => ok(res, readCapacityState()));
@@ -9632,6 +9853,484 @@ main().catch((e) => {
 EOF
 }
 
+setup_license_guard() {
+  local refresh_min guard_tmp wrapper_tmp unit dropin_dir
+  refresh_min="$(echo "${LICENSE_LEASE_REFRESH_MINUTES:-15}" | tr -cd '0-9')"
+  if [[ -z "${refresh_min}" || "${refresh_min}" -lt 5 || "${refresh_min}" -gt 1440 ]]; then
+    refresh_min="15"
+  fi
+  LICENSE_LEASE_REFRESH_MINUTES="${refresh_min}"
+
+  mkdir -p /usr/local/lib/sc-1forcr /usr/local/sbin /var/lib/sc-1forcr
+  guard_tmp="$(mktemp /usr/local/lib/sc-1forcr/.license-guard.XXXXXX.js)"
+  cat > "${guard_tmp}" <<'LICENSE_GUARD_JS_EOF'
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
+const { execFileSync } = require('child_process');
+
+function parseEnvFile(file) {
+  const out = {};
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    for (const lineRaw of raw.split(/\r?\n/)) {
+      const line = String(lineRaw || '').trim();
+      if (!line || line.startsWith('#')) continue;
+      const index = line.indexOf('=');
+      if (index <= 0) continue;
+      const key = line.slice(0, index).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+      let value = line.slice(index + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      out[key] = value;
+    }
+  } catch (_) {}
+  return out;
+}
+
+const fileEnv = {
+  ...parseEnvFile('/etc/sc-1forcr.env'),
+  ...parseEnvFile('/opt/sc-1forcr/.env'),
+  ...parseEnvFile('/opt/potato-compat/.env')
+};
+const env = { ...fileEnv, ...process.env };
+const LEASE_FILE = String(env.LICENSE_LEASE_FILE || '/etc/sc-1forcr-license.lease').trim();
+const PUBLIC_KEY_FILE = String(env.LICENSE_PUBLIC_KEY_FILE || '/etc/sc-1forcr-license-public.pem').trim();
+const REQUIRED_MARKER = String(env.LICENSE_REQUIRED_MARKER || '/etc/sc-1forcr-license-required').trim();
+const LEGACY_STATE_FILE = '/etc/sc-1forcr-license';
+const LOCK_FILE = '/etc/sc-1forcr-access.lock';
+const GUARD_STATE_FILE = String(env.LICENSE_GUARD_STATE_FILE || '/var/lib/sc-1forcr/license-guard-state.json').trim();
+const MACHINE_ID_FILE = String(env.LICENSE_MACHINE_ID_FILE || '/etc/machine-id').trim();
+const API_URL = String(env.LICENSE_API_URL || '').trim();
+const SERVER_KEY = String(env.SC_UPDATE_KEY || env.API_AUTH_TOKEN || env.AUTH_TOKEN || '').trim();
+const LEGACY_BEARER = String(env.LICENSE_API_TOKEN || '').trim();
+const LICENSE_KEY = String(env.LICENSE_KEY || '').trim();
+const SCRIPT_VERSION = String(env.SCRIPT_VERSION || '').trim();
+const REFRESH_MINUTES = Math.min(1440, Math.max(5, Number(env.LICENSE_LEASE_REFRESH_MINUTES || 15) || 15));
+const CLOCK_SKEW_SECONDS = 300;
+
+function sha256Hex(input) {
+  return crypto.createHash('sha256').update(String(input || ''), 'utf8').digest('hex');
+}
+
+function machineId() {
+  try {
+    return String(fs.readFileSync(MACHINE_ID_FILE, 'utf8') || '').trim().toLowerCase();
+  } catch (_) {
+    return '';
+  }
+}
+
+function publicKeyFingerprint(pem) {
+  const key = crypto.createPublicKey(pem);
+  const der = key.export({ type: 'spki', format: 'der' });
+  return crypto.createHash('sha256').update(der).digest('hex');
+}
+
+function atomicWrite(file, content, mode = 0o600) {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(5).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(tmp, content, { encoding: 'utf8', mode });
+    fs.renameSync(tmp, file);
+    try { fs.chmodSync(file, mode); } catch (_) {}
+  } finally {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
+  }
+}
+
+function loadPublicKey() {
+  const pem = String(fs.readFileSync(PUBLIC_KEY_FILE, 'utf8') || '');
+  if (!pem.includes('BEGIN PUBLIC KEY')) throw new Error('public-key-missing');
+  return { pem, key: crypto.createPublicKey(pem), fingerprint: publicKeyFingerprint(pem) };
+}
+
+function inspectSignedToken(token, expectedAudience = 'sc1forcr-runtime') {
+  const raw = String(token || '').trim();
+  const parts = raw.split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return { allowed: false, signatureValid: false, reason: 'lease-format-invalid', payload: null };
+  }
+  try {
+    const publicKey = loadPublicKey();
+    const signature = Buffer.from(parts[1], 'base64url');
+    const signatureValid = crypto.verify(null, Buffer.from(parts[0], 'ascii'), publicKey.key, signature);
+    if (!signatureValid) return { allowed: false, signatureValid: false, reason: 'lease-signature-invalid', payload: null };
+    const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    if (Number(payload?.v || 0) !== 1 || payload?.iss !== 'sc1forcr-license-api' || payload?.aud !== expectedAudience) {
+      return { allowed: false, signatureValid: true, reason: 'lease-claims-invalid', payload };
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const issuedAt = Number(payload.issued_at || 0);
+    if (!issuedAt || issuedAt > now + CLOCK_SKEW_SECONDS) {
+      return { allowed: false, signatureValid: true, reason: 'clock-or-issued-at-invalid', payload };
+    }
+    const expectedKeyId = SERVER_KEY ? sha256Hex(SERVER_KEY).slice(0, 32) : '';
+    if (!expectedKeyId) {
+      return { allowed: false, signatureValid: true, reason: 'server-key-missing', payload };
+    }
+    if (String(payload.key_id || '') !== expectedKeyId) {
+      return { allowed: false, signatureValid: true, reason: 'lease-key-mismatch', payload };
+    }
+    const currentMachineHash = machineId() ? sha256Hex(machineId()) : '';
+    if (expectedAudience === 'sc1forcr-runtime') {
+      if (!currentMachineHash) {
+        return { allowed: false, signatureValid: true, reason: 'machine-id-missing', payload };
+      }
+      if (String(payload.machine_id_hash || '') !== currentMachineHash) {
+        return { allowed: false, signatureValid: true, reason: 'lease-machine-mismatch', payload };
+      }
+    }
+    if (expectedAudience === 'sc1forcr-update') {
+      const validUntil = Number(payload.valid_until || 0);
+      if (!validUntil || now > validUntil) {
+        return { allowed: false, signatureValid: true, reason: 'manifest-expired', payload };
+      }
+      return { allowed: true, signatureValid: true, reason: 'manifest-valid', payload, publicKeyFingerprint: publicKey.fingerprint };
+    }
+
+    const status = String(payload.status || '').trim().toLowerCase();
+    if (status !== 'active') {
+      return { allowed: false, signatureValid: true, reason: `license-${status || 'denied'}`, payload };
+    }
+    const registrationExpiresAt = Number(payload.registration_expires_at || 0);
+    if (registrationExpiresAt > 0 && now >= registrationExpiresAt) {
+      return { allowed: false, signatureValid: true, reason: 'registration-expired', payload };
+    }
+    const graceUntil = Number(payload.grace_until || 0);
+    if (!graceUntil || now > graceUntil) {
+      return { allowed: false, signatureValid: true, reason: 'lease-grace-expired', payload };
+    }
+    const leaseUntil = Number(payload.lease_until || 0);
+    const refreshAfter = Number(payload.refresh_after || 0);
+    return {
+      allowed: true,
+      signatureValid: true,
+      reason: now <= leaseUntil ? 'lease-fresh' : 'lease-offline-grace',
+      mode: now <= leaseUntil ? 'fresh' : 'grace',
+      refreshDue: !refreshAfter || now >= refreshAfter,
+      payload,
+      publicKeyFingerprint: publicKey.fingerprint
+    };
+  } catch (error) {
+    return { allowed: false, signatureValid: false, reason: `lease-verify-error:${error.message}`, payload: null };
+  }
+}
+
+function readLeaseToken() {
+  try { return String(fs.readFileSync(LEASE_FILE, 'utf8') || '').trim(); } catch (_) { return ''; }
+}
+
+function checkLocalLease() {
+  return inspectSignedToken(readLeaseToken(), 'sc1forcr-runtime');
+}
+
+function installPinnedPublicKey(publicKeyB64, expectedFingerprint) {
+  const decoded = Buffer.from(String(publicKeyB64 || ''), 'base64').toString('utf8');
+  if (!decoded.includes('BEGIN PUBLIC KEY')) throw new Error('server-public-key-invalid');
+  const incomingFingerprint = publicKeyFingerprint(decoded);
+  if (expectedFingerprint && incomingFingerprint !== String(expectedFingerprint).trim().toLowerCase()) {
+    throw new Error('server-public-key-fingerprint-mismatch');
+  }
+  if (fs.existsSync(PUBLIC_KEY_FILE)) {
+    const existing = loadPublicKey();
+    if (existing.fingerprint !== incomingFingerprint && String(env.LICENSE_ALLOW_SIGNING_KEY_ROTATION || '0') !== '1') {
+      throw new Error('pinned-public-key-changed');
+    }
+  }
+  atomicWrite(PUBLIC_KEY_FILE, decoded.endsWith('\n') ? decoded : `${decoded}\n`, 0o644);
+  return incomingFingerprint;
+}
+
+function requestJson(urlText, body, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(urlText);
+    const payload = Buffer.from(JSON.stringify(body || {}), 'utf8');
+    const transport = target.protocol === 'https:' ? https : http;
+    const req = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || undefined,
+      family: 4,
+      method: 'POST',
+      path: `${target.pathname}${target.search}`,
+      timeout: 15000,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'Content-Length': String(payload.length),
+        ...headers
+      }
+    }, (res) => {
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > 1024 * 1024) {
+          req.destroy(new Error('license-response-too-large'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        try {
+          resolve({ statusCode: Number(res.statusCode || 0), body: JSON.parse(text) });
+        } catch (_) {
+          reject(new Error(`license-response-invalid-json:${res.statusCode || 0}`));
+        }
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error('license-request-timeout')));
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
+function writeLegacyState(result, responseBody = {}) {
+  const p = result?.payload || {};
+  const status = String(p.status || responseBody.status || (result.allowed ? 'active' : 'rejected')).replace(/[\r\n=]/g, '').slice(0, 60);
+  const reason = String(p.reason || responseBody.message || result.reason || '-').replace(/[\r\n=]/g, ' ').slice(0, 300);
+  const boundIp = String(p.bound_ip || responseBody.bound_ip || responseBody.ip || '-').replace(/[\r\n=]/g, '').slice(0, 80);
+  const expiresAt = Number(p.registration_expires_at || 0);
+  const clientName = String(responseBody.client_name || boundIp).replace(/[\r\n=]/g, ' ').slice(0, 160);
+  atomicWrite(LEGACY_STATE_FILE, [
+    `LICENSE_STATUS=${status}`,
+    `LICENSE_MESSAGE=${reason}`,
+    `LICENSE_BOUND_IP=${boundIp}`,
+    `LICENSE_EXPIRES_AT=${expiresAt || 0}`,
+    'LICENSE_DISTRIBUTION=BOT 1FORCR NEXUS',
+    `LICENSE_CLIENT_NAME=${clientName}`,
+    `LICENSE_KEY_HASH=${sha256Hex(LICENSE_KEY)}`,
+    `LICENSE_CHECK_AT=${new Date().toISOString()}`,
+    ''
+  ].join('\n'), 0o600);
+}
+
+async function refreshLease({ force = false } = {}) {
+  const current = checkLocalLease();
+  if (!force && current.allowed && !current.refreshDue) return { ...current, refreshed: false };
+  if (!API_URL || !SERVER_KEY) {
+    return current.allowed ? { ...current, refreshed: false, refreshError: 'license-endpoint-or-key-missing' }
+      : { ...current, reason: 'license-endpoint-or-key-missing' };
+  }
+  const headers = { 'X-SC-Key': SERVER_KEY };
+  if (LEGACY_BEARER) headers.Authorization = `Bearer ${LEGACY_BEARER}`;
+  try {
+    const response = await requestJson(API_URL, {
+      license_key: LICENSE_KEY,
+      machine_id: machineId(),
+      script_version: SCRIPT_VERSION
+    }, headers);
+    const body = response.body || {};
+    if (body.license_public_key_b64) {
+      installPinnedPublicKey(body.license_public_key_b64, body.license_key_fingerprint);
+    }
+    const token = String(body.license_lease || '').trim();
+    const inspected = inspectSignedToken(token, 'sc1forcr-runtime');
+    if (!inspected.signatureValid) throw new Error(inspected.reason || 'signed-lease-invalid');
+    atomicWrite(LEASE_FILE, `${token}\n`, 0o600);
+    writeLegacyState(inspected, body);
+    return { ...inspected, refreshed: true, httpStatus: response.statusCode };
+  } catch (error) {
+    const fallback = checkLocalLease();
+    if (fallback.allowed) return { ...fallback, refreshed: false, refreshError: error.message };
+    return { ...fallback, allowed: false, refreshed: false, reason: fallback.reason || `refresh-failed:${error.message}`, refreshError: error.message };
+  }
+}
+
+function readLockManagedByGuard() {
+  try {
+    return /(^|\n)managed_by=license-guard(\n|$)/.test(fs.readFileSync(LOCK_FILE, 'utf8'));
+  } catch (_) { return false; }
+}
+
+function runSystemctl(args) {
+  try {
+    execFileSync('/bin/systemctl', args, { stdio: 'ignore', timeout: 30000 });
+    return true;
+  } catch (_) { return false; }
+}
+
+function managedUnits() {
+  return [
+    'sc-1forcr-sshws.service',
+    'dropbear.service',
+    'xray.service',
+    'zivpn.service',
+    'sc-1forcr-udpcustom.service',
+    'sc-1forcr-udpgw@7200.service',
+    'sc-1forcr-udpgw@7300.service'
+  ];
+}
+
+function enforceResult(result) {
+  if (!result.allowed) {
+    const reason = String(result.reason || 'license-denied').replace(/[^a-zA-Z0-9._:-]/g, '-').slice(0, 120);
+    atomicWrite(LOCK_FILE, `blocked=1\nreason=${reason}\nmanaged_by=license-guard\nat=${Math.floor(Date.now() / 1000)}\n`, 0o600);
+    runSystemctl(['stop', ...managedUnits()]);
+    return result;
+  }
+  if (readLockManagedByGuard()) {
+    try { fs.unlinkSync(LOCK_FILE); } catch (_) {}
+    const backend = String(env.ACTIVE_UDP_BACKEND || 'zivpn').trim().toLowerCase();
+    const udpUnit = ['udpcustom', 'udp-custom', 'udphc'].includes(backend)
+      ? 'sc-1forcr-udpcustom.service'
+      : 'zivpn.service';
+    runSystemctl(['start', 'xray.service', 'dropbear.service', 'sc-1forcr-api.service', 'sc-1forcr-sshws.service', udpUnit,
+      'sc-1forcr-udpgw@7200.service', 'sc-1forcr-udpgw@7300.service']);
+  }
+  return result;
+}
+
+function saveGuardState(result) {
+  const payload = result?.payload || {};
+  const safe = {
+    checked_at: Math.floor(Date.now() / 1000),
+    allowed: result?.allowed === true,
+    reason: String(result?.reason || ''),
+    mode: String(result?.mode || ''),
+    refreshed: result?.refreshed === true,
+    refresh_error: String(result?.refreshError || ''),
+    bound_ip: String(payload.bound_ip || ''),
+    issued_at: Number(payload.issued_at || 0),
+    lease_until: Number(payload.lease_until || 0),
+    grace_until: Number(payload.grace_until || 0),
+    registration_expires_at: Number(payload.registration_expires_at || 0)
+  };
+  try { atomicWrite(GUARD_STATE_FILE, `${JSON.stringify(safe, null, 2)}\n`, 0o600); } catch (_) {}
+}
+
+function verifyUpdateFile(file, token) {
+  const inspected = inspectSignedToken(token, 'sc1forcr-update');
+  if (!inspected.allowed) return inspected;
+  const payload = inspected.payload || {};
+  const data = fs.readFileSync(file);
+  const actualHash = crypto.createHash('sha256').update(data).digest('hex');
+  if (actualHash !== String(payload.sha256 || '').toLowerCase()) {
+    return { ...inspected, allowed: false, reason: 'update-sha256-mismatch' };
+  }
+  if (Number(payload.size || 0) !== data.length) {
+    return { ...inspected, allowed: false, reason: 'update-size-mismatch' };
+  }
+  return inspected;
+}
+
+async function main() {
+  const command = String(process.argv[2] || 'status').trim().toLowerCase();
+  let result;
+  if (command === 'check') {
+    result = checkLocalLease();
+  } else if (command === 'refresh' || command === 'refresh-enforce') {
+    result = await refreshLease({ force: process.argv.includes('--force') });
+    if (command === 'refresh-enforce') enforceResult(result);
+  } else if (command === 'verify-update') {
+    result = verifyUpdateFile(String(process.argv[3] || ''), String(process.argv[4] || ''));
+  } else if (command === 'status') {
+    result = checkLocalLease();
+  } else {
+    throw new Error('usage: sc-1forcr-license-guard {check|refresh [--force]|refresh-enforce [--force]|status|verify-update <file> <manifest>}');
+  }
+  saveGuardState(result);
+  const jsonMode = process.argv.includes('--json');
+  if (jsonMode) {
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } else {
+    process.stdout.write(`[sc-license] ${result.allowed ? 'OK' : 'DENY'}: ${result.reason || '-'}${result.mode ? ` (${result.mode})` : ''}\n`);
+  }
+  process.exit(result.allowed ? 0 : 1);
+}
+
+module.exports = { checkLocalLease, inspectSignedToken, verifyUpdateFile };
+
+if (require.main === module) {
+  main().catch((error) => {
+    const result = { allowed: false, reason: `guard-error:${error.message}` };
+    saveGuardState(result);
+    console.error(`[sc-license] DENY: ${result.reason}`);
+    process.exit(1);
+  });
+}
+LICENSE_GUARD_JS_EOF
+  node --check "${guard_tmp}"
+  chmod 700 "${guard_tmp}"
+  mv -f "${guard_tmp}" /usr/local/lib/sc-1forcr/license-guard.js
+
+  wrapper_tmp="$(mktemp /usr/local/sbin/.sc-1forcr-license-guard.XXXXXX)"
+  cat > "${wrapper_tmp}" <<'LICENSE_GUARD_WRAPPER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/bin/node /usr/local/lib/sc-1forcr/license-guard.js "$@"
+LICENSE_GUARD_WRAPPER_EOF
+  bash -n "${wrapper_tmp}"
+  chmod 700 "${wrapper_tmp}"
+  mv -f "${wrapper_tmp}" /usr/local/sbin/sc-1forcr-license-guard
+
+  if ! /usr/local/sbin/sc-1forcr-license-guard check >/dev/null; then
+    log "Signed license lease gagal diverifikasi; guard tidak diaktifkan."
+    return 1
+  fi
+  printf 'required=1\nversion=1\n' > "${LICENSE_REQUIRED_MARKER}"
+  chmod 600 "${LICENSE_REQUIRED_MARKER}"
+
+  cat > /etc/systemd/system/sc-1forcr-license-guard.service <<'LICENSE_GUARD_SERVICE_EOF'
+[Unit]
+Description=SC 1FORCR Signed License Lease Guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-license-guard refresh-enforce
+TimeoutStartSec=45
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+LICENSE_GUARD_SERVICE_EOF
+
+  cat > /etc/systemd/system/sc-1forcr-license-guard.timer <<EOF
+[Unit]
+Description=Refresh and enforce SC 1FORCR signed license lease
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${refresh_min}min
+AccuracySec=30s
+Persistent=true
+Unit=sc-1forcr-license-guard.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  for unit in sc-1forcr-sshws.service dropbear.service xray.service zivpn.service sc-1forcr-udpcustom.service 'sc-1forcr-udpgw@.service'; do
+    dropin_dir="/etc/systemd/system/${unit}.d"
+    mkdir -p "${dropin_dir}"
+    cat > "${dropin_dir}/10-sc-license.conf" <<'LICENSE_GUARD_DROPIN_EOF'
+[Unit]
+After=sc-1forcr-license-guard.service
+
+[Service]
+# Prefix "+" memastikan guard tetap berjalan sebagai root walaupun unit utama
+# memakai User/Group non-root (misalnya beberapa paket Xray).
+ExecStartPre=+/usr/local/sbin/sc-1forcr-license-guard check
+LICENSE_GUARD_DROPIN_EOF
+  done
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-license-guard.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-license-guard.service
+}
+
 setup_services() {
   local iplimit_interval_min
   iplimit_interval_min="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES}" | tr -cd '0-9')"
@@ -12965,6 +13664,13 @@ LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
 LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
 LICENSE_KEY=${LICENSE_KEY}
+SC_UPDATE_KEY=${SC_UPDATE_KEY}
+LICENSE_LEASE_REQUIRED=${LICENSE_LEASE_REQUIRED}
+LICENSE_LEASE_REFRESH_MINUTES=${LICENSE_LEASE_REFRESH_MINUTES}
+LICENSE_LEASE_FILE=${LICENSE_LEASE_FILE}
+LICENSE_PUBLIC_KEY_FILE=${LICENSE_PUBLIC_KEY_FILE}
+LICENSE_REQUIRED_MARKER=${LICENSE_REQUIRED_MARKER}
+SC_DISTRIBUTION_ID=${SC_DISTRIBUTION_ID}
 WILDCARD_ENABLE=${WILDCARD_ENABLE}
 WILDCARD_BASE_DOMAIN=${WILDCARD_BASE_DOMAIN}
 WILDCARD_CF_API_TOKEN=${WILDCARD_CF_API_TOKEN}
@@ -18772,6 +19478,19 @@ enforce_menu_license_access() {
   lock_file="/etc/sc-1forcr-access.lock"
   ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip_text="${ip_text:-unknown}"
+  if [[ -f /etc/sc-1forcr-license-required ]]; then
+    if [[ ! -x /usr/local/sbin/sc-1forcr-license-guard ]] || \
+       ! /usr/local/sbin/sc-1forcr-license-guard refresh-enforce >/dev/null 2>&1; then
+      if [[ ! -f "${lock_file}" ]]; then
+        cat > "${lock_file}" <<'EOF'
+blocked=1
+reason=signed-license-invalid
+managed_by=license-guard
+EOF
+        chmod 600 "${lock_file}" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
   if [[ -f "${lock_file}" ]]; then
     lock_reason="$(sed -n 's/^reason=//p' "${lock_file}" | head -n1)"
     [[ -z "${lock_reason}" ]] && lock_reason="locked_by_admin"
@@ -18827,6 +19546,9 @@ Hubungi admin untuk membuka akses kembali setelah perpanjang.
 EOF
     fi
     return 1
+  fi
+  if [[ -f /etc/sc-1forcr-license-required ]]; then
+    return 0
   fi
   enabled="$(menu_bool_01 "${LICENSE_ENFORCE:-1}")"
   [[ "${enabled}" != "1" ]] && return 0
@@ -20452,6 +21174,7 @@ update_script_from_repo() {
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver update_log update_tail
+  local license_base_url manifest_resp manifest_token
   # Undrop rule burst SSHWS lama saat update agar koneksi tidak nyangkut.
   if declare -F clear_sshws_loop_guard_rules >/dev/null 2>&1; then
     clear_sshws_loop_guard_rules
@@ -20522,6 +21245,34 @@ Time     : $(date '+%F %T')"
     return 1
   fi
 
+  if [[ -f /etc/sc-1forcr-license-required ]]; then
+    license_base_url="$(echo "${LICENSE_API_URL:-}" | sed 's|/sc1forcr/license/activate$||')"
+    if [[ -z "${license_base_url}" || "${license_base_url}" == "${LICENSE_API_URL:-}" || \
+          ! -x /usr/local/sbin/sc-1forcr-license-guard || -z "${SC_UPDATE_KEY:-}" ]]; then
+      echo "Update ditolak: verifier atau key signed manifest tidak tersedia."
+      rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    manifest_resp="$(
+      curl -4fsS --connect-timeout 10 --max-time 30 \
+        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN:-}" \
+        "${license_base_url}/sc1forcr/payload/manifest" 2>/dev/null ||
+      curl -fsS --connect-timeout 10 --max-time 30 \
+        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN:-}" \
+        "${license_base_url}/sc1forcr/payload/manifest" 2>/dev/null || true
+    )"
+    manifest_token="$(echo "${manifest_resp}" | jq -r '.manifest // empty' 2>/dev/null || true)"
+    if [[ -z "${manifest_token}" ]] || \
+       ! /usr/local/sbin/sc-1forcr-license-guard verify-update "${tmp}" "${manifest_token}" >/dev/null; then
+      echo "Update ditolak: signature/checksum manifest installer tidak valid."
+      rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    echo "Signed manifest installer: OK"
+  fi
+
   update_snapshot=""
   if [[ -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
     if ! update_snapshot="$(/usr/local/sbin/sc-1forcr-update-manager snapshot "pre-update-${SCRIPT_VERSION:-unknown}")"; then
@@ -20588,6 +21339,10 @@ Time     : $(date '+%F %T')"
     LICENSE_API_URL="${LICENSE_API_URL:-}" \
     LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}" \
     LICENSE_KEY="${LICENSE_KEY:-}" \
+    SC_UPDATE_KEY="${SC_UPDATE_KEY:-${AUTH_TOKEN:-}}" \
+    LICENSE_LEASE_REQUIRED="${LICENSE_LEASE_REQUIRED:-1}" \
+    LICENSE_PUBLIC_KEY_B64="${LICENSE_PUBLIC_KEY_B64:-}" \
+    LICENSE_LEASE_REFRESH_MINUTES="${LICENSE_LEASE_REFRESH_MINUTES:-15}" \
     WILDCARD_ENABLE="${WILDCARD_ENABLE:-0}" \
     WILDCARD_BASE_DOMAIN="${WILDCARD_BASE_DOMAIN:-}" \
     WILDCARD_CF_API_TOKEN="${WILDCARD_CF_API_TOKEN:-}" \
@@ -21698,6 +22453,10 @@ write_version_marker() {
   chmod 644 "${APP_DIR}/VERSION"
   printf 'SCRIPT_VERSION=%s\n' "${SCRIPT_VERSION}" > /etc/sc-1forcr-version
   chmod 644 /etc/sc-1forcr-version
+  if [[ "${SC_DISTRIBUTION_ID:-}" =~ ^[a-f0-9]{32}$ ]]; then
+    printf '%s\n' "${SC_DISTRIBUTION_ID}" > /etc/sc-1forcr-distribution-id
+    chmod 600 /etc/sc-1forcr-distribution-id
+  fi
 }
 
 post_install_preflight() {
@@ -21774,9 +22533,9 @@ post_install_preflight() {
 - xray/api/sshws   : ${xstat}/${apistat}/${wsstat}
 - zivpn/udphc      : ${zstat}/${ustat}
 - udpgw 7200/7300 : ${udpgw7200}/${udpgw7300}
-- zivpn listen     : ${zport} ($(ss -lunp 2>/dev/null | awk -v p=":${zport}" '$5 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
-- udphc listen     : ${uport} ($(ss -lunp 2>/dev/null | awk -v p=":${uport}" '$5 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
-- udpgw listen     : 7200=$(ss -lntup 2>/dev/null | awk '$5 ~ /:7200$/ {ok=1} END{print ok?"YES":"NO"}') 7300=$(ss -lntup 2>/dev/null | awk '$5 ~ /:7300$/ {ok=1} END{print ok?"YES":"NO"}')
+- zivpn listen     : ${zport} ($(ss -lunp 2>/dev/null | awk -v p=":${zport}" '$4 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
+- udphc listen     : ${uport} ($(ss -lunp 2>/dev/null | awk -v p=":${uport}" '$4 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
+- udpgw listen     : 7200=$(ss -lntup 2>/dev/null | awk '$4 ~ /:7200$/ {ok=1} END{print ok?"YES":"NO"}') 7300=$(ss -lntup 2>/dev/null | awk '$4 ~ /:7300$/ {ok=1} END{print ok?"YES":"NO"}')
 - network compat  : ${NETWORK_COMPAT_ENABLE} (MSS $(network_effective_tcp_mss), Xray ${XRAY_OUTBOUND_DOMAIN_STRATEGY})
 - zivpn cert/key   : $( [[ -s /etc/zivpn/zivpn.crt && -s /etc/zivpn/zivpn.key ]] && echo OK || echo MISSING )
 - dnat ${ZIVPN_DNAT_RANGE:-none}->${zport} : ${nat_ok}
@@ -22083,6 +22842,9 @@ open_menu_after_install() {
 
 PENDING_OP_FILE="/var/lib/sc-1forcr/pending-op.env"
 SCRIPT_SELF_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+if [[ -z "${SC_DISTRIBUTION_ID:-}" && -f "${SCRIPT_SELF_PATH}" ]]; then
+  SC_DISTRIBUTION_ID="$(sed -n 's/^# SC_DISTRIBUTION_ID=\([a-f0-9]\{32\}\)$/\1/p' "${SCRIPT_SELF_PATH}" | head -n1)"
+fi
 PENDING_INSTALL_SCRIPT="/var/lib/sc-1forcr/pending-install.sh"
 PENDING_INSTALL_ENV="/var/lib/sc-1forcr/pending-install.env"
 INSTALL_STEP_FILE="/var/lib/sc-1forcr/install-steps.done"
@@ -22110,7 +22872,9 @@ persist_pending_install_env() {
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
   vars=(
     DOMAIN EMAIL INSTALL_AUTH_TOKEN API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH
-    LICENSE_ENFORCE LICENSE_API_URL LICENSE_API_TOKEN LICENSE_KEY
+    LICENSE_ENFORCE LICENSE_API_URL LICENSE_KEY SC_UPDATE_KEY
+    LICENSE_LEASE_REQUIRED LICENSE_PUBLIC_KEY_B64 LICENSE_LEASE_REFRESH_MINUTES
+    LICENSE_LEASE_FILE LICENSE_PUBLIC_KEY_FILE LICENSE_REQUIRED_MARKER
     UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API API_DOCS_ENABLE SUMMARY_API_SETUP_URL
     WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN WILDCARD_CF_EMAIL WILDCARD_CF_API_KEY
     WILDCARD_BUG_PREFIX WILDCARD_BUG_PREFIXES WILDCARD_XRAY_HOST WILDCARD_XRAY_HOSTS XRAY_PUBLIC_HOST
@@ -22372,8 +23136,14 @@ create_snapshot() {
   for path in \
     /etc/sc-1forcr.env \
     /etc/sc-1forcr \
+    /etc/sc-1forcr-license \
+    /etc/sc-1forcr-license.lease \
+    /etc/sc-1forcr-license-public.pem \
+    /etc/sc-1forcr-license-required \
+    /etc/sc-1forcr-distribution-id \
     /opt/sc-1forcr \
     /opt/potato-compat \
+    /usr/local/lib/sc-1forcr \
     /etc/xray \
     /usr/local/etc/xray \
     /etc/zivpn \
@@ -22385,6 +23155,13 @@ create_snapshot() {
     /etc/nginx/sites-enabled/sc-1forcr \
     /etc/nginx/sites-enabled/sc-1forcr.conf \
     /etc/haproxy/haproxy.cfg \
+    /etc/systemd/system/sc-1forcr-api.service.d \
+    /etc/systemd/system/sc-1forcr-sshws.service.d \
+    /etc/systemd/system/dropbear.service.d \
+    /etc/systemd/system/xray.service.d \
+    /etc/systemd/system/zivpn.service.d \
+    /etc/systemd/system/sc-1forcr-udpcustom.service.d \
+    /etc/systemd/system/sc-1forcr-udpgw@.service.d \
     /usr/local/sbin/menu-sc-1forcr \
     /usr/local/sbin/update; do
     add_snapshot_path "${list_file}" "${path}"
@@ -22524,6 +23301,16 @@ PY
     failures+=("database tidak ditemukan")
   fi
 
+  if [[ -f /etc/sc-1forcr-license-required ]]; then
+    if [[ ! -x /usr/local/sbin/sc-1forcr-license-guard ]] || \
+       ! /usr/local/sbin/sc-1forcr-license-guard check >/dev/null 2>&1; then
+      failures+=("signed license lease")
+    fi
+    if ! systemctl is-active --quiet sc-1forcr-license-guard.timer; then
+      failures+=("license guard timer tidak aktif")
+    fi
+  fi
+
   for unit in sc-1forcr-api.service sc-1forcr-sshws.service; do
     if unit_is_installed "${unit}" && ! systemctl is-active --quiet "${unit}"; then
       failures+=("${unit} tidak aktif")
@@ -22619,15 +23406,46 @@ restart_after_restore() {
       systemctl restart "${zivpn_unit}" >/dev/null 2>&1 || true
     fi
   fi
+  if [[ -f /etc/sc-1forcr-license-required ]] && unit_is_installed sc-1forcr-license-guard.timer; then
+    systemctl enable --now sc-1forcr-license-guard.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-license-guard.service >/dev/null 2>&1 || true
+  fi
 }
 
 rollback_snapshot() {
-  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name
+  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard
   snapshot_dir="$(verify_snapshot "${1:-latest}")" || return 1
   snapshot_name="$(basename "${snapshot_dir}")"
   log_update_manager "Menyiapkan rollback ke ${snapshot_name}..."
   pre_snapshot="$(create_snapshot "pre-rollback-to-${snapshot_name}" 2>/dev/null || true)"
 
+  snapshot_has_signed_guard="0"
+  if tar -tzf "${snapshot_dir}/files.tar.gz" 2>/dev/null | \
+     awk '$0=="etc/sc-1forcr-license-required" {found=1} END{exit found?0:1}'; then
+    snapshot_has_signed_guard="1"
+  fi
+  if [[ "${snapshot_has_signed_guard}" != "1" ]]; then
+    systemctl disable --now sc-1forcr-license-guard.timer >/dev/null 2>&1 || true
+    rm -f \
+      /etc/sc-1forcr-license.lease \
+    /etc/sc-1forcr-license-public.pem \
+    /etc/sc-1forcr-license-required \
+    /etc/sc-1forcr-distribution-id \
+    /usr/local/sbin/sc-1forcr-license-guard \
+      /usr/local/lib/sc-1forcr/license-guard.js \
+      /etc/systemd/system/sc-1forcr-license-guard.service \
+      /etc/systemd/system/sc-1forcr-license-guard.timer \
+      /etc/systemd/system/sc-1forcr-api.service.d/10-sc-license.conf \
+      /etc/systemd/system/sc-1forcr-sshws.service.d/10-sc-license.conf \
+      /etc/systemd/system/dropbear.service.d/10-sc-license.conf \
+      /etc/systemd/system/xray.service.d/10-sc-license.conf \
+      /etc/systemd/system/zivpn.service.d/10-sc-license.conf \
+      /etc/systemd/system/sc-1forcr-udpcustom.service.d/10-sc-license.conf \
+      /etc/systemd/system/sc-1forcr-udpgw@.service.d/10-sc-license.conf \
+      /var/lib/sc-1forcr/license-guard-state.json >/dev/null 2>&1 || true
+  fi
+
+  systemctl stop sc-1forcr-license-guard.timer sc-1forcr-license-guard.service >/dev/null 2>&1 || true
   systemctl stop sc-1forcr-api.service sc-1forcr-sshws.service >/dev/null 2>&1 || true
   tar --extract --gzip --file="${snapshot_dir}/files.tar.gz" --directory=/ \
     --numeric-owner --acls --xattrs \
@@ -22753,6 +23571,7 @@ main() {
     install_legacy_runtime_command_shims
     check_supported_os
     install_node_if_missing
+    enforce_install_license
     install_go_if_missing
     init_db
     setup_udpgw_service_if_possible
@@ -22761,6 +23580,7 @@ main() {
     build_go_files
     write_iplimit_checker
     setup_services
+    setup_license_guard
     setup_auto_reboot_timer
     setup_auto_backup_timer
     setup_online_notify_timer
@@ -22824,6 +23644,7 @@ main() {
   run_install_step "23_build_go" 79 "Build Go mux" build_go_files
   run_install_step "24_iplimit_checker" 82 "Tulis checker limit IP" write_iplimit_checker
   run_install_step "25_services" 85 "Setup service systemd" setup_services
+  run_install_step "25b_license_guard" 86 "Setup signed license lease guard" setup_license_guard
   run_install_step "26_udp_bootfix" 87 "Setup UDP bootfix" setup_udp_bootfix_service
   run_install_step "27_auto_reboot" 88 "Setup auto reboot" setup_auto_reboot_timer
   run_install_step "28_auto_backup" 89 "Setup auto backup" setup_auto_backup_timer

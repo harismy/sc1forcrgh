@@ -5,6 +5,8 @@
 .vars.json
 .vars.*.json
 !.vars.example.json
+.sc1forcr-license-ed25519-private.pem
+.sc1forcr-license-ed25519-public.pem
 
 # Dependency Node.js
 node_modules/

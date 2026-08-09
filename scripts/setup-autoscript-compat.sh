@@ -152,7 +152,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.3}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.4}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -17532,11 +17532,11 @@ set_api_docs_config_menu() {
 tools_menu() {
   while true; do
     clear
-    draw_menu_panel "TOOLS & PENGATURAN" \
+    draw_menu_panel "MENU TOOLS" \
       "1) Informasi Key Script" \
       "2) Install API 1FORCR" \
       "3) Setting Banner" \
-      "4) Update SC Aman (backup + rollback)" \
+      "4) Update / Rollback SC" \
       "5) Setting BOT Telegram" \
       "6) Setting Checker IP Limit" \
       "7) Setting Auto-Lock Realtime" \
@@ -17560,7 +17560,7 @@ tools_menu() {
       1) show_sc_key_info || true ;;
       2) install_summary_api_1forcr || true ;;
       3) set_html_banner_menu || true ;;
-      4) manual_update_sc || true ;;
+      4) update_rollback_menu || true ;;
       5) set_telegram_notif_config || true ;;
       6) set_iplimit_checker_config_menu || true ;;
       7) set_autolock_realtime_tuning_menu || true ;;
@@ -20829,10 +20829,9 @@ update_rollback_menu() {
     echo "1) Update SC aman (backup otomatis)"
     echo "2) Rollback update terakhir"
     echo "3) Daftar snapshot update"
-    echo "4) Buka Tools & Pengaturan"
     echo "0) Kembali"
     echo
-    if ! prompt_input choice "Pilih [0-4]: "; then
+    if ! prompt_input choice "Pilih [0-3]: "; then
       return 0
     fi
     case "${choice}" in
@@ -20845,7 +20844,6 @@ update_rollback_menu() {
           echo "Belum ada snapshot update."
         fi
         ;;
-      4) tools_menu || true ;;
       0) return 0 ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -21391,7 +21389,7 @@ draw_main_options() {
   printf ' %s┌%s┐%s\n' "${MENU_C}" "$(menu_hline '─' "$W")" "${MENU_NC}"
   menu_print_line "  ${MENU_DIM}1)${MENU_NC} MENU AKUN         ${MENU_DIM}5)${MENU_NC} MONITOR USER LOCK"  "$W"
   menu_print_line "  ${MENU_DIM}2)${MENU_NC} SERVICE MENU      ${MENU_DIM}6)${MENU_NC} MONITOR USER LOGIN" "$W"
-  menu_print_line "  ${MENU_DIM}3)${MENU_NC} BACKUP/RESTORE    ${MENU_DIM}7)${MENU_NC} UPDATE/ROLLBACK"   "$W"
+  menu_print_line "  ${MENU_DIM}3)${MENU_NC} BACKUP/RESTORE    ${MENU_DIM}7)${MENU_NC} TOOLS MENU"        "$W"
   menu_print_line "  ${MENU_DIM}4)${MENU_NC} CHANGE DOMAIN"   "$W"
   menu_print_line "  ${MENU_DIM}m)${MENU_NC} MENU UTAMA"       "$W"
   menu_print_line "  ${MENU_DIM}x)${MENU_NC} EXIT"             "$W"
@@ -21460,7 +21458,7 @@ while true; do
     4) change_domain_menu || true ;;
     5) monitor_temp_lock_menu || true ;;
     6) monitor_online_menu || true ;;
-    7) update_rollback_menu || true ;;
+    7) tools_menu || true ;;
     m|M)
       SHOW_FULL_MENU=1
       continue

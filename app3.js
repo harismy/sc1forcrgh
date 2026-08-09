@@ -820,6 +820,49 @@ async function notifyAdminsScRegistration(payload = {}) {
   }
 }
 
+async function notifyAdminsScRenewal(payload = {}) {
+  const adminIds = Array.from(new Set(ADMIN_IDS.map((v) => Number(v || 0)).filter((v) => Number.isInteger(v) && v > 0)));
+  if (!adminIds.length) return;
+
+  const payer = telegramUserInfoForAdmin(payload.user, payload.actorId || 0);
+  const ownerId = Number(payload.targetUserId || payer.id || 0);
+  const ip = cleanNotifyText(payload.ip || '-', 64) || '-';
+  const clientName = cleanNotifyText(payload.clientName || '-', 120) || '-';
+  const days = Math.max(0, Math.floor(Number(payload.days || 0) || 0));
+  const fee = Math.max(0, Number(payload.totalFee || 0) || 0);
+  const saldoNow = Number(payload.saldoNow ?? NaN);
+  const previousExpiresAt = Number(payload.previousExpiresAt || 0);
+  const expiresAt = Number(payload.expiresAt || 0);
+  const prevStatus = cleanNotifyText(payload.prevStatus || '-', 40).toLowerCase() || '-';
+  const lines = [
+    'PERPANJANGAN SC BERHASIL',
+    '',
+    'USER PEMBAYAR',
+    `ID Telegram: ${payer.id || '-'}`,
+    `Chat ID: ${payload.chatId || payer.id || '-'}`,
+    `Username: ${payer.username}`,
+    `Nama: ${payer.fullName}`,
+    ownerId && ownerId !== payer.id ? `Owner SC ID: ${ownerId}` : null,
+    '',
+    'DETAIL PERPANJANGAN',
+    `Nama Client: ${clientName}`,
+    `IP VPS: ${ip}`,
+    `Tambah Durasi: ${days} hari`,
+    `Biaya: Rp ${fee.toLocaleString('id-ID')}`,
+    Number.isFinite(saldoNow) ? `Sisa Saldo: Rp ${saldoNow.toLocaleString('id-ID')}` : null,
+    `Status Sebelumnya: ${prevStatus}`,
+    `Expired Sebelumnya: ${formatDateTime(previousExpiresAt)}`,
+    `Expired Baru: ${formatDateTime(expiresAt)}`,
+    `Aktif Kembali: ${payload.reactivatedFromExpired ? 'YA' : 'TIDAK'}`,
+    `Waktu: ${formatDateTime(Date.now())}`
+  ].filter((line) => line !== null);
+
+  const message = lines.join('\n');
+  for (const aid of adminIds) {
+    await bot.telegram.sendMessage(aid, message).catch(() => {});
+  }
+}
+
 async function getAutoProvisionDomain() {
   const raw = await getDynamicSetting('AUTO_PROVISION_DOMAIN', DEFAULT_AUTO_PROVISION_DOMAIN ? '1' : '0');
   return parseBool01(raw, DEFAULT_AUTO_PROVISION_DOMAIN);
@@ -2709,7 +2752,8 @@ async function extendScRegistration(actorId, targetUserId, ip, clientName, days,
     }
 
     const prevStatus = String(existing?.status || '').trim().toLowerCase();
-    const baseExpiry = Math.max(now, Number(existing?.expires_at || 0));
+    const previousExpiresAt = Number(existing?.expires_at || 0);
+    const baseExpiry = Math.max(now, previousExpiresAt);
     const nextExpiry = baseExpiry + (days * DAY_MS);
     const finalClientName = normalizeClientName(clientName || existing?.client_name || host) || host;
 
@@ -2725,6 +2769,7 @@ async function extendScRegistration(actorId, targetUserId, ip, clientName, days,
       actorId: payerId,
       targetUserId: ownerId,
       expiresAt: nextExpiry,
+      previousExpiresAt,
       clientName: finalClientName,
       prevStatus,
       reactivatedFromExpired: prevStatus === 'expired'
@@ -7126,6 +7171,21 @@ bot.on('text', async (ctx) => {
       const saldoNow = await getSaldo(ctx.from.id);
       const activeServerKey = await ensureServerKeyForHost(targetUserId, ip, serverKey);
       userState.delete(ctx.chat.id);
+      notifyAdminsScRenewal({
+        user: ctx.from,
+        actorId: ctx.from.id,
+        targetUserId,
+        chatId: ctx.chat.id,
+        ip,
+        clientName: result.clientName || clientName,
+        days: Math.floor(days),
+        totalFee,
+        saldoNow,
+        previousExpiresAt: result.previousExpiresAt,
+        expiresAt: result.expiresAt,
+        prevStatus: result.prevStatus,
+        reactivatedFromExpired: result.reactivatedFromExpired
+      }).catch(() => {});
       await ctx.reply(
         `Perpanjang SC berhasil.\n` +
           `Nama Client: ${result.clientName || clientName}\n` +

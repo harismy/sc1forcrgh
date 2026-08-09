@@ -1705,13 +1705,16 @@ async function markScNotifySent(userId, host, event, sentAt = Date.now()) {
 }
 
 async function getActiveRegistrations(userId) {
+  const now = Date.now();
   await dbRun(
     "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
-    [Date.now(), Date.now()]
+    [now, now]
   ).catch(() => {});
   return dbAll(
-    "SELECT vps_ip, client_name, created_at, updated_at, expires_at FROM sc_registrations WHERE user_id = ? AND status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) ORDER BY updated_at DESC",
-    [userId, Date.now()]
+    "SELECT vps_ip, client_name, status, created_at, updated_at, last_used_at, expires_at " +
+      "FROM sc_registrations WHERE user_id = ? AND status = 'active' " +
+      "AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) ORDER BY updated_at DESC",
+    [userId, now]
   );
 }
 
@@ -1890,19 +1893,43 @@ async function getRegistrationStateByIp(userId, ip, adminMode = false) {
   );
 }
 
-async function listActiveRegistrationsForAdmin(limit = 15) {
+async function getActiveScAdminDashboard(page = 0, pageSize = 10) {
   const now = Date.now();
   await dbRun(
     "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
     [now, now]
   ).catch(() => {});
-  const safeLimit = Math.max(1, Math.min(50, Number(limit) || 15));
-  return dbAll(
-    "SELECT user_id, vps_ip, client_name, expires_at, updated_at FROM sc_registrations " +
-      "WHERE status = 'active' AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) " +
-      "ORDER BY updated_at DESC LIMIT ?",
-    [now, safeLimit]
+  const size = Math.max(5, Math.min(20, Number(pageSize) || 10));
+  const stats = await dbGet(
+    "SELECT COUNT(1) AS total, " +
+      "SUM(CASE WHEN expires_at IS NULL OR expires_at <= 0 THEN 1 ELSE 0 END) AS unlimited, " +
+      "SUM(CASE WHEN expires_at > ? AND expires_at <= ? THEN 1 ELSE 0 END) AS expiring_soon " +
+      "FROM sc_registrations WHERE status = 'active' " +
+      "AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?)",
+    [now, now + (3 * DAY_MS), now]
   );
+  const total = Number(stats?.total || 0);
+  const totalPages = Math.max(1, Math.ceil(total / size));
+  const safePage = Math.min(Math.max(0, Number(page) || 0), totalPages - 1);
+  const rows = total > 0
+    ? await dbAll(
+        "SELECT user_id, vps_ip, client_name, status, expires_at, updated_at, last_used_at " +
+          "FROM sc_registrations WHERE status = 'active' " +
+          "AND (expires_at IS NULL OR expires_at <= 0 OR expires_at > ?) " +
+          "ORDER BY CASE WHEN expires_at IS NULL OR expires_at <= 0 THEN 1 ELSE 0 END ASC, " +
+          "expires_at ASC, updated_at DESC LIMIT ? OFFSET ?",
+        [now, size, safePage * size]
+      )
+    : [];
+  return {
+    rows: rows || [],
+    page: safePage,
+    totalPages,
+    total,
+    unlimited: Number(stats?.unlimited || 0),
+    expiringSoon: Number(stats?.expiring_soon || 0),
+    checkedAt: now
+  };
 }
 
 async function listActiveScHosts(limit = 1000) {
@@ -2946,7 +2973,7 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
 function mainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('🛒 Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('🔁 Ganti IP VPS', 'm_register_sc_change_ip')],
-    [Markup.button.callback('📦 SC Saya', 'm_my_sc'), Markup.button.callback('⏳ Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
+    [Markup.button.callback('✅ Info SC Aktif', 'm_my_sc'), Markup.button.callback('⏳ Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
     [Markup.button.callback('💳 Top Up Saldo', 'm_topup_saldo'), Markup.button.callback('💰 Cek Saldo', 'm_cek_saldo')],
     [Markup.button.callback('🔗 Link Instalasi', 'm_install_link'), Markup.button.callback('✨ Fitur SC 1FORCR NEXUS', 'm_sc_features')],
     [Markup.button.callback('🚚 Migrasi Akun', 'm_migrate_accounts'), Markup.button.callback('🧹 Hapus Semua Akun', 'm_delete_all_accounts')],
@@ -3014,7 +3041,8 @@ function adminMenu() {
     [Markup.button.callback('👥 Jadikan Reseller', 'm_admin_reseller_enable'), Markup.button.callback('🚫 Nonaktifkan Reseller', 'm_admin_reseller_disable')],
     [Markup.button.callback('📱 Set WA Admin Reseller', 'm_admin_set_reseller_wa'), Markup.button.callback('✨ Edit Info Fitur SC', 'm_admin_set_sc_features_info')],
 
-    [Markup.button.callback('🧾 Daftar IP + KEY + ID', 'm_admin_list_ip_keys_0'), Markup.button.callback('🗑️ Hapus IP VPS', 'm_admin_remove_sc_ip')],
+    [Markup.button.callback('✅ Semua SC Aktif', 'm_admin_active_sc_0'), Markup.button.callback('🧾 IP + KEY + ID', 'm_admin_list_ip_keys_0')],
+    [Markup.button.callback('🗑️ Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('🔓 Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('ℹ️ Info Detail IP VPS', 'm_admin_ip_info')],
     [Markup.button.callback('🔄 Reset Binding VPS', 'm_admin_reset_machine_binding')],
     [Markup.button.callback('⏱️ Set Masa Aktif IP (Jam)', 'm_admin_set_sc_expiry_ip')],
@@ -3259,6 +3287,7 @@ function myScPageKeyboard(page, totalPages) {
 }
 
 async function sendMyScPage(ctx, page = 0) {
+  const checkedAt = Date.now();
   const regs = await getActiveRegistrations(ctx.from.id).catch(() => []);
   if (regs.length === 0) {
     const latest = await getLatestRegistrationState(ctx.from.id).catch(() => null);
@@ -3283,7 +3312,18 @@ async function sendMyScPage(ctx, page = 0) {
         );
       }
     }
-    return ctx.reply('Belum ada IP SC terdaftar.', mainMenu());
+    return ctx.reply(
+      uiBox('INFO SC AKTIF', [
+        'Tidak ada SC yang benar-benar aktif saat ini.',
+        '',
+        'Kriteria aktif:',
+        '- Status database ACTIVE',
+        '- Masa aktif belum habis atau tanpa batas',
+        '',
+        `Dicek pada: ${formatDateTime(checkedAt)}`
+      ]),
+      mainMenu()
+    );
   }
 
   const pageSize = 10;
@@ -3292,12 +3332,22 @@ async function sendMyScPage(ctx, page = 0) {
   const safePage = Math.min(Math.max(0, Number(page) || 0), totalPages - 1);
   const startNo = safePage * pageSize;
   const chunk = regs.slice(startNo, startNo + pageSize);
-  const lines = chunk.map(
-    (r, i) =>
-      `${startNo + i + 1}. ${r.vps_ip}\n   Nama Client : ${normalizeClientName(r.client_name) || '-'}\n   Expired     : ${formatDateTime(r.expires_at)}\n   Status      : ${formatRemainingDays(r.expires_at)}`
-  );
-  const text = uiBox(`SC TERDAFTAR (PAGE ${safePage + 1}/${totalPages})`, [
-    `Total IP: ${total}`,
+  const lines = chunk.map((r, i) => {
+    const expiresAt = Number(r.expires_at || 0);
+    const unlimited = expiresAt <= 0;
+    return [
+      `${startNo + i + 1}. IP VPS       : ${normalizeHost(r.vps_ip) || '-'}`,
+      `   Nama Client  : ${normalizeClientName(r.client_name) || '-'}`,
+      '   Status       : AKTIF TERVERIFIKASI',
+      `   Jenis        : ${unlimited ? 'TANPA BATAS' : 'BERJANGKA'}`,
+      `   Aktif Sampai : ${unlimited ? 'tanpa batas' : formatDateTime(expiresAt)}`,
+      `   Sisa Aktif   : ${formatRemainingDays(expiresAt)}`
+    ].join('\n');
+  });
+  const text = uiBox(`INFO SC AKTIF (PAGE ${safePage + 1}/${totalPages})`, [
+    `Total SC aktif : ${total}`,
+    `Dicek pada     : ${formatDateTime(checkedAt)}`,
+    'Validasi       : status ACTIVE + masa aktif valid',
     'Maksimal 10 data per halaman.',
     '',
     ...lines
@@ -3425,6 +3475,19 @@ function adminIpKeyListKeyboard(page, totalPages) {
     if (nav.length) rows.push(nav);
   }
   rows.push([Markup.button.callback('Refresh', `m_admin_list_ip_keys_${p}`)]);
+  rows.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+function adminActiveScKeyboard(page, totalPages) {
+  const p = Math.max(0, Number(page) || 0);
+  const total = Math.max(1, Number(totalPages) || 1);
+  const rows = [];
+  const nav = [];
+  if (p > 0) nav.push(Markup.button.callback('Prev', `m_admin_active_sc_${p - 1}`));
+  if (p < total - 1) nav.push(Markup.button.callback('Next', `m_admin_active_sc_${p + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([Markup.button.callback('Refresh', `m_admin_active_sc_${p}`)]);
   rows.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
   return Markup.inlineKeyboard(rows);
 }
@@ -4775,6 +4838,52 @@ bot.action('m_admin_list_domains', async (ctx) => {
   if (!rows.length) return ctx.reply('Belum ada domain API tersimpan.', adminMenu());
   const lines = rows.map((r, i) => `${i + 1}. ${r.domain} (${Number(r.is_active) === 1 ? 'aktif' : 'nonaktif'})`);
   await ctx.reply(`Domain API:\n${lines.join('\n')}`, adminMenu());
+});
+
+bot.action(/m_admin_active_sc_(\d+)/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const requestedPage = Math.max(0, Number(ctx.match?.[1] || 0));
+  const dashboard = await getActiveScAdminDashboard(requestedPage, 10).catch(() => null);
+  if (!dashboard) {
+    return ctx.reply('Gagal membaca dashboard SC aktif.', adminMenu());
+  }
+  if (dashboard.total <= 0) {
+    return ctx.reply(
+      uiBox('DASHBOARD SC AKTIF', [
+        'Tidak ada SC aktif saat ini.',
+        '',
+        `Dicek pada: ${formatDateTime(dashboard.checkedAt)}`
+      ]),
+      adminMenu()
+    );
+  }
+
+  const startNo = dashboard.page * 10;
+  const lines = dashboard.rows.map((row, index) => {
+    const expiresAt = Number(row?.expires_at || 0);
+    const unlimited = expiresAt <= 0;
+    return [
+      `${startNo + index + 1}. User ID      : ${Number(row?.user_id || 0) || '-'}`,
+      `   IP VPS       : ${normalizeHost(row?.vps_ip || '') || '-'}`,
+      `   Nama Client  : ${normalizeClientName(row?.client_name) || '-'}`,
+      '   Status       : ACTIVE',
+      `   Jenis        : ${unlimited ? 'TANPA BATAS' : 'BERJANGKA'}`,
+      `   Aktif Sampai : ${unlimited ? 'tanpa batas' : formatDateTime(expiresAt)}`,
+      `   Sisa Aktif   : ${formatRemainingDays(expiresAt)}`
+    ].join('\n');
+  });
+  const limited = Math.max(0, dashboard.total - dashboard.unlimited);
+  const text = uiBox(`DASHBOARD SC AKTIF (PAGE ${dashboard.page + 1}/${dashboard.totalPages})`, [
+    `Total aktif       : ${dashboard.total}`,
+    `Lisensi berjangka : ${limited}`,
+    `Tanpa batas       : ${dashboard.unlimited}`,
+    `Habis <= 3 hari   : ${dashboard.expiringSoon}`,
+    `Dicek pada        : ${formatDateTime(dashboard.checkedAt)}`,
+    '',
+    ...lines
+  ]);
+  return ctx.reply(text, adminActiveScKeyboard(dashboard.page, dashboard.totalPages));
 });
 
 bot.action(/m_admin_list_ip_keys_(\d+)/, async (ctx) => {

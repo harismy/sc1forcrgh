@@ -99,6 +99,7 @@ set -euo pipefail
 #   EXPIRED_ACCOUNT_RETENTION_DAYS=30            (akun expired dihapus permanen setelah masa recovery)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=3             (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
+#   IPLIMIT_LOCK_HISTORY_RETENTION_DAYS=90       (opsional, retensi riwayat lock permanen)
 #   IPLIMIT_AUTO_LOCK_ENABLE=1                   (opsional, 1=auto lock aktif, 0=monitor only)
 #   QUOTA_LOCK_ENABLE=1                          (opsional, 1=lock akun saat quota habis)
 #   IPLIMIT_AUTO_TUNE=1                          (opsional, 1=otomatis tuning berbasis RAM/vCPU)
@@ -162,7 +163,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.10}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.11}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -234,6 +235,7 @@ AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-5}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
+IPLIMIT_LOCK_HISTORY_RETENTION_DAYS="${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS:-90}"
 IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}"
 QUOTA_LOCK_ENABLE="${QUOTA_LOCK_ENABLE:-1}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
@@ -987,6 +989,10 @@ auto_tune_iplimit_vars() {
   [[ -z "${UDPHC_LOG_LINES_CHECKER}" ]] && UDPHC_LOG_LINES_CHECKER="${profile_udphc_checker}"
 
   IPLIMIT_DEBUG="$(normalize_bool_01 "${IPLIMIT_DEBUG}")"
+  IPLIMIT_LOCK_HISTORY_RETENTION_DAYS="$(echo "${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS:-90}" | tr -cd '0-9')"
+  if [[ -z "${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS}" || "${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS}" -lt 7 || "${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS}" -gt 3650 ]]; then
+    IPLIMIT_LOCK_HISTORY_RETENTION_DAYS="90"
+  fi
   DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
   DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
   UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
@@ -3100,6 +3106,7 @@ UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+IPLIMIT_LOCK_HISTORY_RETENTION_DAYS=${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS}
 IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
 QUOTA_LOCK_ENABLE=${QUOTA_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
@@ -7339,6 +7346,11 @@ const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CH
   : 10;
 const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
+const LOCK_HISTORY_RETENTION_DAYS_RAW = Number(process.env.IPLIMIT_LOCK_HISTORY_RETENTION_DAYS || 90);
+const LOCK_HISTORY_RETENTION_DAYS = Number.isFinite(LOCK_HISTORY_RETENTION_DAYS_RAW)
+  ? Math.min(3650, Math.max(7, Math.floor(LOCK_HISTORY_RETENTION_DAYS_RAW)))
+  : 90;
+const LOCK_HISTORY_PRUNE_STATE_FILE = '/var/lib/sc-1forcr/iplimit-history-prune-at';
 const AUTO_LOCK_ENABLED = !/^(0|false|off|no)$/i.test(String(process.env.IPLIMIT_AUTO_LOCK_ENABLE || '1').trim());
 const LOCK_SECONDS = LOCK_MINUTES * 60;
 const SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW = Number(process.env.SSHWS_ACCOUNT_SESSION_HARD_LIMIT || 8);
@@ -9495,11 +9507,48 @@ async function enforceQuotaLimits() {
   return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
 
+async function pruneIpLimitLockHistory(nowTs) {
+  let lastPrune = 0;
+  try {
+    lastPrune = Number(String(fs.readFileSync(LOCK_HISTORY_PRUNE_STATE_FILE, 'utf8') || '').trim()) || 0;
+  } catch (_) {}
+  // Checker dapat berjalan tiap beberapa menit; pruning cukup sekali per 24 jam.
+  if (lastPrune > 0 && nowTs >= lastPrune && nowTs - lastPrune < 86400) return;
+
+  const cutoff = nowTs - (LOCK_HISTORY_RETENTION_DAYS * 86400);
+  let result;
+  try {
+    result = await run(
+      `DELETE FROM iplimit_lock_history
+       WHERE locked_at < ?
+         AND (unlocked_at IS NOT NULL OR locked_until < ?)`,
+      [cutoff, cutoff]
+    );
+  } catch (err) {
+    console.error(`[iplimit-history] pruning gagal: ${err?.message || err}`);
+    return;
+  }
+
+  try {
+    fs.mkdirSync(require('path').dirname(LOCK_HISTORY_PRUNE_STATE_FILE), { recursive: true });
+    const tmp = `${LOCK_HISTORY_PRUNE_STATE_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, `${nowTs}\n`, { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmp, LOCK_HISTORY_PRUNE_STATE_FILE);
+  } catch (err) {
+    console.error(`[iplimit-history] gagal menyimpan waktu pruning: ${err?.message || err}`);
+  }
+  const removed = Number(result?.changes || 0);
+  if (removed > 0 || IPLIMIT_DEBUG) {
+    console.log(`[iplimit-history] retention=${LOCK_HISTORY_RETENTION_DAYS}d removed=${removed}`);
+  }
+}
+
 async function cleanupExpiredGrace(nowTs) {
   await run("DELETE FROM temp_ip_lock_grace WHERE grace_until <= ?", [nowTs]).catch(() => {});
   // Bersihkan long-term IP history lebih dari 24 jam.
   const longTermCutoff = nowTs - (24 * 3600);
   await run("DELETE FROM temp_ip_long_history WHERE last_seen < ?", [longTermCutoff]).catch(() => {});
+  await pruneIpLimitLockHistory(nowTs);
 }
 
 async function enforceExpiredAccounts() {
@@ -11778,6 +11827,7 @@ SETTINGS_KEYS = [
     "RESOURCE_CAPACITY_STATE_FILE",
     "IPLIMIT_CHECK_INTERVAL_MINUTES",
     "IPLIMIT_LOCK_MINUTES",
+    "IPLIMIT_LOCK_HISTORY_RETENTION_DAYS",
     "IPLIMIT_AUTO_LOCK_ENABLE",
     "QUOTA_LOCK_ENABLE",
     "IPLIMIT_AUTO_TUNE",
@@ -12557,6 +12607,7 @@ SETTINGS_KEYS = [
     "RESOURCE_CAPACITY_STATE_FILE",
     "IPLIMIT_CHECK_INTERVAL_MINUTES",
     "IPLIMIT_LOCK_MINUTES",
+    "IPLIMIT_LOCK_HISTORY_RETENTION_DAYS",
     "IPLIMIT_AUTO_LOCK_ENABLE",
     "QUOTA_LOCK_ENABLE",
     "IPLIMIT_AUTO_TUNE",
@@ -14079,6 +14130,7 @@ AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}
 ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+IPLIMIT_LOCK_HISTORY_RETENTION_DAYS=${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS}
 IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
 QUOTA_LOCK_ENABLE=${QUOTA_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
@@ -19630,7 +19682,7 @@ monitor_temp_lock_menu() {
   history_count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='iplimit_lock_history';" 2>/dev/null || echo 0)"
   if [[ "${history_count}" == "1" ]]; then
     echo
-    echo "20 riwayat lock terbaru (tetap tersimpan setelah unlock):"
+    echo "20 riwayat lock terbaru (retensi ${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS:-90} hari):"
     sqlite3 -header -column "${DB_PATH}" "
       SELECT
         id,
@@ -21746,6 +21798,7 @@ Time     : $(date '+%F %T')"
     DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" \
     IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
     IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
+    IPLIMIT_LOCK_HISTORY_RETENTION_DAYS="${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS:-90}" \
     IPLIMIT_AUTO_LOCK_ENABLE="${IPLIMIT_AUTO_LOCK_ENABLE:-1}" \
     QUOTA_LOCK_ENABLE="${QUOTA_LOCK_ENABLE:-1}" \
     IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}" \
@@ -23315,7 +23368,7 @@ persist_pending_install_env() {
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE
     EXPIRED_ACCOUNT_RETENTION_DAYS
     AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES
-    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
+    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_LOCK_HISTORY_RETENTION_DAYS IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
     SSHWS_TCP_KEEPALIVE_SECONDS SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX

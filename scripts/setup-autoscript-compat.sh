@@ -167,7 +167,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.19}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.20}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -11433,8 +11433,8 @@ for alias_port in "${ports[@]:1}"; do
     continue
   fi
   established="$(ss -Htn state established 2>/dev/null | awk -v wanted="${alias_port}" '
-    function p(v,   s,n,a,port) { s=v; gsub(/^\[/,"",s); gsub(/\]$/,"",s); n=split(s,a,":"); port=a[n]; return (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535 ? port : ""); }
-    { local_ep=$3; if (p(local_ep) !~ /^[0-9]{1,5}$/) local_ep=$4; if (p(local_ep)==wanted) count++; }
+    function p(v,   s,n,a,port) { s=v; gsub(/^\[/,"",s); gsub(/\]$/,"",s); n=split(s,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port : ""); }
+    { local_ep=$3; if (p(local_ep)=="") local_ep=$4; if (p(local_ep)==wanted) count++; }
     END {print count+0}')"
   if [[ "${established}" == "0" ]]; then
     systemctl stop "${unit}" >/dev/null 2>&1 || true
@@ -13263,7 +13263,9 @@ lookback_h="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-24}" | tr -cd '0-9')"
 log_max="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
 state_dir="${SSH_LIVE_STATE_DIR:-/run/sc-1forcr}"
 state_file="${SSH_LIVE_STATE_FILE:-${state_dir}/ssh-live.map}"
+schema_file="${SSH_LIVE_SCHEMA_FILE:-${state_dir}/ssh-live.schema}"
 lock_file="${state_dir}/ssh-live.lock"
+tracker_schema="2"
 
 [[ -z "${dropbear_port}" ]] && dropbear_port="109"
 [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
@@ -13275,6 +13277,17 @@ chmod 700 "${state_dir}" >/dev/null 2>&1 || true
 exec 9>"${lock_file}"
 if command -v flock >/dev/null 2>&1; then
   flock -w 5 9 >/dev/null 2>&1 || exit 0
+fi
+
+stored_schema="$(tr -d '[:space:]' 2>/dev/null < "${schema_file}" || true)"
+if [[ "${stored_schema}" != "${tracker_schema}" ]]; then
+  # Versi lama dapat meninggalkan state kosong karena regex AWK tidak cocok.
+  # Paksa recovery journal penuh satu kali setelah tracker diperbarui.
+  rm -f -- "${state_file}" >/dev/null 2>&1 || true
+  schema_tmp="${schema_file}.$$"
+  printf '%s\n' "${tracker_schema}" > "${schema_tmp}"
+  chmod 600 "${schema_tmp}" >/dev/null 2>&1 || true
+  mv -f "${schema_tmp}" "${schema_file}" >/dev/null 2>&1 || true
 fi
 
 tmp_dir="$(mktemp -d "${state_dir}/ssh-live.XXXXXX")" || exit 0
@@ -13300,7 +13313,7 @@ ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_port}" -v p2="${d
   function port_of(v,   s,n,a,p) {
     s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
     n=split(s, a, ":"); p=a[n];
-    return (p ~ /^[0-9]{1,5}$/ ? p : "");
+    return (p ~ /^[0-9]+$/ && p+0>=1 && p+0<=65535 ? p : "");
   }
   function first_pid(line,   m) {
     if (match(line, /pid=[0-9]+/)) {
@@ -13378,7 +13391,7 @@ awk '
     if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
     src=$0; sub(/^.* from /, "", src); gsub(/[[:space:]]+$/, "", src);
     port=src; sub(/^.*:/, "", port); sub(/[^0-9].*$/, "", port);
-    if (port ~ /^[0-9]{1,5}$/) print "A|" port "|" get_pid($0) "|" u;
+    if (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535) print "A|" port "|" get_pid($0) "|" u;
     next;
   }
   /Exit \(|Exit before auth:/ {
@@ -13507,7 +13520,9 @@ state_file="${XRAY_LIVE_STATE_FILE:-${state_dir}/xray-live.map}"
 cursor_file="${XRAY_LIVE_CURSOR_FILE:-${state_dir}/xray-live.cursor}"
 native_cache_file="${XRAY_LIVE_NATIVE_CACHE_FILE:-${state_dir}/xray-live.native}"
 native_support_file="${XRAY_LIVE_NATIVE_SUPPORT_FILE:-${state_dir}/xray-live.native-support}"
+schema_file="${XRAY_LIVE_SCHEMA_FILE:-${state_dir}/xray-live.schema}"
 lock_file="${state_dir}/xray-live.lock"
+tracker_schema="2"
 
 [[ -z "${recovery_h}" || "${recovery_h}" -lt 1 || "${recovery_h}" -gt 168 ]] && recovery_h="72"
 [[ -z "${log_max}" || "${log_max}" -lt 2000 || "${log_max}" -gt 100000 ]] && log_max="30000"
@@ -13518,6 +13533,17 @@ chmod 700 "${state_dir}" >/dev/null 2>&1 || true
 exec 9>"${lock_file}"
 if command -v flock >/dev/null 2>&1; then
   flock -w 2 9 >/dev/null 2>&1 || exit 0
+fi
+
+stored_schema="$(tr -d '[:space:]' 2>/dev/null < "${schema_file}" || true)"
+if [[ "${stored_schema}" != "${tracker_schema}" ]]; then
+  # Cursor V.1FSC.19 mungkin sudah maju saat mapping port gagal. Hapus hanya
+  # state runtime agar helper melakukan recovery access.log penuh satu kali.
+  rm -f -- "${state_file}" "${cursor_file}" "${native_cache_file}" >/dev/null 2>&1 || true
+  schema_tmp="${schema_file}.$$"
+  printf '%s\n' "${tracker_schema}" > "${schema_tmp}"
+  chmod 600 "${schema_tmp}" >/dev/null 2>&1 || true
+  mv -f "${schema_tmp}" "${schema_file}" >/dev/null 2>&1 || true
 fi
 
 tmp_dir="$(mktemp -d "${state_dir}/xray-live.XXXXXX")" || exit 0
@@ -13595,7 +13621,7 @@ awk -v recovery="${recovery_scan}" -v cutoff="${recovery_cutoff}" '
     if (v ~ /^\[/) sub(/^.*\]:/, "", v);
     else sub(/^.*:/, "", v);
     p=v; sub(/[^0-9].*$/, "", p);
-    return (p ~ /^[0-9]{1,5}$/ ? p : "");
+    return (p ~ /^[0-9]+$/ && p+0>=1 && p+0<=65535 ? p : "");
   }
   function source_host(v, h) {
     v=trim(v);
@@ -13645,7 +13671,7 @@ ss -Htnp state established 2>/dev/null | awk '
   function port_of(v, s,n,a,p) {
     s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
     n=split(s, a, ":"); p=a[n];
-    return (p ~ /^[0-9]{1,5}$/ ? p : "");
+    return (p ~ /^[0-9]+$/ && p+0>=1 && p+0<=65535 ? p : "");
   }
   function first_pid(line, p) {
     if (match(line, /pid=[0-9]+/)) {
@@ -13668,7 +13694,8 @@ ss -Htnp state established 2>/dev/null | awk '
     if (lp in proto) client=rp;
     else if (rp in proto) { client=lp; lp=rp; }
     else next;
-    if (client ~ /^[0-9]{1,5}$/) print client "|" pid "|" proto[lp];
+    if (client ~ /^[0-9]+$/ && client+0>=1 && client+0<=65535)
+      print client "|" pid "|" proto[lp];
   }
 ' | sort -t'|' -k1,1n -k3,3 -u > "${active_map}" || true
 
@@ -14099,15 +14126,15 @@ ssh_users="$(
       function p(v,   s,n,a,port) {
         s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
         n=split(s, a, ":"); port=a[n];
-        if (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535) return port;
+        if (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535) return port;
         return "";
       }
       {
         l=$3; r=$4;
         if (p(l)=="" || p(r)=="") { l=$4; r=$5; }
         lp=p(l); rp=p(r);
-        if (lp==p1 || lp==p2) { if (rp ~ /^[0-9]{1,5}$/) act[rp]=1; }
-        else if (rp==p1 || rp==p2) { if (lp ~ /^[0-9]{1,5}$/) act[lp]=1; }
+        if (lp==p1 || lp==p2) { if (rp ~ /^[0-9]+$/ && rp+0>=1 && rp+0<=65535) act[rp]=1; }
+        else if (rp==p1 || rp==p2) { if (lp ~ /^[0-9]+$/ && lp+0>=1 && lp+0<=65535) act[lp]=1; }
       }
       END { for (k in act) print k; }' > "${tmp_db_ports}" || true
     if [[ -s "${tmp_db_ports}" ]]; then
@@ -21667,7 +21694,7 @@ show_combined_online() {
       gsub(/^\[/, "", s); gsub(/\]$/, "", s);
       n=split(s, a, ":");
       port=a[n];
-      if (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535) return port;
+      if (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535) return port;
       return "";
     }
     {
@@ -21675,9 +21702,9 @@ show_combined_online() {
       if (p(l)=="" || p(r)=="") { l=$4; r=$5; }
       lp=p(l); rp=p(r);
       if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
-        if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
+        if (rp ~ /^[0-9]+$/ && rp+0>=1 && rp+0<=65535) act[rp]=1;
       } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
-        if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
+        if (lp ~ /^[0-9]+$/ && lp+0>=1 && lp+0<=65535) act[lp]=1;
       }
     }
     END { for (k in act) print k; }' > "${tmp_db_ports}" || true
@@ -21697,7 +21724,7 @@ show_combined_online() {
         return (t=="127.0.0.1" || t=="::1" || t=="localhost");
       }
       function sess_key(u, ip, port) {
-        if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
+        if (is_loopback_ip(ip) && port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535) return u "|port:" port;
         return u "|ip:" ip;
       }
       function parse_pid(line,   p) {
@@ -21725,7 +21752,7 @@ show_combined_online() {
         ip=norm_ip(ip);
         sub(/^.*:/, "", port);
         if (ip == "") next;
-        if (port !~ /^[0-9]{1,5}$/) next;
+        if (port !~ /^[0-9]+$/ || port+0<1 || port+0>65535) next;
         if (!(port in ap)) next;
         k=sess_key(u, ip, port);
         if (pid != "") {
@@ -21781,7 +21808,7 @@ show_combined_online() {
       return (t=="127.0.0.1" || t=="::1" || t=="localhost");
     }
     function sess_key(u, ip, port) {
-      if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
+      if (is_loopback_ip(ip) && port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535) return u "|port:" port;
       return u "|ip:" ip;
     }
     function parse_pid(line,   p) {
@@ -21808,7 +21835,7 @@ show_combined_online() {
       port=src;
       sub(/^.*:/, "", port);
       if (ip == "") next;
-      if (port !~ /^[0-9]{1,5}$/) next;
+      if (port !~ /^[0-9]+$/ || port+0<1 || port+0>65535) next;
       k=sess_key(u, ip, port);
       if (pid != "") {
         auth_by_pid[pid]=k;
@@ -21992,7 +22019,7 @@ show_ssh_only_online() {
         gsub(/^\[/, "", s); gsub(/\]$/, "", s);
         n=split(s, a, ":");
         port=a[n];
-        if (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535) return port;
+        if (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535) return port;
         return "";
       }
       {
@@ -22000,9 +22027,9 @@ show_ssh_only_online() {
         if (p(l)=="" || p(r)=="") { l=$4; r=$5; }
         lp=p(l); rp=p(r);
         if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
-          if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
+          if (rp ~ /^[0-9]+$/ && rp+0>=1 && rp+0<=65535) act[rp]=1;
         } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
-          if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
+          if (lp ~ /^[0-9]+$/ && lp+0>=1 && lp+0<=65535) act[lp]=1;
         }
       }
       END { for (k in act) print k; }' > "${tmp_db_ports}" || true
@@ -22072,7 +22099,7 @@ show_ssh_only_online() {
       function p(v,   s,n,a,port) {
         s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
         n=split(s, a, ":"); port=a[n];
-        if (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535) return port;
+        if (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535) return port;
         return "";
       }
       {

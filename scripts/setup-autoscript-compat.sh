@@ -163,7 +163,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.13}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.14}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -12942,12 +12942,14 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
+SSH_HC_AUTH_LOOKBACK_HOURS="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-24}" | tr -cd '0-9')"
 ZIVPN_HANDOFF_GRACE_SECONDS="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
 ONLINE_NOTIFY_STATE_FILE="/var/lib/sc-1forcr/online-notify.last"
 ONLINE_NOTIFY_LIVE_STATE_FILE="${ONLINE_NOTIFY_LIVE_STATE_FILE:-/var/lib/sc-1forcr/online-live.env}"
 ONLINE_NOTIFY_STATE_ONLY="${ONLINE_NOTIFY_STATE_ONLY:-0}"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 [[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
+[[ -z "${SSH_HC_AUTH_LOOKBACK_HOURS}" || "${SSH_HC_AUTH_LOOKBACK_HOURS}" -lt 1 || "${SSH_HC_AUTH_LOOKBACK_HOURS}" -gt 168 ]] && SSH_HC_AUTH_LOOKBACK_HOURS="24"
 [[ -z "${ZIVPN_HANDOFF_GRACE_SECONDS}" || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -lt 3 || "${ZIVPN_HANDOFF_GRACE_SECONDS}" -gt 120 ]] && ZIVPN_HANDOFF_GRACE_SECONDS="90"
 
 if [[ "${ONLINE_NOTIFY_ENABLE}" != "1" && "${ONLINE_NOTIFY_STATE_ONLY}" != "1" ]]; then
@@ -13153,7 +13155,7 @@ ssh_users="$(
       }
       END { for (k in act) print k; }' > "${tmp_db_ports}" || true
     if [[ -s "${tmp_db_ports}" ]]; then
-      journalctl -u dropbear --since "-30 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" --no-pager 2>/dev/null | awk '
+      journalctl -u dropbear --since "-${SSH_HC_AUTH_LOOKBACK_HOURS} hours" -n "${DROPBEAR_LOG_MAX_LINES:-12000}" --no-pager 2>/dev/null | awk '
         NR==FNR { ap[$1]=1; next }
         /auth succeeded for /{
           u=$0;
@@ -13166,9 +13168,12 @@ ssh_users="$(
           src=$0; sub(/^.* from /, "", src); gsub(/[[:space:]]+$/, "", src);
           port=src; sub(/^.*:/, "", port);
           if (!(port in ap)) next;
-          c[u]++;
+          last_user[port]=u;
         }
-        END { for (u in c) print u, c[u]; }' "${tmp_db_ports}" - > "${tmp_recent}" || true
+        END {
+          for (port in last_user) c[last_user[port]]++;
+          for (u in c) print u, c[u];
+        }' "${tmp_db_ports}" - > "${tmp_recent}" || true
       if [[ -s "${tmp_recent}" ]]; then
         awk '{ printf "%s(%d)\n", $1, ($2+0) }' "${tmp_recent}" | sort
         exit 0
@@ -13222,10 +13227,10 @@ if [[ "${ssh_cnt}" -eq 0 ]]; then
       }
       /Exit \(|Exit before auth:/{
         pid=parse_pid($0);
-        if (pid != "") closed_pid[pid]=1;
+        if (pid != "") delete auth_by_pid[pid];
       }
       END{
-        for (pid in auth_by_pid) if (!(pid in closed_pid)) seen[auth_by_pid[pid]]++;
+        for (pid in auth_by_pid) seen[auth_by_pid[pid]]++;
         for (u in auth_no_pid) seen[u]++;
         for (u in seen) printf "%s(%d)\n", u, seen[u];
       }' | sort
@@ -13276,7 +13281,10 @@ if [[ -f /var/log/xray/access.log ]]; then
         u=clean(tolower(u))
         src=norm_ip(src)
         if (u !~ /^[a-z0-9._-]+$/) next
-        if (src == "" || src == "127.0.0.1" || src == "::1") next
+        # Xray WS/gRPC berada di belakang nginx/HAProxy, sehingga source yang
+        # terlihat dapat berupa loopback. Tetap hitung user sebagai aktivitas
+        # online, tetapi jangan gunakan data ini untuk memasang firewall lock.
+        if (src == "") src="proxy-local"
         key=u "|" src
         seen[key]=1
       }
@@ -14416,7 +14424,7 @@ SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
 SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
 SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
 SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
-XRAY_MONITOR_ACTIVE_WINDOW_SECONDS="${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-15}"
+XRAY_MONITOR_ACTIVE_WINDOW_SECONDS="${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-300}"
 XRAY_MONITOR_RECENT_WINDOW_MINUTES="${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
@@ -14433,7 +14441,7 @@ UDPHC_LOG_LINES_CHECKER="$(echo "${UDPHC_LOG_LINES_CHECKER:-6000}" | tr -cd '0-9
   xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
   xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
   xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
-xray_monitor_active_window_sec="$(echo "${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-15}" | tr -cd '0-9')"
+xray_monitor_active_window_sec="$(echo "${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
 xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
 [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
@@ -14443,7 +14451,7 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
   [[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="5"
   [[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="60"
   [[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="2"
-[[ -z "${xray_monitor_active_window_sec}" || "${xray_monitor_active_window_sec}" -lt 5 || "${xray_monitor_active_window_sec}" -gt 120 ]] && xray_monitor_active_window_sec="15"
+[[ -z "${xray_monitor_active_window_sec}" || "${xray_monitor_active_window_sec}" -lt 30 || "${xray_monitor_active_window_sec}" -gt 3600 ]] && xray_monitor_active_window_sec="300"
 [[ -z "${xray_monitor_recent_window_min}" || "${xray_monitor_recent_window_min}" -lt 1 || "${xray_monitor_recent_window_min}" -gt 60 ]] && xray_monitor_recent_window_min="5"
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
@@ -20955,7 +20963,7 @@ show_ssh_online_history() {
 
 show_ssh_only_online() {
   local tmp_status tmp_ip_count tmp_db_ports tmp_proc_count tmp_db_pids
-  local dropbear_main_port dropbear_alt_port db_recent_log_max source_mode
+  local dropbear_main_port dropbear_alt_port db_recent_log_max hc_auth_lookback_h source_mode
   tmp_status="$(mktemp)"
   tmp_ip_count="$(mktemp)"
   tmp_db_ports="$(mktemp)"
@@ -20969,6 +20977,7 @@ show_ssh_only_online() {
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
   [[ -z "${db_recent_log_max}" || "${db_recent_log_max}" -lt 500 ]] && db_recent_log_max="5000"
+  hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
   source_mode="REALTIME_AUTH_120S"
 
   : > "${tmp_ip_count}"
@@ -21043,7 +21052,7 @@ show_ssh_only_online() {
       END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
     if [[ -s "${tmp_db_ports}" ]]; then
-      journalctl -u dropbear --since "-30 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES:-12000}" --no-pager 2>/dev/null | awk '
         NR==FNR { ap[$1]=1; next }
         /auth succeeded for /{
           u=$0;
@@ -21103,10 +21112,10 @@ show_ssh_only_online() {
   if [[ ! -s "${tmp_ip_count}" ]]; then
     source_mode="REALTIME_DROPBEAR_PID"
     : > "${tmp_db_pids}"
-    ss -Htnp state established 2>/dev/null | awk '
+    ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
       {
         lp=$4; rp=$5;
-        if (lp ~ /:109$/ || lp ~ /:143$/ || rp ~ /:109$/ || rp ~ /:143$/) {
+        if (lp ~ (":" p1 "$") || lp ~ (":" p2 "$") || rp ~ (":" p1 "$") || rp ~ (":" p2 "$") ) {
           s=$0;
           while (match(s, /pid=[0-9]+/)) {
             pid=substr(s, RSTART+4, RLENGTH-4);
@@ -21117,7 +21126,7 @@ show_ssh_only_online() {
       }' | sort -u > "${tmp_db_pids}" || true
 
     if [[ -s "${tmp_db_pids}" ]]; then
-      journalctl -u dropbear --since "-30 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
+      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES:-12000}" --no-pager 2>/dev/null | awk '
         NR==FNR { ap[$1]=1; next }
         function parse_pid(line,   p) {
           if (match(line, /\[[0-9]+\]/)) {

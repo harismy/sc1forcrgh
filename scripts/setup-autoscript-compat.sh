@@ -117,6 +117,8 @@ set -euo pipefail
 #   XRAY_RECENT_WINDOW_MINUTES=60                (opsional, jendela menit log xray untuk hitung multi-login)
 #   XRAY_ACTIVE_WINDOW_SECONDS=600               (opsional, jendela detik untuk IP aktif xray)
 #   XRAY_MIN_HITS_PER_IP=1                       (opsional, minimal hit/log per IP pada jendela aktif)
+#   Catatan monitor Xray: socket aktif bukan jumlah perangkat. IP loopback proxy
+#   tidak pernah dihitung sebagai IP pengguna.
 #   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_VLESS=/vless                      (opsional, multi path dipisah koma)
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
@@ -167,7 +169,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.20}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.21}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -1765,6 +1767,28 @@ CREATE TABLE IF NOT EXISTS account_quota_locks (
   locked_at INTEGER DEFAULT (strftime('%s','now')),
   PRIMARY KEY (account_type, username)
 );
+
+-- Fondasi migrasi credential per perangkat. Slot 0 adalah credential legacy
+-- yang sudah dipakai user; slot perangkat baru belum diaktifkan otomatis.
+CREATE TABLE IF NOT EXISTS xray_device_slots (
+  account_type TEXT NOT NULL,
+  username TEXT NOT NULL,
+  slot_no INTEGER NOT NULL DEFAULT 0,
+  client_email TEXT NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'LEGACY',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (account_type, username, slot_no),
+  UNIQUE (account_type, client_email)
+);
+
+INSERT OR IGNORE INTO xray_device_slots(account_type, username, slot_no, client_email, mode)
+  SELECT 'vmess', LOWER(username), 0, LOWER(username), 'LEGACY' FROM account_vmesses WHERE TRIM(COALESCE(username,''))<>'';
+INSERT OR IGNORE INTO xray_device_slots(account_type, username, slot_no, client_email, mode)
+  SELECT 'vless', LOWER(username), 0, LOWER(username), 'LEGACY' FROM account_vlesses WHERE TRIM(COALESCE(username,''))<>'';
+INSERT OR IGNORE INTO xray_device_slots(account_type, username, slot_no, client_email, mode)
+  SELECT 'trojan', LOWER(username), 0, LOWER(username), 'LEGACY' FROM account_trojans WHERE TRIM(COALESCE(username,''))<>'';
 
 DELETE FROM servers;
 INSERT OR IGNORE INTO servers("key") VALUES('${API_AUTH_TOKEN}');
@@ -7364,6 +7388,7 @@ write_iplimit_checker() {
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
 
@@ -8031,9 +8056,15 @@ function addPortToUserMap(map, username, port) {
 function extractIp(raw) {
   let v = String(raw || '').trim();
   if (!v) return '';
-  v = v.replace(/^\[/, '').replace(/\]$/, '');
-  v = v.replace(/:[0-9]+$/, '');
-  return v;
+  // Format access log Xray dapat berupa 127.0.0.1:1234,
+  // tcp:127.0.0.1:1234, [IPv6]:1234, atau tcp:[IPv6]:1234.
+  v = v.replace(/^(?:tcp|udp):/i, '');
+  const bracket = v.match(/^\[([^\]]+)\](?::[0-9]+)?$/);
+  if (bracket && net.isIP(bracket[1])) return bracket[1].toLowerCase();
+  if (net.isIP(v)) return v.toLowerCase();
+  const hostPort = v.match(/^(.+):([0-9]+)$/);
+  if (hostPort && net.isIP(hostPort[1])) return hostPort[1].toLowerCase();
+  return '';
 }
 
 function extractPort(raw) {
@@ -8045,7 +8076,17 @@ function extractPort(raw) {
 
 function isLoopbackIp(ip) {
   const v = String(ip || '').trim().toLowerCase();
-  return v === '127.0.0.1' || v === '::1' || v === 'localhost';
+  if (!v) return false;
+  if (v === '::1' || v === 'localhost') return true;
+  if (/^127(?:\.|$)/.test(v)) return true;
+  return /^::ffff:127(?:\.|$)/.test(v);
+}
+
+function isUsableClientIp(ip) {
+  const v = String(ip || '').trim().toLowerCase();
+  if (!v || net.isIP(v) === 0 || isLoopbackIp(v)) return false;
+  if (v === '0.0.0.0' || v === '::') return false;
+  return true;
 }
 
 function getDropbearPortSet() {
@@ -8566,10 +8607,13 @@ function parseXrayRecentIpMap() {
     const email = String(emailJson?.[1] || emailTxt?.[1] || '').trim().toLowerCase();
     if (!email) continue;
     const srcJson = line.match(/"source":"([^"]+)"/);
-    const srcTxt = line.match(/\bfrom\s+([0-9a-fA-F\.:]+)/i);
+    const srcTxt = line.match(/\bfrom\s+([^\s]+)/i);
     const src = String(srcJson?.[1] || srcTxt?.[1] || '').trim();
     const ip = extractIp(src);
-    if (!ip) continue;
+    // Nginx/HAProxy lokal membuat Xray melihat 127.0.0.1. Alamat itu hanya
+    // membuktikan adanya socket proxy, bukan IP/perangkat pengguna, sehingga
+    // tidak boleh masuk hitungan multi-login atau rule firewall.
+    if (!isUsableClientIp(ip)) continue;
     const lastSeen = Number.isFinite(ts) && ts > 0 ? ts : nowMs;
     if (!userIpStats.has(email)) userIpStats.set(email, new Map());
     const ipMap = userIpStats.get(email);
@@ -9130,6 +9174,30 @@ async function ensureTables() {
     last_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username, ip)
   )`).catch(() => {});
+  await run(`CREATE TABLE IF NOT EXISTS xray_device_slots (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    slot_no INTEGER NOT NULL DEFAULT 0,
+    client_email TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'LEGACY',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username, slot_no),
+    UNIQUE (account_type, client_email)
+  )`).catch(() => {});
+  for (const item of [
+    ['vmess', 'account_vmesses'],
+    ['vless', 'account_vlesses'],
+    ['trojan', 'account_trojans']
+  ]) {
+    await run(
+      `INSERT OR IGNORE INTO xray_device_slots(account_type, username, slot_no, client_email, mode)
+       SELECT ?, LOWER(username), 0, LOWER(username), 'LEGACY'
+       FROM ${item[1]} WHERE TRIM(COALESCE(username,''))<>''`,
+      [item[0]]
+    ).catch(() => {});
+  }
 }
 
 async function createIpLimitLockHistory(data) {
@@ -13522,7 +13590,7 @@ native_cache_file="${XRAY_LIVE_NATIVE_CACHE_FILE:-${state_dir}/xray-live.native}
 native_support_file="${XRAY_LIVE_NATIVE_SUPPORT_FILE:-${state_dir}/xray-live.native-support}"
 schema_file="${XRAY_LIVE_SCHEMA_FILE:-${state_dir}/xray-live.schema}"
 lock_file="${state_dir}/xray-live.lock"
-tracker_schema="2"
+tracker_schema="3"
 
 [[ -z "${recovery_h}" || "${recovery_h}" -lt 1 || "${recovery_h}" -gt 168 ]] && recovery_h="72"
 [[ -z "${log_max}" || "${log_max}" -lt 2000 || "${log_max}" -gt 100000 ]] && log_max="30000"
@@ -13625,12 +13693,15 @@ awk -v recovery="${recovery_scan}" -v cutoff="${recovery_cutoff}" '
   }
   function source_host(v, h) {
     v=trim(v);
+    sub(/^(tcp|udp):/, "", v);
     if (v ~ /^\[/) {
-      h=v; sub(/^\[/, "", h); sub(/\]:[0-9]+$/, "", h);
+      h=v; sub(/^\[/, "", h); sub(/\](:[0-9]+)?$/, "", h);
     } else {
       h=v; sub(/:[0-9]+$/, "", h);
     }
-    if (h=="127.0.0.1" || h=="::1" || h=="localhost" || h=="") return "-";
+    h=tolower(h);
+    if (h=="" || h=="::" || h=="::1" || h=="localhost") return "-";
+    if (h ~ /^127(\.|$)/ || h ~ /^::ffff:127(\.|$)/) return "-";
     return h;
   }
   {
@@ -13831,16 +13902,55 @@ case "${mode}" in
     ;;
   rows)
     awk -F'|' '
+      function usable_ip(v) {
+        v=tolower(v);
+        if (v=="" || v=="-" || v=="::" || v=="::1" || v=="localhost") return 0;
+        if (v ~ /^(tcp|udp):/) return 0;
+        if (v ~ /^127(\.|$)/ || v ~ /^::ffff:127(\.|$)/) return 0;
+        return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || v ~ /^[0-9a-f:]+$/);
+      }
       $1 ~ /^(vmess|vless|trojan)$/ && $2 ~ /^[a-z0-9._-]+$/ && $3!="" {
         sk=$1 SUBSEP $2 SUBSEP $3;
         if (sk in session_seen) next;
         session_seen[sk]=1; key=$1 SUBSEP $2; count[key]++;
-        if ($4!="" && $4!="-") lastip[key]=$4;
+        if (usable_ip($4)) lastip[key]=$4;
       }
       END {
         for (key in count) {
           split(key, a, SUBSEP);
-          printf "%s|%s|%d|%s\n", a[1], a[2], count[key], (key in lastip ? lastip[key] : "-");
+          printf "%s|%s|%d|%s\n", a[1], a[2], count[key], (key in lastip ? lastip[key] : "TIDAK_TERDETEKSI");
+        }
+      }
+    ' "${all_sessions}" | sort -t'|' -k1,1 -k2,2
+    ;;
+  rows-v2)
+    # proto|username|socket_aktif|ip_terverifikasi|last_ip|visibility
+    # Socket hanya indikator aktivitas. Multi-login harus memakai IP sumber
+    # non-loopback atau credential slot, bukan jumlah socket.
+    awk -F'|' '
+      function usable_ip(v) {
+        v=tolower(v);
+        if (v=="" || v=="-" || v=="::" || v=="::1" || v=="localhost") return 0;
+        if (v ~ /^(tcp|udp):/) return 0;
+        if (v ~ /^127(\.|$)/ || v ~ /^::ffff:127(\.|$)/) return 0;
+        return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || v ~ /^[0-9a-f:]+$/);
+      }
+      $1 ~ /^(vmess|vless|trojan)$/ && $2 ~ /^[a-z0-9._-]+$/ && $3!="" {
+        key=$1 SUBSEP $2; sk=key SUBSEP $3;
+        if (!(sk in session_seen)) { session_seen[sk]=1; sockets[key]++; }
+        if (usable_ip($4)) {
+          ik=key SUBSEP tolower($4);
+          if (!(ik in ip_seen)) { ip_seen[ik]=1; ips[key]++; }
+          lastip[key]=$4;
+        }
+      }
+      END {
+        for (key in sockets) {
+          split(key, a, SUBSEP);
+          ipc=(key in ips ? ips[key] : 0);
+          lip=(key in lastip ? lastip[key] : "TIDAK_TERDETEKSI");
+          visibility=(ipc > 0 ? "SOURCE_IP" : "PROXY_LOCAL");
+          printf "%s|%s|%d|%d|%s|%s\n", a[1], a[2], sockets[key], ipc, lip, visibility;
         }
       }
     ' "${all_sessions}" | sort -t'|' -k1,1 -k2,2
@@ -14298,7 +14408,7 @@ if [[ "${xray_tracker_ready}" != "1" && -f /var/log/xray/access.log ]]; then
 fi
 xray_monitor_mode="LOG_WINDOW_${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}S"
 if [[ "${xray_tracker_ready}" == "1" ]]; then
-  xray_monitor_mode="REALTIME_STATEFUL_SOCKET"
+  xray_monitor_mode="REALTIME_SOCKET_OBSERVE"
 fi
 
 udphc_service="$(detect_udphc_service)"
@@ -14488,7 +14598,7 @@ RINGKASAN AKUN AKTIF
 
 ONLINE TERDETEKSI
 $(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}" "SESI")
-$(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}" "SESI")
+$(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}" "SOCKET")
 $(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}" "SESI")
 $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}" "IP")
 "
@@ -22242,13 +22352,25 @@ xray_log_snapshot() {
     : > "${dst}"
     return
   fi
+  # Output: username|socket_aktif|ip_terverifikasi|last_ip|visibility.
+  # Fallback log tidak mengetahui jumlah socket kernel, sehingga kolom socket=0.
   tail -n 5000 /var/log/xray/access.log | awk -v cutoff="${cutoff_ts}" -v active_cutoff="${active_cutoff_ts}" -v min_hits="${xray_min_hits_per_ip}" '
     function norm_ip(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
-      gsub(/^\[/, "", v);
-      gsub(/\]$/, "", v);
-      sub(/:[0-9]+$/, "", v);
-      return v;
+      sub(/^(tcp|udp):/, "", v);
+      if (v ~ /^\[/) {
+        sub(/^\[/, "", v);
+        sub(/\](:[0-9]+)?$/, "", v);
+      } else {
+        sub(/:[0-9]+$/, "", v);
+      }
+      return tolower(v);
+    }
+    function usable_ip(v) {
+      v=tolower(v);
+      if (v=="" || v=="::" || v=="::1" || v=="localhost") return 0;
+      if (v ~ /^127(\.|$)/ || v ~ /^::ffff:127(\.|$)/) return 0;
+      return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || v ~ /^[0-9a-f:]+$/);
     }
     function ts_from_line(line, stamp, ts) {
       if (line !~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return 0;
@@ -22274,7 +22396,7 @@ xray_log_snapshot() {
 
       if (match($0, /"source":"[^"]+"/)) {
         src=substr($0, RSTART+10, RLENGTH-11);
-      } else if (match($0, /from[[:space:]]+[0-9a-fA-F\.:]+/)) {
+      } else if (match($0, /from[[:space:]]+[^[:space:]]+/)) {
         t=substr($0, RSTART, RLENGTH); sub(/from[[:space:]]+/, "", t); src=t;
       }
 
@@ -22284,7 +22406,8 @@ xray_log_snapshot() {
       if (email !~ /^[a-z0-9._-]+$/) next;
 
       ip=norm_ip(src);
-      if (ip == "") next;
+      seen[email]=1;
+      if (!usable_ip(ip)) next;
       key=email "|" ip;
       hits[key]++;
       if (!(key in last_ts) || ts > last_ts[key]) last_ts[key]=ts;
@@ -22292,7 +22415,6 @@ xray_log_snapshot() {
         latest_ts[email]=ts;
         lastip[email]=ip;
       }
-      seen[email]=1;
     }
     END {
       for (k in hits) {
@@ -22309,7 +22431,9 @@ xray_log_snapshot() {
         if (raw >= 1 && raw <= 2) cnt=1;
         else if (raw >= 3 && raw <= 4) cnt=2;
         else cnt=raw;
-        printf "%s|%d|%s\n", u, cnt, (u in lastip ? lastip[u] : "-");
+        lip=(u in lastip ? lastip[u] : "TIDAK_TERDETEKSI");
+        visibility=(cnt > 0 ? "SOURCE_IP" : "PROXY_LOCAL");
+        printf "%s|0|%d|%s|%s\n", u, cnt, lip, visibility;
       }
     }' > "${dst}"
 }
@@ -22328,7 +22452,16 @@ show_xray_online_by_table() {
     *) protocol="" ;;
   esac
 
-  sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY LOWER(username);" > "${t_users}" 2>/dev/null || true
+  sqlite3 "${DB_PATH}" "
+    SELECT LOWER(a.username) || '|' || UPPER(TRIM(COALESCE(a.status,''))) || '|' ||
+           CAST(COALESCE(a.limitip,0) AS INTEGER) || '|' ||
+           CASE WHEN EXISTS (
+             SELECT 1 FROM xray_device_slots d
+             WHERE d.account_type='${protocol}' AND LOWER(d.username)=LOWER(a.username)
+               AND d.enabled=1 AND d.slot_no>0 AND UPPER(d.mode)='DEVICE'
+           ) THEN 'DEVICE_SLOT' ELSE 'LEGACY' END
+    FROM ${table} a ORDER BY LOWER(a.username);
+  " > "${t_users}" 2>/dev/null || true
   if [[ ! -s "${t_users}" ]]; then
     draw_menu_header "${label} ONLINE"
     echo "Tidak ada akun ${label} di DB."
@@ -22338,13 +22471,13 @@ show_xray_online_by_table() {
   source_mode="LOG_WINDOW_FALLBACK"
   tracker_ready="0"
   if [[ -n "${protocol}" && -x /usr/local/sbin/sc-1forcr-xray-live ]]; then
-    if /usr/local/sbin/sc-1forcr-xray-live rows 2>/dev/null | awk -F'|' -v proto="${protocol}" '
-      $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ {
-        print $2 "|" $3 "|" ($4!="" ? $4 : "-");
+    if /usr/local/sbin/sc-1forcr-xray-live rows-v2 2>/dev/null | awk -F'|' -v proto="${protocol}" '
+      $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+        print $2 "|" $3 "|" $4 "|" ($5!="" ? $5 : "TIDAK_TERDETEKSI") "|" ($6!="" ? $6 : "PROXY_LOCAL");
       }
     ' > "${t_seen}"; then
       tracker_ready="1"
-      source_mode="REALTIME_STATEFUL_SOCKET"
+      source_mode="REALTIME_SOCKET_OBSERVE"
     fi
   fi
   if [[ "${tracker_ready}" != "1" ]]; then
@@ -22356,36 +22489,48 @@ show_xray_online_by_table() {
     echo "Tidak ada sesi ${label} yang sedang aktif."
     echo
     echo "Total User ${label} : 0"
-    echo "Total Sesi ${label} : 0"
+    echo "Total Socket ${label} : 0"
+    echo "Total IP Terlihat ${label} : 0"
     return
   fi
 
-  printf "%-24s %-12s %-10s %-13s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "SESI_AKTIF" "LAST_IP"
-  printf "%-24s %-12s %-10s %-13s %-22s\n" "------------------------" "------------" "----------" "-------------" "----------------------"
+  printf "%-20s %-10s %-8s %-11s %-12s %-9s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "MODE" "SOCKET_AKTIF" "IP_AKTIF" "LAST_IP"
+  printf "%-20s %-10s %-8s %-11s %-12s %-9s %-22s\n" "--------------------" "----------" "--------" "-----------" "------------" "---------" "----------------------"
   awk -F'|' '
     NR==FNR {
       db_status[$1]=$2;
       db_limit[$1]=($3 ~ /^[0-9]+$/ ? $3 + 0 : 0);
+      db_mode[$1]=($4!="" ? $4 : "LEGACY");
       next
     }
     {
       u=$1;
-      c=($2 ~ /^[0-9]+$/ ? $2 + 0 : 0);
-      lip=$3;
+      sockets=($2 ~ /^[0-9]+$/ ? $2 + 0 : 0);
+      ipc=($3 ~ /^[0-9]+$/ ? $3 + 0 : 0);
+      lip=$4;
+      visibility=$5;
       if (!(u in db_status)) next;
       s=db_status[u];
       l=(u in db_limit ? db_limit[u] : 0);
+      cm=(u in db_mode ? db_mode[u] : "LEGACY");
       if (s=="LOCK" || s=="LOCK_TMP" || s=="LOCK_QUOTA") out="KENA_LOCK";
       else out="ONLINE";
-      printf "%-24s %-12s %-10d %-13d %-22s\n", u, out, l, c, (lip=="" ? "-" : lip);
+      if (ipc <= 0 || visibility=="PROXY_LOCAL" || lip=="" || lip=="-") lip="TIDAK_TERDETEKSI";
+      printf "%-20s %-10s %-8d %-11s %-12d %-9d %-22s\n", u, out, l, cm, sockets, ipc, lip;
       total_user++;
-      total_session+=c;
+      total_socket+=sockets;
+      total_ip+=ipc;
     }
     END {
       print "";
       printf "Total User : %d\n", total_user + 0;
-      printf "Total Sesi : %d\n", total_session + 0;
+      printf "Total Socket Aktif : %d\n", total_socket + 0;
+      printf "Total IP Terlihat : %d\n", total_ip + 0;
     }' "${t_users}" "${t_seen}"
+  echo
+  echo "Catatan: SOCKET_AKTIF bukan jumlah perangkat/orang."
+  echo "IP_AKTIF hanya dihitung jika sumber non-loopback terlihat oleh Xray."
+  echo "MODE LEGACY memakai satu credential bersama; jumlah orang tidak bisa dipastikan."
 }
 
 show_xray_online_realtime_by_table() {

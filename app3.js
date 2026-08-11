@@ -3124,21 +3124,148 @@ async function listAllUserIds() {
   return rows.map((r) => Number(r?.user_id || 0)).filter((n) => Number.isInteger(n) && n > 0);
 }
 
-async function sendBroadcastToAllUsers(senderCtx, message) {
-  const text = String(message || '').trim();
-  if (!text) return { total: 0, ok: 0, fail: 0 };
-  const ids = await listAllUserIds();
-  let ok = 0;
-  let fail = 0;
-  for (const uid of ids) {
-    try {
-      await senderCtx.telegram.sendMessage(uid, text);
-      ok += 1;
-    } catch (_) {
-      fail += 1;
+const BROADCAST_HTML_TAG_RE = /<\/?(?:b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|code|pre|blockquote)(?:\s[^>]*)?>/i;
+const BROADCAST_COPY_BUTTON_LIMIT = 10;
+
+function escapeBroadcastHtmlText(input) {
+  return String(input ?? '')
+    .replace(/&(?!(?:lt|gt|amp|quot|apos|#\d+|#x[0-9a-f]+);)/gi, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function normalizeBroadcastHtml(input) {
+  const source = String(input ?? '');
+  const tagRe = /<\/?(?:b|strong|i|em|u|ins|s|strike|del|span|tg-spoiler|a|tg-emoji|code|pre|blockquote)(?:\s[^>]*)?>/gi;
+  let output = '';
+  let offset = 0;
+  let match;
+  while ((match = tagRe.exec(source)) !== null) {
+    output += escapeBroadcastHtmlText(source.slice(offset, match.index));
+    output += match[0].replace(/&(?!(?:lt|gt|amp|quot|apos|#\d+|#x[0-9a-f]+);)/gi, '&amp;');
+    offset = match.index + match[0].length;
+  }
+  output += escapeBroadcastHtmlText(source.slice(offset));
+  return output;
+}
+
+function replaceBroadcastCopyBlocks(input) {
+  const source = String(input ?? '');
+  const bracketOpen = (source.match(/\[copy\]/gi) || []).length;
+  const bracketClose = (source.match(/\[\/copy\]/gi) || []).length;
+  const htmlOpen = (source.match(/<copy>/gi) || []).length;
+  const htmlClose = (source.match(/<\/copy>/gi) || []).length;
+  if (bracketOpen !== bracketClose || htmlOpen !== htmlClose) {
+    throw new Error('Format copy tidak lengkap. Gunakan [copy]teks[/copy].');
+  }
+
+  const copyTexts = [];
+  const toCodeBlock = (_whole, value) => {
+    const copyText = String(value ?? '').replace(/\r\n/g, '\n').trim();
+    if (!copyText) return '';
+    copyTexts.push(copyText);
+    return `<pre>${escapeHtml(copyText)}</pre>`;
+  };
+
+  let html = source.replace(/\[copy\]([\s\S]*?)\[\/copy\]/gi, toCodeBlock);
+  html = html.replace(/<copy>([\s\S]*?)<\/copy>/gi, toCodeBlock);
+  return { html, copyTexts };
+}
+
+function buildBroadcastCopyMarkup(copyTextsInput) {
+  const copyTexts = (Array.isArray(copyTextsInput) ? copyTextsInput : [])
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean);
+  const eligible = copyTexts
+    .filter((value) => value.length <= 256)
+    .slice(0, BROADCAST_COPY_BUTTON_LIMIT);
+  if (!eligible.length) return null;
+
+  return {
+    inline_keyboard: eligible.map((value, index) => ([{
+      text: eligible.length === 1 ? '📋 Salin teks' : `📋 Salin teks ${index + 1}`,
+      copy_text: { text: value }
+    }]))
+  };
+}
+
+function buildBroadcastTextPayload(message, entitiesInput = []) {
+  const source = String(message ?? '');
+  if (!source.trim()) return null;
+
+  const entities = Array.isArray(entitiesInput) ? entitiesInput : [];
+  const replaced = replaceBroadcastCopyBlocks(source);
+  const usesHtml = replaced.copyTexts.length > 0 || BROADCAST_HTML_TAG_RE.test(replaced.html);
+  const options = {};
+  let mode = 'teks biasa';
+
+  if (usesHtml) {
+    options.parse_mode = 'HTML';
+    mode = 'HTML';
+  } else if (entities.length) {
+    options.entities = entities;
+    mode = 'format Telegram';
+  }
+
+  const replyMarkup = buildBroadcastCopyMarkup(replaced.copyTexts);
+  if (replyMarkup) options.reply_markup = replyMarkup;
+  return {
+    text: usesHtml ? normalizeBroadcastHtml(replaced.html) : replaced.html,
+    options,
+    mode,
+    copyCount: replaced.copyTexts.length,
+    copyButtonCount: replyMarkup?.inline_keyboard?.length || 0
+  };
+}
+
+function addBroadcastError(result, err) {
+  const errorText = String(parseErr(err) || 'Unknown error').replace(/\s+/g, ' ').trim().slice(0, 500);
+  const isHtmlError = /parse entities|unsupported start tag|can't find end tag|entity/i.test(errorText);
+  if (!result.firstError || (isHtmlError && !result.htmlError)) result.firstError = errorText;
+  if (isHtmlError) result.htmlError = true;
+}
+
+function formatBroadcastResult(title, result, photoCount = 0) {
+  const lines = [String(title || 'Broadcast selesai.')];
+  if (photoCount > 0) lines.push(`Jumlah foto: ${photoCount}`);
+  lines.push(`Total user: ${result.total}`, `Berhasil: ${result.ok}`, `Gagal: ${result.fail}`);
+  if (result.mode) lines.push(`Format: ${result.mode}`);
+  if (result.copyCount > 0) {
+    lines.push(`Tombol salin: ${result.copyButtonCount}/${result.copyCount}`);
+    if (result.copyButtonCount < result.copyCount) {
+      lines.push(result.copyButtonsUnavailable
+        ? 'Catatan: caption album tetap menjadi blok kode, tetapi album Telegram tidak mendukung tombol salin.'
+        : 'Catatan: tombol salin hanya dibuat untuk teks maksimal 256 karakter (maksimal 10 tombol).');
     }
   }
-  return { total: ids.length, ok, fail };
+  if (result.firstError && (result.htmlError || result.ok === 0)) {
+    lines.push(`Error pertama: ${result.firstError}`);
+  }
+  return lines.join('\n');
+}
+
+async function sendBroadcastToAllUsers(senderCtx, message, entities = []) {
+  const payload = buildBroadcastTextPayload(message, entities);
+  if (!payload) return { total: 0, ok: 0, fail: 0 };
+  const ids = await listAllUserIds();
+  const result = {
+    total: ids.length,
+    ok: 0,
+    fail: 0,
+    mode: payload.mode,
+    copyCount: payload.copyCount,
+    copyButtonCount: payload.copyButtonCount
+  };
+  for (const uid of ids) {
+    try {
+      await senderCtx.telegram.sendMessage(uid, payload.text, payload.options);
+      result.ok += 1;
+    } catch (err) {
+      result.fail += 1;
+      addBroadcastError(result, err);
+    }
+  }
+  return result;
 }
 
 async function sendPhotoBroadcastToAllUsers(senderCtx) {
@@ -3147,26 +3274,38 @@ async function sendPhotoBroadcastToAllUsers(senderCtx) {
   const fileId = String(photo?.file_id || '').trim();
   if (!fileId) return { total: 0, ok: 0, fail: 0 };
 
-  const caption = String(senderCtx.message?.caption || '').trim();
+  const caption = String(senderCtx.message?.caption || '');
   const captionEntities = Array.isArray(senderCtx.message?.caption_entities)
     ? senderCtx.message.caption_entities
     : [];
   const extra = {};
-  if (caption) extra.caption = caption;
-  if (caption && captionEntities.length) extra.caption_entities = captionEntities;
+  const captionPayload = caption.trim() ? buildBroadcastTextPayload(caption, captionEntities) : null;
+  if (captionPayload) {
+    extra.caption = captionPayload.text;
+    if (captionPayload.options.parse_mode) extra.parse_mode = captionPayload.options.parse_mode;
+    if (captionPayload.options.entities) extra.caption_entities = captionPayload.options.entities;
+    if (captionPayload.options.reply_markup) extra.reply_markup = captionPayload.options.reply_markup;
+  }
 
   const ids = await listAllUserIds();
-  let ok = 0;
-  let fail = 0;
+  const result = {
+    total: ids.length,
+    ok: 0,
+    fail: 0,
+    mode: captionPayload?.mode || '',
+    copyCount: captionPayload?.copyCount || 0,
+    copyButtonCount: captionPayload?.copyButtonCount || 0
+  };
   for (const uid of ids) {
     try {
       await senderCtx.telegram.sendPhoto(uid, fileId, extra);
-      ok += 1;
-    } catch (_) {
-      fail += 1;
+      result.ok += 1;
+    } catch (err) {
+      result.fail += 1;
+      addBroadcastError(result, err);
     }
   }
-  return { total: ids.length, ok, fail };
+  return result;
 }
 
 async function sendPhotoAlbumBroadcastToAllUsers(senderCtx, itemsInput) {
@@ -3177,42 +3316,74 @@ async function sendPhotoAlbumBroadcastToAllUsers(senderCtx, itemsInput) {
   if (items.length === 1) {
     const item = items[0];
     const extra = {};
-    if (item.caption) extra.caption = item.caption;
-    if (item.caption && item.caption_entities?.length) extra.caption_entities = item.caption_entities;
+    const captionPayload = String(item.caption || '').trim()
+      ? buildBroadcastTextPayload(item.caption, item.caption_entities)
+      : null;
+    if (captionPayload) {
+      extra.caption = captionPayload.text;
+      if (captionPayload.options.parse_mode) extra.parse_mode = captionPayload.options.parse_mode;
+      if (captionPayload.options.entities) extra.caption_entities = captionPayload.options.entities;
+      if (captionPayload.options.reply_markup) extra.reply_markup = captionPayload.options.reply_markup;
+    }
     const ids = await listAllUserIds();
-    let ok = 0;
-    let fail = 0;
+    const result = {
+      total: ids.length,
+      ok: 0,
+      fail: 0,
+      photos: 1,
+      mode: captionPayload?.mode || '',
+      copyCount: captionPayload?.copyCount || 0,
+      copyButtonCount: captionPayload?.copyButtonCount || 0
+    };
     for (const uid of ids) {
       try {
         await senderCtx.telegram.sendPhoto(uid, item.media, extra);
-        ok += 1;
-      } catch (_) {
-        fail += 1;
+        result.ok += 1;
+      } catch (err) {
+        result.fail += 1;
+        addBroadcastError(result, err);
       }
     }
-    return { total: ids.length, ok, fail, photos: 1 };
+    return result;
   }
 
+  let albumMode = '';
+  let albumCopyCount = 0;
   const media = items.map((item) => {
     const payload = { type: 'photo', media: item.media };
-    if (item.caption) payload.caption = item.caption;
-    if (item.caption && item.caption_entities?.length) {
-      payload.caption_entities = item.caption_entities;
+    const captionPayload = String(item.caption || '').trim()
+      ? buildBroadcastTextPayload(item.caption, item.caption_entities)
+      : null;
+    if (captionPayload) {
+      payload.caption = captionPayload.text;
+      if (captionPayload.options.parse_mode) payload.parse_mode = captionPayload.options.parse_mode;
+      if (captionPayload.options.entities) payload.caption_entities = captionPayload.options.entities;
+      albumMode = albumMode || captionPayload.mode;
+      albumCopyCount += captionPayload.copyCount;
     }
     return payload;
   });
   const ids = await listAllUserIds();
-  let ok = 0;
-  let fail = 0;
+  const result = {
+    total: ids.length,
+    ok: 0,
+    fail: 0,
+    photos: media.length,
+    mode: albumMode,
+    copyCount: albumCopyCount,
+    copyButtonCount: 0,
+    copyButtonsUnavailable: albumCopyCount > 0
+  };
   for (const uid of ids) {
     try {
       await senderCtx.telegram.sendMediaGroup(uid, media);
-      ok += 1;
-    } catch (_) {
-      fail += 1;
+      result.ok += 1;
+    } catch (err) {
+      result.fail += 1;
+      addBroadcastError(result, err);
     }
   }
-  return { total: ids.length, ok, fail, photos: media.length };
+  return result;
 }
 
 function queueBroadcastPhotoAlbum(ctx) {
@@ -3235,7 +3406,7 @@ function queueBroadcastPhotoAlbum(ctx) {
   if (pending.items.length < 10) {
     pending.items.push({
       media: fileId,
-      caption: String(ctx.message?.caption || '').trim(),
+      caption: String(ctx.message?.caption || ''),
       caption_entities: Array.isArray(ctx.message?.caption_entities)
         ? ctx.message.caption_entities
         : []
@@ -3250,10 +3421,7 @@ function queueBroadcastPhotoAlbum(ctx) {
     try {
       await pending.ctx.reply(`Broadcast album (${pending.items.length} foto) sedang dikirim ke semua user...`);
       const result = await sendPhotoAlbumBroadcastToAllUsers(pending.ctx, pending.items);
-      await pending.ctx.reply(
-        `Broadcast album selesai.\nJumlah foto: ${result.photos}\nTotal user: ${result.total}\nBerhasil: ${result.ok}\nGagal: ${result.fail}`,
-        adminMenu()
-      );
+      await pending.ctx.reply(formatBroadcastResult('Broadcast album selesai.', result, result.photos), adminMenu());
     } catch (err) {
       await pending.ctx.reply(`Broadcast album gagal: ${parseErr(err)}`, adminMenu()).catch(() => {});
     }
@@ -4457,8 +4625,14 @@ bot.action('m_admin_broadcast', async (ctx) => {
   userState.set(ctx.chat.id, { step: 'admin_broadcast_message' });
   return ctx.reply(
     'Kirim teks, satu foto, atau album maksimal 10 foto.\n' +
-    'Foto boleh menggunakan caption atau tanpa caption.\n' +
-    'Teks dan caption akan dikirim apa adanya.\n' +
+    'Teks/caption mendukung format bawaan Telegram dan HTML.\n\n' +
+    'Contoh HTML:\n' +
+    '<b>Judul tebal</b>\n' +
+    '<i>Teks miring</i>\n' +
+    '<a href="https://contoh.com">Buka link</a>\n\n' +
+    'Agar jadi blok kode + tombol salin:\n' +
+    '[copy]UPDATE_SAFE_MODE=1 /usr/local/sbin/menu-sc-1forcr update[/copy]\n\n' +
+    'Catatan: tombol salin mendukung maksimal 256 karakter per blok.\n' +
     'Ketik "batal" untuk membatalkan.'
   );
 });
@@ -4467,14 +4641,15 @@ bot.command('broadcast', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   const text = String(ctx.message?.text || '').replace(/^\/broadcast(@\w+)?/i, '').trim();
   if (!text) {
-    return ctx.reply('Gunakan /broadcast lalu isi pesan');
+    return ctx.reply('Gunakan /broadcast lalu isi pesan. HTML dan [copy]teks[/copy] didukung.');
   }
-  await ctx.reply('Broadcast sedang dikirim ke semua user...');
-  const result = await sendBroadcastToAllUsers(ctx, text);
-  return ctx.reply(
-    `Broadcast selesai.\nTotal user: ${result.total}\nBerhasil: ${result.ok}\nGagal: ${result.fail}`,
-    adminMenu()
-  );
+  try {
+    await ctx.reply('Broadcast sedang dikirim ke semua user...');
+    const result = await sendBroadcastToAllUsers(ctx, text);
+    return ctx.reply(formatBroadcastResult('Broadcast selesai.', result), adminMenu());
+  } catch (err) {
+    return ctx.reply(`Broadcast gagal: ${parseErr(err)}`, adminMenu());
+  }
 });
 
 bot.command(['ceksaldouser', 'saldouser'], async (ctx) => {
@@ -5804,15 +5979,13 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      const msg = String(text || '').trim();
-      if (msg.length < 1) return ctx.reply('Pesan broadcast tidak boleh kosong.');
+      const msg = String(ctx.message?.text || '');
+      if (!msg.trim()) return ctx.reply('Pesan broadcast tidak boleh kosong.');
+      const entities = Array.isArray(ctx.message?.entities) ? ctx.message.entities : [];
       await ctx.reply('Broadcast sedang dikirim ke semua user...');
-      const result = await sendBroadcastToAllUsers(ctx, msg);
+      const result = await sendBroadcastToAllUsers(ctx, msg, entities);
       userState.delete(ctx.chat.id);
-      return ctx.reply(
-        `Broadcast selesai.\nTotal user: ${result.total}\nBerhasil: ${result.ok}\nGagal: ${result.fail}`,
-        adminMenu()
-      );
+      return ctx.reply(formatBroadcastResult('Broadcast selesai.', result), adminMenu());
     }
 
     if (state.step === 'admin_set_env_key') {
@@ -7497,10 +7670,7 @@ bot.on('photo', async (ctx) => {
   try {
     await ctx.reply('Broadcast foto sedang dikirim ke semua user...');
     const result = await sendPhotoBroadcastToAllUsers(ctx);
-    return ctx.reply(
-      `Broadcast foto selesai.\nTotal user: ${result.total}\nBerhasil: ${result.ok}\nGagal: ${result.fail}`,
-      adminMenu()
-    );
+    return ctx.reply(formatBroadcastResult('Broadcast foto selesai.', result), adminMenu());
   } catch (err) {
     return ctx.reply(`Broadcast foto gagal: ${parseErr(err)}`, adminMenu());
   }

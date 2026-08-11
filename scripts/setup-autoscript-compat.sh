@@ -93,6 +93,9 @@ set -euo pipefail
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
 #   ONLINE_NOTIFY_INTERVAL_HOURS=3               (opsional, interval notifikasi online dalam jam)
 #   ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=300      (opsional, jendela realtime XRAY dalam detik)
+#   SSH_HC_AUTH_LOOKBACK_HOURS=24                 (opsional, recovery mapping sesi SSH setelah reboot/update)
+#   XRAY_LIVE_RECOVERY_HOURS=72                   (opsional, recovery mapping socket Xray setelah reboot/update)
+#   XRAY_LIVE_NATIVE_POLL_SECONDS=15              (opsional, cache query native online Xray agar tetap ringan)
 #   RESOURCE_AUTOTUNE_ENABLE=1                   (opsional, 1=auto tune RAM/CPU service dan capacity analyzer)
 #   RESOURCE_TARGET_USAGE_PERCENT=85             (opsional, target maksimum RAM/CPU sebelum dianggap penuh)
 #   RESOURCE_AUTOTUNE_INTERVAL_MINUTES=5         (opsional, interval analyzer kapasitas)
@@ -164,7 +167,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.17}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.19}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -4381,6 +4384,37 @@ function reloadXrayServiceSafe() {
   safeExec('systemctl', ['kill', '-s', 'HUP', 'xray']);
   return safeExec('systemctl', ['start', 'xray']);
 }
+let xrayOnlineStatsSupportCache = null;
+function xraySupportsUserOnlineStats() {
+  if (xrayOnlineStatsSupportCache !== null) return xrayOnlineStatsSupportCache;
+  xrayOnlineStatsSupportCache = false;
+  for (const bin of ['/usr/local/bin/xray', '/usr/bin/xray', 'xray']) {
+    try {
+      const out = execFileSync(bin, ['version'], {
+        encoding: 'utf8',
+        timeout: 5000,
+        maxBuffer: 256 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore']
+      });
+      const m = String(out || '').match(/\bXray\s+v?(\d+)\.(\d+)(?:\.(\d+))?/i);
+      if (!m) continue;
+      const major = Number(m[1] || 0);
+      const minor = Number(m[2] || 0);
+      const patch = Number(m[3] || 0);
+      xrayOnlineStatsSupportCache = major > 24 ||
+        (major === 24 && (minor > 11 || (minor === 11 && patch >= 5)));
+      break;
+    } catch (_) {}
+  }
+  return xrayOnlineStatsSupportCache;
+}
+function xrayLevelZeroStatsPolicy() {
+  const policy = { statsUserUplink: true, statsUserDownlink: true };
+  // statsUserOnline baru tersedia mulai Xray 24.11.5. Jangan tulis opsi ini
+  // pada core lama karena config lama dapat menolak field yang belum dikenal.
+  if (xraySupportsUserOnlineStats()) policy.statsUserOnline = true;
+  return policy;
+}
 function canValidateXrayConfig(tmpPath) {
   const testCmds = [
     ['xray', ['run', '-test', '-config', tmpPath]],
@@ -4954,7 +4988,7 @@ async function renderAndReloadXray() {
     stats: {},
     api: { tag: 'api', services: ['StatsService'] },
     policy: {
-      levels: { '0': { statsUserUplink: true, statsUserDownlink: true } },
+      levels: { '0': xrayLevelZeroStatsPolicy() },
       system: {
         statsInboundUplink: true,
         statsInboundDownlink: true,
@@ -6407,7 +6441,7 @@ async function setStatusXray(table, username, status) {
     stats: {},
     api: { tag: 'api', services: ['StatsService'] },
     policy: {
-      levels: { '0': { statsUserUplink: true, statsUserDownlink: true } },
+      levels: { '0': xrayLevelZeroStatsPolicy() },
       system: {
         statsInboundUplink: true,
         statsInboundDownlink: true,
@@ -7932,6 +7966,29 @@ function readExec(cmd, args) {
   } catch (_) {
     return '';
   }
+}
+
+let xrayOnlineStatsSupportCache = null;
+function xraySupportsUserOnlineStats() {
+  if (xrayOnlineStatsSupportCache !== null) return xrayOnlineStatsSupportCache;
+  xrayOnlineStatsSupportCache = false;
+  for (const bin of ['/usr/local/bin/xray', '/usr/bin/xray', 'xray']) {
+    const out = readExec(bin, ['version']);
+    const m = String(out || '').match(/\bXray\s+v?(\d+)\.(\d+)(?:\.(\d+))?/i);
+    if (!m) continue;
+    const major = Number(m[1] || 0);
+    const minor = Number(m[2] || 0);
+    const patch = Number(m[3] || 0);
+    xrayOnlineStatsSupportCache = major > 24 ||
+      (major === 24 && (minor > 11 || (minor === 11 && patch >= 5)));
+    break;
+  }
+  return xrayOnlineStatsSupportCache;
+}
+function xrayLevelZeroStatsPolicy() {
+  const policy = { statsUserUplink: true, statsUserDownlink: true };
+  if (xraySupportsUserOnlineStats()) policy.statsUserOnline = true;
+  return policy;
 }
 
 let firewallBackendCache = null;
@@ -10226,7 +10283,7 @@ async function rebuildXrayFromDb() {
     stats: {},
     api: { tag: 'api', services: ['StatsService'] },
     policy: {
-      levels: { '0': { statsUserUplink: true, statsUserDownlink: true } },
+      levels: { '0': xrayLevelZeroStatsPolicy() },
       system: {
         statsInboundUplink: true,
         statsInboundDownlink: true,
@@ -13184,6 +13241,603 @@ EOF
   systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
 }
 
+setup_ssh_live_tracker() {
+  cat > /usr/local/sbin/sc-1forcr-ssh-live <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+for env_file in /etc/sc-1forcr.env /opt/sc-1forcr/.env; do
+  if [[ -f "${env_file}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${env_file}" >/dev/null 2>&1 || true
+    set +a
+  fi
+done
+
+mode="${1:-list}"
+db_path="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+dropbear_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+lookback_h="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-24}" | tr -cd '0-9')"
+log_max="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
+state_dir="${SSH_LIVE_STATE_DIR:-/run/sc-1forcr}"
+state_file="${SSH_LIVE_STATE_FILE:-${state_dir}/ssh-live.map}"
+lock_file="${state_dir}/ssh-live.lock"
+
+[[ -z "${dropbear_port}" ]] && dropbear_port="109"
+[[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
+[[ -z "${lookback_h}" || "${lookback_h}" -lt 1 || "${lookback_h}" -gt 168 ]] && lookback_h="24"
+[[ -z "${log_max}" || "${log_max}" -lt 2000 || "${log_max}" -gt 80000 ]] && log_max="12000"
+
+mkdir -p "${state_dir}" >/dev/null 2>&1 || exit 0
+chmod 700 "${state_dir}" >/dev/null 2>&1 || true
+exec 9>"${lock_file}"
+if command -v flock >/dev/null 2>&1; then
+  flock -w 5 9 >/dev/null 2>&1 || exit 0
+fi
+
+tmp_dir="$(mktemp -d "${state_dir}/ssh-live.XXXXXX")" || exit 0
+trap 'rm -rf -- "${tmp_dir}"' EXIT
+active_raw="${tmp_dir}/active.raw"
+active_ports="${tmp_dir}/active.ports"
+direct_pids="${tmp_dir}/direct.pids"
+events_raw="${tmp_dir}/events.raw"
+events="${tmp_dir}/events"
+old_map="${tmp_dir}/old.map"
+new_map="${tmp_dir}/new.map"
+session_rows="${tmp_dir}/sessions"
+db_users="${tmp_dir}/db-users"
+: > "${active_raw}"
+: > "${direct_pids}"
+: > "${events}"
+: > "${session_rows}"
+
+# Snapshot socket adalah sumber kebenaran. State hanya menyimpan hubungan
+# port lokal Dropbear -> PID -> username agar sesi lama tidak bergantung pada
+# umur baris journal lagi.
+ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_port}" -v p2="${dropbear_alt_port}" '
+  function port_of(v,   s,n,a,p) {
+    s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+    n=split(s, a, ":"); p=a[n];
+    return (p ~ /^[0-9]{1,5}$/ ? p : "");
+  }
+  function first_pid(line,   m) {
+    if (match(line, /pid=[0-9]+/)) {
+      m=substr(line, RSTART+4, RLENGTH-4);
+      if (m ~ /^[0-9]+$/) return m;
+    }
+    return "";
+  }
+  {
+    l=$3; r=$4;
+    if (port_of(l)=="" || port_of(r)=="") { l=$4; r=$5; }
+    lp=port_of(l); rp=port_of(r); pid=first_pid($0);
+    if (lp==p1 || lp==p2) {
+      if (rp!="") print "D|" rp "|" pid;
+    } else if (rp==p1 || rp==p2) {
+      if (lp!="") print "D|" lp "|";
+    }
+    if (lp=="22" && pid!="") print "S|" pid;
+  }
+' > "${active_raw}" || true
+
+# Untuk satu koneksi loopback, ss biasanya menampilkan kedua endpoint. Pilih
+# baris yang membawa PID Dropbear dan gunakan baris tanpa PID hanya sebagai fallback.
+awk -F'|' '
+  $1=="D" && $2 ~ /^[0-9]+$/ {
+    if (!($2 in pid) || (pid[$2]=="" && $3!="")) pid[$2]=$3;
+  }
+  END { for (p in pid) print p "|" pid[p]; }
+' "${active_raw}" > "${active_ports}" || true
+awk -F'|' '$1=="S" && $2 ~ /^[0-9]+$/ { direct[$2]=1 } END { for (p in direct) print p }' \
+  "${active_raw}" > "${direct_pids}" || true
+
+if [[ -f "${state_file}" ]]; then
+  cp -f "${state_file}" "${old_map}" 2>/dev/null || : > "${old_map}"
+else
+  : > "${old_map}"
+fi
+
+now_ts="$(date +%s 2>/dev/null || echo 0)"
+last_scan="$(stat -c %Y "${state_file}" 2>/dev/null || echo 0)"
+[[ "${now_ts}" =~ ^[0-9]+$ ]] || now_ts=0
+[[ "${last_scan}" =~ ^[0-9]+$ ]] || last_scan=0
+if [[ "${last_scan}" -gt 0 && "${now_ts}" -ge "${last_scan}" ]]; then
+  scan_minutes=$(( (now_ts - last_scan + 119) / 60 ))
+  (( scan_minutes < 2 )) && scan_minutes=2
+  (( scan_minutes > lookback_h * 60 )) && scan_minutes=$(( lookback_h * 60 ))
+else
+  scan_minutes=$(( lookback_h * 60 ))
+fi
+
+# --grep mengurangi I/O saat VPS ramai percobaan login. Fallback disediakan
+# untuk systemd lama yang belum mendukung opsi tersebut.
+if ! journalctl -u dropbear --since "-${scan_minutes} min" -n "${log_max}" \
+  --grep='auth succeeded for|Exit \(|Exit before auth:' -o short-unix --no-pager \
+  > "${events_raw}" 2>/dev/null; then
+  journalctl -u dropbear --since "-${scan_minutes} min" -n "${log_max}" \
+    -o short-unix --no-pager > "${events_raw}" 2>/dev/null || true
+fi
+
+awk '
+  function get_pid(line,   p) {
+    if (match(line, /\[[0-9]+\]/)) {
+      p=substr(line, RSTART+1, RLENGTH-2);
+      if (p ~ /^[0-9]+$/) return p;
+    }
+    return "";
+  }
+  /auth succeeded for / {
+    u=$0;
+    sub(/^.*auth succeeded for /, "", u);
+    sub(/^'"'"'/, "", u); sub(/^"/, "", u);
+    sub(/'"'"'.*/, "", u); sub(/".*/, "", u);
+    sub(/[[:space:]].*$/, "", u);
+    u=tolower(u);
+    if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net" || u=="unknown") next;
+    src=$0; sub(/^.* from /, "", src); gsub(/[[:space:]]+$/, "", src);
+    port=src; sub(/^.*:/, "", port); sub(/[^0-9].*$/, "", port);
+    if (port ~ /^[0-9]{1,5}$/) print "A|" port "|" get_pid($0) "|" u;
+    next;
+  }
+  /Exit \(|Exit before auth:/ {
+    pid=get_pid($0);
+    if (pid!="") print "X||" pid "|";
+  }
+' "${events_raw}" > "${events}" || true
+
+awk -F'|' '
+  FILENAME==ARGV[1] {
+    if ($1 ~ /^[0-9]+$/) active_pid[$1]=$2;
+    next;
+  }
+  FILENAME==ARGV[2] {
+    port=$1; pid=$2; user=tolower($3);
+    if (!(port in active_pid) || user !~ /^[a-z0-9._-]+$/) next;
+    ap=active_pid[port];
+    if (ap!="" && (pid=="" || pid!=ap)) next;
+    state_pid[port]=pid; state_user[port]=user;
+    next;
+  }
+  FILENAME==ARGV[3] {
+    action=$1; port=$2; pid=$3; user=tolower($4);
+    if (action=="X" && pid!="") {
+      for (p in state_pid) if (state_pid[p]==pid) {
+        delete state_pid[p]; delete state_user[p];
+      }
+      next;
+    }
+    if (action!="A" || !(port in active_pid) || user !~ /^[a-z0-9._-]+$/) next;
+    ap=active_pid[port];
+    if (ap!="" && pid!="" && ap!=pid) next;
+    state_pid[port]=(pid!="" ? pid : ap); state_user[port]=user;
+  }
+  END {
+    for (port in state_user) {
+      if (!(port in active_pid)) continue;
+      ap=active_pid[port]; sp=state_pid[port];
+      if (ap!="" && sp!="" && ap!=sp) continue;
+      print port "|" sp "|" state_user[port];
+    }
+  }
+' "${active_ports}" "${old_map}" "${events}" | sort -t'|' -k1,1n > "${new_map}" || true
+
+chmod 600 "${new_map}" >/dev/null 2>&1 || true
+mv -f "${new_map}" "${state_file}" >/dev/null 2>&1 || true
+
+# Dropbear/HTTP-Custom: satu port loopback aktif adalah satu sesi nyata.
+awk -F'|' '$1 ~ /^[0-9]+$/ && $3 ~ /^[a-z0-9._-]+$/ { print $3 "|dropbear:" $1 }' \
+  "${state_file}" >> "${session_rows}" 2>/dev/null || true
+
+# OpenSSH langsung bisa dipetakan tanpa journal melalui process title sshd.
+if [[ -s "${direct_pids}" ]]; then
+  pid_csv="$(sort -u "${direct_pids}" | paste -sd, -)"
+  if [[ -n "${pid_csv}" ]]; then
+    ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
+      {
+        pid=$1; $1=""; sub(/^[[:space:]]+/, "", $0);
+        if ($0 !~ /^sshd:/ || $0 ~ /\[(priv|preauth|listener)\]/) next;
+        u=$0; sub(/^sshd:[[:space:]]*/, "", u); sub(/[[:space:]].*$/, "", u);
+        sub(/@.*$/, "", u); sub(/\[.*$/, "", u); u=tolower(u);
+        if (u ~ /^[a-z0-9._-]+$/ && u!="root" && u!="priv" && u!="net" && u!="unknown")
+          print u "|sshd:" pid;
+      }
+    ' >> "${session_rows}" || true
+  fi
+fi
+
+# Jika DB tersedia, jangan laporkan user sistem yang bukan akun autoscript.
+if command -v sqlite3 >/dev/null 2>&1 && [[ -f "${db_path}" ]]; then
+  sqlite3 "${db_path}" "SELECT DISTINCT LOWER(username) FROM account_sshs WHERE TRIM(COALESCE(username,''))<>'';" \
+    > "${db_users}" 2>/dev/null || true
+fi
+if [[ -s "${db_users}" ]]; then
+  awk -F'|' 'NR==FNR { allow[tolower($1)]=1; next } (tolower($1) in allow) { print }' \
+    "${db_users}" "${session_rows}" | sort -u > "${session_rows}.filtered" || true
+  mv -f "${session_rows}.filtered" "${session_rows}" >/dev/null 2>&1 || true
+fi
+
+case "${mode}" in
+  raw)
+    cat "${state_file}" 2>/dev/null || true
+    ;;
+  refresh)
+    ;;
+  *)
+    sort -u "${session_rows}" 2>/dev/null | awk -F'|' '
+      $1 ~ /^[a-z0-9._-]+$/ { sessions[$2]=1; user_of[$2]=$1 }
+      END {
+        for (key in sessions) count[user_of[key]]++;
+        for (u in count) printf "%s(%d)\n", u, count[u];
+      }
+    ' | sort
+    ;;
+esac
+EOF
+  if ! bash -n /usr/local/sbin/sc-1forcr-ssh-live; then
+    log "Gagal menulis tracker sesi SSH realtime."
+    return 1
+  fi
+  chmod 755 /usr/local/sbin/sc-1forcr-ssh-live
+}
+
+setup_xray_live_tracker() {
+  cat > /usr/local/sbin/sc-1forcr-xray-live <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+for env_file in /etc/sc-1forcr.env /opt/sc-1forcr/.env; do
+  if [[ -f "${env_file}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${env_file}" >/dev/null 2>&1 || true
+    set +a
+  fi
+done
+
+mode="${1:-list}"
+db_path="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+access_log="${XRAY_ACCESS_LOG:-/var/log/xray/access.log}"
+recovery_h="$(echo "${XRAY_LIVE_RECOVERY_HOURS:-72}" | tr -cd '0-9')"
+log_max="$(echo "${XRAY_LIVE_LOG_MAX_LINES:-30000}" | tr -cd '0-9')"
+native_poll="$(echo "${XRAY_LIVE_NATIVE_POLL_SECONDS:-15}" | tr -cd '0-9')"
+state_dir="${XRAY_LIVE_STATE_DIR:-/run/sc-1forcr}"
+state_file="${XRAY_LIVE_STATE_FILE:-${state_dir}/xray-live.map}"
+cursor_file="${XRAY_LIVE_CURSOR_FILE:-${state_dir}/xray-live.cursor}"
+native_cache_file="${XRAY_LIVE_NATIVE_CACHE_FILE:-${state_dir}/xray-live.native}"
+native_support_file="${XRAY_LIVE_NATIVE_SUPPORT_FILE:-${state_dir}/xray-live.native-support}"
+lock_file="${state_dir}/xray-live.lock"
+
+[[ -z "${recovery_h}" || "${recovery_h}" -lt 1 || "${recovery_h}" -gt 168 ]] && recovery_h="72"
+[[ -z "${log_max}" || "${log_max}" -lt 2000 || "${log_max}" -gt 100000 ]] && log_max="30000"
+[[ -z "${native_poll}" || "${native_poll}" -lt 5 || "${native_poll}" -gt 300 ]] && native_poll="15"
+
+mkdir -p "${state_dir}" >/dev/null 2>&1 || exit 0
+chmod 700 "${state_dir}" >/dev/null 2>&1 || true
+exec 9>"${lock_file}"
+if command -v flock >/dev/null 2>&1; then
+  flock -w 2 9 >/dev/null 2>&1 || exit 0
+fi
+
+tmp_dir="$(mktemp -d "${state_dir}/xray-live.XXXXXX")" || exit 0
+trap 'rm -rf -- "${tmp_dir}"' EXIT
+active_map="${tmp_dir}/active.map"
+events_raw="${tmp_dir}/events.raw"
+events="${tmp_dir}/events"
+old_map="${tmp_dir}/old.map"
+new_map="${tmp_dir}/new.map"
+db_users="${tmp_dir}/db-users"
+session_rows="${tmp_dir}/sessions"
+native_users="${tmp_dir}/native-users"
+all_sessions="${tmp_dir}/all-sessions"
+: > "${active_map}"
+: > "${events_raw}"
+: > "${events}"
+: > "${db_users}"
+: > "${session_rows}"
+: > "${native_users}"
+
+# Baca hanya byte access.log yang baru. Saat boot/rotasi, lakukan recovery
+# terbatas agar sesi yang sudah berjalan sebelum update tetap dapat dipetakan.
+recovery_scan="1"
+log_inode="0"
+log_size="0"
+cursor_inode="0"
+cursor_size="0"
+if [[ -f "${access_log}" ]]; then
+  log_inode="$(stat -c %i "${access_log}" 2>/dev/null || echo 0)"
+  log_size="$(stat -c %s "${access_log}" 2>/dev/null || echo 0)"
+  if [[ -f "${cursor_file}" ]]; then
+    IFS='|' read -r cursor_inode cursor_size < "${cursor_file}" || true
+  fi
+  [[ "${log_inode}" =~ ^[0-9]+$ ]] || log_inode="0"
+  [[ "${log_size}" =~ ^[0-9]+$ ]] || log_size="0"
+  [[ "${cursor_inode}" =~ ^[0-9]+$ ]] || cursor_inode="0"
+  [[ "${cursor_size}" =~ ^[0-9]+$ ]] || cursor_size="0"
+
+  if [[ "${log_inode}" != "0" && "${log_inode}" == "${cursor_inode}" && "${log_size}" -ge "${cursor_size}" ]]; then
+    recovery_scan="0"
+    if [[ "${log_size}" -gt "${cursor_size}" ]]; then
+      tail -c "+$((cursor_size + 1))" "${access_log}" > "${events_raw}" 2>/dev/null || true
+    fi
+  else
+    tail -n "${log_max}" "${access_log}" > "${events_raw}" 2>/dev/null || true
+  fi
+
+  cursor_tmp="${tmp_dir}/cursor"
+  printf '%s|%s\n' "${log_inode}" "${log_size}" > "${cursor_tmp}"
+  chmod 600 "${cursor_tmp}" >/dev/null 2>&1 || true
+  mv -f "${cursor_tmp}" "${cursor_file}" >/dev/null 2>&1 || true
+fi
+
+now_ts="$(date +%s 2>/dev/null || echo 0)"
+[[ "${now_ts}" =~ ^[0-9]+$ ]] || now_ts="0"
+recovery_cutoff=$(( now_ts - (recovery_h * 3600) ))
+(( recovery_cutoff < 0 )) && recovery_cutoff=0
+
+awk -v recovery="${recovery_scan}" -v cutoff="${recovery_cutoff}" '
+  function trim(v) {
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
+    return v;
+  }
+  function line_ts(line, stamp) {
+    if (line ~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) {
+      stamp=substr(line, 1, 19);
+      gsub(/[\/:]/, " ", stamp);
+      gsub(/[[:space:]]+/, " ", stamp);
+      return mktime(stamp);
+    }
+    return 0;
+  }
+  function source_port(v, p) {
+    v=trim(v);
+    if (v ~ /^\[/) sub(/^.*\]:/, "", v);
+    else sub(/^.*:/, "", v);
+    p=v; sub(/[^0-9].*$/, "", p);
+    return (p ~ /^[0-9]{1,5}$/ ? p : "");
+  }
+  function source_host(v, h) {
+    v=trim(v);
+    if (v ~ /^\[/) {
+      h=v; sub(/^\[/, "", h); sub(/\]:[0-9]+$/, "", h);
+    } else {
+      h=v; sub(/:[0-9]+$/, "", h);
+    }
+    if (h=="127.0.0.1" || h=="::1" || h=="localhost" || h=="") return "-";
+    return h;
+  }
+  {
+    ts=line_ts($0);
+    if (recovery=="1" && ts>0 && ts<cutoff) next;
+    user=""; src="";
+    if (match($0, /"email":"[^"]+"/)) {
+      user=substr($0, RSTART+9, RLENGTH-10);
+    } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
+      user=substr($0, RSTART, RLENGTH); sub(/^email:[[:space:]]*/, "", user);
+    } else if (match($0, /"user":"[^"]+"/)) {
+      user=substr($0, RSTART+8, RLENGTH-9);
+    } else if (match($0, /user:[[:space:]]*[^[:space:]]+/)) {
+      user=substr($0, RSTART, RLENGTH); sub(/^user:[[:space:]]*/, "", user);
+    }
+    if (match($0, /"source":"[^"]+"/)) {
+      src=substr($0, RSTART+10, RLENGTH-11);
+    } else if (match($0, /from[[:space:]]+[^[:space:]]+/)) {
+      src=substr($0, RSTART, RLENGTH); sub(/^from[[:space:]]+/, "", src);
+    }
+    user=tolower(trim(user)); port=source_port(src);
+    if (user !~ /^[a-z0-9._-]+$/ || port=="") next;
+    # Baris access log berurutan; assignment terakhir adalah pemetaan terbaru
+    # jika kernel memakai ulang ephemeral port yang sama.
+    latest_user[port]=user;
+    latest_ip[port]=source_host(src);
+    latest_ts[port]=ts;
+  }
+  END {
+    for (port in latest_user)
+      print port "|" latest_user[port] "|" latest_ip[port] "|" latest_ts[port];
+  }
+' "${events_raw}" > "${events}" || true
+
+# Snapshot socket diambil setelah access.log supaya koneksi yang baru muncul
+# di antara dua langkah tidak kehilangan event akibat cursor sudah maju.
+ss -Htnp state established 2>/dev/null | awk '
+  function port_of(v, s,n,a,p) {
+    s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+    n=split(s, a, ":"); p=a[n];
+    return (p ~ /^[0-9]{1,5}$/ ? p : "");
+  }
+  function first_pid(line, p) {
+    if (match(line, /pid=[0-9]+/)) {
+      p=substr(line, RSTART+4, RLENGTH-4);
+      if (p ~ /^[0-9]+$/) return p;
+    }
+    return "";
+  }
+  BEGIN {
+    proto[10001]="vmess"; proto[11001]="vmess";
+    proto[10002]="vless"; proto[11002]="vless";
+    proto[10003]="trojan"; proto[11003]="trojan";
+  }
+  {
+    # Hindari mengambil endpoint nginx/HAProxy pada sisi seberang socket.
+    if ($0 !~ /\(\("xray"/ && $0 !~ /users:\(\("xray"/) next;
+    l=$3; r=$4;
+    if (port_of(l)=="" || port_of(r)=="") { l=$4; r=$5; }
+    lp=port_of(l); rp=port_of(r); pid=first_pid($0);
+    if (lp in proto) client=rp;
+    else if (rp in proto) { client=lp; lp=rp; }
+    else next;
+    if (client ~ /^[0-9]{1,5}$/) print client "|" pid "|" proto[lp];
+  }
+' | sort -t'|' -k1,1n -k3,3 -u > "${active_map}" || true
+
+if [[ -f "${state_file}" ]]; then
+  cp -f "${state_file}" "${old_map}" 2>/dev/null || : > "${old_map}"
+else
+  : > "${old_map}"
+fi
+
+awk -F'|' '
+  FILENAME==ARGV[1] {
+    if ($1 ~ /^[0-9]+$/ && $3 ~ /^(vmess|vless|trojan)$/) {
+      active_pid[$1]=$2; active_proto[$1]=$3;
+    }
+    next;
+  }
+  FILENAME==ARGV[2] {
+    port=$1; pid=$2; proto=$3; user=tolower($4); ip=$5;
+    if (!(port in active_proto) || active_proto[port]!=proto || user !~ /^[a-z0-9._-]+$/) next;
+    ap=active_pid[port];
+    if (ap!="" && pid!="" && ap!=pid) next;
+    state_pid[port]=(ap!="" ? ap : pid);
+    state_proto[port]=proto; state_user[port]=user; state_ip[port]=(ip!="" ? ip : "-");
+    next;
+  }
+  FILENAME==ARGV[3] {
+    port=$1; user=tolower($2); ip=$3;
+    if (!(port in active_proto) || user !~ /^[a-z0-9._-]+$/) next;
+    state_pid[port]=active_pid[port]; state_proto[port]=active_proto[port];
+    state_user[port]=user; state_ip[port]=(ip!="" ? ip : "-");
+  }
+  END {
+    for (port in state_user) {
+      if (!(port in active_proto) || state_proto[port]!=active_proto[port]) continue;
+      print port "|" state_pid[port] "|" state_proto[port] "|" state_user[port] "|" state_ip[port];
+    }
+  }
+' "${active_map}" "${old_map}" "${events}" | sort -t'|' -k1,1n > "${new_map}" || true
+
+# Validasi protocol+username terhadap DB agar email liar dari log tidak ikut
+# ke dashboard/notifikasi.
+if command -v sqlite3 >/dev/null 2>&1 && [[ -f "${db_path}" ]]; then
+  sqlite3 -separator '|' "${db_path}" "
+    SELECT 'vmess', LOWER(username) FROM account_vmesses WHERE TRIM(COALESCE(username,''))<>''
+    UNION ALL SELECT 'vless', LOWER(username) FROM account_vlesses WHERE TRIM(COALESCE(username,''))<>''
+    UNION ALL SELECT 'trojan', LOWER(username) FROM account_trojans WHERE TRIM(COALESCE(username,''))<>'';
+  " > "${db_users}" 2>/dev/null || true
+fi
+if [[ -s "${db_users}" ]]; then
+  awk -F'|' '
+    NR==FNR { allow[$1 SUBSEP tolower($2)]=1; next }
+    (($3 SUBSEP tolower($4)) in allow) { print }
+  ' "${db_users}" "${new_map}" > "${new_map}.filtered" || true
+  mv -f "${new_map}.filtered" "${new_map}" >/dev/null 2>&1 || true
+fi
+
+chmod 600 "${new_map}" >/dev/null 2>&1 || true
+mv -f "${new_map}" "${state_file}" >/dev/null 2>&1 || true
+awk -F'|' '$1 ~ /^[0-9]+$/ && $3 ~ /^(vmess|vless|trojan)$/ && $4 ~ /^[a-z0-9._-]+$/ {
+  print $3 "|" $4 "|socket:" $1 "|" ($5!="" ? $5 : "-");
+}' "${state_file}" > "${session_rows}" 2>/dev/null || true
+
+# Native stats hanya dipakai jika core memang mendukung. Pada topologi
+# nginx/HAProxy -> Xray via loopback, native map memang kosong sehingga
+# stateful socket tracker di atas tetap menjadi sumber utama.
+xray_bin=""
+for candidate in /usr/local/bin/xray /usr/bin/xray "$(command -v xray 2>/dev/null || true)"; do
+  if [[ -n "${candidate}" && -x "${candidate}" ]]; then xray_bin="${candidate}"; break; fi
+done
+xray_supports_online="0"
+if [[ -n "${xray_bin}" ]]; then
+  xray_bin_mtime="$(stat -c %Y "${xray_bin}" 2>/dev/null || echo 0)"
+  cached_bin_mtime="0"; cached_support=""
+  if [[ -f "${native_support_file}" ]]; then
+    IFS='|' read -r cached_bin_mtime cached_support < "${native_support_file}" || true
+  fi
+  if [[ "${cached_bin_mtime}" == "${xray_bin_mtime}" && "${cached_support}" =~ ^[01]$ ]]; then
+    xray_supports_online="${cached_support}"
+  else
+    xray_ver="$("${xray_bin}" version 2>/dev/null | head -n1 || true)"
+    xray_ver="$(printf '%s\n' "${xray_ver}" | sed -nE 's/^.*Xray[[:space:]]+v?([0-9]+\.[0-9]+(\.[0-9]+)?).*$/\1/p' | head -n1)"
+    IFS='.' read -r ver_major ver_minor ver_patch <<< "${xray_ver:-0.0.0}"
+    ver_major="${ver_major:-0}"; ver_minor="${ver_minor:-0}"; ver_patch="${ver_patch:-0}"
+    if [[ "${ver_major}" =~ ^[0-9]+$ && "${ver_minor}" =~ ^[0-9]+$ && "${ver_patch}" =~ ^[0-9]+$ ]]; then
+      if (( ver_major > 24 || (ver_major == 24 && (ver_minor > 11 || (ver_minor == 11 && ver_patch >= 5))) )); then
+        xray_supports_online="1"
+      fi
+    fi
+    support_tmp="${tmp_dir}/native-support"
+    printf '%s|%s\n' "${xray_bin_mtime}" "${xray_supports_online}" > "${support_tmp}"
+    chmod 600 "${support_tmp}" >/dev/null 2>&1 || true
+    mv -f "${support_tmp}" "${native_support_file}" >/dev/null 2>&1 || true
+  fi
+fi
+if [[ "${xray_supports_online}" == "1" && -x "${xray_bin}" ]] && command -v jq >/dev/null 2>&1; then
+  native_cache_mtime="$(stat -c %Y "${native_cache_file}" 2>/dev/null || echo 0)"
+  [[ "${native_cache_mtime}" =~ ^[0-9]+$ ]] || native_cache_mtime="0"
+  if (( now_ts <= 0 || native_cache_mtime <= 0 || (now_ts - native_cache_mtime) >= native_poll )); then
+    native_tmp="${tmp_dir}/native.new"
+    if "${xray_bin}" api statsgetallonlineusers --server=127.0.0.1:10085 --timeout=2 2>/dev/null \
+      | jq -r '.users[]? // empty' 2>/dev/null \
+      | tr '[:upper:]' '[:lower:]' \
+      | awk '/^[a-z0-9._-]+$/' | sort -u > "${native_tmp}"; then
+      chmod 600 "${native_tmp}" >/dev/null 2>&1 || true
+      mv -f "${native_tmp}" "${native_cache_file}" >/dev/null 2>&1 || true
+    fi
+  fi
+  cp -f "${native_cache_file}" "${native_users}" 2>/dev/null || true
+fi
+
+awk -F'|' '
+  FILENAME==ARGV[1] {
+    print; have[$1 SUBSEP $2]=1; next;
+  }
+  FILENAME==ARGV[2] {
+    proto=tolower($1); user=tolower($2);
+    if (proto ~ /^(vmess|vless|trojan)$/ && user ~ /^[a-z0-9._-]+$/) {
+      db_count[user]++; db_proto[user]=proto;
+    }
+    next;
+  }
+  FILENAME==ARGV[3] {
+    user=tolower($1);
+    if (user !~ /^[a-z0-9._-]+$/ || db_count[user]!=1) next;
+    proto=db_proto[user]; key=proto SUBSEP user;
+    if (!(key in have)) print proto "|" user "|native:" user "|-";
+  }
+' "${session_rows}" "${db_users}" "${native_users}" > "${all_sessions}" || true
+
+case "${mode}" in
+  raw)
+    cat "${state_file}" 2>/dev/null || true
+    ;;
+  rows)
+    awk -F'|' '
+      $1 ~ /^(vmess|vless|trojan)$/ && $2 ~ /^[a-z0-9._-]+$/ && $3!="" {
+        sk=$1 SUBSEP $2 SUBSEP $3;
+        if (sk in session_seen) next;
+        session_seen[sk]=1; key=$1 SUBSEP $2; count[key]++;
+        if ($4!="" && $4!="-") lastip[key]=$4;
+      }
+      END {
+        for (key in count) {
+          split(key, a, SUBSEP);
+          printf "%s|%s|%d|%s\n", a[1], a[2], count[key], (key in lastip ? lastip[key] : "-");
+        }
+      }
+    ' "${all_sessions}" | sort -t'|' -k1,1 -k2,2
+    ;;
+  refresh)
+    ;;
+  *)
+    awk -F'|' '
+      $2 ~ /^[a-z0-9._-]+$/ && $3!="" {
+        sk=$2 SUBSEP $1 SUBSEP $3;
+        if (!(sk in session_seen)) { session_seen[sk]=1; count[$2]++; }
+      }
+      END { for (u in count) printf "%s(%d)\n", u, count[u]; }
+    ' "${all_sessions}" | sort
+    ;;
+esac
+EOF
+  if ! bash -n /usr/local/sbin/sc-1forcr-xray-live; then
+    log "Gagal menulis tracker sesi Xray realtime."
+    return 1
+  fi
+  chmod 755 /usr/local/sbin/sc-1forcr-xray-live
+}
+
 setup_online_notify_timer() {
   local notify_interval_h
   notify_interval_h="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
@@ -13192,6 +13846,9 @@ setup_online_notify_timer() {
   fi
 
   log "Setup notifikasi akun online berkala (${notify_interval_h} jam)..."
+
+  setup_ssh_live_tracker
+  setup_xray_live_tracker
 
   cat > /usr/local/sbin/sc-1forcr-online-notify <<'EOF'
 #!/usr/bin/env bash
@@ -13362,6 +14019,14 @@ refresh_zivpn_live_from_api_log() {
     done
 }
 
+ssh_users=""
+ssh_tracker_ready="0"
+if [[ -x /usr/local/sbin/sc-1forcr-ssh-live ]]; then
+  if ssh_users="$(/usr/local/sbin/sc-1forcr-ssh-live list 2>/dev/null)"; then
+    ssh_tracker_ready="1"
+  fi
+fi
+if [[ "${ssh_tracker_ready}" != "1" ]]; then
 ssh_users="$(
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
@@ -13493,8 +14158,9 @@ ssh_users="$(
   # Primary
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/) c[$1]++ } END { for (u in c) printf "%s(%d)\n", u, c[u] }' "${tmp_pair}" | sort || true
 )"
+fi
 ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
-if [[ "${ssh_cnt}" -eq 0 ]]; then
+if [[ "${ssh_cnt}" -eq 0 && "${ssh_tracker_ready}" != "1" ]]; then
   ssh_users="$(
     journalctl -u dropbear --since "-3 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" --no-pager 2>/dev/null | awk '
       function parse_pid(line,   p) {
@@ -13531,7 +14197,14 @@ fi
 
 xray_users=""
 xray_cnt=0
-if [[ -f /var/log/xray/access.log ]]; then
+xray_tracker_ready="0"
+if [[ -x /usr/local/sbin/sc-1forcr-xray-live ]]; then
+  if xray_users="$(/usr/local/sbin/sc-1forcr-xray-live list 2>/dev/null)"; then
+    xray_tracker_ready="1"
+    xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
+  fi
+fi
+if [[ "${xray_tracker_ready}" != "1" && -f /var/log/xray/access.log ]]; then
   xray_cutoff="$(date -d "-${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} seconds" '+%Y/%m/%d %H:%M:%S' 2>/dev/null || true)"
   [[ -z "${xray_cutoff}" ]] && xray_cutoff="1970/01/01 00:00:00"
   xray_users="$(tail -n 5000 /var/log/xray/access.log 2>/dev/null \
@@ -13595,6 +14268,10 @@ if [[ -f /var/log/xray/access.log ]]; then
       }
     ' | sort || true)"
   xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
+fi
+xray_monitor_mode="LOG_WINDOW_${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}S"
+if [[ "${xray_tracker_ready}" == "1" ]]; then
+  xray_monitor_mode="REALTIME_STATEFUL_SOCKET"
 fi
 
 udphc_service="$(detect_udphc_service)"
@@ -13697,8 +14374,8 @@ count_lines() {
 }
 
 format_user_rows() {
-  local data="$1"
-  echo "${data}" | awk '
+  local data="$1" unit="${2:-SESI}"
+  echo "${data}" | awk -v unit="${unit}" '
     function parse_row(raw, name, val, tmp) {
       name = raw
       val = "-"
@@ -13732,20 +14409,20 @@ format_user_rows() {
         exit
       }
       for (i = 1; i <= n; i++) {
-        printf "  - %s (%s IP)\n", users[i], vals[i]
+        printf "  - %s (%s %s)\n", users[i], vals[i], unit
       }
     }
   '
 }
 
 format_protocol_block() {
-  local proto="$1" cnt="$2" users="$3"
+  local proto="$1" cnt="$2" users="$3" unit="${4:-SESI}"
   printf -- "\n[%s] %s akun\n" "${proto}" "${cnt}"
   if [[ -z "${cnt}" || ! "${cnt}" =~ ^[0-9]+$ || "${cnt}" -le 0 ]]; then
     echo "  - -"
     return
   fi
-  format_user_rows "${users}"
+  format_user_rows "${users}" "${unit}"
 }
 
 online_total_detected="$((ssh_cnt + xray_cnt + udphc_cnt + zivpn_cnt))"
@@ -13773,7 +14450,7 @@ Event: ONLINE_REPORT
 Domain: ${DOMAIN}
 Waktu: $(date '+%F %T')
 Interval: ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
-Window XRAY: ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik
+Monitor XRAY: ${xray_monitor_mode}
 Handoff ZIVPN: ${ZIVPN_HANDOFF_GRACE_SECONDS} detik
 
 RINGKASAN AKUN AKTIF
@@ -13783,10 +14460,10 @@ RINGKASAN AKUN AKTIF
 - TROJAN: ${acct_trojan}
 
 ONLINE TERDETEKSI
-$(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}")
-$(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}")
-$(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}")
-$(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}")
+$(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}" "SESI")
+$(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}" "SESI")
+$(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}" "SESI")
+$(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}" "IP")
 "
 
 if should_send_online_report; then
@@ -21170,6 +21847,21 @@ show_combined_online() {
     }' "${tmp_ssh_count}" "${tmp_db_recent_loose}" > "${tmp_ssh_count_logs}" || true
   mv -f "${tmp_ssh_count_logs}" "${tmp_ssh_count}"
 
+  # Sumber stateful sudah memvalidasi ulang seluruh sesi terhadap socket/PID
+  # hidup. Jika tersedia, hasil ini menggantikan fallback log agar sesi yang
+  # sudah putus tidak ikut dihitung dan sesi lama tidak menghilang.
+  if [[ -x /usr/local/sbin/sc-1forcr-ssh-live ]]; then
+    if /usr/local/sbin/sc-1forcr-ssh-live list 2>/dev/null | awk '
+      match($0, /\([0-9]+\)$/) {
+        u=substr($0, 1, RSTART-1);
+        n=substr($0, RSTART+1, RLENGTH-2) + 0;
+        if (u ~ /^[a-z0-9._-]+$/ && n > 0) print u, n;
+      }
+    ' > "${tmp_ssh_count_merged}"; then
+      mv -f "${tmp_ssh_count_merged}" "${tmp_ssh_count}"
+    fi
+  fi
+
   awk '
     NR==FNR {
       u=$1; n=$2 + 0;
@@ -21258,7 +21950,7 @@ show_ssh_online_history() {
 
 show_ssh_only_online() {
   local tmp_status tmp_ip_count tmp_db_ports tmp_proc_count tmp_db_pids
-  local dropbear_main_port dropbear_alt_port db_recent_log_max hc_auth_lookback_h source_mode
+  local dropbear_main_port dropbear_alt_port db_recent_log_max hc_auth_lookback_h source_mode ssh_tracker_ready
   tmp_status="$(mktemp)"
   tmp_ip_count="$(mktemp)"
   tmp_db_ports="$(mktemp)"
@@ -21274,11 +21966,26 @@ show_ssh_only_online() {
   [[ -z "${db_recent_log_max}" || "${db_recent_log_max}" -lt 500 ]] && db_recent_log_max="5000"
   hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
   source_mode="REALTIME_ACTIVE_PORT"
+  ssh_tracker_ready="0"
 
   : > "${tmp_ip_count}"
+  if [[ -x /usr/local/sbin/sc-1forcr-ssh-live ]]; then
+    if /usr/local/sbin/sc-1forcr-ssh-live list 2>/dev/null | awk '
+      match($0, /\([0-9]+\)$/) {
+        u=substr($0, 1, RSTART-1);
+        n=substr($0, RSTART+1, RLENGTH-2) + 0;
+        if (u ~ /^[a-z0-9._-]+$/ && n > 0) print u, n;
+      }
+    ' > "${tmp_ip_count}"; then
+      ssh_tracker_ready="1"
+      source_mode="REALTIME_STATEFUL_SOCKET"
+    fi
+  fi
+
   # Sumber utama: port ssh-mux yang saat ini masih established ke Dropbear,
   # lalu cocokkan port tersebut dengan event autentikasi terakhir.
-  : > "${tmp_db_ports}"
+  if [[ "${ssh_tracker_ready}" != "1" && ! -s "${tmp_ip_count}" ]]; then
+    : > "${tmp_db_ports}"
     ss -Htnp state established 2>/dev/null | awk '
       function p(v,   s,n,a,port) {
         s=v;
@@ -21324,11 +22031,12 @@ show_ssh_only_online() {
           for (p in last_user) cnt[last_user[p]]++;
           for (u in cnt) print u, cnt[u];
       }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
+    fi
   fi
 
   # Fallback terakhir: hitung sesi dari process list aktif.
   # Ini menjaga monitor tetap tampil meski format log dropbear berbeda antar versi distro.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
+  if [[ "${ssh_tracker_ready}" != "1" && ! -s "${tmp_ip_count}" ]]; then
     source_mode="REALTIME_PROCESS"
     ps -eo args= 2>/dev/null | awk '
       {
@@ -21357,7 +22065,7 @@ show_ssh_only_online() {
   fi
 
   # Fallback final: map PID dropbear aktif (dari socket established) ke username auth di log.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
+  if [[ "${ssh_tracker_ready}" != "1" && ! -s "${tmp_ip_count}" ]]; then
     source_mode="REALTIME_DROPBEAR_PID"
     : > "${tmp_db_pids}"
     ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
@@ -21413,7 +22121,7 @@ show_ssh_only_online() {
   # Fallback paling longgar: auth sukses dropbear terbaru tanpa syarat PID aktif.
   # Berguna untuk pola koneksi HTTP Custom yang sangat cepat reconnect sehingga
   # snapshot socket aktif sering miss di saat monitor dibuka.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
+  if [[ "${ssh_tracker_ready}" != "1" && ! -s "${tmp_ip_count}" ]]; then
     source_mode="REALTIME_RECENT_AUTH"
     journalctl -u dropbear --since "-3 min" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
       function parse_pid(line,   p) {
@@ -21581,10 +22289,17 @@ xray_log_snapshot() {
 
 show_xray_online_by_table() {
   local table="$1" label="$2" mode="${3:-normal}"
-  local t_users t_seen
+  local t_users t_seen protocol source_mode tracker_ready
   t_users="$(mktemp)"
   t_seen="$(mktemp)"
   trap 'rm -f "${t_users:-}" "${t_seen:-}"' RETURN
+
+  case "${table}" in
+    account_vmesses) protocol="vmess" ;;
+    account_vlesses) protocol="vless" ;;
+    account_trojans) protocol="trojan" ;;
+    *) protocol="" ;;
+  esac
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY LOWER(username);" > "${t_users}" 2>/dev/null || true
   if [[ ! -s "${t_users}" ]]; then
@@ -21593,18 +22308,32 @@ show_xray_online_by_table() {
     return
   fi
 
-  xray_log_snapshot "${t_seen}" "${mode}"
+  source_mode="LOG_WINDOW_FALLBACK"
+  tracker_ready="0"
+  if [[ -n "${protocol}" && -x /usr/local/sbin/sc-1forcr-xray-live ]]; then
+    if /usr/local/sbin/sc-1forcr-xray-live rows 2>/dev/null | awk -F'|' -v proto="${protocol}" '
+      $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ {
+        print $2 "|" $3 "|" ($4!="" ? $4 : "-");
+      }
+    ' > "${t_seen}"; then
+      tracker_ready="1"
+      source_mode="REALTIME_STATEFUL_SOCKET"
+    fi
+  fi
+  if [[ "${tracker_ready}" != "1" ]]; then
+    xray_log_snapshot "${t_seen}" "${mode}"
+  fi
 
-  draw_menu_header "${label} USER LOGIN (berdasarkan log xray terbaru)"
+  draw_menu_header "${label} USER LOGIN (${source_mode})"
   if [[ ! -s "${t_seen}" ]]; then
-    echo "Tidak ada aktivitas terbaru."
+    echo "Tidak ada sesi ${label} yang sedang aktif."
     echo
     echo "Total User ${label} : 0"
-    echo "Total IP ${label}   : 0"
+    echo "Total Sesi ${label} : 0"
     return
   fi
 
-  printf "%-24s %-12s %-10s %-13s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "TERKONEKSI_IP" "LAST_IP"
+  printf "%-24s %-12s %-10s %-13s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "SESI_AKTIF" "LAST_IP"
   printf "%-24s %-12s %-10s %-13s %-22s\n" "------------------------" "------------" "----------" "-------------" "----------------------"
   awk -F'|' '
     NR==FNR {
@@ -21620,16 +22349,15 @@ show_xray_online_by_table() {
       s=db_status[u];
       l=(u in db_limit ? db_limit[u] : 0);
       if (s=="LOCK" || s=="LOCK_TMP" || s=="LOCK_QUOTA") out="KENA_LOCK";
-      else if (l > 0 && c > l) out="MULTI_LOGIN";
-      else out="AMAN";
+      else out="ONLINE";
       printf "%-24s %-12s %-10d %-13d %-22s\n", u, out, l, c, (lip=="" ? "-" : lip);
       total_user++;
-      total_ip+=c;
+      total_session+=c;
     }
     END {
       print "";
       printf "Total User : %d\n", total_user + 0;
-      printf "Total IP   : %d\n", total_ip + 0;
+      printf "Total Sesi : %d\n", total_session + 0;
     }' "${t_users}" "${t_seen}"
 }
 

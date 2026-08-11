@@ -1057,6 +1057,43 @@ app.get('/sc1forcr/payload/manifest', requireUpdateClient, async (req, res) => {
   }
 });
 
+app.get('/sc1forcr/payload/summary-manifest', requireUpdateClient, async (req, res) => {
+  try {
+    const reg = req.scUpdateRegistration || null;
+    const summaryApiPath = resolveSummaryApiLocalPath();
+    if (!reg || !fs.existsSync(summaryApiPath)) {
+      return res.status(404).json({ ok: false, message: 'installer Summary API/registrasi tidak tersedia' });
+    }
+    const serverKey = String(req.scUpdateServerKey || '').trim();
+    const content = normalizeScriptLineEndings(fs.readFileSync(summaryApiPath, 'utf8'));
+    const digest = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+    const now = Math.floor(Date.now() / 1000);
+    const payload = {
+      v: 1,
+      iss: 'sc1forcr-license-api',
+      aud: 'sc1forcr-update',
+      bound_ip: cleanIp(reg.vps_ip),
+      user_id: Number(reg.user_id || 0),
+      key_id: serverKeyId(serverKey),
+      file: 'scripts/setup-summary-api.sh',
+      version: `summary-${digest.slice(0, 16)}`,
+      sha256: digest,
+      size: Buffer.byteLength(content, 'utf8'),
+      issued_at: now,
+      valid_until: now + 600
+    };
+    return res.json({
+      ok: true,
+      algorithm: 'Ed25519',
+      manifest: signLicensePayload(payload),
+      ...payload,
+      public_key_fingerprint: licenseSigningKeyFingerprint
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
 app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) => {
   try {
     const keyedReg = req.scLicenseRegistration || null;

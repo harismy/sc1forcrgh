@@ -162,7 +162,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.8}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.9}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -21733,7 +21733,7 @@ set_account_event_webhook_config() {
 }
 
 install_summary_api_1forcr() {
-  local url tmp derived_url
+  local url tmp derived_url manifest_base manifest_resp manifest_token
   url="${SUMMARY_API_SETUP_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
@@ -21757,8 +21757,36 @@ install_summary_api_1forcr() {
     return 1
   fi
   sed -i 's/\r$//' "${tmp}"
-  chmod +x "${tmp}"
-  APP_DIR="/root/tunnel-sync" POTATO_DB="${DB_PATH}" bash "${tmp}"
+  if ! bash -n "${tmp}"; then
+    echo "Installer Summary API gagal validasi syntax."
+    rm -f "${tmp}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if [[ -f /etc/sc-1forcr-license-required ]]; then
+    manifest_base="$(echo "${LICENSE_API_URL:-}" | sed 's|/sc1forcr/license/activate$||')"
+    if [[ -z "${manifest_base}" || "${manifest_base}" == "${LICENSE_API_URL:-}" || \
+          -z "${SC_UPDATE_KEY:-}" || ! -x /usr/local/sbin/sc-1forcr-license-guard ]]; then
+      echo "Update Summary API ditolak: verifier/key signed manifest tidak tersedia."
+      rm -f "${tmp}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    manifest_resp="$(curl -4fsS --connect-timeout 10 --max-time 30 \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" -H "Authorization: Bearer ${LICENSE_API_TOKEN:-}" \
+      "${manifest_base}/sc1forcr/payload/summary-manifest" 2>/dev/null || \
+      curl -fsS --connect-timeout 10 --max-time 30 \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" -H "Authorization: Bearer ${LICENSE_API_TOKEN:-}" \
+      "${manifest_base}/sc1forcr/payload/summary-manifest" 2>/dev/null || true)"
+    manifest_token="$(echo "${manifest_resp}" | jq -r '.manifest // empty' 2>/dev/null || true)"
+    if [[ -z "${manifest_token}" ]] || \
+       ! /usr/local/sbin/sc-1forcr-license-guard verify-update "${tmp}" "${manifest_token}" >/dev/null; then
+      echo "Update Summary API ditolak: signature/checksum manifest tidak valid."
+      rm -f "${tmp}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    echo "Signed manifest Summary API: OK"
+  fi
+  chmod 700 "${tmp}"
+  SUMMARY_UPDATE_SAFE_MODE=1 APP_DIR="/root/tunnel-sync" POTATO_DB="${DB_PATH}" bash "${tmp}"
   return 0
 }
 
@@ -22624,7 +22652,7 @@ update_app_env_var() {
 }
 
 install_summary_api_1forcr() {
-  local url tmp derived_url
+  local url tmp derived_url manifest_base manifest_resp manifest_token
   url="${SUMMARY_API_SETUP_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
@@ -22647,8 +22675,36 @@ install_summary_api_1forcr() {
     return 1
   fi
   sed -i 's/\r$//' "${tmp}"
-  chmod +x "${tmp}"
-  APP_DIR="/root/tunnel-sync" POTATO_DB="${DB_PATH}" bash "${tmp}"
+  if ! bash -n "${tmp}"; then
+    echo "Installer Summary API gagal validasi syntax."
+    rm -f "${tmp}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if [[ -f /etc/sc-1forcr-license-required ]]; then
+    manifest_base="$(echo "${LICENSE_API_URL:-}" | sed 's|/sc1forcr/license/activate$||')"
+    if [[ -z "${manifest_base}" || "${manifest_base}" == "${LICENSE_API_URL:-}" || \
+          -z "${SC_UPDATE_KEY:-}" || ! -x /usr/local/sbin/sc-1forcr-license-guard ]]; then
+      echo "Update Summary API ditolak: verifier/key signed manifest tidak tersedia."
+      rm -f "${tmp}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    manifest_resp="$(curl -4fsS --connect-timeout 10 --max-time 30 \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" -H "Authorization: Bearer ${LICENSE_API_TOKEN:-}" \
+      "${manifest_base}/sc1forcr/payload/summary-manifest" 2>/dev/null || \
+      curl -fsS --connect-timeout 10 --max-time 30 \
+      -H "X-SC-Key: ${SC_UPDATE_KEY}" -H "Authorization: Bearer ${LICENSE_API_TOKEN:-}" \
+      "${manifest_base}/sc1forcr/payload/summary-manifest" 2>/dev/null || true)"
+    manifest_token="$(echo "${manifest_resp}" | jq -r '.manifest // empty' 2>/dev/null || true)"
+    if [[ -z "${manifest_token}" ]] || \
+       ! /usr/local/sbin/sc-1forcr-license-guard verify-update "${tmp}" "${manifest_token}" >/dev/null; then
+      echo "Update Summary API ditolak: signature/checksum manifest tidak valid."
+      rm -f "${tmp}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    echo "Signed manifest Summary API: OK"
+  fi
+  chmod 700 "${tmp}"
+  SUMMARY_UPDATE_SAFE_MODE=1 APP_DIR="/root/tunnel-sync" POTATO_DB="${DB_PATH}" bash "${tmp}"
 }
 
 mask_secret() {
@@ -23150,6 +23206,10 @@ prune_snapshots() {
 
 create_snapshot() {
   local reason="${1:-manual}" snapshot_id snapshot_dir list_file current_version path
+  local summary_systemd_present="0" summary_systemd_active="0" summary_systemd_enabled="0" summary_pm2_present="0"
+  local summary_watchdog_active="0" summary_watchdog_enabled="0"
+  local include_db="${SC_UPDATE_SNAPSHOT_INCLUDE_DB:-1}"
+  [[ "${include_db}" == "0" ]] || include_db="1"
   mkdir -p "${SNAPSHOT_ROOT}"
   chmod 700 "${SNAPSHOT_ROOT}" >/dev/null 2>&1 || true
   snapshot_id="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
@@ -23168,6 +23228,11 @@ create_snapshot() {
     /etc/sc-1forcr-distribution-id \
     /opt/sc-1forcr \
     /opt/potato-compat \
+    /root/tunnel-sync/summary-api.js \
+    /root/tunnel-sync/.env \
+    /root/tunnel-sync/package.json \
+    /root/tunnel-sync/package-lock.json \
+    /root/.pm2/dump.pm2 \
     /usr/local/lib/sc-1forcr \
     /etc/xray \
     /usr/local/etc/xray \
@@ -23181,6 +23246,11 @@ create_snapshot() {
     /etc/nginx/sites-enabled/sc-1forcr.conf \
     /etc/haproxy/haproxy.cfg \
     /etc/systemd/system/sc-1forcr-api.service.d \
+    /etc/systemd/system/sc-1forcr-summary-api.service \
+    /etc/systemd/system/sc-1forcr-summary-api.service.d \
+    /etc/systemd/system/sc-1forcr-summary-watchdog.service \
+    /etc/systemd/system/sc-1forcr-summary-watchdog.timer \
+    /etc/systemd/system/pm2-root.service \
     /etc/systemd/system/sc-1forcr-sshws.service.d \
     /etc/systemd/system/dropbear.service.d \
     /etc/systemd/system/xray.service.d \
@@ -23212,7 +23282,7 @@ create_snapshot() {
   fi
   rm -f "${list_file}"
 
-  if [[ -f "${DB_PATH}" ]]; then
+  if [[ "${include_db}" == "1" && -f "${DB_PATH}" ]]; then
     if ! command -v python3 >/dev/null 2>&1; then
       log_update_manager "python3 tidak tersedia; snapshot database dibatalkan."
       rm -rf -- "${snapshot_dir}"
@@ -23239,12 +23309,33 @@ PY
   fi
 
   current_version="$(awk -F= '/^SCRIPT_VERSION=/{print $2; exit}' /etc/sc-1forcr-version 2>/dev/null || true)"
+  systemctl cat sc-1forcr-summary-api.service >/dev/null 2>&1 && summary_systemd_present="1"
+  systemctl is-active --quiet sc-1forcr-summary-api.service 2>/dev/null && summary_systemd_active="1"
+  systemctl is-enabled --quiet sc-1forcr-summary-api.service 2>/dev/null && summary_systemd_enabled="1"
+  systemctl is-active --quiet sc-1forcr-summary-watchdog.timer 2>/dev/null && summary_watchdog_active="1"
+  systemctl is-enabled --quiet sc-1forcr-summary-watchdog.timer 2>/dev/null && summary_watchdog_enabled="1"
+  if command -v pm2 >/dev/null 2>&1 && [[ -r /root/.pm2/pm2.pid ]]; then
+    local summary_pm2_pid
+    summary_pm2_pid="$(tr -cd '0-9' </root/.pm2/pm2.pid 2>/dev/null || true)"
+    if [[ -n "${summary_pm2_pid}" ]] && kill -0 "${summary_pm2_pid}" >/dev/null 2>&1 && \
+       pm2 describe tunnel-summary >/dev/null 2>&1; then
+      summary_pm2_present="1"
+    fi
+  fi
   {
     printf 'SNAPSHOT_ID=%q\n' "${snapshot_id}"
     printf 'CREATED_AT=%q\n' "$(date -Iseconds 2>/dev/null || date '+%F %T%z')"
     printf 'REASON=%q\n' "${reason}"
     printf 'FROM_VERSION=%q\n' "${current_version:-unknown}"
     printf 'DB_PATH=%q\n' "${DB_PATH}"
+    printf 'DB_SNAPSHOT_INCLUDED=%q\n' "${include_db}"
+    printf 'SUMMARY_RUNTIME_STATE_RECORDED=1\n'
+    printf 'SUMMARY_SYSTEMD_PRESENT=%q\n' "${summary_systemd_present}"
+    printf 'SUMMARY_SYSTEMD_ACTIVE=%q\n' "${summary_systemd_active}"
+    printf 'SUMMARY_SYSTEMD_ENABLED=%q\n' "${summary_systemd_enabled}"
+    printf 'SUMMARY_PM2_PRESENT=%q\n' "${summary_pm2_present}"
+    printf 'SUMMARY_WATCHDOG_ACTIVE=%q\n' "${summary_watchdog_active}"
+    printf 'SUMMARY_WATCHDOG_ENABLED=%q\n' "${summary_watchdog_enabled}"
   } > "${snapshot_dir}/state.env"
   chmod 600 "${snapshot_dir}/state.env"
   (
@@ -23303,7 +23394,7 @@ service_unit_name() {
 }
 
 health_check() {
-  local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok
+  local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok
   load_update_env
   DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
   API_PORT="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
@@ -23359,6 +23450,22 @@ PY
       sleep 1
     done
     [[ "${api_ok}" == "1" ]] || failures+=("API /vps/health")
+  fi
+
+  if unit_is_installed sc-1forcr-summary-api.service; then
+    summary_port="$(awk -F= '$1 == "SUMMARY_PORT" {gsub(/[[:space:]\r]/, "", $2); print $2; exit}' /root/tunnel-sync/.env 2>/dev/null || true)"
+    summary_port="$(printf '%s' "${summary_port:-8789}" | tr -cd '0-9')"
+    [[ -z "${summary_port}" ]] && summary_port="8789"
+    summary_ok="0"
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      if systemctl is-active --quiet sc-1forcr-summary-api.service && \
+         curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${summary_port}/health" >/dev/null 2>&1; then
+        summary_ok="1"
+        break
+      fi
+      sleep 1
+    done
+    [[ "${summary_ok}" == "1" ]] || failures+=("Summary API /health")
   fi
 
   backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
@@ -23437,12 +23544,79 @@ restart_after_restore() {
   fi
 }
 
+restore_summary_runtime() {
+  local state_recorded="${1:-0}" had_systemd="${2:-0}" systemd_was_active="${3:-0}" systemd_was_enabled="${4:-0}"
+  local had_pm2="${5:-0}" watchdog_was_active="${6:-0}" watchdog_was_enabled="${7:-0}"
+  local summary_port attempt
+  [[ "${state_recorded}" == "1" ]] || return 0
+
+  systemctl stop sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+  if [[ "${had_systemd}" == "1" ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "${systemd_was_enabled}" == "1" ]]; then
+      systemctl enable sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+    else
+      systemctl disable sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+    fi
+    if [[ "${systemd_was_active}" == "1" ]]; then
+      systemctl restart sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+    fi
+    if command -v pm2 >/dev/null 2>&1 && [[ -r /root/.pm2/pm2.pid ]]; then
+      local running_pm2_pid
+      running_pm2_pid="$(tr -cd '0-9' </root/.pm2/pm2.pid 2>/dev/null || true)"
+      if [[ -n "${running_pm2_pid}" ]] && kill -0 "${running_pm2_pid}" >/dev/null 2>&1; then
+        pm2 delete tunnel-summary >/dev/null 2>&1 || true
+        pm2 save --force >/dev/null 2>&1 || true
+      fi
+    fi
+  else
+    systemctl disable --now sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/sc-1forcr-summary-api.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "${had_pm2}" == "1" ]] && command -v pm2 >/dev/null 2>&1; then
+      systemctl enable --now pm2-root.service >/dev/null 2>&1 || true
+      pm2 resurrect >/dev/null 2>&1 || \
+        pm2 start /root/tunnel-sync/summary-api.js --name tunnel-summary --time --max-memory-restart 256M >/dev/null 2>&1 || true
+      pm2 save --force >/dev/null 2>&1 || true
+      summary_port="$(awk -F= '$1 == "SUMMARY_PORT" {gsub(/[[:space:]\r]/, "", $2); print $2; exit}' /root/tunnel-sync/.env 2>/dev/null || true)"
+      summary_port="$(printf '%s' "${summary_port:-8789}" | tr -cd '0-9')"
+      [[ -z "${summary_port}" ]] && summary_port="8789"
+      for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${summary_port}/health" >/dev/null 2>&1 && break
+        sleep 1
+      done
+      if ! curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${summary_port}/health" >/dev/null 2>&1; then
+        log_update_manager "Fallback PM2 Summary API gagal health-check."
+        return 1
+      fi
+    fi
+  fi
+
+  if systemctl cat sc-1forcr-summary-watchdog.timer >/dev/null 2>&1; then
+    if [[ "${watchdog_was_enabled}" == "1" ]]; then
+      systemctl enable sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
+    else
+      systemctl disable sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
+    fi
+    if [[ "${watchdog_was_active}" == "1" ]]; then
+      systemctl restart sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
+    else
+      systemctl stop sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
+    fi
+  fi
+  return 0
+}
+
 rollback_snapshot() {
   local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard
+  local SUMMARY_RUNTIME_STATE_RECORDED="0" SUMMARY_SYSTEMD_PRESENT="0" SUMMARY_SYSTEMD_ACTIVE="0" SUMMARY_SYSTEMD_ENABLED="0"
+  local SUMMARY_PM2_PRESENT="0" SUMMARY_WATCHDOG_ACTIVE="0" SUMMARY_WATCHDOG_ENABLED="0"
   snapshot_dir="$(verify_snapshot "${1:-latest}")" || return 1
   snapshot_name="$(basename "${snapshot_dir}")"
   log_update_manager "Menyiapkan rollback ke ${snapshot_name}..."
   pre_snapshot="$(create_snapshot "pre-rollback-to-${snapshot_name}" 2>/dev/null || true)"
+  # shellcheck disable=SC1090
+  source "${snapshot_dir}/state.env"
 
   snapshot_has_signed_guard="0"
   if tar -tzf "${snapshot_dir}/files.tar.gz" 2>/dev/null | \
@@ -23472,6 +23646,12 @@ rollback_snapshot() {
 
   systemctl stop sc-1forcr-license-guard.timer sc-1forcr-license-guard.service >/dev/null 2>&1 || true
   systemctl stop sc-1forcr-api.service sc-1forcr-sshws.service >/dev/null 2>&1 || true
+  if [[ "${SUMMARY_RUNTIME_STATE_RECORDED:-0}" == "1" ]]; then
+    systemctl stop sc-1forcr-summary-api.service sc-1forcr-summary-watchdog.timer >/dev/null 2>&1 || true
+    if [[ "${SUMMARY_SYSTEMD_PRESENT:-0}" != "1" ]]; then
+      rm -f /etc/systemd/system/sc-1forcr-summary-api.service
+    fi
+  fi
   tar --extract --gzip --file="${snapshot_dir}/files.tar.gz" --directory=/ \
     --numeric-owner --acls --xattrs \
     --exclude='usr/local/sbin/sc-1forcr-update-manager' \
@@ -23480,8 +23660,6 @@ rollback_snapshot() {
     --exclude='opt/sc-1forcr/menu-sc-1forcr.sh' \
     --exclude='opt/potato-compat/menu-sc-1forcr.sh'
 
-  # shellcheck disable=SC1090
-  source "${snapshot_dir}/state.env"
   rollback_db="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
   if [[ -f "${snapshot_dir}/database.sqlite" ]]; then
     db_dir="$(dirname "${rollback_db}")"
@@ -23493,6 +23671,14 @@ rollback_snapshot() {
   fi
   chmod 600 /etc/sc-1forcr.env "${rollback_db}" >/dev/null 2>&1 || true
   restart_after_restore
+  restore_summary_runtime \
+    "${SUMMARY_RUNTIME_STATE_RECORDED:-0}" \
+    "${SUMMARY_SYSTEMD_PRESENT:-0}" \
+    "${SUMMARY_SYSTEMD_ACTIVE:-0}" \
+    "${SUMMARY_SYSTEMD_ENABLED:-0}" \
+    "${SUMMARY_PM2_PRESENT:-0}" \
+    "${SUMMARY_WATCHDOG_ACTIVE:-0}" \
+    "${SUMMARY_WATCHDOG_ENABLED:-0}"
   ln -sfn "${snapshot_name}" "${SNAPSHOT_ROOT}/latest"
   ln -sfn "${snapshot_name}" "${SNAPSHOT_ROOT}/latest-rollback"
   {

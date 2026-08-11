@@ -7,6 +7,7 @@ SUMMARY_PORT="${SUMMARY_PORT:-8789}"
 SUMMARY_HOST="${SUMMARY_HOST:-0.0.0.0}"
 POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
+SUMMARY_UPDATE_SAFE_MODE="${SUMMARY_UPDATE_SAFE_MODE:-1}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root (or use sudo)."
@@ -79,17 +80,6 @@ install_node_if_missing() {
   exit 1
 }
 
-install_pm2_if_missing() {
-  if command -v pm2 >/dev/null 2>&1; then
-    log "PM2 already installed: $(pm2 -v)"
-    return
-  fi
-
-  log "Installing PM2..."
-  npm install -g pm2
-  log "PM2 installed: $(pm2 -v)"
-}
-
 install_vnstat_if_missing() {
   if command -v vnstat >/dev/null 2>&1; then
     log "vnstat already installed: $(vnstat --version | head -n1)"
@@ -105,6 +95,7 @@ install_vnstat_if_missing() {
 }
 
 write_files() {
+  local existing_port
   mkdir -p "${APP_DIR}"
 
   cat > "${APP_DIR}/summary-api.js" <<'JS'
@@ -2789,7 +2780,8 @@ app.listen(PORT, HOST, () => {
 });
 JS
 
-  cat > "${APP_DIR}/.env" <<EOF
+  if [[ ! -f "${APP_DIR}/.env" ]]; then
+    cat > "${APP_DIR}/.env" <<EOF
 SUMMARY_PORT=${SUMMARY_PORT}
 SUMMARY_HOST=${SUMMARY_HOST}
 POTATO_DB=${POTATO_DB}
@@ -2808,6 +2800,15 @@ SC_REG_META_FILE=/etc/sc-1forcr-registration.env
 FULL_RESTORE_SCRIPT=/usr/local/sbin/sc-1forcr-restore-backup
 RESTORE_TMP_DIR=/tmp
 EOF
+  else
+    # Token dan setting runtime dapat diubah oleh admin/bot. Jangan reset saat update.
+    existing_port="$(awk -F= '$1 == "SUMMARY_PORT" {gsub(/[[:space:]\r]/, "", $2); print $2; exit}' "${APP_DIR}/.env" 2>/dev/null || true)"
+    existing_port="$(printf '%s' "${existing_port}" | tr -cd '0-9')"
+    if [[ -n "${existing_port}" && "${existing_port}" -ge 1 && "${existing_port}" -le 65535 ]]; then
+      SUMMARY_PORT="${existing_port}"
+    fi
+    log "Konfigurasi ${APP_DIR}/.env lama dipertahankan."
+  fi
 
   chmod 600 "${APP_DIR}/.env"
 }
@@ -2903,32 +2904,125 @@ open_summary_firewall() {
   fi
 }
 
-start_pm2_service() {
-  cd "${APP_DIR}"
-
-  if [[ "${SUMMARY_UPDATE_SAFE_MODE:-0}" == "1" ]]; then
-    if pm2 describe "${APP_NAME}" >/dev/null 2>&1; then
-      pm2 restart "${APP_NAME}" --update-env >/dev/null 2>&1 || \
-        pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
-    else
-      pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
+summary_health_check() {
+  local attempt port
+  port="$(echo "${SUMMARY_PORT:-8789}" | tr -cd '0-9')"
+  [[ -z "${port}" || "${port}" -lt 1 || "${port}" -gt 65535 ]] && port="8789"
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if systemctl is-active --quiet sc-1forcr-summary-api.service && \
+       curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+      return 0
     fi
-    pm2 save --force >/dev/null 2>&1 || true
-    return 0
-  fi
+    sleep 1
+  done
+  return 1
+}
 
+pm2_daemon_is_running() {
+  local pm2_pid=""
+  [[ -r /root/.pm2/pm2.pid ]] && pm2_pid="$(tr -cd '0-9' </root/.pm2/pm2.pid 2>/dev/null || true)"
+  [[ -n "${pm2_pid}" ]] && kill -0 "${pm2_pid}" >/dev/null 2>&1
+}
+
+pm2_has_other_apps() {
+  local pm2_json
+  command -v pm2 >/dev/null 2>&1 || return 1
+  if ! pm2_json="$(pm2 jlist 2>/dev/null)"; then
+    return 0 # Status tidak pasti: anggap ada aplikasi lain agar PM2 tidak dimatikan.
+  fi
+  printf '%s' "${pm2_json}" | node -e '
+const target = String(process.argv[1] || "tunnel-summary");
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { raw += chunk; });
+process.stdin.on("end", () => {
+  try {
+    const apps = JSON.parse(raw || "[]");
+    process.exit(apps.some((app) => String(app && app.name || "") !== target) ? 0 : 1);
+  } catch (_) {
+    process.exit(0); // Jangan matikan PM2 jika statusnya tidak dapat dipastikan.
+  }
+});
+' "${APP_NAME}" >/dev/null 2>&1
+}
+
+restore_pm2_summary_fallback() {
+  command -v pm2 >/dev/null 2>&1 || return 1
+  cd "${APP_DIR}"
   pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
-  pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M
-  pm2 save --force
+  pm2 start "${APP_DIR}/summary-api.js" --name "${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1
+  pm2 save --force >/dev/null 2>&1 || true
+}
 
-  pm2 startup systemd -u root --hp /root >/tmp/pm2-startup.out 2>&1 || true
-  STARTUP_CMD="$(grep -Eo 'sudo .+' /tmp/pm2-startup.out | head -n1 || true)"
-  if [[ -n "${STARTUP_CMD}" ]]; then
-    bash -lc "${STARTUP_CMD#sudo }" || true
+cleanup_old_pm2_summary() {
+  command -v pm2 >/dev/null 2>&1 && pm2_daemon_is_running || return 0
+  pm2 delete "${APP_NAME}" >/dev/null 2>&1 || true
+  pm2 save --force >/dev/null 2>&1 || true
+  if ! pm2_has_other_apps; then
+    pm2 kill >/dev/null 2>&1 || true
+    systemctl disable --now pm2-root.service >/dev/null 2>&1 || true
+    log "PM2 tidak lagi memiliki aplikasi lain; daemon dimatikan (paket tidak dihapus)."
+  else
+    log "PM2 tetap aktif karena masih mengelola aplikasi lain."
+  fi
+}
+
+start_systemd_service() {
+  local unit_tmp had_pm2="0"
+  cd "${APP_DIR}"
+  unit_tmp="$(mktemp /etc/systemd/system/.sc-1forcr-summary-api.XXXXXX)"
+  cat > "${unit_tmp}" <<EOF
+[Unit]
+Description=SC 1FORCR Summary API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+Environment=NODE_ENV=production
+Environment=UV_THREADPOOL_SIZE=2
+ExecStart=/usr/bin/node ${APP_DIR}/summary-api.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+TasksMax=256
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "${unit_tmp}"
+
+  if command -v pm2 >/dev/null 2>&1 && pm2_daemon_is_running && \
+     pm2 describe "${APP_NAME}" >/dev/null 2>&1; then
+    had_pm2="1"
   fi
 
-  systemctl enable pm2-root >/dev/null 2>&1 || true
-  systemctl restart pm2-root >/dev/null 2>&1 || true
+  # Unit dipasang atomik. PM2 baru dihentikan sesaat sebelum systemd mengambil port.
+  mv -f "${unit_tmp}" /etc/systemd/system/sc-1forcr-summary-api.service
+  systemctl daemon-reload
+  systemctl enable sc-1forcr-summary-api.service >/dev/null 2>&1
+  if [[ "${had_pm2}" == "1" ]]; then
+    pm2 stop "${APP_NAME}" >/dev/null 2>&1 || true
+  fi
+  systemctl restart sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+
+  if ! summary_health_check; then
+    log "Service systemd Summary API gagal health-check; mengembalikan runtime PM2 lama."
+    systemctl disable --now sc-1forcr-summary-api.service >/dev/null 2>&1 || true
+    if [[ "${had_pm2}" == "1" ]] && restore_pm2_summary_fallback; then
+      log "Fallback PM2 berhasil dipulihkan."
+    fi
+    journalctl -u sc-1forcr-summary-api.service -n 80 --no-pager >&2 || true
+    return 1
+  fi
+
+  cleanup_old_pm2_summary
+  log "Summary API aktif via systemd; PM2 tidak lagi diperlukan untuk service ini."
 }
 
 install_summary_watchdog() {
@@ -2943,6 +3037,7 @@ install_summary_watchdog() {
 set -euo pipefail
 APP_NAME="${app_name}"
 APP_DIR="${app_dir}"
+SERVICE_NAME="sc-1forcr-summary-api.service"
 PORT="${port}"
 LOG_TAG="sc-1forcr-summary-watchdog"
 
@@ -2954,12 +3049,8 @@ if curl -fsS --connect-timeout 2 --max-time 6 "http://127.0.0.1:\${PORT}/health"
   exit 0
 fi
 
-log_msg "summary api health gagal, restart pm2 \${APP_NAME}"
-if command -v pm2 >/dev/null 2>&1; then
-  pm2 restart "\${APP_NAME}" --update-env >/dev/null 2>&1 || \
-    pm2 start "\${APP_DIR}/summary-api.js" --name "\${APP_NAME}" --time --max-memory-restart 256M >/dev/null 2>&1 || true
-  pm2 save --force >/dev/null 2>&1 || true
-fi
+log_msg "summary api health gagal, restart systemd \${SERVICE_NAME}"
+systemctl restart "\${SERVICE_NAME}" >/dev/null 2>&1 || true
 
 sleep 3
 if ! curl -fsS --connect-timeout 2 --max-time 6 "http://127.0.0.1:\${PORT}/health" >/dev/null 2>&1; then
@@ -2974,7 +3065,7 @@ EOF
   cat > /etc/systemd/system/sc-1forcr-summary-watchdog.service <<'EOF'
 [Unit]
 Description=SC 1FORCR Summary API watchdog
-After=network-online.target pm2-root.service
+After=network-online.target sc-1forcr-summary-api.service
 
 [Service]
 Type=oneshot
@@ -3003,7 +3094,7 @@ EOF
 print_result() {
   log "Done."
   echo
-  echo "Service Name : ${APP_NAME}"
+  echo "Service Name : sc-1forcr-summary-api.service (systemd)"
   echo "Service Path : ${APP_DIR}/summary-api.js"
   echo "Listen       : ${SUMMARY_HOST}:${SUMMARY_PORT}"
   echo "DB Path      : ${POTATO_DB}"
@@ -3048,12 +3139,47 @@ print_result() {
   echo "    \"http://127.0.0.1:${SUMMARY_PORT}/internal/restore-full-backup-url\" && echo"
 }
 
+SUMMARY_TRANSACTION_SNAPSHOT=""
+SUMMARY_TRANSACTION_COMMITTED="0"
+
+rollback_summary_transaction_on_exit() {
+  local rc="$?"
+  trap - EXIT
+  if [[ "${SUMMARY_TRANSACTION_COMMITTED:-0}" != "1" && -n "${SUMMARY_TRANSACTION_SNAPSHOT:-}" && \
+        -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+    log "Update Summary API gagal; menjalankan rollback otomatis."
+    /usr/local/sbin/sc-1forcr-update-manager rollback "${SUMMARY_TRANSACTION_SNAPSHOT}" || \
+      log "PERINGATAN: rollback otomatis gagal. Snapshot: ${SUMMARY_TRANSACTION_SNAPSHOT}"
+  fi
+  exit "${rc}"
+}
+
+begin_summary_transaction() {
+  [[ "${SUMMARY_UPDATE_SAFE_MODE:-0}" == "1" ]] || return 0
+  if [[ ! -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
+    log "Update aman membutuhkan sc-1forcr-update-manager terbaru. Update SC utama terlebih dahulu."
+    return 1
+  fi
+  SUMMARY_TRANSACTION_SNAPSHOT="$(SC_UPDATE_SNAPSHOT_INCLUDE_DB=0 \
+    /usr/local/sbin/sc-1forcr-update-manager snapshot 'pre-summary-systemd-migration')"
+  /usr/local/sbin/sc-1forcr-update-manager verify "${SUMMARY_TRANSACTION_SNAPSHOT}" >/dev/null
+  trap rollback_summary_transaction_on_exit EXIT
+}
+
+commit_summary_transaction() {
+  [[ -n "${SUMMARY_TRANSACTION_SNAPSHOT:-}" ]] || return 0
+  /usr/local/sbin/sc-1forcr-update-manager commit "${SUMMARY_TRANSACTION_SNAPSHOT}" "summary-systemd"
+  SUMMARY_TRANSACTION_COMMITTED="1"
+  trap - EXIT
+}
+
 install_node_if_missing
-install_pm2_if_missing
 install_vnstat_if_missing
+begin_summary_transaction
 write_files
 install_dependencies
-start_pm2_service
+start_systemd_service
 install_summary_watchdog
 open_summary_firewall
+commit_summary_transaction
 print_result

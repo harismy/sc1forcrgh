@@ -164,7 +164,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.16}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.17}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -10974,9 +10974,11 @@ ss -Htn state established 2>/dev/null | awk -v port_re="${port_re}" '
     return x;
   }
   {
-    lp=port_of($4);
+    local_ep=$3; remote_ep=$4;
+    if (port_of(local_ep) == "" || port_of(remote_ep) == "") { local_ep=$4; remote_ep=$5; }
+    lp=port_of(local_ep);
     if (lp !~ port_re) next;
-    ip=ip_of($5);
+    ip=ip_of(remote_ep);
     if (ip == "" || ip ~ /^(127\.|::1$|0\.0\.0\.0$)/) next;
     print ip;
   }' > "${tmp_conn}" || true
@@ -11373,7 +11375,10 @@ for alias_port in "${ports[@]:1}"; do
     systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
     continue
   fi
-  established="$(ss -Htn state established 2>/dev/null | awk -v port=":${alias_port}" '$3 ~ (port "$") {count++} END {print count+0}')"
+  established="$(ss -Htn state established 2>/dev/null | awk -v wanted="${alias_port}" '
+    function p(v,   s,n,a,port) { s=v; gsub(/^\[/,"",s); gsub(/\]$/,"",s); n=split(s,a,":"); port=a[n]; return (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535 ? port : ""); }
+    { local_ep=$3; if (p(local_ep) !~ /^[0-9]{1,5}$/) local_ep=$4; if (p(local_ep)==wanted) count++; }
+    END {print count+0}')"
   if [[ "${established}" == "0" ]]; then
     systemctl stop "${unit}" >/dev/null 2>&1 || true
     systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
@@ -13372,8 +13377,9 @@ ssh_users="$(
 
   ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
     {
-      l=$4
-      r=$5
+      l=$3
+      r=$4
+      if (l !~ /:[0-9]+$/ || r !~ /:[0-9]+$/) { l=$4; r=$5 }
       if (l ~ /:22$/ || l ~ (":" p1 "$") || l ~ (":" p2 "$")) {
         ip=r
         gsub(/^\[/, "", ip)
@@ -13428,11 +13434,13 @@ ssh_users="$(
       function p(v,   s,n,a,port) {
         s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
         n=split(s, a, ":"); port=a[n];
-        if (port ~ /^[0-9]{1,5}$/) return port;
+        if (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535) return port;
         return "";
       }
       {
-        lp=p($4); rp=p($5);
+        l=$3; r=$4;
+        if (p(l)=="" || p(r)=="") { l=$4; r=$5; }
+        lp=p(l); rp=p(r);
         if (lp==p1 || lp==p2) { if (rp ~ /^[0-9]{1,5}$/) act[rp]=1; }
         else if (rp==p1 || rp==p2) { if (lp ~ /^[0-9]{1,5}$/) act[lp]=1; }
       }
@@ -20755,8 +20763,9 @@ show_combined_online() {
   : > "${tmp_ssh_count}"
   ss -Htnp state established 2>/dev/null | awk '
     {
-      l=$4;
-      r=$5;
+      l=$3;
+      r=$4;
+      if (l !~ /:[0-9]+$/ || r !~ /:[0-9]+$/) { l=$4; r=$5; }
       if (l ~ /:22$/ || l ~ /:'"${dropbear_main_port}"'$/ || l ~ /:'"${dropbear_alt_port}"'$/) {
         ip=r;
         gsub(/^\[/, "", ip);
@@ -20981,11 +20990,13 @@ show_combined_online() {
       gsub(/^\[/, "", s); gsub(/\]$/, "", s);
       n=split(s, a, ":");
       port=a[n];
-      if (port ~ /^[0-9]{1,5}$/) return port;
+      if (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535) return port;
       return "";
     }
     {
-      lp=p($4); rp=p($5);
+      l=$3; r=$4;
+      if (p(l)=="" || p(r)=="") { l=$4; r=$5; }
+      lp=p(l); rp=p(r);
       if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
         if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
       } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
@@ -21262,71 +21273,25 @@ show_ssh_only_online() {
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
   [[ -z "${db_recent_log_max}" || "${db_recent_log_max}" -lt 500 ]] && db_recent_log_max="5000"
   hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
-  source_mode="REALTIME_AUTH_120S"
+  source_mode="REALTIME_ACTIVE_PORT"
 
   : > "${tmp_ip_count}"
-  # Ambil user aktif dari auth sukses 120 detik terakhir, keluarkan sesi yang sudah Exit by PID.
-  journalctl -u dropbear --since "-120 sec" -n "${db_recent_log_max}" --no-pager 2>/dev/null | awk '
-    function parse_pid(line,   p) {
-      if (match(line, /\[[0-9]+\]/)) {
-        p=substr(line, RSTART+1, RLENGTH-2);
-        if (p ~ /^[0-9]+$/) return p;
-      }
-      return "";
-    }
-    /auth succeeded for /{
-      pid=parse_pid($0);
-      u=$0;
-      sub(/^.*auth succeeded for /,"",u);
-      sub(/^'\''/,"",u); sub(/^"/,"",u);
-      sub(/'\''.*/,"",u); sub(/".*/,"",u);
-      sub(/[[:space:]].*$/,"",u);
-      u=tolower(u);
-      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
-
-      src=$0;
-      sub(/^.* from /, "", src);
-      gsub(/[[:space:]]+$/, "", src);
-      port=src;
-      sub(/^.*:/, "", port);
-      if (port !~ /^[0-9]{1,5}$/) next;
-
-      key=u "|" port;
-      if (pid != "") auth_by_pid[pid]=key; else auth_no_pid[key]=1;
-      next;
-    }
-    /Exit \(|Exit before auth:/{
-      pid=parse_pid($0);
-      if (pid != "") closed_pid[pid]=1;
-    }
-    END{
-      for (pid in auth_by_pid) {
-        if (pid in closed_pid) continue;
-        seen[auth_by_pid[pid]]=1;
-      }
-      for (k in auth_no_pid) seen[k]=1;
-      for (k in seen) {
-        split(k, a, /\|/);
-        cnt[a[1]]++;
-      }
-      for (u in cnt) print u, cnt[u];
-    }' > "${tmp_ip_count}" || true
-
-  # Fallback realtime berdasarkan port ssh-mux yang masih aktif ke dropbear.
-  if [[ ! -s "${tmp_ip_count}" ]]; then
-    source_mode="REALTIME_ACTIVE_PORT"
-    : > "${tmp_db_ports}"
+  # Sumber utama: port ssh-mux yang saat ini masih established ke Dropbear,
+  # lalu cocokkan port tersebut dengan event autentikasi terakhir.
+  : > "${tmp_db_ports}"
     ss -Htnp state established 2>/dev/null | awk '
       function p(v,   s,n,a,port) {
         s=v;
         gsub(/^\[/, "", s); gsub(/\]$/, "", s);
         n=split(s, a, ":");
         port=a[n];
-        if (port ~ /^[0-9]{1,5}$/) return port;
+        if (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535) return port;
         return "";
       }
       {
-        lp=p($4); rp=p($5);
+        l=$3; r=$4;
+        if (p(l)=="" || p(r)=="") { l=$4; r=$5; }
+        lp=p(l); rp=p(r);
         if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
           if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
         } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
@@ -21335,8 +21300,8 @@ show_ssh_only_online() {
       }
       END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
-    if [[ -s "${tmp_db_ports}" ]]; then
-      journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES:-12000}" --no-pager 2>/dev/null | awk '
+  if [[ -s "${tmp_db_ports}" ]]; then
+    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES:-12000}" --no-pager 2>/dev/null | awk '
         NR==FNR { ap[$1]=1; next }
         /auth succeeded for /{
           u=$0;
@@ -21358,8 +21323,7 @@ show_ssh_only_online() {
         END {
           for (p in last_user) cnt[last_user[p]]++;
           for (u in cnt) print u, cnt[u];
-        }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
-    fi
+      }' "${tmp_db_ports}" - > "${tmp_ip_count}" || true
   fi
 
   # Fallback terakhir: hitung sesi dari process list aktif.
@@ -21397,9 +21361,17 @@ show_ssh_only_online() {
     source_mode="REALTIME_DROPBEAR_PID"
     : > "${tmp_db_pids}"
     ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_main_port}" -v p2="${dropbear_alt_port}" '
+      function p(v,   s,n,a,port) {
+        s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+        n=split(s, a, ":"); port=a[n];
+        if (port ~ /^[0-9]{1,5}$/ && port+0>=1 && port+0<=65535) return port;
+        return "";
+      }
       {
-        lp=$4; rp=$5;
-        if (lp ~ (":" p1 "$") || lp ~ (":" p2 "$") || rp ~ (":" p1 "$") || rp ~ (":" p2 "$") ) {
+        l=$3; r=$4;
+        if (p(l)=="" || p(r)=="") { l=$4; r=$5; }
+        lp=p(l); rp=p(r);
+        if (lp==p1 || lp==p2 || rp==p1 || rp==p2) {
           s=$0;
           while (match(s, /pid=[0-9]+/)) {
             pid=substr(s, RSTART+4, RLENGTH-4);

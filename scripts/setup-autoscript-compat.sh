@@ -162,7 +162,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.9}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.10}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -1701,6 +1701,34 @@ CREATE TABLE IF NOT EXISTS temp_ip_locks (
   created_at INTEGER DEFAULT (strftime('%s','now')),
   PRIMARY KEY (account_type, username)
 );
+
+CREATE TABLE IF NOT EXISTS iplimit_lock_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_type TEXT NOT NULL,
+  service TEXT NOT NULL,
+  username TEXT NOT NULL,
+  limitip INTEGER NOT NULL DEFAULT 0,
+  detected INTEGER NOT NULL DEFAULT 0,
+  detected_raw INTEGER NOT NULL DEFAULT 0,
+  detected_effective INTEGER NOT NULL DEFAULT 0,
+  ips_json TEXT NOT NULL DEFAULT '[]',
+  lock_reason TEXT NOT NULL DEFAULT '',
+  device_detected_label TEXT NOT NULL DEFAULT '',
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER,
+  locked_at INTEGER NOT NULL,
+  locked_until INTEGER NOT NULL,
+  unlocked_at INTEGER,
+  unlock_reason TEXT NOT NULL DEFAULT '',
+  admin_notify_status TEXT NOT NULL DEFAULT 'pending',
+  webhook_notify_status TEXT NOT NULL DEFAULT 'pending',
+  admin_notify_attempts INTEGER NOT NULL DEFAULT 0,
+  webhook_notify_attempts INTEGER NOT NULL DEFAULT 0,
+  admin_notify_error TEXT NOT NULL DEFAULT '',
+  webhook_notify_error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_iplimit_lock_history_user_time
+  ON iplimit_lock_history(account_type, username, locked_at DESC);
 
 CREATE TABLE IF NOT EXISTS account_trial_flags (
   account_type TEXT NOT NULL,
@@ -4991,6 +5019,12 @@ async function cleanupDeletedAccountState(accountType, username) {
   const t = String(accountType || '').trim().toLowerCase();
   const u = String(username || '').trim();
   if (!t || !u) return;
+  await run(
+    `UPDATE iplimit_lock_history SET unlocked_at=COALESCE(unlocked_at,strftime('%s','now')),
+       unlock_reason=CASE WHEN unlock_reason='' THEN 'account-deleted' ELSE unlock_reason END
+     WHERE account_type=? AND LOWER(username)=LOWER(?) AND unlocked_at IS NULL`,
+    [t, u]
+  ).catch(() => {});
   await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
   await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
   await run("DELETE FROM temp_ip_lock_grace WHERE account_type=? AND username=?", [t, u]).catch(() => {});
@@ -6426,6 +6460,12 @@ async function releaseTempLockNow(accountType, username) {
       }
     }
   }
+  await run(
+    `UPDATE iplimit_lock_history SET unlocked_at=COALESCE(unlocked_at,strftime('%s','now')),
+       unlock_reason=CASE WHEN unlock_reason='' THEN 'manual-unlock' ELSE unlock_reason END
+     WHERE account_type=? AND LOWER(username)=LOWER(?) AND unlocked_at IS NULL`,
+    [t, u]
+  ).catch(() => {});
   await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
   await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
   await run(
@@ -7394,11 +7434,19 @@ const ZIVPN_AUTH_LOG_UNITS = Array.from(new Set([
 
 const db = new sqlite3.Database(DB_PATH);
 
-function telegramNotifyTo(chatId, text) {
+function telegramNotifyToResult(chatId, text) {
   return new Promise((resolve) => {
     const target = String(chatId || '').trim();
-    if (!TELEGRAM_BOT_TOKEN || !target || !text) return resolve(false);
+    if (!TELEGRAM_BOT_TOKEN || !target || !text) {
+      return resolve({ ok: false, statusCode: 0, error: 'telegram-not-configured' });
+    }
     const payload = `chat_id=${encodeURIComponent(target)}&text=${encodeURIComponent(String(text))}`;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     const req = https.request({
       hostname: 'api.telegram.org',
       path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -7408,33 +7456,58 @@ function telegramNotifyTo(chatId, text) {
         'Content-Length': Buffer.byteLength(payload)
       }
     }, (res) => {
-      res.on('data', () => {});
-      res.on('end', () => resolve(true));
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        if (size >= 8192) return;
+        const part = Buffer.from(chunk);
+        chunks.push(part);
+        size += part.length;
+      });
+      res.on('end', () => {
+        const statusCode = Number(res.statusCode || 0);
+        const body = Buffer.concat(chunks).toString('utf8').slice(0, 8192);
+        let parsed = null;
+        try { parsed = body ? JSON.parse(body) : null; } catch (_) {}
+        const ok = statusCode >= 200 && statusCode < 300 && parsed?.ok !== false;
+        const error = ok ? '' : String(parsed?.description || `telegram-http-${statusCode || 0}`).slice(0, 500);
+        finish({ ok, statusCode, error });
+      });
     });
-    req.on('error', () => resolve(false));
+    req.on('error', (err) => finish({ ok: false, statusCode: 0, error: String(err?.message || 'telegram-request-error').slice(0, 500) }));
     req.setTimeout(4500, () => {
       try { req.destroy(); } catch (_) {}
-      resolve(false);
+      finish({ ok: false, statusCode: 0, error: 'telegram-timeout' });
     });
     req.write(payload);
     req.end();
   });
 }
 
+async function telegramNotifyTo(chatId, text) {
+  const result = await telegramNotifyToResult(chatId, text);
+  if (!result.ok && result.error !== 'telegram-not-configured') {
+    console.error(`[iplimit-notify] Telegram gagal chat=${String(chatId || '-')} status=${result.statusCode || 0} error=${result.error}`);
+  }
+  return result.ok;
+}
+
 function telegramNotify(text) {
   return telegramNotifyTo(TELEGRAM_CHAT_ID, text);
 }
 
-function postJson(urlRaw, payload, token = '') {
+function postJsonResult(urlRaw, payload, token = '') {
   return new Promise((resolve) => {
-    if (!urlRaw || !payload) return resolve(false);
+    if (!urlRaw || !payload) return resolve({ ok: false, statusCode: 0, error: 'webhook-not-configured' });
     let url;
     try {
       url = new URL(urlRaw);
     } catch (_) {
-      return resolve(false);
+      return resolve({ ok: false, statusCode: 0, error: 'webhook-url-invalid' });
     }
-    if (!['http:', 'https:'].includes(url.protocol)) return resolve(false);
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      return resolve({ ok: false, statusCode: 0, error: 'webhook-protocol-invalid' });
+    }
     const body = JSON.stringify(payload);
     const headers = {
       'Content-Type': 'application/json',
@@ -7445,6 +7518,12 @@ function postJson(urlRaw, payload, token = '') {
       headers['X-SC-Event-Token'] = token;
     }
     const client = url.protocol === 'https:' ? https : http;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     const req = client.request({
       protocol: url.protocol,
       hostname: url.hostname,
@@ -7453,17 +7532,37 @@ function postJson(urlRaw, payload, token = '') {
       method: 'POST',
       headers
     }, (res) => {
-      res.on('data', () => {});
-      res.on('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300));
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        if (size >= 8192) return;
+        const part = Buffer.from(chunk);
+        chunks.push(part);
+        size += part.length;
+      });
+      res.on('end', () => {
+        const statusCode = Number(res.statusCode || 0);
+        const ok = statusCode >= 200 && statusCode < 300;
+        const responseText = Buffer.concat(chunks).toString('utf8').slice(0, 500).trim();
+        finish({ ok, statusCode, error: ok ? '' : (responseText || `webhook-http-${statusCode || 0}`) });
+      });
     });
-    req.on('error', () => resolve(false));
+    req.on('error', (err) => finish({ ok: false, statusCode: 0, error: String(err?.message || 'webhook-request-error').slice(0, 500) }));
     req.setTimeout(4500, () => {
       try { req.destroy(); } catch (_) {}
-      resolve(false);
+      finish({ ok: false, statusCode: 0, error: 'webhook-timeout' });
     });
     req.write(body);
     req.end();
   });
+}
+
+async function postJson(urlRaw, payload, token = '') {
+  const result = await postJsonResult(urlRaw, payload, token);
+  if (!result.ok && result.error !== 'webhook-not-configured') {
+    console.error(`[iplimit-notify] Webhook gagal status=${result.statusCode || 0} error=${result.error}`);
+  }
+  return result.ok;
 }
 
 async function notifyAccountBotMultiLogin(event) {
@@ -7475,16 +7574,92 @@ async function notifyAccountBotMultiLogin(event) {
   }
 }
 
-async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null, extra = null) {
+function buildMultiLoginMessage(event) {
+  const list = Array.isArray(event?.ips) ? event.ips.filter(Boolean).slice(0, 8) : [];
+  return (
+    `SC 1FORCR NOTIF\n` +
+    `Event    : MULTI_LOGIN\n` +
+    `Action   : LOCK_TMP\n` +
+    `Domain   : ${event?.source_domain || '-'}\n` +
+    `Layanan  : ${String(event?.service || '-').toUpperCase()}\n` +
+    `Username : ${String(event?.username || '-')}\n` +
+    `Limit IP : ${Number(event?.limitip || 0)}\n` +
+    `Detected : ${Number(event?.detected || 0)}\n` +
+    `${event?.lock_reason ? `Reason   : ${event.lock_reason}\n` : ''}` +
+    `${event?.device_detected_label ? `Info     : ${event.device_detected_label}\n` : ''}` +
+    `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
+    `Unlock   : ${Number(event?.unlock_minutes || LOCK_MINUTES || 15)} menit\n` +
+    `TG User  : ${event?.owner_telegram_id || '-'}\n` +
+    `TG Chat  : ${event?.owner_telegram_chat_id || '-'}`
+  );
+}
+
+async function deliverMultiLoginNotifications(event, historyId = 0, previous = null) {
+  const ownerIdNum = Number(event?.owner_telegram_id || 0);
+  const ownerChatIdNum = Number(event?.owner_telegram_chat_id || 0);
+  const hasOwnerTarget = ownerIdNum > 0 || ownerChatIdNum > 0;
+  let adminStatus = String(previous?.admin_notify_status || 'pending');
+  let webhookStatus = String(previous?.webhook_notify_status || 'pending');
+  let adminAttempts = Number(previous?.admin_notify_attempts || 0);
+  let webhookAttempts = Number(previous?.webhook_notify_attempts || 0);
+  let adminError = String(previous?.admin_notify_error || '');
+  let webhookError = String(previous?.webhook_notify_error || '');
+
+  if (!['sent', 'skipped'].includes(webhookStatus)) {
+    if (!hasOwnerTarget) {
+      webhookStatus = 'skipped';
+      webhookError = 'owner-telegram-id-missing';
+    } else if (!BOT_ACCOUNT_EVENT_WEBHOOK_URL || !BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN) {
+      webhookStatus = 'pending';
+      webhookError = 'webhook-not-configured';
+    } else {
+      webhookAttempts += 1;
+      const result = await postJsonResult(BOT_ACCOUNT_EVENT_WEBHOOK_URL, event, BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN);
+      webhookStatus = result.ok ? 'sent' : 'failed';
+      webhookError = result.ok ? '' : String(result.error || `webhook-http-${result.statusCode || 0}`).slice(0, 500);
+      if (!result.ok) {
+        console.error(`[iplimit-notify] webhook MULTI_LOGIN gagal user=${event.username} attempt=${webhookAttempts} status=${result.statusCode || 0} error=${webhookError}`);
+      }
+    }
+  }
+
+  if (!['sent', 'skipped'].includes(adminStatus)) {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+      adminStatus = 'pending';
+      adminError = 'telegram-not-configured';
+    } else {
+      adminAttempts += 1;
+      const result = await telegramNotifyToResult(TELEGRAM_CHAT_ID, buildMultiLoginMessage(event));
+      adminStatus = result.ok ? 'sent' : 'failed';
+      adminError = result.ok ? '' : String(result.error || `telegram-http-${result.statusCode || 0}`).slice(0, 500);
+      if (!result.ok) {
+        console.error(`[iplimit-notify] Telegram MULTI_LOGIN gagal user=${event.username} attempt=${adminAttempts} status=${result.statusCode || 0} error=${adminError}`);
+      }
+    }
+  }
+
+  if (Number(historyId || 0) > 0) {
+    await run(
+      `UPDATE iplimit_lock_history
+       SET admin_notify_status=?, webhook_notify_status=?,
+           admin_notify_attempts=?, webhook_notify_attempts=?,
+           admin_notify_error=?, webhook_notify_error=?
+       WHERE id=?`,
+      [adminStatus, webhookStatus, adminAttempts, webhookAttempts, adminError, webhookError, Number(historyId)]
+    ).catch((err) => {
+      console.error(`[iplimit-notify] gagal menyimpan status notifikasi history_id=${historyId}: ${err?.message || err}`);
+    });
+  }
+  return { adminStatus, webhookStatus };
+}
+
+async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null, extra = null, historyId = 0) {
   try {
     const list = Array.isArray(ips) ? ips.filter(Boolean).slice(0, 8) : [];
     const ownerIdNum = Number(ownerId || 0);
     const ownerChatIdNum = Number(ownerChatId || 0);
-    const hasOwnerTarget = ownerIdNum > 0 || ownerChatIdNum > 0;
     const rawDetected = Number(extra?.detected_raw || 0);
     const effectiveDetected = Number(extra?.detected_effective || Number(detected || 0));
-    const deviceDetectedLabel = String(extra?.device_detected_label || '').trim();
-    const lockReason = String(extra?.lock_reason || '').trim();
     const event = {
       event: 'MULTI_LOGIN',
       action: 'LOCK_TMP',
@@ -7495,35 +7670,19 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       detected: Number(detected || 0),
       detected_raw: rawDetected > 0 ? rawDetected : null,
       detected_effective: effectiveDetected > 0 ? effectiveDetected : Number(detected || 0),
-      device_detected_label: deviceDetectedLabel || null,
-      lock_reason: lockReason || null,
+      device_detected_label: String(extra?.device_detected_label || '').trim() || null,
+      lock_reason: String(extra?.lock_reason || '').trim() || null,
       ips: list,
       unlock_minutes: Number(LOCK_MINUTES || 15),
       owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
       owner_telegram_chat_id: ownerChatIdNum > 0 ? ownerChatIdNum : (ownerIdNum > 0 ? ownerIdNum : null),
       occurred_at: new Date().toISOString()
     };
-    if (hasOwnerTarget) {
-      await notifyAccountBotMultiLogin(event);
-    }
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    const msg =
-      `SC 1FORCR NOTIF\n` +
-      `Event    : MULTI_LOGIN\n` +
-      `Action   : LOCK_TMP\n` +
-      `Domain   : ${DOMAIN || '-'}\n` +
-      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
-      `Username : ${String(username || '-')}\n` +
-      `Limit IP : ${Number(limitip || 0)}\n` +
-      `Detected : ${Number(detected || 0)}\n` +
-      `${lockReason ? `Reason   : ${lockReason}\n` : ''}` +
-      `${deviceDetectedLabel ? `Info     : ${deviceDetectedLabel}\n` : ''}` +
-      `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
-      `Unlock   : ${Number(LOCK_MINUTES || 15)} menit\n` +
-      `TG User  : ${ownerId || '-'}\n` +
-      `TG Chat  : ${ownerChatId || '-'}`;
-    await telegramNotify(msg);
-  } catch (_) {}
+    return await deliverMultiLoginNotifications(event, historyId);
+  } catch (err) {
+    console.error(`[iplimit-notify] MULTI_LOGIN gagal diproses user=${String(username || '-')}: ${err?.message || err}`);
+    return { adminStatus: 'failed', webhookStatus: 'failed' };
+  }
 }
 
 function bytesToGbText(bytes) {
@@ -8334,17 +8493,10 @@ function parseXrayRecentIpMap() {
         console.log(`[iplimit-debug][xray] mobile-handoff filtered user=${email} old_ip=${cur.ip} lag=${lagSec}s hits=${cur.hits}`);
       }
     }
-    const chosenList = Array.from(chosen);
-    // Anti false-positive Xray mobile/dual-stack:
-    // 1 HP sering muncul sebagai 2 source IP (IPv4+IPv6/NAT handoff/proxy path).
-    // Samakan dengan normalisasi ZIVPN: 1-2 IP => 1 device, 3-4 IP => 2 device.
-    if (chosenList.length <= 2) {
-      map.set(email, new Set([latest.ip]));
-    } else if (chosenList.length <= 4) {
-      map.set(email, new Set(chosenList.slice(0, 2)));
-    } else {
-      map.set(email, chosen);
-    }
+    // Simpan seluruh IP aktif yang sudah lolos filter overlap/hit. Toleransi
+    // dual-stack diterapkan kemudian berdasarkan limit akun, bukan dengan
+    // memangkas 3-4 IP menjadi 2 karena itu membuat limit >1 mudah terlewati.
+    map.set(email, chosen);
   }
   return map;
 }
@@ -8799,6 +8951,33 @@ async function ensureTables() {
     created_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`);
+  await run(`CREATE TABLE IF NOT EXISTS iplimit_lock_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_type TEXT NOT NULL,
+    service TEXT NOT NULL,
+    username TEXT NOT NULL,
+    limitip INTEGER NOT NULL DEFAULT 0,
+    detected INTEGER NOT NULL DEFAULT 0,
+    detected_raw INTEGER NOT NULL DEFAULT 0,
+    detected_effective INTEGER NOT NULL DEFAULT 0,
+    ips_json TEXT NOT NULL DEFAULT '[]',
+    lock_reason TEXT NOT NULL DEFAULT '',
+    device_detected_label TEXT NOT NULL DEFAULT '',
+    owner_telegram_id INTEGER,
+    owner_telegram_chat_id INTEGER,
+    locked_at INTEGER NOT NULL,
+    locked_until INTEGER NOT NULL,
+    unlocked_at INTEGER,
+    unlock_reason TEXT NOT NULL DEFAULT '',
+    admin_notify_status TEXT NOT NULL DEFAULT 'pending',
+    webhook_notify_status TEXT NOT NULL DEFAULT 'pending',
+    admin_notify_attempts INTEGER NOT NULL DEFAULT 0,
+    webhook_notify_attempts INTEGER NOT NULL DEFAULT 0,
+    admin_notify_error TEXT NOT NULL DEFAULT '',
+    webhook_notify_error TEXT NOT NULL DEFAULT ''
+  )`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_iplimit_lock_history_user_time
+    ON iplimit_lock_history(account_type, username, locked_at DESC)`).catch(() => {});
   await run(`CREATE TABLE IF NOT EXISTS account_quota_usage (
     account_type TEXT NOT NULL,
     username TEXT NOT NULL,
@@ -8832,6 +9011,94 @@ async function ensureTables() {
     last_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username, ip)
   )`).catch(() => {});
+}
+
+async function createIpLimitLockHistory(data) {
+  try {
+    const out = await run(
+      `INSERT INTO iplimit_lock_history(
+         account_type, service, username, limitip, detected,
+         detected_raw, detected_effective, ips_json, lock_reason,
+         device_detected_label, owner_telegram_id, owner_telegram_chat_id,
+         locked_at, locked_until
+       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        String(data?.account_type || ''),
+        String(data?.service || ''),
+        String(data?.username || ''),
+        Number(data?.limitip || 0),
+        Number(data?.detected || 0),
+        Number(data?.detected_raw || data?.detected || 0),
+        Number(data?.detected_effective || data?.detected || 0),
+        JSON.stringify(Array.isArray(data?.ips) ? data.ips.filter(Boolean).slice(0, 32) : []),
+        String(data?.lock_reason || ''),
+        String(data?.device_detected_label || ''),
+        Number(data?.owner_telegram_id || 0) || null,
+        Number(data?.owner_telegram_chat_id || 0) || null,
+        Number(data?.locked_at || Math.floor(Date.now() / 1000)),
+        Number(data?.locked_until || Math.floor(Date.now() / 1000))
+      ]
+    );
+    return Number(out?.lastID || 0);
+  } catch (err) {
+    console.error(`[iplimit-history] gagal mencatat lock user=${String(data?.username || '-')}: ${err?.message || err}`);
+    return 0;
+  }
+}
+
+async function markIpLimitHistoryUnlocked(accountType, username, nowTs, reason) {
+  await run(
+    `UPDATE iplimit_lock_history
+     SET unlocked_at=?, unlock_reason=?
+     WHERE id=(
+       SELECT id FROM iplimit_lock_history
+       WHERE account_type=? AND LOWER(username)=LOWER(?) AND unlocked_at IS NULL
+       ORDER BY locked_at DESC LIMIT 1
+     )`,
+    [Number(nowTs || Math.floor(Date.now() / 1000)), String(reason || 'unlock'), String(accountType || ''), String(username || '')]
+  ).catch((err) => {
+    console.error(`[iplimit-history] gagal mencatat unlock user=${String(username || '-')}: ${err?.message || err}`);
+  });
+}
+
+async function retryPendingLockNotifications(nowTs) {
+  const rows = await all(
+    `SELECT * FROM iplimit_lock_history
+     WHERE locked_at >= ? AND locked_at <= ?
+       AND ((admin_notify_status IN ('pending','failed') AND admin_notify_attempts < 5)
+         OR (webhook_notify_status IN ('pending','failed') AND webhook_notify_attempts < 5))
+     ORDER BY locked_at ASC LIMIT 10`,
+    [Number(nowTs) - 86400, Number(nowTs) - 30]
+  ).catch((err) => {
+    console.error(`[iplimit-notify] gagal membaca antrean retry: ${err?.message || err}`);
+    return [];
+  });
+  for (const row of rows) {
+    let ips = [];
+    try {
+      const parsed = JSON.parse(String(row?.ips_json || '[]'));
+      if (Array.isArray(parsed)) ips = parsed;
+    } catch (_) {}
+    const event = {
+      event: 'MULTI_LOGIN',
+      action: 'LOCK_TMP',
+      source_domain: DOMAIN || null,
+      service: String(row?.service || row?.account_type || '-').toUpperCase(),
+      username: String(row?.username || '-'),
+      limitip: Number(row?.limitip || 0),
+      detected: Number(row?.detected || 0),
+      detected_raw: Number(row?.detected_raw || 0) || null,
+      detected_effective: Number(row?.detected_effective || row?.detected || 0),
+      device_detected_label: String(row?.device_detected_label || '') || null,
+      lock_reason: String(row?.lock_reason || '') || null,
+      ips,
+      unlock_minutes: Math.max(1, Math.ceil((Number(row?.locked_until || 0) - Number(row?.locked_at || 0)) / 60)),
+      owner_telegram_id: Number(row?.owner_telegram_id || 0) || null,
+      owner_telegram_chat_id: Number(row?.owner_telegram_chat_id || 0) || null,
+      occurred_at: new Date(Number(row?.locked_at || nowTs) * 1000).toISOString()
+    };
+    await deliverMultiLoginNotifications(event, Number(row.id || 0), row);
+  }
 }
 
 function quotaToBytes(quotaGb) {
@@ -9281,6 +9548,7 @@ async function enforceExpiredAccounts() {
     if (removeUdpcustomUser(user)) udphcSecretChanged = true;
     if (udphcSecretChanged) udpcustomChanged = true;
 
+    await markIpLimitHistoryUnlocked('ssh', user, Math.floor(Date.now() / 1000), 'account-expired');
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_long_history WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
@@ -9311,6 +9579,7 @@ async function enforceExpiredAccounts() {
         exp,
         limitip: Number(row?.limitip || 0)
       });
+      await markIpLimitHistoryUnlocked(item.type, user, Math.floor(Date.now() / 1000), 'account-expired');
       await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       xrayChanged = true;
@@ -9370,6 +9639,7 @@ async function unlockExpired(nowTs) {
         if (pass && removeUdpcustomUser(pass)) expiredUdphcChanged = true;
         if (removeUdpcustomUser(u)) expiredUdphcChanged = true;
         if (expiredUdphcChanged) udpcustomChanged = true;
+        await markIpLimitHistoryUnlocked(t, u, nowTs, 'account-expired');
         await run("DELETE FROM zivpn_live_sessions WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
         await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
         await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
@@ -9408,6 +9678,7 @@ async function unlockExpired(nowTs) {
       await run("UPDATE account_trojans SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
       xrayChanged = true;
     }
+    await markIpLimitHistoryUnlocked(t, u, nowTs, 'auto-timeout');
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     // Reset long-term IP history saat unlock (beri kesempatan bersih).
@@ -9511,15 +9782,11 @@ async function lockIfExceeded(nowTs) {
     const cntZivpnRaw = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
       ? Math.max(cntZivpnLive, cntZivpnLiveIp)
       : Math.max(cntZivpn, cntZivpnIp, cntZivpnLive, cntZivpnLiveIp);
-    // Normalisasi khusus ZIVPN (permintaan operasional):
-    // 1-2 IP aktif => hitung 1
-    // 3-4 IP aktif => hitung 2
-    // >=5 IP aktif => hitung normal
+    // Toleransi dual-stack hanya untuk akun berlimit 1. Akun berlimit >1
+    // memakai jumlah realtime sebenarnya agar limit 3 dengan 4 IP tetap lock.
     let cntZivpnEffective = cntZivpnRaw;
-    if (cntZivpnRaw > 0 && cntZivpnRaw <= 2) {
+    if (lim === 1 && cntZivpnRaw > 0 && cntZivpnRaw <= 2) {
       cntZivpnEffective = 1;
-    } else if (cntZivpnRaw >= 3 && cntZivpnRaw <= 4) {
-      cntZivpnEffective = 2;
     }
     // Sumber realtime utama:
     // - ipMap/sessionMap untuk SSH normal
@@ -9609,7 +9876,7 @@ async function lockIfExceeded(nowTs) {
     await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + LOCK_SECONDS, removed]).catch(() => {});
     let zivpnNotifyLabel = '';
-    if (ZIVPN_AUTH_MODE === 'http' && lim === 1 && cntZivpnRaw >= 4 && cntZivpnEffective === 2) {
+    if (lim === 1 && cntZivpnRaw === 2 && cntZivpnEffective === 1) {
       zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
     }
     let lockReasonText = hardSessionExceeded
@@ -9618,20 +9885,40 @@ async function lockIfExceeded(nowTs) {
     if (longTermAbuse && !hardSessionExceeded) {
       lockReasonText = `sharing akun terdeteksi: ${longTermIpCount} IP berbeda dalam ${LONG_TERM_HOURS} jam (limit=${lim}, max=${lim * 3})`;
     }
+    const notifyService = hardSessionExceeded ? 'sshws/udpgw' : 'ssh/zivpn';
+    const notifyLimit = accountLimitExceeded ? lim : SSHWS_ACCOUNT_SESSION_HARD_LIMIT;
+    const notifyDetected = hardSessionExceeded ? cntWsPorts : cnt;
+    const historyId = await createIpLimitLockHistory({
+      account_type: 'ssh',
+      service: notifyService,
+      username: user,
+      limitip: notifyLimit,
+      detected: notifyDetected,
+      detected_raw: Math.max(cntZivpnRaw, notifyDetected),
+      detected_effective: notifyDetected,
+      ips: lockIps,
+      lock_reason: lockReasonText,
+      device_detected_label: zivpnNotifyLabel,
+      owner_telegram_id: Number(r.owner_telegram_id || 0) || null,
+      owner_telegram_chat_id: Number(r.owner_telegram_chat_id || 0) || null,
+      locked_at: nowTs,
+      locked_until: nowTs + LOCK_SECONDS
+    });
     await notifyMultiLoginLock(
-      hardSessionExceeded ? 'sshws/udpgw' : 'ssh/zivpn',
+      notifyService,
       user,
-      accountLimitExceeded ? lim : SSHWS_ACCOUNT_SESSION_HARD_LIMIT,
-      hardSessionExceeded ? cntWsPorts : cnt,
+      notifyLimit,
+      notifyDetected,
       lockIps,
       Number(r.owner_telegram_id || 0) || null,
       Number(r.owner_telegram_chat_id || 0) || null,
       {
-        detected_raw: cntZivpnRaw,
-        detected_effective: cntZivpnEffective,
+        detected_raw: Math.max(cntZivpnRaw, notifyDetected),
+        detected_effective: notifyDetected,
         device_detected_label: zivpnNotifyLabel,
         lock_reason: lockReasonText
-      }
+      },
+      historyId
     );
   }
 
@@ -9650,10 +9937,13 @@ async function lockIfExceeded(nowTs) {
       const userKey = user.toLowerCase();
       const lim = Number(r.limitip || 0);
       const lockIpSet = xrayMap.has(userKey) ? xrayMap.get(userKey) : new Set();
-      const cnt = lockIpSet.size;
+      const cntRaw = lockIpSet.size;
+      // IPv4+IPv6 dari satu perangkat masih ditoleransi khusus limit 1.
+      // Untuk limit di atas 1, jumlah IP aktif tidak boleh dipangkas.
+      const cnt = lim === 1 && cntRaw === 2 ? 1 : cntRaw;
       if (IPLIMIT_DEBUG) {
         const ips = Array.from(lockIpSet).slice(0, 8).join(',');
-        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cnt=${cnt} ips=${ips}`);
+        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cnt=${cnt} ips=${ips}`);
       }
       if (cnt <= lim) continue;
       if (graceMap.has(`${item.type}|${userKey}`)) continue;
@@ -9678,6 +9968,22 @@ async function lockIfExceeded(nowTs) {
       }
       await run(`UPDATE ${item.table} SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES(?, ?, ?, 0)", [item.type, user, nowTs + LOCK_SECONDS]).catch(() => {});
+      const lockReasonText = 'pemakaian IP aktif bersamaan melewati limit akun';
+      const historyId = await createIpLimitLockHistory({
+        account_type: item.type,
+        service: item.type,
+        username: user,
+        limitip: lim,
+        detected: cnt,
+        detected_raw: cntRaw,
+        detected_effective: cnt,
+        ips: lockIps,
+        lock_reason: lockReasonText,
+        owner_telegram_id: Number(r.owner_telegram_id || 0) || null,
+        owner_telegram_chat_id: Number(r.owner_telegram_chat_id || 0) || null,
+        locked_at: nowTs,
+        locked_until: nowTs + LOCK_SECONDS
+      });
       await notifyMultiLoginLock(
         item.type,
         user,
@@ -9685,7 +9991,13 @@ async function lockIfExceeded(nowTs) {
         cnt,
         lockIps,
         Number(r.owner_telegram_id || 0) || null,
-        Number(r.owner_telegram_chat_id || 0) || null
+        Number(r.owner_telegram_chat_id || 0) || null,
+        {
+          detected_raw: cntRaw,
+          detected_effective: cnt,
+          lock_reason: lockReasonText
+        },
+        historyId
       );
       xrayChanged = true;
     }
@@ -9833,6 +10145,7 @@ async function rebuildXrayFromDb() {
 async function main() {
   const now = Math.floor(Date.now() / 1000);
   await ensureTables();
+  await retryPendingLockNotifications(now);
   await cleanupExpiredGrace(now);
   const e = await enforceExpiredAccounts();
   const u = await unlockExpired(now);
@@ -10327,10 +10640,10 @@ LICENSE_GUARD_SERVICE_EOF
 Description=Refresh and enforce SC 1FORCR signed license lease
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=${refresh_min}min
+OnActiveSec=2min
+OnUnitInactiveSec=${refresh_min}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-license-guard.service
 
 [Install]
@@ -10353,6 +10666,7 @@ LICENSE_GUARD_DROPIN_EOF
 
   systemctl daemon-reload
   systemctl enable --now sc-1forcr-license-guard.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-license-guard.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-license-guard.service
 }
 
@@ -10447,11 +10761,11 @@ EOF
 Description=Run SC 1FORCR IP Limit Checker every ${iplimit_interval_min} minutes
 
 [Timer]
-OnBootSec=15s
-OnUnitActiveSec=${iplimit_interval_min}min
+OnActiveSec=15s
+OnUnitInactiveSec=${iplimit_interval_min}min
 AccuracySec=1s
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -10767,11 +11081,11 @@ EOF
 Description=Run SC 1FORCR Resource Capacity Analyzer every ${interval} minutes
 
 [Timer]
-OnBootSec=2m
-OnUnitActiveSec=${interval}min
+OnActiveSec=2m
+OnUnitInactiveSec=${interval}min
 AccuracySec=30s
 RandomizedDelaySec=15s
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-capacity-tune.service
 
 [Install]
@@ -11174,9 +11488,9 @@ EOF
 Description=Run SC 1FORCR auto reboot every ${interval_min} minutes
 
 [Timer]
-OnBootSec=${interval_min}min
-OnUnitActiveSec=${interval_min}min
-Persistent=true
+OnActiveSec=${interval_min}min
+OnUnitInactiveSec=${interval_min}min
+Persistent=false
 AccuracySec=1min
 Unit=sc-1forcr-autoreboot.service
 
@@ -11793,11 +12107,11 @@ apply_restored_runtime_units() {
 Description=Run SC 1FORCR IP Limit Checker every ${iplimit_interval} minutes
 
 [Timer]
-OnBootSec=15s
-OnUnitActiveSec=${iplimit_interval}min
+OnActiveSec=15s
+OnUnitInactiveSec=${iplimit_interval}min
 AccuracySec=1s
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -11836,10 +12150,10 @@ EOF_TIMER
 Description=Run SC 1FORCR auto backup every ${backup_interval} minutes
 
 [Timer]
-OnBootSec=5m
-OnUnitActiveSec=${backup_interval}min
+OnActiveSec=5m
+OnUnitInactiveSec=${backup_interval}min
 AccuracySec=1s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-autobackup.service
 
@@ -11883,9 +12197,9 @@ EOF_TIMER
 Description=Run SC 1FORCR auto reboot every ${auto_reboot_interval} minutes
 
 [Timer]
-OnBootSec=${auto_reboot_interval}min
-OnUnitActiveSec=${auto_reboot_interval}min
-Persistent=true
+OnActiveSec=${auto_reboot_interval}min
+OnUnitInactiveSec=${auto_reboot_interval}min
+Persistent=false
 AccuracySec=1min
 Unit=sc-1forcr-autoreboot.service
 
@@ -11905,10 +12219,10 @@ EOF_TIMER
 Description=Check SC 1FORCR update trigger every ${pull_interval} minutes
 
 [Timer]
-OnBootSec=3m
-OnUnitActiveSec=${pull_interval}min
+OnActiveSec=3m
+OnUnitInactiveSec=${pull_interval}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-pull-update.service
 
@@ -11922,10 +12236,10 @@ EOF_TIMER
 Description=Check SC 1FORCR Summary API update trigger every ${pull_interval} minutes
 
 [Timer]
-OnBootSec=4m
-OnUnitActiveSec=${pull_interval}min
+OnActiveSec=4m
+OnUnitInactiveSec=${pull_interval}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=45s
 Unit=sc-1forcr-pull-summary-update.service
 
@@ -11944,11 +12258,11 @@ EOF_TIMER
 Description=Run SC 1FORCR online account notifier every ${notify_interval} hours
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=${notify_interval}h
+OnActiveSec=10min
+OnUnitInactiveSec=${notify_interval}h
 AccuracySec=1min
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-online-notify.service
 
 [Install]
@@ -12481,10 +12795,10 @@ EOF
 Description=Run SC 1FORCR auto backup every ${AUTO_BACKUP_INTERVAL_MINUTES} minutes
 
 [Timer]
-OnBootSec=5m
-OnUnitActiveSec=${AUTO_BACKUP_INTERVAL_MINUTES}min
+OnActiveSec=5m
+OnUnitInactiveSec=${AUTO_BACKUP_INTERVAL_MINUTES}min
 AccuracySec=1s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-autobackup.service
 
@@ -13119,11 +13433,11 @@ EOF
 Description=Run SC 1FORCR online account notifier every ${notify_interval_h} hours
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=${notify_interval_h}h
+OnActiveSec=10min
+OnUnitInactiveSec=${notify_interval_h}h
 AccuracySec=1min
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-online-notify.service
 
 [Install]
@@ -13635,10 +13949,10 @@ EOF
 Description=Check SC 1FORCR update trigger every ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} minutes
 
 [Timer]
-OnBootSec=3m
-OnUnitActiveSec=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}min
+OnActiveSec=3m
+OnUnitInactiveSec=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-pull-update.service
 
@@ -13651,10 +13965,10 @@ EOF
 Description=Check SC 1FORCR Summary API update trigger every ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} minutes
 
 [Timer]
-OnBootSec=4m
-OnUnitActiveSec=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}min
+OnActiveSec=4m
+OnUnitInactiveSec=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=45s
 Unit=sc-1forcr-pull-summary-update.service
 
@@ -14805,11 +15119,11 @@ write_iplimit_timer_unit() {
 Description=Run SC 1FORCR IP Limit Checker every ${interval} minutes
 
 [Timer]
-OnBootSec=15s
-OnUnitActiveSec=${interval}min
+OnActiveSec=15s
+OnUnitInactiveSec=${interval}min
 AccuracySec=1s
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -14824,11 +15138,11 @@ write_online_notify_timer_unit() {
 Description=Run SC 1FORCR online account notifier every ${interval_h} hours
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=${interval_h}h
+OnActiveSec=10min
+OnUnitInactiveSec=${interval_h}h
 AccuracySec=1min
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-online-notify.service
 
 [Install]
@@ -14876,10 +15190,10 @@ EOF
 Description=Run SC 1FORCR auto backup every ${interval_min} minutes
 
 [Timer]
-OnBootSec=5m
-OnUnitActiveSec=${interval_min}min
+OnActiveSec=5m
+OnUnitInactiveSec=${interval_min}min
 AccuracySec=1s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-autobackup.service
 
@@ -14924,9 +15238,9 @@ EOF
 Description=Run SC 1FORCR auto reboot every ${interval_min} minutes
 
 [Timer]
-OnBootSec=${interval_min}min
-OnUnitActiveSec=${interval_min}min
-Persistent=true
+OnActiveSec=${interval_min}min
+OnUnitInactiveSec=${interval_min}min
+Persistent=false
 AccuracySec=1min
 Unit=sc-1forcr-autoreboot.service
 
@@ -14944,10 +15258,10 @@ write_pull_update_timer_unit() {
 Description=Check SC 1FORCR update trigger every ${interval_min} minutes
 
 [Timer]
-OnBootSec=3m
-OnUnitActiveSec=${interval_min}min
+OnActiveSec=3m
+OnUnitInactiveSec=${interval_min}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-pull-update.service
 
@@ -14959,10 +15273,10 @@ EOF
 Description=Check SC 1FORCR Summary API update trigger every ${interval_min} minutes
 
 [Timer]
-OnBootSec=4m
-OnUnitActiveSec=${interval_min}min
+OnActiveSec=4m
+OnUnitInactiveSec=${interval_min}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=45s
 Unit=sc-1forcr-pull-summary-update.service
 
@@ -19284,7 +19598,7 @@ EOF
 }
 
 monitor_temp_lock_menu() {
-  draw_menu_header "AKUN LOCK SEMENTARA (IP LIMIT)"
+  draw_menu_header "MONITOR & RIWAYAT IP LIMIT"
   if [[ ! -f "${DB_PATH}" ]]; then
     echo "DB tidak ditemukan: ${DB_PATH}"
     return
@@ -19297,6 +19611,7 @@ monitor_temp_lock_menu() {
     return
   fi
 
+  echo "Lock aktif saat ini:"
   sqlite3 -header -column "${DB_PATH}" "
     SELECT
       account_type AS type,
@@ -19310,6 +19625,29 @@ monitor_temp_lock_menu() {
     FROM temp_ip_locks
     ORDER BY locked_until ASC;
   " || true
+
+  local history_count
+  history_count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='iplimit_lock_history';" 2>/dev/null || echo 0)"
+  if [[ "${history_count}" == "1" ]]; then
+    echo
+    echo "20 riwayat lock terbaru (tetap tersimpan setelah unlock):"
+    sqlite3 -header -column "${DB_PATH}" "
+      SELECT
+        id,
+        account_type AS type,
+        username,
+        limitip AS lim,
+        detected AS hit,
+        datetime(locked_at, 'unixepoch', 'localtime') AS locked_at,
+        CASE WHEN unlocked_at IS NULL THEN 'ACTIVE'
+             ELSE datetime(unlocked_at, 'unixepoch', 'localtime') END AS unlocked_at,
+        admin_notify_status AS tg_admin,
+        webhook_notify_status AS webhook
+      FROM iplimit_lock_history
+      ORDER BY locked_at DESC
+      LIMIT 20;
+    " || true
+  fi
 }
 
 detect_udpcustom_service() {
@@ -23394,7 +23732,7 @@ service_unit_name() {
 }
 
 health_check() {
-  local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok
+  local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok timer_state
   load_update_env
   DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
   API_PORT="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
@@ -23424,6 +23762,18 @@ PY
     fi
     if ! systemctl is-active --quiet sc-1forcr-license-guard.timer; then
       failures+=("license guard timer tidak aktif")
+    else
+      timer_state="$(systemctl show sc-1forcr-license-guard.timer -p SubState --value 2>/dev/null || true)"
+      [[ "${timer_state}" == "waiting" ]] || failures+=("license guard timer tidak terjadwal (${timer_state:-unknown})")
+    fi
+  fi
+
+  if unit_is_installed sc-1forcr-iplimit.timer; then
+    if ! systemctl is-active --quiet sc-1forcr-iplimit.timer; then
+      failures+=("IP limit timer tidak aktif")
+    else
+      timer_state="$(systemctl show sc-1forcr-iplimit.timer -p SubState --value 2>/dev/null || true)"
+      [[ "${timer_state}" == "waiting" ]] || failures+=("IP limit timer tidak terjadwal (${timer_state:-unknown})")
     fi
   fi
 
@@ -23540,6 +23890,7 @@ restart_after_restore() {
   fi
   if [[ -f /etc/sc-1forcr-license-required ]] && unit_is_installed sc-1forcr-license-guard.timer; then
     systemctl enable --now sc-1forcr-license-guard.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-license-guard.timer >/dev/null 2>&1 || true
     systemctl start sc-1forcr-license-guard.service >/dev/null 2>&1 || true
   fi
 }

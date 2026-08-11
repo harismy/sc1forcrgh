@@ -1434,11 +1434,11 @@ function writeIpLimitTimerUnit(intervalMinutes) {
 Description=Run SC 1FORCR IP Limit Checker every ${intervalMinutes} minutes
 
 [Timer]
-OnBootSec=15s
-OnUnitActiveSec=${intervalMinutes}min
+OnActiveSec=15s
+OnUnitInactiveSec=${intervalMinutes}min
 AccuracySec=1s
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -1471,10 +1471,10 @@ WantedBy=timers.target
 Description=Run SC 1FORCR auto backup every ${interval} minutes
 
 [Timer]
-OnBootSec=5m
-OnUnitActiveSec=${interval}min
+OnActiveSec=5m
+OnUnitInactiveSec=${interval}min
 AccuracySec=1s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-autobackup.service
 
@@ -1557,9 +1557,9 @@ WantedBy=timers.target
 Description=Run SC 1FORCR auto reboot every ${interval} minutes
 
 [Timer]
-OnBootSec=${interval}min
-OnUnitActiveSec=${interval}min
-Persistent=true
+OnActiveSec=${interval}min
+OnUnitInactiveSec=${interval}min
+Persistent=false
 AccuracySec=1min
 Unit=sc-1forcr-autoreboot.service
 
@@ -1576,10 +1576,10 @@ function writePullUpdateTimerUnit(settings) {
 Description=Check SC 1FORCR update trigger every ${interval} minutes
 
 [Timer]
-OnBootSec=3m
-OnUnitActiveSec=${interval}min
+OnActiveSec=3m
+OnUnitInactiveSec=${interval}min
 AccuracySec=30s
-Persistent=true
+Persistent=false
 RandomizedDelaySec=30s
 Unit=sc-1forcr-pull-update.service
 
@@ -1596,11 +1596,11 @@ function writeOnlineNotifyTimerUnit(settings) {
 Description=Run SC 1FORCR online account notifier every ${interval} hours
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=${interval}h
+OnActiveSec=10min
+OnUnitInactiveSec=${interval}h
 AccuracySec=1min
 RandomizedDelaySec=0
-Persistent=true
+Persistent=false
 Unit=sc-1forcr-online-notify.service
 
 [Install]
@@ -3077,8 +3077,8 @@ EOF
 Description=Run SC 1FORCR Summary API watchdog
 
 [Timer]
-OnBootSec=2m
-OnUnitActiveSec=2m
+OnActiveSec=2m
+OnUnitInactiveSec=2m
 AccuracySec=30s
 Unit=sc-1forcr-summary-watchdog.service
 

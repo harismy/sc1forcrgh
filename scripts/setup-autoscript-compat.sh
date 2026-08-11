@@ -58,6 +58,7 @@ set -euo pipefail
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
+#   SSHWS_UDPGW_SINGLE_PROCESS=1               (opsional, satu proses + alias port; fallback otomatis)
 #   SSHWS_UDPGW_MAX_CLIENTS=auto               (opsional, hemat RAM; auto by RAM/vCPU)
 #   SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=auto (opsional, koneksi UDP per client badvpn)
 #   SSHWS_UDPGW_MEMORY_MAX=auto                (opsional, batas RAM per service badvpn)
@@ -163,7 +164,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.14}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.15}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -193,6 +194,7 @@ UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
 SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}"
+SSHWS_UDPGW_SINGLE_PROCESS="${SSHWS_UDPGW_SINGLE_PROCESS:-1}"
 SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-auto}"
 SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-auto}"
 SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-auto}"
@@ -3132,6 +3134,7 @@ VMESS_BUG_PROFILE_HOST=${VMESS_BUG_PROFILE_HOST}
 VMESS_BUG_PROFILE_ALLOW_INSECURE=${VMESS_BUG_PROFILE_ALLOW_INSECURE}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
+SSHWS_UDPGW_SINGLE_PROCESS=${SSHWS_UDPGW_SINGLE_PROCESS}
 SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
 SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
 SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
@@ -3294,6 +3297,19 @@ const SSHWS_UDPGW_PORTS = String(process.env.SSHWS_UDPGW_PORTS || '7300,7200')
   .map((v) => String(v || '').trim())
   .filter((v) => /^[0-9]{1,5}$/.test(v))
   .filter((v, i, arr) => arr.indexOf(v) === i);
+const SSHWS_UDPGW_SINGLE_PROCESS = /^(1|true|yes|on)$/i.test(
+  String(process.env.SSHWS_UDPGW_SINGLE_PROCESS || '1').trim()
+);
+function sshUdpgwServiceUnits(allConfigured = false) {
+  const ports = SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'];
+  const selected = SSHWS_UDPGW_SINGLE_PROCESS && !allConfigured ? ports.slice(0, 1) : ports;
+  return selected.map((port) => `sc-1forcr-udpgw@${port}.service`);
+}
+function sshUdpgwAliasServiceUnits(singleOnly = false) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-udpgw-alias.service')) return [];
+  if (singleOnly && !SSHWS_UDPGW_SINGLE_PROCESS) return [];
+  return ['sc-1forcr-udpgw-alias.service'];
+}
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const LICENSE_ENFORCE = String(process.env.LICENSE_ENFORCE || '1').trim().toLowerCase();
@@ -5489,7 +5505,7 @@ app.post('/internal/sc-access-lock', auth, (req, res) => {
       ].join('\n'));
       systemctlControl('stop', [
         'sc-1forcr-sshws.service', 'dropbear.service', 'xray.service', 'zivpn.service', 'sc-1forcr-udpcustom.service',
-        'sc-1forcr-udpgw@7200.service', 'sc-1forcr-udpgw@7300.service'
+        ...sshUdpgwServiceUnits(true), ...sshUdpgwAliasServiceUnits(false)
       ]);
       return res.json({ ok: true, blocked: true, reason });
     }
@@ -5510,7 +5526,7 @@ app.post('/internal/sc-access-lock', auth, (req, res) => {
       : 'zivpn.service';
     systemctlControl('start', [
       'xray.service', 'dropbear.service', 'sc-1forcr-sshws.service', udpUnit,
-      'sc-1forcr-udpgw@7200.service', 'sc-1forcr-udpgw@7300.service'
+      ...sshUdpgwServiceUnits(false), ...sshUdpgwAliasServiceUnits(true)
     ]);
     return res.json({ ok: true, blocked: false, reason });
   } catch (e) {
@@ -10572,6 +10588,25 @@ function runSystemctl(args) {
   } catch (_) { return false; }
 }
 
+function configuredUdpgwUnits(allConfigured = false) {
+  const ports = String(env.SSHWS_UDPGW_PORTS || '7300,7200')
+    .split(',')
+    .map((value) => String(value || '').trim())
+    .filter((value) => /^[0-9]{1,5}$/.test(value))
+    .filter((value, index, values) => values.indexOf(value) === index);
+  const safePorts = ports.length > 0 ? ports : ['7300', '7200'];
+  const singleProcess = /^(1|true|yes|on)$/i.test(String(env.SSHWS_UDPGW_SINGLE_PROCESS || '1').trim());
+  const selected = singleProcess && !allConfigured ? safePorts.slice(0, 1) : safePorts;
+  return selected.map((port) => `sc-1forcr-udpgw@${port}.service`);
+}
+
+function configuredUdpgwAliasUnits(singleOnly = false) {
+  if (!fs.existsSync('/etc/systemd/system/sc-1forcr-udpgw-alias.service')) return [];
+  const singleProcess = /^(1|true|yes|on)$/i.test(String(env.SSHWS_UDPGW_SINGLE_PROCESS || '1').trim());
+  if (singleOnly && !singleProcess) return [];
+  return ['sc-1forcr-udpgw-alias.service'];
+}
+
 function managedUnits() {
   return [
     'sc-1forcr-sshws.service',
@@ -10579,8 +10614,8 @@ function managedUnits() {
     'xray.service',
     'zivpn.service',
     'sc-1forcr-udpcustom.service',
-    'sc-1forcr-udpgw@7200.service',
-    'sc-1forcr-udpgw@7300.service'
+    ...configuredUdpgwUnits(true),
+    ...configuredUdpgwAliasUnits(false)
   ];
 }
 
@@ -10598,7 +10633,7 @@ function enforceResult(result) {
       ? 'sc-1forcr-udpcustom.service'
       : 'zivpn.service';
     runSystemctl(['start', 'xray.service', 'dropbear.service', 'sc-1forcr-api.service', 'sc-1forcr-sshws.service', udpUnit,
-      'sc-1forcr-udpgw@7200.service', 'sc-1forcr-udpgw@7300.service']);
+      ...configuredUdpgwUnits(false), ...configuredUdpgwAliasUnits(true)]);
   }
   return result;
 }
@@ -11184,9 +11219,222 @@ EOF
   fi
 }
 
+write_udpgw_refactor_helpers() {
+  install -d -m 755 /usr/local/sbin
+
+  cat > /usr/local/sbin/sc-1forcr-udpgw-alias <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+CHAIN="SC1FORCR_UDPGW"
+
+runtime_value() {
+  local key="${1}" fallback="${2:-}" env_file parsed value=""
+  for env_file in /etc/sc-1forcr.env /opt/sc-1forcr/.env; do
+    [[ -r "${env_file}" ]] || continue
+    parsed="$(awk -v key="${key}" 'index($0, key "=")==1 {value=substr($0, length(key)+2)} END {print value}' "${env_file}" 2>/dev/null || true)"
+    [[ -n "${parsed}" ]] && value="${parsed}"
+  done
+  printf '%s' "${value:-${fallback}}"
+}
+
+flag_enabled_local() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+read_ports() {
+  local raw
+  raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
+  mapfile -t PORTS < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}')
+  if (( ${#PORTS[@]} == 0 )); then
+    PORTS=(7300 7200)
+  fi
+  PRIMARY="${PORTS[0]}"
+  ALIASES=("${PORTS[@]:1}")
+}
+
+clear_rules() {
+  command -v iptables >/dev/null 2>&1 || return 0
+  while iptables -w 10 -t nat -C OUTPUT -p tcp -d 127.0.0.1/32 -j "${CHAIN}" >/dev/null 2>&1; do
+    iptables -w 10 -t nat -D OUTPUT -p tcp -d 127.0.0.1/32 -j "${CHAIN}" >/dev/null 2>&1 || break
+  done
+  iptables -w 10 -t nat -F "${CHAIN}" >/dev/null 2>&1 || true
+  iptables -w 10 -t nat -X "${CHAIN}" >/dev/null 2>&1 || true
+}
+
+tcp_connect_ok() {
+  local port="${1:-}"
+  timeout 3 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/${1}"' _ "${port}" >/dev/null 2>&1
+}
+
+apply_rules() {
+  local alias_port port
+  flag_enabled_local "${SSHWS_UDPGW_SINGLE_PROCESS:-1}" || return 2
+  [[ "${SSHWS_UDPGW_BIND_ADDR:-127.0.0.1}" == "127.0.0.1" ]] || return 2
+  (( ${#ALIASES[@]} > 0 )) || return 2
+  command -v iptables >/dev/null 2>&1 || return 2
+
+  systemctl start "sc-1forcr-udpgw@${PRIMARY}.service" >/dev/null 2>&1 || return 1
+  clear_rules
+  iptables -w 10 -t nat -N "${CHAIN}" >/dev/null 2>&1 || return 1
+  for alias_port in "${ALIASES[@]}"; do
+    if ! iptables -w 10 -t nat -A "${CHAIN}" -p tcp --dport "${alias_port}" -j REDIRECT --to-ports "${PRIMARY}" >/dev/null 2>&1; then
+      clear_rules
+      return 1
+    fi
+  done
+  if ! iptables -w 10 -t nat -I OUTPUT 1 -p tcp -d 127.0.0.1/32 -j "${CHAIN}" >/dev/null 2>&1; then
+    clear_rules
+    return 1
+  fi
+
+  for port in "${PORTS[@]}"; do
+    if ! tcp_connect_ok "${port}"; then
+      clear_rules
+      return 1
+    fi
+  done
+  return 0
+}
+
+fallback_multi() {
+  local port
+  clear_rules
+  for port in "${PORTS[@]}"; do
+    systemctl enable "sc-1forcr-udpgw@${port}.service" >/dev/null 2>&1 || true
+    systemctl start "sc-1forcr-udpgw@${port}.service" >/dev/null 2>&1 || true
+  done
+  logger -t sc-1forcr-udpgw "Alias port gagal/tidak didukung; fallback ke proses UDPGW per port." || true
+}
+
+SSHWS_UDPGW_PORTS="$(runtime_value SSHWS_UDPGW_PORTS "${SSHWS_UDPGW_PORTS:-7300,7200}")"
+SSHWS_UDPGW_SINGLE_PROCESS="$(runtime_value SSHWS_UDPGW_SINGLE_PROCESS "${SSHWS_UDPGW_SINGLE_PROCESS:-1}")"
+SSHWS_UDPGW_BIND_ADDR="$(runtime_value SSHWS_UDPGW_BIND_ADDR "${SSHWS_UDPGW_BIND_ADDR:-127.0.0.1}")"
+declare -a PORTS=() ALIASES=()
+PRIMARY=""
+read_ports
+
+case "${1:-apply}" in
+  apply)
+    apply_rules
+    ;;
+  apply-or-fallback)
+    if ! apply_rules; then
+      fallback_multi
+    fi
+    ;;
+  clear)
+    clear_rules
+    ;;
+  fallback)
+    fallback_multi
+    ;;
+  *)
+    echo "Usage: $0 {apply|apply-or-fallback|clear|fallback}" >&2
+    exit 2
+    ;;
+esac
+EOF
+  chmod 755 /usr/local/sbin/sc-1forcr-udpgw-alias
+
+  cat > /usr/local/sbin/sc-1forcr-udpgw-drain <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+runtime_value() {
+  local key="${1}" fallback="${2:-}" env_file parsed value=""
+  for env_file in /etc/sc-1forcr.env /opt/sc-1forcr/.env; do
+    [[ -r "${env_file}" ]] || continue
+    parsed="$(awk -v key="${key}" 'index($0, key "=")==1 {value=substr($0, length(key)+2)} END {print value}' "${env_file}" 2>/dev/null || true)"
+    [[ -n "${parsed}" ]] && value="${parsed}"
+  done
+  printf '%s' "${value:-${fallback}}"
+}
+
+SSHWS_UDPGW_PORTS="$(runtime_value SSHWS_UDPGW_PORTS "${SSHWS_UDPGW_PORTS:-7300,7200}")"
+SSHWS_UDPGW_SINGLE_PROCESS="$(runtime_value SSHWS_UDPGW_SINGLE_PROCESS "${SSHWS_UDPGW_SINGLE_PROCESS:-1}")"
+
+case "$(printf '%s' "${SSHWS_UDPGW_SINGLE_PROCESS:-1}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on|enable|enabled) ;;
+  *) exit 0 ;;
+esac
+
+raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
+mapfile -t ports < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}')
+(( ${#ports[@]} > 1 )) || exit 0
+
+for alias_port in "${ports[@]:1}"; do
+  unit="sc-1forcr-udpgw@${alias_port}.service"
+  systemctl disable "${unit}" >/dev/null 2>&1 || true
+  systemctl is-active --quiet "${unit}" || continue
+  established="$(ss -Htn state established 2>/dev/null | awk -v port=":${alias_port}" '$3 ~ (port "$") {count++} END {print count+0}')"
+  if [[ "${established}" == "0" ]]; then
+    systemctl stop "${unit}" >/dev/null 2>&1 || true
+    logger -t sc-1forcr-udpgw "Drain selesai; proses alias UDPGW port ${alias_port} dihentikan." || true
+  fi
+done
+EOF
+  chmod 755 /usr/local/sbin/sc-1forcr-udpgw-drain
+
+  cat > /etc/systemd/system/sc-1forcr-udpgw-alias.service <<'EOF'
+[Unit]
+Description=SC 1FORCR UDPGW local port alias
+After=network.target
+Before=sc-1forcr-sshws.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-udpgw-alias apply-or-fallback
+ExecStop=/usr/local/sbin/sc-1forcr-udpgw-alias clear
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-udpgw-drain.service <<'EOF'
+[Unit]
+Description=SC 1FORCR UDPGW legacy process drain
+After=sc-1forcr-udpgw-alias.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-udpgw-drain
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-udpgw-drain.timer <<'EOF'
+[Unit]
+Description=Drain unused SC 1FORCR UDPGW alias processes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+AccuracySec=10s
+RandomizedDelaySec=5s
+Persistent=false
+Unit=sc-1forcr-udpgw-drain.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  install -d -m 755 /etc/systemd/system/sc-1forcr-sshws.service.d
+  cat > /etc/systemd/system/sc-1forcr-sshws.service.d/30-udpgw-alias.conf <<'EOF'
+[Unit]
+Wants=sc-1forcr-udpgw-alias.service
+After=sc-1forcr-udpgw-alias.service
+EOF
+}
+
 setup_udpgw_service_if_possible() {
   local udpgw_bin udpgw_ports_raw udpgw_ports udpgw_max_clients udpgw_max_connections_per_client
   local udpgw_memory_max udpgw_bind_addr udpgw_client_sndbuf unit_file unit_tmp unit_changed p
+  local primary_port alias_ports single_requested
   udpgw_bin=""
   for p in /usr/bin/badvpn-udpgw /usr/sbin/badvpn-udpgw /usr/local/bin/badvpn-udpgw; do
     if [[ -x "${p}" ]]; then
@@ -11250,7 +11498,17 @@ setup_udpgw_service_if_possible() {
   udpgw_client_sndbuf="$(echo "${SSHWS_UDPGW_CLIENT_SNDBUF:-262144}" | tr -cd '0-9')"
   [[ -z "${udpgw_client_sndbuf}" || "${udpgw_client_sndbuf}" -lt 65536 || "${udpgw_client_sndbuf}" -gt 4194304 ]] && udpgw_client_sndbuf="262144"
 
-  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//') bind=${udpgw_bind_addr} limit=${udpgw_max_clients}/${udpgw_max_connections_per_client} mem=${udpgw_memory_max}"
+  primary_port="$(printf '%s\n' "${udpgw_ports}" | head -n 1)"
+  alias_ports="$(printf '%s\n' "${udpgw_ports}" | tail -n +2)"
+  single_requested="0"
+  if flag_enabled "${SSHWS_UDPGW_SINGLE_PROCESS:-1}" \
+    && [[ "${udpgw_bind_addr}" == "127.0.0.1" ]] \
+    && [[ -n "${alias_ports}" ]] \
+    && command -v iptables >/dev/null 2>&1; then
+    single_requested="1"
+  fi
+
+  log "Setup service badvpn-udpgw pada port: $(echo "${udpgw_ports}" | tr '\n' ',' | sed 's/,$//') bind=${udpgw_bind_addr} limit=${udpgw_max_clients}/${udpgw_max_connections_per_client} mem=${udpgw_memory_max} single=${single_requested}"
   unit_file="/etc/systemd/system/sc-1forcr-udpgw@.service"
   unit_tmp="$(mktemp)"
   cat > "${unit_tmp}" <<EOF
@@ -11287,16 +11545,35 @@ EOF
   if [[ "${unit_changed}" == "1" ]]; then
     systemctl daemon-reload
   fi
-  for p in ${udpgw_ports}; do
-    systemctl enable "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
-    if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
-      if [[ "${unit_changed}" == "1" ]]; then
-        systemctl try-restart "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
-      fi
-      systemctl start "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
-    else
-      systemctl restart "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+
+  write_udpgw_refactor_helpers
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  systemctl enable "sc-1forcr-udpgw@${primary_port}.service" >/dev/null 2>&1 || true
+  if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
+    if [[ "${unit_changed}" == "1" ]]; then
+      systemctl try-restart "sc-1forcr-udpgw@${primary_port}.service" >/dev/null 2>&1 || true
     fi
+    systemctl start "sc-1forcr-udpgw@${primary_port}.service" >/dev/null 2>&1 || true
+  else
+    systemctl restart "sc-1forcr-udpgw@${primary_port}.service" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "${single_requested}" == "1" ]] && /usr/local/sbin/sc-1forcr-udpgw-alias apply; then
+    systemctl enable --now sc-1forcr-udpgw-alias.service >/dev/null 2>&1 || true
+    systemctl enable --now sc-1forcr-udpgw-drain.timer >/dev/null 2>&1 || true
+    for p in ${alias_ports}; do
+      systemctl disable "sc-1forcr-udpgw@${p}.service" >/dev/null 2>&1 || true
+    done
+    systemctl start sc-1forcr-udpgw-drain.service >/dev/null 2>&1 || true
+    log "UDPGW hemat RAM aktif: proses utama=${primary_port}; alias=$(echo "${alias_ports}" | tr '\n' ',' | sed 's/,$//'). Sesi lama akan di-drain tanpa diputus."
+  else
+    /usr/local/sbin/sc-1forcr-udpgw-alias fallback >/dev/null 2>&1 || true
+    systemctl disable --now sc-1forcr-udpgw-alias.service sc-1forcr-udpgw-drain.timer >/dev/null 2>&1 || true
+    log "UDPGW mode kompatibilitas aktif: satu proses per port (alias lokal tidak tersedia)."
+  fi
+
+  for p in ${udpgw_ports}; do
     if [[ "${udpgw_bind_addr}" == "0.0.0.0" ]] && command -v iptables >/dev/null 2>&1; then
       iptables -w 10 -C INPUT -p tcp --dport "${p}" -j ACCEPT >/dev/null 2>&1 || \
         iptables -w 10 -I INPUT -p tcp --dport "${p}" -j ACCEPT
@@ -11903,6 +12180,7 @@ SETTINGS_KEYS = [
     "SSH_HC_AUTH_LOOKBACK_HOURS",
     "SSHWS_TCP_KEEPALIVE_SECONDS",
     "SSHWS_UDPGW_PORTS",
+    "SSHWS_UDPGW_SINGLE_PROCESS",
     "SSHWS_UDPGW_MAX_CLIENTS",
     "SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT",
     "SSHWS_UDPGW_MEMORY_MAX",
@@ -12683,6 +12961,7 @@ SETTINGS_KEYS = [
     "SSH_HC_AUTH_LOOKBACK_HOURS",
     "SSHWS_TCP_KEEPALIVE_SECONDS",
     "SSHWS_UDPGW_PORTS",
+    "SSHWS_UDPGW_SINGLE_PROCESS",
     "SSHWS_UDPGW_MAX_CLIENTS",
     "SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT",
     "SSHWS_UDPGW_MEMORY_MAX",
@@ -14128,6 +14407,7 @@ ZIVPN_EXTRA_UDP_PORTS=${ZIVPN_EXTRA_UDP_PORTS}
 UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
 SSHWS_UDPGW_PORTS=${SSHWS_UDPGW_PORTS}
+SSHWS_UDPGW_SINGLE_PROCESS=${SSHWS_UDPGW_SINGLE_PROCESS}
 SSHWS_UDPGW_MAX_CLIENTS=${SSHWS_UDPGW_MAX_CLIENTS}
 SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT=${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT}
 SSHWS_UDPGW_MEMORY_MAX=${SSHWS_UDPGW_MEMORY_MAX}
@@ -21825,6 +22105,7 @@ Time     : $(date '+%F %T')"
     UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
     UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
     SSHWS_UDPGW_PORTS="${SSHWS_UDPGW_PORTS:-7300,7200}" \
+    SSHWS_UDPGW_SINGLE_PROCESS="${SSHWS_UDPGW_SINGLE_PROCESS:-1}" \
     SSHWS_UDPGW_MAX_CLIENTS="${SSHWS_UDPGW_MAX_CLIENTS:-auto}" \
     SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT="${SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT:-auto}" \
     SSHWS_UDPGW_MEMORY_MAX="${SSHWS_UDPGW_MEMORY_MAX:-auto}" \
@@ -22830,6 +23111,13 @@ systemctl stop sc-1forcr-udpgw@7300.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udpgw@7300.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
+systemctl disable --now sc-1forcr-udpgw-alias.service sc-1forcr-udpgw-drain.timer >/dev/null 2>&1 || true
+/usr/local/sbin/sc-1forcr-udpgw-alias clear >/dev/null 2>&1 || true
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save >/dev/null 2>&1 || true
+elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
+  iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+fi
 rm -f /etc/systemd/system/sc-1forcr-api.service
 rm -f /etc/systemd/system/sc-1forcr-sshws.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.service
@@ -22849,6 +23137,10 @@ rm -f /etc/systemd/system/sc-1forcr-capacity-tune.timer
 rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/sc-1forcr-udpgw@.service
+rm -f /etc/systemd/system/sc-1forcr-udpgw-alias.service
+rm -f /etc/systemd/system/sc-1forcr-udpgw-drain.service
+rm -f /etc/systemd/system/sc-1forcr-udpgw-drain.timer
+rm -f /etc/systemd/system/sc-1forcr-sshws.service.d/30-udpgw-alias.conf
 rm -f /etc/systemd/system/potato-compat-api.service
 systemctl daemon-reload
 
@@ -22869,6 +23161,8 @@ rm -f /usr/local/sbin/sc-1forcr-restore-backup
 rm -f /usr/local/sbin/sc-1forcr-online-notify
 rm -f /usr/local/sbin/sc-1forcr-pull-update
 rm -f /usr/local/sbin/sc-1forcr-pull-summary-update
+rm -f /usr/local/sbin/sc-1forcr-udpgw-alias
+rm -f /usr/local/sbin/sc-1forcr-udpgw-drain
 rm -f /usr/local/sbin/sc-1forcr-capacity-tune
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 rm -f /etc/profile.d/sc-1forcr-auto-menu.sh
@@ -22951,6 +23245,7 @@ write_version_marker() {
 post_install_preflight() {
   local fw zstat ustat xstat apistat wsstat zport uport range_nft nat_ok extra_nat_ok extra_ports p udpgw7300 udpgw7200
   local udp_socket_dump tcp_socket_dump zlisten ulisten udpgw7200_listen udpgw7300_listen
+  local udpgw7200_access udpgw7300_access udpgw_mode
   fw="$(fw_backend_kind)"
   zstat="$(systemctl is-active "${ZIVPN_SERVICE_NAME}" 2>/dev/null || true)"
   ustat="$(systemctl is-active "${UDPCUSTOM_SERVICE_NAME}" 2>/dev/null || true)"
@@ -22971,6 +23266,20 @@ post_install_preflight() {
   ulisten="$(printf '%s\n' "${udp_socket_dump}" | awk -v p=":${uport}" '$4 ~ (p "$") && $0 ~ /"udp-custom"/ {ok=1} END{print ok?"YES":"NO"}')"
   udpgw7200_listen="$(printf '%s\n' "${tcp_socket_dump}" | awk '$4 ~ /:7200$/ && $0 ~ /"badvpn-udpgw"/ {ok=1} END{print ok?"YES":"NO"}')"
   udpgw7300_listen="$(printf '%s\n' "${tcp_socket_dump}" | awk '$4 ~ /:7300$/ && $0 ~ /"badvpn-udpgw"/ {ok=1} END{print ok?"YES":"NO"}')"
+  udpgw7200_access="NO"
+  udpgw7300_access="NO"
+  timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7200' >/dev/null 2>&1 && udpgw7200_access="YES"
+  timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/7300' >/dev/null 2>&1 && udpgw7300_access="YES"
+  udpgw_mode="multi"
+  if flag_enabled "${SSHWS_UDPGW_SINGLE_PROCESS:-1}" \
+    && command -v iptables >/dev/null 2>&1 \
+    && iptables -w 10 -t nat -C OUTPUT -p tcp -d 127.0.0.1/32 -j SC1FORCR_UDPGW >/dev/null 2>&1; then
+    if [[ "${udpgw7200}" == "active" ]]; then
+      udpgw_mode="single-draining"
+    else
+      udpgw_mode="single"
+    fi
+  fi
 
   nat_ok="n/a"
   if [[ -n "${ZIVPN_DNAT_RANGE}" ]]; then
@@ -23030,9 +23339,11 @@ post_install_preflight() {
 - xray/api/sshws   : ${xstat}/${apistat}/${wsstat}
 - zivpn/udphc      : ${zstat}/${ustat}
 - udpgw 7200/7300 : ${udpgw7200}/${udpgw7300}
+- udpgw mode       : ${udpgw_mode}
 - zivpn listen     : ${zport} (${zlisten})
 - udphc listen     : ${uport} (${ulisten})
 - udpgw listen     : 7200=${udpgw7200_listen} 7300=${udpgw7300_listen}
+- udpgw access     : 7200=${udpgw7200_access} 7300=${udpgw7300_access}
 - network compat  : ${NETWORK_COMPAT_ENABLE} (MSS $(network_effective_tcp_mss), Xray ${XRAY_OUTBOUND_DOMAIN_STRATEGY})
 - zivpn cert/key   : $( [[ -s /etc/zivpn/zivpn.crt && -s /etc/zivpn/zivpn.key ]] && echo OK || echo MISSING )
 - dnat ${ZIVPN_DNAT_RANGE:-none}->${zport} : ${nat_ok}
@@ -23410,7 +23721,7 @@ persist_pending_install_env() {
     ZIVPN_LISTEN_PORT ZIVPN_DNAT_RANGE ZIVPN_EXTRA_UDP_PORTS ZIVPN_DNAT_IFACE
     UDPCUSTOM_BIN_URL UDPCUSTOM_SERVICE_NAME UDPCUSTOM_LISTEN_PORT
     UDPCUSTOM_DNAT_RANGE UDPCUSTOM_DNAT_AUTO_RANGE UDPCUSTOM_DEFAULT_USER
-    SSHWS_UDPGW_PORTS SSHWS_UDPGW_MAX_CLIENTS SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT SSHWS_UDPGW_MEMORY_MAX
+    SSHWS_UDPGW_PORTS SSHWS_UDPGW_SINGLE_PROCESS SSHWS_UDPGW_MAX_CLIENTS SSHWS_UDPGW_MAX_CONNECTIONS_PER_CLIENT SSHWS_UDPGW_MEMORY_MAX
     SSHWS_UDPGW_BIND_ADDR SSHWS_UDPGW_CLIENT_SNDBUF SSHWS_ACCOUNT_SESSION_HARD_LIMIT
     SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
     SSH_TUNNEL_BLOCK_OUTBOUND_PORTS TUNNEL_ABUSE_GUARD_ENABLE TUNNEL_ABUSE_BLOCK_TCP_PORTS ACTIVE_UDP_BACKEND
@@ -23839,6 +24150,7 @@ service_unit_name() {
 
 health_check() {
   local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok timer_state
+  local udpgw_ports_raw udpgw_port udpgw_ok
   load_update_env
   DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
   API_PORT="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
@@ -23888,6 +24200,20 @@ PY
       failures+=("${unit} tidak aktif")
     fi
   done
+  if [[ -f /etc/systemd/system/sc-1forcr-udpgw@.service ]]; then
+    udpgw_ports_raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
+    for udpgw_port in $(printf '%s' "${udpgw_ports_raw:-7300,7200}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}'); do
+      udpgw_ok="0"
+      for attempt in 1 2 3 4 5; do
+        if timeout 3 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/${1}"' _ "${udpgw_port}" >/dev/null 2>&1; then
+          udpgw_ok="1"
+          break
+        fi
+        sleep 1
+      done
+      [[ "${udpgw_ok}" == "1" ]] || failures+=("UDPGW port ${udpgw_port} tidak dapat diakses")
+    done
+  fi
   if command -v nginx >/dev/null 2>&1 && ! nginx -t >/dev/null 2>&1; then
     failures+=("nginx -t")
   fi
@@ -23969,7 +24295,7 @@ PY
 }
 
 restart_after_restore() {
-  local unit backend zivpn_unit udpcustom_unit
+  local unit backend zivpn_unit udpcustom_unit udpgw_ports_raw udpgw_port
   systemctl daemon-reload >/dev/null 2>&1 || true
   for unit in sc-1forcr-api.service sc-1forcr-sshws.service; do
     unit_is_installed "${unit}" && systemctl restart "${unit}" >/dev/null 2>&1 || true
@@ -23978,6 +24304,19 @@ restart_after_restore() {
     unit_is_installed "${unit}" && systemctl reload-or-restart "${unit}" >/dev/null 2>&1 || true
   done
   load_update_env
+  udpgw_ports_raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
+  if [[ -x /usr/local/sbin/sc-1forcr-udpgw-alias ]] && unit_is_installed sc-1forcr-udpgw-alias.service; then
+    systemctl enable --now sc-1forcr-udpgw-alias.service >/dev/null 2>&1 || true
+    /usr/local/sbin/sc-1forcr-udpgw-alias apply-or-fallback >/dev/null 2>&1 || true
+    if unit_is_installed sc-1forcr-udpgw-drain.timer; then
+      systemctl enable --now sc-1forcr-udpgw-drain.timer >/dev/null 2>&1 || true
+    fi
+  else
+    for udpgw_port in $(printf '%s' "${udpgw_ports_raw:-7300,7200}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}'); do
+      systemctl enable "sc-1forcr-udpgw@${udpgw_port}.service" >/dev/null 2>&1 || true
+      systemctl start "sc-1forcr-udpgw@${udpgw_port}.service" >/dev/null 2>&1 || true
+    done
+  fi
   backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
   zivpn_unit="$(service_unit_name "${ZIVPN_SERVICE:-zivpn}")"
   udpcustom_unit="$(service_unit_name "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}")"
@@ -24065,7 +24404,7 @@ restore_summary_runtime() {
 }
 
 rollback_snapshot() {
-  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard
+  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard snapshot_has_udpgw_refactor
   local SUMMARY_RUNTIME_STATE_RECORDED="0" SUMMARY_SYSTEMD_PRESENT="0" SUMMARY_SYSTEMD_ACTIVE="0" SUMMARY_SYSTEMD_ENABLED="0"
   local SUMMARY_PM2_PRESENT="0" SUMMARY_WATCHDOG_ACTIVE="0" SUMMARY_WATCHDOG_ENABLED="0"
   snapshot_dir="$(verify_snapshot "${1:-latest}")" || return 1
@@ -24099,6 +24438,28 @@ rollback_snapshot() {
       /etc/systemd/system/sc-1forcr-udpcustom.service.d/10-sc-license.conf \
       /etc/systemd/system/sc-1forcr-udpgw@.service.d/10-sc-license.conf \
       /var/lib/sc-1forcr/license-guard-state.json >/dev/null 2>&1 || true
+  fi
+
+  snapshot_has_udpgw_refactor="0"
+  if tar -tzf "${snapshot_dir}/files.tar.gz" 2>/dev/null | \
+     awk '$0=="etc/systemd/system/sc-1forcr-udpgw-alias.service" {found=1} END{exit found?0:1}'; then
+    snapshot_has_udpgw_refactor="1"
+  fi
+  if [[ "${snapshot_has_udpgw_refactor}" != "1" ]]; then
+    systemctl disable --now sc-1forcr-udpgw-alias.service sc-1forcr-udpgw-drain.timer >/dev/null 2>&1 || true
+    /usr/local/sbin/sc-1forcr-udpgw-alias clear >/dev/null 2>&1 || true
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 || true
+    elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+    rm -f \
+      /usr/local/sbin/sc-1forcr-udpgw-alias \
+      /usr/local/sbin/sc-1forcr-udpgw-drain \
+      /etc/systemd/system/sc-1forcr-udpgw-alias.service \
+      /etc/systemd/system/sc-1forcr-udpgw-drain.service \
+      /etc/systemd/system/sc-1forcr-udpgw-drain.timer \
+      /etc/systemd/system/sc-1forcr-sshws.service.d/30-udpgw-alias.conf >/dev/null 2>&1 || true
   fi
 
   systemctl stop sc-1forcr-license-guard.timer sc-1forcr-license-guard.service >/dev/null 2>&1 || true

@@ -164,7 +164,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.15}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.16}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -11369,10 +11369,14 @@ mapfile -t ports < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=6553
 for alias_port in "${ports[@]:1}"; do
   unit="sc-1forcr-udpgw@${alias_port}.service"
   systemctl disable "${unit}" >/dev/null 2>&1 || true
-  systemctl is-active --quiet "${unit}" || continue
+  if ! systemctl is-active --quiet "${unit}"; then
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    continue
+  fi
   established="$(ss -Htn state established 2>/dev/null | awk -v port=":${alias_port}" '$3 ~ (port "$") {count++} END {print count+0}')"
   if [[ "${established}" == "0" ]]; then
     systemctl stop "${unit}" >/dev/null 2>&1 || true
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
     logger -t sc-1forcr-udpgw "Drain selesai; proses alias UDPGW port ${alias_port} dihentikan." || true
   fi
 done

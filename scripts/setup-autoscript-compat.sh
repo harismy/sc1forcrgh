@@ -169,7 +169,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.21}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.22}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -24836,7 +24836,7 @@ prune_snapshots() {
 }
 
 create_snapshot() {
-  local reason="${1:-manual}" snapshot_id snapshot_dir list_file current_version path
+  local reason="${1:-manual}" snapshot_id snapshot_dir list_file current_version runtime_version marker_version path
   local summary_systemd_present="0" summary_systemd_active="0" summary_systemd_enabled="0" summary_pm2_present="0"
   local summary_watchdog_active="0" summary_watchdog_enabled="0"
   local include_db="${SC_UPDATE_SNAPSHOT_INCLUDE_DB:-1}"
@@ -24857,6 +24857,7 @@ create_snapshot() {
     /etc/sc-1forcr-license-public.pem \
     /etc/sc-1forcr-license-required \
     /etc/sc-1forcr-distribution-id \
+    /etc/sc-1forcr-version \
     /opt/sc-1forcr \
     /opt/potato-compat \
     /root/tunnel-sync/summary-api.js \
@@ -24939,7 +24940,16 @@ PY
     chmod 600 "${snapshot_dir}/database.sqlite"
   fi
 
-  current_version="$(awk -F= '/^SCRIPT_VERSION=/{print $2; exit}' /etc/sc-1forcr-version 2>/dev/null || true)"
+  runtime_version="$(tr -d '[:space:]' </opt/sc-1forcr/VERSION 2>/dev/null || true)"
+  marker_version="$(awk -F= '/^SCRIPT_VERSION=/{print $2; exit}' /etc/sc-1forcr-version 2>/dev/null || true)"
+  if [[ -n "${runtime_version}" ]]; then
+    current_version="${runtime_version}"
+  else
+    current_version="${marker_version}"
+  fi
+  if [[ -n "${runtime_version}" && -n "${marker_version}" && "${runtime_version}" != "${marker_version}" ]]; then
+    log_update_manager "Marker versi tidak sinkron (runtime=${runtime_version}, marker=${marker_version}); snapshot memakai runtime."
+  fi
   systemctl cat sc-1forcr-summary-api.service >/dev/null 2>&1 && summary_systemd_present="1"
   systemctl is-active --quiet sc-1forcr-summary-api.service 2>/dev/null && summary_systemd_active="1"
   systemctl is-enabled --quiet sc-1forcr-summary-api.service 2>/dev/null && summary_systemd_enabled="1"
@@ -25024,8 +25034,23 @@ service_unit_name() {
   printf '%s\n' "${name}"
 }
 
+udp_listener_present() {
+  local port="${1:-}"
+  [[ "${port}" =~ ^[0-9]+$ && "${port}" -ge 1 && "${port}" -le 65535 ]] || return 1
+  # Jangan bergantung pada kolom process (-p); pada beberapa iproute/kernel
+  # resolusi process dapat terlambat walau socket UDP sudah listen.
+  ss -H -lun 2>/dev/null | awk -v want="${port}" '
+    {
+      local_addr=$4;
+      sub(/^.*:/, "", local_addr);
+      if (local_addr == want) found=1;
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
 health_check() {
-  local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok timer_state
+  local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok timer_state configured_udp_port udp_state
   local udpgw_ports_raw udpgw_port udpgw_ok
   load_update_env
   DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
@@ -25127,36 +25152,46 @@ PY
   fi
 
   backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
-  zivpn_unit="$(service_unit_name "${ZIVPN_SERVICE:-zivpn}")"
-  udpcustom_unit="$(service_unit_name "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}")"
+  zivpn_unit="$(service_unit_name "${ZIVPN_SERVICE:-${ZIVPN_SERVICE_NAME:-zivpn}}")"
+  udpcustom_unit="$(service_unit_name "${UDPCUSTOM_SERVICE:-${UDPCUSTOM_SERVICE_NAME:-sc-1forcr-udpcustom}}")"
   udp_ok="0"
   if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
     udp_port="$(printf '%s' "${UDPCUSTOM_LISTEN_PORT:-5667}" | tr -cd '0-9')"
     [[ -z "${udp_port}" ]] && udp_port="5667"
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    configured_udp_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+    [[ -n "${configured_udp_port}" ]] && udp_port="${configured_udp_port}"
+    for attempt in {1..15}; do
       if systemctl is-active --quiet "${udpcustom_unit}" && \
-        ss -H -lunp 2>/dev/null | grep -Eq ":${udp_port}[[:space:]]"; then
+        udp_listener_present "${udp_port}"; then
         udp_ok="1"
         break
       fi
       sleep 1
     done
-    [[ "${udp_ok}" == "1" ]] || failures+=("UDP Custom tidak sehat/listen ${udp_port}")
+    if [[ "${udp_ok}" != "1" ]]; then
+      udp_state="$(systemctl is-active "${udpcustom_unit}" 2>/dev/null || true)"
+      failures+=("UDP Custom tidak sehat/listen ${udp_port} (unit=${udp_state:-unknown})")
+    fi
     if systemctl is-active --quiet "${zivpn_unit}"; then
       failures+=("konflik UDP: ZIVPN ikut aktif")
     fi
   else
     udp_port="$(printf '%s' "${ZIVPN_LISTEN_PORT:-5667}" | tr -cd '0-9')"
     [[ -z "${udp_port}" ]] && udp_port="5667"
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    configured_udp_port="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+    [[ -n "${configured_udp_port}" ]] && udp_port="${configured_udp_port}"
+    for attempt in {1..15}; do
       if systemctl is-active --quiet "${zivpn_unit}" && \
-        ss -H -lunp 2>/dev/null | grep -Eq ":${udp_port}[[:space:]]"; then
+        udp_listener_present "${udp_port}"; then
         udp_ok="1"
         break
       fi
       sleep 1
     done
-    [[ "${udp_ok}" == "1" ]] || failures+=("ZIVPN tidak sehat/listen ${udp_port}")
+    if [[ "${udp_ok}" != "1" ]]; then
+      udp_state="$(systemctl is-active "${zivpn_unit}" 2>/dev/null || true)"
+      failures+=("ZIVPN tidak sehat/listen ${udp_port} (unit=${udp_state:-unknown})")
+    fi
     if systemctl is-active --quiet "${udpcustom_unit}"; then
       failures+=("konflik UDP: UDP Custom ikut aktif")
     fi
@@ -25280,7 +25315,7 @@ restore_summary_runtime() {
 }
 
 rollback_snapshot() {
-  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard snapshot_has_udpgw_refactor
+  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard snapshot_has_udpgw_refactor restore_version
   local SUMMARY_RUNTIME_STATE_RECORDED="0" SUMMARY_SYSTEMD_PRESENT="0" SUMMARY_SYSTEMD_ACTIVE="0" SUMMARY_SYSTEMD_ENABLED="0"
   local SUMMARY_PM2_PRESENT="0" SUMMARY_WATCHDOG_ACTIVE="0" SUMMARY_WATCHDOG_ENABLED="0"
   snapshot_dir="$(verify_snapshot "${1:-latest}")" || return 1
@@ -25353,6 +25388,17 @@ rollback_snapshot() {
     --exclude='usr/local/sbin/sc-1forcr-pull-summary-update' \
     --exclude='opt/sc-1forcr/menu-sc-1forcr.sh' \
     --exclude='opt/potato-compat/menu-sc-1forcr.sh'
+
+  # Snapshot lama belum selalu memasukkan /etc/sc-1forcr-version. Pulihkan
+  # kedua marker dari state.env agar rollback tidak melaporkan versi update
+  # baru padahal helper/runtime sudah kembali ke versi lama.
+  restore_version="${FROM_VERSION:-}"
+  if [[ "${restore_version}" =~ ^[A-Za-z0-9._-]+$ && "${restore_version}" != "unknown" ]]; then
+    mkdir -p /etc /opt/sc-1forcr
+    printf 'SCRIPT_VERSION=%s\n' "${restore_version}" > /etc/sc-1forcr-version
+    printf '%s\n' "${restore_version}" > /opt/sc-1forcr/VERSION
+    chmod 644 /etc/sc-1forcr-version /opt/sc-1forcr/VERSION
+  fi
 
   rollback_db="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
   if [[ -f "${snapshot_dir}/database.sqlite" ]]; then

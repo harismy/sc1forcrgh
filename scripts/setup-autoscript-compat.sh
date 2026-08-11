@@ -163,7 +163,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.12}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.13}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -7908,10 +7908,27 @@ function ensureTunnelShellAllowed() {
 
 function readExec(cmd, args) {
   try {
-    return execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
+    return execFileSync(cmd, args, {
+      encoding: 'utf8',
+      maxBuffer: 2 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
   } catch (_) {
     return '';
   }
+}
+
+let firewallBackendCache = null;
+function firewallBackendKind() {
+  if (firewallBackendCache !== null) return firewallBackendCache;
+  if (safeExec('iptables', ['-w', '5', '-L'])) {
+    firewallBackendCache = 'iptables';
+  } else if (safeExec('nft', ['list', 'ruleset'])) {
+    firewallBackendCache = 'nft';
+  } else {
+    firewallBackendCache = 'none';
+  }
+  return firewallBackendCache;
 }
 
 function addIpToUserMap(map, username, ip) {
@@ -8693,6 +8710,7 @@ function nftDropSnippet(ip, proto, port) {
 }
 
 function detectNftInputChain() {
+  if (firewallBackendKind() !== 'nft') return null;
   if (safeExec('nft', ['list', 'chain', 'inet', 'filter', 'input'])) {
     return ['inet', 'filter', 'input'];
   }
@@ -8729,13 +8747,14 @@ function removeNftDropRule(ip, proto, port) {
 function addUdpDropRule(ip, port) {
   const src = String(ip || '').trim();
   if (!src) return false;
-  if (safeExec('iptables', ['-L'])) {
+  const backend = firewallBackendKind();
+  if (backend === 'iptables') {
     const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
     const rule = ['INPUT', '-p', 'udp', '-s', src, '--dport', String(port), '-j', 'DROP'];
-    if (safeExec(cmd, ['-C', ...rule])) return true;
-    return safeExec(cmd, ['-I', ...rule]);
+    if (safeExec(cmd, ['-w', '5', '-C', ...rule])) return true;
+    return safeExec(cmd, ['-w', '5', '-I', ...rule]);
   }
-  if (safeExec('nft', ['list', 'ruleset'])) {
+  if (backend === 'nft') {
     return addNftDropRule(src, 'udp', port);
   }
   return false;
@@ -8744,13 +8763,14 @@ function addUdpDropRule(ip, port) {
 function removeUdpDropRule(ip, port) {
   const src = String(ip || '').trim();
   if (!src) return;
-  if (safeExec('iptables', ['-L'])) {
+  const backend = firewallBackendKind();
+  if (backend === 'iptables') {
     const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
     const rule = ['INPUT', '-p', 'udp', '-s', src, '--dport', String(port), '-j', 'DROP'];
-    while (safeExec(cmd, ['-D', ...rule])) {}
+    while (safeExec(cmd, ['-w', '5', '-D', ...rule])) {}
     return;
   }
-  if (safeExec('nft', ['list', 'ruleset'])) {
+  if (backend === 'nft') {
     removeNftDropRule(src, 'udp', port);
   }
 }
@@ -8758,13 +8778,14 @@ function removeUdpDropRule(ip, port) {
 function addTcpDropRule(ip, port) {
   const src = String(ip || '').trim();
   if (!src) return false;
-  if (safeExec('iptables', ['-L'])) {
+  const backend = firewallBackendKind();
+  if (backend === 'iptables') {
     const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
     const rule = ['INPUT', '-p', 'tcp', '-s', src, '--dport', String(port), '-j', 'DROP'];
-    if (safeExec(cmd, ['-C', ...rule])) return true;
-    return safeExec(cmd, ['-I', ...rule]);
+    if (safeExec(cmd, ['-w', '5', '-C', ...rule])) return true;
+    return safeExec(cmd, ['-w', '5', '-I', ...rule]);
   }
-  if (safeExec('nft', ['list', 'ruleset'])) {
+  if (backend === 'nft') {
     return addNftDropRule(src, 'tcp', port);
   }
   return false;
@@ -8773,13 +8794,14 @@ function addTcpDropRule(ip, port) {
 function removeTcpDropRule(ip, port) {
   const src = String(ip || '').trim();
   if (!src) return;
-  if (safeExec('iptables', ['-L'])) {
+  const backend = firewallBackendKind();
+  if (backend === 'iptables') {
     const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
     const rule = ['INPUT', '-p', 'tcp', '-s', src, '--dport', String(port), '-j', 'DROP'];
-    while (safeExec(cmd, ['-D', ...rule])) {}
+    while (safeExec(cmd, ['-w', '5', '-D', ...rule])) {}
     return;
   }
-  if (safeExec('nft', ['list', 'ruleset'])) {
+  if (backend === 'nft') {
     removeNftDropRule(src, 'tcp', port);
   }
 }
@@ -8792,9 +8814,10 @@ function normalizeRuleSource(raw) {
 }
 
 function listCurrentTcpDropRuleIps(port, ipv6 = false) {
+  const set = new Set();
+  if (firewallBackendKind() !== 'iptables') return set;
   const cmd = ipv6 ? 'ip6tables-save' : 'iptables-save';
   const out = readExec(cmd, []);
-  const set = new Set();
   if (!out) return set;
   const dport = String(port);
   for (const lineRaw of String(out).split('\n')) {
@@ -8813,28 +8836,24 @@ function listCurrentTcpDropRuleIps(port, ipv6 = false) {
 
 function listCurrentTcpDropRuleIpsNft(port, ipv6 = false) {
   const set = new Set();
-  if (!safeExec('nft', ['list', 'ruleset'])) return set;
-  const candidates = [
-    ['inet', 'filter', 'input'],
-    ['ip', 'filter', 'input']
-  ];
+  if (firewallBackendKind() !== 'nft') return set;
+  const chain = detectNftInputChain();
+  if (!chain) return set;
   const dport = String(port);
   const familyToken = ipv6 ? 'ip6 saddr' : 'ip saddr';
-  for (const chain of candidates) {
-    const out = readExec('nft', ['list', 'chain', ...chain]);
-    if (!out) continue;
-    for (const lineRaw of String(out).split('\n')) {
-      const line = String(lineRaw || '').trim();
-      if (!line || !line.includes(familyToken)) continue;
-      if (!line.includes(' tcp ')) continue;
-      if (!line.includes(` dport ${dport} `)) continue;
-      if (!line.includes(' drop')) continue;
-      const re = ipv6 ? /ip6 saddr\s+([0-9a-fA-F:]+)/ : /ip saddr\s+([0-9.]+)/;
-      const m = line.match(re);
-      const src = normalizeRuleSource(m?.[1] || '');
-      if (!src) continue;
-      set.add(src);
-    }
+  const out = readExec('nft', ['list', 'chain', ...chain]);
+  if (!out) return set;
+  for (const lineRaw of String(out).split('\n')) {
+    const line = String(lineRaw || '').trim();
+    if (!line || !line.includes(familyToken)) continue;
+    if (!line.includes(' tcp ')) continue;
+    if (!line.includes(` dport ${dport} `)) continue;
+    if (!line.includes(' drop')) continue;
+    const re = ipv6 ? /ip6 saddr\s+([0-9a-fA-F:]+)/ : /ip saddr\s+([0-9.]+)/;
+    const m = line.match(re);
+    const src = normalizeRuleSource(m?.[1] || '');
+    if (!src) continue;
+    set.add(src);
   }
   return set;
 }
@@ -22922,6 +22941,7 @@ write_version_marker() {
 
 post_install_preflight() {
   local fw zstat ustat xstat apistat wsstat zport uport range_nft nat_ok extra_nat_ok extra_ports p udpgw7300 udpgw7200
+  local udp_socket_dump tcp_socket_dump zlisten ulisten udpgw7200_listen udpgw7300_listen
   fw="$(fw_backend_kind)"
   zstat="$(systemctl is-active "${ZIVPN_SERVICE_NAME}" 2>/dev/null || true)"
   ustat="$(systemctl is-active "${UDPCUSTOM_SERVICE_NAME}" 2>/dev/null || true)"
@@ -22935,6 +22955,13 @@ post_install_preflight() {
   [[ -z "${zport}" ]] && zport="${ZIVPN_LISTEN_PORT}"
   uport="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   [[ -z "${uport}" ]] && uport="${UDPCUSTOM_LISTEN_PORT}"
+
+  udp_socket_dump="$(ss -H -lunp 2>/dev/null || true)"
+  tcp_socket_dump="$(ss -H -lntp 2>/dev/null || true)"
+  zlisten="$(printf '%s\n' "${udp_socket_dump}" | awk -v p=":${zport}" '$4 ~ (p "$") && $0 ~ /"zivpn"/ {ok=1} END{print ok?"YES":"NO"}')"
+  ulisten="$(printf '%s\n' "${udp_socket_dump}" | awk -v p=":${uport}" '$4 ~ (p "$") && $0 ~ /"udp-custom"/ {ok=1} END{print ok?"YES":"NO"}')"
+  udpgw7200_listen="$(printf '%s\n' "${tcp_socket_dump}" | awk '$4 ~ /:7200$/ && $0 ~ /"badvpn-udpgw"/ {ok=1} END{print ok?"YES":"NO"}')"
+  udpgw7300_listen="$(printf '%s\n' "${tcp_socket_dump}" | awk '$4 ~ /:7300$/ && $0 ~ /"badvpn-udpgw"/ {ok=1} END{print ok?"YES":"NO"}')"
 
   nat_ok="n/a"
   if [[ -n "${ZIVPN_DNAT_RANGE}" ]]; then
@@ -22994,9 +23021,9 @@ post_install_preflight() {
 - xray/api/sshws   : ${xstat}/${apistat}/${wsstat}
 - zivpn/udphc      : ${zstat}/${ustat}
 - udpgw 7200/7300 : ${udpgw7200}/${udpgw7300}
-- zivpn listen     : ${zport} ($(ss -lunp 2>/dev/null | awk -v p=":${zport}" '$4 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
-- udphc listen     : ${uport} ($(ss -lunp 2>/dev/null | awk -v p=":${uport}" '$4 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
-- udpgw listen     : 7200=$(ss -lntup 2>/dev/null | awk '$4 ~ /:7200$/ {ok=1} END{print ok?"YES":"NO"}') 7300=$(ss -lntup 2>/dev/null | awk '$4 ~ /:7300$/ {ok=1} END{print ok?"YES":"NO"}')
+- zivpn listen     : ${zport} (${zlisten})
+- udphc listen     : ${uport} (${ulisten})
+- udpgw listen     : 7200=${udpgw7200_listen} 7300=${udpgw7300_listen}
 - network compat  : ${NETWORK_COMPAT_ENABLE} (MSS $(network_effective_tcp_mss), Xray ${XRAY_OUTBOUND_DOMAIN_STRATEGY})
 - zivpn cert/key   : $( [[ -s /etc/zivpn/zivpn.crt && -s /etc/zivpn/zivpn.key ]] && echo OK || echo MISSING )
 - dnat ${ZIVPN_DNAT_RANGE:-none}->${zport} : ${nat_ok}

@@ -163,7 +163,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.11}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.12}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -8145,16 +8145,33 @@ function parseSshAndUdpUsage() {
       { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }
     );
   } catch (_) {}
+  const activeDropbearAuthByPid = new Map();
+  const activeDropbearAuthWithoutPid = new Map();
   for (const lineRaw of String(dropbearLog || '').split('\n')) {
     const parsed = parseDropbearAuthLine(lineRaw);
-    if (!parsed) continue;
-    const user = parsed.username;
-    const src = parsed.source;
-    const clientPort = parsed.port;
-    if (!user || !clientPort) continue;
+    if (parsed) {
+      const user = parsed.username;
+      const clientPort = parsed.port;
+      const pid = String(parsed.pid || '').trim();
+      if (!user || !clientPort) continue;
+      const item = { user, source: parsed.source, clientPort };
+      if (pid) {
+        activeDropbearAuthByPid.set(pid, item);
+      } else {
+        activeDropbearAuthWithoutPid.set(`${user}|${clientPort}`, item);
+      }
+      continue;
+    }
+    const exited = parseDropbearExitLine(lineRaw);
+    if (exited?.pid) activeDropbearAuthByPid.delete(exited.pid);
+  }
+  for (const item of [...activeDropbearAuthByPid.values(), ...activeDropbearAuthWithoutPid.values()]) {
+    const user = item.user;
+    const clientPort = item.clientPort;
     if (!dropbearActiveClientPorts.has(clientPort)) continue;
     addSessionKeyToUserMap(sessionMap, user, `dropbear-port:${clientPort}`);
-    addIpToUserMap(ipMap, user, extractIp(src));
+    const sourceIp = extractIp(item.source);
+    if (sourceIp && !isLoopbackIp(sourceIp)) addIpToUserMap(ipMap, user, sourceIp);
     addPortToUserMap(wsClientPortMap, user, clientPort);
   }
 
@@ -8168,7 +8185,6 @@ function parseSshAndUdpUsage() {
     );
   } catch (_) {}
   const recentAuthByPid = new Map();
-  const closedRecentPid = new Set();
   for (const lineRaw of String(dropbearRecent || '').split('\n')) {
     const auth = parseDropbearAuthLine(lineRaw);
     if (auth) {
@@ -8194,11 +8210,10 @@ function parseSshAndUdpUsage() {
     }
     const ex = parseDropbearExitLine(lineRaw);
     if (ex) {
-      closedRecentPid.add(ex.pid);
+      recentAuthByPid.delete(ex.pid);
     }
   }
-  for (const [pid, data] of recentAuthByPid.entries()) {
-    if (closedRecentPid.has(pid)) continue;
+  for (const [, data] of recentAuthByPid.entries()) {
     addSessionKeyToUserMap(recentAuthMap, data.user, data.recentKey);
     if (dropbearActiveClientPorts.has(data.clientPort)) {
       addPortToUserMap(wsClientPortMap, data.user, data.clientPort);
@@ -9905,7 +9920,7 @@ async function lockIfExceeded(nowTs) {
       ...Array.from(setUnionValues(sshIpMap)),
       ...Array.from(setUnionValues(sshUdphcIpMap)),
       ...zivpnLockIps
-    ]));
+    ])).filter((ip) => ip && !isLoopbackIp(ip));
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     for (const ip of lockIps) {
       if (addUdpDropRule(ip, udpLockPort)) {
@@ -21147,10 +21162,12 @@ show_ssh_only_online() {
       END {
         for (pid in auth_by_pid) {
           if (pid in closed_pid) continue;
-          seen[auth_by_pid[pid]]=1;
+          cnt[auth_by_pid[pid]]++;
         }
-        for (u in auth_no_pid) seen[u]=1;
-        for (u in seen) print u, 1;
+        # Format log tanpa PID tidak dapat dibedakan per sesi dengan aman;
+        # gunakan satu fallback hanya jika belum ada sesi PID untuk user itu.
+        for (u in auth_no_pid) if (!(u in cnt)) cnt[u]=1;
+        for (u in cnt) if (cnt[u] > 0) print u, cnt[u];
       }' > "${tmp_ip_count}" || true
   fi
 
@@ -21161,11 +21178,11 @@ show_ssh_only_online() {
     echo "Tidak ada user SSH yang sedang online."
     echo
     echo "Total User SSH : 0"
-    echo "Total HP SSH   : 0"
+    echo "Total Sesi SSH : 0"
     return
   fi
 
-  printf "%-24s %-12s %-10s %-13s\n" "USERNAME" "STATUS" "LIMIT_IP" "TERKONEKSI_HP"
+  printf "%-24s %-12s %-10s %-13s\n" "USERNAME" "STATUS" "LIMIT_IP" "SESI_AKTIF"
   printf "%-24s %-12s %-10s %-13s\n" "------------------------" "------------" "----------" "-------------"
   awk '
     NR==FNR {
@@ -21187,7 +21204,7 @@ show_ssh_only_online() {
     END {
       print "";
       printf "Total User SSH : %d\n", total_user + 0;
-      printf "Total HP SSH   : %d\n", total_hp + 0;
+      printf "Total Sesi SSH : %d\n", total_hp + 0;
     }' "${tmp_status}" "${tmp_ip_count}"
 }
 

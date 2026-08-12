@@ -118,6 +118,8 @@ set -euo pipefail
 #   XRAY_ACTIVE_WINDOW_SECONDS=600               (opsional, jendela detik untuk IP aktif xray)
 #   XRAY_MIN_HITS_PER_IP=1                       (opsional, minimal hit/log per IP pada jendela aktif)
 #   XRAY_REAL_IP_ENABLE=0                        (canary: 1=teruskan IP asli HAProxy->Nginx->Xray)
+#   XRAY_MIRROR_BASE=                            (opsional, base URL mirror binary Xray, mis. https://installer.domain/xray)
+#   XRAY_VERSION=                                (opsional, pin versi Xray, mis. v2.6.3.27)
 #   XRAY_LIVE_IP_TTL_SECONDS=900                 (retensi IP aktif monitor; bukan jumlah socket)
 #   Catatan monitor Xray: socket aktif bukan jumlah perangkat. IP loopback proxy
 #   tidak pernah dihitung sebagai IP pengguna.
@@ -271,6 +273,8 @@ XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
 XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}"
+XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}"
+XRAY_VERSION="${XRAY_VERSION:-}"
 XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
 XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
@@ -1343,20 +1347,137 @@ install_xray() {
     return
   fi
   log "Install Xray..."
+
+  # 1. Coba installer resmi (jalur normal).
   tmp="$(mktemp)"
-  if ! curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 \
-    https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "${tmp}"; then
-    rm -f "${tmp}" >/dev/null 2>&1 || true
-    echo "Gagal download installer Xray."
-    return 1
+  if curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 \
+    https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "${tmp}" 2>/dev/null; then
+    if bash "${tmp}" install; then
+      rm -f "${tmp}" >/dev/null 2>&1 || true
+      if command -v xray >/dev/null 2>&1; then
+        log "Xray terpasang: $(xray version | head -n1)"
+        return
+      fi
+    fi
   fi
-  bash "${tmp}" install
   rm -f "${tmp}" >/dev/null 2>&1 || true
-  if ! command -v xray >/dev/null 2>&1; then
-    echo "Install Xray selesai tanpa binary xray. Cek koneksi/repo installer Xray."
+
+  # 2. Fallback: mirror internal (bot server) jika XRAY_MIRROR_BASE di-set.
+  if [[ -n "${XRAY_MIRROR_BASE:-}" ]] && install_xray_manual_from_sources "internal"; then
+    log "Xray terpasang via mirror internal: $(xray version | head -n1)"
+    return
+  fi
+
+  # 3. Fallback terakhir: proxy mirror GitHub publik (untuk VPS yang
+  #    diblok akses ke github.com/.../releases/download).
+  if install_xray_manual_from_sources "public-proxy"; then
+    log "Xray terpasang via proxy mirror: $(xray version | head -n1)"
+    return
+  fi
+
+  echo "Gagal install Xray dari semua sumber. Coba lagi nanti."
+  return 1
+}
+
+xray_arch_pkg() {
+  case "$(uname -m)" in
+    aarch64|arm64) echo "Xray-linux-arm64-v8a.zip" ;;
+    armv7l|armv6l) echo "Xray-linux-arm32-v7a.zip" ;;
+    *) echo "Xray-linux-64.zip" ;;
+  esac
+}
+
+install_xray_manual_from_sources() {
+  local mode="$1" pkg ver urls url tmpdir geo_url downloaded
+  pkg="$(xray_arch_pkg)"
+  tmpdir="$(mktemp -d)"
+
+  ver="${XRAY_VERSION:-}"
+  if [[ -z "${ver}" ]]; then
+    ver="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+      https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
+      | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+  fi
+  [[ -z "${ver}" ]] && ver="v2.6.3.27"
+
+  urls=""
+  if [[ "${mode}" == "internal" ]]; then
+    urls="${XRAY_MIRROR_BASE%/}/${pkg}"
+  else
+    urls="
+https://github.com/XTLS/Xray-core/releases/download/${ver}/${pkg}
+https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/${ver}/${pkg}
+https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/download/${ver}/${pkg}
+https://ghproxy.net/https://github.com/XTLS/Xray-core/releases/download/${ver}/${pkg}
+https://gh.llkk.cc/https://github.com/XTLS/Xray-core/releases/download/${ver}/${pkg}
+"
+  fi
+
+  downloaded=0
+  for url in ${urls}; do
+    [[ -n "${url}" ]] || continue
+    log "Coba download Xray binary: ${url}"
+    if curl -fsSL --connect-timeout 15 --max-time 300 --retry 5 --retry-delay 3 \
+      "${url}" -o "${tmpdir}/${pkg}" 2>/dev/null; then
+      if unzip -tq "${tmpdir}/${pkg}" >/dev/null 2>&1; then
+        downloaded=1
+        break
+      fi
+    fi
+    rm -f "${tmpdir}/${pkg}" >/dev/null 2>&1 || true
+  done
+
+  if [[ "${downloaded}" != "1" ]]; then
+    rm -rf "${tmpdir}" >/dev/null 2>&1 || true
     return 1
   fi
-  log "Xray terpasang: $(xray version | head -n1)"
+
+  unzip -oq "${tmpdir}/${pkg}" -d "${tmpdir}/bin" || { rm -rf "${tmpdir}" >/dev/null 2>&1 || true; return 1; }
+  install -m 755 "${tmpdir}/bin/xray" /usr/local/bin/xray || { rm -rf "${tmpdir}" >/dev/null 2>&1 || true; return 1; }
+
+  # Geodata opsional: config SC tidak pakai routing geoip/geosite,
+  # jadi gagal download geodata tidak membatalkan instalasi.
+  mkdir -p /usr/local/share/xray >/dev/null 2>&1 || true
+  for geo in geoip.dat geosite.dat; do
+    [[ -s "/usr/local/share/xray/${geo}" ]] && continue
+    for url in ${urls}; do
+      [[ -n "${url}" ]] || continue
+      geo_url="${url%/${pkg}}/${geo}"
+      curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 \
+        "${geo_url}" -o "/usr/local/share/xray/${geo}" 2>/dev/null && break
+      rm -f "/usr/local/share/xray/${geo}" >/dev/null 2>&1 || true
+    done
+  done
+
+  # Systemd unit (replika installer resmi) bila belum ada.
+  if [[ ! -f /etc/systemd/system/xray.service ]]; then
+    cat > /etc/systemd/system/xray.service <<'XRAY_UNIT_EOF'
+[Unit]
+Description=Xray Service
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
+
+[Service]
+User=nobody
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+Restart=on-failure
+RestartPreventExitStatus=23
+LimitNPROC=10000
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+XRAY_UNIT_EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable xray >/dev/null 2>&1 || true
+  fi
+
+  mkdir -p /usr/local/etc/xray >/dev/null 2>&1 || true
+  rm -rf "${tmpdir}" >/dev/null 2>&1 || true
+  command -v xray >/dev/null 2>&1
 }
 
 setup_default_banner_assets() {
@@ -23545,6 +23666,8 @@ Time     : $(date '+%F %T')"
     XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
     XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP}" \
     XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}" \
+    XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}" \
+    XRAY_VERSION="${XRAY_VERSION:-}" \
     XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}" \
     XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}" \
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \

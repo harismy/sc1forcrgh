@@ -117,6 +117,8 @@ set -euo pipefail
 #   XRAY_RECENT_WINDOW_MINUTES=60                (opsional, jendela menit log xray untuk hitung multi-login)
 #   XRAY_ACTIVE_WINDOW_SECONDS=600               (opsional, jendela detik untuk IP aktif xray)
 #   XRAY_MIN_HITS_PER_IP=1                       (opsional, minimal hit/log per IP pada jendela aktif)
+#   XRAY_REAL_IP_ENABLE=0                        (canary: 1=teruskan IP asli HAProxy->Nginx->Xray)
+#   XRAY_LIVE_IP_TTL_SECONDS=900                 (retensi IP aktif monitor; bukan jumlah socket)
 #   Catatan monitor Xray: socket aktif bukan jumlah perangkat. IP loopback proxy
 #   tidak pernah dihitung sebagai IP pengguna.
 #   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
@@ -169,7 +171,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.22}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.23}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -268,6 +270,8 @@ XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
 XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
+XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
+XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
@@ -607,6 +611,8 @@ build_nginx_ws_locations() {
     out+=$'        proxy_set_header Upgrade "websocket";\n'
     out+=$'        proxy_set_header Connection "Upgrade";\n'
     out+=$'        proxy_set_header Host \\$host;\n'
+    out+=$'        proxy_set_header X-Forwarded-For \\$sc_xray_client_ip;\n'
+    out+=$'        proxy_set_header X-SC-Real-IP-Proxy "1";\n'
     out+=$'        proxy_read_timeout 3600s;\n'
     out+=$'        proxy_send_timeout 3600s;\n'
     out+=$'        proxy_connect_timeout 60s;\n'
@@ -2115,9 +2121,15 @@ EOF_LIMIT
   fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
 ${sshws_nginx_limit_conf}
+map \$proxy_protocol_addr \$sc_xray_client_ip {
+    "" \$remote_addr;
+    default \$proxy_protocol_addr;
+}
+
 server {
     listen 80;
     listen [::]:80;
+    listen 127.0.0.1:8080 proxy_protocol;
     server_name ${nginx_server_names};
     keepalive_timeout 30;
 
@@ -2133,6 +2145,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2143,7 +2157,8 @@ server {
         proxy_pass http://127.0.0.1:${API_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
@@ -2158,6 +2173,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2174,6 +2191,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2189,6 +2208,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2205,6 +2226,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2220,6 +2243,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2229,6 +2254,8 @@ server {
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11001;
@@ -2237,6 +2264,8 @@ server {
     location /vless-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11002;
@@ -2245,6 +2274,8 @@ server {
     location /trojan-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
@@ -2260,6 +2291,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2276,6 +2309,8 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2292,6 +2327,8 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2301,6 +2338,7 @@ ${sshws_nginx_limit_rules}
 
 server {
     listen 127.0.0.1:8081 http2;
+    listen 127.0.0.1:8082 proxy_protocol http2;
     server_name _;
 
     include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
@@ -2308,6 +2346,8 @@ server {
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11001;
@@ -2316,6 +2356,8 @@ server {
     location /vless-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11002;
@@ -2324,6 +2366,8 @@ server {
     location /trojan-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
@@ -2364,6 +2408,7 @@ EOF
 
 setup_haproxy_tls_mux() {
   local pem haproxy_maxconn haproxy_nbthread haproxy_limit_nofile haproxy_log_option cores
+  local xray_ws_backend_line xray_grpc_backend_line
   pem="$(prepare_haproxy_pem)" || {
     log "Gagal menyiapkan sertifikat HAProxy."
     return 1
@@ -2383,6 +2428,13 @@ setup_haproxy_tls_mux() {
     haproxy_log_option="    option tcplog"
   else
     haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
+  fi
+  if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8080 check send-proxy-v2"
+    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check send-proxy-v2"
+  else
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:80 check"
+    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check"
   fi
 
   log "Setup HAProxy TLS mux di 443..."
@@ -2439,12 +2491,12 @@ backend bk_mux
     mode tcp
     # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
     # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
-    server nginx_local 127.0.0.1:80 check
+${xray_ws_backend_line}
 
 backend bk_grpc
     mode tcp
     # Jalur khusus gRPC (HTTP/2) ke listener Nginx internal agar tidak mengganggu WS existing.
-    server nginx_grpc 127.0.0.1:8081 check
+${xray_grpc_backend_line}
 
 backend bk_sshws_tls
     mode tcp
@@ -3149,6 +3201,8 @@ XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
+XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
+XRAY_LIVE_IP_TTL_SECONDS=${XRAY_LIVE_IP_TTL_SECONDS}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
@@ -3503,6 +3557,18 @@ const XRAY_PATHS_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/tro
 const XRAY_PATH_VMESS = XRAY_PATHS_VMESS[0];
 const XRAY_PATH_VLESS = XRAY_PATHS_VLESS[0];
 const XRAY_PATH_TROJAN = XRAY_PATHS_TROJAN[0];
+const XRAY_REAL_IP_ENABLE = /^(1|true|yes|on)$/i.test(String(process.env.XRAY_REAL_IP_ENABLE || '0').trim());
+const XRAY_TRUSTED_PROXY_HEADER = 'X-SC-Real-IP-Proxy';
+function withXrayRealIp(streamSettings) {
+  if (!XRAY_REAL_IP_ENABLE) return streamSettings;
+  return {
+    ...streamSettings,
+    sockopt: {
+      ...(streamSettings?.sockopt || {}),
+      trustedXForwardedFor: [XRAY_TRUSTED_PROXY_HEADER]
+    }
+  };
+}
 const XRAY_PUBLIC_HOST_IS_CUSTOM = Boolean(XRAY_PUBLIC_HOST && normalizeHost(DOMAIN) && XRAY_PUBLIC_HOST !== normalizeHost(DOMAIN));
 const VMESS_BUG_PROFILE_ADDRESS = normalizeHost(process.env.VMESS_BUG_PROFILE_ADDRESS || '') || (XRAY_PUBLIC_HOST_IS_CUSTOM ? XRAY_PUBLIC_HOST : '');
 const VMESS_BUG_PROFILE_SNI = normalizeHost(process.env.VMESS_BUG_PROFILE_SNI || '') || (XRAY_PUBLIC_HOST_IS_CUSTOM ? XRAY_PUBLIC_HOST : '');
@@ -4976,32 +5042,32 @@ async function renderAndReloadXray() {
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } }
+        streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } }
+        streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+        streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
       },
       {
         port: 11001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
       },
       {
         port: 11002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
       },
       {
         port: 11003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
       }
     ],
     outbounds: [{
@@ -6429,32 +6495,32 @@ async function setStatusXray(table, username, status) {
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } }
+        streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } }
+        streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+        streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
       },
       {
         port: 11001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
       },
       {
         port: 11002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
       },
       {
         port: 11003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
       }
     ],
     outbounds: [{
@@ -10315,32 +10381,32 @@ async function rebuildXrayFromDb() {
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } }
+        streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } }
+        streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } }
+        streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
       },
       {
         port: 11001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
-        streamSettings: { network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
       },
       {
         port: 11002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
-        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
       },
       {
         port: 11003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
-        streamSettings: { network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } }
+        streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
       }
     ],
     outbounds: [{
@@ -12288,6 +12354,8 @@ SETTINGS_KEYS = [
     "XRAY_RECENT_WINDOW_MINUTES",
     "XRAY_ACTIVE_WINDOW_SECONDS",
     "XRAY_MIN_HITS_PER_IP",
+    "XRAY_REAL_IP_ENABLE",
+    "XRAY_LIVE_IP_TTL_SECONDS",
     "XRAY_PATHS_VMESS",
     "XRAY_PATHS_VLESS",
     "XRAY_PATHS_TROJAN",
@@ -13069,6 +13137,8 @@ SETTINGS_KEYS = [
     "XRAY_RECENT_WINDOW_MINUTES",
     "XRAY_ACTIVE_WINDOW_SECONDS",
     "XRAY_MIN_HITS_PER_IP",
+    "XRAY_REAL_IP_ENABLE",
+    "XRAY_LIVE_IP_TTL_SECONDS",
     "XRAY_PATHS_VMESS",
     "XRAY_PATHS_VLESS",
     "XRAY_PATHS_TROJAN",
@@ -13588,13 +13658,16 @@ state_file="${XRAY_LIVE_STATE_FILE:-${state_dir}/xray-live.map}"
 cursor_file="${XRAY_LIVE_CURSOR_FILE:-${state_dir}/xray-live.cursor}"
 native_cache_file="${XRAY_LIVE_NATIVE_CACHE_FILE:-${state_dir}/xray-live.native}"
 native_support_file="${XRAY_LIVE_NATIVE_SUPPORT_FILE:-${state_dir}/xray-live.native-support}"
+ip_state_file="${XRAY_LIVE_IP_STATE_FILE:-${state_dir}/xray-live.ips}"
 schema_file="${XRAY_LIVE_SCHEMA_FILE:-${state_dir}/xray-live.schema}"
 lock_file="${state_dir}/xray-live.lock"
-tracker_schema="3"
+ip_ttl="$(echo "${XRAY_LIVE_IP_TTL_SECONDS:-900}" | tr -cd '0-9')"
+tracker_schema="4"
 
 [[ -z "${recovery_h}" || "${recovery_h}" -lt 1 || "${recovery_h}" -gt 168 ]] && recovery_h="72"
 [[ -z "${log_max}" || "${log_max}" -lt 2000 || "${log_max}" -gt 100000 ]] && log_max="30000"
 [[ -z "${native_poll}" || "${native_poll}" -lt 5 || "${native_poll}" -gt 300 ]] && native_poll="15"
+[[ -z "${ip_ttl}" || "${ip_ttl}" -lt 60 || "${ip_ttl}" -gt 86400 ]] && ip_ttl="900"
 
 mkdir -p "${state_dir}" >/dev/null 2>&1 || exit 0
 chmod 700 "${state_dir}" >/dev/null 2>&1 || true
@@ -13607,7 +13680,7 @@ stored_schema="$(tr -d '[:space:]' 2>/dev/null < "${schema_file}" || true)"
 if [[ "${stored_schema}" != "${tracker_schema}" ]]; then
   # Cursor V.1FSC.19 mungkin sudah maju saat mapping port gagal. Hapus hanya
   # state runtime agar helper melakukan recovery access.log penuh satu kali.
-  rm -f -- "${state_file}" "${cursor_file}" "${native_cache_file}" >/dev/null 2>&1 || true
+  rm -f -- "${state_file}" "${cursor_file}" "${native_cache_file}" "${ip_state_file}" >/dev/null 2>&1 || true
   schema_tmp="${schema_file}.$$"
   printf '%s\n' "${tracker_schema}" > "${schema_tmp}"
   chmod 600 "${schema_tmp}" >/dev/null 2>&1 || true
@@ -13625,9 +13698,13 @@ db_users="${tmp_dir}/db-users"
 session_rows="${tmp_dir}/sessions"
 native_users="${tmp_dir}/native-users"
 all_sessions="${tmp_dir}/all-sessions"
+ip_events="${tmp_dir}/ip-events"
+old_ip_state="${tmp_dir}/old-ip-state"
+new_ip_state="${tmp_dir}/new-ip-state"
 : > "${active_map}"
 : > "${events_raw}"
 : > "${events}"
+: > "${ip_events}"
 : > "${db_users}"
 : > "${session_rows}"
 : > "${native_users}"
@@ -13670,7 +13747,7 @@ now_ts="$(date +%s 2>/dev/null || echo 0)"
 recovery_cutoff=$(( now_ts - (recovery_h * 3600) ))
 (( recovery_cutoff < 0 )) && recovery_cutoff=0
 
-awk -v recovery="${recovery_scan}" -v cutoff="${recovery_cutoff}" '
+awk -v recovery="${recovery_scan}" -v cutoff="${recovery_cutoff}" -v now="${now_ts}" -v ipout="${ip_events}" '
   function trim(v) {
     gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
     return v;
@@ -13722,8 +13799,11 @@ awk -v recovery="${recovery_scan}" -v cutoff="${recovery_cutoff}" '
     } else if (match($0, /from[[:space:]]+[^[:space:]]+/)) {
       src=substr($0, RSTART, RLENGTH); sub(/^from[[:space:]]+/, "", src);
     }
-    user=tolower(trim(user)); port=source_port(src);
-    if (user !~ /^[a-z0-9._-]+$/ || port=="") next;
+    user=tolower(trim(user)); ip=source_host(src);
+    if (user !~ /^[a-z0-9._-]+$/) next;
+    if (ip!="-") print user "|" ip "|" (ts>0 ? ts : now) >> ipout;
+    port=source_port(src);
+    if (port=="") next;
     # Baris access log berurutan; assignment terakhir adalah pemetaan terbaru
     # jika kernel memakai ulang ephemeral port yang sama.
     latest_user[port]=user;
@@ -13735,6 +13815,28 @@ awk -v recovery="${recovery_scan}" -v cutoff="${recovery_cutoff}" '
       print port "|" latest_user[port] "|" latest_ip[port] "|" latest_ts[port];
   }
 ' "${events_raw}" > "${events}" || true
+
+if [[ -f "${ip_state_file}" ]]; then
+  cp -f "${ip_state_file}" "${old_ip_state}" 2>/dev/null || : > "${old_ip_state}"
+else
+  : > "${old_ip_state}"
+fi
+awk -F'|' -v now="${now_ts}" -v ttl="${ip_ttl}" '
+  $1 ~ /^[a-z0-9._-]+$/ && $2!="" && $2!="-" && $3 ~ /^[0-9]+$/ {
+    key=tolower($1) SUBSEP tolower($2); ts=$3+0;
+    if (!(key in latest) || ts>latest[key]) latest[key]=ts;
+  }
+  END {
+    cutoff=now-ttl;
+    for (key in latest) {
+      if (latest[key] < cutoff) continue;
+      split(key, a, SUBSEP);
+      print a[1] "|" a[2] "|" latest[key];
+    }
+  }
+' "${old_ip_state}" "${ip_events}" | sort -t'|' -k1,1 -k2,2 > "${new_ip_state}" || true
+chmod 600 "${new_ip_state}" >/dev/null 2>&1 || true
+mv -f "${new_ip_state}" "${ip_state_file}" >/dev/null 2>&1 || true
 
 # Snapshot socket diambil setelah access.log supaya koneksi yang baru muncul
 # di antara dua langkah tidak kehilangan event akibat cursor sudah maju.
@@ -13896,9 +13998,40 @@ awk -F'|' '
   }
 ' "${session_rows}" "${db_users}" "${native_users}" > "${all_sessions}" || true
 
+# X-Forwarded-For membuat Xray mencatat IP asli dengan port 0. IP tersebut
+# tidak bisa dipasangkan ke ephemeral port socket, jadi gabungkan sebagai
+# bukti IP terbaru per akun/protokol tanpa menganggapnya sebagai socket baru.
+awk -F'|' '
+  FILENAME==ARGV[1] {
+    proto=tolower($1); user=tolower($2);
+    if (proto !~ /^(vmess|vless|trojan)$/ || user !~ /^[a-z0-9._-]+$/) next;
+    key=user SUBSEP proto;
+    if (!(key in active_seen)) { active_seen[key]=1; active_count[user]++; active_proto[user]=proto; }
+    next;
+  }
+  FILENAME==ARGV[2] {
+    proto=tolower($1); user=tolower($2);
+    if (proto !~ /^(vmess|vless|trojan)$/ || user !~ /^[a-z0-9._-]+$/) next;
+    key=user SUBSEP proto;
+    if (!(key in db_seen)) { db_seen[key]=1; db_count[user]++; db_proto[user]=proto; }
+    next;
+  }
+  FILENAME==ARGV[3] {
+    user=tolower($1); ip=tolower($2);
+    if (user !~ /^[a-z0-9._-]+$/ || ip=="" || ip=="-") next;
+    proto="";
+    if (active_count[user]==1) proto=active_proto[user];
+    else if (db_count[user]==1) proto=db_proto[user];
+    if (proto!="") print proto "|" user "|ip:" ip "|" ip;
+  }
+' "${all_sessions}" "${db_users}" "${ip_state_file}" >> "${all_sessions}" || true
+
 case "${mode}" in
   raw)
     cat "${state_file}" 2>/dev/null || true
+    ;;
+  raw-ip|ips)
+    cat "${ip_state_file}" 2>/dev/null || true
     ;;
   rows)
     awk -F'|' '
@@ -13910,15 +14043,17 @@ case "${mode}" in
         return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || v ~ /^[0-9a-f:]+$/);
       }
       $1 ~ /^(vmess|vless|trojan)$/ && $2 ~ /^[a-z0-9._-]+$/ && $3!="" {
+        key=$1 SUBSEP $2; seen[key]=1;
         sk=$1 SUBSEP $2 SUBSEP $3;
         if (sk in session_seen) next;
-        session_seen[sk]=1; key=$1 SUBSEP $2; count[key]++;
+        session_seen[sk]=1;
+        if ($3 !~ /^ip:/) count[key]++;
         if (usable_ip($4)) lastip[key]=$4;
       }
       END {
-        for (key in count) {
+        for (key in seen) {
           split(key, a, SUBSEP);
-          printf "%s|%s|%d|%s\n", a[1], a[2], count[key], (key in lastip ? lastip[key] : "TIDAK_TERDETEKSI");
+          printf "%s|%s|%d|%s\n", a[1], a[2], (key in count ? count[key] : 0), (key in lastip ? lastip[key] : "TIDAK_TERDETEKSI");
         }
       }
     ' "${all_sessions}" | sort -t'|' -k1,1 -k2,2
@@ -13936,8 +14071,11 @@ case "${mode}" in
         return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || v ~ /^[0-9a-f:]+$/);
       }
       $1 ~ /^(vmess|vless|trojan)$/ && $2 ~ /^[a-z0-9._-]+$/ && $3!="" {
-        key=$1 SUBSEP $2; sk=key SUBSEP $3;
-        if (!(sk in session_seen)) { session_seen[sk]=1; sockets[key]++; }
+        key=$1 SUBSEP $2; seen[key]=1; sk=key SUBSEP $3;
+        if (!(sk in session_seen)) {
+          session_seen[sk]=1;
+          if ($3 !~ /^ip:/) sockets[key]++;
+        }
         if (usable_ip($4)) {
           ik=key SUBSEP tolower($4);
           if (!(ik in ip_seen)) { ip_seen[ik]=1; ips[key]++; }
@@ -13945,12 +14083,13 @@ case "${mode}" in
         }
       }
       END {
-        for (key in sockets) {
+        for (key in seen) {
           split(key, a, SUBSEP);
+          socketc=(key in sockets ? sockets[key] : 0);
           ipc=(key in ips ? ips[key] : 0);
           lip=(key in lastip ? lastip[key] : "TIDAK_TERDETEKSI");
-          visibility=(ipc > 0 ? "SOURCE_IP" : "PROXY_LOCAL");
-          printf "%s|%s|%d|%d|%s|%s\n", a[1], a[2], sockets[key], ipc, lip, visibility;
+          visibility=(ipc > 0 ? "SOURCE_IP_RECENT" : "PROXY_LOCAL");
+          printf "%s|%s|%d|%d|%s|%s\n", a[1], a[2], socketc, ipc, lip, visibility;
         }
       }
     ' "${all_sessions}" | sort -t'|' -k1,1 -k2,2
@@ -13960,10 +14099,14 @@ case "${mode}" in
   *)
     awk -F'|' '
       $2 ~ /^[a-z0-9._-]+$/ && $3!="" {
+        seen[$2]=1;
         sk=$2 SUBSEP $1 SUBSEP $3;
-        if (!(sk in session_seen)) { session_seen[sk]=1; count[$2]++; }
+        if (!(sk in session_seen)) {
+          session_seen[sk]=1;
+          if ($3 !~ /^ip:/) count[$2]++;
+        }
       }
-      END { for (u in count) printf "%s(%d)\n", u, count[u]; }
+      END { for (u in seen) printf "%s(%d)\n", u, (u in count && count[u]>0 ? count[u] : 1); }
     ' "${all_sessions}" | sort
     ;;
 esac
@@ -15184,11 +15327,264 @@ EOF
   fi
 }
 
+install_xray_realip_manager() {
+  cat > /usr/local/sbin/sc-1forcr-xray-realip <<'XRAY_REALIP_MANAGER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+NGINX_CONF="/etc/nginx/sites-available/sc-1forcr.conf"
+HAPROXY_CONF="/etc/haproxy/haproxy.cfg"
+XRAY_CONF="/usr/local/etc/xray/config.json"
+SC_ENV="/etc/sc-1forcr.env"
+APP_ENV="/opt/sc-1forcr/.env"
+BACKUP_ROOT="/var/lib/sc-1forcr/xray-realip-backups"
+LATEST_FILE="${BACKUP_ROOT}/LATEST"
+
+die() { echo "[xray-realip] ERROR: $*" >&2; exit 1; }
+log_realip() { echo "[xray-realip] $*"; }
+
+require_root() {
+  [[ "$(id -u)" -eq 0 ]] || die "jalankan sebagai root"
+}
+
+set_env_value() {
+  local file="$1" key="$2" value="$3" tmp
+  mkdir -p "$(dirname "${file}")"
+  [[ -f "${file}" ]] || : > "${file}"
+  tmp="$(mktemp "$(dirname "${file}")/.xray-realip-env.XXXXXX")"
+  awk -F= -v key="${key}" -v value="${value}" '
+    BEGIN { done=0 }
+    $1==key { if (!done) print key "=" value; done=1; next }
+    { print }
+    END { if (!done) print key "=" value }
+  ' "${file}" > "${tmp}"
+  chmod --reference="${file}" "${tmp}" 2>/dev/null || chmod 600 "${tmp}"
+  chown --reference="${file}" "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${file}"
+}
+
+create_backup() {
+  local reason="${1:-manual}" stamp dir
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  dir="${BACKUP_ROOT}/${stamp}"
+  mkdir -p "${dir}"
+  [[ -f "${NGINX_CONF}" ]] && cp -a "${NGINX_CONF}" "${dir}/nginx.conf"
+  [[ -f "${HAPROXY_CONF}" ]] && cp -a "${HAPROXY_CONF}" "${dir}/haproxy.cfg"
+  [[ -f "${XRAY_CONF}" ]] && cp -a "${XRAY_CONF}" "${dir}/xray-config.json"
+  [[ -f "${SC_ENV}" ]] && cp -a "${SC_ENV}" "${dir}/sc.env"
+  [[ -f "${APP_ENV}" ]] && cp -a "${APP_ENV}" "${dir}/app.env"
+  printf 'reason=%s\ncreated_at=%s\n' "${reason}" "$(date -u +%FT%TZ)" > "${dir}/meta"
+  printf '%s\n' "${dir}" > "${LATEST_FILE}"
+  chmod 700 "${dir}"
+  printf '%s\n' "${dir}"
+}
+
+xray_test_config() {
+  local bin=""
+  for candidate in /usr/local/bin/xray /usr/bin/xray "$(command -v xray 2>/dev/null || true)"; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then bin="${candidate}"; break; fi
+  done
+  [[ -n "${bin}" ]] || return 1
+  "${bin}" run -test -config "${XRAY_CONF}" >/dev/null 2>&1 || \
+    "${bin}" -test -config "${XRAY_CONF}" >/dev/null 2>&1
+}
+
+validate_all() {
+  nginx -t >/dev/null 2>&1 || return 1
+  haproxy -c -f "${HAPROXY_CONF}" >/dev/null 2>&1 || return 1
+  jq -e . "${XRAY_CONF}" >/dev/null 2>&1 || return 1
+  xray_test_config || return 1
+}
+
+reload_stack() {
+  systemctl reload nginx >/dev/null 2>&1 || return 1
+  systemctl reload haproxy >/dev/null 2>&1 || systemctl restart haproxy >/dev/null 2>&1 || return 1
+  systemctl restart xray >/dev/null 2>&1 || return 1
+  systemctl try-restart sc-1forcr-api >/dev/null 2>&1 || true
+  systemctl is-active --quiet nginx haproxy xray
+}
+
+restore_backup() {
+  local dir="$1" resolved
+  [[ -n "${dir}" && -d "${dir}" ]] || die "backup tidak ditemukan: ${dir:-kosong}"
+  resolved="$(realpath -e "${dir}")"
+  case "${resolved}" in
+    "$(realpath -m "${BACKUP_ROOT}")"/*) ;;
+    *) die "path backup di luar ${BACKUP_ROOT}" ;;
+  esac
+  [[ -f "${resolved}/nginx.conf" ]] && cp -a "${resolved}/nginx.conf" "${NGINX_CONF}"
+  [[ -f "${resolved}/haproxy.cfg" ]] && cp -a "${resolved}/haproxy.cfg" "${HAPROXY_CONF}"
+  [[ -f "${resolved}/xray-config.json" ]] && cp -a "${resolved}/xray-config.json" "${XRAY_CONF}"
+  [[ -f "${resolved}/sc.env" ]] && cp -a "${resolved}/sc.env" "${SC_ENV}"
+  [[ -f "${resolved}/app.env" ]] && cp -a "${resolved}/app.env" "${APP_ENV}"
+  validate_all || die "config backup tidak valid; service tidak direload"
+  reload_stack || die "config kembali tetapi reload service belum sehat"
+  log_realip "Rollback berhasil: ${resolved}"
+}
+
+patch_nginx_realip() {
+  local tmp have_map have_ws have_grpc
+  have_map=0; have_ws=0; have_grpc=0
+  grep -q 'map[[:space:]]\+\$proxy_protocol_addr[[:space:]]\+\$sc_xray_client_ip' "${NGINX_CONF}" && have_map=1 || true
+  grep -q 'listen[[:space:]]\+127\.0\.0\.1:8080[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_ws=1 || true
+  grep -q 'listen[[:space:]]\+127\.0\.0\.1:8082[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_grpc=1 || true
+  tmp="$(mktemp "$(dirname "${NGINX_CONF}")/.sc-xray-realip-nginx.XXXXXX")"
+  awk -v have_map="${have_map}" -v have_ws="${have_ws}" -v have_grpc="${have_grpc}" '
+    function print_map() {
+      print "map $proxy_protocol_addr $sc_xray_client_ip {";
+      print "    \"\" $remote_addr;";
+      print "    default $proxy_protocol_addr;";
+      print "}";
+      print "";
+    }
+    /^[[:space:]]*(proxy_set_header|grpc_set_header)[[:space:]]+X-Forwarded-For[[:space:]]+/ { next }
+    /^[[:space:]]*(proxy_set_header|grpc_set_header)[[:space:]]+X-SC-Real-IP-Proxy[[:space:]]+/ { next }
+    {
+      if (!have_map && !map_added && $0 ~ /^server[[:space:]]*\{/) { print_map(); map_added=1; }
+      print;
+      if (!have_ws && !ws_added && $0 ~ /^[[:space:]]*listen[[:space:]]+80[[:space:]]*;/) {
+        print "    listen 127.0.0.1:8080 proxy_protocol;"; ws_added=1;
+      }
+      if (!have_grpc && !grpc_added && $0 ~ /^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:8081([[:space:]]|;)/) {
+        print "    listen 127.0.0.1:8082 proxy_protocol http2;"; grpc_added=1;
+      }
+      if ($0 ~ /^[[:space:]]*proxy_set_header[[:space:]]+Host[[:space:]]+/) {
+        print "        proxy_set_header X-Forwarded-For $sc_xray_client_ip;";
+        print "        proxy_set_header X-SC-Real-IP-Proxy \"1\";";
+      }
+      if ($0 ~ /^[[:space:]]*grpc_set_header[[:space:]]+Host[[:space:]]+/) {
+        print "        grpc_set_header X-Forwarded-For $sc_xray_client_ip;";
+        print "        grpc_set_header X-SC-Real-IP-Proxy \"1\";";
+      }
+    }
+  ' "${NGINX_CONF}" > "${tmp}"
+  chmod --reference="${NGINX_CONF}" "${tmp}" 2>/dev/null || chmod 644 "${tmp}"
+  chown --reference="${NGINX_CONF}" "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${NGINX_CONF}"
+}
+
+patch_haproxy_mode() {
+  local mode="$1" tmp
+  tmp="$(mktemp "$(dirname "${HAPROXY_CONF}")/.sc-xray-realip-haproxy.XXXXXX")"
+  awk -v mode="${mode}" '
+    $1=="server" && $2=="nginx_local" {
+      if (mode=="enable") print "    server nginx_local 127.0.0.1:8080 check send-proxy-v2";
+      else print "    server nginx_local 127.0.0.1:80 check";
+      next;
+    }
+    $1=="server" && $2=="nginx_grpc" {
+      if (mode=="enable") print "    server nginx_grpc 127.0.0.1:8082 check send-proxy-v2";
+      else print "    server nginx_grpc 127.0.0.1:8081 check";
+      next;
+    }
+    { print }
+  ' "${HAPROXY_CONF}" > "${tmp}"
+  chmod --reference="${HAPROXY_CONF}" "${tmp}" 2>/dev/null || chmod 644 "${tmp}"
+  chown --reference="${HAPROXY_CONF}" "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${HAPROXY_CONF}"
+}
+
+patch_xray_mode() {
+  local mode="$1" tmp filter
+  tmp="$(mktemp "$(dirname "${XRAY_CONF}")/.sc-xray-realip-xray.XXXXXX")"
+  if [[ "${mode}" == "enable" ]]; then
+    filter='.inbounds |= map(if (((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc")) then .streamSettings.sockopt = ((.streamSettings.sockopt // {}) + {"trustedXForwardedFor":["X-SC-Real-IP-Proxy"]}) else . end)'
+  else
+    filter='.inbounds |= map(if (((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc")) then del(.streamSettings.sockopt.trustedXForwardedFor) else . end)'
+  fi
+  jq "${filter}" "${XRAY_CONF}" > "${tmp}"
+  chmod --reference="${XRAY_CONF}" "${tmp}" 2>/dev/null || chmod 644 "${tmp}"
+  chown --reference="${XRAY_CONF}" "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${XRAY_CONF}"
+}
+
+apply_mode() {
+  local mode="$1" backup
+  require_root
+  command -v jq >/dev/null 2>&1 || die "jq tidak tersedia"
+  command -v nginx >/dev/null 2>&1 || die "nginx tidak tersedia"
+  command -v haproxy >/dev/null 2>&1 || die "haproxy tidak tersedia"
+  [[ -f "${NGINX_CONF}" && -f "${HAPROXY_CONF}" && -f "${XRAY_CONF}" ]] || die "config Nginx/HAProxy/Xray belum lengkap"
+
+  backup="$(create_backup "xray-realip-${mode}")"
+  log_realip "Backup: ${backup}"
+  if [[ "${mode}" == "enable" ]]; then
+    for port in 8080 8082; do
+      if ss -H -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ (p "$") && $0 !~ /nginx/ { found=1 } END { exit(found ? 0 : 1) }'; then
+        restore_backup "${backup}" >/dev/null 2>&1 || true
+        die "port internal ${port} sedang dipakai proses lain"
+      fi
+    done
+    patch_nginx_realip
+  fi
+  patch_haproxy_mode "${mode}"
+  patch_xray_mode "${mode}"
+
+  if ! validate_all; then
+    restore_backup "${backup}" >/dev/null 2>&1 || true
+    die "validasi config gagal; otomatis dikembalikan ke backup"
+  fi
+  set_env_value "${SC_ENV}" XRAY_REAL_IP_ENABLE "$([[ "${mode}" == "enable" ]] && echo 1 || echo 0)"
+  set_env_value "${APP_ENV}" XRAY_REAL_IP_ENABLE "$([[ "${mode}" == "enable" ]] && echo 1 || echo 0)"
+  if ! reload_stack; then
+    restore_backup "${backup}" >/dev/null 2>&1 || true
+    die "reload service gagal; rollback otomatis sudah dicoba"
+  fi
+  rm -f /run/sc-1forcr/xray-live.* >/dev/null 2>&1 || true
+  log_realip "Mode ${mode} berhasil diterapkan. Xray direstart satu kali agar sesi reconnect dengan IP asli."
+}
+
+show_status() {
+  local env_mode="0" route="legacy" trusted="no" ws_listener="no" grpc_listener="no"
+  if [[ -f "${SC_ENV}" ]]; then
+    env_mode="$(awk -F= '$1=="XRAY_REAL_IP_ENABLE" {v=$2} END {print v+0}' "${SC_ENV}")"
+  fi
+  grep -q 'server nginx_local 127\.0\.0\.1:8080 .*send-proxy' "${HAPROXY_CONF}" 2>/dev/null && route="real-ip" || true
+  jq -e '.inbounds[]? | select(((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc")) | select((.streamSettings.sockopt.trustedXForwardedFor // []) | index("X-SC-Real-IP-Proxy"))' "${XRAY_CONF}" >/dev/null 2>&1 && trusted="yes" || true
+  ss -H -lnt 2>/dev/null | awk '$4 ~ /:8080$/ {ok=1} END {exit(ok?0:1)}' && ws_listener="yes" || true
+  ss -H -lnt 2>/dev/null | awk '$4 ~ /:8082$/ {ok=1} END {exit(ok?0:1)}' && grpc_listener="yes" || true
+  echo "XRAY_REAL_IP_ENABLE=${env_mode}"
+  echo "haproxy_route=${route}"
+  echo "xray_trusted_header=${trusted}"
+  echo "nginx_proxy_listener_8080=${ws_listener}"
+  echo "nginx_grpc_listener_8082=${grpc_listener}"
+  echo "nginx=$(systemctl is-active nginx 2>/dev/null || true) haproxy=$(systemctl is-active haproxy 2>/dev/null || true) xray=$(systemctl is-active xray 2>/dev/null || true)"
+}
+
+case "${1:-status}" in
+  enable) apply_mode enable ;;
+  disable) apply_mode disable ;;
+  status) show_status ;;
+  test)
+    validate_all || die "validasi config gagal"
+    show_status
+    if [[ -x /usr/local/sbin/sc-1forcr-xray-live ]]; then
+      echo "--- akun/IP terbaru ---"
+      /usr/local/sbin/sc-1forcr-xray-live rows-v2 2>/dev/null || true
+    fi
+    ;;
+  rollback)
+    require_root
+    target="${2:-}"
+    if [[ -z "${target}" && -f "${LATEST_FILE}" ]]; then target="$(head -n1 "${LATEST_FILE}")"; fi
+    restore_backup "${target}"
+    ;;
+  *)
+    echo "Usage: sc-1forcr-xray-realip {enable|disable|status|test|rollback [backup-dir]}"
+    exit 1
+    ;;
+esac
+XRAY_REALIP_MANAGER_EOF
+  bash -n /usr/local/sbin/sc-1forcr-xray-realip
+  chmod 700 /usr/local/sbin/sc-1forcr-xray-realip
+}
+
 write_cli_menu() {
   local menu_runtime menu_runtime_tmp menu_wrapper_tmp update_cmd_tmp
   menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
 
   log "Menulis CLI menu..."
+  install_xray_realip_manager
 
   cat > /etc/sc-1forcr.env <<EOF
 SCRIPT_VERSION=${SCRIPT_VERSION}
@@ -15292,6 +15688,8 @@ XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
+XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
+XRAY_LIVE_IP_TTL_SECONDS=${XRAY_LIVE_IP_TTL_SECONDS}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
@@ -20344,6 +20742,7 @@ backup_restore_menu() {
 
 change_domain_menu() {
   local new_domain email app_env pem cert_domain haproxy_maxconn haproxy_nbthread haproxy_limit_nofile haproxy_log_option cores nginx_server_names
+  local xray_ws_backend_line xray_grpc_backend_line
   prompt_input new_domain "Masukkan domain baru: " || return
   new_domain="$(sanitize_domain_host "${new_domain}")"
   if [[ -z "${new_domain}" ]]; then
@@ -20395,9 +20794,15 @@ EOF_LIMIT
   fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
 ${sshws_nginx_limit_conf}
+map \$proxy_protocol_addr \$sc_xray_client_ip {
+    "" \$remote_addr;
+    default \$proxy_protocol_addr;
+}
+
 server {
     listen 80;
     listen [::]:80;
+    listen 127.0.0.1:8080 proxy_protocol;
     server_name ${nginx_server_names};
     keepalive_timeout 30;
 
@@ -20413,6 +20818,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20423,7 +20830,8 @@ server {
         proxy_pass http://127.0.0.1:${API_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
@@ -20438,6 +20846,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20454,6 +20864,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20469,6 +20881,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20485,6 +20899,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20500,6 +20916,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20509,6 +20927,8 @@ server {
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11001;
@@ -20517,6 +20937,8 @@ server {
     location /vless-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11002;
@@ -20525,6 +20947,8 @@ server {
     location /trojan-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
@@ -20540,6 +20964,8 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20556,6 +20982,8 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20572,6 +21000,8 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20581,6 +21011,7 @@ ${sshws_nginx_limit_rules}
 
 server {
     listen 127.0.0.1:8081 http2;
+    listen 127.0.0.1:8082 proxy_protocol http2;
     server_name _;
 
     include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
@@ -20588,6 +21019,8 @@ server {
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11001;
@@ -20596,6 +21029,8 @@ server {
     location /vless-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11002;
@@ -20604,6 +21039,8 @@ server {
     location /trojan-grpc {
         access_log off;
         grpc_set_header Host \$host;
+        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
@@ -20649,6 +21086,13 @@ EONGINX
     haproxy_log_option="    option tcplog"
   else
     haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
+  fi
+  if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8080 check send-proxy-v2"
+    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check send-proxy-v2"
+  else
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:80 check"
+    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check"
   fi
 
   cat > /etc/haproxy/haproxy.cfg <<EOHAP
@@ -20703,12 +21147,12 @@ backend bk_mux
     mode tcp
     # TLS terminasi di HAProxy, lalu HTTP/WS diteruskan langsung ke Nginx.
     # Ini menjaga jalur VMESS/VLESS WS stabil tanpa lewat sshws mux.
-    server nginx_local 127.0.0.1:80 check
+${xray_ws_backend_line}
 
 backend bk_grpc
     mode tcp
     # Jalur khusus gRPC (HTTP/2) ke listener Nginx internal agar tidak mengganggu WS existing.
-    server nginx_grpc 127.0.0.1:8081 check
+${xray_grpc_backend_line}
 
 backend bk_sshws_tls
     mode tcp
@@ -23009,6 +23453,8 @@ Time     : $(date '+%F %T')"
     XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES}" \
     XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
     XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP}" \
+    XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}" \
+    XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}" \
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \
     XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
     XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN}" \
@@ -24613,7 +25059,7 @@ persist_pending_install_env() {
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
-    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP
+    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_LIVE_IP_TTL_SECONDS
     XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
     NETWORK_COMPAT_ENABLE NETWORK_TCP_MSS XRAY_OUTBOUND_DOMAIN_STRATEGY
     VMESS_BUG_PROFILE_ADDRESS VMESS_BUG_PROFILE_SNI VMESS_BUG_PROFILE_HOST VMESS_BUG_PROFILE_ALLOW_INSECURE

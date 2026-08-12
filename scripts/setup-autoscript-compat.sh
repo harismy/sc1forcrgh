@@ -26019,6 +26019,7 @@ main() {
     install_go_if_missing
     init_db
     setup_udpgw_service_if_possible
+    setup_nginx_and_cert
     write_api_files
     write_go_mux_files
     build_go_files

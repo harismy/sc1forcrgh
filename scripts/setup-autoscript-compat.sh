@@ -171,7 +171,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.23}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.24}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -611,8 +611,10 @@ build_nginx_ws_locations() {
     out+=$'        proxy_set_header Upgrade "websocket";\n'
     out+=$'        proxy_set_header Connection "Upgrade";\n'
     out+=$'        proxy_set_header Host \\$host;\n'
-    out+=$'        proxy_set_header X-Forwarded-For \\$sc_xray_client_ip;\n'
-    out+=$'        proxy_set_header X-SC-Real-IP-Proxy "1";\n'
+    if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
+      out+=$'        proxy_set_header X-Forwarded-For \\$sc_xray_real_ip;\n'
+      out+=$'        proxy_set_header X-SC-Real-IP-Proxy "1";\n'
+    fi
     out+=$'        proxy_read_timeout 3600s;\n'
     out+=$'        proxy_send_timeout 3600s;\n'
     out+=$'        proxy_connect_timeout 60s;\n'
@@ -2096,8 +2098,15 @@ setup_nginx_and_cert() {
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
   local sshws_nginx_limit_conf sshws_nginx_limit_rules nginx_server_names
+  local xray_realip_nginx_map xray_realip_ws_listener xray_realip_grpc_listener
+  local xray_proxy_realip_headers xray_grpc_realip_headers
   sshws_nginx_limit_conf=""
   sshws_nginx_limit_rules=""
+  xray_realip_nginx_map=""
+  xray_realip_ws_listener=""
+  xray_realip_grpc_listener=""
+  xray_proxy_realip_headers=""
+  xray_grpc_realip_headers=""
   XRAY_PUBLIC_HOST="$(build_xray_public_host)"
   nginx_server_names="$(build_nginx_server_names)"
   if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
@@ -2119,17 +2128,39 @@ EOF_LIMIT
 EOF_LIMIT
 )
   fi
+  if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
+    xray_realip_nginx_map=$(cat <<'EOF_REALIP'
+map $proxy_protocol_addr $sc_xray_client_ip {
+    "" $remote_addr;
+    default $proxy_protocol_addr;
+}
+map $http_cf_connecting_ip $sc_xray_real_ip {
+    "" $sc_xray_client_ip;
+    default $http_cf_connecting_ip;
+}
+EOF_REALIP
+)
+    xray_realip_ws_listener="    listen 127.0.0.1:8080 proxy_protocol;"
+    xray_realip_grpc_listener="    listen 127.0.0.1:8082 proxy_protocol http2;"
+    xray_proxy_realip_headers=$(cat <<'EOF_REALIP'
+        proxy_set_header X-Forwarded-For $sc_xray_real_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
+EOF_REALIP
+)
+    xray_grpc_realip_headers=$(cat <<'EOF_REALIP'
+        grpc_set_header X-Forwarded-For $sc_xray_real_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
+EOF_REALIP
+)
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
 ${sshws_nginx_limit_conf}
-map \$proxy_protocol_addr \$sc_xray_client_ip {
-    "" \$remote_addr;
-    default \$proxy_protocol_addr;
-}
+${xray_realip_nginx_map}
 
 server {
     listen 80;
     listen [::]:80;
-    listen 127.0.0.1:8080 proxy_protocol;
+${xray_realip_ws_listener}
     server_name ${nginx_server_names};
     keepalive_timeout 30;
 
@@ -2145,8 +2176,6 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2157,8 +2186,7 @@ server {
         proxy_pass http://127.0.0.1:${API_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
@@ -2173,8 +2201,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2191,8 +2218,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2208,8 +2234,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2226,8 +2251,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2243,8 +2267,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2254,8 +2277,7 @@ server {
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11001;
@@ -2264,8 +2286,7 @@ server {
     location /vless-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11002;
@@ -2274,8 +2295,7 @@ server {
     location /trojan-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
@@ -2291,8 +2311,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2309,8 +2328,6 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2327,8 +2344,6 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2338,7 +2353,7 @@ ${sshws_nginx_limit_rules}
 
 server {
     listen 127.0.0.1:8081 http2;
-    listen 127.0.0.1:8082 proxy_protocol http2;
+${xray_realip_grpc_listener}
     server_name _;
 
     include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
@@ -2346,8 +2361,7 @@ server {
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11001;
@@ -2356,8 +2370,7 @@ server {
     location /vless-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11002;
@@ -2366,8 +2379,7 @@ server {
     location /trojan-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
@@ -15425,7 +15437,7 @@ restore_backup() {
 patch_nginx_realip() {
   local tmp have_map have_ws have_grpc
   have_map=0; have_ws=0; have_grpc=0
-  grep -q 'map[[:space:]]\+\$proxy_protocol_addr[[:space:]]\+\$sc_xray_client_ip' "${NGINX_CONF}" && have_map=1 || true
+  grep -q 'map[[:space:]]\+\$http_cf_connecting_ip[[:space:]]\+\$sc_xray_real_ip' "${NGINX_CONF}" && have_map=1 || true
   grep -q 'listen[[:space:]]\+127\.0\.0\.1:8080[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_ws=1 || true
   grep -q 'listen[[:space:]]\+127\.0\.0\.1:8082[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_grpc=1 || true
   tmp="$(mktemp "$(dirname "${NGINX_CONF}")/.sc-xray-realip-nginx.XXXXXX")"
@@ -15435,11 +15447,32 @@ patch_nginx_realip() {
       print "    \"\" $remote_addr;";
       print "    default $proxy_protocol_addr;";
       print "}";
+      print "map $http_cf_connecting_ip $sc_xray_real_ip {";
+      print "    \"\" $sc_xray_client_ip;";
+      print "    default $http_cf_connecting_ip;";
+      print "}";
       print "";
     }
-    /^[[:space:]]*(proxy_set_header|grpc_set_header)[[:space:]]+X-Forwarded-For[[:space:]]+/ { next }
-    /^[[:space:]]*(proxy_set_header|grpc_set_header)[[:space:]]+X-SC-Real-IP-Proxy[[:space:]]+/ { next }
+    function is_xray_location(line) {
+      return line ~ /^[[:space:]]*location[[:space:]]+\/(vmess|vless|trojan)(-grpc)?([[:space:]]|\{)/ ||
+        line ~ /^[[:space:]]*location[[:space:]]+\/yourbug(\/(vless|trojan))?([[:space:]]|\{)/;
+    }
+    function brace_delta(line, work, opens, closes) {
+      work=line; opens=gsub(/\{/, "", work);
+      work=line; closes=gsub(/\}/, "", work);
+      return opens-closes;
+    }
     {
+      if ($0 ~ /^[[:space:]]*location[[:space:]]+/) {
+        in_xray_location=is_xray_location($0);
+        location_depth=0;
+      }
+      if (in_xray_location && $0 ~ /^[[:space:]]*(proxy_set_header|grpc_set_header)[[:space:]]+X-Forwarded-For[[:space:]]+/) {
+        next;
+      }
+      if (in_xray_location && $0 ~ /^[[:space:]]*(proxy_set_header|grpc_set_header)[[:space:]]+X-SC-Real-IP-Proxy[[:space:]]+/) {
+        next;
+      }
       if (!have_map && !map_added && $0 ~ /^server[[:space:]]*\{/) { print_map(); map_added=1; }
       print;
       if (!have_ws && !ws_added && $0 ~ /^[[:space:]]*listen[[:space:]]+80[[:space:]]*;/) {
@@ -15448,13 +15481,17 @@ patch_nginx_realip() {
       if (!have_grpc && !grpc_added && $0 ~ /^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:8081([[:space:]]|;)/) {
         print "    listen 127.0.0.1:8082 proxy_protocol http2;"; grpc_added=1;
       }
-      if ($0 ~ /^[[:space:]]*proxy_set_header[[:space:]]+Host[[:space:]]+/) {
-        print "        proxy_set_header X-Forwarded-For $sc_xray_client_ip;";
+      if (in_xray_location && $0 ~ /^[[:space:]]*proxy_set_header[[:space:]]+Host[[:space:]]+/) {
+        print "        proxy_set_header X-Forwarded-For $sc_xray_real_ip;";
         print "        proxy_set_header X-SC-Real-IP-Proxy \"1\";";
       }
-      if ($0 ~ /^[[:space:]]*grpc_set_header[[:space:]]+Host[[:space:]]+/) {
-        print "        grpc_set_header X-Forwarded-For $sc_xray_client_ip;";
+      if (in_xray_location && $0 ~ /^[[:space:]]*grpc_set_header[[:space:]]+Host[[:space:]]+/) {
+        print "        grpc_set_header X-Forwarded-For $sc_xray_real_ip;";
         print "        grpc_set_header X-SC-Real-IP-Proxy \"1\";";
+      }
+      if (in_xray_location) {
+        location_depth+=brace_delta($0);
+        if (location_depth<=0) { in_xray_location=0; location_depth=0; }
       }
     }
   ' "${NGINX_CONF}" > "${tmp}"
@@ -20743,6 +20780,8 @@ backup_restore_menu() {
 change_domain_menu() {
   local new_domain email app_env pem cert_domain haproxy_maxconn haproxy_nbthread haproxy_limit_nofile haproxy_log_option cores nginx_server_names
   local xray_ws_backend_line xray_grpc_backend_line
+  local xray_realip_nginx_map xray_realip_ws_listener xray_realip_grpc_listener
+  local xray_proxy_realip_headers xray_grpc_realip_headers
   prompt_input new_domain "Masukkan domain baru: " || return
   new_domain="$(sanitize_domain_host "${new_domain}")"
   if [[ -z "${new_domain}" ]]; then
@@ -20772,6 +20811,11 @@ change_domain_menu() {
   local sshws_nginx_limit_conf sshws_nginx_limit_rules
   sshws_nginx_limit_conf=""
   sshws_nginx_limit_rules=""
+  xray_realip_nginx_map=""
+  xray_realip_ws_listener=""
+  xray_realip_grpc_listener=""
+  xray_proxy_realip_headers=""
+  xray_grpc_realip_headers=""
   nginx_server_names="$(build_nginx_server_names)"
   if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
     sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
@@ -20792,17 +20836,39 @@ EOF_LIMIT
 EOF_LIMIT
 )
   fi
+  if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
+    xray_realip_nginx_map=$(cat <<'EOF_REALIP'
+map $proxy_protocol_addr $sc_xray_client_ip {
+    "" $remote_addr;
+    default $proxy_protocol_addr;
+}
+map $http_cf_connecting_ip $sc_xray_real_ip {
+    "" $sc_xray_client_ip;
+    default $http_cf_connecting_ip;
+}
+EOF_REALIP
+)
+    xray_realip_ws_listener="    listen 127.0.0.1:8080 proxy_protocol;"
+    xray_realip_grpc_listener="    listen 127.0.0.1:8082 proxy_protocol http2;"
+    xray_proxy_realip_headers=$(cat <<'EOF_REALIP'
+        proxy_set_header X-Forwarded-For $sc_xray_real_ip;
+        proxy_set_header X-SC-Real-IP-Proxy "1";
+EOF_REALIP
+)
+    xray_grpc_realip_headers=$(cat <<'EOF_REALIP'
+        grpc_set_header X-Forwarded-For $sc_xray_real_ip;
+        grpc_set_header X-SC-Real-IP-Proxy "1";
+EOF_REALIP
+)
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
 ${sshws_nginx_limit_conf}
-map \$proxy_protocol_addr \$sc_xray_client_ip {
-    "" \$remote_addr;
-    default \$proxy_protocol_addr;
-}
+${xray_realip_nginx_map}
 
 server {
     listen 80;
     listen [::]:80;
-    listen 127.0.0.1:8080 proxy_protocol;
+${xray_realip_ws_listener}
     server_name ${nginx_server_names};
     keepalive_timeout 30;
 
@@ -20818,8 +20884,6 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20830,8 +20894,7 @@ server {
         proxy_pass http://127.0.0.1:${API_PORT};
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
@@ -20846,8 +20909,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20864,8 +20926,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20881,8 +20942,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20899,8 +20959,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20916,8 +20975,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20927,8 +20985,7 @@ server {
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11001;
@@ -20937,8 +20994,7 @@ server {
     location /vless-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11002;
@@ -20947,8 +21003,7 @@ server {
     location /trojan-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
@@ -20964,8 +21019,7 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
+${xray_proxy_realip_headers}
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -20982,8 +21036,6 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -21000,8 +21052,6 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$sc_xray_client_ip;
-        proxy_set_header X-SC-Real-IP-Proxy "1";
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -21011,7 +21061,7 @@ ${sshws_nginx_limit_rules}
 
 server {
     listen 127.0.0.1:8081 http2;
-    listen 127.0.0.1:8082 proxy_protocol http2;
+${xray_realip_grpc_listener}
     server_name _;
 
     include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
@@ -21019,8 +21069,7 @@ server {
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11001;
@@ -21029,8 +21078,7 @@ server {
     location /vless-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11002;
@@ -21039,8 +21087,7 @@ server {
     location /trojan-grpc {
         access_log off;
         grpc_set_header Host \$host;
-        grpc_set_header X-Forwarded-For \$sc_xray_client_ip;
-        grpc_set_header X-SC-Real-IP-Proxy "1";
+${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;

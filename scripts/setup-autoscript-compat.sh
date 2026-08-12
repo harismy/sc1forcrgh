@@ -23470,6 +23470,16 @@ Time     : $(date '+%F %T')"
     update_sc_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "5"
     echo "Migrasi: IPLIMIT_CHECK_INTERVAL_MINUTES ${_iplimit_cur:-?} -> 5 (minimal 5 menit, cegah CPU spike)"
   fi
+  # XRAY_IP_GROUP_MASK: upgrade default lama 24 -> 16 (CGNAT Indo tolerance).
+  # Hanya sentuh jika nilai masih default lama 24 (bukan custom 32/8).
+  local _mask_cur
+  _mask_cur="$(echo "${XRAY_IP_GROUP_MASK:-24}" | tr -cd '0-9')"
+  if [[ "${_mask_cur}" == "24" ]]; then
+    XRAY_IP_GROUP_MASK="16"
+    update_sc_env_var "XRAY_IP_GROUP_MASK" "16"
+    update_app_env_var "XRAY_IP_GROUP_MASK" "16" 2>/dev/null || true
+    echo "Migrasi: XRAY_IP_GROUP_MASK 24 -> 16 (toleransi CGNAT Indo, cegah false multi-login)"
+  fi
 
   echo "Menjalankan update installer..."
   : > "${update_log}" 2>/dev/null || true
@@ -26047,6 +26057,13 @@ main() {
     fi
     trap rollback_update_transaction_on_exit EXIT
     log "Mode update aman aktif: Xray/SSH/SSHWS/HAProxy tidak direstart; UDPGW hanya direstart jika unit berubah."
+    # Migrasi XRAY_IP_GROUP_MASK 24->16 (hanya jika masih default lama)
+    if [[ "${XRAY_IP_GROUP_MASK:-24}" == "24" ]]; then
+      XRAY_IP_GROUP_MASK="16"
+      update_sc_env_var "XRAY_IP_GROUP_MASK" "16"
+      update_app_env_var "XRAY_IP_GROUP_MASK" "16" 2>/dev/null || true
+      log "Migrasi: XRAY_IP_GROUP_MASK 24 -> 16 (toleransi CGNAT)"
+    fi
     install_legacy_runtime_command_shims
     check_supported_os
     install_node_if_missing

@@ -270,6 +270,7 @@ XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
 XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
+XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-24}"
 XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
 XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
@@ -3213,6 +3214,7 @@ XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
+XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
 XRAY_LIVE_IP_TTL_SECONDS=${XRAY_LIVE_IP_TTL_SECONDS}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
@@ -7527,6 +7529,10 @@ const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 1);
 const XRAY_MIN_HITS_PER_IP = Number.isFinite(XRAY_MIN_HITS_PER_IP_RAW) && XRAY_MIN_HITS_PER_IP_RAW >= 1
   ? Math.min(Math.floor(XRAY_MIN_HITS_PER_IP_RAW), 20)
   : 1;
+const XRAY_IP_GROUP_MASK_RAW = Number(process.env.XRAY_IP_GROUP_MASK || 24);
+const XRAY_IP_GROUP_MASK = Number.isFinite(XRAY_IP_GROUP_MASK_RAW) && XRAY_IP_GROUP_MASK_RAW >= 8 && XRAY_IP_GROUP_MASK_RAW <= 32
+  ? Math.floor(XRAY_IP_GROUP_MASK_RAW)
+  : 24;
 const QUOTA_LOCK_ENABLED = !/^(0|false|off|no)$/i.test(String(process.env.QUOTA_LOCK_ENABLE || '1').trim());
 const QUOTA_BYTES_PER_GB = 1024 * 1024 * 1024;
 function normalizeXrayPath(raw, fallback = '/') {
@@ -8740,6 +8746,24 @@ function parseXrayRecentIpMap() {
   return map;
 }
 
+function ipSubnetPrefix(ip, mask) {
+  if (!ip || mask >= 32) return String(ip || '').trim();
+  const v = String(ip).trim();
+  if (v.includes(':')) return v; // IPv6: no subnet grouping
+  const parts = v.split('.');
+  if (parts.length !== 4) return v;
+  if (mask <= 8) return parts[0] + '.0.0.0/' + mask;
+  if (mask <= 16) return parts[0] + '.' + parts[1] + '.0.0/' + mask;
+  return parts[0] + '.' + parts[1] + '.' + parts[2] + '.0/' + mask;
+}
+function countIpGroups(ipSet, mask) {
+  if (mask >= 32 || !ipSet || ipSet.size <= 1) return ipSet ? ipSet.size : 0;
+  const groups = new Set();
+  for (const ip of ipSet) {
+    groups.add(ipSubnetPrefix(ip, mask));
+  }
+  return groups.size;
+}
 function removeZivpnUser(username) {
   try {
     if (ZIVPN_AUTH_MODE !== 'passwords') return false;
@@ -10240,12 +10264,15 @@ async function lockIfExceeded(nowTs) {
       const lim = Number(r.limitip || 0);
       const lockIpSet = xrayMap.has(userKey) ? xrayMap.get(userKey) : new Set();
       const cntRaw = lockIpSet.size;
-      // IPv4+IPv6 dari satu perangkat masih ditoleransi khusus limit 1.
-      // Untuk limit di atas 1, jumlah IP aktif tidak boleh dipangkas.
-      const cnt = lim === 1 && cntRaw === 2 ? 1 : cntRaw;
+      // CGNAT tolerance: grup IP dalam subnet yang sama sebagai 1 device.
+      // XRAY_IP_GROUP_MASK: 24 = /24 (moderate), 16 = /16 (aggressive), 32 = exact match.
+      const cntGrouped = XRAY_IP_GROUP_MASK < 32 ? countIpGroups(lockIpSet, XRAY_IP_GROUP_MASK) : cntRaw;
+      // IPv4+IPv6 dual-stack: satu device bisa punya 2 IP beda family.
+      // Hanya ditoleransi untuk limit 1 dan tepat 2 IP mentah.
+      const cnt = (lim === 1 && cntRaw === 2) ? 1 : cntGrouped;
       if (IPLIMIT_DEBUG) {
         const ips = Array.from(lockIpSet).slice(0, 8).join(',');
-        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cnt=${cnt} ips=${ips}`);
+        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cntGrouped=${cntGrouped} cnt=${cnt} mask=${XRAY_IP_GROUP_MASK} ips=${ips}`);
       }
       if (cnt <= lim) continue;
       if (graceMap.has(`${item.type}|${userKey}`)) continue;
@@ -15725,6 +15752,7 @@ XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
+XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
 XRAY_LIVE_IP_TTL_SECONDS=${XRAY_LIVE_IP_TTL_SECONDS}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
@@ -23500,6 +23528,7 @@ Time     : $(date '+%F %T')"
     XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES}" \
     XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
     XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP}" \
+    XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-24}" \
     XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}" \
     XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}" \
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \

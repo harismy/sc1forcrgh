@@ -270,7 +270,7 @@ XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
 XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
-XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-24}"
+XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}"
 XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
 XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
@@ -3100,6 +3100,9 @@ enforce_single_udp_backend() {
   case "${backend}" in
     udpcustom|udp-custom|udphc)
       systemctl disable --now "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
+      # Force kill kalau service masih bandel (stuck activating)
+      pkill -9 -f "zivpn" >/dev/null 2>&1 || true
+      sleep 1
       systemctl enable "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
       if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]] && systemctl is-active --quiet "${UDPCUSTOM_SERVICE_NAME}"; then
         systemctl start "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -3111,6 +3114,9 @@ enforce_single_udp_backend() {
       ;;
     zivpn|*)
       systemctl disable --now "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+      # Force kill kalau service masih bandel (stuck activating)
+      pkill -9 -f "udp-custom" >/dev/null 2>&1 || true
+      sleep 1
       systemctl enable "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
       if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]] && systemctl is-active --quiet "${ZIVPN_SERVICE_NAME}"; then
         systemctl start "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -7529,10 +7535,10 @@ const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 1);
 const XRAY_MIN_HITS_PER_IP = Number.isFinite(XRAY_MIN_HITS_PER_IP_RAW) && XRAY_MIN_HITS_PER_IP_RAW >= 1
   ? Math.min(Math.floor(XRAY_MIN_HITS_PER_IP_RAW), 20)
   : 1;
-const XRAY_IP_GROUP_MASK_RAW = Number(process.env.XRAY_IP_GROUP_MASK || 24);
+const XRAY_IP_GROUP_MASK_RAW = Number(process.env.XRAY_IP_GROUP_MASK || 16);
 const XRAY_IP_GROUP_MASK = Number.isFinite(XRAY_IP_GROUP_MASK_RAW) && XRAY_IP_GROUP_MASK_RAW >= 8 && XRAY_IP_GROUP_MASK_RAW <= 32
   ? Math.floor(XRAY_IP_GROUP_MASK_RAW)
-  : 24;
+  : 16;
 const QUOTA_LOCK_ENABLED = !/^(0|false|off|no)$/i.test(String(process.env.QUOTA_LOCK_ENABLE || '1').trim());
 const QUOTA_BYTES_PER_GB = 1024 * 1024 * 1024;
 function normalizeXrayPath(raw, fallback = '/') {
@@ -23528,7 +23534,7 @@ Time     : $(date '+%F %T')"
     XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES}" \
     XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
     XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP}" \
-    XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-24}" \
+    XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}" \
     XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}" \
     XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}" \
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \

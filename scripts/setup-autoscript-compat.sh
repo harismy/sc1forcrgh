@@ -1476,6 +1476,18 @@ XRAY_UNIT_EOF
   fi
 
   mkdir -p /usr/local/etc/xray >/dev/null 2>&1 || true
+  # Placeholder config sementara agar xray.service tidak crash-loop
+  # sebelum checker/API menulis config lengkap (inbound 10001-11003).
+  if [[ ! -s /usr/local/etc/xray/config.json ]]; then
+    cat > /usr/local/etc/xray/config.json <<'XRAY_PLACEHOLDER_EOF'
+{
+  "log": { "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log", "loglevel": "warning" },
+  "inbounds": [],
+  "outbounds": []
+}
+XRAY_PLACEHOLDER_EOF
+  fi
+  mkdir -p /var/log/xray >/dev/null 2>&1 || true
   rm -rf "${tmpdir}" >/dev/null 2>&1 || true
   command -v xray >/dev/null 2>&1
 }
@@ -1538,6 +1550,17 @@ dropbear_runtime_args() {
   printf -- '-K %s -I %s' "${keepalive}" "${idle}"
 }
 
+dropbear_fallback_urls() {
+  local ver="$1"
+  # Sumber utama kadang mati (HTTP 525). Fallback:
+  # GitHub mirror resmi mkj/dropbear + pool Debian/Ubuntu.
+  printf '%s\n' \
+    "https://matt.ucc.asn.au/dropbear/releases/dropbear-${ver}.tar.bz2" \
+    "https://github.com/mkj/dropbear/releases/download/DROPBEAR_${ver}/dropbear-${ver}.tar.bz2" \
+    "http://deb.debian.org/debian/pool/main/d/dropbear/dropbear_${ver}.orig.tar.bz2" \
+    "http://archive.ubuntu.com/ubuntu/pool/universe/d/dropbear/dropbear_${ver}.orig.tar.bz2"
+}
+
 setup_dropbear() {
   log "Setup Dropbear..."
 
@@ -1582,7 +1605,17 @@ EOF
     log "Build Dropbear ${DROPBEAR_VERSION} from source..."
     mkdir -p "${src_dir}"
     rm -rf "${build_dir}"
-    if curl -fL --retry 5 --retry-delay 2 "${archive_url}" -o "${archive_path}"; then
+    local dl_ok=0 dl_url
+    while IFS= read -r dl_url; do
+      [[ -n "${dl_url}" ]] || continue
+      log "Coba download source Dropbear: ${dl_url}"
+      if curl -fL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 "${dl_url}" -o "${archive_path}"; then
+        dl_ok=1
+        break
+      fi
+      rm -f "${archive_path}" >/dev/null 2>&1 || true
+    done < <(dropbear_fallback_urls "${DROPBEAR_VERSION}")
+    if [[ "${dl_ok}" == "1" ]]; then
       if tar -xjf "${archive_path}" -C "${src_dir}"; then
         (
           cd "${build_dir}"
@@ -1598,7 +1631,7 @@ EOF
         log "Warning: gagal extract source Dropbear. Fallback ke binary bawaan sistem."
       fi
     else
-      log "Warning: gagal download source Dropbear (${archive_url}). Fallback ke binary bawaan sistem."
+      log "Warning: gagal download source Dropbear. Fallback ke binary bawaan sistem."
     fi
   fi
 
@@ -24180,8 +24213,18 @@ apply_dropbear_version_with_lock() {
   mkdir -p "${src_dir}"
   rm -rf "${build_dir}"
   echo "Download & build Dropbear ${ver}..."
-  if ! curl -fL --retry 5 --retry-delay 2 "${archive_url}" -o "${archive_path}"; then
-    echo "Gagal download source: ${archive_url}"
+  local dl_ok=0 dl_url
+  while IFS= read -r dl_url; do
+    [[ -n "${dl_url}" ]] || continue
+    echo "Coba download: ${dl_url}"
+    if curl -fL --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 "${dl_url}" -o "${archive_path}"; then
+      dl_ok=1
+      break
+    fi
+    rm -f "${archive_path}" >/dev/null 2>&1 || true
+  done < <(dropbear_fallback_urls "${ver}")
+  if [[ "${dl_ok}" != "1" ]]; then
+    echo "Gagal download source Dropbear ${ver} dari semua mirror."
     return 1
   fi
   if ! tar -xjf "${archive_path}" -C "${src_dir}"; then

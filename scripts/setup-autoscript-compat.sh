@@ -10169,9 +10169,11 @@ async function unlockExpired(nowTs) {
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     // Reset long-term IP history saat unlock (beri kesempatan bersih).
     await run("DELETE FROM temp_ip_long_history WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+    // Simpan grace dengan username lowercase agar cocok dengan lookup
+    // graceMap di lockIfExceeded (yang memakai userKey lowercase).
     await run(
       "INSERT OR REPLACE INTO temp_ip_lock_grace(account_type, username, grace_until) VALUES(?, ?, ?)",
-      [t, u, nowTs + LOCK_RECHECK_GRACE_SECONDS]
+      [t, String(u || '').toLowerCase(), nowTs + LOCK_RECHECK_GRACE_SECONDS]
     ).catch(() => {});
   }
   return { zivpnChanged, udpcustomChanged, xrayChanged };
@@ -10253,21 +10255,38 @@ async function lockIfExceeded(nowTs) {
       return out;
     };
     const lim = Number(r.limitip || 0);
-    const cntIp = setMaxSize(sshIpMap);
+    // Toleransi CGNAT: grup IP dalam subnet yang sama sebagai 1 device
+    // (pakai XRAY_IP_GROUP_MASK global, sama dengan checker Xray).
+    const countGroupedForMap = (m) => {
+      let max = 0;
+      for (const k of keyCandidates) {
+        if (!m.has(k)) continue;
+        const grouped = XRAY_IP_GROUP_MASK < 32
+          ? countIpGroups(m.get(k), XRAY_IP_GROUP_MASK)
+          : m.get(k).size;
+        if (grouped > max) max = grouped;
+      }
+      return max;
+    };
+    const cntIpRaw = setMaxSize(sshIpMap);
+    const cntIp = XRAY_IP_GROUP_MASK < 32 ? countGroupedForMap(sshIpMap) : cntIpRaw;
     const cntSession = setMaxSize(sshSessionMap);
     const cntWsPorts = setMaxSize(sshWsClientPortMap);
     const cntRecent = setMaxSize(sshRecentAuthMap);
     const cntProc = setMaxSize(sshProcSessionMap);
     const cntUdphc = setMaxSize(sshUdphcSessionMap);
-    const cntUdphcIp = setMaxSize(sshUdphcIpMap);
+    const cntUdphcIpRaw = setMaxSize(sshUdphcIpMap);
+    const cntUdphcIp = XRAY_IP_GROUP_MASK < 32 ? countGroupedForMap(sshUdphcIpMap) : cntUdphcIpRaw;
     const cntZivpn = setMaxSize(sshZivpnSessionMap);
-    const cntZivpnIp = setMaxSize(sshZivpnIpMap);
+    const cntZivpnIpRaw = setMaxSize(sshZivpnIpMap);
+    const cntZivpnIpGrouped = XRAY_IP_GROUP_MASK < 32 ? countGroupedForMap(sshZivpnIpMap) : cntZivpnIpRaw;
     const cntZivpnLive = setMaxSize(sshZivpnLiveSessionMap);
-    const cntZivpnLiveIp = setMaxSize(sshZivpnLiveIpMap);
-    const hasLiveZivpn = cntZivpnLive > 0 || cntZivpnLiveIp > 0;
+    const cntZivpnLiveIpRaw = setMaxSize(sshZivpnLiveIpMap);
+    const cntZivpnLiveIpGrouped = XRAY_IP_GROUP_MASK < 32 ? countGroupedForMap(sshZivpnLiveIpMap) : cntZivpnLiveIpRaw;
+    const hasLiveZivpn = cntZivpnLive > 0 || cntZivpnLiveIpRaw > 0;
     const cntZivpnRaw = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
-      ? Math.max(cntZivpnLive, cntZivpnLiveIp)
-      : Math.max(cntZivpn, cntZivpnIp, cntZivpnLive, cntZivpnLiveIp);
+      ? Math.max(cntZivpnLive, cntZivpnLiveIpGrouped)
+      : Math.max(cntZivpn, cntZivpnIpGrouped, cntZivpnLive, cntZivpnLiveIpGrouped);
     // Toleransi dual-stack hanya untuk akun berlimit 1. Akun berlimit >1
     // memakai jumlah realtime sebenarnya agar limit 3 dengan 4 IP tetap lock.
     let cntZivpnEffective = cntZivpnRaw;
@@ -10305,16 +10324,24 @@ async function lockIfExceeded(nowTs) {
         [user, ip, userKey, ip, nowTs, nowTs]
       ).catch(() => {});
     }
-    // Hitung unique IP 24 jam.
-    const longTermRow = await get(
-      "SELECT COUNT(*) AS cnt FROM temp_ip_long_history WHERE account_type='ssh' AND LOWER(username)=LOWER(?) AND last_seen >= ?",
+    // Hitung unique IP 24 jam dengan toleransi subnet CGNAT.
+    const longTermRows = await all(
+      "SELECT ip FROM temp_ip_long_history WHERE account_type='ssh' AND LOWER(username)=LOWER(?) AND last_seen >= ?",
       [user, longTermCutoff]
-    ).catch(() => ({ cnt: 0 }));
-    const longTermIpCount = Number(longTermRow?.cnt || 0);
+    ).catch(() => []);
+    const longTermIpSet = new Set();
+    for (const row of longTermRows) {
+      const ip = extractIp(String(row?.ip || '').trim());
+      if (!ip || isLoopbackIp(ip)) continue;
+      longTermIpSet.add(ip);
+    }
+    const longTermIpCount = XRAY_IP_GROUP_MASK < 32
+      ? countIpGroups(longTermIpSet, XRAY_IP_GROUP_MASK)
+      : longTermIpSet.size;
     const longTermAbuse = lim > 0 && longTermIpCount > lim * 3;
     const accountLimitExceeded = (lim > 0 && cnt > lim) || longTermAbuse;
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIp=${cntZivpnIp} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIp=${cntZivpnLiveIp} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt} hintCap=${hintCap} cnt24h=${longTermIpCount} longTermAbuse=${longTermAbuse ? 1 : 0}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntIpRaw=${cntIpRaw} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIpG=${cntZivpnIpGrouped} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIpG=${cntZivpnLiveIpGrouped} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt} hintCap=${hintCap} mask=${XRAY_IP_GROUP_MASK} cnt24h=${longTermIpCount} longTermAbuse=${longTermAbuse ? 1 : 0}`);
     }
     if (!accountLimitExceeded && !hardSessionExceeded) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;

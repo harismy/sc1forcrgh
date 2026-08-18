@@ -1259,6 +1259,10 @@ check_supported_os() {
   log "OS terdeteksi: ${PRETTY_NAME:-${id} ${ver}}"
 }
 
+ipv6_supported() {
+  [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]] && grep -q . /proc/net/if_inet6 2>/dev/null
+}
+
 install_optional_pkg_if_available() {
   local pkg="$1"
   if apt-cache show "${pkg}" >/dev/null 2>&1; then
@@ -2340,7 +2344,7 @@ setup_nginx_and_cert() {
   mkdir -p /var/www/html
   local sshws_nginx_limit_conf sshws_nginx_limit_rules sshws_realip_nginx_map nginx_server_names
   local xray_realip_nginx_map xray_realip_ws_listener xray_realip_grpc_listener
-  local xray_proxy_realip_headers xray_grpc_realip_headers
+  local xray_proxy_realip_headers xray_grpc_realip_headers nginx_ipv6_listen
   sshws_nginx_limit_conf=""
   sshws_nginx_limit_rules=""
   sshws_realip_nginx_map="$(build_sshws_realip_nginx_map)"
@@ -2390,6 +2394,12 @@ EOF_REALIP
 EOF_REALIP
 )
   fi
+  nginx_ipv6_listen=""
+  if ipv6_supported; then
+    nginx_ipv6_listen="    listen [::]:80;"
+  else
+    log "IPv6 tidak tersedia di VPS ini. Nginx listen IPv4 saja (port 80)."
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
 ${sshws_realip_nginx_map}
 ${sshws_nginx_limit_conf}
@@ -2397,7 +2407,7 @@ ${xray_realip_nginx_map}
 
 server {
     listen 80;
-    listen [::]:80;
+${nginx_ipv6_listen}
     listen 127.0.0.1:8083 proxy_protocol;
 ${xray_realip_ws_listener}
     server_name ${nginx_server_names};
@@ -2651,9 +2661,12 @@ EOF
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
   tune_nginx_capacity
-  nginx -t
-  systemctl enable nginx
-  systemctl restart nginx
+  if nginx -t; then
+    systemctl enable nginx
+    systemctl restart nginx
+  else
+    log "PERINGATAN: nginx -t gagal. Port 80 mungkin tidak aktif. Cek /var/lib/sc-1forcr/install.log lalu perbaiki /etc/nginx/sites-available/sc-1forcr.conf."
+  fi
 
   if ! issue_letsencrypt_cert; then
     log "Let's Encrypt gagal. Lanjut tanpa TLS 443 (haproxy belum diaktifkan)."
@@ -21453,7 +21466,7 @@ change_domain_menu() {
   local new_domain email app_env pem cert_domain haproxy_maxconn haproxy_nbthread haproxy_limit_nofile haproxy_log_option cores nginx_server_names
   local xray_ws_backend_line xray_grpc_backend_line
   local xray_realip_nginx_map xray_realip_ws_listener xray_realip_grpc_listener
-  local xray_proxy_realip_headers xray_grpc_realip_headers
+  local xray_proxy_realip_headers xray_grpc_realip_headers nginx_ipv6_listen
   prompt_input new_domain "Masukkan domain baru: " || return
   new_domain="$(sanitize_domain_host "${new_domain}")"
   if [[ -z "${new_domain}" ]]; then
@@ -21529,6 +21542,12 @@ EOF_REALIP
 EOF_REALIP
 )
   fi
+  nginx_ipv6_listen=""
+  if ipv6_supported; then
+    nginx_ipv6_listen="    listen [::]:80;"
+  else
+    log "IPv6 tidak tersedia di VPS ini. Nginx listen IPv4 saja (port 80)."
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
 ${sshws_realip_nginx_map}
 ${sshws_nginx_limit_conf}
@@ -21536,7 +21555,7 @@ ${xray_realip_nginx_map}
 
 server {
     listen 80;
-    listen [::]:80;
+${nginx_ipv6_listen}
     listen 127.0.0.1:8083 proxy_protocol;
 ${xray_realip_ws_listener}
     server_name ${nginx_server_names};

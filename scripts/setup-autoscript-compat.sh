@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.26}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.27}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -506,6 +506,7 @@ build_nginx_server_names() {
 
 build_sshws_realip_nginx_map() {
   cat <<'EOF'
+# sc-1forcr-trusted-realip-v2: trust CF-Connecting-IP only from Cloudflare peers
 map $proxy_protocol_addr $sc_sshws_peer_ip {
     "" $remote_addr;
     default $proxy_protocol_addr;
@@ -2335,13 +2336,8 @@ EOF_LIMIT
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
     xray_realip_nginx_map=$(cat <<'EOF_REALIP'
-map $proxy_protocol_addr $sc_xray_client_ip {
-    "" $remote_addr;
-    default $proxy_protocol_addr;
-}
-map $http_cf_connecting_ip $sc_xray_real_ip {
-    "" $sc_xray_client_ip;
-    default $http_cf_connecting_ip;
+map $sc_sshws_real_ip $sc_xray_real_ip {
+    default $sc_sshws_real_ip;
 }
 EOF_REALIP
 )
@@ -8158,6 +8154,55 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
   }
 }
 
+async function notifyLongTermIpWarning(username, limitip, detected, ips = [], nowTs = 0) {
+  const user = String(username || '').trim();
+  const count = Math.max(0, Number(detected || 0));
+  const limit = Math.max(0, Number(limitip || 0));
+  const ts = Math.max(0, Number(nowTs || Math.floor(Date.now() / 1000)));
+  if (!user || count < 1 || limit < 1 || ts < 1) return false;
+
+  const previous = await get(
+    "SELECT detected, last_alert_at FROM iplimit_longterm_alerts WHERE account_type='ssh' AND LOWER(username)=LOWER(?)",
+    [user]
+  ).catch(() => null);
+  const previousCount = Math.max(0, Number(previous?.detected || 0));
+  const previousAt = Math.max(0, Number(previous?.last_alert_at || 0));
+  const cooldownSeconds = 24 * 3600;
+  if (previousAt > 0 && count <= previousCount && (ts - previousAt) < cooldownSeconds) return false;
+
+  const list = Array.from(new Set((Array.isArray(ips) ? ips : []).map((v) => String(v || '').trim()).filter(Boolean))).slice(0, 8);
+  const message =
+    `SC 1FORCR NOTIF\n` +
+    `Event    : IP_HISTORY_WARNING\n` +
+    `Action   : NO_LOCK\n` +
+    `Domain   : ${DOMAIN || '-'}\n` +
+    `Username : ${user}\n` +
+    `Limit IP : ${limit}\n` +
+    `IP 24 Jam: ${count}\n` +
+    `Info     : Riwayat IP melewati ambang audit; akun tidak dikunci.\n` +
+    (list.length > 0 ? `IPs      : ${list.join(', ')}\n` : '') +
+    `Time     : ${new Date(ts * 1000).toISOString()}`;
+
+  console.warn(`[iplimit-warning] user=${user} ip24h=${count} limit=${limit} action=no-lock`);
+  if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
+    const result = await telegramNotifyToResult(TELEGRAM_CHAT_ID, message).catch((err) => ({ ok: false, error: err?.message || String(err) }));
+    if (!result?.ok) {
+      console.error(`[iplimit-warning] Telegram gagal user=${user} error=${result?.error || result?.statusCode || 'unknown'}`);
+    }
+  }
+
+  await run(
+    `INSERT INTO iplimit_longterm_alerts(account_type, username, detected, ips_json, last_alert_at)
+     VALUES('ssh', ?, ?, ?, ?)
+     ON CONFLICT(account_type, username) DO UPDATE SET
+       detected=excluded.detected,
+       ips_json=excluded.ips_json,
+       last_alert_at=excluded.last_alert_at`,
+    [user.toLowerCase(), count, JSON.stringify(list), ts]
+  ).catch(() => {});
+  return true;
+}
+
 function bytesToGbText(bytes) {
   const n = Number(bytes || 0);
   if (!Number.isFinite(n) || n <= 0) return '0 GB';
@@ -9594,7 +9639,7 @@ async function ensureTables() {
     locked_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`);
-  // Long-term IP tracker (24h window) untuk deteksi sharing akun.
+  // Long-term IP tracker (24h window) untuk audit/peringatan sharing akun.
   await run(`CREATE TABLE IF NOT EXISTS temp_ip_long_history (
     account_type TEXT NOT NULL,
     username TEXT NOT NULL,
@@ -9602,6 +9647,16 @@ async function ensureTables() {
     first_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     last_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username, ip)
+  )`).catch(() => {});
+  // Riwayat jangka panjang hanya untuk audit/peringatan. Tabel ini membatasi
+  // spam notifikasi dan tidak pernah dipakai sebagai alasan auto-lock.
+  await run(`CREATE TABLE IF NOT EXISTS iplimit_longterm_alerts (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    detected INTEGER NOT NULL DEFAULT 0,
+    ips_json TEXT NOT NULL DEFAULT '[]',
+    last_alert_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_type, username)
   )`).catch(() => {});
   await run(`CREATE TABLE IF NOT EXISTS xray_device_slots (
     account_type TEXT NOT NULL,
@@ -10205,6 +10260,7 @@ async function cleanupExpiredGrace(nowTs) {
   // Bersihkan long-term IP history lebih dari 24 jam.
   const longTermCutoff = nowTs - (24 * 3600);
   await run("DELETE FROM temp_ip_long_history WHERE last_seen < ?", [longTermCutoff]).catch(() => {});
+  await run("DELETE FROM iplimit_longterm_alerts WHERE last_alert_at < ?", [nowTs - (7 * 86400)]).catch(() => {});
   await pruneIpLimitLockHistory(nowTs);
 }
 
@@ -10327,6 +10383,7 @@ async function enforceExpiredAccounts() {
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_long_history WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
+    await run("DELETE FROM iplimit_longterm_alerts WHERE account_type='ssh' AND LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND LOWER(username)=LOWER(?)", [user]).catch(() => {});
   }
 
@@ -10459,6 +10516,7 @@ async function unlockExpired(nowTs) {
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     // Reset long-term IP history saat unlock (beri kesempatan bersih).
     await run("DELETE FROM temp_ip_long_history WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+    await run("DELETE FROM iplimit_longterm_alerts WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
     // Simpan grace dengan username lowercase agar cocok dengan lookup
     // graceMap di lockIfExceeded (yang memakai userKey lowercase).
     await run(
@@ -10603,8 +10661,8 @@ async function lockIfExceeded(nowTs) {
     // pengaman abuse terpisah dan wajib bertahan dua siklus pemeriksaan.
     const sshwsHardSample = await sampleSshwsHardLimit(userKey, cntWsPorts, nowTs);
     const hardSessionExceeded = sshwsHardSample.confirmed;
-    // Long-term IP tracker: deteksi sharing akun dalam 24 jam.
-    // Track semua IP yang pernah terlihat dalam 24 jam — kalau > limitip * 3 → abuse.
+    // Long-term IP tracker: audit pola sharing dalam 24 jam.
+    // Banyak IP historis tidak membuktikan sesi serentak, jadi tidak auto-lock.
     const LONG_TERM_HOURS = 24;
     const longTermCutoff = nowTs - (LONG_TERM_HOURS * 3600);
     const currentUserIps = sshCombinedIpSet;
@@ -10630,11 +10688,17 @@ async function lockIfExceeded(nowTs) {
     const longTermIpCount = XRAY_IP_GROUP_MASK < 32
       ? countIpGroups(longTermIpSet, XRAY_IP_GROUP_MASK)
       : longTermIpSet.size;
-    const longTermAbuse = lim > 0 && longTermIpCount > lim * 3;
+    const longTermAlert = lim > 0 && longTermIpCount > lim * 3;
     const immediateLimitExceeded = lim > 0 && cntImmediate > lim;
-    const accountLimitExceeded = immediateLimitExceeded || sshwsIpExceeded || longTermAbuse;
+    // Riwayat 24 jam tidak membuktikan pemakaian serentak. Mode pesawat,
+    // CGNAT dan pergantian gateway operator dapat menghasilkan banyak IP.
+    // Karena itu, hanya kirim audit warning; jangan jadikan alasan auto-lock.
+    const accountLimitExceeded = immediateLimitExceeded || sshwsIpExceeded;
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardCandidate=${sshwsHardSample.candidate ? 1 : 0} hardHits=${sshwsHardSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntIpRaw=${cntIpRaw} cntWsIpRaw=${cntWsIpRaw} cntSshCombinedRaw=${cntSshCombinedRaw} wsIpCandidate=${sshwsIpSample.candidate ? 1 : 0} wsIpHits=${sshwsIpSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} wsIpExceeded=${sshwsIpExceeded ? 1 : 0} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIpG=${cntZivpnIpGrouped} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIpG=${cntZivpnLiveIpGrouped} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cntImmediate=${cntImmediate} cntDeviceIp=${cnt} mask=${XRAY_IP_GROUP_MASK} cnt24h=${longTermIpCount} longTermAbuse=${longTermAbuse ? 1 : 0}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardCandidate=${sshwsHardSample.candidate ? 1 : 0} hardHits=${sshwsHardSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntIpRaw=${cntIpRaw} cntWsIpRaw=${cntWsIpRaw} cntSshCombinedRaw=${cntSshCombinedRaw} wsIpCandidate=${sshwsIpSample.candidate ? 1 : 0} wsIpHits=${sshwsIpSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} wsIpExceeded=${sshwsIpExceeded ? 1 : 0} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIpG=${cntZivpnIpGrouped} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIpG=${cntZivpnLiveIpGrouped} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cntImmediate=${cntImmediate} cntDeviceIp=${cnt} mask=${XRAY_IP_GROUP_MASK} cnt24h=${longTermIpCount} longTermAlert=${longTermAlert ? 1 : 0}`);
+    }
+    if (longTermAlert) {
+      await notifyLongTermIpWarning(user, lim, longTermIpCount, Array.from(longTermIpSet), nowTs);
     }
     if (!accountLimitExceeded && !hardSessionExceeded) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;
@@ -10687,16 +10751,13 @@ async function lockIfExceeded(nowTs) {
     if (lim === 1 && cntZivpnRaw === 2 && cntZivpnEffective === 1) {
       zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
     }
-    const lockBySshwsIp = sshwsIpExceeded && !immediateLimitExceeded && !longTermAbuse;
+    const lockBySshwsIp = sshwsIpExceeded && !immediateLimitExceeded;
     const lockByHardSession = hardSessionExceeded && !accountLimitExceeded;
     let lockReasonText = lockByHardSession
       ? `sesi SSHWS aktif melewati batas aman ${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`
       : 'pemakaian perangkat/IP melewati limit akun';
     if (lockBySshwsIp) {
       lockReasonText = `IP asli SSHWS aktif melewati limit akun selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`;
-    }
-    if (longTermAbuse && !lockByHardSession) {
-      lockReasonText = `sharing akun terdeteksi: ${longTermIpCount} IP berbeda dalam ${LONG_TERM_HOURS} jam (limit=${lim}, max=${lim * 3})`;
     }
     const ipSourceCounts = [
       { service: 'ssh', count: cntIp },
@@ -10710,12 +10771,10 @@ async function lockIfExceeded(nowTs) {
     const notifyLimit = lockByHardSession ? SSHWS_ACCOUNT_SESSION_HARD_LIMIT : lim;
     const notifyDetected = lockByHardSession
       ? cntWsPorts
-      : (longTermAbuse ? longTermIpCount : (lockBySshwsIp ? cntSshCombinedRaw : cnt));
+      : (lockBySshwsIp ? cntSshCombinedRaw : cnt);
     const notifyDetectedRaw = lockByHardSession
       ? cntWsPorts
-      : (longTermAbuse
-          ? longTermIpSet.size
-          : Math.max(cntIpRaw, cntWsIpRaw, cntSshCombinedRaw, cntUdphcIpRaw, cntZivpnRaw));
+      : Math.max(cntIpRaw, cntWsIpRaw, cntSshCombinedRaw, cntUdphcIpRaw, cntZivpnRaw);
     const historyId = await createIpLimitLockHistory({
       account_type: 'ssh',
       service: notifyService,
@@ -15966,19 +16025,14 @@ restore_backup() {
 patch_nginx_realip() {
   local tmp have_map have_ws have_grpc
   have_map=0; have_ws=0; have_grpc=0
-  grep -q 'map[[:space:]]\+\$http_cf_connecting_ip[[:space:]]\+\$sc_xray_real_ip' "${NGINX_CONF}" && have_map=1 || true
+  grep -q 'map[[:space:]]\+\$sc_sshws_real_ip[[:space:]]\+\$sc_xray_real_ip' "${NGINX_CONF}" && have_map=1 || true
   grep -q 'listen[[:space:]]\+127\.0\.0\.1:8083[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_ws=1 || true
   grep -q 'listen[[:space:]]\+127\.0\.0\.1:8082[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_grpc=1 || true
   tmp="$(mktemp "$(dirname "${NGINX_CONF}")/.sc-xray-realip-nginx.XXXXXX")"
   awk -v have_map="${have_map}" -v have_ws="${have_ws}" -v have_grpc="${have_grpc}" '
     function print_map() {
-      print "map $proxy_protocol_addr $sc_xray_client_ip {";
-      print "    \"\" $remote_addr;";
-      print "    default $proxy_protocol_addr;";
-      print "}";
-      print "map $http_cf_connecting_ip $sc_xray_real_ip {";
-      print "    \"\" $sc_xray_client_ip;";
-      print "    default $http_cf_connecting_ip;";
+      print "map $sc_sshws_real_ip $sc_xray_real_ip {";
+      print "    default $sc_sshws_real_ip;";
       print "}";
       print "";
     }
@@ -15992,6 +16046,17 @@ patch_nginx_realip() {
       return opens-closes;
     }
     {
+      # Buang dua map Xray lama yang mempercayai CF-Connecting-IP tanpa
+      # memverifikasi bahwa peer memang berasal dari jaringan Cloudflare.
+      if (!skip_old_map && ($0 ~ /^map[[:space:]]+\$proxy_protocol_addr[[:space:]]+\$sc_xray_client_ip[[:space:]]*\{/ ||
+                            $0 ~ /^map[[:space:]]+\$http_cf_connecting_ip[[:space:]]+\$sc_xray_real_ip[[:space:]]*\{/)) {
+        skip_old_map=1;
+        next;
+      }
+      if (skip_old_map) {
+        if ($0 ~ /^}[[:space:]]*$/) skip_old_map=0;
+        next;
+      }
       if ($0 ~ /^[[:space:]]*location[[:space:]]+/) {
         in_xray_location=is_xray_location($0);
         location_depth=0;
@@ -16100,18 +16165,20 @@ apply_mode() {
 }
 
 show_status() {
-  local env_mode="0" route="legacy" trusted="no" ws_listener="no" grpc_listener="no"
+  local env_mode="0" route="legacy" trusted="no" cf_trust="no" ws_listener="no" grpc_listener="no"
   if [[ -f "${SC_ENV}" ]]; then
     env_mode="$(awk -F= '$1=="XRAY_REAL_IP_ENABLE" {v=$2} END {print v+0}' "${SC_ENV}")"
   fi
   grep -q 'server nginx_local 127\.0\.0\.1:8083 .*send-proxy' "${HAPROXY_CONF}" 2>/dev/null && route="proxy-ip" || true
   [[ "${env_mode}" == "1" && "${route}" == "proxy-ip" ]] && route="real-ip"
   jq -e '.inbounds[]? | select(((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc")) | select((.streamSettings.sockopt.trustedXForwardedFor // []) | index("X-SC-Real-IP-Proxy"))' "${XRAY_CONF}" >/dev/null 2>&1 && trusted="yes" || true
+  grep -q 'sc-1forcr-trusted-realip-v2' "${NGINX_CONF}" 2>/dev/null && cf_trust="cloudflare-only" || true
   ss -H -lnt 2>/dev/null | awk '$4 ~ /:8083$/ {ok=1} END {exit(ok?0:1)}' && ws_listener="yes" || true
   ss -H -lnt 2>/dev/null | awk '$4 ~ /:8082$/ {ok=1} END {exit(ok?0:1)}' && grpc_listener="yes" || true
   echo "XRAY_REAL_IP_ENABLE=${env_mode}"
   echo "haproxy_route=${route}"
   echo "xray_trusted_header=${trusted}"
+  echo "nginx_cf_header_trust=${cf_trust}"
   echo "nginx_proxy_listener_8083=${ws_listener}"
   echo "nginx_grpc_listener_8082=${grpc_listener}"
   echo "nginx=$(systemctl is-active nginx 2>/dev/null || true) haproxy=$(systemctl is-active haproxy 2>/dev/null || true) xray=$(systemctl is-active xray 2>/dev/null || true)"
@@ -16669,6 +16736,7 @@ build_xray_alias_hosts() {
 
 build_sshws_realip_nginx_map() {
   cat <<'EOF'
+# sc-1forcr-trusted-realip-v2: trust CF-Connecting-IP only from Cloudflare peers
 map $proxy_protocol_addr $sc_sshws_peer_ip {
     "" $remote_addr;
     default $proxy_protocol_addr;
@@ -21407,13 +21475,8 @@ EOF_LIMIT
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
     xray_realip_nginx_map=$(cat <<'EOF_REALIP'
-map $proxy_protocol_addr $sc_xray_client_ip {
-    "" $remote_addr;
-    default $proxy_protocol_addr;
-}
-map $http_cf_connecting_ip $sc_xray_real_ip {
-    "" $sc_xray_client_ip;
-    default $http_cf_connecting_ip;
+map $sc_sshws_real_ip $sc_xray_real_ip {
+    default $sc_sshws_real_ip;
 }
 EOF_REALIP
 )
@@ -23122,10 +23185,10 @@ show_combined_online() {
       l=(u in lim ? lim[u] : 0);
       if (s == "LOCK" || s == "LOCK_TMP" || s == "LOCK_QUOTA") {
         out="KENA_LOCK";
-      } else if (l > 0 && cnt > l) {
-        out="MULTI_LOGIN";
       } else {
-        out="AMAN";
+        # Tampilan gabungan memuat jumlah sesi SSH/UDP, bukan jumlah IP unik.
+        # Jangan menuduh MULTI_LOGIN berdasarkan socket/session count.
+        out="ONLINE";
       }
       printf "%-24s %-12s %-10d %-10d %-10d\n", u, out, ssh, udp, cnt;
     }' "${tmp_status}" "${tmp_count}"
@@ -23151,14 +23214,15 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_ip_count tmp_db_ports tmp_proc_count tmp_db_pids
+  local tmp_status tmp_ip_count tmp_verified_ip_count tmp_db_ports tmp_proc_count tmp_db_pids
   local dropbear_main_port dropbear_alt_port db_recent_log_max hc_auth_lookback_h source_mode ssh_tracker_ready
   tmp_status="$(mktemp)"
   tmp_ip_count="$(mktemp)"
+  tmp_verified_ip_count="$(mktemp)"
   tmp_db_ports="$(mktemp)"
   tmp_proc_count="$(mktemp)"
   tmp_db_pids="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}" "${tmp_proc_count:-}" "${tmp_db_pids:-}"' RETURN
+  trap 'rm -f "${tmp_status:-}" "${tmp_ip_count:-}" "${tmp_verified_ip_count:-}" "${tmp_db_ports:-}" "${tmp_proc_count:-}" "${tmp_db_pids:-}"' RETURN
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
@@ -23365,6 +23429,33 @@ show_ssh_only_online() {
       }' > "${tmp_ip_count}" || true
   fi
 
+  # Hitung IP publik unik yang benar-benar terkait dengan sesi SSHWS aktif.
+  # Jumlah socket tetap ditampilkan sebagai informasi, tetapi tidak boleh
+  # menentukan status MULTI_LOGIN karena satu aplikasi dapat membuka banyak socket.
+  : > "${tmp_verified_ip_count}"
+  if [[ -s /run/sc-1forcr/ssh-live.map && -s /var/lib/sc-1forcr/sshws-quota.tsv ]]; then
+    awk -F'|' '
+      NR==FNR {
+        port=$1; user=tolower($3);
+        if (port ~ /^[0-9]+$/ && user ~ /^[a-z0-9._-]+$/) port_user[port]=user;
+        next;
+      }
+      {
+        n=split($0, a, "\t");
+        if (n < 7 || a[6] != "1") next;
+        port=a[2]; ip=tolower(a[7]); user=port_user[port];
+        if (user !~ /^[a-z0-9._-]+$/ || ip=="" || ip=="-" || ip=="::" || ip=="::1" || ip=="localhost") next;
+        if (ip ~ /^127(\.|$)/ || ip ~ /^::ffff:127(\.|$)/) next;
+        key=user SUBSEP ip;
+        if (!(key in seen_ip)) { seen_ip[key]=1; count[user]++; }
+      }
+      END { for (user in count) print user, count[user]; }
+    ' /run/sc-1forcr/ssh-live.map /var/lib/sc-1forcr/sshws-quota.tsv > "${tmp_verified_ip_count}" || true
+    if [[ -s "${tmp_verified_ip_count}" ]]; then
+      source_mode="REALTIME_STATEFUL_IP"
+    fi
+  fi
+
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
   echo "LIST USER LOGIN SSH (${source_mode})"
@@ -23376,30 +23467,42 @@ show_ssh_only_online() {
     return
   fi
 
-  printf "%-24s %-12s %-10s %-13s\n" "USERNAME" "STATUS" "LIMIT_IP" "SESI_AKTIF"
-  printf "%-24s %-12s %-10s %-13s\n" "------------------------" "------------" "----------" "-------------"
+  printf "%-24s %-12s %-10s %-13s %-10s\n" "USERNAME" "STATUS" "LIMIT_IP" "SESI_AKTIF" "IP_AKTIF"
+  printf "%-24s %-12s %-10s %-13s %-10s\n" "------------------------" "------------" "----------" "-------------" "----------"
   awk '
-    NR==FNR {
+    FILENAME==ARGV[1] {
       split($0,a,/\|/);
       st[a[1]]=a[2];
       lim[a[1]]=(a[3] ~ /^[0-9]+$/ ? a[3] + 0 : 0);
       next
     }
-    {
+    FILENAME==ARGV[2] {
       u=$1; n=$2+0;
+      sessions[u]=n; online[u]=1;
+      next
+    }
+    FILENAME==ARGV[3] {
+      u=$1; verified_ip[u]=$2+0;
+      next
+    }
+    END {
+      for (u in online) {
+      n=sessions[u]+0;
+      ipn=(u in verified_ip ? verified_ip[u] : 0);
       s=(u in st ? st[u] : "AMAN");
       l=(u in lim ? lim[u] : 0);
       if (s=="LOCK" || s=="LOCK_TMP" || s=="LOCK_QUOTA") out="KENA_LOCK";
-      else if (l > 0 && n > l) out="MULTI_LOGIN";
-      else out="AMAN";
-      printf "%-24s %-12s %-10d %-13d\n", u, out, l, n;
-      total_user++; total_hp+=n;
-    }
-    END {
+      else if (l > 0 && ipn > l) out="MULTI_LOGIN";
+      else if (ipn > 0) out="AMAN";
+      else out="ONLINE";
+      printf "%-24s %-12s %-10d %-13d %-10d\n", u, out, l, n, ipn;
+      total_user++; total_session+=n; total_ip+=ipn;
+      }
       print "";
       printf "Total User SSH : %d\n", total_user + 0;
-      printf "Total Sesi SSH : %d\n", total_hp + 0;
-    }' "${tmp_status}" "${tmp_ip_count}"
+      printf "Total Sesi SSH : %d\n", total_session + 0;
+      printf "Total IP Aktif : %d\n", total_ip + 0;
+    }' "${tmp_status}" "${tmp_ip_count}" "${tmp_verified_ip_count}"
 }
 
 xray_log_snapshot() {
@@ -25300,6 +25403,7 @@ post_install_preflight() {
   sshws_realip_status="NO"
   if grep -qE 'server[[:space:]]+nginx_local[[:space:]]+127\.0\.0\.1:8083.*send-proxy' /etc/haproxy/haproxy.cfg 2>/dev/null &&
      grep -qE 'server[[:space:]]+sshws_local[[:space:]]+127\.0\.0\.1:2082.*send-proxy' /etc/haproxy/haproxy.cfg 2>/dev/null &&
+     grep -q 'sc-1forcr-trusted-realip-v2' /etc/nginx/sites-available/sc-1forcr.conf 2>/dev/null &&
      grep -q 'X-SC-SSHWS-IP' /etc/nginx/sites-available/sc-1forcr.conf 2>/dev/null; then
     sshws_realip_status="READY"
   fi

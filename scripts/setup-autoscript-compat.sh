@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.24}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.26}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -502,6 +502,44 @@ build_nginx_server_names() {
   fi
   [[ -z "${names}" ]] && names="_"
   echo "${names}"
+}
+
+build_sshws_realip_nginx_map() {
+  cat <<'EOF'
+map $proxy_protocol_addr $sc_sshws_peer_ip {
+    "" $remote_addr;
+    default $proxy_protocol_addr;
+}
+geo $sc_sshws_peer_ip $sc_sshws_peer_is_cloudflare {
+    default 0;
+    173.245.48.0/20 1;
+    103.21.244.0/22 1;
+    103.22.200.0/22 1;
+    103.31.4.0/22 1;
+    141.101.64.0/18 1;
+    108.162.192.0/18 1;
+    190.93.240.0/20 1;
+    188.114.96.0/20 1;
+    197.234.240.0/22 1;
+    198.41.128.0/17 1;
+    162.158.0.0/15 1;
+    104.16.0.0/13 1;
+    104.24.0.0/14 1;
+    172.64.0.0/13 1;
+    131.0.72.0/22 1;
+    2400:cb00::/32 1;
+    2606:4700::/32 1;
+    2803:f800::/32 1;
+    2405:b500::/32 1;
+    2405:8100::/32 1;
+    2a06:98c0::/29 1;
+    2c0f:f248::/32 1;
+}
+map "$sc_sshws_peer_is_cloudflare:$http_cf_connecting_ip" $sc_sshws_real_ip {
+    ~^1:.+ $http_cf_connecting_ip;
+    default $sc_sshws_peer_ip;
+}
+EOF
 }
 
 domain_covered_by_one_label_wildcard() {
@@ -1906,6 +1944,17 @@ CREATE TABLE IF NOT EXISTS iplimit_lock_history (
 CREATE INDEX IF NOT EXISTS idx_iplimit_lock_history_user_time
   ON iplimit_lock_history(account_type, username, locked_at DESC);
 
+CREATE TABLE IF NOT EXISTS iplimit_violation_pending (
+  account_type TEXT NOT NULL,
+  username TEXT NOT NULL,
+  signal TEXT NOT NULL,
+  first_seen INTEGER NOT NULL,
+  last_seen INTEGER NOT NULL,
+  hits INTEGER NOT NULL DEFAULT 1,
+  detected INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_type, username, signal)
+);
+
 CREATE TABLE IF NOT EXISTS account_trial_flags (
   account_type TEXT NOT NULL,
   username TEXT NOT NULL,
@@ -2252,11 +2301,12 @@ prepare_haproxy_pem() {
 setup_nginx_and_cert() {
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
-  local sshws_nginx_limit_conf sshws_nginx_limit_rules nginx_server_names
+  local sshws_nginx_limit_conf sshws_nginx_limit_rules sshws_realip_nginx_map nginx_server_names
   local xray_realip_nginx_map xray_realip_ws_listener xray_realip_grpc_listener
   local xray_proxy_realip_headers xray_grpc_realip_headers
   sshws_nginx_limit_conf=""
   sshws_nginx_limit_rules=""
+  sshws_realip_nginx_map="$(build_sshws_realip_nginx_map)"
   xray_realip_nginx_map=""
   xray_realip_ws_listener=""
   xray_realip_grpc_listener=""
@@ -2266,9 +2316,9 @@ setup_nginx_and_cert() {
   nginx_server_names="$(build_nginx_server_names)"
   if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
     sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
-map \$http_cf_connecting_ip \$sc_sshws_limit_key {
+map \$sc_sshws_real_ip \$sc_sshws_limit_key {
     "" \$binary_remote_addr;
-    default \$http_cf_connecting_ip;
+    default \$sc_sshws_real_ip;
 }
 limit_req_zone \$sc_sshws_limit_key zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
 limit_conn_zone \$sc_sshws_limit_key zone=sc_sshws_conn:10m;
@@ -2309,12 +2359,14 @@ EOF_REALIP
 )
   fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
+${sshws_realip_nginx_map}
 ${sshws_nginx_limit_conf}
 ${xray_realip_nginx_map}
 
 server {
     listen 80;
     listen [::]:80;
+    listen 127.0.0.1:8083 proxy_protocol;
 ${xray_realip_ws_listener}
     server_name ${nginx_server_names};
     keepalive_timeout 30;
@@ -2331,6 +2383,7 @@ ${xray_realip_ws_listener}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-SC-SSHWS-IP \$sc_sshws_real_ip;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2483,6 +2536,7 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-SC-SSHWS-IP \$sc_sshws_real_ip;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2499,6 +2553,7 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-SC-SSHWS-IP \$sc_sshws_real_ip;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -2597,10 +2652,10 @@ setup_haproxy_tls_mux() {
     haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
-    xray_ws_backend_line="    server nginx_local 127.0.0.1:8080 check send-proxy-v2"
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check send-proxy-v2"
     xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check send-proxy-v2"
   else
-    xray_ws_backend_line="    server nginx_local 127.0.0.1:80 check"
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check send-proxy-v2"
     xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check"
   fi
 
@@ -2668,7 +2723,7 @@ ${xray_grpc_backend_line}
 backend bk_sshws_tls
     mode tcp
     # Jalur khusus HTTP Custom SSL-only (payload CONNECT) langsung ke sshws mux.
-    server sshws_local 127.0.0.1:2082 check
+    server sshws_local 127.0.0.1:2082 check send-proxy
 EOF
 
   haproxy -c -f /etc/haproxy/haproxy.cfg
@@ -7200,6 +7255,7 @@ import (
 type quotaSession struct {
 	ID          string
 	LocalPort   int
+	ClientIP    string
 	ClientToSSH uint64
 	SSHToClient uint64
 	UpdatedAt   int64
@@ -7306,7 +7362,72 @@ func localTCPPort(conn net.Conn) int {
 	return port
 }
 
-func registerQuotaSession(upstream net.Conn) *quotaSession {
+func normalizeClientIP(raw string) string {
+	v := strings.TrimSpace(strings.Trim(raw, "[]"))
+	if v == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(v); err == nil {
+		v = strings.TrimSpace(strings.Trim(host, "[]"))
+	}
+	ip := net.ParseIP(v)
+	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
+		return ""
+	}
+	return ip.String()
+}
+
+func remoteClientIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(addr.String())
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		return normalizeClientIP(host)
+	}
+	return normalizeClientIP(raw)
+}
+
+func consumeProxyV1(reader *bufio.Reader) (string, bool, error) {
+	prefix, err := reader.Peek(6)
+	if err != nil || string(prefix) != "PROXY " {
+		return "", false, nil
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", true, err
+	}
+	if len(line) > 108 {
+		return "", true, fmt.Errorf("proxy protocol line too long")
+	}
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) >= 2 && strings.EqualFold(fields[1], "UNKNOWN") {
+		return "", true, nil
+	}
+	if len(fields) < 6 || !(strings.EqualFold(fields[1], "TCP4") || strings.EqualFold(fields[1], "TCP6")) {
+		return "", true, fmt.Errorf("invalid proxy protocol line")
+	}
+	ip := normalizeClientIP(fields[2])
+	if ip == "" {
+		return "", true, fmt.Errorf("invalid proxy source ip")
+	}
+	return ip, true, nil
+}
+
+func httpHeaderIP(raw []byte, name string) string {
+	target := strings.ToLower(strings.TrimSpace(name))
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 || strings.ToLower(strings.TrimSpace(parts[0])) != target {
+			continue
+		}
+		value := strings.TrimSpace(strings.SplitN(parts[1], ",", 2)[0])
+		return normalizeClientIP(value)
+	}
+	return ""
+}
+
+func registerQuotaSession(upstream net.Conn, clientIP string) *quotaSession {
 	port := localTCPPort(upstream)
 	if port <= 0 {
 		return nil
@@ -7315,6 +7436,7 @@ func registerQuotaSession(upstream net.Conn) *quotaSession {
 	session := &quotaSession{
 		ID:        fmt.Sprintf("%d-%d", now.UnixNano(), port),
 		LocalPort: port,
+		ClientIP:  normalizeClientIP(clientIP),
 		UpdatedAt: now.Unix(),
 		Active:    true,
 	}
@@ -7342,7 +7464,7 @@ func flushQuotaState() {
 	}
 	now := time.Now().Unix()
 	cutoff := now - 21600
-	lines := []string{"# session_id\tlocal_port\tclient_to_ssh\tssh_to_client\tupdated_at\tactive"}
+	lines := []string{"# session_id\tlocal_port\tclient_to_ssh\tssh_to_client\tupdated_at\tactive\tclient_ip"}
 	quotaMu.Lock()
 	for id, session := range quotaSessions {
 		updatedAt := atomic.LoadInt64(&session.UpdatedAt)
@@ -7354,12 +7476,12 @@ func flushQuotaState() {
 		if session.Active {
 			active = "1"
 		}
-		lines = append(lines, fmt.Sprintf("%s\t%d\t%d\t%d\t%d\t%s", session.ID, session.LocalPort, atomic.LoadUint64(&session.ClientToSSH), atomic.LoadUint64(&session.SSHToClient), updatedAt, active))
+		lines = append(lines, fmt.Sprintf("%s\t%d\t%d\t%d\t%d\t%s\t%s", session.ID, session.LocalPort, atomic.LoadUint64(&session.ClientToSSH), atomic.LoadUint64(&session.SSHToClient), updatedAt, active, session.ClientIP))
 	}
 	quotaMu.Unlock()
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
 	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
-	if err := ioutil.WriteFile(tmp, []byte(strings.Join(lines, "\n")+"\n"), 0644); err != nil {
+	if err := ioutil.WriteFile(tmp, []byte(strings.Join(lines, "\n")+"\n"), 0600); err != nil {
 		return
 	}
 	_ = os.Rename(tmp, path)
@@ -7457,6 +7579,17 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 	defer client.Close()
 	tuneTCP(client, keepAliveSeconds)
 	reader := bufio.NewReaderSize(client, readerBufferSize)
+	peerIP := remoteClientIP(client.RemoteAddr())
+	clientIP := peerIP
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	proxyIP, proxySeen, err := consumeProxyV1(reader)
+	if err != nil {
+		return
+	}
+	if proxyIP != "" {
+		clientIP = proxyIP
+	}
+	trustInternalHeader := !proxySeen && peerIP == ""
 	afterConnect := false
 
 	peek, err := reader.Peek(4)
@@ -7469,7 +7602,8 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			_ = sshUp.Close()
 			return
 		}
-		tunnelBoth(client, sshUp, registerQuotaSession(sshUp))
+		_ = client.SetReadDeadline(time.Time{})
+		tunnelBoth(client, sshUp, registerQuotaSession(sshUp, clientIP))
 		return
 	}
 
@@ -7480,6 +7614,11 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		rawHeader, first, header, err := readHttpHeader(reader, 128*1024)
 		if err != nil {
 			return
+		}
+		if trustInternalHeader {
+			if headerIP := httpHeaderIP(rawHeader, "x-sc-sshws-ip"); headerIP != "" {
+				clientIP = headerIP
+			}
 		}
 
 	    if strings.HasPrefix(first, "connect ") {
@@ -7500,7 +7639,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 				_ = sshUp.Close()
 				return
 			}
-				tunnelBoth(client, sshUp, registerQuotaSession(sshUp))
+				tunnelBoth(client, sshUp, registerQuotaSession(sshUp, clientIP))
 				return
 			}
 
@@ -7518,7 +7657,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 					_ = sshUp.Close()
 					return
 				}
-				tunnelBoth(client, sshUp, registerQuotaSession(sshUp))
+				tunnelBoth(client, sshUp, registerQuotaSession(sshUp, clientIP))
 				return
 			}
 
@@ -7560,7 +7699,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			_ = sshUp.Close()
 			return
 		}
-		tunnelBoth(client, sshUp, registerQuotaSession(sshUp))
+		tunnelBoth(client, sshUp, registerQuotaSession(sshUp, clientIP))
 		return
 	}
 }
@@ -7672,6 +7811,9 @@ const SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW = Number(process.env.SSHWS_ACCOUNT_SE
 const SSHWS_ACCOUNT_SESSION_HARD_LIMIT = Number.isFinite(SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW)
   ? Math.min(64, Math.max(4, Math.floor(SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW)))
   : 8;
+const SSHWS_HARD_LIMIT_CONFIRM_CYCLES = 2;
+const SSHWS_HARD_LIMIT_MIN_GAP_SECONDS = Math.max(30, CHECK_INTERVAL_MINUTES * 30);
+const SSHWS_HARD_LIMIT_MAX_GAP_SECONDS = Math.max(180, (CHECK_INTERVAL_MINUTES * 120) + 60);
 const LOCK_RECHECK_GRACE_SECONDS = Math.max(180, CHECK_INTERVAL_MINUTES * 120);
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
   .split(',')
@@ -8441,6 +8583,8 @@ function parseSshAndUdpUsage() {
   const recentAuthMap = new Map();
   const procSessionMap = new Map();
   const wsClientPortMap = new Map();
+  const sshWsIpMap = new Map();
+  const sshWsPortIpMap = readSshWsActivePortIpMap();
   const udphcSessionMap = new Map();
   const udphcIpMap = new Map();
   const zivpnSessionMap = new Map();
@@ -8547,6 +8691,10 @@ function parseSshAndUdpUsage() {
     addSessionKeyToUserMap(sessionMap, user, `dropbear-port:${clientPort}`);
     const sourceIp = extractIp(item.source);
     if (sourceIp && !isLoopbackIp(sourceIp)) addIpToUserMap(ipMap, user, sourceIp);
+    const wsRealIp = sshWsPortIpMap.get(String(clientPort || '').trim());
+    if (wsRealIp && !isLoopbackIp(wsRealIp)) {
+      addIpToUserMap(sshWsIpMap, user, wsRealIp);
+    }
     addPortToUserMap(wsClientPortMap, user, clientPort);
   }
 
@@ -8762,7 +8910,16 @@ function parseSshAndUdpUsage() {
     }
   }
 
-  return { ipMap, sessionMap, recentAuthMap, procSessionMap, wsClientPortMap, udphcSessionMap, udphcIpMap, zivpnSessionMap, zivpnIpMap };
+  // Fallback stateful: tetap petakan IP sesi lama walau baris auth sudah keluar
+  // dari tail journal. State hanya berisi sesi yang masih active di ssh-mux.
+  const statefulSshWsIpMap = readSshWsActiveIpMap();
+  for (const [user, ips] of statefulSshWsIpMap.entries()) {
+    for (const ip of ips) {
+      addIpToUserMap(sshWsIpMap, user, ip);
+    }
+  }
+
+  return { ipMap, sessionMap, recentAuthMap, procSessionMap, wsClientPortMap, sshWsIpMap, udphcSessionMap, udphcIpMap, zivpnSessionMap, zivpnIpMap };
 }
 
 async function readZivpnLiveMap(nowTs) {
@@ -9403,6 +9560,16 @@ async function ensureTables() {
   )`);
   await run(`CREATE INDEX IF NOT EXISTS idx_iplimit_lock_history_user_time
     ON iplimit_lock_history(account_type, username, locked_at DESC)`).catch(() => {});
+  await run(`CREATE TABLE IF NOT EXISTS iplimit_violation_pending (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    hits INTEGER NOT NULL DEFAULT 1,
+    detected INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_type, username, signal)
+  )`).catch(() => {});
   await run(`CREATE TABLE IF NOT EXISTS account_quota_usage (
     account_type TEXT NOT NULL,
     username TEXT NOT NULL,
@@ -9665,8 +9832,25 @@ function readSshProcessQuotaCounters() {
   return map;
 }
 
+let dropbearAuthPortUserMapCache = null;
+
 function readDropbearAuthPortUserMap() {
+  if (dropbearAuthPortUserMapCache instanceof Map) return dropbearAuthPortUserMapCache;
   const map = new Map();
+  try {
+    const liveStateFile = '/run/sc-1forcr/ssh-live.map';
+    if (fs.existsSync(liveStateFile)) {
+      const state = fs.readFileSync(liveStateFile, 'utf8');
+      for (const lineRaw of String(state || '').split(/\r?\n/)) {
+        const parts = String(lineRaw || '').trim().split('|');
+        const port = String(parts[0] || '').trim();
+        const user = String(parts[2] || '').trim().toLowerCase();
+        if (/^[0-9]{1,5}$/.test(port) && /^[a-z0-9._-]+$/.test(user) && user !== 'root') {
+          map.set(port, user);
+        }
+      }
+    }
+  } catch (_) {}
   const readLogs = (args) => {
     try {
       return execFileSync('journalctl', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
@@ -9686,7 +9870,41 @@ function readDropbearAuthPortUserMap() {
     if (!user || !/^[0-9]{1,5}$/.test(port)) continue;
     map.set(port, user);
   }
+  dropbearAuthPortUserMapCache = map;
   return map;
+}
+
+function readSshWsActivePortIpMap() {
+  const out = new Map();
+  try {
+    if (!SSHWS_QUOTA_STATE_FILE || !fs.existsSync(SSHWS_QUOTA_STATE_FILE)) return out;
+    const raw = fs.readFileSync(SSHWS_QUOTA_STATE_FILE, 'utf8');
+    for (const lineRaw of String(raw || '').split(/\r?\n/)) {
+      const line = String(lineRaw || '').trim();
+      if (!line || line.startsWith('#')) continue;
+      const parts = line.split('\t');
+      if (parts.length < 7) continue;
+      const port = String(parts[1] || '').trim();
+      const active = String(parts[5] || '').trim();
+      const ip = extractIp(String(parts[6] || '').trim());
+      if (!/^[0-9]{1,5}$/.test(port) || active !== '1' || !ip || isLoopbackIp(ip)) continue;
+      out.set(port, ip);
+    }
+  } catch (_) {}
+  return out;
+}
+
+function readSshWsActiveIpMap() {
+  const out = new Map();
+  const portIp = readSshWsActivePortIpMap();
+  if (portIp.size < 1) return out;
+  const portUser = readDropbearAuthPortUserMap();
+  for (const [port, ip] of portIp.entries()) {
+    const user = String(portUser.get(port) || '').trim().toLowerCase();
+    if (!user || user === 'root') continue;
+    addIpToUserMap(out, user, ip);
+  }
+  return out;
 }
 
 function readSshWsQuotaCounters() {
@@ -9982,10 +10200,81 @@ async function pruneIpLimitLockHistory(nowTs) {
 
 async function cleanupExpiredGrace(nowTs) {
   await run("DELETE FROM temp_ip_lock_grace WHERE grace_until <= ?", [nowTs]).catch(() => {});
+  const pendingCutoff = nowTs - Math.max(3600, SSHWS_HARD_LIMIT_MAX_GAP_SECONDS * 2);
+  await run("DELETE FROM iplimit_violation_pending WHERE last_seen < ?", [pendingCutoff]).catch(() => {});
   // Bersihkan long-term IP history lebih dari 24 jam.
   const longTermCutoff = nowTs - (24 * 3600);
   await run("DELETE FROM temp_ip_long_history WHERE last_seen < ?", [longTermCutoff]).catch(() => {});
   await pruneIpLimitLockHistory(nowTs);
+}
+
+async function sampleSshwsViolation(username, signalRaw, detected, candidate, nowTs) {
+  const user = String(username || '').trim().toLowerCase();
+  const count = Math.max(0, Number(detected || 0));
+  const signal = String(signalRaw || '').trim().toLowerCase();
+  if (!user || !/^[a-z0-9._-]+$/.test(signal)) {
+    return { candidate: false, confirmed: false, hits: 0 };
+  }
+  if (!candidate) {
+    if (user) {
+      await run(
+        "DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND username=? AND signal=?",
+        [user, signal]
+      ).catch(() => {});
+    }
+    return { candidate: false, confirmed: false, hits: 0 };
+  }
+
+  const previous = await get(
+    "SELECT first_seen, last_seen, hits FROM iplimit_violation_pending WHERE account_type='ssh' AND username=? AND signal=?",
+    [user, signal]
+  ).catch(() => null);
+  const previousLastSeen = Number(previous?.last_seen || 0);
+  const elapsed = nowTs - previousLastSeen;
+  const validPrevious = previousLastSeen > 0 && previousLastSeen <= nowTs + 60;
+  const tooSoon = validPrevious && elapsed >= 0 && elapsed < SSHWS_HARD_LIMIT_MIN_GAP_SECONDS;
+  const consecutive = validPrevious
+    && elapsed >= SSHWS_HARD_LIMIT_MIN_GAP_SECONDS
+    && elapsed <= SSHWS_HARD_LIMIT_MAX_GAP_SECONDS;
+  const firstSeen = (tooSoon || consecutive) ? Number(previous?.first_seen || nowTs) : nowTs;
+  const hits = consecutive
+    ? Math.min(SSHWS_HARD_LIMIT_CONFIRM_CYCLES, Number(previous?.hits || 0) + 1)
+    : (tooSoon ? Math.max(1, Number(previous?.hits || 1)) : 1);
+  const lastSeen = tooSoon ? previousLastSeen : nowTs;
+  await run(
+    `INSERT OR REPLACE INTO iplimit_violation_pending
+       (account_type, username, signal, first_seen, last_seen, hits, detected)
+     VALUES('ssh', ?, ?, ?, ?, ?, ?)`,
+    [user, signal, firstSeen, lastSeen, hits, count]
+  ).catch(() => {});
+  return {
+    candidate: true,
+    confirmed: hits >= SSHWS_HARD_LIMIT_CONFIRM_CYCLES,
+    hits
+  };
+}
+
+async function sampleSshwsHardLimit(username, detected, nowTs) {
+  const count = Math.max(0, Number(detected || 0));
+  return sampleSshwsViolation(
+    username,
+    'sshws-hard-session',
+    count,
+    count > SSHWS_ACCOUNT_SESSION_HARD_LIMIT,
+    nowTs
+  );
+}
+
+async function sampleSshwsIpLimit(username, detected, limit, nowTs) {
+  const count = Math.max(0, Number(detected || 0));
+  const accountLimit = Math.max(0, Number(limit || 0));
+  return sampleSshwsViolation(
+    username,
+    'sshws-real-ip',
+    count,
+    accountLimit > 0 && count > accountLimit,
+    nowTs
+  );
 }
 
 async function enforceExpiredAccounts() {
@@ -10038,6 +10327,7 @@ async function enforceExpiredAccounts() {
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_long_history WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
+    await run("DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND LOWER(username)=LOWER(?)", [user]).catch(() => {});
   }
 
   const xrayTargets = [
@@ -10191,6 +10481,7 @@ async function lockIfExceeded(nowTs) {
   const sshRecentAuthMap = sshUsage.recentAuthMap || new Map();
   const sshProcSessionMap = sshUsage.procSessionMap || new Map();
   const sshWsClientPortMap = sshUsage.wsClientPortMap || new Map();
+  const sshWsIpMap = sshUsage.sshWsIpMap || new Map();
   const sshUdphcSessionMap = sshUsage.udphcSessionMap || new Map();
   const sshUdphcIpMap = sshUsage.udphcIpMap || new Map();
   const sshZivpnSessionMap = sshUsage.zivpnSessionMap || new Map();
@@ -10270,6 +10561,12 @@ async function lockIfExceeded(nowTs) {
     };
     const cntIpRaw = setMaxSize(sshIpMap);
     const cntIp = XRAY_IP_GROUP_MASK < 32 ? countGroupedForMap(sshIpMap) : cntIpRaw;
+    const cntWsIpRaw = setMaxSize(sshWsIpMap);
+    const sshCombinedIpSet = new Set([
+      ...Array.from(setUnionValues(sshIpMap)),
+      ...Array.from(setUnionValues(sshWsIpMap))
+    ]);
+    const cntSshCombinedRaw = sshCombinedIpSet.size;
     const cntSession = setMaxSize(sshSessionMap);
     const cntWsPorts = setMaxSize(sshWsClientPortMap);
     const cntRecent = setMaxSize(sshRecentAuthMap);
@@ -10285,37 +10582,32 @@ async function lockIfExceeded(nowTs) {
     const cntZivpnLiveIpGrouped = XRAY_IP_GROUP_MASK < 32 ? countGroupedForMap(sshZivpnLiveIpMap) : cntZivpnLiveIpRaw;
     const hasLiveZivpn = cntZivpnLive > 0 || cntZivpnLiveIpRaw > 0;
     const cntZivpnRaw = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
-      ? Math.max(cntZivpnLive, cntZivpnLiveIpGrouped)
-      : Math.max(cntZivpn, cntZivpnIpGrouped, cntZivpnLive, cntZivpnLiveIpGrouped);
+      ? cntZivpnLiveIpRaw
+      : Math.max(cntZivpnIpRaw, cntZivpnLiveIpRaw);
+    const cntZivpnGrouped = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
+      ? cntZivpnLiveIpGrouped
+      : Math.max(cntZivpnIpGrouped, cntZivpnLiveIpGrouped);
     // Toleransi dual-stack hanya untuk akun berlimit 1. Akun berlimit >1
     // memakai jumlah realtime sebenarnya agar limit 3 dengan 4 IP tetap lock.
-    let cntZivpnEffective = cntZivpnRaw;
+    let cntZivpnEffective = cntZivpnGrouped;
     if (lim === 1 && cntZivpnRaw > 0 && cntZivpnRaw <= 2) {
       cntZivpnEffective = 1;
     }
-    // Sumber realtime utama:
-    // - ipMap/sessionMap untuk SSH normal
-    // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
-    // - udphcSessionMap/udphcIpMap untuk jalur UDPHC native.
-    const cntActive = Math.max(cntIp, cntSession, cntWsPorts, cntUdphc, cntUdphcIp, cntZivpnEffective);
-    // proc/recent dipakai sebagai fallback kuantitatif (cap proportional terhadap limitip).
-    // recent sudah dedup berdasarkan source IP, jadi tidak overcount karena port reconnect.
-    // Cap = max(3, min(limitip*2, 10)) — minimal 3, maksimal 10, proporsional limit.
-    const hintCap = Math.max(3, Math.min((lim > 0 ? lim : 1) * 2, 10));
-    const cntProcHint = Math.min(Math.max(cntProc, 0), hintCap);
-    const cntRecentHint = Math.min(Math.max(cntRecent, 0), hintCap);
-    // Untuk mode ZIVPN HTTP, hitung final diprioritaskan dari sesi aktif realtime
-    // agar mobile handoff 1 HP (IP cepat berganti) tidak false multi-login karena hint historis.
-    const cntHint = Math.max(cntProcHint, cntRecentHint);
-    const cnt = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
-      ? cntActive
-      : Math.max(cntActive, cntHint);
-    const hardSessionExceeded = cntWsPorts > SSHWS_ACCOUNT_SESSION_HARD_LIMIT;
+    // limitip hanya memakai sinyal IP/device nyata. IP SSHWS dihitung exact
+    // dari state mux, sedangkan sesi/proses/client-port tidak dianggap device.
+    const cntImmediate = Math.max(cntIp, cntUdphcIp, cntZivpnEffective);
+    const cnt = Math.max(cntImmediate, cntSshCombinedRaw);
+    const sshwsIpSample = await sampleSshwsIpLimit(userKey, cntSshCombinedRaw, lim, nowTs);
+    const sshwsIpExceeded = sshwsIpSample.confirmed;
+    // SSHWS menutupi IP asal dengan 127.0.0.1. Jumlah socket hanya menjadi
+    // pengaman abuse terpisah dan wajib bertahan dua siklus pemeriksaan.
+    const sshwsHardSample = await sampleSshwsHardLimit(userKey, cntWsPorts, nowTs);
+    const hardSessionExceeded = sshwsHardSample.confirmed;
     // Long-term IP tracker: deteksi sharing akun dalam 24 jam.
     // Track semua IP yang pernah terlihat dalam 24 jam — kalau > limitip * 3 → abuse.
     const LONG_TERM_HOURS = 24;
     const longTermCutoff = nowTs - (LONG_TERM_HOURS * 3600);
-    const currentUserIps = setUnionValues(sshIpMap);
+    const currentUserIps = sshCombinedIpSet;
     for (const ip of currentUserIps) {
       if (isLoopbackIp(ip)) continue;
       await run(
@@ -10339,9 +10631,10 @@ async function lockIfExceeded(nowTs) {
       ? countIpGroups(longTermIpSet, XRAY_IP_GROUP_MASK)
       : longTermIpSet.size;
     const longTermAbuse = lim > 0 && longTermIpCount > lim * 3;
-    const accountLimitExceeded = (lim > 0 && cnt > lim) || longTermAbuse;
+    const immediateLimitExceeded = lim > 0 && cntImmediate > lim;
+    const accountLimitExceeded = immediateLimitExceeded || sshwsIpExceeded || longTermAbuse;
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntIpRaw=${cntIpRaw} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIpG=${cntZivpnIpGrouped} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIpG=${cntZivpnLiveIpGrouped} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt} hintCap=${hintCap} mask=${XRAY_IP_GROUP_MASK} cnt24h=${longTermIpCount} longTermAbuse=${longTermAbuse ? 1 : 0}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardCandidate=${sshwsHardSample.candidate ? 1 : 0} hardHits=${sshwsHardSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntIpRaw=${cntIpRaw} cntWsIpRaw=${cntWsIpRaw} cntSshCombinedRaw=${cntSshCombinedRaw} wsIpCandidate=${sshwsIpSample.candidate ? 1 : 0} wsIpHits=${sshwsIpSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} wsIpExceeded=${sshwsIpExceeded ? 1 : 0} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIpG=${cntZivpnIpGrouped} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIpG=${cntZivpnLiveIpGrouped} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cntImmediate=${cntImmediate} cntDeviceIp=${cnt} mask=${XRAY_IP_GROUP_MASK} cnt24h=${longTermIpCount} longTermAbuse=${longTermAbuse ? 1 : 0}`);
     }
     if (!accountLimitExceeded && !hardSessionExceeded) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;
@@ -10367,6 +10660,7 @@ async function lockIfExceeded(nowTs) {
         ]));
     const lockIps = Array.from(new Set([
       ...Array.from(setUnionValues(sshIpMap)),
+      ...Array.from(setUnionValues(sshWsIpMap)),
       ...Array.from(setUnionValues(sshUdphcIpMap)),
       ...zivpnLockIps
     ])).filter((ip) => ip && !isLoopbackIp(ip));
@@ -10388,26 +10682,47 @@ async function lockIfExceeded(nowTs) {
     if (udphcSecretChanged) udpcustomChanged = true;
     await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + LOCK_SECONDS, removed]).catch(() => {});
+    await run("DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND username=?", [userKey]).catch(() => {});
     let zivpnNotifyLabel = '';
     if (lim === 1 && cntZivpnRaw === 2 && cntZivpnEffective === 1) {
       zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
     }
-    let lockReasonText = hardSessionExceeded
-      ? `sesi SSHWS aktif melewati batas aman ${SSHWS_ACCOUNT_SESSION_HARD_LIMIT}`
+    const lockBySshwsIp = sshwsIpExceeded && !immediateLimitExceeded && !longTermAbuse;
+    const lockByHardSession = hardSessionExceeded && !accountLimitExceeded;
+    let lockReasonText = lockByHardSession
+      ? `sesi SSHWS aktif melewati batas aman ${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`
       : 'pemakaian perangkat/IP melewati limit akun';
-    if (longTermAbuse && !hardSessionExceeded) {
+    if (lockBySshwsIp) {
+      lockReasonText = `IP asli SSHWS aktif melewati limit akun selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`;
+    }
+    if (longTermAbuse && !lockByHardSession) {
       lockReasonText = `sharing akun terdeteksi: ${longTermIpCount} IP berbeda dalam ${LONG_TERM_HOURS} jam (limit=${lim}, max=${lim * 3})`;
     }
-    const notifyService = hardSessionExceeded ? 'sshws/udpgw' : 'ssh/zivpn';
-    const notifyLimit = accountLimitExceeded ? lim : SSHWS_ACCOUNT_SESSION_HARD_LIMIT;
-    const notifyDetected = hardSessionExceeded ? cntWsPorts : cnt;
+    const ipSourceCounts = [
+      { service: 'ssh', count: cntIp },
+      { service: 'sshws-real-ip', count: cntWsIpRaw },
+      { service: 'udphc', count: cntUdphcIp },
+      { service: 'zivpn', count: cntZivpnEffective }
+    ].sort((a, b) => b.count - a.count);
+    const notifyService = lockByHardSession
+      ? 'sshws'
+      : (lockBySshwsIp ? 'sshws-real-ip' : (ipSourceCounts[0]?.service || 'ssh'));
+    const notifyLimit = lockByHardSession ? SSHWS_ACCOUNT_SESSION_HARD_LIMIT : lim;
+    const notifyDetected = lockByHardSession
+      ? cntWsPorts
+      : (longTermAbuse ? longTermIpCount : (lockBySshwsIp ? cntSshCombinedRaw : cnt));
+    const notifyDetectedRaw = lockByHardSession
+      ? cntWsPorts
+      : (longTermAbuse
+          ? longTermIpSet.size
+          : Math.max(cntIpRaw, cntWsIpRaw, cntSshCombinedRaw, cntUdphcIpRaw, cntZivpnRaw));
     const historyId = await createIpLimitLockHistory({
       account_type: 'ssh',
       service: notifyService,
       username: user,
       limitip: notifyLimit,
       detected: notifyDetected,
-      detected_raw: Math.max(cntZivpnRaw, notifyDetected),
+      detected_raw: notifyDetectedRaw,
       detected_effective: notifyDetected,
       ips: lockIps,
       lock_reason: lockReasonText,
@@ -10426,7 +10741,7 @@ async function lockIfExceeded(nowTs) {
       Number(r.owner_telegram_id || 0) || null,
       Number(r.owner_telegram_chat_id || 0) || null,
       {
-        detected_raw: Math.max(cntZivpnRaw, notifyDetected),
+        detected_raw: notifyDetectedRaw,
         detected_effective: notifyDetected,
         device_detected_label: zivpnNotifyLabel,
         lock_reason: lockReasonText
@@ -15652,7 +15967,7 @@ patch_nginx_realip() {
   local tmp have_map have_ws have_grpc
   have_map=0; have_ws=0; have_grpc=0
   grep -q 'map[[:space:]]\+\$http_cf_connecting_ip[[:space:]]\+\$sc_xray_real_ip' "${NGINX_CONF}" && have_map=1 || true
-  grep -q 'listen[[:space:]]\+127\.0\.0\.1:8080[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_ws=1 || true
+  grep -q 'listen[[:space:]]\+127\.0\.0\.1:8083[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_ws=1 || true
   grep -q 'listen[[:space:]]\+127\.0\.0\.1:8082[[:space:]].*proxy_protocol' "${NGINX_CONF}" && have_grpc=1 || true
   tmp="$(mktemp "$(dirname "${NGINX_CONF}")/.sc-xray-realip-nginx.XXXXXX")"
   awk -v have_map="${have_map}" -v have_ws="${have_ws}" -v have_grpc="${have_grpc}" '
@@ -15690,7 +16005,7 @@ patch_nginx_realip() {
       if (!have_map && !map_added && $0 ~ /^server[[:space:]]*\{/) { print_map(); map_added=1; }
       print;
       if (!have_ws && !ws_added && $0 ~ /^[[:space:]]*listen[[:space:]]+80[[:space:]]*;/) {
-        print "    listen 127.0.0.1:8080 proxy_protocol;"; ws_added=1;
+        print "    listen 127.0.0.1:8083 proxy_protocol;"; ws_added=1;
       }
       if (!have_grpc && !grpc_added && $0 ~ /^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:8081([[:space:]]|;)/) {
         print "    listen 127.0.0.1:8082 proxy_protocol http2;"; grpc_added=1;
@@ -15719,8 +16034,7 @@ patch_haproxy_mode() {
   tmp="$(mktemp "$(dirname "${HAPROXY_CONF}")/.sc-xray-realip-haproxy.XXXXXX")"
   awk -v mode="${mode}" '
     $1=="server" && $2=="nginx_local" {
-      if (mode=="enable") print "    server nginx_local 127.0.0.1:8080 check send-proxy-v2";
-      else print "    server nginx_local 127.0.0.1:80 check";
+      print "    server nginx_local 127.0.0.1:8083 check send-proxy-v2";
       next;
     }
     $1=="server" && $2=="nginx_grpc" {
@@ -15760,7 +16074,7 @@ apply_mode() {
   backup="$(create_backup "xray-realip-${mode}")"
   log_realip "Backup: ${backup}"
   if [[ "${mode}" == "enable" ]]; then
-    for port in 8080 8082; do
+    for port in 8083 8082; do
       if ss -H -lntp 2>/dev/null | awk -v p=":${port}" '$4 ~ (p "$") && $0 !~ /nginx/ { found=1 } END { exit(found ? 0 : 1) }'; then
         restore_backup "${backup}" >/dev/null 2>&1 || true
         die "port internal ${port} sedang dipakai proses lain"
@@ -15790,14 +16104,15 @@ show_status() {
   if [[ -f "${SC_ENV}" ]]; then
     env_mode="$(awk -F= '$1=="XRAY_REAL_IP_ENABLE" {v=$2} END {print v+0}' "${SC_ENV}")"
   fi
-  grep -q 'server nginx_local 127\.0\.0\.1:8080 .*send-proxy' "${HAPROXY_CONF}" 2>/dev/null && route="real-ip" || true
+  grep -q 'server nginx_local 127\.0\.0\.1:8083 .*send-proxy' "${HAPROXY_CONF}" 2>/dev/null && route="proxy-ip" || true
+  [[ "${env_mode}" == "1" && "${route}" == "proxy-ip" ]] && route="real-ip"
   jq -e '.inbounds[]? | select(((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc")) | select((.streamSettings.sockopt.trustedXForwardedFor // []) | index("X-SC-Real-IP-Proxy"))' "${XRAY_CONF}" >/dev/null 2>&1 && trusted="yes" || true
-  ss -H -lnt 2>/dev/null | awk '$4 ~ /:8080$/ {ok=1} END {exit(ok?0:1)}' && ws_listener="yes" || true
+  ss -H -lnt 2>/dev/null | awk '$4 ~ /:8083$/ {ok=1} END {exit(ok?0:1)}' && ws_listener="yes" || true
   ss -H -lnt 2>/dev/null | awk '$4 ~ /:8082$/ {ok=1} END {exit(ok?0:1)}' && grpc_listener="yes" || true
   echo "XRAY_REAL_IP_ENABLE=${env_mode}"
   echo "haproxy_route=${route}"
   echo "xray_trusted_header=${trusted}"
-  echo "nginx_proxy_listener_8080=${ws_listener}"
+  echo "nginx_proxy_listener_8083=${ws_listener}"
   echo "nginx_grpc_listener_8082=${grpc_listener}"
   echo "nginx=$(systemctl is-active nginx 2>/dev/null || true) haproxy=$(systemctl is-active haproxy 2>/dev/null || true) xray=$(systemctl is-active xray 2>/dev/null || true)"
 }
@@ -16350,6 +16665,44 @@ build_xray_alias_hosts() {
   done
 
   echo "${aliases}"
+}
+
+build_sshws_realip_nginx_map() {
+  cat <<'EOF'
+map $proxy_protocol_addr $sc_sshws_peer_ip {
+    "" $remote_addr;
+    default $proxy_protocol_addr;
+}
+geo $sc_sshws_peer_ip $sc_sshws_peer_is_cloudflare {
+    default 0;
+    173.245.48.0/20 1;
+    103.21.244.0/22 1;
+    103.22.200.0/22 1;
+    103.31.4.0/22 1;
+    141.101.64.0/18 1;
+    108.162.192.0/18 1;
+    190.93.240.0/20 1;
+    188.114.96.0/20 1;
+    197.234.240.0/22 1;
+    198.41.128.0/17 1;
+    162.158.0.0/15 1;
+    104.16.0.0/13 1;
+    104.24.0.0/14 1;
+    172.64.0.0/13 1;
+    131.0.72.0/22 1;
+    2400:cb00::/32 1;
+    2606:4700::/32 1;
+    2803:f800::/32 1;
+    2405:b500::/32 1;
+    2405:8100::/32 1;
+    2a06:98c0::/29 1;
+    2c0f:f248::/32 1;
+}
+map "$sc_sshws_peer_is_cloudflare:$http_cf_connecting_ip" $sc_sshws_real_ip {
+    ~^1:.+ $http_cf_connecting_ip;
+    default $sc_sshws_peer_ip;
+}
+EOF
 }
 
 build_xray_public_host() {
@@ -21023,9 +21376,10 @@ change_domain_menu() {
   XRAY_PUBLIC_HOST="$(build_xray_public_host)"
 
   mkdir -p /var/www/html
-  local sshws_nginx_limit_conf sshws_nginx_limit_rules
+  local sshws_nginx_limit_conf sshws_nginx_limit_rules sshws_realip_nginx_map
   sshws_nginx_limit_conf=""
   sshws_nginx_limit_rules=""
+  sshws_realip_nginx_map="$(build_sshws_realip_nginx_map)"
   xray_realip_nginx_map=""
   xray_realip_ws_listener=""
   xray_realip_grpc_listener=""
@@ -21034,9 +21388,9 @@ change_domain_menu() {
   nginx_server_names="$(build_nginx_server_names)"
   if flag_enabled "${SSHWS_NGINX_LIMIT_ENABLE:-1}"; then
     sshws_nginx_limit_conf=$(cat <<EOF_LIMIT
-map \$http_cf_connecting_ip \$sc_sshws_limit_key {
+map \$sc_sshws_real_ip \$sc_sshws_limit_key {
     "" \$binary_remote_addr;
-    default \$http_cf_connecting_ip;
+    default \$sc_sshws_real_ip;
 }
 limit_req_zone \$sc_sshws_limit_key zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
 limit_conn_zone \$sc_sshws_limit_key zone=sc_sshws_conn:10m;
@@ -21077,12 +21431,14 @@ EOF_REALIP
 )
   fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
+${sshws_realip_nginx_map}
 ${sshws_nginx_limit_conf}
 ${xray_realip_nginx_map}
 
 server {
     listen 80;
     listen [::]:80;
+    listen 127.0.0.1:8083 proxy_protocol;
 ${xray_realip_ws_listener}
     server_name ${nginx_server_names};
     keepalive_timeout 30;
@@ -21099,6 +21455,7 @@ ${xray_realip_ws_listener}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-SC-SSHWS-IP \$sc_sshws_real_ip;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -21251,6 +21608,7 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-SC-SSHWS-IP \$sc_sshws_real_ip;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -21267,6 +21625,7 @@ ${sshws_nginx_limit_rules}
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_set_header X-SC-SSHWS-IP \$sc_sshws_real_ip;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
         proxy_connect_timeout 60s;
@@ -21350,10 +21709,10 @@ EONGINX
     haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
-    xray_ws_backend_line="    server nginx_local 127.0.0.1:8080 check send-proxy-v2"
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check send-proxy-v2"
     xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check send-proxy-v2"
   else
-    xray_ws_backend_line="    server nginx_local 127.0.0.1:80 check"
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check send-proxy-v2"
     xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check"
   fi
 
@@ -21419,7 +21778,7 @@ ${xray_grpc_backend_line}
 backend bk_sshws_tls
     mode tcp
     # Jalur khusus HTTP Custom SSL-only (payload CONNECT) langsung ke sshws mux.
-    server sshws_local 127.0.0.1:2082 check
+    server sshws_local 127.0.0.1:2082 check send-proxy
 EOHAP
 
   mkdir -p /etc/systemd/system/haproxy.service.d
@@ -24852,7 +25211,7 @@ write_version_marker() {
 post_install_preflight() {
   local fw zstat ustat xstat apistat wsstat zport uport range_nft nat_ok extra_nat_ok extra_ports p udpgw7300 udpgw7200
   local udp_socket_dump tcp_socket_dump zlisten ulisten udpgw7200_listen udpgw7300_listen
-  local udpgw7200_access udpgw7300_access udpgw_mode
+  local udpgw7200_access udpgw7300_access udpgw_mode sshws_realip_status
   fw="$(fw_backend_kind)"
   zstat="$(systemctl is-active "${ZIVPN_SERVICE_NAME}" 2>/dev/null || true)"
   ustat="$(systemctl is-active "${UDPCUSTOM_SERVICE_NAME}" 2>/dev/null || true)"
@@ -24938,12 +25297,19 @@ post_install_preflight() {
     esac
   done
   [[ -z "${extra_nat_ok}" ]] && extra_nat_ok="none"
+  sshws_realip_status="NO"
+  if grep -qE 'server[[:space:]]+nginx_local[[:space:]]+127\.0\.0\.1:8083.*send-proxy' /etc/haproxy/haproxy.cfg 2>/dev/null &&
+     grep -qE 'server[[:space:]]+sshws_local[[:space:]]+127\.0\.0\.1:2082.*send-proxy' /etc/haproxy/haproxy.cfg 2>/dev/null &&
+     grep -q 'X-SC-SSHWS-IP' /etc/nginx/sites-available/sc-1forcr.conf 2>/dev/null; then
+    sshws_realip_status="READY"
+  fi
 
   cat <<EOF
 
 === PREFLIGHT CHECK ===
 - firewall backend : ${fw}
 - xray/api/sshws   : ${xstat}/${apistat}/${wsstat}
+- sshws real-ip    : ${sshws_realip_status}
 - zivpn/udphc      : ${zstat}/${ustat}
 - udpgw 7200/7300 : ${udpgw7200}/${udpgw7300}
 - udpgw mode       : ${udpgw_mode}
@@ -25117,6 +25483,21 @@ restart_update_safe_services() {
     systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
     systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
   fi
+}
+
+SSHWS_REALIP_RUNTIME_RESTARTED="0"
+activate_sshws_realip_runtime_if_needed() {
+  local haproxy_conf="/etc/haproxy/haproxy.cfg"
+  if grep -qE 'server[[:space:]]+nginx_local[[:space:]]+127\.0\.0\.1:8083.*send-proxy' "${haproxy_conf}" 2>/dev/null &&
+     grep -qE 'server[[:space:]]+sshws_local[[:space:]]+127\.0\.0\.1:2082.*send-proxy' "${haproxy_conf}" 2>/dev/null; then
+    return 0
+  fi
+
+  log "Migrasi real-IP SSHWS: restart bridge dan HAProxy satu kali (sesi SSHWS akan reconnect)."
+  systemctl restart sc-1forcr-sshws.service || return 1
+  setup_haproxy_tls_mux || return 1
+  systemctl is-active --quiet sc-1forcr-sshws.service haproxy.service nginx.service || return 1
+  SSHWS_REALIP_RUNTIME_RESTARTED="1"
 }
 
 install_legacy_runtime_command_shims() {
@@ -26249,7 +26630,7 @@ main() {
       UPDATE_TRANSACTION_SNAPSHOT="$(/usr/local/sbin/sc-1forcr-update-manager snapshot "safe-update-${SCRIPT_VERSION}")"
     fi
     trap rollback_update_transaction_on_exit EXIT
-    log "Mode update aman aktif: Xray/SSH/SSHWS/HAProxy tidak direstart; UDPGW hanya direstart jika unit berubah."
+    log "Mode update aman aktif: layanan inti dipertahankan; migrasi real-IP SSHWS dapat restart bridge/HAProxy satu kali."
     # Migrasi XRAY_IP_GROUP_MASK 24->16 (hanya jika masih default lama)
     if [[ "${XRAY_IP_GROUP_MASK:-24}" == "24" ]]; then
       XRAY_IP_GROUP_MASK="16"
@@ -26270,6 +26651,7 @@ main() {
     build_go_files
     write_iplimit_checker
     setup_services
+    activate_sshws_realip_runtime_if_needed
     setup_license_guard
     setup_auto_reboot_timer
     setup_auto_backup_timer
@@ -26292,7 +26674,11 @@ main() {
     /usr/local/sbin/sc-1forcr-update-manager commit "${UPDATE_TRANSACTION_SNAPSHOT}" "${SCRIPT_VERSION}"
     UPDATE_TRANSACTION_COMMITTED="1"
     trap - EXIT
-    log "Update aman selesai. Xray/SSH/SSHWS/HAProxy aktif tidak direstart."
+    if [[ "${SSHWS_REALIP_RUNTIME_RESTARTED:-0}" == "1" ]]; then
+      log "Update aman selesai. Migrasi real-IP SSHWS aktif; bridge/HAProxy tadi direstart satu kali."
+    else
+      log "Update aman selesai. Xray/SSH/SSHWS/HAProxy aktif tidak direstart."
+    fi
     return 0
   fi
   if [[ -f "${SCRIPT_SELF_PATH}" ]]; then

@@ -11575,6 +11575,18 @@ LICENSE_GUARD_WRAPPER_EOF
     log "Signed license lease gagal diverifikasi: ${guard_check_output:-alasan tidak tersedia}"
     return 1
   fi
+  # Sinkronkan key/license terkini ke env file yang dibaca unit systemd dan API runtime,
+  # agar resume install dengan key hasil rotasi tidak memakai nilai lama.
+  update_sc_env_var "SC_UPDATE_KEY" "${SC_UPDATE_KEY}" 2>/dev/null || true
+  update_sc_env_var "API_AUTH_TOKEN" "${API_AUTH_TOKEN}" 2>/dev/null || true
+  update_sc_env_var "AUTH_TOKEN" "${AUTH_TOKEN}" 2>/dev/null || true
+  update_sc_env_var "LICENSE_API_URL" "${LICENSE_API_URL}" 2>/dev/null || true
+  update_sc_env_var "LICENSE_KEY" "${LICENSE_KEY}" 2>/dev/null || true
+  update_sc_env_var "LICENSE_LEASE_FILE" "${LICENSE_LEASE_FILE}" 2>/dev/null || true
+  update_sc_env_var "LICENSE_PUBLIC_KEY_FILE" "${LICENSE_PUBLIC_KEY_FILE}" 2>/dev/null || true
+  update_sc_env_var "LICENSE_REQUIRED_MARKER" "${LICENSE_REQUIRED_MARKER}" 2>/dev/null || true
+  update_app_env_var "API_AUTH_TOKEN" "${API_AUTH_TOKEN}" 2>/dev/null || true
+  update_app_env_var "AUTH_TOKEN" "${AUTH_TOKEN}" 2>/dev/null || true
   printf 'required=1\nversion=1\n' > "${LICENSE_REQUIRED_MARKER}"
   chmod 600 "${LICENSE_REQUIRED_MARKER}"
 

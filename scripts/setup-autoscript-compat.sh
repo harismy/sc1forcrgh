@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
-# Target OS: Debian 10+ / Ubuntu 22+ (Ubuntu 20 tetap kompatibel)
+# Target OS: Debian 10+ / Ubuntu 20+ (22.04 / 24.04 / 26.04 kompatibel)
 #
 # Fitur:
 # - SSH
@@ -1344,27 +1344,61 @@ install_base_packages() {
 }
 
 install_node_if_missing() {
+  local node_major node_arch node_ver node_url tmpdir
   if command -v node >/dev/null 2>&1; then
     log "Node sudah ada: $(node -v)"
     return
   fi
-  log "Install Node.js (prioritas 20, fallback 18)..."
+  log "Install Node.js (prioritas NodeSource 20, fallback 22/18)..."
   apt_get_safe update -y
   apt_get_safe install -y curl ca-certificates gnupg
-  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt_get_safe install -y nodejs; then
-    log "Node terpasang: $(node -v)"
-    return
+  for node_major in 20 22 18; do
+    log "Coba install Node.js ${node_major} (NodeSource)..."
+    if curl -fsSL "https://deb.nodesource.com/setup_${node_major}.x" | bash - && apt_get_safe install -y nodejs; then
+      log "Node terpasang: $(node -v)"
+      return
+    fi
+    log "Node ${node_major} gagal/tidak tersedia, coba versi berikutnya..."
+    apt_get_safe purge -y nodejs >/dev/null 2>&1 || true
+    rm -f /etc/apt/sources.list.d/nodesource.list
+  done
+
+  log "NodeSource tidak mendukung distro ini. Fallback: paket nodejs dari repo distro..."
+  apt_get_safe update -y
+  if apt-cache show nodejs >/dev/null 2>&1 && apt_get_safe install -y nodejs npm; then
+    if command -v node >/dev/null 2>&1; then
+      log "Node terpasang dari repo distro: $(node -v)"
+      return
+    fi
   fi
 
-  log "Node 20 gagal/kurang kompatibel, fallback ke Node 18..."
-  apt_get_safe purge -y nodejs >/dev/null 2>&1 || true
-  rm -f /etc/apt/sources.list.d/nodesource.list
-  if curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt_get_safe install -y nodejs; then
-    log "Node terpasang: $(node -v)"
-    return
+  log "Fallback terakhir: binary resmi Node.js dari nodejs.org (linux)..."
+  case "$(uname -m)" in
+    x86_64) node_arch="x64" ;;
+    aarch64|arm64) node_arch="arm64" ;;
+    *) node_arch="" ;;
+  esac
+  if [[ -n "${node_arch}" ]]; then
+    if node_ver="$(curl -fsSL --connect-timeout 15 --max-time 60 "https://nodejs.org/dist/latest-v22.x/" 2>/dev/null | grep -oE "node-v22\.[0-9]+\.[0-9]+-linux-${node_arch}\.tar\.xz" | head -n1)"; then
+      node_url="https://nodejs.org/dist/latest-v22.x/${node_ver}"
+      tmpdir="$(mktemp -d)"
+      log "Download ${node_url}"
+      if curl -fL --connect-timeout 15 --max-time 300 --retry 3 "${node_url}" -o "${tmpdir}/${node_ver}" \
+        && tar -xJf "${tmpdir}/${node_ver}" -C "${tmpdir}" \
+        && cp -a "${tmpdir}"/node-v22.*-linux-"${node_arch}"/. /usr/local/; then
+        rm -rf "${tmpdir}" >/dev/null 2>&1 || true
+        hash -r
+        if command -v node >/dev/null 2>&1; then
+          log "Node terpasang dari binary resmi: $(node -v)"
+          return
+        fi
+      else
+        rm -rf "${tmpdir}" >/dev/null 2>&1 || true
+      fi
+    fi
   fi
 
-  echo "Gagal install Node.js dari NodeSource (20/18)."
+  echo "Gagal install Node.js (NodeSource 20/22/18, repo distro, dan binary resmi)."
   exit 1
 }
 
@@ -1664,8 +1698,10 @@ EOF
           if [[ -x ./dropbearkey ]]; then
             cp -f ./dropbearkey /usr/local/bin/dropbearkey-sc1
           fi
-        )
-        chmod 755 "${custom_bin}"
+        ) || log "Warning: build Dropbear ${DROPBEAR_VERSION} gagal (kemungkinan toolchain baru). Fallback ke binary bawaan sistem."
+        if [[ -x "${custom_bin}" ]]; then
+          chmod 755 "${custom_bin}"
+        fi
       else
         log "Warning: gagal extract source Dropbear. Fallback ke binary bawaan sistem."
       fi
@@ -12265,7 +12301,7 @@ setup_udpgw_service_if_possible() {
       cd badvpn
       mkdir -p build
       cd build
-      cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null
+      cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_C_FLAGS=-fcommon >/dev/null
       make -j"$(nproc)" >/dev/null
       install -m 755 udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
     ) || true
@@ -24721,7 +24757,7 @@ apply_dropbear_version_with_lock() {
     return 1
   fi
 
-  (
+  if ! (
     cd "${build_dir}"
     ./configure --prefix=/usr/local --sysconfdir=/etc/dropbear
     make -j"$(nproc || echo 1)"
@@ -24729,7 +24765,10 @@ apply_dropbear_version_with_lock() {
     if [[ -x ./dropbearkey ]]; then
       cp -f ./dropbearkey /usr/local/bin/dropbearkey-sc1
     fi
-  )
+  ); then
+    echo "Build Dropbear ${ver} gagal. Versi lama belum tentu cocok dengan toolchain sistem ini."
+    return 1
+  fi
   chmod 755 "${custom_bin}"
 
   mkdir -p /etc/dropbear
@@ -26726,6 +26765,9 @@ rollback_update_transaction_on_exit() {
 
 main() {
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  if [[ "${INSTALL_LOG_DISABLE:-0}" != "1" ]]; then
+    exec > >(tee -a "/var/lib/sc-1forcr/install.log") 2>&1
+  fi
   if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then
     install_update_manager
     if [[ -n "${UPDATE_TRANSACTION_SNAPSHOT}" ]]; then

@@ -783,6 +783,8 @@ app.get('/health', async (_req, res) => {
 
 async function sendInstallerScript(req, res) {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
     const allowDomain = await isDomainAllowed(req);
     if (!allowDomain) {
       return res.status(403).type('text/plain').send('Forbidden domain');
@@ -912,7 +914,7 @@ download_installer_payload() {
 repair_dpkg_state || true
 ensure_curl_ready
 echo "Mengunduh installer utama..."
-download_installer_payload "${sourceUrl}" "$TMP_SC"
+download_installer_payload "${sourceUrl}?ts=$(date +%s)" "$TMP_SC"
 if ! head -n 1 "$TMP_SC" | grep -q '^#!'; then
   echo "Installer utama tidak valid atau gagal diunduh."
   exit 1
@@ -941,6 +943,8 @@ app.get('/sc1forcr/installer.sh', sendInstallerScript);
 
 app.get('/sc1forcr/payload/setup-autoscript-compat.sh', async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
     const allowDomain = await isDomainAllowed(req);
     if (!allowDomain) return res.status(403).type('text/plain').send('Forbidden domain');
     const ip = getClientIp(req);
@@ -965,6 +969,8 @@ app.get('/sc1forcr/payload/setup-autoscript-compat.sh', async (req, res) => {
 
 app.get('/sc1forcr/payload/scripts/setup-autoscript-compat.sh', async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
     const allowDomain = await isDomainAllowed(req);
     if (!allowDomain) return res.status(403).type('text/plain').send('Forbidden domain');
     const ip = getClientIp(req);
@@ -989,6 +995,8 @@ app.get('/sc1forcr/payload/scripts/setup-autoscript-compat.sh', async (req, res)
 
 app.get('/sc1forcr/payload/scripts/setup-summary-api.sh', async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.set('Pragma', 'no-cache');
     const allowDomain = await isDomainAllowed(req);
     if (!allowDomain) return res.status(403).type('text/plain').send('Forbidden domain');
     const ip = getClientIp(req);

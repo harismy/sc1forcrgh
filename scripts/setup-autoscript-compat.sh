@@ -11569,7 +11569,7 @@ LICENSE_GUARD_WRAPPER_EOF
     LICENSE_LEASE_FILE="${LICENSE_LEASE_FILE}" \
     LICENSE_PUBLIC_KEY_FILE="${LICENSE_PUBLIC_KEY_FILE}" \
     LICENSE_REQUIRED_MARKER="${LICENSE_REQUIRED_MARKER}" \
-      /usr/local/sbin/sc-1forcr-license-guard check --json 2>&1
+      /usr/local/sbin/sc-1forcr-license-guard refresh --json 2>&1
   )"; then
     guard_check_output="$(printf '%s' "${guard_check_output}" | tr '\r\n' ' ' | cut -c1-900)"
     log "Signed license lease gagal diverifikasi: ${guard_check_output:-alasan tidak tersedia}"

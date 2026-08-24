@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.35}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.36}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -11302,7 +11302,7 @@ async function loadEnforceableXrayRows(table, secretColumn, protocol) {
 
 function readXrayConfigAuthSnapshot() {
   const snapshot = {
-    emails: new Set(),
+    emails: { vmess: new Set(), vless: new Set(), trojan: new Set() },
     credentials: { vmess: new Set(), vless: new Set(), trojan: new Set() },
     configsRead: 0
   };
@@ -11324,7 +11324,7 @@ function readXrayConfigAuthSnapshot() {
             protocol === 'trojan' ? client?.password : client?.id,
             secretColumn
           );
-          if (email) snapshot.emails.add(email);
+          if (email) snapshot.emails[protocol].add(email);
           if (credential) snapshot.credentials[protocol].add(credential);
         }
       }
@@ -11352,11 +11352,11 @@ function stopXrayFailClosed(reason) {
 
 function restartXrayChecked() {
   const restarted = safeExec('systemctl', ['restart', 'xray']) || safeExec('service', ['xray', 'restart']);
-  const active = safeExec('systemctl', ['is-active', '--quiet', 'xray']) || safeExec('service', ['xray', 'status']);
-  if (!restarted || !active) return false;
+  if (!restarted) return false;
   const requiredPorts = [10001, 10002, 10003, 11001, 11002, 11003];
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    if (requiredPorts.every(isTcpPortListening)) return true;
+    const active = safeExec('systemctl', ['is-active', '--quiet', 'xray']) || safeExec('service', ['xray', 'status']);
+    if (active && requiredPorts.every(isTcpPortListening)) return true;
     safeExec('sleep', ['0.25']);
   }
   return false;
@@ -11390,6 +11390,28 @@ function applyXrayConfigAndRestart(cfg) {
   }
 }
 
+function findLockedXrayUsersInSnapshot(lockedRows, snapshot) {
+  const rows = Array.isArray(lockedRows) ? lockedRows : [];
+  if (!rows.length) return { changed: false, users: [] };
+  if (!snapshot || snapshot.configsRead === 0) {
+    return {
+      changed: true,
+      users: rows.map((row) => String(row?.username || '').trim()).filter(Boolean)
+    };
+  }
+
+  const leaked = [];
+  for (const row of rows) {
+    const protocol = String(row?.account_type || '').trim().toLowerCase();
+    const username = String(row?.username || '').trim().toLowerCase();
+    const credential = normalizeXrayCredential(row?.credential, protocol === 'trojan' ? 'password' : 'uuid');
+    if (snapshot.emails[protocol]?.has(username) || (credential && snapshot.credentials[protocol]?.has(credential))) {
+      leaked.push(username);
+    }
+  }
+  return { changed: leaked.length > 0, users: Array.from(new Set(leaked)) };
+}
+
 async function detectLockedUsersStillInXrayConfig() {
   const lockedRows = await all(
     "SELECT 'vmess' AS account_type, LOWER(username) AS username, LOWER(TRIM(COALESCE(uuid,''))) AS credential FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA','EXPIRED') " +
@@ -11397,25 +11419,7 @@ async function detectLockedUsersStillInXrayConfig() {
     "UNION ALL SELECT 'trojan' AS account_type, LOWER(username) AS username, TRIM(COALESCE(password,'')) AS credential FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA','EXPIRED')"
   ).catch(() => []);
   if (!lockedRows.length) return { changed: false, users: [] };
-
-  const snapshot = readXrayConfigAuthSnapshot();
-  if (snapshot.configsRead === 0) {
-    return {
-      changed: true,
-      users: lockedRows.map((row) => String(row?.username || '').trim()).filter(Boolean)
-    };
-  }
-
-  const leaked = [];
-  for (const row of lockedRows) {
-    const protocol = String(row?.account_type || '').trim().toLowerCase();
-    const username = String(row?.username || '').trim().toLowerCase();
-    const credential = normalizeXrayCredential(row?.credential, protocol === 'trojan' ? 'password' : 'uuid');
-    if (snapshot.emails.has(username) || (credential && snapshot.credentials[protocol]?.has(credential))) {
-      leaked.push(username);
-    }
-  }
-  return { changed: leaked.length > 0, users: Array.from(new Set(leaked)) };
+  return findLockedXrayUsersInSnapshot(lockedRows, readXrayConfigAuthSnapshot());
 }
 
 function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {

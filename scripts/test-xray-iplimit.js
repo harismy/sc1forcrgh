@@ -55,6 +55,8 @@ globalThis.__xrayPolicy = {
   normalizeMultiLoginEvidence,
   xrayViolationSignal,
   selectEnforceableXrayRows,
+  readXrayConfigAuthSnapshot,
+  findLockedXrayUsersInSnapshot,
   buildXrayRuntimeConfig,
   defaults: {
     checkInterval: CHECK_INTERVAL_MINUTES,
@@ -144,6 +146,37 @@ const trojanCaseRows = JSON.parse(JSON.stringify(policy.selectEnforceableXrayRow
 ], 'password')));
 assert.strictEqual(trojanCaseRows.rows.length, 1, 'Trojan password comparison must remain case-sensitive');
 
+const snapshotFunctionSource = policy.readXrayConfigAuthSnapshot.toString();
+assert(snapshotFunctionSource.includes('emails: { vmess: new Set(), vless: new Set(), trojan: new Set() }'));
+assert(snapshotFunctionSource.includes('snapshot.emails[protocol].add(email)'));
+assert(installer.includes('snapshot.emails[protocol]?.has(username)'));
+assert(!installer.includes('snapshot.emails.has(username)'));
+const crossProtocolUsernameSnapshot = {
+  configsRead: 1,
+  emails: { vmess: new Set(), vless: new Set(['shared-user']), trojan: new Set() },
+  credentials: {
+    vmess: new Set(),
+    vless: new Set(['bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb']),
+    trojan: new Set()
+  }
+};
+const lockedVmessRows = [{
+  account_type: 'vmess',
+  username: 'shared-user',
+  credential: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+}];
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(policy.findLockedXrayUsersInSnapshot(lockedVmessRows, crossProtocolUsernameSnapshot))),
+  { changed: false, users: [] },
+  'the same username in another protocol must not trigger fail-closed'
+);
+crossProtocolUsernameSnapshot.emails.vmess.add('shared-user');
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(policy.findLockedXrayUsersInSnapshot(lockedVmessRows, crossProtocolUsernameSnapshot))),
+  { changed: true, users: ['shared-user'] },
+  'the same username in the locked protocol must still be treated as a leak'
+);
+
 const sameCarrierGroup = policy.xrayViolationSignal(new Set(['140.213.1.1', '140.213.200.2']));
 assert.strictEqual(
   sameCarrierGroup,
@@ -215,6 +248,7 @@ assert(installer.includes('20-sc-managed-config.conf'));
 assert(installer.includes('write_iplimit_checker() {\n  log "Menulis checker limit IP otomatis..."\n  configure_xray_managed_runtime'));
 assert(installer.includes('/usr/local/etc/xray/.config.${process.pid}.tmp.json'));
 assert(!installer.includes('const primaryTmpPath = `${primaryPath}.tmp`;'));
+assert(installer.includes("if (active && requiredPorts.every(isTcpPortListening)) return true;"));
 assert(installer.includes('stopXrayFailClosed(`locked credential remains in config users='));
 assert(installer.includes("throw new Error('Xray lock enforcement verification failed.')"));
 const xrayLockStatusIndex = installer.indexOf("await run(`UPDATE ${item.table} SET status='LOCK_TMP'");

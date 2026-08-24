@@ -51,6 +51,8 @@ globalThis.__xrayPolicy = {
   selectXrayRecentIpMap,
   countIpGroups,
   countXrayEffectiveDevices,
+  xrayRepresentativeIps,
+  normalizeMultiLoginEvidence,
   xrayViolationSignal,
   defaults: {
     checkInterval: CHECK_INTERVAL_MINUTES,
@@ -140,9 +142,36 @@ assert.strictEqual(
   'IPv6 privacy addresses in one /64 must count as one device'
 );
 
+const rawXrayIps = [
+  '140.213.1.1',
+  '140.213.200.2',
+  '182.5.1.1',
+  '182.5.100.2',
+  '182.5.200.3'
+];
+assert.deepStrictEqual(
+  Array.from(policy.xrayRepresentativeIps(new Set(rawXrayIps), 16)).sort(),
+  ['140.213.1.1', '182.5.1.1'],
+  'webhook IP list must contain one representative per effective Xray network'
+);
+const webhookEvidence = JSON.parse(JSON.stringify(policy.normalizeMultiLoginEvidence(
+  'VMESS',
+  2,
+  rawXrayIps,
+  { detected_raw: 5, detected_effective: 2 }
+)));
+assert.deepStrictEqual(webhookEvidence, {
+  effective: 2,
+  reportedRaw: 2,
+  observedRaw: 5,
+  ips: ['140.213.1.1', '182.5.1.1'],
+  label: '2 jaringan aktif (5 IP mentah teramati; IP operator/dual-stack digabung)'
+});
+
 assert(installer.includes('const hasSocketEvidence = xrayLive.available && liveSocketCount > 0;'));
 assert(installer.includes('const hasStrongLogEvidence = cnt > 0 && lockIpSet.size > 0;'));
 assert(installer.includes('const hasLiveEvidence = hasSocketEvidence || hasStrongLogEvidence;'));
+assert(installer.includes('observed_ip_raw_count: evidence.observedRaw'));
 assert(installer.includes('if (!violation.confirmed) continue;'));
 assert(installer.includes('active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);'));
 assert(installer.includes('else out="OFFLINE";'));

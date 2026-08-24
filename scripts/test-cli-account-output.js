@@ -68,6 +68,6 @@ assert(menuSource.includes('.data.link.grpc'), 'gRPC link must come from the API
 assert(menuSource.includes('.data.link.uptls'), 'upgrade TLS link must come from the API response');
 assert(menuSource.includes('.data.city // .data.location.city'), 'VPS city must come from the API response');
 assert(menuSource.includes('.data.isp // .data.location.isp'), 'VPS ISP must come from the API response');
-assert(installer.includes('SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.31}"'));
+assert(installer.includes('SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.32}"'));
 
 console.log('CLI account output tests: OK');

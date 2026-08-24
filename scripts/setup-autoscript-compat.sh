@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.31}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.32}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -8109,6 +8109,31 @@ async function notifyAccountBotMultiLogin(event) {
   }
 }
 
+function normalizeMultiLoginEvidence(service, detected, ips = [], extra = null) {
+  const serviceKey = String(service || '').trim().toLowerCase();
+  const isXray = ['vmess', 'vless', 'trojan'].includes(serviceKey);
+  const sourceIps = Array.from(new Set(
+    (Array.isArray(ips) ? ips : []).map((ip) => String(ip || '').trim()).filter(Boolean)
+  ));
+  const effective = Math.max(0, Number(extra?.detected_effective || detected || 0));
+  const observedRaw = Math.max(0, Number(extra?.observed_ip_raw_count || extra?.detected_raw || sourceIps.length || effective));
+  const displayIps = isXray
+    ? xrayRepresentativeIps(new Set(sourceIps), XRAY_IP_GROUP_MASK)
+    : sourceIps;
+  return {
+    effective,
+    // Beberapa webhook lama menampilkan detected_raw sebagai jumlah device.
+    // Untuk Xray field legacy ini harus mengikuti hasil grouping efektif.
+    reportedRaw: isXray ? effective : observedRaw,
+    observedRaw,
+    ips: displayIps.slice(0, 8),
+    label: String(extra?.device_detected_label || '').trim()
+      || (isXray && observedRaw > effective
+        ? `${effective} jaringan aktif (${observedRaw} IP mentah teramati; IP operator/dual-stack digabung)`
+        : '')
+  };
+}
+
 function buildMultiLoginMessage(event) {
   const list = Array.isArray(event?.ips) ? event.ips.filter(Boolean).slice(0, 8) : [];
   return (
@@ -8120,6 +8145,7 @@ function buildMultiLoginMessage(event) {
     `Username : ${String(event?.username || '-')}\n` +
     `Limit IP : ${Number(event?.limitip || 0)}\n` +
     `Detected : ${Number(event?.detected || 0)}\n` +
+    `${Number(event?.observed_ip_raw_count || 0) > Number(event?.detected || 0) ? `IP Audit : ${Number(event.observed_ip_raw_count)} mentah\n` : ''}` +
     `${event?.lock_reason ? `Reason   : ${event.lock_reason}\n` : ''}` +
     `${event?.device_detected_label ? `Info     : ${event.device_detected_label}\n` : ''}` +
     `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
@@ -8190,11 +8216,9 @@ async function deliverMultiLoginNotifications(event, historyId = 0, previous = n
 
 async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null, extra = null, historyId = 0) {
   try {
-    const list = Array.isArray(ips) ? ips.filter(Boolean).slice(0, 8) : [];
     const ownerIdNum = Number(ownerId || 0);
     const ownerChatIdNum = Number(ownerChatId || 0);
-    const rawDetected = Number(extra?.detected_raw || 0);
-    const effectiveDetected = Number(extra?.detected_effective || Number(detected || 0));
+    const evidence = normalizeMultiLoginEvidence(service, detected, ips, extra);
     const event = {
       event: 'MULTI_LOGIN',
       action: 'LOCK_TMP',
@@ -8202,12 +8226,13 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       service: String(service || '-').toUpperCase(),
       username: String(username || '-'),
       limitip: Number(limitip || 0),
-      detected: Number(detected || 0),
-      detected_raw: rawDetected > 0 ? rawDetected : null,
-      detected_effective: effectiveDetected > 0 ? effectiveDetected : Number(detected || 0),
-      device_detected_label: String(extra?.device_detected_label || '').trim() || null,
+      detected: evidence.effective,
+      detected_raw: evidence.reportedRaw > 0 ? evidence.reportedRaw : null,
+      detected_effective: evidence.effective,
+      observed_ip_raw_count: evidence.observedRaw > 0 ? evidence.observedRaw : null,
+      device_detected_label: evidence.label || null,
       lock_reason: String(extra?.lock_reason || '').trim() || null,
-      ips: list,
+      ips: evidence.ips,
       unlock_minutes: Number(LOCK_MINUTES || 15),
       owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
       owner_telegram_chat_id: ownerChatIdNum > 0 ? ownerChatIdNum : (ownerIdNum > 0 ? ownerIdNum : null),
@@ -9220,6 +9245,24 @@ function countXrayEffectiveDevices(ipSet, mask) {
   return ipv4Groups.size + ipv6Groups.size;
 }
 
+function xrayRepresentativeIps(ipSet, mask) {
+  const ipv4 = new Map();
+  const ipv6 = new Map();
+  for (const ipRaw of ipSet || []) {
+    const ip = String(ipRaw || '').trim().toLowerCase();
+    if (!ip) continue;
+    const group = ipSubnetPrefix(ip, mask);
+    if (!group) continue;
+    const target = ip.includes(':') ? ipv6 : ipv4;
+    if (!target.has(group)) target.set(group, ip);
+  }
+  let selected = ipv4;
+  if (ipv4.size === 0 || ipv6.size > ipv4.size) selected = ipv6;
+  return Array.from(selected.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, ip]) => ip);
+}
+
 function xrayViolationSignal(ipSet) {
   const groups = Array.from(new Set(
     Array.from(ipSet || [])
@@ -9880,19 +9923,26 @@ async function retryPendingLockNotifications(nowTs) {
       const parsed = JSON.parse(String(row?.ips_json || '[]'));
       if (Array.isArray(parsed)) ips = parsed;
     } catch (_) {}
+    const service = String(row?.service || row?.account_type || '-').toUpperCase();
+    const evidence = normalizeMultiLoginEvidence(service, Number(row?.detected || 0), ips, {
+      detected_raw: Number(row?.detected_raw || 0),
+      detected_effective: Number(row?.detected_effective || row?.detected || 0),
+      device_detected_label: String(row?.device_detected_label || '')
+    });
     const event = {
       event: 'MULTI_LOGIN',
       action: 'LOCK_TMP',
       source_domain: DOMAIN || null,
-      service: String(row?.service || row?.account_type || '-').toUpperCase(),
+      service,
       username: String(row?.username || '-'),
       limitip: Number(row?.limitip || 0),
-      detected: Number(row?.detected || 0),
-      detected_raw: Number(row?.detected_raw || 0) || null,
-      detected_effective: Number(row?.detected_effective || row?.detected || 0),
-      device_detected_label: String(row?.device_detected_label || '') || null,
+      detected: evidence.effective,
+      detected_raw: evidence.reportedRaw > 0 ? evidence.reportedRaw : null,
+      detected_effective: evidence.effective,
+      observed_ip_raw_count: evidence.observedRaw > 0 ? evidence.observedRaw : null,
+      device_detected_label: evidence.label || null,
       lock_reason: String(row?.lock_reason || '') || null,
-      ips,
+      ips: evidence.ips,
       unlock_minutes: Math.max(1, Math.ceil((Number(row?.locked_until || 0) - Number(row?.locked_at || 0)) / 60)),
       owner_telegram_id: Number(row?.owner_telegram_id || 0) || null,
       owner_telegram_chat_id: Number(row?.owner_telegram_chat_id || 0) || null,

@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.34}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.35}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -7909,6 +7909,7 @@ build_go_files() {
 
 write_iplimit_checker() {
   log "Menulis checker limit IP otomatis..."
+  configure_xray_managed_runtime
   cat > "${APP_DIR}/iplimit-checker.js" <<'EOF'
 const fs = require('fs');
 const http = require('http');
@@ -8006,6 +8007,18 @@ function parseXrayPathList(raw, fallback) {
 const XRAY_PATH_VMESS = parseXrayPathList(process.env.XRAY_PATHS_VMESS, '/vmess')[0];
 const XRAY_PATH_VLESS = parseXrayPathList(process.env.XRAY_PATHS_VLESS, '/vless')[0];
 const XRAY_PATH_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/trojan')[0];
+const XRAY_REAL_IP_ENABLE = /^(1|true|yes|on)$/i.test(String(process.env.XRAY_REAL_IP_ENABLE || '0').trim());
+const XRAY_TRUSTED_PROXY_HEADER = 'X-SC-Real-IP-Proxy';
+function withXrayRealIp(streamSettings) {
+  if (!XRAY_REAL_IP_ENABLE) return streamSettings;
+  return {
+    ...streamSettings,
+    sockopt: {
+      ...(streamSettings?.sockopt || {}),
+      trustedXForwardedFor: [XRAY_TRUSTED_PROXY_HEADER]
+    }
+  };
+}
 const XRAY_OUTBOUND_DOMAIN_STRATEGY = (() => {
   const value = String(process.env.XRAY_OUTBOUND_DOMAIN_STRATEGY || 'AsIs').trim().toLowerCase();
   if (value === 'asis') return 'AsIs';
@@ -11405,12 +11418,8 @@ async function detectLockedUsersStillInXrayConfig() {
   return { changed: leaked.length > 0, users: Array.from(new Set(leaked)) };
 }
 
-async function rebuildXrayFromDb() {
-  const vmessRows = await loadEnforceableXrayRows('account_vmesses', 'uuid', 'vmess');
-  const vlessRows = await loadEnforceableXrayRows('account_vlesses', 'uuid', 'vless');
-  const trojanRows = await loadEnforceableXrayRows('account_trojans', 'password', 'trojan');
-
-  const cfg = {
+function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
+  return {
     log: {
       access: '/var/log/xray/access.log',
       error: '/var/log/xray/error.log',
@@ -11475,7 +11484,13 @@ async function rebuildXrayFromDb() {
       rules: [{ type: 'field', inboundTag: ['api'], outboundTag: 'api' }]
     }
   };
-  applyXrayConfigAndRestart(cfg);
+}
+
+async function rebuildXrayFromDb() {
+  const vmessRows = await loadEnforceableXrayRows('account_vmesses', 'uuid', 'vmess');
+  const vlessRows = await loadEnforceableXrayRows('account_vlesses', 'uuid', 'vless');
+  const trojanRows = await loadEnforceableXrayRows('account_trojans', 'password', 'trojan');
+  applyXrayConfigAndRestart(buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows));
 }
 
 async function main() {

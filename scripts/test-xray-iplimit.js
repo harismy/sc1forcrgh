@@ -55,6 +55,7 @@ globalThis.__xrayPolicy = {
   normalizeMultiLoginEvidence,
   xrayViolationSignal,
   selectEnforceableXrayRows,
+  buildXrayRuntimeConfig,
   defaults: {
     checkInterval: CHECK_INTERVAL_MINUTES,
     recentMinutes: XRAY_RECENT_WINDOW_MINUTES,
@@ -69,7 +70,7 @@ class FakeDatabase {}
 const context = vm.createContext({
   Buffer,
   console,
-  process: { env: {}, pid: 1 },
+  process: { env: { XRAY_REAL_IP_ENABLE: '1' }, pid: 1 },
   require(name) {
     if (name === 'sqlite3') {
       return { verbose: () => ({ Database: FakeDatabase }) };
@@ -83,6 +84,20 @@ const policy = context.__xrayPolicy;
 assert.deepStrictEqual(
   JSON.parse(JSON.stringify(policy.defaults)),
   { checkInterval: 5, recentMinutes: 5, activeSeconds: 60, minHits: 2, confirmCycles: 2 }
+);
+
+const generatedConfig = JSON.parse(JSON.stringify(policy.buildXrayRuntimeConfig(
+  [{ username: 'vmess-user', secret: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }],
+  [{ username: 'vless-user', secret: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' }],
+  [{ username: 'trojan-user', secret: 'CaseSensitiveSecret' }]
+)));
+assert.strictEqual(generatedConfig.inbounds.length, 7, 'runtime config must contain API and six Xray inbounds');
+const generatedVmessWs = generatedConfig.inbounds.find((inbound) => inbound.port === 10001);
+assert.strictEqual(generatedVmessWs.settings.clients[0].email, 'vmess-user');
+assert.deepStrictEqual(
+  generatedVmessWs.streamSettings.sockopt.trustedXForwardedFor,
+  ['X-SC-Real-IP-Proxy'],
+  'checker runtime config must include the real-IP helper output'
 );
 
 const now = 1_000_000;
@@ -197,6 +212,7 @@ assert(installer.includes('active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);'));
 assert(installer.includes('else out="OFFLINE";'));
 assert(installer.includes('tracker_schema="5"'));
 assert(installer.includes('20-sc-managed-config.conf'));
+assert(installer.includes('write_iplimit_checker() {\n  log "Menulis checker limit IP otomatis..."\n  configure_xray_managed_runtime'));
 assert(installer.includes('/usr/local/etc/xray/.config.${process.pid}.tmp.json'));
 assert(!installer.includes('const primaryTmpPath = `${primaryPath}.tmp`;'));
 assert(installer.includes('stopXrayFailClosed(`locked credential remains in config users='));

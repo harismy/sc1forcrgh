@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.32}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.33}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -1430,10 +1430,27 @@ install_go_if_missing() {
   log "Go installed: $(go version)"
 }
 
+configure_xray_managed_runtime() {
+  local xray_bin dropin_dir dropin_file
+  xray_bin="$(command -v xray 2>/dev/null || true)"
+  [[ -n "${xray_bin}" ]] || return 1
+
+  dropin_dir="/etc/systemd/system/xray.service.d"
+  dropin_file="${dropin_dir}/20-sc-managed-config.conf"
+  mkdir -p "${dropin_dir}" /usr/local/etc/xray
+  cat > "${dropin_file}" <<EOF
+[Service]
+ExecStart=
+ExecStart=${xray_bin} run -config /usr/local/etc/xray/config.json
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 install_xray() {
   local tmp
   if command -v xray >/dev/null 2>&1; then
     log "Xray sudah ada: $(xray version | head -n1)"
+    configure_xray_managed_runtime
     return
   fi
   log "Install Xray..."
@@ -1446,6 +1463,7 @@ install_xray() {
       rm -f "${tmp}" >/dev/null 2>&1 || true
       if command -v xray >/dev/null 2>&1; then
         log "Xray terpasang: $(xray version | head -n1)"
+        configure_xray_managed_runtime
         return
       fi
     fi
@@ -1455,6 +1473,7 @@ install_xray() {
   # 2. Fallback: mirror internal (bot server) jika XRAY_MIRROR_BASE di-set.
   if [[ -n "${XRAY_MIRROR_BASE:-}" ]] && install_xray_manual_from_sources "internal"; then
     log "Xray terpasang via mirror internal: $(xray version | head -n1)"
+    configure_xray_managed_runtime
     return
   fi
 
@@ -1462,6 +1481,7 @@ install_xray() {
   #    diblok akses ke github.com/.../releases/download).
   if install_xray_manual_from_sources "public-proxy"; then
     log "Xray terpasang via proxy mirror: $(xray version | head -n1)"
+    configure_xray_managed_runtime
     return
   fi
 
@@ -4796,6 +4816,8 @@ function canValidateXrayConfig(tmpPath) {
   const testCmds = [
     ['xray', ['run', '-test', '-config', tmpPath]],
     ['xray', ['-test', '-config', tmpPath]],
+    ['/usr/local/bin/xray', ['run', '-test', '-config', tmpPath]],
+    ['/usr/local/bin/xray', ['-test', '-config', tmpPath]],
     ['/usr/bin/xray', ['run', '-test', '-config', tmpPath]],
     ['/usr/bin/xray', ['-test', '-config', tmpPath]]
   ];
@@ -4804,12 +4826,17 @@ function canValidateXrayConfig(tmpPath) {
   }
   return false;
 }
+function stopXrayFailClosed() {
+  safeExec('systemctl', ['stop', 'xray']);
+  safeExec('service', ['xray', 'stop']);
+}
 function writeXrayConfigAndReload(cfg, forceRestart = false) {
   const cfgDir = '/usr/local/etc/xray';
   const cfgPath = `${cfgDir}/config.json`;
   const tmpPath = `${cfgPath}.tmp`;
   fs.mkdirSync(cfgDir, { recursive: true });
-  fs.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2));
+  const cfgText = `${JSON.stringify(cfg, null, 2)}\n`;
+  fs.writeFileSync(tmpPath, cfgText, { encoding: 'utf8', mode: 0o644 });
 
   // Validasi bersifat "best effort".
   // Beberapa build xray tidak mendukung kombinasi flag test yang sama.
@@ -4827,15 +4854,25 @@ function writeXrayConfigAndReload(cfg, forceRestart = false) {
     const legacyDir = '/etc/xray';
     const legacyPath = `${legacyDir}/config.json`;
     if (fs.existsSync(legacyDir)) {
-      fs.writeFileSync(legacyPath, JSON.stringify(cfg, null, 2));
+      const legacyTmpPath = `${legacyPath}.tmp`;
+      fs.writeFileSync(legacyTmpPath, cfgText, { encoding: 'utf8', mode: 0o644 });
+      fs.renameSync(legacyTmpPath, legacyPath);
     }
   } catch (_) {}
 
+  let applied = false;
   if (forceRestart) {
-    if (safeExec('systemctl', ['restart', 'xray'])) return true;
-    if (safeExec('service', ['xray', 'restart'])) return true;
+    applied = safeExec('systemctl', ['restart', 'xray']) || safeExec('service', ['xray', 'restart']);
+  } else {
+    applied = reloadXrayServiceSafe();
   }
-  return reloadXrayServiceSafe();
+  const active = safeExec('systemctl', ['is-active', '--quiet', 'xray']) ||
+    safeExec('service', ['xray', 'status']);
+  if (applied && active) {
+    return true;
+  }
+  stopXrayFailClosed();
+  return false;
 }
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -5307,10 +5344,57 @@ function addFrontBugLink(protocol, links, secret, username = '') {
   return nextLinks;
 }
 
-async function renderAndReloadXray() {
-  const vmessRows = await all("SELECT username, uuid FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
-  const vlessRows = await all("SELECT username, uuid FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
-  const trojanRows = await all("SELECT username, password FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+function normalizeXrayCredential(value, secretColumn) {
+  const credential = String(value || '').trim();
+  return secretColumn === 'uuid' ? credential.toLowerCase() : credential;
+}
+
+function selectEnforceableXrayRows(rows, secretColumn) {
+  const source = Array.isArray(rows) ? rows : [];
+  const blockedCredentials = new Set();
+  for (const row of source) {
+    const status = String(row?.status || '').trim().toUpperCase();
+    const credential = normalizeXrayCredential(row?.[secretColumn], secretColumn);
+    if (status !== 'AKTIF' && credential) blockedCredentials.add(credential);
+  }
+
+  const selected = [];
+  const selectedCredentials = new Set();
+  const collisions = [];
+  for (const row of source) {
+    const status = String(row?.status || '').trim().toUpperCase();
+    if (status !== 'AKTIF') continue;
+    const credential = normalizeXrayCredential(row?.[secretColumn], secretColumn);
+    const username = String(row?.username || '').trim();
+    if (!credential || !username) continue;
+    if (blockedCredentials.has(credential)) {
+      collisions.push({ username, reason: 'credential-owned-by-blocked-account' });
+      continue;
+    }
+    if (selectedCredentials.has(credential)) {
+      collisions.push({ username, reason: 'duplicate-active-credential' });
+      continue;
+    }
+    selectedCredentials.add(credential);
+    selected.push({ username, secret: String(row?.[secretColumn] || '').trim() });
+  }
+  return { rows: selected, collisions, blockedCredentials };
+}
+
+async function loadEnforceableXrayRows(table, secretColumn, protocol) {
+  const rows = await all(`SELECT username, ${secretColumn}, status FROM ${table}`);
+  const selected = selectEnforceableXrayRows(rows, secretColumn);
+  if (selected.collisions.length > 0) {
+    const users = selected.collisions.map((item) => `${item.username}:${item.reason}`).join(',');
+    console.error(`[xray-enforcement] ${protocol} credential collision blocked users=${users}`);
+  }
+  return selected.rows;
+}
+
+async function renderAndReloadXray(forceRestart = false) {
+  const vmessRows = await loadEnforceableXrayRows('account_vmesses', 'uuid', 'vmess');
+  const vlessRows = await loadEnforceableXrayRows('account_vlesses', 'uuid', 'vless');
+  const trojanRows = await loadEnforceableXrayRows('account_trojans', 'password', 'trojan');
 
   const cfg = {
     log: {
@@ -5328,32 +5412,32 @@ async function renderAndReloadXray() {
       },
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
-        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
-        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
-        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
       },
       {
         port: 11001, listen: '127.0.0.1', protocol: 'vmess',
-        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
       },
       {
         port: 11002, listen: '127.0.0.1', protocol: 'vless',
-        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
       },
       {
         port: 11003, listen: '127.0.0.1', protocol: 'trojan',
-        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
       }
     ],
@@ -5377,7 +5461,9 @@ async function renderAndReloadXray() {
       rules: [{ type: 'field', inboundTag: ['api'], outboundTag: 'api' }]
     }
   };
-  writeXrayConfigAndReload(cfg);
+  if (!writeXrayConfigAndReload(cfg, forceRestart)) {
+    throw new Error('Xray config could not be applied to the running service.');
+  }
 }
 
 let xrayDbSyncBusy = false;
@@ -6762,9 +6848,9 @@ async function setStatusXray(table, username, status) {
   await run(`UPDATE ${table} SET status=? WHERE LOWER(username)=LOWER(?)`, [status, username]);
   // Lock/unlock manual harus memutus sesi lama juga.
   // Render ulang config lalu paksa restart xray agar sesi lama benar-benar drop.
-  const vmessRows = await all("SELECT username, uuid FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
-  const vlessRows = await all("SELECT username, uuid FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
-  const trojanRows = await all("SELECT username, password FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const vmessRows = await loadEnforceableXrayRows('account_vmesses', 'uuid', 'vmess');
+  const vlessRows = await loadEnforceableXrayRows('account_vlesses', 'uuid', 'vless');
+  const trojanRows = await loadEnforceableXrayRows('account_trojans', 'password', 'trojan');
   const cfg = {
     log: {
       access: '/var/log/xray/access.log',
@@ -6781,32 +6867,32 @@ async function setStatusXray(table, username, status) {
       },
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
-        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
-        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
-        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
       },
       {
         port: 11001, listen: '127.0.0.1', protocol: 'vmess',
-        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
       },
       {
         port: 11002, listen: '127.0.0.1', protocol: 'vless',
-        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
       },
       {
         port: 11003, listen: '127.0.0.1', protocol: 'trojan',
-        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
       }
     ],
@@ -6830,7 +6916,9 @@ async function setStatusXray(table, username, status) {
       rules: [{ type: 'field', inboundTag: ['api'], outboundTag: 'api' }]
     }
   };
-  writeXrayConfigAndReload(cfg, true);
+  if (!writeXrayConfigAndReload(cfg, true)) {
+    throw new Error('Xray lock/unlock could not be applied to the running service.');
+  }
   return { username };
 }
 
@@ -11109,6 +11197,13 @@ async function lockIfExceeded(nowTs) {
         "DELETE FROM iplimit_violation_pending WHERE account_type=? AND username=? AND signal LIKE 'xray-ip-%'",
         [item.type, userKey]
       ).catch(() => {});
+      // Terapkan lock ke runtime sebelum menunggu webhook/Telegram.
+      await rebuildXrayFromDb();
+      const leakedAfterLock = await detectLockedUsersStillInXrayConfig();
+      if (leakedAfterLock.changed) {
+        stopXrayFailClosed(`locked credential remains after immediate lock users=${leakedAfterLock.users.join(',')}`);
+        throw new Error('Immediate Xray lock verification failed.');
+      }
       const lockReasonText = 'pemakaian IP aktif bersamaan melewati limit akun';
       const historyId = await createIpLimitLockHistory({
         account_type: item.type,
@@ -11140,80 +11235,180 @@ async function lockIfExceeded(nowTs) {
         },
         historyId
       );
-      xrayChanged = true;
     }
   }
   return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
 
-function readActiveXrayEmailsFromConfig() {
-  const set = new Set();
+function normalizeXrayCredential(value, secretColumn) {
+  const credential = String(value || '').trim();
+  return secretColumn === 'uuid' ? credential.toLowerCase() : credential;
+}
+
+function selectEnforceableXrayRows(rows, secretColumn) {
+  const source = Array.isArray(rows) ? rows : [];
+  const blockedCredentials = new Set();
+  for (const row of source) {
+    const status = String(row?.status || '').trim().toUpperCase();
+    const credential = normalizeXrayCredential(row?.[secretColumn], secretColumn);
+    if (status !== 'AKTIF' && credential) blockedCredentials.add(credential);
+  }
+
+  const selected = [];
+  const selectedCredentials = new Set();
+  const collisions = [];
+  for (const row of source) {
+    const status = String(row?.status || '').trim().toUpperCase();
+    if (status !== 'AKTIF') continue;
+    const credential = normalizeXrayCredential(row?.[secretColumn], secretColumn);
+    const username = String(row?.username || '').trim();
+    if (!credential || !username) continue;
+    if (blockedCredentials.has(credential)) {
+      collisions.push({ username, reason: 'credential-owned-by-blocked-account' });
+      continue;
+    }
+    if (selectedCredentials.has(credential)) {
+      collisions.push({ username, reason: 'duplicate-active-credential' });
+      continue;
+    }
+    selectedCredentials.add(credential);
+    selected.push({ username, secret: String(row?.[secretColumn] || '').trim() });
+  }
+  return { rows: selected, collisions, blockedCredentials };
+}
+
+async function loadEnforceableXrayRows(table, secretColumn, protocol) {
+  const rows = await all(`SELECT username, ${secretColumn}, status FROM ${table}`);
+  const selected = selectEnforceableXrayRows(rows, secretColumn);
+  if (selected.collisions.length > 0) {
+    const users = selected.collisions.map((item) => `${item.username}:${item.reason}`).join(',');
+    console.error(`[xray-enforcement] ${protocol} credential collision blocked users=${users}`);
+  }
+  return selected.rows;
+}
+
+function readXrayConfigAuthSnapshot() {
+  const snapshot = {
+    emails: new Set(),
+    credentials: { vmess: new Set(), vless: new Set(), trojan: new Set() },
+    configsRead: 0
+  };
   const candidates = ['/usr/local/etc/xray/config.json', '/etc/xray/config.json'];
   for (const cfgPath of candidates) {
     try {
       if (!fs.existsSync(cfgPath)) continue;
       const root = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      snapshot.configsRead += 1;
       const inbounds = Array.isArray(root?.inbounds) ? root.inbounds : [];
-      for (const ib of inbounds) {
-        const clients = Array.isArray(ib?.settings?.clients) ? ib.settings.clients : [];
-        for (const c of clients) {
-          const email = String(c?.email || '').trim().toLowerCase();
-          if (email) set.add(email);
+      for (const inbound of inbounds) {
+        const protocol = String(inbound?.protocol || '').trim().toLowerCase();
+        if (!snapshot.credentials[protocol]) continue;
+        const clients = Array.isArray(inbound?.settings?.clients) ? inbound.settings.clients : [];
+        for (const client of clients) {
+          const email = String(client?.email || '').trim().toLowerCase();
+          const secretColumn = protocol === 'trojan' ? 'password' : 'uuid';
+          const credential = normalizeXrayCredential(
+            protocol === 'trojan' ? client?.password : client?.id,
+            secretColumn
+          );
+          if (email) snapshot.emails.add(email);
+          if (credential) snapshot.credentials[protocol].add(credential);
         }
       }
-      if (set.size > 0) return set;
     } catch (_) {
-      // ignore broken/temporary config and continue fallback path
+      // Config rusak atau belum selesai ditulis dianggap tidak dapat diverifikasi.
     }
   }
-  return set;
+  return snapshot;
+}
+
+function validateXrayConfig(configPath) {
+  const commands = ['/usr/local/bin/xray', '/usr/bin/xray', 'xray'];
+  for (const command of commands) {
+    if (safeExec(command, ['run', '-test', '-config', configPath])) return true;
+    if (safeExec(command, ['-test', '-config', configPath])) return true;
+  }
+  return false;
+}
+
+function stopXrayFailClosed(reason) {
+  console.error(`[xray-enforcement] fail-closed: ${String(reason || 'unknown error')}`);
+  safeExec('systemctl', ['stop', 'xray']);
+  safeExec('service', ['xray', 'stop']);
+}
+
+function restartXrayChecked() {
+  const restarted = safeExec('systemctl', ['restart', 'xray']) || safeExec('service', ['xray', 'restart']);
+  const active = safeExec('systemctl', ['is-active', '--quiet', 'xray']) || safeExec('service', ['xray', 'status']);
+  if (!restarted || !active) return false;
+  const requiredPorts = [10001, 10002, 10003, 11001, 11002, 11003];
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (requiredPorts.every(isTcpPortListening)) return true;
+    safeExec('sleep', ['0.25']);
+  }
+  return false;
 }
 
 function applyXrayConfigAndRestart(cfg) {
   const cfgText = `${JSON.stringify(cfg, null, 2)}\n`;
-  const targets = ['/usr/local/etc/xray/config.json', '/etc/xray/config.json'];
-
-  for (const p of targets) {
-    try {
-      fs.mkdirSync(require('path').dirname(p), { recursive: true });
-      fs.writeFileSync(p, cfgText, 'utf8');
-    } catch (e) {
-      if (IPLIMIT_DEBUG) {
-        console.log(`[iplimit-debug][xray] write config failed path=${p} err=${String(e?.message || e)}`);
-      }
+  const primaryPath = '/usr/local/etc/xray/config.json';
+  const primaryTmpPath = `${primaryPath}.tmp`;
+  try {
+    fs.mkdirSync('/usr/local/etc/xray', { recursive: true });
+    fs.writeFileSync(primaryTmpPath, cfgText, { encoding: 'utf8', mode: 0o644 });
+    if (!validateXrayConfig(primaryTmpPath)) {
+      throw new Error('generated Xray config did not pass validation');
     }
-  }
+    fs.renameSync(primaryTmpPath, primaryPath);
 
-  // Cukup restart xray. Jangan sentuh service lain agar minim dampak ke SSHWS/UDPHC/ZIVPN.
-  restartService('xray');
+    fs.mkdirSync('/etc/xray', { recursive: true });
+    const legacyPath = '/etc/xray/config.json';
+    const legacyTmpPath = `${legacyPath}.tmp`;
+    fs.writeFileSync(legacyTmpPath, cfgText, { encoding: 'utf8', mode: 0o644 });
+    fs.renameSync(legacyTmpPath, legacyPath);
+
+    if (!restartXrayChecked()) {
+      throw new Error('Xray restart or inbound verification failed');
+    }
+  } catch (error) {
+    try { if (fs.existsSync(primaryTmpPath)) fs.unlinkSync(primaryTmpPath); } catch (_) {}
+    stopXrayFailClosed(error?.message || error);
+    throw error;
+  }
 }
 
 async function detectLockedUsersStillInXrayConfig() {
   const lockedRows = await all(
-    "SELECT LOWER(username) AS username FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA') " +
-    "UNION ALL SELECT LOWER(username) AS username FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA') " +
-    "UNION ALL SELECT LOWER(username) AS username FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA')"
+    "SELECT 'vmess' AS account_type, LOWER(username) AS username, LOWER(TRIM(COALESCE(uuid,''))) AS credential FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA','EXPIRED') " +
+    "UNION ALL SELECT 'vless' AS account_type, LOWER(username) AS username, LOWER(TRIM(COALESCE(uuid,''))) AS credential FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA','EXPIRED') " +
+    "UNION ALL SELECT 'trojan' AS account_type, LOWER(username) AS username, TRIM(COALESCE(password,'')) AS credential FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP','LOCK_QUOTA','EXPIRED')"
   ).catch(() => []);
   if (!lockedRows.length) return { changed: false, users: [] };
-  const lockedSet = new Set(
-    lockedRows.map((r) => String(r?.username || '').trim().toLowerCase()).filter(Boolean)
-  );
-  if (lockedSet.size === 0) return { changed: false, users: [] };
 
-  const activeEmails = readActiveXrayEmailsFromConfig();
-  if (activeEmails.size === 0) return { changed: false, users: [] };
+  const snapshot = readXrayConfigAuthSnapshot();
+  if (snapshot.configsRead === 0) {
+    return {
+      changed: true,
+      users: lockedRows.map((row) => String(row?.username || '').trim()).filter(Boolean)
+    };
+  }
 
   const leaked = [];
-  for (const u of lockedSet) {
-    if (activeEmails.has(u)) leaked.push(u);
+  for (const row of lockedRows) {
+    const protocol = String(row?.account_type || '').trim().toLowerCase();
+    const username = String(row?.username || '').trim().toLowerCase();
+    const credential = normalizeXrayCredential(row?.credential, protocol === 'trojan' ? 'password' : 'uuid');
+    if (snapshot.emails.has(username) || (credential && snapshot.credentials[protocol]?.has(credential))) {
+      leaked.push(username);
+    }
   }
-  return { changed: leaked.length > 0, users: leaked };
+  return { changed: leaked.length > 0, users: Array.from(new Set(leaked)) };
 }
 
 async function rebuildXrayFromDb() {
-  const vmessRows = await all("SELECT username, uuid FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
-  const vlessRows = await all("SELECT username, uuid FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
-  const trojanRows = await all("SELECT username, password FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const vmessRows = await loadEnforceableXrayRows('account_vmesses', 'uuid', 'vmess');
+  const vlessRows = await loadEnforceableXrayRows('account_vlesses', 'uuid', 'vless');
+  const trojanRows = await loadEnforceableXrayRows('account_trojans', 'password', 'trojan');
 
   const cfg = {
     log: {
@@ -11231,32 +11426,32 @@ async function rebuildXrayFromDb() {
       },
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
-        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
       },
       {
         port: 10002, listen: '127.0.0.1', protocol: 'vless',
-        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
       },
       {
         port: 10003, listen: '127.0.0.1', protocol: 'trojan',
-        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
       },
       {
         port: 11001, listen: '127.0.0.1', protocol: 'vmess',
-        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
       },
       {
         port: 11002, listen: '127.0.0.1', protocol: 'vless',
-        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
       },
       {
         port: 11003, listen: '127.0.0.1', protocol: 'trojan',
-        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
       }
     ],
@@ -11298,9 +11493,12 @@ async function main() {
     console.log(`[iplimit-debug][xray] stale-locked-user-in-config -> force rebuild users=${staleLockSync.users.join(',')}`);
   }
   if (e.xrayChanged || u.xrayChanged || q.xrayChanged || l.xrayChanged || staleLockSync.changed) {
-    await rebuildXrayFromDb().catch((err) => {
-      console.error('[iplimit-checker] rebuildXrayFromDb failed:', err?.message || err);
-    });
+    await rebuildXrayFromDb();
+    const leakedAfterRebuild = await detectLockedUsersStillInXrayConfig();
+    if (leakedAfterRebuild.changed) {
+      stopXrayFailClosed(`locked credential remains in config users=${leakedAfterRebuild.users.join(',')}`);
+      throw new Error('Xray lock enforcement verification failed.');
+    }
   }
   if ((e.zivpnChanged || u.zivpnChanged || q.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
     restartService(ZIVPN_SERVICE);
@@ -22517,6 +22715,55 @@ monitor_temp_lock_menu() {
     FROM temp_ip_locks
     ORDER BY locked_until ASC;
   " || true
+
+  local xray_lock_count xray_cfg xray_service_state
+  xray_lock_count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM temp_ip_locks WHERE account_type IN ('vmess','vless','trojan');" 2>/dev/null || echo 0)"
+  if [[ "${xray_lock_count}" =~ ^[0-9]+$ ]] && [[ "${xray_lock_count}" -gt 0 ]]; then
+    xray_cfg="/usr/local/etc/xray/config.json"
+    xray_service_state="STOPPED"
+    systemctl is-active --quiet xray 2>/dev/null && xray_service_state="ACTIVE"
+    echo
+    echo "XRAY RUNTIME ENFORCEMENT:"
+    printf '%-8s %-20s %-12s %-10s %-10s\n' "TYPE" "USERNAME" "DB_STATUS" "CONFIG" "SERVICE"
+    sqlite3 -separator '|' "${DB_PATH}" "
+      SELECT l.account_type, l.username,
+        CASE l.account_type
+          WHEN 'vmess' THEN COALESCE((SELECT status FROM account_vmesses WHERE LOWER(username)=LOWER(l.username) LIMIT 1),'-')
+          WHEN 'vless' THEN COALESCE((SELECT status FROM account_vlesses WHERE LOWER(username)=LOWER(l.username) LIMIT 1),'-')
+          WHEN 'trojan' THEN COALESCE((SELECT status FROM account_trojans WHERE LOWER(username)=LOWER(l.username) LIMIT 1),'-')
+        END,
+        CASE l.account_type
+          WHEN 'vmess' THEN COALESCE((SELECT uuid FROM account_vmesses WHERE LOWER(username)=LOWER(l.username) LIMIT 1),'')
+          WHEN 'vless' THEN COALESCE((SELECT uuid FROM account_vlesses WHERE LOWER(username)=LOWER(l.username) LIMIT 1),'')
+          WHEN 'trojan' THEN COALESCE((SELECT password FROM account_trojans WHERE LOWER(username)=LOWER(l.username) LIMIT 1),'')
+        END
+      FROM temp_ip_locks l
+      WHERE l.account_type IN ('vmess','vless','trojan')
+      ORDER BY l.locked_until ASC;
+    " 2>/dev/null | while IFS='|' read -r lock_type lock_user db_status lock_secret; do
+      local config_state="UNKNOWN"
+      if [[ -s "${xray_cfg}" ]] && command -v jq >/dev/null 2>&1; then
+        if jq -e --arg proto "${lock_type}" --arg secret "${lock_secret}" '
+          any(.inbounds[]?;
+            ((.protocol // "") | ascii_downcase) == ($proto | ascii_downcase) and
+            any(.settings.clients[]?;
+              if ($proto | ascii_downcase) == "trojan" then
+                ((.password // "") | tostring) == $secret
+              else
+                (((.id // "") | tostring | ascii_downcase) == ($secret | ascii_downcase))
+              end
+            )
+          )
+        ' "${xray_cfg}" >/dev/null 2>&1; then
+          config_state="LEAK"
+        else
+          config_state="CLEAN"
+        fi
+      fi
+      printf '%-8s %-20s %-12s %-10s %-10s\n' \
+        "${lock_type}" "${lock_user}" "${db_status}" "${config_state}" "${xray_service_state}"
+    done
+  fi
 
   local history_count
   history_count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='iplimit_lock_history';" 2>/dev/null || echo 0)"

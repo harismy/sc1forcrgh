@@ -54,6 +54,7 @@ globalThis.__xrayPolicy = {
   xrayRepresentativeIps,
   normalizeMultiLoginEvidence,
   xrayViolationSignal,
+  selectEnforceableXrayRows,
   defaults: {
     checkInterval: CHECK_INTERVAL_MINUTES,
     recentMinutes: XRAY_RECENT_WINDOW_MINUTES,
@@ -108,6 +109,25 @@ assert.deepStrictEqual(select([
 assert.deepStrictEqual(select([
   ['182.5.1.1', { hits: 4, firstSeen: now - 120_000, lastSeen: now - 70_000 }]
 ]), [], 'stale IPs must not be active candidates');
+
+const enforceableRows = JSON.parse(JSON.stringify(policy.selectEnforceableXrayRows([
+  { username: 'locked-user', uuid: 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', status: 'LOCK_TMP' },
+  { username: 'active-copy', uuid: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', status: 'AKTIF' },
+  { username: 'active-ok', uuid: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', status: 'AKTIF' },
+  { username: 'active-duplicate', uuid: 'BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB', status: 'AKTIF' }
+], 'uuid')));
+assert.deepStrictEqual(enforceableRows.rows, [
+  { username: 'active-ok', secret: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' }
+], 'credentials owned by a locked account and duplicate active credentials must not reach Xray');
+assert.deepStrictEqual(enforceableRows.collisions, [
+  { username: 'active-copy', reason: 'credential-owned-by-blocked-account' },
+  { username: 'active-duplicate', reason: 'duplicate-active-credential' }
+]);
+const trojanCaseRows = JSON.parse(JSON.stringify(policy.selectEnforceableXrayRows([
+  { username: 'locked-trojan', password: 'CaseSensitiveSecret', status: 'LOCK_TMP' },
+  { username: 'active-trojan', password: 'casesensitivesecret', status: 'AKTIF' }
+], 'password')));
+assert.strictEqual(trojanCaseRows.rows.length, 1, 'Trojan password comparison must remain case-sensitive');
 
 const sameCarrierGroup = policy.xrayViolationSignal(new Set(['140.213.1.1', '140.213.200.2']));
 assert.strictEqual(
@@ -176,6 +196,14 @@ assert(installer.includes('if (!violation.confirmed) continue;'));
 assert(installer.includes('active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);'));
 assert(installer.includes('else out="OFFLINE";'));
 assert(installer.includes('tracker_schema="5"'));
+assert(installer.includes('20-sc-managed-config.conf'));
+assert(installer.includes('stopXrayFailClosed(`locked credential remains in config users='));
+assert(installer.includes("throw new Error('Xray lock enforcement verification failed.')"));
+const xrayLockStatusIndex = installer.indexOf("await run(`UPDATE ${item.table} SET status='LOCK_TMP'");
+const immediateRebuildIndex = installer.indexOf('await rebuildXrayFromDb();', xrayLockStatusIndex);
+const xrayLockNotifyIndex = installer.indexOf('await notifyMultiLoginLock(', immediateRebuildIndex);
+assert(xrayLockStatusIndex > 0 && immediateRebuildIndex > xrayLockStatusIndex);
+assert(xrayLockNotifyIndex > immediateRebuildIndex, 'Xray runtime lock must be applied before webhook notification');
 
 const xrayLiveSource = extract(
   "cat > /usr/local/sbin/sc-1forcr-xray-live <<'EOF'\n",

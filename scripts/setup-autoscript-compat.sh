@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.33}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.34}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -4833,7 +4833,7 @@ function stopXrayFailClosed() {
 function writeXrayConfigAndReload(cfg, forceRestart = false) {
   const cfgDir = '/usr/local/etc/xray';
   const cfgPath = `${cfgDir}/config.json`;
-  const tmpPath = `${cfgPath}.tmp`;
+  const tmpPath = `${cfgDir}/.config.${process.pid}.tmp.json`;
   fs.mkdirSync(cfgDir, { recursive: true });
   const cfgText = `${JSON.stringify(cfg, null, 2)}\n`;
   fs.writeFileSync(tmpPath, cfgText, { encoding: 'utf8', mode: 0o644 });
@@ -11352,7 +11352,7 @@ function restartXrayChecked() {
 function applyXrayConfigAndRestart(cfg) {
   const cfgText = `${JSON.stringify(cfg, null, 2)}\n`;
   const primaryPath = '/usr/local/etc/xray/config.json';
-  const primaryTmpPath = `${primaryPath}.tmp`;
+  const primaryTmpPath = `/usr/local/etc/xray/.config.${process.pid}.tmp.json`;
   try {
     fs.mkdirSync('/usr/local/etc/xray', { recursive: true });
     fs.writeFileSync(primaryTmpPath, cfgText, { encoding: 'utf8', mode: 0o644 });

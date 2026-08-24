@@ -197,6 +197,8 @@ assert(installer.includes('active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);'));
 assert(installer.includes('else out="OFFLINE";'));
 assert(installer.includes('tracker_schema="5"'));
 assert(installer.includes('20-sc-managed-config.conf'));
+assert(installer.includes('/usr/local/etc/xray/.config.${process.pid}.tmp.json'));
+assert(!installer.includes('const primaryTmpPath = `${primaryPath}.tmp`;'));
 assert(installer.includes('stopXrayFailClosed(`locked credential remains in config users='));
 assert(installer.includes("throw new Error('Xray lock enforcement verification failed.')"));
 const xrayLockStatusIndex = installer.indexOf("await run(`UPDATE ${item.table} SET status='LOCK_TMP'");

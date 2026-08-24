@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.30}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.31}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -9174,8 +9174,19 @@ function parseXrayRecentIpMap() {
 
 function ipSubnetPrefix(ip, mask) {
   if (!ip || mask >= 32) return String(ip || '').trim();
-  const v = String(ip).trim();
-  if (v.includes(':')) return v; // IPv6: no subnet grouping
+  const v = String(ip).trim().toLowerCase();
+  if (v.includes(':')) {
+    const halves = v.split('::');
+    if (halves.length > 2) return v;
+    const left = String(halves[0] || '').split(':').filter(Boolean);
+    const right = String(halves[1] || '').split(':').filter(Boolean);
+    const missing = Math.max(0, 8 - left.length - right.length);
+    const expanded = halves.length === 2
+      ? [...left, ...Array(missing).fill('0'), ...right]
+      : left;
+    if (expanded.length < 4) return v;
+    return `${expanded.slice(0, 4).map((part) => part || '0').join(':')}::/64`;
+  }
   const parts = v.split('.');
   if (parts.length !== 4) return v;
   if (mask <= 8) return parts[0] + '.0.0.0/' + mask;
@@ -9189,6 +9200,24 @@ function countIpGroups(ipSet, mask) {
     groups.add(ipSubnetPrefix(ip, mask));
   }
   return groups.size;
+}
+
+function countXrayEffectiveDevices(ipSet, mask) {
+  const ipv4Groups = new Set();
+  const ipv6Groups = new Set();
+  for (const ipRaw of ipSet || []) {
+    const ip = String(ipRaw || '').trim().toLowerCase();
+    if (!ip) continue;
+    const group = ipSubnetPrefix(ip, mask);
+    if (!group) continue;
+    if (ip.includes(':')) ipv6Groups.add(group);
+    else ipv4Groups.add(group);
+  }
+  // IPv4 dan IPv6 pada koneksi yang sama adalah dual-stack, bukan dua device.
+  if (ipv4Groups.size > 0 && ipv6Groups.size > 0) {
+    return Math.max(ipv4Groups.size, ipv6Groups.size);
+  }
+  return ipv4Groups.size + ipv6Groups.size;
 }
 
 function xrayViolationSignal(ipSet) {
@@ -10982,15 +11011,15 @@ async function lockIfExceeded(nowTs) {
       const cntRaw = lockIpSet.size;
       // CGNAT tolerance: grup IP dalam subnet yang sama sebagai 1 device.
       // XRAY_IP_GROUP_MASK: 24 = /24 (moderate), 16 = /16 (aggressive), 32 = exact match.
-      const cntGrouped = XRAY_IP_GROUP_MASK < 32 ? countIpGroups(lockIpSet, XRAY_IP_GROUP_MASK) : cntRaw;
-      // IPv4+IPv6 dual-stack: satu device bisa punya 2 IP beda family.
-      // Hanya ditoleransi untuk limit 1 dan tepat 2 IP mentah.
-      const cnt = (lim === 1 && cntRaw === 2) ? 1 : cntGrouped;
+      const cntGrouped = countXrayEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK);
+      const cnt = cntGrouped;
       const liveSocketCount = Number(xrayLive.sockets.get(`${item.type}|${userKey}`) || 0);
-      // Access log tanpa bukti socket hidup hanya merupakan histori/handoff.
-      // Jika helper realtime tidak tersedia, Xray tetap monitor-only agar
-      // kegagalan observasi tidak berubah menjadi false lock.
-      const hasLiveEvidence = xrayLive.available && liveSocketCount > 0;
+      const hasSocketEvidence = xrayLive.available && liveSocketCount > 0;
+      // Parser log hanya mengembalikan IP yang overlap dalam window aktif.
+      // Bukti ini tetap wajib stabil dua siklus sebelum lock, sehingga tracker
+      // socket yang gagal memetakan proxy lokal tidak mematikan limit akun.
+      const hasStrongLogEvidence = cnt > 0 && lockIpSet.size > 0;
+      const hasLiveEvidence = hasSocketEvidence || hasStrongLogEvidence;
       const violation = await sampleXrayIpLimit(
         item.type,
         userKey,
@@ -11001,7 +11030,7 @@ async function lockIfExceeded(nowTs) {
       );
       if (IPLIMIT_DEBUG) {
         const ips = Array.from(lockIpSet).slice(0, 8).join(',');
-        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cntGrouped=${cntGrouped} cnt=${cnt} mask=${XRAY_IP_GROUP_MASK} liveTracker=${xrayLive.available ? 1 : 0} liveSockets=${liveSocketCount} candidate=${violation.candidate ? 1 : 0} confirm=${violation.hits}/${XRAY_LIMIT_CONFIRM_CYCLES} ips=${ips}`);
+        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cntGrouped=${cntGrouped} cnt=${cnt} mask=${XRAY_IP_GROUP_MASK} liveTracker=${xrayLive.available ? 1 : 0} liveSockets=${liveSocketCount} socketEvidence=${hasSocketEvidence ? 1 : 0} logEvidence=${hasStrongLogEvidence ? 1 : 0} candidate=${violation.candidate ? 1 : 0} confirm=${violation.hits}/${XRAY_LIMIT_CONFIRM_CYCLES} ips=${ips}`);
       }
       if (!violation.confirmed) continue;
       if (graceMap.has(`${item.type}|${userKey}`)) continue;
@@ -15323,82 +15352,134 @@ if [[ "${ssh_cnt}" -eq 0 && "${ssh_tracker_ready}" != "1" ]]; then
 fi
 
 xray_users=""
+xray_tracker_users=""
+xray_log_users=""
 xray_cnt=0
 xray_tracker_ready="0"
 if [[ -x /usr/local/sbin/sc-1forcr-xray-live ]]; then
-  if xray_users="$(/usr/local/sbin/sc-1forcr-xray-live list 2>/dev/null)"; then
+  if /usr/local/sbin/sc-1forcr-xray-live capabilities 2>/dev/null | grep -qx 'rows-v3'; then
+    if xray_tracker_users="$(/usr/local/sbin/sc-1forcr-xray-live rows-v3 2>/dev/null | awk -F'|' '
+      $1 ~ /^(vmess|vless|trojan)$/ && $2 ~ /^[a-z0-9._-]+$/ {
+        socketc=($3 ~ /^[0-9]+$/ ? $3+0 : 0);
+        activec=($4 ~ /^[0-9]+$/ ? $4+0 : 0);
+        if (socketc<=0 && activec<=0) next;
+        n=(activec>0 ? activec : 1);
+        if (!(tolower($2) in count) || n>count[tolower($2)]) count[tolower($2)]=n;
+      }
+      END { for (u in count) printf "%s(%d)\n", u, count[u]; }
+    ' | sort)"; then
+      xray_tracker_ready="1"
+    fi
+  elif xray_tracker_users="$(/usr/local/sbin/sc-1forcr-xray-live list 2>/dev/null)"; then
     xray_tracker_ready="1"
-    xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
   fi
 fi
-if [[ "${xray_tracker_ready}" != "1" && -f /var/log/xray/access.log ]]; then
-  xray_cutoff="$(date -d "-${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} seconds" '+%Y/%m/%d %H:%M:%S' 2>/dev/null || true)"
-  [[ -z "${xray_cutoff}" ]] && xray_cutoff="1970/01/01 00:00:00"
-  xray_users="$(tail -n 5000 /var/log/xray/access.log 2>/dev/null \
-    | awk -v cutoff="${xray_cutoff}" '
+if [[ -f /var/log/xray/access.log ]]; then
+  xray_now="$(date +%s 2>/dev/null || echo 0)"
+  [[ "${xray_now}" =~ ^[0-9]+$ ]] || xray_now="0"
+  xray_log_users="$(tail -n 8000 /var/log/xray/access.log 2>/dev/null \
+    | awk -v now="${xray_now}" -v win="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -v min_hits="${XRAY_MIN_HITS_PER_IP:-2}" '
       function clean(v) {
-        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-        return v
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
+        return v;
       }
-      function norm_ip(v) {
-        v=clean(v)
-        gsub(/^\[/, "", v)
-        gsub(/\]$/, "", v)
-        sub(/:[0-9]+$/, "", v)
-        return v
+      function line_ts(line, stamp) {
+        if (line !~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return now;
+        stamp=substr(line, 1, 19);
+        gsub(/[\/:]/, " ", stamp); gsub(/[[:space:]]+/, " ", stamp);
+        return mktime(stamp);
+      }
+      function norm_ip(v, colon_count) {
+        v=tolower(clean(v)); sub(/^(tcp|udp):/, "", v);
+        if (v ~ /^\[/) { sub(/^\[/, "", v); sub(/\](:[0-9]+)?$/, "", v); return v; }
+        colon_count=gsub(/:/, ":", v);
+        if (colon_count==1) sub(/:[0-9]+$/, "", v);
+        return v;
+      }
+      function usable_ip(v) {
+        if (v=="" || v=="::" || v=="::1" || v=="localhost") return 0;
+        if (v ~ /^127(\.|$)/ || v ~ /^::ffff:127(\.|$)/) return 0;
+        return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || v ~ /^[0-9a-f:]+$/);
+      }
+      function network_group(v, parts) {
+        if (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+          split(v, parts, /\./); return "4:" parts[1] "." parts[2] ".0.0/16";
+        }
+        if (v ~ /^[0-9a-f:]+$/) {
+          split(v, parts, /:/); return "6:" parts[1] ":" parts[2] ":" parts[3] ":" parts[4] "::/64";
+        }
+        return "";
       }
       {
-        ts = substr($0, 1, 19)
-        if (ts == "" || ts < cutoff) next
-        u=""
-        src=""
+        ts=line_ts($0); if (ts>0 && now>0 && ts < (now-win)) next;
+        u=""; src="";
         if (match($0, /"email":"[^"]+"/)) {
-          u=substr($0, RSTART+9, RLENGTH-10)
+          u=substr($0, RSTART+9, RLENGTH-10);
         } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
-          u=substr($0, RSTART, RLENGTH)
-          sub(/^email:[[:space:]]*/, "", u)
+          u=substr($0, RSTART, RLENGTH); sub(/^email:[[:space:]]*/, "", u);
         } else if (match($0, /"user":"[^"]+"/)) {
-          u=substr($0, RSTART+8, RLENGTH-9)
+          u=substr($0, RSTART+8, RLENGTH-9);
         } else if (match($0, /user:[[:space:]]*[^[:space:]]+/)) {
-          u=substr($0, RSTART, RLENGTH)
-          sub(/^user:[[:space:]]*/, "", u)
+          u=substr($0, RSTART, RLENGTH); sub(/^user:[[:space:]]*/, "", u);
         }
         if (match($0, /"source":"[^"]+"/)) {
-          src=substr($0, RSTART+10, RLENGTH-11)
-        } else if (match($0, /from[[:space:]]+[0-9a-fA-F\.:]+/)) {
-          src=substr($0, RSTART, RLENGTH)
-          sub(/^from[[:space:]]+/, "", src)
+          src=substr($0, RSTART+10, RLENGTH-11);
+        } else if (match($0, /from[[:space:]]+[^[:space:]]+/)) {
+          src=substr($0, RSTART, RLENGTH); sub(/^from[[:space:]]+/, "", src);
         }
-        u=clean(tolower(u))
-        src=norm_ip(src)
-        if (u !~ /^[a-z0-9._-]+$/) next
-        # Xray WS/gRPC berada di belakang nginx/HAProxy, sehingga source yang
-        # terlihat dapat berupa loopback. Tetap hitung user sebagai aktivitas
-        # online, tetapi jangan gunakan data ini untuk memasang firewall lock.
-        if (src == "") src="proxy-local"
-        key=u "|" src
-        seen[key]=1
+        u=clean(tolower(u)); if (u !~ /^[a-z0-9._-]+$/) next;
+        auth[u]=1; ip=norm_ip(src); if (!usable_ip(ip)) next;
+        key=u SUBSEP ip; hits[key]++;
+        if (!(key in first_ts) || ts<first_ts[key]) first_ts[key]=ts;
+        if (!(key in last_ts) || ts>last_ts[key]) last_ts[key]=ts;
       }
       END {
-        for (k in seen) {
-          split(k, a, /\|/)
-          user=a[1]
-          ipcnt_raw[user]++
+        for (key in hits) {
+          split(key, a, SUBSEP); u=a[1]; ip=a[2];
+          if (!(u in newest_ts) || last_ts[key]>=newest_ts[u]) {
+            newest_ts[u]=last_ts[key]; newest_ip[u]=ip;
+          }
         }
-        for (u in ipcnt_raw) {
-          raw=ipcnt_raw[u]
-          if (raw >= 1 && raw <= 2) cnt=1
-          else if (raw >= 3 && raw <= 4) cnt=2
-          else cnt=raw
-          printf "%s(%d)\n", u, cnt
+        for (key in hits) {
+          split(key, a, SUBSEP); u=a[1]; ip=a[2]; newest_key=u SUBSEP newest_ip[u];
+          if (ip!=newest_ip[u] && (hits[key]<min_hits || last_ts[key]<first_ts[newest_key])) continue;
+          group=network_group(ip); if (group=="") continue;
+          group_key=u SUBSEP group; if (group_key in group_seen) continue;
+          group_seen[group_key]=1;
+          if (group ~ /^4:/) v4[u]++; else v6[u]++;
+        }
+        for (u in auth) {
+          c4=(u in v4 ? v4[u] : 0); c6=(u in v6 ? v6[u] : 0);
+          estimated=(c4>0 && c6>0 ? (c4>c6 ? c4 : c6) : c4+c6);
+          if (estimated<1) estimated=1;
+          printf "%s(%d)\n", u, estimated;
         }
       }
     ' | sort || true)"
-  xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
 fi
-xray_monitor_mode="LOG_WINDOW_${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}S"
-if [[ "${xray_tracker_ready}" == "1" ]]; then
-  xray_monitor_mode="REALTIME_SOCKET_OBSERVE"
+xray_users="$(printf '%s\n%s\n' "${xray_tracker_users}" "${xray_log_users}" | awk '
+  NF {
+    row=$0; user=row; count=1;
+    if (row ~ /\([0-9]+\)$/) {
+      raw=row; sub(/^.*\(/, "", raw); sub(/\)$/, "", raw); count=raw+0;
+      sub(/\([0-9]+\)$/, "", user);
+    }
+    user=tolower(user);
+    if (user !~ /^[a-z0-9._-]+$/) next;
+    if (!(user in max_count) || count>max_count[user]) max_count[user]=count;
+  }
+  END { for (user in max_count) printf "%s(%d)\n", user, max_count[user]; }
+' | sort)"
+xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
+xray_monitor_mode="NO_ACTIVITY"
+if [[ -n "${xray_tracker_users}" && -n "${xray_log_users}" ]]; then
+  xray_monitor_mode="SOCKET+AUTH_LOG"
+elif [[ -n "${xray_tracker_users}" ]]; then
+  xray_monitor_mode="REALTIME_SOCKET"
+elif [[ -n "${xray_log_users}" ]]; then
+  xray_monitor_mode="AUTH_LOG_FALLBACK"
+elif [[ "${xray_tracker_ready}" == "1" ]]; then
+  xray_monitor_mode="REALTIME_SOCKET"
 fi
 
 udphc_service="$(detect_udphc_service)"
@@ -15588,7 +15669,7 @@ RINGKASAN AKUN AKTIF
 
 ONLINE TERDETEKSI
 $(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}" "SESI")
-$(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}" "SOCKET")
+$(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}" "JARINGAN")
 $(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}" "SESI")
 $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}" "IP")
 "
@@ -23940,7 +24021,8 @@ show_ssh_only_online() {
 
 xray_log_snapshot() {
   local dst="$1" mode="${2:-normal}"
-  local cutoff_ts active_cutoff_ts recent_min active_sec
+  local cutoff_ts active_cutoff_ts recent_min active_sec access_log
+  access_log="${XRAY_ACCESS_LOG:-/var/log/xray/access.log}"
   recent_min="${xray_recent_window_min}"
   active_sec="${xray_active_window_sec}"
   if [[ "${mode}" == "realtime" ]]; then
@@ -23949,14 +24031,14 @@ xray_log_snapshot() {
   fi
   cutoff_ts="$(( $(date +%s) - (recent_min * 60) ))"
   active_cutoff_ts="$(( $(date +%s) - active_sec ))"
-  if [[ ! -f /var/log/xray/access.log ]]; then
+  if [[ ! -f "${access_log}" ]]; then
     : > "${dst}"
     return
   fi
   # Output: username|socket_aktif|ip_aktif|ip_recent|last_ip|visibility.
   # Fallback log tidak mengetahui socket hidup. Seluruh IP hanya histori recent
   # dan tidak boleh diberi label aktif/online.
-  tail -n 5000 /var/log/xray/access.log | awk -v cutoff="${cutoff_ts}" -v active_cutoff="${active_cutoff_ts}" -v min_hits="${xray_min_hits_per_ip}" '
+  tail -n 5000 "${access_log}" | awk -v cutoff="${cutoff_ts}" -v active_cutoff="${active_cutoff_ts}" -v min_hits="${xray_min_hits_per_ip}" '
     function norm_ip(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
       sub(/^(tcp|udp):/, "", v);
@@ -23973,6 +24055,18 @@ xray_log_snapshot() {
       if (v=="" || v=="::" || v=="::1" || v=="localhost") return 0;
       if (v ~ /^127(\.|$)/ || v ~ /^::ffff:127(\.|$)/) return 0;
       return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || v ~ /^[0-9a-f:]+$/);
+    }
+    function network_group(v, parts, n) {
+      v=tolower(v);
+      if (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+        split(v, parts, /\./);
+        return "4:" parts[1] "." parts[2] ".0.0/16";
+      }
+      if (v ~ /^[0-9a-f:]+$/) {
+        n=split(v, parts, /:/);
+        return "6:" parts[1] ":" parts[2] ":" parts[3] ":" parts[4] "::/64";
+      }
+      return "";
     }
     function ts_from_line(line, stamp, ts) {
       if (line !~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return 0;
@@ -24013,6 +24107,7 @@ xray_log_snapshot() {
       if (!usable_ip(ip)) next;
       key=email "|" ip;
       hits[key]++;
+      if (!(key in first_ts) || ts < first_ts[key]) first_ts[key]=ts;
       if (!(key in last_ts) || ts > last_ts[key]) last_ts[key]=ts;
       if (!(email in latest_ts) || ts >= latest_ts[email]) {
         latest_ts[email]=ts;
@@ -24025,16 +24120,35 @@ xray_log_snapshot() {
         u=a[1]; ip=a[2];
         if (last_ts[k] < active_cutoff) continue;
         if (hits[k] < min_hits && lastip[u] != ip) continue;
-        cnt_raw[u]++;
+        recent_raw[u]++;
+        if (!(u in newest_ts) || last_ts[k] >= newest_ts[u]) {
+          newest_ts[u]=last_ts[k]; newest_ip[u]=ip;
+        }
+      }
+      for (k in hits) {
+        split(k, a, /\|/);
+        u=a[1]; ip=a[2];
+        if (last_ts[k] < active_cutoff || !(u in newest_ip)) continue;
+        newest_key=u "|" newest_ip[u];
+        if (ip != newest_ip[u] && (hits[k] < min_hits || last_ts[k] < first_ts[newest_key])) continue;
+        group=network_group(ip);
+        if (group=="") continue;
+        group_key=u SUBSEP group;
+        if (group_key in group_seen) continue;
+        group_seen[group_key]=1;
+        if (group ~ /^4:/) active_v4[u]++;
+        else active_v6[u]++;
       }
       for (u in seen) {
-        raw=(u in cnt_raw ? cnt_raw[u] : 0);
-        cnt=raw;
+        raw=(u in recent_raw ? recent_raw[u] : 0);
+        v4=(u in active_v4 ? active_v4[u] : 0);
+        v6=(u in active_v6 ? active_v6[u] : 0);
+        net_active=(v4>0 && v6>0 ? (v4>v6 ? v4 : v6) : v4+v6);
         lip=(u in lastip ? lastip[u] : "TIDAK_TERDETEKSI");
         auth_active=((u in latest_auth_ts) && latest_auth_ts[u] >= active_cutoff ? 1 : 0);
-        if (cnt > 0) visibility=(auth_active ? "SOURCE_IP_RECENT_ACTIVE" : "SOURCE_IP_RECENT");
+        if (net_active > 0) visibility=(auth_active ? "SOURCE_NET_EST_ACTIVE" : "SOURCE_IP_RECENT");
         else visibility=(auth_active ? "AUTH_ACTIVE" : "AUTH_RECENT");
-        printf "%s|0|0|%d|%s|%s\n", u, cnt, lip, visibility;
+        printf "%s|0|%d|%d|%s|%s\n", u, net_active, raw, lip, visibility;
       }
     }' > "${dst}"
 }
@@ -24044,6 +24158,7 @@ merge_xray_observations() {
   awk -F'|' '
     function visibility_rank(v) {
       if (v=="SOURCE_IP_ACTIVE") return 60;
+      if (v=="SOURCE_NET_EST_ACTIVE") return 55;
       if (v=="SOURCE_IP_RECENT_ACTIVE") return 50;
       if (v=="AUTH_ACTIVE") return 40;
       if (v=="SOURCE_IP_RECENT") return 30;
@@ -24146,13 +24261,13 @@ show_xray_online_by_table() {
     echo
     echo "Total User ${label} : 0"
     echo "Total Socket ${label} : 0"
-    echo "Total IP Aktif ${label} : 0"
+    echo "Total Jaringan Aktif/Estimasi ${label} : 0"
     echo "Total IP Recent ${label} : 0"
     return
   fi
 
-  printf "%-20s %-10s %-8s %-11s %-12s %-9s %-10s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "MODE" "SOCKET_AKTIF" "IP_AKTIF" "IP_RECENT" "LAST_IP"
-  printf "%-20s %-10s %-8s %-11s %-12s %-9s %-10s %-22s\n" "--------------------" "----------" "--------" "-----------" "------------" "---------" "----------" "----------------------"
+  printf "%-20s %-10s %-8s %-11s %-12s %-10s %-10s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "MODE" "SOCKET_AKTIF" "NET_AKTIF" "IP_RECENT" "LAST_IP"
+  printf "%-20s %-10s %-8s %-11s %-12s %-10s %-10s %-22s\n" "--------------------" "----------" "--------" "-----------" "------------" "----------" "----------" "----------------------"
   awk -F'|' '
     NR==FNR {
       db_status[$1]=$2;
@@ -24172,11 +24287,11 @@ show_xray_online_by_table() {
       l=(u in db_limit ? db_limit[u] : 0);
       cm=(u in db_mode ? db_mode[u] : "LEGACY");
       if (s=="LOCK" || s=="LOCK_TMP" || s=="LOCK_QUOTA") out="KENA_LOCK";
-      else if (sockets > 0 || visibility=="SOURCE_IP_ACTIVE" || visibility=="SOURCE_IP_RECENT_ACTIVE" || visibility=="AUTH_ACTIVE") out="ONLINE";
+      else if (sockets > 0 || visibility=="SOURCE_IP_ACTIVE" || visibility=="SOURCE_NET_EST_ACTIVE" || visibility=="SOURCE_IP_RECENT_ACTIVE" || visibility=="AUTH_ACTIVE") out="ONLINE";
       else if (visibility ~ /RECENT/) out="RECENT";
       else out="OFFLINE";
       if (recent <= 0 || visibility=="PROXY_LOCAL" || lip=="" || lip=="-") lip="TIDAK_TERDETEKSI";
-      printf "%-20s %-10s %-8d %-11s %-12d %-9d %-10d %-22s\n", u, out, l, cm, sockets, ipc, recent, lip;
+      printf "%-20s %-10s %-8d %-11s %-12d %-10d %-10d %-22s\n", u, out, l, cm, sockets, ipc, recent, lip;
       total_user++;
       total_socket+=sockets;
       total_ip+=ipc;
@@ -24186,14 +24301,15 @@ show_xray_online_by_table() {
       print "";
       printf "Total User : %d\n", total_user + 0;
       printf "Total Socket Aktif : %d\n", total_socket + 0;
-      printf "Total IP Aktif : %d\n", total_ip + 0;
+      printf "Total Jaringan Aktif/Estimasi : %d\n", total_ip + 0;
       printf "Total IP Recent : %d\n", total_recent + 0;
     }' "${t_users}" "${t_seen}"
   echo
   echo "Catatan: SOCKET_AKTIF bukan jumlah perangkat/orang."
   echo "ONLINE berarti ada socket hidup atau autentikasi akun dalam ${xray_active_window_sec} detik terakhir."
   echo "RECENT berarti akun terlihat di log, tetapi tidak ada bukti sesi hidup saat diperiksa."
-  echo "IP_AKTIF memerlukan sesi hidup; IP_RECENT adalah histori dan bukan bukti multi-login."
+  echo "NET_AKTIF adalah estimasi jaringan overlap; IPv4/IPv6 dual-stack dan IP satu operator digabung."
+  echo "IP_RECENT adalah jumlah IP mentah dalam window aktif dan bukan jumlah perangkat."
   echo "MODE LEGACY memakai satu credential bersama; jumlah perangkat tidak bisa dipastikan dari IP saja."
 }
 

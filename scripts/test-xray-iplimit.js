@@ -50,6 +50,7 @@ const checkerForPolicyTest = `${checkerSource.slice(0, mainCallIndex)}
 globalThis.__xrayPolicy = {
   selectXrayRecentIpMap,
   countIpGroups,
+  countXrayEffectiveDevices,
   xrayViolationSignal,
   defaults: {
     checkInterval: CHECK_INTERVAL_MINUTES,
@@ -118,7 +119,30 @@ assert.notStrictEqual(
   'different carrier groups must produce a different fingerprint'
 );
 
-assert(installer.includes('const hasLiveEvidence = xrayLive.available && liveSocketCount > 0;'));
+assert.strictEqual(
+  policy.countXrayEffectiveDevices(new Set(['140.213.1.1', '140.213.200.2']), 16),
+  1,
+  'carrier handoff addresses in one /16 must count as one device'
+);
+assert.strictEqual(
+  policy.countXrayEffectiveDevices(new Set(['140.213.1.1', '182.5.10.2']), 16),
+  2,
+  'two active IPv4 carrier groups must count as two devices'
+);
+assert.strictEqual(
+  policy.countXrayEffectiveDevices(new Set(['140.213.1.1', '2001:db8::1']), 16),
+  1,
+  'one IPv4 plus one IPv6 address must be treated as dual-stack'
+);
+assert.strictEqual(
+  policy.countXrayEffectiveDevices(new Set(['2001:db8::1', '2001:db8::abcd']), 16),
+  1,
+  'IPv6 privacy addresses in one /64 must count as one device'
+);
+
+assert(installer.includes('const hasSocketEvidence = xrayLive.available && liveSocketCount > 0;'));
+assert(installer.includes('const hasStrongLogEvidence = cnt > 0 && lockIpSet.size > 0;'));
+assert(installer.includes('const hasLiveEvidence = hasSocketEvidence || hasStrongLogEvidence;'));
 assert(installer.includes('if (!violation.confirmed) continue;'));
 assert(installer.includes('active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);'));
 assert(installer.includes('else out="OFFLINE";'));

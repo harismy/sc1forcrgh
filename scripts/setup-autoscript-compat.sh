@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.29}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.30}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -24009,6 +24009,7 @@ xray_log_snapshot() {
 
       ip=norm_ip(src);
       seen[email]=1;
+      if (!(email in latest_auth_ts) || ts > latest_auth_ts[email]) latest_auth_ts[email]=ts;
       if (!usable_ip(ip)) next;
       key=email "|" ip;
       hits[key]++;
@@ -24030,18 +24031,59 @@ xray_log_snapshot() {
         raw=(u in cnt_raw ? cnt_raw[u] : 0);
         cnt=raw;
         lip=(u in lastip ? lastip[u] : "TIDAK_TERDETEKSI");
-        visibility=(cnt > 0 ? "RECENT_LOG_ONLY" : "PROXY_LOCAL");
+        auth_active=((u in latest_auth_ts) && latest_auth_ts[u] >= active_cutoff ? 1 : 0);
+        if (cnt > 0) visibility=(auth_active ? "SOURCE_IP_RECENT_ACTIVE" : "SOURCE_IP_RECENT");
+        else visibility=(auth_active ? "AUTH_ACTIVE" : "AUTH_RECENT");
         printf "%s|0|0|%d|%s|%s\n", u, cnt, lip, visibility;
       }
     }' > "${dst}"
 }
 
+merge_xray_observations() {
+  local tracker_file="$1" log_file="$2" output_file="$3"
+  awk -F'|' '
+    function visibility_rank(v) {
+      if (v=="SOURCE_IP_ACTIVE") return 60;
+      if (v=="SOURCE_IP_RECENT_ACTIVE") return 50;
+      if (v=="AUTH_ACTIVE") return 40;
+      if (v=="SOURCE_IP_RECENT") return 30;
+      if (v=="AUTH_RECENT") return 20;
+      if (v=="PROXY_LOCAL") return 10;
+      return 0;
+    }
+    $1 ~ /^[a-z0-9._-]+$/ {
+      u=tolower($1);
+      socketc=($2 ~ /^[0-9]+$/ ? $2+0 : 0);
+      activec=($3 ~ /^[0-9]+$/ ? $3+0 : 0);
+      recentc=($4 ~ /^[0-9]+$/ ? $4+0 : 0);
+      lip=$5; visibility=$6; rank=visibility_rank(visibility);
+      seen[u]=1;
+      if (!(u in sockets) || socketc>sockets[u]) sockets[u]=socketc;
+      if (!(u in active_ips) || activec>active_ips[u]) active_ips[u]=activec;
+      if (!(u in recent_ips) || recentc>recent_ips[u]) recent_ips[u]=recentc;
+      if (rank>visibility_rank(best_visibility[u])) best_visibility[u]=visibility;
+      if (lip!="" && lip!="-" && lip!="TIDAK_TERDETEKSI" && rank>=last_ip_rank[u]) {
+        last_ip[u]=lip; last_ip_rank[u]=rank;
+      }
+    }
+    END {
+      for (u in seen) {
+        printf "%s|%d|%d|%d|%s|%s\n", u, sockets[u]+0, active_ips[u]+0, recent_ips[u]+0,
+          (u in last_ip ? last_ip[u] : "TIDAK_TERDETEKSI"),
+          (best_visibility[u]!="" ? best_visibility[u] : "PROXY_LOCAL");
+      }
+    }
+  ' "${log_file}" "${tracker_file}" | sort -t'|' -k1,1 > "${output_file}"
+}
+
 show_xray_online_by_table() {
   local table="$1" label="$2" mode="${3:-normal}"
-  local t_users t_seen protocol source_mode tracker_ready
+  local t_users t_seen t_tracker t_log protocol source_mode tracker_ready
   t_users="$(mktemp)"
   t_seen="$(mktemp)"
-  trap 'rm -f "${t_users:-}" "${t_seen:-}"' RETURN
+  t_tracker="$(mktemp)"
+  t_log="$(mktemp)"
+  trap 'rm -f "${t_users:-}" "${t_seen:-}" "${t_tracker:-}" "${t_log:-}"' RETURN
 
   case "${table}" in
     account_vmesses) protocol="vmess" ;;
@@ -24074,22 +24116,28 @@ show_xray_online_by_table() {
         $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {
           print $2 "|" $3 "|" $4 "|" $5 "|" ($6!="" ? $6 : "TIDAK_TERDETEKSI") "|" ($7!="" ? $7 : "PROXY_LOCAL");
         }
-      ' > "${t_seen}"; then
+      ' > "${t_tracker}"; then
         tracker_ready="1"
-        source_mode="REALTIME_SOCKET_OBSERVE"
       fi
     elif /usr/local/sbin/sc-1forcr-xray-live rows-v2 2>/dev/null | awk -F'|' -v proto="${protocol}" '
         $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
           active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);
           print $2 "|" $3 "|" active "|" $4 "|" ($5!="" ? $5 : "TIDAK_TERDETEKSI") "|" ($6!="" ? $6 : "PROXY_LOCAL");
         }
-      ' > "${t_seen}"; then
+      ' > "${t_tracker}"; then
         tracker_ready="1"
-        source_mode="REALTIME_SOCKET_COMPAT"
     fi
   fi
-  if [[ "${tracker_ready}" != "1" ]]; then
-    xray_log_snapshot "${t_seen}" "${mode}"
+  xray_log_snapshot "${t_log}" "${mode}"
+  merge_xray_observations "${t_tracker}" "${t_log}" "${t_seen}"
+  if [[ -s "${t_tracker}" && -s "${t_log}" ]]; then
+    source_mode="SOCKET+AUTH_LOG"
+  elif [[ -s "${t_tracker}" ]]; then
+    source_mode="REALTIME_SOCKET"
+  elif [[ -s "${t_log}" ]]; then
+    source_mode="AUTH_LOG_FALLBACK"
+  elif [[ "${tracker_ready}" == "1" ]]; then
+    source_mode="REALTIME_SOCKET"
   fi
 
   draw_menu_header "${label} USER LOGIN (${source_mode})"
@@ -24124,7 +24172,8 @@ show_xray_online_by_table() {
       l=(u in db_limit ? db_limit[u] : 0);
       cm=(u in db_mode ? db_mode[u] : "LEGACY");
       if (s=="LOCK" || s=="LOCK_TMP" || s=="LOCK_QUOTA") out="KENA_LOCK";
-      else if (sockets > 0) out="ONLINE";
+      else if (sockets > 0 || visibility=="SOURCE_IP_ACTIVE" || visibility=="SOURCE_IP_RECENT_ACTIVE" || visibility=="AUTH_ACTIVE") out="ONLINE";
+      else if (visibility ~ /RECENT/) out="RECENT";
       else out="OFFLINE";
       if (recent <= 0 || visibility=="PROXY_LOCAL" || lip=="" || lip=="-") lip="TIDAK_TERDETEKSI";
       printf "%-20s %-10s %-8d %-11s %-12d %-9d %-10d %-22s\n", u, out, l, cm, sockets, ipc, recent, lip;
@@ -24142,6 +24191,8 @@ show_xray_online_by_table() {
     }' "${t_users}" "${t_seen}"
   echo
   echo "Catatan: SOCKET_AKTIF bukan jumlah perangkat/orang."
+  echo "ONLINE berarti ada socket hidup atau autentikasi akun dalam ${xray_active_window_sec} detik terakhir."
+  echo "RECENT berarti akun terlihat di log, tetapi tidak ada bukti sesi hidup saat diperiksa."
   echo "IP_AKTIF memerlukan sesi hidup; IP_RECENT adalah histori dan bukan bukti multi-login."
   echo "MODE LEGACY memakai satu credential bersama; jumlah perangkat tidak bisa dipastikan dari IP saja."
 }

@@ -114,13 +114,13 @@ set -euo pipefail
 #   UDPHC_LOG_LINES_REALTIME=auto                (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   UDPHC_LOG_LINES_CHECKER=auto                 (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   XRAY_BLOCK_TCP_PORTS=80,443                  (opsional, port TCP yang diblok saat lock tmp xray)
-#   XRAY_RECENT_WINDOW_MINUTES=60                (opsional, jendela menit log xray untuk hitung multi-login)
-#   XRAY_ACTIVE_WINDOW_SECONDS=600               (opsional, jendela detik untuk IP aktif xray)
-#   XRAY_MIN_HITS_PER_IP=1                       (opsional, minimal hit/log per IP pada jendela aktif)
+#   XRAY_RECENT_WINDOW_MINUTES=5                 (opsional, jendela menit log xray untuk kandidat multi-login)
+#   XRAY_ACTIVE_WINDOW_SECONDS=60                (opsional, jendela detik untuk kandidat IP aktif xray)
+#   XRAY_MIN_HITS_PER_IP=2                       (opsional, minimal hit/log per IP pada jendela aktif)
 #   XRAY_REAL_IP_ENABLE=0                        (canary: 1=teruskan IP asli HAProxy->Nginx->Xray)
 #   XRAY_MIRROR_BASE=                            (opsional, base URL mirror binary Xray, mis. https://installer.domain/xray)
 #   XRAY_VERSION=                                (opsional, pin versi Xray, mis. v2.6.3.27)
-#   XRAY_LIVE_IP_TTL_SECONDS=900                 (retensi IP aktif monitor; bukan jumlah socket)
+#   XRAY_LIVE_IP_TTL_SECONDS=90                  (retensi histori IP monitor; bukan jumlah socket/perangkat)
 #   Catatan monitor Xray: socket aktif bukan jumlah perangkat. IP loopback proxy
 #   tidak pernah dihitung sebagai IP pengguna.
 #   XRAY_PATHS_VMESS=/vmess                      (opsional, multi path dipisah koma)
@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.27}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.29}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -276,7 +276,7 @@ XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}"
 XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}"
 XRAY_VERSION="${XRAY_VERSION:-}"
 XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
-XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}"
+XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-90}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
@@ -298,6 +298,19 @@ VMESS_BUG_PROFILE_SNI="${VMESS_BUG_PROFILE_SNI:-}"
 VMESS_BUG_PROFILE_HOST="${VMESS_BUG_PROFILE_HOST:-}"
 VMESS_BUG_PROFILE_ALLOW_INSECURE="${VMESS_BUG_PROFILE_ALLOW_INSECURE:-1}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
+
+# Migrasi default Xray lama. Kombinasi ini adalah nilai bawaan versi sebelum
+# V.1FSC.28; nilai custom lain tetap dipertahankan.
+if [[ "${XRAY_RECENT_WINDOW_MINUTES}" == "60" &&
+      "${XRAY_ACTIVE_WINDOW_SECONDS}" == "600" &&
+      "${XRAY_MIN_HITS_PER_IP}" == "1" ]]; then
+  XRAY_RECENT_WINDOW_MINUTES="5"
+  XRAY_ACTIVE_WINDOW_SECONDS="60"
+  XRAY_MIN_HITS_PER_IP="2"
+fi
+if [[ "${XRAY_LIVE_IP_TTL_SECONDS}" == "900" ]]; then
+  XRAY_LIVE_IP_TTL_SECONDS="90"
+fi
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
   echo "setup-autoscript-compat ${SCRIPT_VERSION}"
@@ -7813,6 +7826,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const net = require('net');
+const crypto = require('crypto');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
 
@@ -7839,10 +7853,10 @@ const BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN = String(
   ''
 ).trim();
 const ACTIVE_UDP_BACKEND = String(process.env.ACTIVE_UDP_BACKEND || '').trim().toLowerCase();
-const CHECK_INTERVAL_MINUTES_RAW = Number(process.env.IPLIMIT_CHECK_INTERVAL_MINUTES || 10);
+const CHECK_INTERVAL_MINUTES_RAW = Number(process.env.IPLIMIT_CHECK_INTERVAL_MINUTES || 5);
 const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CHECK_INTERVAL_MINUTES_RAW > 0
   ? Math.floor(CHECK_INTERVAL_MINUTES_RAW)
-  : 10;
+  : 5;
 const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
 const LOCK_HISTORY_RETENTION_DAYS_RAW = Number(process.env.IPLIMIT_LOCK_HISTORY_RETENTION_DAYS || 90);
@@ -7859,23 +7873,26 @@ const SSHWS_ACCOUNT_SESSION_HARD_LIMIT = Number.isFinite(SSHWS_ACCOUNT_SESSION_H
 const SSHWS_HARD_LIMIT_CONFIRM_CYCLES = 2;
 const SSHWS_HARD_LIMIT_MIN_GAP_SECONDS = Math.max(30, CHECK_INTERVAL_MINUTES * 30);
 const SSHWS_HARD_LIMIT_MAX_GAP_SECONDS = Math.max(180, (CHECK_INTERVAL_MINUTES * 120) + 60);
+const XRAY_LIMIT_CONFIRM_CYCLES = 2;
+const XRAY_LIMIT_MIN_GAP_SECONDS = Math.max(30, CHECK_INTERVAL_MINUTES * 30);
+const XRAY_LIMIT_MAX_GAP_SECONDS = Math.max(180, (CHECK_INTERVAL_MINUTES * 120) + 60);
 const LOCK_RECHECK_GRACE_SECONDS = Math.max(180, CHECK_INTERVAL_MINUTES * 120);
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
   .split(',')
   .map((v) => Number(String(v || '').trim()))
   .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535);
-const XRAY_RECENT_WINDOW_MINUTES_RAW = Number(process.env.XRAY_RECENT_WINDOW_MINUTES || 60);
+const XRAY_RECENT_WINDOW_MINUTES_RAW = Number(process.env.XRAY_RECENT_WINDOW_MINUTES || 5);
 const XRAY_RECENT_WINDOW_MINUTES = Number.isFinite(XRAY_RECENT_WINDOW_MINUTES_RAW) && XRAY_RECENT_WINDOW_MINUTES_RAW >= 5
   ? Math.min(Math.floor(XRAY_RECENT_WINDOW_MINUTES_RAW), 1440)
-  : 60;
-const XRAY_ACTIVE_WINDOW_SECONDS_RAW = Number(process.env.XRAY_ACTIVE_WINDOW_SECONDS || 600);
+  : 5;
+const XRAY_ACTIVE_WINDOW_SECONDS_RAW = Number(process.env.XRAY_ACTIVE_WINDOW_SECONDS || 60);
 const XRAY_ACTIVE_WINDOW_SECONDS = Number.isFinite(XRAY_ACTIVE_WINDOW_SECONDS_RAW) && XRAY_ACTIVE_WINDOW_SECONDS_RAW >= 30
   ? Math.min(Math.floor(XRAY_ACTIVE_WINDOW_SECONDS_RAW), 1800)
-  : 600;
-const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 1);
+  : 60;
+const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 2);
 const XRAY_MIN_HITS_PER_IP = Number.isFinite(XRAY_MIN_HITS_PER_IP_RAW) && XRAY_MIN_HITS_PER_IP_RAW >= 1
   ? Math.min(Math.floor(XRAY_MIN_HITS_PER_IP_RAW), 20)
-  : 1;
+  : 2;
 const XRAY_IP_GROUP_MASK_RAW = Number(process.env.XRAY_IP_GROUP_MASK || 16);
 const XRAY_IP_GROUP_MASK = Number.isFinite(XRAY_IP_GROUP_MASK_RAW) && XRAY_IP_GROUP_MASK_RAW >= 8 && XRAY_IP_GROUP_MASK_RAW <= 32
   ? Math.floor(XRAY_IP_GROUP_MASK_RAW)
@@ -7937,7 +7954,7 @@ const ZIVPN_HANDOFF_GRACE_SECONDS_RAW = Number(process.env.ZIVPN_HANDOFF_GRACE_S
 const ZIVPN_HANDOFF_GRACE_SECONDS = Number.isFinite(ZIVPN_HANDOFF_GRACE_SECONDS_RAW) && ZIVPN_HANDOFF_GRACE_SECONDS_RAW >= 3
   ? Math.min(Math.floor(ZIVPN_HANDOFF_GRACE_SECONDS_RAW), 120)
   : 20;
-const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '1').trim() === '1';
+const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '0').trim() === '1';
 const UDPCUSTOM_LOG_UNITS = Array.from(new Set([
   UDPCUSTOM_SERVICE,
   'sc-1forcr-udpcustom',
@@ -9065,19 +9082,50 @@ async function readZivpnLiveMap(nowTs) {
   return { ipMap, sessionMap };
 }
 
-function parseXrayRecentIpMap() {
+function selectXrayRecentIpMap(userIpStats, nowMs = Date.now()) {
   const map = new Map();
+  const activeCutoffTs = nowMs - (XRAY_ACTIVE_WINDOW_SECONDS * 1000);
+
+  // Pergantian IP serial tidak membuktikan multi-login. IP lain hanya dipilih
+  // jika aktivitasnya benar-benar overlap dengan awal aktivitas IP terbaru.
+  for (const [email, ipMap] of userIpStats.entries()) {
+    const active = [];
+    for (const [ip, stat] of ipMap.entries()) {
+      if ((stat.lastSeen || 0) < activeCutoffTs) continue;
+      active.push({ ip, ...stat });
+    }
+    if (active.length === 0) continue;
+
+    active.sort((a, b) => b.lastSeen - a.lastSeen);
+    const latest = active[0];
+    const chosen = new Set([latest.ip]);
+    for (let i = 1; i < active.length; i += 1) {
+      const cur = active[i];
+      if (cur.hits < XRAY_MIN_HITS_PER_IP) continue;
+      const overlapsLatestPeriod = cur.lastSeen >= latest.firstSeen;
+      if (overlapsLatestPeriod) {
+        chosen.add(cur.ip);
+      } else if (IPLIMIT_DEBUG) {
+        const lagSec = Math.max(0, Math.floor((latest.firstSeen - cur.lastSeen) / 1000));
+        console.log(`[iplimit-debug][xray] mobile-handoff filtered user=${email} old_ip=${cur.ip} lag=${lagSec}s hits=${cur.hits}`);
+      }
+    }
+    map.set(email, chosen);
+  }
+  return map;
+}
+
+function parseXrayRecentIpMap() {
   const path = '/var/log/xray/access.log';
-  if (!fs.existsSync(path)) return map;
+  if (!fs.existsSync(path)) return new Map();
   let tailOut = '';
   try {
     tailOut = execFileSync('tail', ['-n', String(XRAY_LOG_TAIL_LINES), path], { encoding: 'utf8', maxBuffer: 12 * 1024 * 1024 });
   } catch (_) {
-    return map;
+    return new Map();
   }
   const nowMs = Date.now();
   const cutoffTs = nowMs - (XRAY_RECENT_WINDOW_MINUTES * 60 * 1000);
-  const activeCutoffTs = nowMs - (XRAY_ACTIVE_WINDOW_SECONDS * 1000);
   const userIpStats = new Map(); // email -> Map(ip -> { hits, firstSeen, lastSeen })
   const lines = String(tailOut || '').split('\n');
   for (const lineRaw of lines) {
@@ -9121,40 +9169,7 @@ function parseXrayRecentIpMap() {
     if (lastSeen > stat.lastSeen) stat.lastSeen = lastSeen;
   }
 
-  // Anti false-positive mobile handoff:
-  // ketika jaringan seluler berpindah IP cepat, IP lama sering masih muncul
-  // dalam window log tapi bukan sesi paralel. Hanya hitung IP lain jika ada
-  // overlap waktu dengan periode setelah IP terbaru mulai aktif.
-  for (const [email, ipMap] of userIpStats.entries()) {
-    const active = [];
-    for (const [ip, stat] of ipMap.entries()) {
-      if ((stat.lastSeen || 0) < activeCutoffTs) continue;
-      active.push({ ip, ...stat });
-    }
-    if (active.length === 0) continue;
-
-    active.sort((a, b) => b.lastSeen - a.lastSeen);
-    const latest = active[0];
-    const chosen = new Set([latest.ip]);
-    for (let i = 1; i < active.length; i += 1) {
-      const cur = active[i];
-      if (cur.hits < XRAY_MIN_HITS_PER_IP) continue;
-      // dianggap sesi paralel jika masih ada aktivitas IP ini setelah
-      // IP terbaru mulai muncul di log.
-      const overlapsLatestPeriod = cur.lastSeen >= latest.firstSeen;
-      if (overlapsLatestPeriod) {
-        chosen.add(cur.ip);
-      } else if (IPLIMIT_DEBUG) {
-        const lagSec = Math.max(0, Math.floor((latest.firstSeen - cur.lastSeen) / 1000));
-        console.log(`[iplimit-debug][xray] mobile-handoff filtered user=${email} old_ip=${cur.ip} lag=${lagSec}s hits=${cur.hits}`);
-      }
-    }
-    // Simpan seluruh IP aktif yang sudah lolos filter overlap/hit. Toleransi
-    // dual-stack diterapkan kemudian berdasarkan limit akun, bukan dengan
-    // memangkas 3-4 IP menjadi 2 karena itu membuat limit >1 mudah terlewati.
-    map.set(email, chosen);
-  }
-  return map;
+  return selectXrayRecentIpMap(userIpStats, nowMs);
 }
 
 function ipSubnetPrefix(ip, mask) {
@@ -9174,6 +9189,43 @@ function countIpGroups(ipSet, mask) {
     groups.add(ipSubnetPrefix(ip, mask));
   }
   return groups.size;
+}
+
+function xrayViolationSignal(ipSet) {
+  const groups = Array.from(new Set(
+    Array.from(ipSet || [])
+      .map((ip) => ipSubnetPrefix(ip, XRAY_IP_GROUP_MASK))
+      .filter(Boolean)
+  )).sort();
+  const fingerprint = crypto.createHash('sha256').update(groups.join('|')).digest('hex').slice(0, 16);
+  return `xray-ip-${fingerprint}`;
+}
+
+function readXrayLiveSocketMap() {
+  const helper = '/usr/local/sbin/sc-1forcr-xray-live';
+  try {
+    fs.accessSync(helper, fs.constants.X_OK);
+    const output = execFileSync(helper, ['rows-v2'], {
+      encoding: 'utf8',
+      timeout: 10000,
+      maxBuffer: 4 * 1024 * 1024
+    });
+    const sockets = new Map();
+    for (const lineRaw of String(output || '').split(/\r?\n/)) {
+      const parts = String(lineRaw || '').trim().split('|');
+      const proto = String(parts[0] || '').trim().toLowerCase();
+      const user = String(parts[1] || '').trim().toLowerCase();
+      const count = Number(parts[2] || 0);
+      if (!/^(vmess|vless|trojan)$/.test(proto) || !/^[a-z0-9._-]+$/.test(user)) continue;
+      sockets.set(`${proto}|${user}`, Number.isFinite(count) && count > 0 ? Math.floor(count) : 0);
+    }
+    return { available: true, sockets };
+  } catch (err) {
+    if (IPLIMIT_DEBUG) {
+      console.log(`[iplimit-debug][xray-live] unavailable err=${String(err?.message || err)}`);
+    }
+    return { available: false, sockets: new Map() };
+  }
 }
 function removeZivpnUser(username) {
   try {
@@ -10382,6 +10434,59 @@ async function sampleSshwsIpLimit(username, detected, limit, nowTs) {
   );
 }
 
+async function sampleXrayIpLimit(accountTypeRaw, username, ipSet, detected, limit, nowTs) {
+  const accountType = String(accountTypeRaw || '').trim().toLowerCase();
+  const user = String(username || '').trim().toLowerCase();
+  const count = Math.max(0, Number(detected || 0));
+  const accountLimit = Math.max(0, Number(limit || 0));
+  if (!/^(vmess|vless|trojan)$/.test(accountType) || !/^[a-z0-9._-]+$/.test(user)) {
+    return { candidate: false, confirmed: false, hits: 0, signal: '' };
+  }
+
+  const candidate = accountLimit > 0 && count > accountLimit;
+  if (!candidate) {
+    await run(
+      "DELETE FROM iplimit_violation_pending WHERE account_type=? AND username=? AND signal LIKE 'xray-ip-%'",
+      [accountType, user]
+    ).catch(() => {});
+    return { candidate: false, confirmed: false, hits: 0, signal: '' };
+  }
+
+  const signal = xrayViolationSignal(ipSet);
+  await run(
+    "DELETE FROM iplimit_violation_pending WHERE account_type=? AND username=? AND signal LIKE 'xray-ip-%' AND signal<>?",
+    [accountType, user, signal]
+  ).catch(() => {});
+  const previous = await get(
+    "SELECT first_seen, last_seen, hits FROM iplimit_violation_pending WHERE account_type=? AND username=? AND signal=?",
+    [accountType, user, signal]
+  ).catch(() => null);
+  const previousLastSeen = Number(previous?.last_seen || 0);
+  const elapsed = nowTs - previousLastSeen;
+  const validPrevious = previousLastSeen > 0 && previousLastSeen <= nowTs + 60;
+  const tooSoon = validPrevious && elapsed >= 0 && elapsed < XRAY_LIMIT_MIN_GAP_SECONDS;
+  const consecutive = validPrevious
+    && elapsed >= XRAY_LIMIT_MIN_GAP_SECONDS
+    && elapsed <= XRAY_LIMIT_MAX_GAP_SECONDS;
+  const firstSeen = (tooSoon || consecutive) ? Number(previous?.first_seen || nowTs) : nowTs;
+  const hits = consecutive
+    ? Math.min(XRAY_LIMIT_CONFIRM_CYCLES, Number(previous?.hits || 0) + 1)
+    : (tooSoon ? Math.max(1, Number(previous?.hits || 1)) : 1);
+  const lastSeen = tooSoon ? previousLastSeen : nowTs;
+  await run(
+    `INSERT OR REPLACE INTO iplimit_violation_pending
+       (account_type, username, signal, first_seen, last_seen, hits, detected)
+     VALUES(?, ?, ?, ?, ?, ?, ?)`,
+    [accountType, user, signal, firstSeen, lastSeen, hits, count]
+  ).catch(() => {});
+  return {
+    candidate: true,
+    confirmed: hits >= XRAY_LIMIT_CONFIRM_CYCLES,
+    hits,
+    signal
+  };
+}
+
 async function enforceExpiredAccounts() {
   const today = ymdLocalNow();
   let zivpnChanged = false;
@@ -10596,6 +10701,7 @@ async function lockIfExceeded(nowTs) {
   const sshZivpnLiveSessionMap = zivpnLive.sessionMap || new Map();
   const sshZivpnLiveIpMap = zivpnLive.ipMap || new Map();
   const xrayMap = parseXrayRecentIpMap();
+  const xrayLive = readXrayLiveSocketMap();
   const udpLockPort = getActiveUdpLockPort();
   let zivpnChanged = false;
   let udpcustomChanged = false;
@@ -10880,11 +10986,24 @@ async function lockIfExceeded(nowTs) {
       // IPv4+IPv6 dual-stack: satu device bisa punya 2 IP beda family.
       // Hanya ditoleransi untuk limit 1 dan tepat 2 IP mentah.
       const cnt = (lim === 1 && cntRaw === 2) ? 1 : cntGrouped;
+      const liveSocketCount = Number(xrayLive.sockets.get(`${item.type}|${userKey}`) || 0);
+      // Access log tanpa bukti socket hidup hanya merupakan histori/handoff.
+      // Jika helper realtime tidak tersedia, Xray tetap monitor-only agar
+      // kegagalan observasi tidak berubah menjadi false lock.
+      const hasLiveEvidence = xrayLive.available && liveSocketCount > 0;
+      const violation = await sampleXrayIpLimit(
+        item.type,
+        userKey,
+        lockIpSet,
+        cnt,
+        hasLiveEvidence ? lim : Number.MAX_SAFE_INTEGER,
+        nowTs
+      );
       if (IPLIMIT_DEBUG) {
         const ips = Array.from(lockIpSet).slice(0, 8).join(',');
-        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cntGrouped=${cntGrouped} cnt=${cnt} mask=${XRAY_IP_GROUP_MASK} ips=${ips}`);
+        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cntGrouped=${cntGrouped} cnt=${cnt} mask=${XRAY_IP_GROUP_MASK} liveTracker=${xrayLive.available ? 1 : 0} liveSockets=${liveSocketCount} candidate=${violation.candidate ? 1 : 0} confirm=${violation.hits}/${XRAY_LIMIT_CONFIRM_CYCLES} ips=${ips}`);
       }
-      if (cnt <= lim) continue;
+      if (!violation.confirmed) continue;
       if (graceMap.has(`${item.type}|${userKey}`)) continue;
       const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]);
       if (exists) continue;
@@ -10907,6 +11026,10 @@ async function lockIfExceeded(nowTs) {
       }
       await run(`UPDATE ${item.table} SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES(?, ?, ?, 0)", [item.type, user, nowTs + LOCK_SECONDS]).catch(() => {});
+      await run(
+        "DELETE FROM iplimit_violation_pending WHERE account_type=? AND username=? AND signal LIKE 'xray-ip-%'",
+        [item.type, userKey]
+      ).catch(() => {});
       const lockReasonText = 'pemakaian IP aktif bersamaan melewati limit akun';
       const historyId = await createIpLimitLockHistory({
         account_type: item.type,
@@ -14311,6 +14434,10 @@ done
 mode="${1:-list}"
 db_path="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 access_log="${XRAY_ACCESS_LOG:-/var/log/xray/access.log}"
+if [[ "${mode}" == "capabilities" ]]; then
+  printf '%s\n' 'rows-v3'
+  exit 0
+fi
 recovery_h="$(echo "${XRAY_LIVE_RECOVERY_HOURS:-72}" | tr -cd '0-9')"
 log_max="$(echo "${XRAY_LIVE_LOG_MAX_LINES:-30000}" | tr -cd '0-9')"
 native_poll="$(echo "${XRAY_LIVE_NATIVE_POLL_SECONDS:-15}" | tr -cd '0-9')"
@@ -14322,13 +14449,13 @@ native_support_file="${XRAY_LIVE_NATIVE_SUPPORT_FILE:-${state_dir}/xray-live.nat
 ip_state_file="${XRAY_LIVE_IP_STATE_FILE:-${state_dir}/xray-live.ips}"
 schema_file="${XRAY_LIVE_SCHEMA_FILE:-${state_dir}/xray-live.schema}"
 lock_file="${state_dir}/xray-live.lock"
-ip_ttl="$(echo "${XRAY_LIVE_IP_TTL_SECONDS:-900}" | tr -cd '0-9')"
-tracker_schema="4"
+ip_ttl="$(echo "${XRAY_LIVE_IP_TTL_SECONDS:-90}" | tr -cd '0-9')"
+tracker_schema="5"
 
 [[ -z "${recovery_h}" || "${recovery_h}" -lt 1 || "${recovery_h}" -gt 168 ]] && recovery_h="72"
 [[ -z "${log_max}" || "${log_max}" -lt 2000 || "${log_max}" -gt 100000 ]] && log_max="30000"
 [[ -z "${native_poll}" || "${native_poll}" -lt 5 || "${native_poll}" -gt 300 ]] && native_poll="15"
-[[ -z "${ip_ttl}" || "${ip_ttl}" -lt 60 || "${ip_ttl}" -gt 86400 ]] && ip_ttl="900"
+[[ -z "${ip_ttl}" || "${ip_ttl}" -lt 60 || "${ip_ttl}" -gt 86400 ]] && ip_ttl="90"
 
 mkdir -p "${state_dir}" >/dev/null 2>&1 || exit 0
 chmod 700 "${state_dir}" >/dev/null 2>&1 || true
@@ -14659,9 +14786,9 @@ awk -F'|' '
   }
 ' "${session_rows}" "${db_users}" "${native_users}" > "${all_sessions}" || true
 
-# X-Forwarded-For membuat Xray mencatat IP asli dengan port 0. IP tersebut
-# tidak bisa dipasangkan ke ephemeral port socket, jadi gabungkan sebagai
-# bukti IP terbaru per akun/protokol tanpa menganggapnya sebagai socket baru.
+# X-Forwarded-For membuat Xray mencatat IP asli dengan port 0 sehingga tidak
+# bisa dipasangkan ke ephemeral port. Kaitkan hanya IP terbaru dan hanya bila
+# akun masih mempunyai sesi hidup; daftar lainnya tetap histori di mode ips.
 awk -F'|' '
   FILENAME==ARGV[1] {
     proto=tolower($1); user=tolower($2);
@@ -14671,21 +14798,20 @@ awk -F'|' '
     next;
   }
   FILENAME==ARGV[2] {
-    proto=tolower($1); user=tolower($2);
-    if (proto !~ /^(vmess|vless|trojan)$/ || user !~ /^[a-z0-9._-]+$/) next;
-    key=user SUBSEP proto;
-    if (!(key in db_seen)) { db_seen[key]=1; db_count[user]++; db_proto[user]=proto; }
-    next;
+    user=tolower($1); ip=tolower($2); ts=$3+0;
+    if (user !~ /^[a-z0-9._-]+$/ || ip=="" || ip=="-" || ts<=0) next;
+    if (!(user in latest_ts) || ts>=latest_ts[user]) {
+      latest_ts[user]=ts; latest_ip[user]=ip;
+    }
   }
-  FILENAME==ARGV[3] {
-    user=tolower($1); ip=tolower($2);
-    if (user !~ /^[a-z0-9._-]+$/ || ip=="" || ip=="-") next;
-    proto="";
-    if (active_count[user]==1) proto=active_proto[user];
-    else if (db_count[user]==1) proto=db_proto[user];
-    if (proto!="") print proto "|" user "|ip:" ip "|" ip;
+  END {
+    for (user in latest_ip) {
+      if (active_count[user]!=1) continue;
+      proto=active_proto[user]; ip=latest_ip[user];
+      print proto "|" user "|ip:" ip "|" ip;
+    }
   }
-' "${all_sessions}" "${db_users}" "${ip_state_file}" >> "${all_sessions}" || true
+' "${all_sessions}" "${ip_state_file}" >> "${all_sessions}" || true
 
 case "${mode}" in
   raw)
@@ -14749,11 +14875,71 @@ case "${mode}" in
           socketc=(key in sockets ? sockets[key] : 0);
           ipc=(key in ips ? ips[key] : 0);
           lip=(key in lastip ? lastip[key] : "TIDAK_TERDETEKSI");
-          visibility=(ipc > 0 ? "SOURCE_IP_RECENT" : "PROXY_LOCAL");
+          visibility=(ipc > 0 ? "SOURCE_IP_ACTIVE" : "PROXY_LOCAL");
           printf "%s|%s|%d|%d|%s|%s\n", a[1], a[2], socketc, ipc, lip, visibility;
         }
       }
     ' "${all_sessions}" | sort -t'|' -k1,1 -k2,2
+    ;;
+  rows-v3)
+    # proto|username|socket_aktif|ip_aktif|ip_recent|last_ip|visibility
+    awk -F'|' '
+      function usable_ip(v) {
+        v=tolower(v);
+        if (v=="" || v=="-" || v=="::" || v=="::1" || v=="localhost") return 0;
+        if (v ~ /^(tcp|udp):/) return 0;
+        if (v ~ /^127(\.|$)/ || v ~ /^::ffff:127(\.|$)/) return 0;
+        return (v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || v ~ /^[0-9a-f:]+$/);
+      }
+      FILENAME==ARGV[1] {
+        proto=tolower($1); user=tolower($2);
+        if (proto !~ /^(vmess|vless|trojan)$/ || user !~ /^[a-z0-9._-]+$/ || $3=="") next;
+        key=proto SUBSEP user; seen[key]=1;
+        if (!(key in user_active_seen)) { user_active_seen[key]=1; active_proto_count[user]++; active_proto[user]=proto; }
+        sk=key SUBSEP $3;
+        if (!(sk in session_seen)) {
+          session_seen[sk]=1;
+          if ($3 !~ /^ip:/) sockets[key]++;
+        }
+        if (usable_ip($4)) {
+          ik=key SUBSEP tolower($4);
+          if (!(ik in active_ip_seen)) { active_ip_seen[ik]=1; active_ips[key]++; }
+          active_lastip[key]=$4;
+        }
+        next;
+      }
+      FILENAME==ARGV[2] {
+        proto=tolower($1); user=tolower($2);
+        if (proto ~ /^(vmess|vless|trojan)$/ && user ~ /^[a-z0-9._-]+$/) {
+          db_proto_count[user]++; db_proto[user]=proto;
+        }
+        next;
+      }
+      FILENAME==ARGV[3] {
+        user=tolower($1); ip=tolower($2); ts=$3+0;
+        if (user !~ /^[a-z0-9._-]+$/ || !usable_ip(ip)) next;
+        proto="";
+        if (active_proto_count[user]==1) proto=active_proto[user];
+        else if (db_proto_count[user]==1) proto=db_proto[user];
+        if (proto=="") next;
+        key=proto SUBSEP user; seen[key]=1; ik=key SUBSEP ip;
+        if (!(ik in recent_ip_seen)) { recent_ip_seen[ik]=1; recent_ips[key]++; }
+        if (!(key in recent_last_ts) || ts>=recent_last_ts[key]) {
+          recent_last_ts[key]=ts; recent_lastip[key]=ip;
+        }
+      }
+      END {
+        for (key in seen) {
+          split(key, a, SUBSEP);
+          socketc=(key in sockets ? sockets[key] : 0);
+          activec=(key in active_ips ? active_ips[key] : 0);
+          recentc=(key in recent_ips ? recent_ips[key] : activec);
+          lip=(key in recent_lastip ? recent_lastip[key] : (key in active_lastip ? active_lastip[key] : "TIDAK_TERDETEKSI"));
+          visibility=(activec > 0 ? "SOURCE_IP_ACTIVE" : (recentc > 0 ? "SOURCE_IP_RECENT" : "PROXY_LOCAL"));
+          printf "%s|%s|%d|%d|%d|%s|%s\n", a[1], a[2], socketc, activec, recentc, lip, visibility;
+        }
+      }
+    ' "${all_sessions}" "${db_users}" "${ip_state_file}" | sort -t'|' -k1,1 -k2,2
     ;;
   refresh)
     ;;
@@ -16623,7 +16809,7 @@ SSHWS_NGINX_LIMIT_ENABLE="${SSHWS_NGINX_LIMIT_ENABLE:-1}"
 SSHWS_NGINX_LIMIT_RATE="${SSHWS_NGINX_LIMIT_RATE:-2r/s}"
 SSHWS_NGINX_LIMIT_BURST="${SSHWS_NGINX_LIMIT_BURST:-4}"
 SSHWS_NGINX_LIMIT_CONN="${SSHWS_NGINX_LIMIT_CONN:-3}"
-XRAY_MONITOR_ACTIVE_WINDOW_SECONDS="${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-300}"
+XRAY_MONITOR_ACTIVE_WINDOW_SECONDS="${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-60}"
 XRAY_MONITOR_RECENT_WINDOW_MINUTES="${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
@@ -16640,7 +16826,7 @@ UDPHC_LOG_LINES_CHECKER="$(echo "${UDPHC_LOG_LINES_CHECKER:-6000}" | tr -cd '0-9
   xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
   xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
   xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
-xray_monitor_active_window_sec="$(echo "${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
+xray_monitor_active_window_sec="$(echo "${XRAY_MONITOR_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
 xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
 [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
@@ -16650,7 +16836,7 @@ xray_monitor_recent_window_min="$(echo "${XRAY_MONITOR_RECENT_WINDOW_MINUTES:-5}
   [[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="5"
   [[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="60"
   [[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="2"
-[[ -z "${xray_monitor_active_window_sec}" || "${xray_monitor_active_window_sec}" -lt 30 || "${xray_monitor_active_window_sec}" -gt 3600 ]] && xray_monitor_active_window_sec="300"
+[[ -z "${xray_monitor_active_window_sec}" || "${xray_monitor_active_window_sec}" -lt 30 || "${xray_monitor_active_window_sec}" -gt 3600 ]] && xray_monitor_active_window_sec="60"
 [[ -z "${xray_monitor_recent_window_min}" || "${xray_monitor_recent_window_min}" -lt 1 || "${xray_monitor_recent_window_min}" -gt 60 ]] && xray_monitor_recent_window_min="5"
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
@@ -18112,6 +18298,35 @@ endpoint_quota() {
   esac
 }
 
+created_json_value() {
+  local raw="$1" query="$2" fallback="${3--}"
+  local value
+  value="$(printf '%s' "${raw}" | jq -r "(${query}) // empty" 2>/dev/null || true)"
+  if [[ -n "${value}" && "${value}" != "null" ]]; then
+    printf '%s' "${value}"
+  else
+    printf '%s' "${fallback}"
+  fi
+}
+
+created_expiry_time() {
+  local expired="$1" fallback="${2--}"
+  if [[ "${expired}" =~ ([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  else
+    printf '%s' "${fallback}"
+  fi
+}
+
+created_quota_text() {
+  local quota="$1"
+  if [[ "${quota}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%s GB' "${quota}"
+  else
+    printf '%s' "${quota:--}"
+  fi
+}
+
 print_created_account() {
   local type="$1" raw="$2"
   local code err_msg
@@ -18124,12 +18339,22 @@ print_created_account() {
 
   case "${type}" in
     ssh)
-      local host user pass exp lim
-      host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
-      user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
-      pass="$(echo "${raw}" | jq -r '.data.password // "-"' )"
-      exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
-      lim="$(echo "${raw}" | jq -r '.data.limitip // "0"' )"
+      local host user pass exp exp_time lim city isp tls ntls dns ovpn_tcp ovpn_udp ssh_ohp udp_custom
+      host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
+      user="$(created_json_value "${raw}" '.data.username')"
+      pass="$(created_json_value "${raw}" '.data.password // .data.secret')"
+      exp="$(created_json_value "${raw}" '.data.exp // .data.expired // .data.date_exp')"
+      exp_time="$(created_expiry_time "${exp}" "$(created_json_value "${raw}" '.data.time')")"
+      lim="$(created_json_value "${raw}" '.data.limitip // .data.iplimit' '0')"
+      city="$(created_json_value "${raw}" '.data.city // .data.location.city')"
+      isp="$(created_json_value "${raw}" '.data.isp // .data.location.isp')"
+      tls="$(created_json_value "${raw}" '.data.port.tls // .data.port.ssl // .data.port.any' '443')"
+      ntls="$(created_json_value "${raw}" '.data.port.none // .data.port.ntls // .data.port.ws' '80')"
+      dns="$(created_json_value "${raw}" '.data.port.dns // .data.port.dnsslow // .data.port.dnslow')"
+      ovpn_tcp="$(created_json_value "${raw}" '.data.port.ovpntcp // .data.port.ovpn_tcp' '1194')"
+      ovpn_udp="$(created_json_value "${raw}" '.data.port.ovpnudp // .data.port.ovpn_udp' '2200')"
+      ssh_ohp="$(created_json_value "${raw}" '.data.port.sshohp // .data.port.ssh_ohp' '8181')"
+      udp_custom="$(created_json_value "${raw}" '.data.port.udpcustom // .data.port.udp_custom // .data.port.udphc // .data.udpcustom_port // .data.udp_custom_port')"
       cat <<EOT_SSH
 =============================
  SSH ACCOUNT CREATED
@@ -18137,44 +18362,110 @@ print_created_account() {
 
 [ SSH PREMIUM DETAILS ]
 -----------------------------
-SSH WS       : ${host}:80@${user}:${pass}
-SSH SSL      : ${host}:443@${user}:${pass}
-DNS SELOW    : ${host}:5300@${user}:${pass}
+SSH WS      : ${host}:${ntls}@${user}:${pass}
+SSH SSL     : ${host}:${tls}@${user}:${pass}
+DNS SELOW   : ${host}:${dns}@${user}:${pass}
+
+[ HOST INFORMATION ]
+-----------------------------
+Hostname    : ${host}
+City        : ${city}
+ISP         : ${isp}
+Username    : ${user}
+Password    : ${pass}
+Expiry Date : ${exp}
+Expiry Time : ${exp_time}
+IP Limit    : ${lim}
+
+[ PORTS ]
+------------------------------
+TLS         : ${tls}
+Non-TLS     : ${ntls}
+OVPN TCP    : ${ovpn_tcp}
+OVPN UDP    : ${ovpn_udp}
+SSH OHP     : ${ssh_ohp}
+UDP Custom  : ${udp_custom}
+
+[ PAYLOAD WS ]
+------------------------------
+GET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]
+
+[ PAYLOAD ENHANCED + SPLIT ]
+------------------------------
+PATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection:
+Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]
+------------------------------
+Terima kasih telah menggunakan layanan kami.
+EOT_SSH
+      ;;
+    zivpn)
+      local host user exp exp_time lim city isp udp_port backend
+      host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
+      user="$(created_json_value "${raw}" '.data.username')"
+      exp="$(created_json_value "${raw}" '.data.exp // .data.expired // .data.date_exp')"
+      exp_time="$(created_expiry_time "${exp}" "$(created_json_value "${raw}" '.data.time')")"
+      lim="$(created_json_value "${raw}" '.data.limitip // .data.iplimit' '0')"
+      city="$(created_json_value "${raw}" '.data.city // .data.location.city')"
+      isp="$(created_json_value "${raw}" '.data.isp // .data.location.isp')"
+      backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+      udp_port="-"
+      if [[ "${backend}" == "zivpn" ]]; then
+        udp_port="${ZIVPN_LISTEN_PORT:-5667}"
+      fi
+      cat <<EOT_ZIVPN
+=============================
+ ZIVPN ACCOUNT CREATED
+=============================
+
+[ ZIVPN DETAILS ]
+-----------------------------
+HOST         : ${host}
+UDP PASSWORD : ${user}
+UDP PORT     : ${udp_port}
+EXPIRED      : ${exp}
+EXPIRY TIME  : ${exp_time}
+IP LIMIT     : ${lim} pengguna
 
 [ HOST INFORMATION ]
 -----------------------------
 Hostname     : ${host}
-Username     : ${user}
-Password     : ${pass}
-Expiry Date  : ${exp}
-IP Limit     : ${lim}
-EOT_SSH
-      ;;
-    zivpn)
-      local host user exp lim
-      host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
-      user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
-      exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
-      lim="$(echo "${raw}" | jq -r '.data.limitip // "0"' )"
-      cat <<EOT_ZIVPN
-=============================
- ZIVPN SSH ACCOUNT
-=============================
-udp password : ${user}
-Hostname     : ${host}
-Expired      : ${exp}
-IP Limit     : ${lim}
+City         : ${city}
+ISP          : ${isp}
+-----------------------------
+Terima kasih telah menggunakan layanan kami.
 EOT_ZIVPN
       ;;
     vmess|vless|trojan)
-      local host user exp tls none linktls linknone linkbug linkbugs linkbugntls linkbugsntls aliases fronts
-      host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
-      user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
-      exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
-      tls="$(echo "${raw}" | jq -r '.data.port.tls // "443"' )"
-      none="$(echo "${raw}" | jq -r '.data.port.none // "80"' )"
-      linktls="$(echo "${raw}" | jq -r '.data.link.tls // "-"' )"
-      linknone="$(echo "${raw}" | jq -r '.data.link.none // "-"' )"
+      local title host user secret exp exp_time exp_text quota lim city isp domain sni tls none grpc any_port path_ws path_upgrade service_name
+      local linktls linknone linkgrpc linkuptls linkupntls linkbug linkbugs linkbugntls linkbugsntls aliases fronts
+      title="${type^^}"
+      host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
+      user="$(created_json_value "${raw}" '.data.username')"
+      secret="$(created_json_value "${raw}" '.data.uuid // .data.password // .data.secret // .data.id')"
+      exp="$(created_json_value "${raw}" '.data.exp // .data.expired // .data.date_exp')"
+      exp_time="$(created_expiry_time "${exp}" "$(created_json_value "${raw}" '.data.time')")"
+      exp_text="${exp}"
+      if [[ "${exp}" != *" - "* && "${exp_time}" != "-" ]]; then
+        exp_text="${exp} - ${exp_time}"
+      fi
+      quota="$(created_quota_text "$(created_json_value "${raw}" '.data.quota // .data.kuota // .data.quota_gb' '0')")"
+      lim="$(created_json_value "${raw}" '.data.limitip // .data.iplimit' '0')"
+      city="$(created_json_value "${raw}" '.data.city // .data.location.city')"
+      isp="$(created_json_value "${raw}" '.data.isp // .data.location.isp')"
+      domain="$(created_json_value "${raw}" '.data.domain // .data.hostname // .data.host')"
+      sni="$(created_json_value "${raw}" '.data.sni // .data.server_name // .data.hostname // .data.host')"
+      tls="$(created_json_value "${raw}" '.data.port.tls // .data.port.any' '443')"
+      none="$(created_json_value "${raw}" '.data.port.none // .data.port.ntls' '80')"
+      grpc="$(created_json_value "${raw}" '.data.port.grpc' '443')"
+      any_port="$(created_json_value "${raw}" '.data.port.any // .data.port.tls' '443')"
+      path_ws="$(created_json_value "${raw}" ".data.path.ws // .data.path.stn // .data.ws_path" "/${type}")"
+      path_upgrade="$(created_json_value "${raw}" ".data.path.upgrade // .data.upgrade_path" "/up${type}")"
+      service_name="$(created_json_value "${raw}" '.data.serviceName // .data.service_name' "${type}-grpc")"
+      linktls="$(created_json_value "${raw}" '.data.link.tls // .data.link.ws_tls')"
+      linknone="$(created_json_value "${raw}" '.data.link.none // .data.link.ntls // .data.link.ws_ntls')"
+      linkgrpc="$(created_json_value "${raw}" '.data.link.grpc // .data.link.grpc_tls')"
+      linkuptls="$(created_json_value "${raw}" '.data.link.uptls // .data.link.up_tls // .data.link.tls')"
+      linkupntls="$(created_json_value "${raw}" '.data.link.upntls // .data.link.up_ntls // .data.link.none // .data.link.ntls')"
       linkbug="$(echo "${raw}" | jq -r '.data.link.bugtls // .data.link.front_tls // ""' 2>/dev/null || true)"
       linkbugs="$(echo "${raw}" | jq -r 'if ((.data.link.front_tls_all // []) | type) == "array" and ((.data.link.front_tls_all // []) | length) > 0 then (.data.link.front_tls_all[] | "BUG " + (.address // "-") + " | SNI " + (.sni // .address // "-") + " -> Host " + (.host // "-") + ":\n" + (.link // "")) else empty end' 2>/dev/null || true)"
       linkbugntls="$(echo "${raw}" | jq -r '.data.link.bugntls // .data.link.front_none // ""' 2>/dev/null || true)"
@@ -18183,48 +18474,123 @@ EOT_ZIVPN
       fronts="$(echo "${raw}" | jq -r '(.data.front_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
       cat <<EOT_XRAY
 =============================
- ${type^^} ACCOUNT CREATED
+        ${title} ACCOUNT
 =============================
-Hostname     : ${host}
-Username     : ${user}
-Expired      : ${exp}
-TLS Port     : ${tls}
-NON TLS Port : ${none}
-Wildcard     : ${aliases:-none}
-Front bug    : ${fronts:-none}
 
-Link TLS:
+[ ${title} DETAILS ]
+-----------------------------
+REMARKS     : ${user}
+HOST        : ${host}
+PORT TLS    : ${tls}
+PORT NTLS   : ${none}
+PORT GRPC   : ${grpc}
+PORT ANY    : ${any_port}
+EOT_XRAY
+      case "${type}" in
+        vmess)
+          cat <<EOT_VMESS_DETAIL
+UUID        : ${secret}
+ALTER ID    : 0
+SECURITY    : auto
+EOT_VMESS_DETAIL
+          ;;
+        vless)
+          cat <<EOT_VLESS_DETAIL
+UUID        : ${secret}
+ENCRYPTION  : none
+SECURITY    : tls / none
+EOT_VLESS_DETAIL
+          ;;
+        trojan)
+          cat <<EOT_TROJAN_DETAIL
+PASSWORD    : ${secret}
+SECURITY    : tls / none
+EOT_TROJAN_DETAIL
+          ;;
+      esac
+      cat <<EOT_XRAY_LINKS
+NETWORK     : ws, grpc, upgrade
+PATH WS     : ${path_ws}
+SERVICE     : ${service_name}
+PATH UPGRADE: ${path_upgrade}
+EXPIRED     : ${exp_text}
+QUOTA       : ${quota}
+IP LIMIT    : ${lim} pengguna
+
+[ ${title} URL ]
+-----------------------------
+TLS:
 ${linktls}
 
-Link NON TLS:
+Non-TLS:
 ${linknone}
-EOT_XRAY
+
+gRPC:
+${linkgrpc}
+
+Up TLS:
+${linkuptls}
+
+Up Non-TLS:
+${linkupntls}
+EOT_XRAY_LINKS
+      if [[ -n "${aliases:-}" || -n "${fronts:-}" ]]; then
+        cat <<EOT_XRAY_HOSTS
+
+[ FRONT/BUG HOSTS ]
+-----------------------------
+Wildcard    : ${aliases:--}
+Front bug   : ${fronts:--}
+EOT_XRAY_HOSTS
+      fi
       if [[ -n "${linkbugs:-}" ]]; then
         cat <<EOT_XRAY_BUGS
 
-Link BUG TLS:
+[ FRONT/BUG URL TLS ]
+-----------------------------
 ${linkbugs}
 EOT_XRAY_BUGS
       elif [[ -n "${linkbug:-}" && "${linkbug}" != "null" && "${linkbug}" != "-" ]]; then
         cat <<EOT_XRAY_BUG
 
-Link BUG TLS:
+[ FRONT/BUG URL TLS ]
+-----------------------------
 ${linkbug}
 EOT_XRAY_BUG
       fi
       if [[ -n "${linkbugsntls:-}" ]]; then
         cat <<EOT_XRAY_BUGS_NTLS
 
-Link BUG NON TLS:
+[ FRONT/BUG URL NON-TLS ]
+-----------------------------
 ${linkbugsntls}
 EOT_XRAY_BUGS_NTLS
       elif [[ -n "${linkbugntls:-}" && "${linkbugntls}" != "null" && "${linkbugntls}" != "-" ]]; then
         cat <<EOT_XRAY_BUG_NTLS
 
-Link BUG NON TLS:
+[ FRONT/BUG URL NON-TLS ]
+-----------------------------
 ${linkbugntls}
 EOT_XRAY_BUG_NTLS
       fi
+      cat <<EOT_XRAY_FOOTER
+
+[ HOST INFORMATION ]
+-----------------------------
+Domain      : ${domain}
+SNI         : ${sni}
+City        : ${city}
+ISP         : ${isp}
+
+[ PORTS ]
+-----------------------------
+WS TLS      : ${tls}
+WS NTLS     : ${none}
+GRPC TLS    : ${grpc}
+ANY PORT    : ${any_port}
+-----------------------------
+Terima kasih telah menggunakan layanan kami.
+EOT_XRAY_FOOTER
       ;;
     *)
       echo "${raw}" | jq . 2>/dev/null || echo "${raw}"
@@ -23587,8 +23953,9 @@ xray_log_snapshot() {
     : > "${dst}"
     return
   fi
-  # Output: username|socket_aktif|ip_terverifikasi|last_ip|visibility.
-  # Fallback log tidak mengetahui jumlah socket kernel, sehingga kolom socket=0.
+  # Output: username|socket_aktif|ip_aktif|ip_recent|last_ip|visibility.
+  # Fallback log tidak mengetahui socket hidup. Seluruh IP hanya histori recent
+  # dan tidak boleh diberi label aktif/online.
   tail -n 5000 /var/log/xray/access.log | awk -v cutoff="${cutoff_ts}" -v active_cutoff="${active_cutoff_ts}" -v min_hits="${xray_min_hits_per_ip}" '
     function norm_ip(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
@@ -23661,14 +24028,10 @@ xray_log_snapshot() {
       }
       for (u in seen) {
         raw=(u in cnt_raw ? cnt_raw[u] : 0);
-        # Anti false-positive Xray mobile/dual-stack:
-        # 1-2 IP aktif cepat dihitung 1 device, 3-4 IP dihitung 2 device.
-        if (raw >= 1 && raw <= 2) cnt=1;
-        else if (raw >= 3 && raw <= 4) cnt=2;
-        else cnt=raw;
+        cnt=raw;
         lip=(u in lastip ? lastip[u] : "TIDAK_TERDETEKSI");
-        visibility=(cnt > 0 ? "SOURCE_IP" : "PROXY_LOCAL");
-        printf "%s|0|%d|%s|%s\n", u, cnt, lip, visibility;
+        visibility=(cnt > 0 ? "RECENT_LOG_ONLY" : "PROXY_LOCAL");
+        printf "%s|0|0|%d|%s|%s\n", u, cnt, lip, visibility;
       }
     }' > "${dst}"
 }
@@ -23706,13 +24069,23 @@ show_xray_online_by_table() {
   source_mode="LOG_WINDOW_FALLBACK"
   tracker_ready="0"
   if [[ -n "${protocol}" && -x /usr/local/sbin/sc-1forcr-xray-live ]]; then
-    if /usr/local/sbin/sc-1forcr-xray-live rows-v2 2>/dev/null | awk -F'|' -v proto="${protocol}" '
-      $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
-        print $2 "|" $3 "|" $4 "|" ($5!="" ? $5 : "TIDAK_TERDETEKSI") "|" ($6!="" ? $6 : "PROXY_LOCAL");
-      }
-    ' > "${t_seen}"; then
-      tracker_ready="1"
-      source_mode="REALTIME_SOCKET_OBSERVE"
+    if /usr/local/sbin/sc-1forcr-xray-live capabilities 2>/dev/null | grep -qx 'rows-v3'; then
+      if /usr/local/sbin/sc-1forcr-xray-live rows-v3 2>/dev/null | awk -F'|' -v proto="${protocol}" '
+        $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {
+          print $2 "|" $3 "|" $4 "|" $5 "|" ($6!="" ? $6 : "TIDAK_TERDETEKSI") "|" ($7!="" ? $7 : "PROXY_LOCAL");
+        }
+      ' > "${t_seen}"; then
+        tracker_ready="1"
+        source_mode="REALTIME_SOCKET_OBSERVE"
+      fi
+    elif /usr/local/sbin/sc-1forcr-xray-live rows-v2 2>/dev/null | awk -F'|' -v proto="${protocol}" '
+        $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+          active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);
+          print $2 "|" $3 "|" active "|" $4 "|" ($5!="" ? $5 : "TIDAK_TERDETEKSI") "|" ($6!="" ? $6 : "PROXY_LOCAL");
+        }
+      ' > "${t_seen}"; then
+        tracker_ready="1"
+        source_mode="REALTIME_SOCKET_COMPAT"
     fi
   fi
   if [[ "${tracker_ready}" != "1" ]]; then
@@ -23725,12 +24098,13 @@ show_xray_online_by_table() {
     echo
     echo "Total User ${label} : 0"
     echo "Total Socket ${label} : 0"
-    echo "Total IP Terlihat ${label} : 0"
+    echo "Total IP Aktif ${label} : 0"
+    echo "Total IP Recent ${label} : 0"
     return
   fi
 
-  printf "%-20s %-10s %-8s %-11s %-12s %-9s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "MODE" "SOCKET_AKTIF" "IP_AKTIF" "LAST_IP"
-  printf "%-20s %-10s %-8s %-11s %-12s %-9s %-22s\n" "--------------------" "----------" "--------" "-----------" "------------" "---------" "----------------------"
+  printf "%-20s %-10s %-8s %-11s %-12s %-9s %-10s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "MODE" "SOCKET_AKTIF" "IP_AKTIF" "IP_RECENT" "LAST_IP"
+  printf "%-20s %-10s %-8s %-11s %-12s %-9s %-10s %-22s\n" "--------------------" "----------" "--------" "-----------" "------------" "---------" "----------" "----------------------"
   awk -F'|' '
     NR==FNR {
       db_status[$1]=$2;
@@ -23742,30 +24116,34 @@ show_xray_online_by_table() {
       u=$1;
       sockets=($2 ~ /^[0-9]+$/ ? $2 + 0 : 0);
       ipc=($3 ~ /^[0-9]+$/ ? $3 + 0 : 0);
-      lip=$4;
-      visibility=$5;
+      recent=($4 ~ /^[0-9]+$/ ? $4 + 0 : 0);
+      lip=$5;
+      visibility=$6;
       if (!(u in db_status)) next;
       s=db_status[u];
       l=(u in db_limit ? db_limit[u] : 0);
       cm=(u in db_mode ? db_mode[u] : "LEGACY");
       if (s=="LOCK" || s=="LOCK_TMP" || s=="LOCK_QUOTA") out="KENA_LOCK";
-      else out="ONLINE";
-      if (ipc <= 0 || visibility=="PROXY_LOCAL" || lip=="" || lip=="-") lip="TIDAK_TERDETEKSI";
-      printf "%-20s %-10s %-8d %-11s %-12d %-9d %-22s\n", u, out, l, cm, sockets, ipc, lip;
+      else if (sockets > 0) out="ONLINE";
+      else out="OFFLINE";
+      if (recent <= 0 || visibility=="PROXY_LOCAL" || lip=="" || lip=="-") lip="TIDAK_TERDETEKSI";
+      printf "%-20s %-10s %-8d %-11s %-12d %-9d %-10d %-22s\n", u, out, l, cm, sockets, ipc, recent, lip;
       total_user++;
       total_socket+=sockets;
       total_ip+=ipc;
+      total_recent+=recent;
     }
     END {
       print "";
       printf "Total User : %d\n", total_user + 0;
       printf "Total Socket Aktif : %d\n", total_socket + 0;
-      printf "Total IP Terlihat : %d\n", total_ip + 0;
+      printf "Total IP Aktif : %d\n", total_ip + 0;
+      printf "Total IP Recent : %d\n", total_recent + 0;
     }' "${t_users}" "${t_seen}"
   echo
   echo "Catatan: SOCKET_AKTIF bukan jumlah perangkat/orang."
-  echo "IP_AKTIF hanya dihitung jika sumber non-loopback terlihat oleh Xray."
-  echo "MODE LEGACY memakai satu credential bersama; jumlah orang tidak bisa dipastikan."
+  echo "IP_AKTIF memerlukan sesi hidup; IP_RECENT adalah histori dan bukan bukti multi-login."
+  echo "MODE LEGACY memakai satu credential bersama; jumlah perangkat tidak bisa dipastikan dari IP saja."
 }
 
 show_xray_online_realtime_by_table() {
@@ -24258,7 +24636,7 @@ Time     : $(date '+%F %T')"
     XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}" \
     XRAY_VERSION="${XRAY_VERSION:-}" \
     XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}" \
-    XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-900}" \
+    XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-90}" \
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \
     XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
     XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN}" \

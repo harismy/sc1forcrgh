@@ -173,7 +173,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.36}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.37}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -5466,7 +5466,7 @@ async function renderAndReloadXray(forceRestart = false) {
   }
 }
 
-let xrayDbSyncBusy = false;
+let xrayDbSyncInFlight = null;
 let xrayDbSyncLastHash = '';
 async function computeActiveXrayHash() {
   const vmessRows = await all("SELECT LOWER(username) AS u, COALESCE(uuid,'') AS s FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
@@ -5481,9 +5481,11 @@ async function computeActiveXrayHash() {
 }
 
 async function syncXrayFromDbIfChanged(force = false) {
-  if (xrayDbSyncBusy) return false;
-  xrayDbSyncBusy = true;
-  try {
+  if (xrayDbSyncInFlight) {
+    await xrayDbSyncInFlight;
+    return false;
+  }
+  const operation = (async () => {
     const nowHash = await computeActiveXrayHash();
     if (!force && xrayDbSyncLastHash && nowHash === xrayDbSyncLastHash) {
       return false;
@@ -5491,20 +5493,28 @@ async function syncXrayFromDbIfChanged(force = false) {
     await renderAndReloadXray();
     xrayDbSyncLastHash = nowHash;
     return true;
-  } catch (_) {
-    return false;
+  })();
+  xrayDbSyncInFlight = operation;
+  try {
+    return await operation;
   } finally {
-    xrayDbSyncBusy = false;
+    if (xrayDbSyncInFlight === operation) xrayDbSyncInFlight = null;
   }
 }
 
 async function syncXrayFromDbAndRespond(res, force = false) {
-  const changed = await syncXrayFromDbIfChanged(force).catch(() => false);
-  return ok(res, {
-    synced: true,
-    changed,
-    at: nowTime()
-  });
+  try {
+    const changed = await syncXrayFromDbIfChanged(force);
+    return ok(res, {
+      synced: true,
+      changed,
+      at: nowTime()
+    });
+  } catch (error) {
+    const message = error?.message || 'Xray sync failed';
+    console.error(`[xray-sync] request failed: ${message}`);
+    return fail(res, 500, message);
+  }
 }
 
 function isExpiredDateValue(v) {
@@ -7159,7 +7169,9 @@ app.listen(PORT, '127.0.0.1', () => {
   setInterval(() => { cleanupExpiredSshAccounts().catch(() => {}); }, 60 * 1000);
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
-  syncXrayFromDbIfChanged(true).catch(() => {});
+  syncXrayFromDbIfChanged(true).catch((error) => {
+    console.error(`[xray-sync] startup failed: ${error?.message || error}`);
+  });
   setInterval(() => { cleanupExpiredXrayAccounts().catch(() => {}); }, 60 * 1000);
   const expiredPurgeTimer = setInterval(() => {
     cleanupStaleExpiredAccounts().catch(() => {});
@@ -9273,7 +9285,9 @@ function parseXrayRecentIpMap() {
     }
     const emailJson = line.match(/"email":"([^"]+)"/);
     const emailTxt = line.match(/\bemail:\s*([^\s]+)/i);
-    const email = String(emailJson?.[1] || emailTxt?.[1] || '').trim().toLowerCase();
+    const userJson = line.match(/"user":"([^"]+)"/);
+    const userTxt = line.match(/\buser:\s*([^\s]+)/i);
+    const email = String(emailJson?.[1] || emailTxt?.[1] || userJson?.[1] || userTxt?.[1] || '').trim().toLowerCase();
     if (!email) continue;
     const srcJson = line.match(/"source":"([^"]+)"/);
     const srcTxt = line.match(/\bfrom\s+([^\s]+)/i);
@@ -14746,7 +14760,7 @@ ip_state_file="${XRAY_LIVE_IP_STATE_FILE:-${state_dir}/xray-live.ips}"
 schema_file="${XRAY_LIVE_SCHEMA_FILE:-${state_dir}/xray-live.schema}"
 lock_file="${state_dir}/xray-live.lock"
 ip_ttl="$(echo "${XRAY_LIVE_IP_TTL_SECONDS:-90}" | tr -cd '0-9')"
-tracker_schema="5"
+tracker_schema="6"
 
 [[ -z "${recovery_h}" || "${recovery_h}" -lt 1 || "${recovery_h}" -gt 168 ]] && recovery_h="72"
 [[ -z "${log_max}" || "${log_max}" -lt 2000 || "${log_max}" -gt 100000 ]] && log_max="30000"
@@ -16202,7 +16216,7 @@ main_pull_update() {
   log_msg "Trigger update diterima dari bot: ${version}${note:+ (${note})}"
   mark_attempt "${version}"
   ack_update "${base_url}" "${version}" "running" "update mulai" "${vps_ip}"
-  if UPDATE_SAFE_MODE=1 /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
+  if SC_EXPECTED_UPDATE_VERSION="${version}" UPDATE_SAFE_MODE=1 /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
     clear_attempt
     rollback_snapshot="$(/usr/local/sbin/sc-1forcr-update-manager latest 2>/dev/null || true)"
@@ -21971,6 +21985,70 @@ restart_update_safe_services() {
   fi
 }
 
+sync_xray_runtime_after_update() {
+  local port token response api_ready attempt all_ports_ready capabilities
+  port="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
+  [[ -z "${port}" ]] && port="8088"
+  token="${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}"
+  [[ -n "${token}" ]] || {
+    log "Sinkronisasi Xray gagal: token API lokal kosong."
+    return 1
+  }
+
+  api_ready="0"
+  for attempt in {1..20}; do
+    if curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${port}/vps/health" >/dev/null 2>&1; then
+      api_ready="1"
+      break
+    fi
+    sleep 1
+  done
+  [[ "${api_ready}" == "1" ]] || {
+    log "Sinkronisasi Xray gagal: API lokal belum siap."
+    return 1
+  }
+
+  response="$(curl -fsS --connect-timeout 3 --max-time 45 -X POST \
+    -H "Authorization: Bearer ${token}" \
+    "http://127.0.0.1:${port}/vps/sync-xray" 2>/dev/null || true)"
+  if ! printf '%s' "${response}" | jq -e '.meta.code == 200 and .data.synced == true' >/dev/null 2>&1; then
+    log "Sinkronisasi Xray pasca-update ditolak oleh API."
+    journalctl -u sc-1forcr-api.service -n 20 --no-pager -o cat 2>/dev/null || true
+    return 1
+  fi
+
+  all_ports_ready="0"
+  for attempt in {1..20}; do
+    all_ports_ready="1"
+    for port in 10001 10002 10003 11001 11002 11003; do
+      if ! ss -H -lnt 2>/dev/null | awk -v want="${port}" '
+        { address=$4; sub(/^.*:/, "", address); if (address == want) found=1 }
+        END { exit(found ? 0 : 1) }
+      '; then
+        all_ports_ready="0"
+        break
+      fi
+    done
+    [[ "${all_ports_ready}" == "1" ]] && break
+    sleep 1
+  done
+  [[ "${all_ports_ready}" == "1" ]] || {
+    log "Sinkronisasi Xray gagal: inbound 10001-10003/11001-11003 belum lengkap."
+    return 1
+  }
+
+  [[ -x /usr/local/sbin/sc-1forcr-xray-live ]] || {
+    log "Sinkronisasi Xray gagal: tracker realtime belum terpasang."
+    return 1
+  }
+  capabilities="$(/usr/local/sbin/sc-1forcr-xray-live capabilities 2>/dev/null || true)"
+  [[ "${capabilities}" == "rows-v3" ]] || {
+    log "Sinkronisasi Xray gagal: tracker realtime tidak kompatibel (${capabilities:-unknown})."
+    return 1
+  }
+  return 0
+}
+
 udp_port_from_config() {
   local cfg="$1" fallback="$2" port
   port="${fallback}"
@@ -24404,6 +24482,10 @@ xray_log_snapshot() {
         email=substr($0, RSTART+9, RLENGTH-10);
       } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
         t=substr($0, RSTART, RLENGTH); sub(/email:[[:space:]]*/, "", t); email=t;
+      } else if (match($0, /"user":"[^"]+"/)) {
+        email=substr($0, RSTART+8, RLENGTH-9);
+      } else if (match($0, /user:[[:space:]]*[^[:space:]]+/)) {
+        t=substr($0, RSTART, RLENGTH); sub(/user:[[:space:]]*/, "", t); email=t;
       }
 
       if (match($0, /"source":"[^"]+"/)) {
@@ -24886,6 +24968,7 @@ update_script_from_repo() {
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver update_log update_tail
+  local downloaded_version current_version expected_version downloaded_revision current_revision
   local license_base_url manifest_resp manifest_token
   # Undrop rule burst SSHWS lama saat update agar koneksi tidak nyangkut.
   if declare -F clear_sshws_loop_guard_rules >/dev/null 2>&1; then
@@ -24955,6 +25038,44 @@ Alasan   : payload update tidak lengkap, helper wajib tidak ditemukan
 Time     : $(date '+%F %T')"
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
+  fi
+
+  downloaded_version="$(awk -F'SC_SCRIPT_VERSION_OVERRIDE:-' '
+    /^SCRIPT_VERSION=/ {
+      value=$2;
+      sub(/}.*/, "", value);
+      print value;
+      exit;
+    }
+  ' "${tmp}" 2>/dev/null || true)"
+  if [[ ! "${downloaded_version}" =~ ^V\.1FSC\.[0-9]+$ ]]; then
+    echo "Update ditolak: versi payload tidak dapat diverifikasi."
+    rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  current_version="$(tr -d '[:space:]' </opt/sc-1forcr/VERSION 2>/dev/null || true)"
+  if [[ -z "${current_version}" ]]; then
+    current_version="$(awk -F= '/^SCRIPT_VERSION=/{print $2; exit}' /etc/sc-1forcr-version 2>/dev/null || true)"
+  fi
+  expected_version="${SC_EXPECTED_UPDATE_VERSION:-}"
+  echo "Versi terpasang : ${current_version:-unknown}"
+  echo "Versi payload   : ${downloaded_version}"
+  if [[ -n "${expected_version}" && "${downloaded_version}" != "${expected_version}" ]]; then
+    echo "Update ditolak: trigger meminta ${expected_version}, tetapi VPS bot masih menyajikan ${downloaded_version}."
+    rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if [[ "${current_version}" =~ ^V\.1FSC\.[0-9]+$ ]]; then
+    downloaded_revision="${downloaded_version##*.}"
+    current_revision="${current_version##*.}"
+    if (( 10#${downloaded_revision} < 10#${current_revision} )) && [[ "${SC_UPDATE_ALLOW_DOWNGRADE:-0}" != "1" ]]; then
+      echo "Update ditolak: payload ${downloaded_version} lebih lama dari versi terpasang ${current_version}."
+      rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+      return 1
+    fi
+    if [[ "${downloaded_version}" == "${current_version}" ]]; then
+      echo "INFO: payload server masih pada versi yang sama; update dijalankan sebagai repair."
+    fi
   fi
 
   if [[ -f /etc/sc-1forcr-license-required ]]; then
@@ -25229,6 +25350,18 @@ Time     : $(date '+%F %T')"
   if [[ -f /etc/sc-1forcr-version ]]; then
     new_ver="$(awk -F= '/^SCRIPT_VERSION=/{print $2}' /etc/sc-1forcr-version | head -n1)"
     [[ -z "${new_ver}" ]] && new_ver="-"
+  fi
+  if [[ "${new_ver}" != "${downloaded_version}" ]]; then
+    update_note="SC 1FORCR NOTIF
+Event    : UPDATE_SCRIPT
+Status   : GAGAL
+Domain   : ${DOMAIN}
+Alasan   : marker versi ${new_ver} tidak sama dengan payload ${downloaded_version}
+Time     : ${ts_now}"
+    telegram_notify "${update_note}"
+    echo "Update gagal diverifikasi: marker ${new_ver}, payload ${downloaded_version}."
+    rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+    return 1
   fi
   update_note="SC 1FORCR NOTIF
 Event    : UPDATE_SCRIPT
@@ -26520,6 +26653,70 @@ restart_update_safe_services() {
   fi
 }
 
+sync_xray_runtime_after_update() {
+  local port token response api_ready attempt all_ports_ready capabilities
+  port="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
+  [[ -z "${port}" ]] && port="8088"
+  token="${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}"
+  [[ -n "${token}" ]] || {
+    log "Sinkronisasi Xray gagal: token API lokal kosong."
+    return 1
+  }
+
+  api_ready="0"
+  for attempt in {1..20}; do
+    if curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${port}/vps/health" >/dev/null 2>&1; then
+      api_ready="1"
+      break
+    fi
+    sleep 1
+  done
+  [[ "${api_ready}" == "1" ]] || {
+    log "Sinkronisasi Xray gagal: API lokal belum siap."
+    return 1
+  }
+
+  response="$(curl -fsS --connect-timeout 3 --max-time 45 -X POST \
+    -H "Authorization: Bearer ${token}" \
+    "http://127.0.0.1:${port}/vps/sync-xray" 2>/dev/null || true)"
+  if ! printf '%s' "${response}" | jq -e '.meta.code == 200 and .data.synced == true' >/dev/null 2>&1; then
+    log "Sinkronisasi Xray pasca-update ditolak oleh API."
+    journalctl -u sc-1forcr-api.service -n 20 --no-pager -o cat 2>/dev/null || true
+    return 1
+  fi
+
+  all_ports_ready="0"
+  for attempt in {1..20}; do
+    all_ports_ready="1"
+    for port in 10001 10002 10003 11001 11002 11003; do
+      if ! ss -H -lnt 2>/dev/null | awk -v want="${port}" '
+        { address=$4; sub(/^.*:/, "", address); if (address == want) found=1 }
+        END { exit(found ? 0 : 1) }
+      '; then
+        all_ports_ready="0"
+        break
+      fi
+    done
+    [[ "${all_ports_ready}" == "1" ]] && break
+    sleep 1
+  done
+  [[ "${all_ports_ready}" == "1" ]] || {
+    log "Sinkronisasi Xray gagal: inbound 10001-10003/11001-11003 belum lengkap."
+    return 1
+  }
+
+  [[ -x /usr/local/sbin/sc-1forcr-xray-live ]] || {
+    log "Sinkronisasi Xray gagal: tracker realtime belum terpasang."
+    return 1
+  }
+  capabilities="$(/usr/local/sbin/sc-1forcr-xray-live capabilities 2>/dev/null || true)"
+  [[ "${capabilities}" == "rows-v3" ]] || {
+    log "Sinkronisasi Xray gagal: tracker realtime tidak kompatibel (${capabilities:-unknown})."
+    return 1
+  }
+  return 0
+}
+
 SSHWS_REALIP_RUNTIME_RESTARTED="0"
 activate_sshws_realip_runtime_if_needed() {
   local haproxy_conf="/etc/haproxy/haproxy.cfg"
@@ -27199,6 +27396,7 @@ udp_listener_present() {
 health_check() {
   local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok timer_state configured_udp_port udp_state
   local udpgw_ports_raw udpgw_port udpgw_ok
+  local runtime_version runtime_revision strict_xray_monitor xray_port xray_ports_ok xray_config_result xray_capabilities
   load_update_env
   DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
   API_PORT="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
@@ -27248,6 +27446,78 @@ PY
       failures+=("${unit} tidak aktif")
     fi
   done
+
+  if unit_is_installed xray.service; then
+    if ! systemctl is-active --quiet xray.service; then
+      failures+=("xray.service tidak aktif")
+    else
+      xray_ports_ok="0"
+      for attempt in {1..15}; do
+        xray_ports_ok="1"
+        for xray_port in 10001 10002 10003 11001 11002 11003; do
+          if ! ss -H -lnt 2>/dev/null | awk -v want="${xray_port}" '
+            { address=$4; sub(/^.*:/, "", address); if (address == want) found=1 }
+            END { exit(found ? 0 : 1) }
+          '; then
+            xray_ports_ok="0"
+            break
+          fi
+        done
+        [[ "${xray_ports_ok}" == "1" ]] && break
+        sleep 1
+      done
+      [[ "${xray_ports_ok}" == "1" ]] || failures+=("inbound Xray 10001-10003/11001-11003 tidak lengkap")
+    fi
+
+    strict_xray_monitor="0"
+    runtime_version="$(tr -d '[:space:]' </opt/sc-1forcr/VERSION 2>/dev/null || true)"
+    if [[ "${runtime_version}" =~ ^V\.1FSC\.[0-9]+$ ]]; then
+      runtime_revision="${runtime_version##*.}"
+      (( 10#${runtime_revision} >= 37 )) && strict_xray_monitor="1"
+    fi
+    if [[ "${strict_xray_monitor}" == "1" ]]; then
+      xray_capabilities="$(/usr/local/sbin/sc-1forcr-xray-live capabilities 2>/dev/null || true)"
+      [[ "${xray_capabilities}" == "rows-v3" ]] || failures+=("tracker Xray tidak kompatibel (${xray_capabilities:-unknown})")
+      xray_config_result="$(python3 - /usr/local/etc/xray/config.json <<'PY' 2>/dev/null || true
+import json
+import sys
+
+path = sys.argv[1]
+required_ports = {10001, 10002, 10003, 11001, 11002, 11003}
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+except Exception as exc:
+    print(f"config-unreadable:{exc}")
+    raise SystemExit(0)
+
+if (config.get("log") or {}).get("access") != "/var/log/xray/access.log":
+    print("access-log-not-configured")
+    raise SystemExit(0)
+
+inbounds = {
+    int(item.get("port")): item
+    for item in config.get("inbounds", [])
+    if isinstance(item, dict) and str(item.get("port", "")).isdigit()
+}
+missing_ports = sorted(required_ports.difference(inbounds))
+if missing_ports:
+    print("missing-ports:" + ",".join(map(str, missing_ports)))
+    raise SystemExit(0)
+
+for port in sorted(required_ports):
+    clients = ((inbounds[port].get("settings") or {}).get("clients") or [])
+    for client in clients:
+        if not str((client or {}).get("email") or "").strip():
+            print(f"client-email-missing:{port}")
+            raise SystemExit(0)
+
+print("ok")
+PY
+)"
+      [[ "${xray_config_result}" == "ok" ]] || failures+=("config monitor Xray (${xray_config_result:-unknown})")
+    fi
+  fi
   if [[ -f /etc/systemd/system/sc-1forcr-udpgw@.service ]]; then
     udpgw_ports_raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
     for udpgw_port in $(printf '%s' "${udpgw_ports_raw:-7300,7200}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}'); do
@@ -27704,6 +27974,10 @@ main() {
     enforce_single_udp_backend
     apply_tunnel_outbound_guard_rules
     restart_update_safe_services
+    if ! sync_xray_runtime_after_update; then
+      log "Rekonsiliasi monitor Xray pasca-update gagal. Rollback otomatis akan dijalankan."
+      return 1
+    fi
     post_install_preflight || true
     if ! /usr/local/sbin/sc-1forcr-update-manager health; then
       log "Health-check pasca-update gagal. Rollback otomatis akan dijalankan."

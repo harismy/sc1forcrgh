@@ -409,8 +409,8 @@ function uniqPaths(paths) {
 
 function resolveScInstallerLocalPath() {
   const candidates = uniqPaths([
-    DEFAULT_SC_INSTALLER_LOCAL_PATH,
     ENV_SC_INSTALLER_LOCAL_PATH,
+    DEFAULT_SC_INSTALLER_LOCAL_PATH,
     LEGACY_SC_INSTALLER_LOCAL_PATH
   ]);
   for (const p of candidates) {
@@ -423,8 +423,8 @@ function resolveScInstallerLocalPath() {
 
 function resolveSummaryApiLocalPath() {
   const candidates = uniqPaths([
-    DEFAULT_SUMMARY_API_LOCAL_PATH,
-    ENV_SUMMARY_API_LOCAL_PATH
+    ENV_SUMMARY_API_LOCAL_PATH,
+    DEFAULT_SUMMARY_API_LOCAL_PATH
   ]);
   for (const p of candidates) {
     try {
@@ -1394,7 +1394,15 @@ Promise.resolve()
   .then(() => initDb())
   .then(() => {
     app.listen(PORT, HOST, () => {
+      const installerPath = resolveScInstallerLocalPath();
+      let installerVersion = 'unknown';
+      try {
+        const source = fs.readFileSync(installerPath, 'utf8');
+        const match = source.match(/SC_SCRIPT_VERSION_OVERRIDE:-([^}"\r\n]+)/);
+        installerVersion = String(match?.[1] || '').trim() || 'unknown';
+      } catch (_) {}
       console.log(`sc1forcr-license-api listening on ${HOST}:${PORT}`);
+      console.log(`SC installer payload: ${installerPath} (${installerVersion})`);
       console.log(`license signing key fingerprint: ${licenseSigningKeyFingerprint}`);
       console.log(`legacy bearer compatibility: ${LICENSE_ALLOW_LEGACY_BEARER ? 'enabled' : 'disabled'}`);
     });

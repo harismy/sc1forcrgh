@@ -1,5 +1,6 @@
 'use strict';
 
+const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -8,6 +9,13 @@ const { spawnSync } = require('child_process');
 
 const repoRoot = path.resolve(__dirname, '..');
 const installerPath = path.join(repoRoot, 'scripts', 'setup-autoscript-compat.sh');
+const licenseApiSource = fs.readFileSync(path.join(repoRoot, 'license-api.js'), 'utf8');
+
+assert(
+  licenseApiSource.indexOf('ENV_SC_INSTALLER_LOCAL_PATH,') < licenseApiSource.indexOf('DEFAULT_SC_INSTALLER_LOCAL_PATH,'),
+  'configured installer path must take priority over the default path'
+);
+assert(licenseApiSource.includes('SC installer payload: ${installerPath} (${installerVersion})'));
 
 function extractGuardSource() {
   const source = fs.readFileSync(installerPath, 'utf8').replace(/\r\n/g, '\n');

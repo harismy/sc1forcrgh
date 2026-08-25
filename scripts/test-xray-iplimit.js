@@ -243,7 +243,7 @@ assert(installer.includes('observed_ip_raw_count: evidence.observedRaw'));
 assert(installer.includes('if (!violation.confirmed) continue;'));
 assert(installer.includes('active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);'));
 assert(installer.includes('else out="OFFLINE";'));
-assert(installer.includes('tracker_schema="5"'));
+assert(installer.includes('tracker_schema="6"'));
 assert(installer.includes('20-sc-managed-config.conf'));
 assert(installer.includes('write_iplimit_checker() {\n  log "Menulis checker limit IP otomatis..."\n  configure_xray_managed_runtime'));
 assert(installer.includes('/usr/local/etc/xray/.config.${process.pid}.tmp.json'));

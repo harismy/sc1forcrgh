@@ -9,6 +9,9 @@ const repoRoot = path.resolve(__dirname, '..');
 const installerPath = path.join(repoRoot, 'scripts', 'setup-autoscript-compat.sh');
 const installer = fs.readFileSync(installerPath, 'utf8').replace(/\r\n/g, '\n');
 
+assert(installer.includes('tracker_schema="6"'), 'Xray tracker schema must reset stale V5 state');
+assert(installer.includes('userJson?.[1] || userTxt?.[1]'), 'IP limit parser must accept Xray user fields');
+
 function resolveBash() {
   const candidates = [
     process.env.BASH,
@@ -30,6 +33,18 @@ function extract(startMarker, endMarker) {
   assert(endIndex >= 0, `end marker not found: ${endMarker}`);
   return `${installer.slice(bodyStart, endIndex)}\n`;
 }
+
+for (const [name, source] of [
+  ['menu runtime', extract("cat > \"${menu_runtime_tmp}\" <<'MENU_SCRIPT_EOF'\n", '\nMENU_SCRIPT_EOF\n')],
+  ['update manager', extract("cat > /usr/local/sbin/sc-1forcr-update-manager <<'UPDATE_MANAGER_EOF'\n", '\nUPDATE_MANAGER_EOF\n')]
+]) {
+  const syntax = spawnSync(resolveBash(), ['-n'], { input: source, encoding: 'utf8' });
+  assert.strictEqual(syntax.status, 0, `${name} syntax failed:\n${syntax.stderr || syntax.stdout}`);
+}
+
+assert(installer.includes('[xray-sync] startup failed:'));
+assert(installer.includes('Rekonsiliasi monitor Xray pasca-update gagal. Rollback otomatis akan dijalankan.'));
+assert(installer.includes('config monitor Xray (${xray_config_result:-unknown})'));
 
 const start = installer.indexOf('merge_xray_observations() {');
 assert(start >= 0, 'merge_xray_observations function not found');
@@ -113,7 +128,9 @@ try {
     `${stamp(35)} from tcp:203.0.113.8:42001 accepted tcp:example.com:443 [vmess >> direct] email: dualstack`,
     `${stamp(25)} from tcp:[2001:db8::8]:42002 accepted tcp:example.com:443 [vmess >> direct] email: dualstack`,
     `${stamp(15)} from tcp:203.0.113.8:42001 accepted tcp:example.com:443 [vmess >> direct] email: dualstack`,
-    `${stamp(5)} from tcp:[2001:db8::8]:42002 accepted tcp:example.com:443 [vmess >> direct] email: dualstack`
+    `${stamp(5)} from tcp:[2001:db8::8]:42002 accepted tcp:example.com:443 [vmess >> direct] email: dualstack`,
+    `${stamp(25)} from tcp:198.51.100.44:43001 accepted tcp:example.com:443 [vmess >> direct] user: userfield`,
+    `${stamp(5)} from tcp:198.51.100.44:43001 accepted tcp:example.com:443 [vmess >> direct] user: userfield`
   ];
   fs.writeFileSync(accessLogPath, `${accessRows.join('\n')}\n`);
   const snapshotScript = `${snapshotSource}\nxray_recent_window_min=5\nxray_active_window_sec=60\nxray_monitor_recent_window_min=5\nxray_monitor_active_window_sec=60\nxray_min_hits_per_ip=2\nXRAY_ACCESS_LOG="$1" xray_log_snapshot "$2" normal\n`;
@@ -127,6 +144,7 @@ try {
   assert(snapshotRows.includes('twophones|0|2|2|182.5.10.2|SOURCE_NET_EST_ACTIVE'));
   assert(snapshotRows.includes('handoff|0|1|2|140.213.200.2|SOURCE_NET_EST_ACTIVE'));
   assert(snapshotRows.includes('dualstack|0|1|2|2001:db8::8|SOURCE_NET_EST_ACTIVE'));
+  assert(snapshotRows.includes('userfield|0|1|1|198.51.100.44|SOURCE_NET_EST_ACTIVE'));
 } finally {
   for (const file of [snapshotPath, accessLogPath, outputPath, trackerPath, logPath]) {
     try { fs.unlinkSync(file); } catch (_) {}

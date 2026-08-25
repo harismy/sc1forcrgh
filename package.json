@@ -4,7 +4,7 @@
   "private": true,
   "main": "app3.js",
   "scripts": {
-    "test": "npm run test:license && npm run test:xray-iplimit && npm run test:xray-monitor && npm run test:cli-output",
+    "test": "npm run test:license && npm run test:xray-iplimit && npm run test:xray-monitor && npm run test:dns-guard && npm run test:update-compat && npm run test:cli-output",
     "start": "node app3.js",
     "start:api": "node license-api.js",
     "start:expiry": "node app3.js --run-sc-expiry-scheduler",
@@ -12,6 +12,8 @@
     "test:license": "node scripts/test-license-lease.js",
     "test:xray-iplimit": "node scripts/test-xray-iplimit.js",
     "test:xray-monitor": "node scripts/test-xray-monitor.js",
+    "test:dns-guard": "node scripts/test-dns-resolver-guard.js",
+    "test:update-compat": "node scripts/test-update-compat.js",
     "test:cli-output": "node scripts/test-cli-account-output.js"
   },
   "dependencies": {

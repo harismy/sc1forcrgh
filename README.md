@@ -51,6 +51,28 @@ UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setu
 SUMMARY_API_SETUP_URL=https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-summary-api.sh menu-sc-1forcr update-summary
 ```
 
+## DNS Resolver Guard
+
+SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui
+`sc-1forcr-dns-guard.timer`. Selama DNS VPS sehat, konfigurasi resolver tidak
+diubah. Jika seluruh tes DNS gagal dua kali, konfigurasi lama dicadangkan ke
+`/var/backups/sc-1forcr/dns`, lalu resolver dipulihkan menggunakan `8.8.8.8` dan
+`1.1.1.1`.
+
+Fitur aktif secara default dan dapat disesuaikan melalui:
+
+```bash
+DNS_GUARD_ENABLE=1
+DNS_GUARD_INTERVAL_MINUTES=10
+```
+
+## HAProxy Backend Readiness
+
+Konfigurasi HAProxy memberi toleransi pada restart singkat Nginx dan SSHWS agar
+backend tidak langsung ditandai `DOWN`. Instalasi penuh menunggu seluruh port
+backend lokal siap sebelum HAProxy dinyalakan kembali, sedangkan safe update
+memvalidasi listener backend dan menjalankan rollback jika layanan tidak pulih.
+
 ## Catatan Penting
 
 Jangan menjalankan installer besar dengan format ini:

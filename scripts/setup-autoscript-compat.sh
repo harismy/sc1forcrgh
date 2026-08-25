@@ -128,6 +128,8 @@ set -euo pipefail
 #   XRAY_PATHS_TROJAN=/trojan                    (opsional, multi path dipisah koma)
 #   NETWORK_COMPAT_ENABLE=0                      (opsional, 1=prefer IPv4 + mitigasi MTU black-hole)
 #   NETWORK_TCP_MSS=1360                         (opsional, MSS maksimum koneksi TCP tunnel)
+#   DNS_GUARD_ENABLE=1                           (opsional, perbaiki resolver hanya setelah tes DNS gagal 2x)
+#   DNS_GUARD_INTERVAL_MINUTES=10                (opsional, interval health-check DNS ringan)
 #   XRAY_OUTBOUND_DOMAIN_STRATEGY=UseIPv4        (opsional: AsIs|UseIP|UseIPv4|UseIPv6)
 #   SSHWS_READER_BUFFER_KB=16                    (opsional, buffer per koneksi SSHWS; 16 hemat RAM, max 64)
 #   SSHWS_TCP_KEEPALIVE_SECONDS=30               (opsional, keepalive TCP mux SSHWS)
@@ -173,7 +175,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.37}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.38}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
@@ -282,6 +284,8 @@ XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
 XRAY_PATHS_TROJAN="${XRAY_PATHS_TROJAN:-/trojan}"
 NETWORK_COMPAT_ENABLE="${NETWORK_COMPAT_ENABLE:-0}"
 NETWORK_TCP_MSS="${NETWORK_TCP_MSS:-1360}"
+DNS_GUARD_ENABLE="${DNS_GUARD_ENABLE:-1}"
+DNS_GUARD_INTERVAL_MINUTES="${DNS_GUARD_INTERVAL_MINUTES:-10}"
 XRAY_OUTBOUND_DOMAIN_STRATEGY="${XRAY_OUTBOUND_DOMAIN_STRATEGY:-}"
 SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-auto}"
 SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}"
@@ -416,6 +420,19 @@ sanitize_domain_host() {
   host="${host%%:*}"
   host="$(printf '%s' "${host}" | sed -E 's/[^a-z0-9.-]//g; s/^\.+//; s/\.+$//; s/\.\.+/./g')"
   echo "${host}"
+}
+
+certificate_dns_host_valid() {
+  local host label
+  host="$(sanitize_domain_host "${1:-}")"
+  [[ -n "${host}" && "${host}" == *.* ]] || return 1
+  [[ ! "${host}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS='.' read -ra __certificate_labels <<< "${host}"
+  for label in "${__certificate_labels[@]}"; do
+    [[ "${#label}" -ge 1 && "${#label}" -le 63 ]] || return 1
+    [[ "${label}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+  done
+  return 0
 }
 
 normalize_domain_host_list() {
@@ -693,6 +710,10 @@ XRAY_PATHS_TROJAN="/trojan"
 NETWORK_TCP_MSS="$(echo "${NETWORK_TCP_MSS}" | tr -cd '0-9')"
 if [[ -z "${NETWORK_TCP_MSS}" || "${NETWORK_TCP_MSS}" -lt 536 || "${NETWORK_TCP_MSS}" -gt 1460 ]]; then
   NETWORK_TCP_MSS="1360"
+fi
+DNS_GUARD_INTERVAL_MINUTES="$(echo "${DNS_GUARD_INTERVAL_MINUTES}" | tr -cd '0-9')"
+if [[ -z "${DNS_GUARD_INTERVAL_MINUTES}" || "${DNS_GUARD_INTERVAL_MINUTES}" -lt 5 ]]; then
+  DNS_GUARD_INTERVAL_MINUTES="10"
 fi
 case "${XRAY_OUTBOUND_DOMAIN_STRATEGY,,}" in
   asis) XRAY_OUTBOUND_DOMAIN_STRATEGY="AsIs" ;;
@@ -1274,6 +1295,182 @@ check_supported_os() {
 
 ipv6_supported() {
   [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]] && grep -q . /proc/net/if_inet6 2>/dev/null
+}
+
+write_dns_resolver_guard() {
+  mkdir -p /usr/local/sbin
+  cat > /usr/local/sbin/sc-1forcr-dns-guard <<'DNS_GUARD_SCRIPT_EOF'
+#!/usr/bin/env bash
+set -u
+
+ENV_FILE="/etc/sc-1forcr.env"
+BACKUP_DIR="/var/backups/sc-1forcr/dns"
+DNS_TEST_HOSTS=(deb.debian.org github.com ipinfo.io)
+
+guard_enabled() {
+  local raw="1"
+  if [[ -r "${ENV_FILE}" ]]; then
+    raw="$(sed -n 's/^DNS_GUARD_ENABLE=//p' "${ENV_FILE}" | tail -n1 | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    [[ -z "${raw}" ]] && raw="1"
+  fi
+  case "${raw}" in
+    0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+dns_resolution_healthy() {
+  local host
+  for host in "${DNS_TEST_HOSTS[@]}"; do
+    if timeout 6 getent ahostsv4 "${host}" 2>/dev/null |
+      grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}[[:space:]]'; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+dns_guard_log() {
+  logger -t sc-1forcr-dns-guard -- "$*" 2>/dev/null || true
+  printf '[dns-guard] %s\n' "$*" >&2
+}
+
+recovery_resolver_configured() {
+  if [[ -r /etc/resolv.conf ]] &&
+     grep -qE '^[[:space:]]*nameserver[[:space:]]+8\.8\.8\.8([[:space:]]|$)' /etc/resolv.conf &&
+     grep -qE '^[[:space:]]*nameserver[[:space:]]+1\.1\.1\.1([[:space:]]|$)' /etc/resolv.conf; then
+    return 0
+  fi
+  if [[ -r /etc/systemd/resolved.conf.d/sc-1forcr-dns.conf ]] &&
+     grep -qF 'DNS=8.8.8.8 1.1.1.1' /etc/systemd/resolved.conf.d/sc-1forcr-dns.conf; then
+    return 0
+  fi
+  return 1
+}
+
+backup_resolver() {
+  local stamp
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "${BACKUP_DIR}"
+  if [[ -e /etc/resolv.conf || -L /etc/resolv.conf ]]; then
+    cp -a /etc/resolv.conf "${BACKUP_DIR}/resolv.conf.${stamp}.link" 2>/dev/null || true
+    cp -L /etc/resolv.conf "${BACKUP_DIR}/resolv.conf.${stamp}.content" 2>/dev/null || true
+  fi
+}
+
+write_static_resolver() {
+  rm -f /etc/resolv.conf || return 1
+  cat > /etc/resolv.conf <<'RESOLV_CONF_EOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+options timeout:2 attempts:3 rotate single-request-reopen
+RESOLV_CONF_EOF
+  chmod 644 /etc/resolv.conf || true
+}
+
+repair_resolver() {
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    cat > /etc/systemd/resolved.conf.d/sc-1forcr-dns.conf <<'RESOLVED_CONF_EOF'
+[Resolve]
+DNS=8.8.8.8 1.1.1.1
+FallbackDNS=1.1.1.1 8.8.8.8
+DNSSEC=no
+Domains=~.
+RESOLVED_CONF_EOF
+    if systemctl restart systemd-resolved; then
+      if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
+        ln -sfn /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+        return 0
+      fi
+      if [[ -e /run/systemd/resolve/resolv.conf ]]; then
+        ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf
+        return 0
+      fi
+    fi
+    dns_guard_log "systemd-resolved tidak menyediakan resolv.conf; gunakan resolver statis."
+  fi
+  write_static_resolver
+}
+
+main() {
+  guard_enabled || exit 0
+  dns_resolution_healthy && exit 0
+
+  sleep 3
+  dns_resolution_healthy && exit 0
+
+  if recovery_resolver_configured; then
+    dns_guard_log "DNS tetap gagal walau resolver pemulihan sudah aktif; periksa koneksi dan firewall provider."
+    exit 1
+  fi
+
+  dns_guard_log "Resolusi DNS gagal dua kali; backup dan pasang resolver pemulihan."
+  backup_resolver
+  if ! repair_resolver; then
+    dns_guard_log "Gagal menulis konfigurasi resolver pemulihan."
+    exit 1
+  fi
+
+  sleep 2
+  if dns_resolution_healthy; then
+    dns_guard_log "DNS pulih menggunakan 8.8.8.8 dan 1.1.1.1."
+    exit 0
+  fi
+
+  dns_guard_log "Resolver sudah diperbaiki tetapi tes DNS masih gagal; periksa firewall UDP/TCP 53 provider."
+  exit 1
+}
+
+main "$@"
+DNS_GUARD_SCRIPT_EOF
+  chmod 700 /usr/local/sbin/sc-1forcr-dns-guard
+  bash -n /usr/local/sbin/sc-1forcr-dns-guard
+}
+
+ensure_dns_resolver_if_needed() {
+  flag_enabled "${DNS_GUARD_ENABLE:-1}" || return 0
+  write_dns_resolver_guard
+  /usr/local/sbin/sc-1forcr-dns-guard
+}
+
+setup_dns_resolver_guard() {
+  if ! flag_enabled "${DNS_GUARD_ENABLE:-1}"; then
+    systemctl disable --now sc-1forcr-dns-guard.timer >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  write_dns_resolver_guard
+  cat > /etc/systemd/system/sc-1forcr-dns-guard.service <<'EOF'
+[Unit]
+Description=SC 1FORCR DNS Resolver Guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-dns-guard
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-dns-guard.timer <<EOF
+[Unit]
+Description=Periodic SC 1FORCR DNS Resolver Check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${DNS_GUARD_INTERVAL_MINUTES}min
+AccuracySec=1min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=sc-1forcr-dns-guard.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-dns-guard.timer >/dev/null
+  systemctl start sc-1forcr-dns-guard.service
 }
 
 install_optional_pkg_if_available() {
@@ -2312,6 +2509,10 @@ issue_letsencrypt_cert() {
     IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
     for alias_host in "${__cert_alias_hosts[@]}"; do
       [[ -z "${alias_host}" || "${alias_host}" == "${WILDCARD_BASE_DOMAIN}" ]] && continue
+      if ! certificate_dns_host_valid "${alias_host}"; then
+        log "Lewati SAN alias Xray non-domain: ${alias_host}"
+        continue
+      fi
       if ! domain_covered_by_one_label_wildcard "${alias_host}" "${WILDCARD_BASE_DOMAIN}"; then
         cert_extra_args+=(-d "${alias_host}")
         log "Tambahkan SAN exact untuk alias Xray wildcard: ${alias_host}"
@@ -2335,6 +2536,10 @@ issue_letsencrypt_cert() {
   IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
   for alias_host in "${__cert_alias_hosts[@]}"; do
     [[ -z "${alias_host}" || "${alias_host}" == "${DOMAIN}" ]] && continue
+    if ! certificate_dns_host_valid "${alias_host}"; then
+      log "Lewati SAN alias Xray non-domain: ${alias_host}"
+      continue
+    fi
     cert_extra_args+=(-d "${alias_host}")
     log "Tambahkan SAN exact untuk alias Xray: ${alias_host}"
   done
@@ -2696,7 +2901,11 @@ EOF
   tune_nginx_capacity
   if nginx -t; then
     systemctl enable nginx
-    systemctl restart nginx
+    if systemctl is-active --quiet nginx; then
+      systemctl reload nginx
+    else
+      systemctl start nginx
+    fi
   else
     log "PERINGATAN: nginx -t gagal. Port 80 mungkin tidak aktif. Cek /var/lib/sc-1forcr/install.log lalu perbaiki /etc/nginx/sites-available/sc-1forcr.conf."
   fi
@@ -2730,19 +2939,18 @@ setup_haproxy_tls_mux() {
     haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
-    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check send-proxy-v2"
-    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check send-proxy-v2"
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2"
+    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check inter 2s fall 3 rise 2 send-proxy-v2"
   else
-    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check send-proxy-v2"
-    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check"
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2"
+    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check inter 2s fall 3 rise 2"
   fi
 
   log "Setup HAProxy TLS mux di 443..."
 
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
-    log /dev/log local0
-    log /dev/log local1 notice
+    log /dev/log local0 notice
     daemon
     maxconn ${haproxy_maxconn}
     nbthread ${haproxy_nbthread}
@@ -2801,7 +3009,7 @@ ${xray_grpc_backend_line}
 backend bk_sshws_tls
     mode tcp
     # Jalur khusus HTTP Custom SSL-only (payload CONNECT) langsung ke sshws mux.
-    server sshws_local 127.0.0.1:2082 check send-proxy
+    server sshws_local 127.0.0.1:2082 check inter 2s fall 3 rise 2 send-proxy
 EOF
 
   haproxy -c -f /etc/haproxy/haproxy.cfg
@@ -2818,7 +3026,11 @@ EOF
   systemctl disable stunnel4 >/dev/null 2>&1 || true
   systemctl stop stunnel4 >/dev/null 2>&1 || true
   systemctl enable haproxy >/dev/null 2>&1 || true
-  systemctl restart haproxy >/dev/null 2>&1 || true
+  if systemctl is-active --quiet haproxy; then
+    systemctl reload haproxy >/dev/null 2>&1 || systemctl restart haproxy >/dev/null 2>&1 || true
+  else
+    systemctl start haproxy >/dev/null 2>&1 || true
+  fi
 }
 
 resolve_zivpn_bin_url() {
@@ -3515,6 +3727,8 @@ XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 NETWORK_COMPAT_ENABLE=${NETWORK_COMPAT_ENABLE}
 NETWORK_TCP_MSS=${NETWORK_TCP_MSS}
+DNS_GUARD_ENABLE=${DNS_GUARD_ENABLE}
+DNS_GUARD_INTERVAL_MINUTES=${DNS_GUARD_INTERVAL_MINUTES}
 XRAY_OUTBOUND_DOMAIN_STRATEGY=${XRAY_OUTBOUND_DOMAIN_STRATEGY}
 VMESS_BUG_PROFILE_ADDRESS=${VMESS_BUG_PROFILE_ADDRESS}
 VMESS_BUG_PROFILE_SNI=${VMESS_BUG_PROFILE_SNI}
@@ -12759,7 +12973,11 @@ setup_udpgw_service_if_possible() {
       cd badvpn
       mkdir -p build
       cd build
-      cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 -DCMAKE_C_FLAGS=-fcommon >/dev/null
+      cmake .. \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        -DBUILD_NOTHING_BY_DEFAULT=1 \
+        -DBUILD_UDPGW=1 \
+        -DCMAKE_C_FLAGS=-fcommon >/dev/null
       make -j"$(nproc)" >/dev/null
       install -m 755 udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
     ) || true
@@ -16708,12 +16926,12 @@ patch_haproxy_mode() {
   tmp="$(mktemp "$(dirname "${HAPROXY_CONF}")/.sc-xray-realip-haproxy.XXXXXX")"
   awk -v mode="${mode}" '
     $1=="server" && $2=="nginx_local" {
-      print "    server nginx_local 127.0.0.1:8083 check send-proxy-v2";
+      print "    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2";
       next;
     }
     $1=="server" && $2=="nginx_grpc" {
-      if (mode=="enable") print "    server nginx_grpc 127.0.0.1:8082 check send-proxy-v2";
-      else print "    server nginx_grpc 127.0.0.1:8081 check";
+      if (mode=="enable") print "    server nginx_grpc 127.0.0.1:8082 check inter 2s fall 3 rise 2 send-proxy-v2";
+      else print "    server nginx_grpc 127.0.0.1:8081 check inter 2s fall 3 rise 2";
       next;
     }
     { print }
@@ -16938,6 +17156,8 @@ XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
 XRAY_PATHS_TROJAN=${XRAY_PATHS_TROJAN}
 NETWORK_COMPAT_ENABLE=${NETWORK_COMPAT_ENABLE}
 NETWORK_TCP_MSS=${NETWORK_TCP_MSS}
+DNS_GUARD_ENABLE=${DNS_GUARD_ENABLE}
+DNS_GUARD_INTERVAL_MINUTES=${DNS_GUARD_INTERVAL_MINUTES}
 XRAY_OUTBOUND_DOMAIN_STRATEGY=${XRAY_OUTBOUND_DOMAIN_STRATEGY}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 SSHWS_READER_BUFFER_KB=${SSHWS_READER_BUFFER_KB}
@@ -17284,6 +17504,19 @@ sanitize_domain_host() {
   echo "${host}"
 }
 
+certificate_dns_host_valid() {
+  local host label
+  host="$(sanitize_domain_host "${1:-}")"
+  [[ -n "${host}" && "${host}" == *.* ]] || return 1
+  [[ ! "${host}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  IFS='.' read -ra __certificate_labels <<< "${host}"
+  for label in "${__certificate_labels[@]}"; do
+    [[ "${#label}" -ge 1 && "${#label}" -le 63 ]] || return 1
+    [[ "${label}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+  done
+  return 0
+}
+
 normalize_domain_host_list() {
   local raw item host out
   raw="$(printf '%s' "${1:-}" | tr '\r\n\t ;|' ',')"
@@ -17529,6 +17762,10 @@ issue_letsencrypt_cert() {
     IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
     for alias_host in "${__cert_alias_hosts[@]}"; do
       [[ -z "${alias_host}" || "${alias_host}" == "${WILDCARD_BASE_DOMAIN}" ]] && continue
+      if ! certificate_dns_host_valid "${alias_host}"; then
+        echo "Lewati SAN alias Xray non-domain: ${alias_host}"
+        continue
+      fi
       if ! domain_covered_by_one_label_wildcard "${alias_host}" "${WILDCARD_BASE_DOMAIN}"; then
         cert_extra_args+=(-d "${alias_host}")
         echo "Tambahkan SAN exact untuk alias Xray wildcard: ${alias_host}"
@@ -17551,6 +17788,10 @@ issue_letsencrypt_cert() {
   IFS=',' read -ra __cert_alias_hosts <<< "${xray_alias_hosts}"
   for alias_host in "${__cert_alias_hosts[@]}"; do
     [[ -z "${alias_host}" || "${alias_host}" == "${DOMAIN}" ]] && continue
+    if ! certificate_dns_host_valid "${alias_host}"; then
+      echo "Lewati SAN alias Xray non-domain: ${alias_host}"
+      continue
+    fi
     cert_extra_args+=(-d "${alias_host}")
     echo "Tambahkan SAN exact untuk alias Xray: ${alias_host}"
   done
@@ -21004,7 +21245,7 @@ set_wildcard_config_menu() {
   if [[ -f /etc/nginx/sites-available/sc-1forcr.conf ]]; then
     sed -i "0,/server_name[[:space:]].*;/s//server_name ${nginx_server_names};/" /etc/nginx/sites-available/sc-1forcr.conf
     if nginx -t; then
-      systemctl restart nginx >/dev/null 2>&1 || true
+      systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
     else
       echo "Peringatan: konfigurasi nginx invalid setelah update server_name."
     fi
@@ -21013,7 +21254,7 @@ set_wildcard_config_menu() {
   if [[ -n "${aliases}" ]] || flag_enabled "${WILDCARD_ENABLE:-0}"; then
     if issue_letsencrypt_cert; then
       pem="$(prepare_haproxy_pem)" || pem=""
-      [[ -n "${pem}" ]] && systemctl restart haproxy >/dev/null 2>&1 || true
+      [[ -n "${pem}" ]] && { systemctl reload haproxy >/dev/null 2>&1 || systemctl restart haproxy >/dev/null 2>&1; } || true
     else
       echo "Peringatan: issue cert gagal. Alias bisa DNS resolve, tapi TLS bisa mismatch sampai cert berhasil."
     fi
@@ -22599,7 +22840,11 @@ EONGINX
   rm -f /etc/nginx/sites-enabled/default
   tune_nginx_capacity
   nginx -t || { echo "Konfigurasi nginx invalid."; return; }
-  systemctl restart nginx || true
+  if systemctl is-active --quiet nginx; then
+    systemctl reload nginx || true
+  else
+    systemctl start nginx || true
+  fi
 
   if ! issue_letsencrypt_cert; then
     echo "Peringatan: issue cert Let's Encrypt untuk ${new_domain} gagal. Lanjut dengan cert sementara."
@@ -22631,17 +22876,16 @@ EONGINX
     haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
-    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check send-proxy-v2"
-    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check send-proxy-v2"
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2"
+    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check inter 2s fall 3 rise 2 send-proxy-v2"
   else
-    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check send-proxy-v2"
-    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check"
+    xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2"
+    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check inter 2s fall 3 rise 2"
   fi
 
   cat > /etc/haproxy/haproxy.cfg <<EOHAP
 global
-    log /dev/log local0
-    log /dev/log local1 notice
+    log /dev/log local0 notice
     daemon
     maxconn ${haproxy_maxconn}
     nbthread ${haproxy_nbthread}
@@ -22700,7 +22944,7 @@ ${xray_grpc_backend_line}
 backend bk_sshws_tls
     mode tcp
     # Jalur khusus HTTP Custom SSL-only (payload CONNECT) langsung ke sshws mux.
-    server sshws_local 127.0.0.1:2082 check send-proxy
+    server sshws_local 127.0.0.1:2082 check inter 2s fall 3 rise 2 send-proxy
 EOHAP
 
   mkdir -p /etc/systemd/system/haproxy.service.d
@@ -22717,7 +22961,11 @@ EOF
     echo "Konfigurasi haproxy invalid."
     return
   }
-  systemctl restart haproxy || true
+  if systemctl is-active --quiet haproxy; then
+    systemctl reload haproxy || systemctl restart haproxy || true
+  else
+    systemctl start haproxy || true
+  fi
 
   if [[ ! -s "${pem}" ]]; then
     echo "Gagal menyiapkan sertifikat HAProxy untuk domain ${new_domain}."
@@ -22780,7 +23028,9 @@ location ^~ /docs/ {
 }
 EOF
   fi
-  systemctl restart sc-1forcr-api sc-1forcr-sshws haproxy nginx
+  systemctl restart sc-1forcr-api sc-1forcr-sshws
+  systemctl reload nginx
+  systemctl reload haproxy || systemctl restart haproxy
   echo "Domain berhasil diubah ke ${new_domain}"
 }
 
@@ -26244,6 +26494,8 @@ systemctl stop sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
+systemctl disable --now sc-1forcr-dns-guard.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-dns-guard.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
@@ -26277,6 +26529,8 @@ rm -f /etc/systemd/system/sc-1forcr-pull-summary-update.service
 rm -f /etc/systemd/system/sc-1forcr-pull-summary-update.timer
 rm -f /etc/systemd/system/sc-1forcr-capacity-tune.service
 rm -f /etc/systemd/system/sc-1forcr-capacity-tune.timer
+rm -f /etc/systemd/system/sc-1forcr-dns-guard.service
+rm -f /etc/systemd/system/sc-1forcr-dns-guard.timer
 rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/sc-1forcr-udpgw@.service
@@ -26307,6 +26561,7 @@ rm -f /usr/local/sbin/sc-1forcr-pull-summary-update
 rm -f /usr/local/sbin/sc-1forcr-udpgw-alias
 rm -f /usr/local/sbin/sc-1forcr-udpgw-drain
 rm -f /usr/local/sbin/sc-1forcr-capacity-tune
+rm -f /usr/local/sbin/sc-1forcr-dns-guard
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 rm -f /etc/profile.d/sc-1forcr-auto-menu.sh
 
@@ -26503,14 +26758,72 @@ post_install_preflight() {
 EOF
 }
 
+tcp_listener_present() {
+  local port="${1:-}"
+  [[ "${port}" =~ ^[0-9]+$ && "${port}" -ge 1 && "${port}" -le 65535 ]] || return 1
+  ss -H -lnt 2>/dev/null | awk -v want="${port}" '
+    {
+      local_addr=$4;
+      sub(/^.*:/, "", local_addr);
+      if (local_addr == want) found=1;
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+wait_haproxy_local_backends() {
+  local timeout_seconds="${1:-30}" deadline port all_ready
+  local backend_ports=()
+  [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || timeout_seconds="30"
+  if [[ -f /etc/haproxy/haproxy.cfg ]]; then
+    mapfile -t backend_ports < <(awk '
+      $1 == "server" && ($2 == "nginx_local" || $2 == "nginx_grpc" || $2 == "sshws_local") {
+        count=split($3, address, ":");
+        port=address[count];
+        if (port ~ /^[0-9]+$/ && !seen[port]++) print port;
+      }
+    ' /etc/haproxy/haproxy.cfg)
+  fi
+  [[ "${#backend_ports[@]}" -gt 0 ]] || {
+    log "Backend lokal HAProxy tidak ditemukan di konfigurasi."
+    return 1
+  }
+
+  deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    all_ready="1"
+    for port in "${backend_ports[@]}"; do
+      if ! tcp_listener_present "${port}"; then
+        all_ready="0"
+        break
+      fi
+    done
+    [[ "${all_ready}" == "1" ]] && return 0
+    sleep 1
+  done
+  log "Backend lokal HAProxy belum siap pada port: ${backend_ports[*]}"
+  return 1
+}
+
 apply_final_service_restart_chain() {
+  local unit backend_ready="0"
   echo "Menerapkan restart berurutan layanan inti..."
   systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
   sleep 2
   systemctl restart "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
-  systemctl restart sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
-  sleep 1
-  systemctl restart haproxy >/dev/null 2>&1 || true
+  systemctl stop haproxy >/dev/null 2>&1 || true
+  for unit in sc-1forcr-sshws xray nginx; do
+    if ! systemctl restart "${unit}" >/dev/null 2>&1; then
+      log "Gagal restart layanan inti: ${unit}"
+      systemctl start haproxy >/dev/null 2>&1 || true
+      return 1
+    fi
+  done
+  if wait_haproxy_local_backends 30; then
+    backend_ready="1"
+  fi
+  systemctl start haproxy >/dev/null 2>&1 || return 1
+  [[ "${backend_ready}" == "1" ]] || return 1
 }
 
 update_sc_env_var() {
@@ -26969,7 +27282,7 @@ persist_pending_install_env() {
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
     XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_LIVE_IP_TTL_SECONDS
     XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
-    NETWORK_COMPAT_ENABLE NETWORK_TCP_MSS XRAY_OUTBOUND_DOMAIN_STRATEGY
+    NETWORK_COMPAT_ENABLE NETWORK_TCP_MSS DNS_GUARD_ENABLE DNS_GUARD_INTERVAL_MINUTES XRAY_OUTBOUND_DOMAIN_STRATEGY
     VMESS_BUG_PROFILE_ADDRESS VMESS_BUG_PROFILE_SNI VMESS_BUG_PROFILE_HOST VMESS_BUG_PROFILE_ALLOW_INSECURE
     SSH_HC_AUTH_LOOKBACK_HOURS SCRIPT_VERSION
   )
@@ -27403,10 +27716,24 @@ udp_listener_present() {
   '
 }
 
+tcp_listener_present() {
+  local port="${1:-}"
+  [[ "${port}" =~ ^[0-9]+$ && "${port}" -ge 1 && "${port}" -le 65535 ]] || return 1
+  ss -H -lnt 2>/dev/null | awk -v want="${port}" '
+    {
+      local_addr=$4;
+      sub(/^.*:/, "", local_addr);
+      if (local_addr == want) found=1;
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
 health_check() {
   local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok timer_state configured_udp_port udp_state
   local udpgw_ports_raw udpgw_port udpgw_ok
   local runtime_version runtime_revision strict_xray_monitor xray_port xray_ports_ok xray_config_result xray_capabilities
+  local haproxy_backend_ports_raw haproxy_port haproxy_backends_ok
   load_update_env
   DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
   API_PORT="$(printf '%s' "${API_PORT:-8088}" | tr -cd '0-9')"
@@ -27438,7 +27765,8 @@ PY
       failures+=("license guard timer tidak aktif")
     else
       timer_state="$(systemctl show sc-1forcr-license-guard.timer -p SubState --value 2>/dev/null || true)"
-      [[ "${timer_state}" == "waiting" ]] || failures+=("license guard timer tidak terjadwal (${timer_state:-unknown})")
+      [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
+        failures+=("license guard timer tidak terjadwal (${timer_state:-unknown})")
     fi
   fi
 
@@ -27447,11 +27775,12 @@ PY
       failures+=("IP limit timer tidak aktif")
     else
       timer_state="$(systemctl show sc-1forcr-iplimit.timer -p SubState --value 2>/dev/null || true)"
-      [[ "${timer_state}" == "waiting" ]] || failures+=("IP limit timer tidak terjadwal (${timer_state:-unknown})")
+      [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
+        failures+=("IP limit timer tidak terjadwal (${timer_state:-unknown})")
     fi
   fi
 
-  for unit in sc-1forcr-api.service sc-1forcr-sshws.service; do
+  for unit in sc-1forcr-api.service sc-1forcr-sshws.service nginx.service haproxy.service; do
     if unit_is_installed "${unit}" && ! systemctl is-active --quiet "${unit}"; then
       failures+=("${unit} tidak aktif")
     fi
@@ -27548,6 +27877,35 @@ PY
   if command -v haproxy >/dev/null 2>&1 && [[ -f /etc/haproxy/haproxy.cfg ]] && \
     ! haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1; then
     failures+=("haproxy config")
+  fi
+  if unit_is_installed haproxy.service && systemctl is-active --quiet haproxy.service && \
+     [[ -f /etc/haproxy/haproxy.cfg ]]; then
+    haproxy_backend_ports_raw="$(awk '
+      $1 == "server" && ($2 == "nginx_local" || $2 == "nginx_grpc" || $2 == "sshws_local") {
+        count=split($3, address, ":");
+        port=address[count];
+        if (port ~ /^[0-9]+$/ && !seen[port]++) print port;
+      }
+    ' /etc/haproxy/haproxy.cfg)"
+    if [[ -z "${haproxy_backend_ports_raw}" ]]; then
+      failures+=("target backend HAProxy tidak ditemukan")
+    else
+      haproxy_backends_ok="0"
+      for attempt in {1..15}; do
+        haproxy_backends_ok="1"
+        while IFS= read -r haproxy_port; do
+          [[ -z "${haproxy_port}" ]] && continue
+          if ! tcp_listener_present "${haproxy_port}"; then
+            haproxy_backends_ok="0"
+            break
+          fi
+        done <<< "${haproxy_backend_ports_raw}"
+        [[ "${haproxy_backends_ok}" == "1" ]] && break
+        sleep 1
+      done
+      [[ "${haproxy_backends_ok}" == "1" ]] || \
+        failures+=("backend lokal HAProxy tidak listen ($(echo "${haproxy_backend_ports_raw}" | tr '\n' ',' | sed 's/,$//'))")
+    fi
   fi
 
   api_ok="0"
@@ -27958,6 +28316,8 @@ main() {
     fi
     install_legacy_runtime_command_shims
     check_supported_os
+    ensure_dns_resolver_if_needed
+    setup_dns_resolver_guard
     install_node_if_missing
     enforce_install_license
     install_go_if_missing
@@ -27984,6 +28344,7 @@ main() {
     enforce_single_udp_backend
     apply_tunnel_outbound_guard_rules
     restart_update_safe_services
+    ensure_dns_resolver_if_needed
     if ! sync_xray_runtime_after_update; then
       log "Rekonsiliasi monitor Xray pasca-update gagal. Rollback otomatis akan dijalankan."
       return 1
@@ -28014,9 +28375,12 @@ main() {
   show_install_banner
   show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
 
+  show_install_progress 1 "Cek DNS resolver"
+  ensure_dns_resolver_if_needed
   run_install_step "00_license" 2 "Validasi lisensi" enforce_install_license
   run_install_step "01_check_os" 4 "Cek OS server" check_supported_os
   run_install_step "02_base_packages" 8 "Install paket dasar" install_base_packages
+  run_install_step "02b_dns_guard" 10 "Setup DNS resolver guard" setup_dns_resolver_guard
   run_install_step "03_vnstat" 12 "Setup vnStat" setup_vnstat
   run_install_step "04_system_optimizations" 16 "Optimasi sistem" apply_system_optimizations
   run_install_step "05_logrotate" 20 "Setup logrotate" setup_logrotate_optimizations
@@ -28062,6 +28426,7 @@ main() {
   run_install_step "36_sshws_guard" 98 "Terapkan guard SSHWS" apply_sshws_loop_guard_rules
   run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
   run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
+  ensure_dns_resolver_if_needed
   run_install_step "39_preflight" 100 "Preflight akhir" post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. GASSS LANGSUNG TESTTT BANGGG."
 

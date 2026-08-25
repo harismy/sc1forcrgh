@@ -15,7 +15,7 @@ assert(
   licenseApiSource.indexOf('normalizeLegacyInstallerPathValue(ENV_SC_INSTALLER_LOCAL_PATH),') < licenseApiSource.indexOf('DEFAULT_SC_INSTALLER_LOCAL_PATH,'),
   'configured installer path must take priority over the default path'
 );
-assert(licenseApiSource.includes("replace(/\\/g, '/')"));
+assert(licenseApiSource.includes(String.raw`raw.replace(/\\/g, '/')`));
 assert(licenseApiSource.includes("/payload/setup-autoscript-compat.sh"));
 assert(licenseApiSource.includes('SC installer payload: ${installerPath} (${installerVersion})'));
 

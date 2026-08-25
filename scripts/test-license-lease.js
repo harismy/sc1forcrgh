@@ -12,9 +12,11 @@ const installerPath = path.join(repoRoot, 'scripts', 'setup-autoscript-compat.sh
 const licenseApiSource = fs.readFileSync(path.join(repoRoot, 'license-api.js'), 'utf8');
 
 assert(
-  licenseApiSource.indexOf('ENV_SC_INSTALLER_LOCAL_PATH,') < licenseApiSource.indexOf('DEFAULT_SC_INSTALLER_LOCAL_PATH,'),
+  licenseApiSource.indexOf('normalizeLegacyInstallerPathValue(ENV_SC_INSTALLER_LOCAL_PATH),') < licenseApiSource.indexOf('DEFAULT_SC_INSTALLER_LOCAL_PATH,'),
   'configured installer path must take priority over the default path'
 );
+assert(licenseApiSource.includes("replace(/\\/g, '/')"));
+assert(licenseApiSource.includes("/payload/setup-autoscript-compat.sh"));
 assert(licenseApiSource.includes('SC installer payload: ${installerPath} (${installerVersion})'));
 
 function extractGuardSource() {

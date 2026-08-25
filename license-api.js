@@ -407,9 +407,19 @@ function uniqPaths(paths) {
   return [...new Set((Array.isArray(paths) ? paths : []).map((p) => String(p || '').trim()).filter(Boolean))];
 }
 
+function normalizeLegacyInstallerPathValue(rawValue) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return raw;
+  const normalized = raw.replace(/\\/g, '/');
+  if (normalized.endsWith('/payload/setup-autoscript-compat.sh')) {
+    return normalized.replace(/\/payload\/setup-autoscript-compat\.sh$/, '/scripts/setup-autoscript-compat.sh');
+  }
+  return raw;
+}
+
 function resolveScInstallerLocalPath() {
   const candidates = uniqPaths([
-    ENV_SC_INSTALLER_LOCAL_PATH,
+    normalizeLegacyInstallerPathValue(ENV_SC_INSTALLER_LOCAL_PATH),
     DEFAULT_SC_INSTALLER_LOCAL_PATH,
     LEGACY_SC_INSTALLER_LOCAL_PATH
   ]);

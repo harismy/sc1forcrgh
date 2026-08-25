@@ -23521,7 +23521,12 @@ draw_dashboard() {
   # ── HEADER ──
   printf '%s\n' "${btop}"
   crow "${WH}${BOLD}SC 1FORCR NEXUS${NC}"
-  local sub="${license_client_name}  |  ${SCRIPT_VERSION:-V.1FSC}  |  ${expiry_in_text}"
+  local displayed_version=""
+  displayed_version="$(tr -d '[:space:]' </opt/sc-1forcr/VERSION 2>/dev/null || true)"
+  if [[ ! "${displayed_version}" =~ ^V\.1FSC\.[0-9]+$ ]]; then
+    displayed_version="${SCRIPT_VERSION:-V.1FSC}"
+  fi
+  local sub="${license_client_name}  |  ${displayed_version}  |  ${expiry_in_text}"
   crow "${DIM}${sub}${NC}"
   printf '%s\n' "${bbot}"
   printf '\n'
@@ -25402,7 +25407,12 @@ manual_update_sc() {
     echo "Update dibatalkan."
     return 0
   }
-  UPDATE_SAFE_MODE=1 update_script_locked
+  if UPDATE_SAFE_MODE=1 update_script_locked; then
+    echo
+    echo "Update berhasil. Memuat ulang menu dari runtime terbaru..."
+    exec /usr/local/sbin/menu-sc-1forcr
+  fi
+  return 1
 }
 
 manual_rollback_latest_update() {

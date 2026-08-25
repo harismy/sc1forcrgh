@@ -71,6 +71,8 @@ assert(menuSource.includes('.data.isp // .data.location.isp'), 'VPS ISP must com
 assert(installer.includes('SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.37}"'));
 assert(installer.includes('Versi payload   : ${downloaded_version}'));
 assert(installer.includes('marker versi ${new_ver} tidak sama dengan payload ${downloaded_version}'));
+assert(installer.includes('displayed_version="$(tr -d \'[:space:]\' </opt/sc-1forcr/VERSION 2>/dev/null || true)"'));
+assert(installer.includes('Update berhasil. Memuat ulang menu dari runtime terbaru...'));
 assert(installer.includes('XRAY RUNTIME ENFORCEMENT:'));
 assert(installer.includes('config_state="LEAK"'));
 

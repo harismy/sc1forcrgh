@@ -417,6 +417,7 @@ function syncSshLinuxUsers(accounts) {
   const tunnelShell = ensureTunnelShellAllowed();
   let created = 0;
   let updated = 0;
+  let disabled = 0;
   let skipped = 0;
   let failed = 0;
   const errors = [];
@@ -429,8 +430,9 @@ function syncSshLinuxUsers(accounts) {
     }
 
     const password = String(row?.password || username).trim() || username;
-    const dateExp = String(row?.date_exp || '').trim();
+    const dateExp = String(row?.date_exp || row?.exp || row?.to || '').trim();
     const homeDir = `/home/${username}`;
+    const shouldEnable = shouldEnableImportedSshUser(row);
 
     try {
       let exists = true;
@@ -438,6 +440,19 @@ function syncSshLinuxUsers(accounts) {
         execFileSync('id', ['-u', username], { stdio: 'ignore' });
       } catch (_) {
         exists = false;
+      }
+
+      if (!shouldEnable) {
+        if (!exists) {
+          skipped += 1;
+          continue;
+        }
+        try { execFileSync('pkill', ['-KILL', '-u', username], { stdio: 'ignore' }); } catch (_) {}
+        try { execFileSync('passwd', ['-l', username], { stdio: 'ignore' }); } catch (_) {}
+        const nologin = fs.existsSync('/usr/sbin/nologin') ? '/usr/sbin/nologin' : (fs.existsSync('/sbin/nologin') ? '/sbin/nologin' : '/bin/false');
+        execFileSync('usermod', ['-s', nologin, username], { stdio: 'ignore' });
+        disabled += 1;
+        continue;
       }
 
       if (!exists) {
@@ -451,9 +466,13 @@ function syncSshLinuxUsers(accounts) {
       execFileSync('chown', ['-R', `${username}:${username}`, homeDir], { stdio: 'ignore' });
       execFileSync('usermod', ['-d', homeDir, '-s', tunnelShell, username], { stdio: 'ignore' });
       execFileSync('chpasswd', [], { input: `${username}:${password}\n` });
+      try { execFileSync('passwd', ['-u', username], { stdio: 'ignore' }); } catch (_) {}
 
-      if (/^\d{4}-\d{2}-\d{2}$/.test(dateExp)) {
-        execFileSync('chage', ['-E', dateExp, username], { stdio: 'ignore' });
+      const linuxExp = linuxAccountExpiryDate(dateExp);
+      if (linuxExp) {
+        execFileSync('chage', ['-E', linuxExp, username], { stdio: 'ignore' });
+      } else {
+        try { execFileSync('chage', ['-E', '-1', username], { stdio: 'ignore' }); } catch (_) {}
       }
     } catch (err) {
       failed += 1;
@@ -465,6 +484,7 @@ function syncSshLinuxUsers(accounts) {
     ok: failed === 0,
     created,
     updated,
+    disabled,
     skipped,
     failed,
     errors
@@ -695,6 +715,57 @@ function normalizeImportedStatus(statusInput) {
   if (['EXPIRED', 'KADALUARSA', 'RECOVERY'].includes(s)) return 'EXPIRED';
   if (['LOCK', 'LOCKED', 'LOCK_TMP', 'LOCK_QUOTA', 'BANNED', 'BAN'].includes(s)) return 'LOCK';
   return 'AKTIF';
+}
+
+function parseDateExpMs(dateExpInput) {
+  const raw = String(dateExpInput || '').trim();
+  if (!raw) return 0;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const ms = Date.parse(`${raw}T00:00:00`);
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function isDateExpExpiredForRuntime(dateExpInput) {
+  const raw = String(dateExpInput || '').trim();
+  if (!raw) return false;
+  const ms = parseDateExpMs(raw);
+  if (!ms) return false;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return (ms + 24 * 60 * 60 * 1000) <= Date.now();
+  }
+  return ms <= Date.now();
+}
+
+function ymdLocalFromDate(dateInput) {
+  const d = dateInput instanceof Date ? dateInput : new Date(dateInput);
+  if (!Number.isFinite(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function linuxAccountExpiryDate(dateExpInput) {
+  const raw = String(dateExpInput || '').trim();
+  if (!raw) return '';
+  const ms = parseDateExpMs(raw);
+  if (!ms) return '';
+  const d = new Date(ms);
+  // chage hanya presisi tanggal. Pakai H+1 agar akun dengan expired jam tertentu
+  // tidak terkunci lebih awal di hari yang sama.
+  d.setDate(d.getDate() + 1);
+  return ymdLocalFromDate(d);
+}
+
+function shouldEnableImportedSshUser(rowInput) {
+  const row = rowInput && typeof rowInput === 'object' ? rowInput : {};
+  const status = normalizeImportedStatus(row.status || row.status_lock || row.type);
+  if (status !== 'AKTIF') return false;
+  return !isDateExpExpiredForRuntime(row.date_exp || row.exp || row.to);
 }
 
 function normalizeImportedAccountRow(type, rowInput) {
@@ -2422,6 +2493,47 @@ function readCoreApiRuntimeConfig() {
   return { ok: true, token, port };
 }
 
+async function postCoreApi(endpoint, body = {}, timeoutMs = 120000) {
+  const core = readCoreApiRuntimeConfig();
+  if (!core.ok) {
+    return { ok: false, statusCode: 500, message: core.message };
+  }
+  const path = String(endpoint || '').startsWith('/') ? String(endpoint || '') : `/${String(endpoint || '')}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(5000, Number(timeoutMs || 120000)));
+  try {
+    const resp = await fetch(`http://127.0.0.1:${core.port}${path}`, {
+      method: 'POST',
+      headers: {
+        Authorization: core.token,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal
+    });
+    const text = await resp.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!resp.ok) {
+      return {
+        ok: false,
+        statusCode: Number(resp.status || 500),
+        message: `core api gagal (${resp.status})`,
+        core_response: parsed || text || null
+      };
+    }
+    return { ok: true, statusCode: Number(resp.status || 200), core_response: parsed || text || null };
+  } catch (err) {
+    return {
+      ok: false,
+      statusCode: 500,
+      message: err?.name === 'AbortError' ? 'request core api timeout' : (err?.message || 'request core api gagal')
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function renewXrayAccount(typeInput, usernameInput, daysInput) {
   const type = String(typeInput || '').trim().toLowerCase();
   const username = String(usernameInput || '').trim();
@@ -2698,6 +2810,29 @@ app.post('/internal/sync-xray-from-db', (req, res) => {
       })
       .catch((err) => {
         return res.status(500).json({ ok: false, message: err?.message || 'sync xray gagal' });
+      });
+  });
+});
+
+app.post('/internal/restore-finished', (req, res) => {
+  return authorizeAndRun(req, res, (db) => {
+    db.close();
+    postCoreApi('/vps/restore-finished', {}, 300000)
+      .then((result) => {
+        if (!result.ok) {
+          return res.status(Number(result.statusCode || 500)).json({
+            ok: false,
+            message: result.message || 'final sync restore gagal',
+            core_response: result.core_response || null
+          });
+        }
+        return res.json({
+          ok: true,
+          core_restore_finished: result.core_response || null
+        });
+      })
+      .catch((err) => {
+        return res.status(500).json({ ok: false, message: err?.message || 'final sync restore gagal' });
       });
   });
 });

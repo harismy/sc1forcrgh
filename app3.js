@@ -7903,6 +7903,16 @@ bot.on('document', async (ctx) => {
       resultLines.push('ZIVPN auth: mengikuti akun SSH (mode unified)');
     }
 
+    try {
+      const finished = await apiPost(state.host, state.key, '/internal/restore-finished', {}, 300000);
+      const coreData = finished?.core_restore_finished?.data || finished?.core_restore_finished || {};
+      const sshSynced = coreData?.ssh_backends_synced === true || coreData?.data?.ssh_backends_synced === true;
+      const xraySynced = coreData?.xray_synced === true || coreData?.data?.xray_synced === true;
+      resultLines.push(`Runtime final sync: OK (SSH=${sshSynced ? 'OK' : 'sent'}, XRAY=${xraySynced ? 'OK' : 'sent'})`);
+    } catch (finishErr) {
+      resultLines.push(`Runtime final sync: gagal (${parseErr(finishErr)})`);
+    }
+
     if (Object.prototype.hasOwnProperty.call(backupData, 'banner_html') || Object.prototype.hasOwnProperty.call(backupData, 'banner_txt')) {
       try {
         await apiPost(state.host, state.key, '/internal/restore-banner-config', {

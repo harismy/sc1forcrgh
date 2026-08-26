@@ -7351,12 +7351,31 @@ app.patch('/vps/editquotavless/:username', async (req, res) => quotaRoute('vless
 app.patch('/vps/editquotatrojan/:username', async (req, res) => quotaRoute('trojan', req, res));
 
 // Endpoint untuk dipanggil bot setelah proses restore/import DB selesai.
-// Auto-sync xray hanya on-demand (bukan berkala) agar ringan dan deterministik.
+// Auto-sync runtime restore hanya on-demand agar ringan dan deterministik.
 app.post('/vps/sync-xray', async (_req, res) => {
   return syncXrayFromDbAndRespond(res, true);
 });
+app.post('/vps/sync-ssh-backends', async (_req, res) => {
+  try {
+    await syncSshBackendsFromDb();
+    return ok(res, { synced: true, at: nowTime() });
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e?.message || 'sync ssh backend failed');
+  }
+});
 app.post('/vps/restore-finished', async (_req, res) => {
-  return syncXrayFromDbAndRespond(res, true);
+  try {
+    await syncSshBackendsFromDb();
+    const xrayChanged = await syncXrayFromDbIfChanged(true);
+    return ok(res, {
+      ssh_backends_synced: true,
+      xray_synced: true,
+      xray_changed: xrayChanged,
+      at: nowTime()
+    });
+  } catch (e) {
+    return fail(res, Number(e?.statusCode || 500), e?.message || 'restore final sync failed');
+  }
 });
 
 app.use((err, _req, res, _next) => {
@@ -21676,7 +21695,7 @@ write_api_docs_index() {
       ['Quota', 'PATCH', '/vps/editquotavless/:username', true, 'Alias quota untuk akun VLESS.', '{\n  "kuota": 10,\n  "mode": "add"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"kuota":10,"mode":"add"}' "${BASE}/vps/editquotavless/vless01"`, 'Alias endpoint quota VLESS.'],
       ['Quota', 'PATCH', '/vps/editquotatrojan/:username', true, 'Alias quota untuk akun Trojan.', '{\n  "kuota": 10,\n  "mode": "add"\n}', `curl -X PATCH ${authCurl} -H "Content-Type: application/json" -d '{"kuota":10,"mode":"add"}' "${BASE}/vps/editquotatrojan/trojan01"`, 'Alias endpoint quota Trojan.'],
       ['Utility', 'POST', '/vps/sync-xray', true, 'Sinkron ulang konfigurasi Xray dari database.', '-', `curl -X POST ${authCurl} "${BASE}/vps/sync-xray"`, 'Dipakai setelah restore/import DB.'],
-      ['Utility', 'POST', '/vps/restore-finished', true, 'Alias sync-xray setelah restore selesai.', '-', `curl -X POST ${authCurl} "${BASE}/vps/restore-finished"`, 'Dipakai setelah restore/import DB.']
+      ['Utility', 'POST', '/vps/restore-finished', true, 'Sinkron runtime SSH backend dan Xray setelah restore selesai.', '-', `curl -X POST ${authCurl} "${BASE}/vps/restore-finished"`, 'Dipakai setelah restore/import DB.']
     ].map(([group, method, path, auth, summary, body, curl, note]) => ({ group, method, path, auth, summary, body, curl, note }));
     const groups = ['Semua', 'Core', 'SSH', 'Xray', 'Quota', 'Utility'];
     let activeGroup = 'Semua';

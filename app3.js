@@ -41,6 +41,68 @@ const ADMIN_IDS = String(process.env.ADMIN_IDS || '')
   .filter((n) => Number.isInteger(n) && n > 0);
 
 const bot = new Telegraf(BOT_TOKEN);
+
+const TELEGRAM_BUTTON_STYLE_ENABLE = !/^(0|false|no|off)$/i.test(
+  String(process.env.TELEGRAM_BUTTON_STYLE_ENABLE || '1').trim()
+);
+const TELEGRAM_BUTTON_STYLES = new Set(['primary', 'success', 'danger']);
+
+function inferTelegramButtonStyle(button) {
+  if (!TELEGRAM_BUTTON_STYLE_ENABLE || !button || typeof button !== 'object') return '';
+  const explicit = String(button.style || '').trim().toLowerCase();
+  if (TELEGRAM_BUTTON_STYLES.has(explicit)) return explicit;
+
+  const text = String(button.text || '').toLowerCase();
+  const action = String(button.callback_data || button.url || '').toLowerCase();
+  const key = `${text} ${action}`;
+
+  if (/(kembali|back|prev|next|refresh|pilih periode)/i.test(key)) return '';
+  if (/(batal|batalkan|hapus|delete|remove|nonaktif|disable|rollback|gajadi|delall)/i.test(key)) return 'danger';
+  if (/(unlock|perpanjang|extend|top ?up|saldo|restore|backup|hubungi|wa admin|aktif|cek status|success|paid)/i.test(key)) {
+    return 'success';
+  }
+  return 'primary';
+}
+
+function withTelegramButtonStyle(button) {
+  if (!button || typeof button !== 'object') return button;
+  const style = inferTelegramButtonStyle(button);
+  if (!style) {
+    const { style: _style, ...cleanButton } = button;
+    return cleanButton;
+  }
+  return { ...button, style };
+}
+
+function styleTelegramInlineKeyboardRows(rows) {
+  if (!Array.isArray(rows)) return rows;
+  return rows.map((row) => (Array.isArray(row) ? row.map(withTelegramButtonStyle) : row));
+}
+
+function styleTelegramMarkup(markup) {
+  if (markup?.reply_markup?.inline_keyboard) {
+    return {
+      ...markup,
+      reply_markup: {
+        ...markup.reply_markup,
+        inline_keyboard: styleTelegramInlineKeyboardRows(markup.reply_markup.inline_keyboard)
+      }
+    };
+  }
+  if (markup?.inline_keyboard) {
+    return {
+      ...markup,
+      inline_keyboard: styleTelegramInlineKeyboardRows(markup.inline_keyboard)
+    };
+  }
+  return markup;
+}
+
+const originalInlineKeyboard = Markup.inlineKeyboard.bind(Markup);
+Markup.inlineKeyboard = function inlineKeyboardWithSemanticStyles(buttons, options) {
+  return styleTelegramMarkup(originalInlineKeyboard(buttons, options));
+};
+
 const userState = new Map();
 const pendingBroadcastAlbums = new Map();
 const db = new sqlite3.Database(DB_PATH);
@@ -3184,7 +3246,8 @@ function buildBroadcastCopyMarkup(copyTextsInput) {
   return {
     inline_keyboard: eligible.map((value, index) => ([{
       text: eligible.length === 1 ? '📋 Salin teks' : `📋 Salin teks ${index + 1}`,
-      copy_text: { text: value }
+      copy_text: { text: value },
+      style: 'success'
     }]))
   };
 }

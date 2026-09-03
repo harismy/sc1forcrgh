@@ -58,6 +58,10 @@ assert(licenseApi.includes('licenseApiUrls: baseUrls.map'));
 assert(botApp.includes("const SC_IP_CHANGE_MAX = 5;"));
 assert(botApp.includes("Markup.button.callback('⚡ GOD MODE UPDATE WAJIB', 'm_admin_god_update')"));
 assert(botApp.includes("setInterval(() => {\n    processGodUpdateCampaigns()"));
+assert(botApp.includes("'certonly', '--webroot', '-w', '/var/www/certbot'"));
+assert(botApp.includes('verifyInstallerAcmeWebroot(domain)'));
+assert(botApp.includes('location ^~ /.well-known/acme-challenge/'));
+assert(botApp.includes('writeNginxInstallerVhost(domain, DEFAULT_LICENSE_API_PORT, { tls: true })'));
 
 const acceptedTimerState = '[[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]';
 assert.strictEqual((updateManager.split(acceptedTimerState).length - 1), 3);

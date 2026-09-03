@@ -4588,20 +4588,10 @@ function ensureRuntimeDeps() {
   }
 }
 
-function writeNginxInstallerVhost(domain, targetPort) {
+function writeNginxInstallerVhost(domain, targetPort, { tls = false } = {}) {
   const confPath = `/etc/nginx/sites-available/sc1forcr-installer-${domain}.conf`;
   const linkPath = `/etc/nginx/sites-enabled/sc1forcr-installer-${domain}.conf`;
-  const cfg = [
-    'server {',
-    '    listen 80;',
-    '    listen [::]:80;',
-    `    server_name ${domain};`,
-    '    client_max_body_size 16m;',
-    '',
-    '    location /.well-known/acme-challenge/ {',
-    '        root /var/www/certbot;',
-    '    }',
-    '',
+  const proxyLines = [
     '    location / {',
     `        proxy_pass http://127.0.0.1:${targetPort};`,
     '        proxy_http_version 1.1;',
@@ -4610,8 +4600,40 @@ function writeNginxInstallerVhost(domain, targetPort) {
     '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
     '        proxy_set_header X-Forwarded-Proto $scheme;',
     '        proxy_read_timeout 300s;',
+    '    }'
+  ];
+  const cfg = [
+    'server {',
+    '    listen 80;',
+    '    listen [::]:80;',
+    `    server_name ${domain};`,
+    '    client_max_body_size 16m;',
+    '',
+    '    location ^~ /.well-known/acme-challenge/ {',
+    '        root /var/www/certbot;',
+    '        default_type text/plain;',
+    '        try_files $uri =404;',
     '    }',
+    '',
+    ...(tls ? ['    location / {', '        return 301 https://$host$request_uri;', '    }'] : proxyLines),
     '}',
+    ...(tls ? [
+      '',
+      'server {',
+      '    listen 443 ssl;',
+      '    listen [::]:443 ssl;',
+      `    server_name ${domain};`,
+      '    client_max_body_size 16m;',
+      `    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;`,
+      `    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;`,
+      '    ssl_protocols TLSv1.2 TLSv1.3;',
+      '    ssl_session_cache shared:SC1FORCRSSL:10m;',
+      '    ssl_session_timeout 1d;',
+      '    ssl_session_tickets off;',
+      '',
+      ...proxyLines,
+      '}'
+    ] : []),
     ''
   ].join('\n');
   fs.mkdirSync('/var/www/certbot', { recursive: true });
@@ -4630,6 +4652,30 @@ function writeNginxInstallerVhost(domain, targetPort) {
   }
 }
 
+function verifyInstallerAcmeWebroot(domain) {
+  const challengeDir = '/var/www/certbot/.well-known/acme-challenge';
+  const probeName = `sc1forcr-${crypto.randomBytes(10).toString('hex')}`;
+  const probeValue = crypto.randomBytes(18).toString('hex');
+  const probePath = path.join(challengeDir, probeName);
+  fs.mkdirSync(challengeDir, { recursive: true });
+  fs.writeFileSync(probePath, `${probeValue}\n`, { encoding: 'utf8', mode: 0o644 });
+  try {
+    const response = runCmd('curl', [
+      '-4fsS', '--connect-timeout', '10', '--max-time', '20',
+      `http://${domain}/.well-known/acme-challenge/${probeName}`
+    ]).trim();
+    if (response !== probeValue) {
+      throw new Error(`uji HTTP-01 tidak cocok: menerima ${JSON.stringify(response.slice(0, 160))}`);
+    }
+  } catch (error) {
+    throw new Error(
+      `uji HTTP-01 gagal. Pastikan record A ${domain} mengarah ke IP VPS bot dan port 80 terbuka. ${String(error?.message || error)}`
+    );
+  } finally {
+    try { fs.rmSync(probePath, { force: true }); } catch (_) {}
+  }
+}
+
 async function provisionInstallerDomain(domain) {
   const autoProvisionEnabled = await getAutoProvisionDomain();
   if (!autoProvisionEnabled) return;
@@ -4644,15 +4690,27 @@ async function provisionInstallerDomain(domain) {
   writeNginxInstallerVhost(domain, DEFAULT_LICENSE_API_PORT);
   runCmd('nginx', ['-t']);
   runCmd('systemctl', ['reload', 'nginx']);
+  verifyInstallerAcmeWebroot(domain);
 
   const certbotEmail = await getCertbotEmail();
-  const certbotArgs = ['--nginx', '-d', domain, '--non-interactive', '--agree-tos', '--redirect'];
+  const certbotArgs = [
+    'certonly', '--webroot', '-w', '/var/www/certbot',
+    '--cert-name', domain, '-d', domain,
+    '--non-interactive', '--agree-tos', '--keep-until-expiring',
+    '--deploy-hook', 'systemctl reload nginx'
+  ];
   if (certbotEmail) {
     certbotArgs.push('-m', certbotEmail);
   } else {
     certbotArgs.push('--register-unsafely-without-email');
   }
   runCmd('certbot', certbotArgs);
+  const fullchainPath = `/etc/letsencrypt/live/${domain}/fullchain.pem`;
+  const privateKeyPath = `/etc/letsencrypt/live/${domain}/privkey.pem`;
+  if (!fs.existsSync(fullchainPath) || !fs.existsSync(privateKeyPath)) {
+    throw new Error('Certbot selesai tetapi file fullchain/privkey tidak ditemukan.');
+  }
+  writeNginxInstallerVhost(domain, DEFAULT_LICENSE_API_PORT, { tls: true });
   runCmd('nginx', ['-t']);
   runCmd('systemctl', ['reload', 'nginx']);
 }

@@ -6857,7 +6857,12 @@ bot.on('text', async (ctx) => {
         await provisionInstallerDomain(domain);
       } catch (e) {
         userState.delete(ctx.chat.id);
-        return ctx.reply(`Auto-setup domain gagal: ${String(e?.message || e)}`, adminMenu());
+        const commandOutput = [e?.stdout, e?.stderr, e?.message]
+          .map((value) => Buffer.isBuffer(value) ? value.toString('utf8') : String(value || ''))
+          .map((value) => value.trim())
+          .filter(Boolean);
+        const detail = Array.from(new Set(commandOutput)).join('\n').slice(-3000);
+        return ctx.reply(`Auto-setup domain gagal:\n${detail || String(e)}`, adminMenu());
       }
       await addApiDomain(domain, ctx.from.id);
       userState.delete(ctx.chat.id);

@@ -181,7 +181,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.39}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.40}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -11863,6 +11863,7 @@ const LEGACY_STATE_FILE = '/etc/sc-1forcr-license';
 const LOCK_FILE = '/etc/sc-1forcr-access.lock';
 const GUARD_STATE_FILE = String(env.LICENSE_GUARD_STATE_FILE || '/var/lib/sc-1forcr/license-guard-state.json').trim();
 const MACHINE_ID_FILE = String(env.LICENSE_MACHINE_ID_FILE || '/etc/machine-id').trim();
+const SC_ENV_FILE = String(env.SC_ENV_FILE || '/etc/sc-1forcr.env').trim();
 const API_URLS = Array.from(new Set(
   `${String(env.LICENSE_API_URLS || '')},${String(env.LICENSE_API_URL || '')}`
     .split(/[\s,]+/)
@@ -11906,6 +11907,77 @@ function atomicWrite(file, content, mode = 0o600) {
   } finally {
     try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch (_) {}
   }
+}
+
+function normalizeSignedEndpointUrls(values, expectedPath) {
+  const output = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    try {
+      const target = new URL(String(value || '').trim());
+      if (!['http:', 'https:'].includes(target.protocol)) continue;
+      if (target.username || target.password || !target.hostname) continue;
+      if (target.pathname !== expectedPath || target.search || target.hash) continue;
+      const normalized = `${target.origin}${expectedPath}`;
+      if (!output.includes(normalized)) output.push(normalized);
+    } catch (_) {}
+  }
+  return output.slice(0, 20);
+}
+
+function updateEnvFileValues(file, values) {
+  const entries = new Map(Object.entries(values || {})
+    .filter(([key, value]) => /^[A-Z][A-Z0-9_]*$/.test(key) && String(value || '').trim())
+    .map(([key, value]) => [key, String(value).replace(/[\r\n]/g, '').trim()]));
+  if (!entries.size) return false;
+  let source = '';
+  let mode = 0o600;
+  try {
+    source = String(fs.readFileSync(file, 'utf8') || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    mode = fs.statSync(file).mode & 0o777;
+  } catch (_) {}
+  const output = [];
+  const written = new Set();
+  for (const line of source.split('\n')) {
+    const match = line.match(/^([A-Z][A-Z0-9_]*)=/);
+    const key = match?.[1] || '';
+    if (!entries.has(key)) {
+      output.push(line);
+      continue;
+    }
+    if (!written.has(key)) {
+      output.push(`${key}=${entries.get(key)}`);
+      written.add(key);
+    }
+  }
+  for (const [key, value] of entries) {
+    if (!written.has(key)) output.push(`${key}=${value}`);
+  }
+  while (output.length > 0 && output[output.length - 1] === '') output.pop();
+  const nextContent = `${output.join('\n')}\n`;
+  const currentContent = source.replace(/\n*$/, '\n');
+  if (nextContent === currentContent) return false;
+  atomicWrite(file, nextContent, mode || 0o600);
+  return true;
+}
+
+function persistSignedEndpointConfig(payload) {
+  const licenseUrls = normalizeSignedEndpointUrls(payload?.license_api_urls, '/sc1forcr/license/activate');
+  if (!licenseUrls.length) return false;
+  const updateUrls = normalizeSignedEndpointUrls(payload?.update_script_urls, '/sc1forcr/payload/scripts/setup-autoscript-compat.sh');
+  const summaryUrls = normalizeSignedEndpointUrls(payload?.summary_api_urls, '/sc1forcr/payload/scripts/setup-summary-api.sh');
+  const values = {
+    LICENSE_API_URL: licenseUrls[0],
+    LICENSE_API_URLS: licenseUrls.join(',')
+  };
+  if (updateUrls.length) {
+    values.UPDATE_SCRIPT_URL = updateUrls[0];
+    values.UPDATE_SCRIPT_URLS = updateUrls.join(',');
+  }
+  if (summaryUrls.length) {
+    values.SUMMARY_API_SETUP_URL = summaryUrls[0];
+    values.SUMMARY_API_SETUP_URLS = summaryUrls.join(',');
+  }
+  return updateEnvFileValues(SC_ENV_FILE, values);
 }
 
 function loadPublicKey() {
@@ -12102,8 +12174,12 @@ async function refreshLease({ force = false } = {}) {
       const inspected = inspectSignedToken(token, 'sc1forcr-runtime');
       if (!inspected.signatureValid) throw new Error(inspected.reason || 'signed-lease-invalid');
       atomicWrite(LEASE_FILE, `${token}\n`, 0o600);
+      let endpointsUpdated = false;
+      if (inspected.allowed) {
+        try { endpointsUpdated = persistSignedEndpointConfig(inspected.payload); } catch (_) {}
+      }
       writeLegacyState(inspected, body);
-      return { ...inspected, refreshed: true, httpStatus: response.statusCode, endpoint: apiUrl };
+      return { ...inspected, refreshed: true, endpointsUpdated, httpStatus: response.statusCode, endpoint: apiUrl };
     } catch (error) {
       lastError = error;
     }
@@ -12234,7 +12310,7 @@ async function main() {
   process.exit(result.allowed ? 0 : 1);
 }
 
-module.exports = { checkLocalLease, inspectSignedToken, verifyUpdateFile };
+module.exports = { checkLocalLease, inspectSignedToken, verifyUpdateFile, persistSignedEndpointConfig };
 
 if (require.main === module) {
   main().catch((error) => {
@@ -12300,7 +12376,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/sc-1forcr-license-guard refresh-enforce
+ExecStart=/usr/local/sbin/sc-1forcr-license-guard refresh-enforce --force
 TimeoutStartSec=45
 Nice=5
 NoNewPrivileges=true

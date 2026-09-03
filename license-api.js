@@ -170,7 +170,8 @@ function createSignedLicenseLease({
   serverKey = '',
   status = '',
   reason = '',
-  scriptVersion = ''
+  scriptVersion = '',
+  endpointConfig = null
 } = {}) {
   const now = Math.floor(Date.now() / 1000);
   const regActive = registrationIsActive(reg, now * 1000);
@@ -188,6 +189,11 @@ function createSignedLicenseLease({
   const refreshAfter = active
     ? Math.min(leaseUntil, now + Math.max(60, Math.floor(LICENSE_LEASE_TTL_SECONDS / 2)))
     : now;
+  const signedEndpoints = active && endpointConfig ? {
+    license_api_urls: Array.isArray(endpointConfig.licenseApiUrls) ? endpointConfig.licenseApiUrls.slice(0, 20) : [],
+    update_script_urls: Array.isArray(endpointConfig.updateScriptUrls) ? endpointConfig.updateScriptUrls.slice(0, 20) : [],
+    summary_api_urls: Array.isArray(endpointConfig.summaryApiUrls) ? endpointConfig.summaryApiUrls.slice(0, 20) : []
+  } : {};
   const payload = {
     v: 1,
     iss: 'sc1forcr-license-api',
@@ -204,7 +210,8 @@ function createSignedLicenseLease({
     lease_until: leaseUntil,
     grace_until: graceUntil,
     registration_expires_at: registrationExpiresAt,
-    script_version: String(scriptVersion || '').trim().slice(0, 80)
+    script_version: String(scriptVersion || '').trim().slice(0, 80),
+    ...signedEndpoints
   };
   return {
     payload,
@@ -461,12 +468,12 @@ function personalizeScInstaller(input, reg, serverKey, runtimeConfig = null) {
   const injected = [
     distributionId ? `# SC_DISTRIBUTION_ID=${distributionId}` : '',
     '# SC_ENDPOINT_FALLBACKS=1',
-    licenseApiUrls.length ? `: "\${LICENSE_API_URLS:=${licenseApiUrls.join(',')}}"` : '',
-    updateScriptUrls.length ? `: "\${UPDATE_SCRIPT_URLS:=${updateScriptUrls.join(',')}}"` : '',
-    summaryApiUrls.length ? `: "\${SUMMARY_API_SETUP_URLS:=${summaryApiUrls.join(',')}}"` : '',
-    licenseApiUrls[0] ? `: "\${LICENSE_API_URL:=${licenseApiUrls[0]}}"` : '',
-    updateScriptUrls[0] ? `: "\${UPDATE_SCRIPT_URL:=${updateScriptUrls[0]}}"` : '',
-    summaryApiUrls[0] ? `: "\${SUMMARY_API_SETUP_URL:=${summaryApiUrls[0]}}"` : '',
+    licenseApiUrls.length ? `LICENSE_API_URLS="${licenseApiUrls.join(',')}"` : '',
+    updateScriptUrls.length ? `UPDATE_SCRIPT_URLS="${updateScriptUrls.join(',')}"` : '',
+    summaryApiUrls.length ? `SUMMARY_API_SETUP_URLS="${summaryApiUrls.join(',')}"` : '',
+    licenseApiUrls[0] ? `LICENSE_API_URL="${licenseApiUrls[0]}"` : '',
+    updateScriptUrls[0] ? `UPDATE_SCRIPT_URL="${updateScriptUrls[0]}"` : '',
+    summaryApiUrls[0] ? `SUMMARY_API_SETUP_URL="${summaryApiUrls[0]}"` : '',
     'export LICENSE_API_URLS UPDATE_SCRIPT_URLS SUMMARY_API_SETUP_URLS LICENSE_API_URL UPDATE_SCRIPT_URL SUMMARY_API_SETUP_URL'
   ].filter(Boolean).join('\n');
   if (content.includes('# SC_ENDPOINT_FALLBACKS=1')) return content;
@@ -1357,6 +1364,7 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
       reg.vps_ip
     ]).catch(() => {});
 
+    const runtimeConfig = await getRuntimeEndpointConfig(req);
     return res.json(attachSignedLease({
       ok: true,
       allowed: true,
@@ -1367,6 +1375,9 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
       bound_ip: reg.vps_ip,
       user_id: reg.user_id,
       expires_at: Number(reg.expires_at || 0) || null,
+      license_api_urls: runtimeConfig.licenseApiUrls,
+      update_script_urls: runtimeConfig.updateScriptUrls,
+      summary_api_urls: runtimeConfig.summaryApiUrls,
       ...(req.scLicenseAuth === 'legacy-bearer'
         ? { sc_update_key: serverKey, key_migrated: true, key_rotated: legacyKeyRotated }
         : {})
@@ -1377,7 +1388,8 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
       serverKey,
       status: 'active',
       reason: machineBinding.reason,
-      scriptVersion
+      scriptVersion,
+      endpointConfig: runtimeConfig
     }));
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });

@@ -58,6 +58,10 @@ function assertExit(result, expected, label) {
 }
 
 function main() {
+  const guardSource = extractGuardSource();
+  assert(guardSource.includes('persistSignedEndpointConfig(inspected.payload)'));
+  assert(guardSource.includes("'/sc1forcr/license/activate'"));
+  assert(guardSource.includes('SC_ENV_FILE'));
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-license-test-'));
   try {
     const guardPath = path.join(tmp, 'license-guard.js');
@@ -67,7 +71,31 @@ function main() {
     const statePath = path.join(tmp, 'state.json');
     const machineIdPath = path.join(tmp, 'machine-id');
     const updatePath = path.join(tmp, 'update.sh');
-    fs.writeFileSync(guardPath, extractGuardSource(), { mode: 0o700 });
+    const endpointEnvPath = path.join(tmp, 'sc-1forcr.env');
+    fs.writeFileSync(guardPath, guardSource, { mode: 0o700 });
+
+    fs.writeFileSync(endpointEnvPath, 'KEEP_SETTING=1\nLICENSE_API_URL=https://old.example/sc1forcr/license/activate\n');
+    const previousScEnvFile = process.env.SC_ENV_FILE;
+    process.env.SC_ENV_FILE = endpointEnvPath;
+    delete require.cache[require.resolve(guardPath)];
+    const guardModule = require(guardPath);
+    assert.strictEqual(guardModule.persistSignedEndpointConfig({
+      license_api_urls: [
+        'https://api-a.example/sc1forcr/license/activate',
+        'https://api-b.example/sc1forcr/license/activate',
+        'https://evil.example/not-license'
+      ],
+      update_script_urls: ['https://api-a.example/sc1forcr/payload/scripts/setup-autoscript-compat.sh'],
+      summary_api_urls: ['https://api-a.example/sc1forcr/payload/scripts/setup-summary-api.sh']
+    }), true);
+    const endpointEnv = fs.readFileSync(endpointEnvPath, 'utf8');
+    assert(endpointEnv.includes('KEEP_SETTING=1'));
+    assert(endpointEnv.includes('LICENSE_API_URLS=https://api-a.example/sc1forcr/license/activate,https://api-b.example/sc1forcr/license/activate'));
+    assert(endpointEnv.includes('UPDATE_SCRIPT_URL=https://api-a.example/sc1forcr/payload/scripts/setup-autoscript-compat.sh'));
+    assert(endpointEnv.includes('SUMMARY_API_SETUP_URL=https://api-a.example/sc1forcr/payload/scripts/setup-summary-api.sh'));
+    assert(!endpointEnv.includes('evil.example'));
+    if (previousScEnvFile === undefined) delete process.env.SC_ENV_FILE;
+    else process.env.SC_ENV_FILE = previousScEnvFile;
 
     const pair = crypto.generateKeyPairSync('ed25519');
     const publicPem = pair.publicKey.export({ type: 'spki', format: 'pem' });

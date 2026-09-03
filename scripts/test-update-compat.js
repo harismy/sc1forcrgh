@@ -9,6 +9,8 @@ const repoRoot = path.resolve(__dirname, '..');
 const installer = fs
   .readFileSync(path.join(repoRoot, 'scripts', 'setup-autoscript-compat.sh'), 'utf8')
   .replace(/\r\n/g, '\n');
+const licenseApi = fs.readFileSync(path.join(repoRoot, 'license-api.js'), 'utf8');
+const botApp = fs.readFileSync(path.join(repoRoot, 'app3.js'), 'utf8');
 
 function extract(startMarker, endMarker, offset = 0) {
   const start = installer.indexOf(startMarker, offset);
@@ -40,8 +42,25 @@ const updateManager = extract(
 const updateSyntax = spawnSync(bash, ['-n'], { input: updateManager, encoding: 'utf8' });
 assert.strictEqual(updateSyntax.status, 0, `generated update manager syntax failed:\n${updateSyntax.stderr || updateSyntax.stdout}`);
 
+const godUpdater = extract(
+  'cat > "${god_script_tmp}" <<\'EOF\'\n',
+  '\nEOF\n  if ! bash -n "${god_script_tmp}"; then'
+).body;
+const godSyntax = spawnSync(bash, ['-n'], { input: godUpdater, encoding: 'utf8' });
+assert.strictEqual(godSyntax.status, 0, `generated God Mode updater syntax failed:\n${godSyntax.stderr || godSyntax.stdout}`);
+assert(godUpdater.includes('/sc1forcr/god-update/check'));
+assert(godUpdater.includes('/sc1forcr/god-update/ack'));
+assert(!godUpdater.includes('AUTO_PULL_UPDATE_ENABLE'));
+assert(licenseApi.includes("app.post('/sc1forcr/god-update/check', requireKeyedUpdateClient"));
+assert(licenseApi.includes("app.post('/sc1forcr/god-update/ack', requireKeyedUpdateClient"));
+assert(licenseApi.includes('script_urls: needsScript ? runtimeConfig.updateScriptUrls : []'));
+assert(licenseApi.includes('licenseApiUrls: baseUrls.map'));
+assert(botApp.includes("const SC_IP_CHANGE_MAX = 5;"));
+assert(botApp.includes("Markup.button.callback('⚡ GOD MODE UPDATE WAJIB', 'm_admin_god_update')"));
+assert(botApp.includes("setInterval(() => {\n    processGodUpdateCampaigns()"));
+
 const acceptedTimerState = '[[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]';
-assert.strictEqual((updateManager.split(acceptedTimerState).length - 1), 2);
+assert.strictEqual((updateManager.split(acceptedTimerState).length - 1), 3);
 
 assert(installer.includes('-DCMAKE_POLICY_VERSION_MINIMUM=3.5'));
 assert.strictEqual((installer.match(/certificate_dns_host_valid "\$\{alias_host\}"/g) || []).length, 4);

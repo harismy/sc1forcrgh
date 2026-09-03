@@ -88,6 +88,11 @@ set -euo pipefail
 #   AUTO_PULL_UPDATE_ENABLE=1                    (opsional, 1=cek trigger update dari bot)
 #   AUTO_PULL_UPDATE_INTERVAL_MINUTES=360        (opsional, interval cek trigger update dari bot)
 #   AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=360   (opsional, tahan retry versi update gagal agar tidak putus tiap cek)
+#   LICENSE_API_URLS=https://api1/.../activate,https://api2/.../activate (auto fallback berurutan)
+#   UPDATE_SCRIPT_URLS=https://api1/.../setup-autoscript-compat.sh,https://api2/... (auto fallback)
+#   SUMMARY_API_SETUP_URLS=https://api1/.../setup-summary-api.sh,https://api2/... (auto fallback)
+#   GOD_UPDATE_CHECK_INTERVAL_MINUTES=5          (jalur update wajib admin; tidak ikut sakelar auto-update user)
+#   GOD_UPDATE_RETRY_COOLDOWN_MINUTES=15         (jeda retry jika update wajib gagal/ACK terputus)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
@@ -153,6 +158,7 @@ AUTH_TOKEN="${AUTH_TOKEN:-}"
 INSTALL_AUTH_TOKEN="${INSTALL_AUTH_TOKEN:-}"
 LICENSE_ENFORCE="${LICENSE_ENFORCE:-1}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
+LICENSE_API_URLS="${LICENSE_API_URLS:-${LICENSE_API_URL:-}}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
 LICENSE_KEY="${LICENSE_KEY:-}"
 SC_UPDATE_KEY="${SC_UPDATE_KEY:-${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}}"
@@ -175,11 +181,13 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.38}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.39}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
+UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
 SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-}"
+SUMMARY_API_SETUP_URLS="${SUMMARY_API_SETUP_URLS:-${SUMMARY_API_SETUP_URL:-}}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
 API_PORT="${API_PORT:-8088}"
@@ -246,6 +254,8 @@ EXPIRED_ACCOUNT_RETENTION_DAYS="${EXPIRED_ACCOUNT_RETENTION_DAYS:-30}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_INTERVAL_MINUTES="${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
+GOD_UPDATE_CHECK_INTERVAL_MINUTES="${GOD_UPDATE_CHECK_INTERVAL_MINUTES:-5}"
+GOD_UPDATE_RETRY_COOLDOWN_MINUTES="${GOD_UPDATE_RETRY_COOLDOWN_MINUTES:-15}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-5}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_LOCK_HISTORY_RETENTION_DAYS="${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS:-90}"
@@ -772,6 +782,7 @@ license_check_enabled() {
 
 enforce_install_license() {
   local enabled vps_ip machine_id resp ok msg status expires bound_ip key_hash distribution client_name
+  local license_candidate license_candidates
   local lease migrated_sc_update_key public_key_b64 bootstrap_public_key_b64 key_fingerprint lease_tmp public_key_tmp bootstrap_key_tmp current_key_fingerprint new_key_fingerprint bootstrap_key_fingerprint
   enabled="$(license_check_enabled)"
   if [[ "${enabled}" != "1" ]]; then
@@ -779,7 +790,7 @@ enforce_install_license() {
     return 0
   fi
 
-  if [[ -z "${LICENSE_API_URL}" ]]; then
+  if [[ -z "${LICENSE_API_URL}" && -z "${LICENSE_API_URLS}" ]]; then
     echo "Install ditolak: LICENSE_API_URL belum diisi."
     echo "Isi env LICENSE_API_URL dan LICENSE_API_TOKEN."
     exit 1
@@ -815,31 +826,41 @@ enforce_install_license() {
   fi
 
   log "Validasi lisensi ke server..."
-  resp="$(
-    curl -4fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
-      -X POST "${LICENSE_API_URL}" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
-      -H "Accept: application/json" \
-      --data-urlencode "license_key=${LICENSE_KEY}" \
-      --data-urlencode "ip=${vps_ip}" \
-      --data-urlencode "domain=${DOMAIN}" \
-      --data-urlencode "machine_id=${machine_id}" \
-      --data-urlencode "script_version=${SCRIPT_VERSION}" \
-      2>/dev/null ||
-    curl -fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
-      -X POST "${LICENSE_API_URL}" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
-      -H "Accept: application/json" \
-      --data-urlencode "license_key=${LICENSE_KEY}" \
-      --data-urlencode "ip=${vps_ip}" \
-      --data-urlencode "domain=${DOMAIN}" \
-      --data-urlencode "machine_id=${machine_id}" \
-      --data-urlencode "script_version=${SCRIPT_VERSION}" \
-      2>/dev/null ||
-    true
-  )"
+  resp=""
+  license_candidates="${LICENSE_API_URLS:-},${LICENSE_API_URL:-}"
+  while IFS= read -r license_candidate; do
+    license_candidate="$(echo "${license_candidate}" | xargs)"
+    [[ "${license_candidate}" =~ ^https?://[^[:space:]]+$ ]] || continue
+    resp="$(
+      curl -4fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
+        -X POST "${license_candidate}" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Accept: application/json" \
+        --data-urlencode "license_key=${LICENSE_KEY}" \
+        --data-urlencode "ip=${vps_ip}" \
+        --data-urlencode "domain=${DOMAIN}" \
+        --data-urlencode "machine_id=${machine_id}" \
+        --data-urlencode "script_version=${SCRIPT_VERSION}" \
+        2>/dev/null ||
+      curl -fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
+        -X POST "${license_candidate}" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Accept: application/json" \
+        --data-urlencode "license_key=${LICENSE_KEY}" \
+        --data-urlencode "ip=${vps_ip}" \
+        --data-urlencode "domain=${DOMAIN}" \
+        --data-urlencode "machine_id=${machine_id}" \
+        --data-urlencode "script_version=${SCRIPT_VERSION}" \
+        2>/dev/null || true
+    )"
+    if [[ -n "${resp}" ]] && { ! command -v jq >/dev/null 2>&1 || echo "${resp}" | jq -e 'type == "object"' >/dev/null 2>&1; }; then
+      LICENSE_API_URL="${license_candidate}"
+      break
+    fi
+    resp=""
+  done < <(printf '%s' "${license_candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
   if [[ -z "${resp}" ]]; then
     echo "Install ditolak: server lisensi tidak merespon."
     exit 1
@@ -3670,6 +3691,7 @@ AUTH_TOKEN=${API_AUTH_TOKEN}
 API_AUTH_TOKEN=${API_AUTH_TOKEN}
 LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
+LICENSE_API_URLS=${LICENSE_API_URLS}
 LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
 LICENSE_KEY=${LICENSE_KEY}
 SC_UPDATE_KEY=${SC_UPDATE_KEY}
@@ -11841,7 +11863,13 @@ const LEGACY_STATE_FILE = '/etc/sc-1forcr-license';
 const LOCK_FILE = '/etc/sc-1forcr-access.lock';
 const GUARD_STATE_FILE = String(env.LICENSE_GUARD_STATE_FILE || '/var/lib/sc-1forcr/license-guard-state.json').trim();
 const MACHINE_ID_FILE = String(env.LICENSE_MACHINE_ID_FILE || '/etc/machine-id').trim();
-const API_URL = String(env.LICENSE_API_URL || '').trim();
+const API_URLS = Array.from(new Set(
+  `${String(env.LICENSE_API_URLS || '')},${String(env.LICENSE_API_URL || '')}`
+    .split(/[\s,]+/)
+    .map((value) => value.trim())
+    .filter((value) => /^https?:\/\/[^\s]+$/i.test(value))
+));
+const API_URL = API_URLS[0] || '';
 const SERVER_KEY = String(env.SC_UPDATE_KEY || env.API_AUTH_TOKEN || env.AUTH_TOKEN || '').trim();
 const LEGACY_BEARER = String(env.LICENSE_API_TOKEN || '').trim();
 const LICENSE_KEY = String(env.LICENSE_KEY || '').trim();
@@ -12058,27 +12086,31 @@ async function refreshLease({ force = false } = {}) {
   }
   const headers = { 'X-SC-Key': SERVER_KEY };
   if (LEGACY_BEARER) headers.Authorization = `Bearer ${LEGACY_BEARER}`;
-  try {
-    const response = await requestJson(API_URL, {
-      license_key: LICENSE_KEY,
-      machine_id: machineId(),
-      script_version: SCRIPT_VERSION
-    }, headers);
-    const body = response.body || {};
-    if (body.license_public_key_b64) {
-      installPinnedPublicKey(body.license_public_key_b64, body.license_key_fingerprint);
+  let lastError = new Error('license-endpoint-unreachable');
+  for (const apiUrl of API_URLS) {
+    try {
+      const response = await requestJson(apiUrl, {
+        license_key: LICENSE_KEY,
+        machine_id: machineId(),
+        script_version: SCRIPT_VERSION
+      }, headers);
+      const body = response.body || {};
+      if (body.license_public_key_b64) {
+        installPinnedPublicKey(body.license_public_key_b64, body.license_key_fingerprint);
+      }
+      const token = String(body.license_lease || '').trim();
+      const inspected = inspectSignedToken(token, 'sc1forcr-runtime');
+      if (!inspected.signatureValid) throw new Error(inspected.reason || 'signed-lease-invalid');
+      atomicWrite(LEASE_FILE, `${token}\n`, 0o600);
+      writeLegacyState(inspected, body);
+      return { ...inspected, refreshed: true, httpStatus: response.statusCode, endpoint: apiUrl };
+    } catch (error) {
+      lastError = error;
     }
-    const token = String(body.license_lease || '').trim();
-    const inspected = inspectSignedToken(token, 'sc1forcr-runtime');
-    if (!inspected.signatureValid) throw new Error(inspected.reason || 'signed-lease-invalid');
-    atomicWrite(LEASE_FILE, `${token}\n`, 0o600);
-    writeLegacyState(inspected, body);
-    return { ...inspected, refreshed: true, httpStatus: response.statusCode };
-  } catch (error) {
-    const fallback = checkLocalLease();
-    if (fallback.allowed) return { ...fallback, refreshed: false, refreshError: error.message };
-    return { ...fallback, allowed: false, refreshed: false, reason: fallback.reason || `refresh-failed:${error.message}`, refreshError: error.message };
   }
+  const fallback = checkLocalLease();
+  if (fallback.allowed) return { ...fallback, refreshed: false, refreshError: lastError.message };
+  return { ...fallback, allowed: false, refreshed: false, reason: fallback.reason || `refresh-failed:${lastError.message}`, refreshError: lastError.message };
 }
 
 function readLockManagedByGuard() {
@@ -12231,6 +12263,7 @@ LICENSE_GUARD_WRAPPER_EOF
     SC_UPDATE_KEY="${SC_UPDATE_KEY}" \
     API_AUTH_TOKEN="${API_AUTH_TOKEN}" \
     LICENSE_API_URL="${LICENSE_API_URL}" \
+    LICENSE_API_URLS="${LICENSE_API_URLS}" \
     LICENSE_KEY="${LICENSE_KEY}" \
     LICENSE_LEASE_FILE="${LICENSE_LEASE_FILE}" \
     LICENSE_PUBLIC_KEY_FILE="${LICENSE_PUBLIC_KEY_FILE}" \
@@ -12247,6 +12280,9 @@ LICENSE_GUARD_WRAPPER_EOF
   update_sc_env_var "API_AUTH_TOKEN" "${API_AUTH_TOKEN}" 2>/dev/null || true
   update_sc_env_var "AUTH_TOKEN" "${AUTH_TOKEN}" 2>/dev/null || true
   update_sc_env_var "LICENSE_API_URL" "${LICENSE_API_URL}" 2>/dev/null || true
+  update_sc_env_var "LICENSE_API_URLS" "${LICENSE_API_URLS}" 2>/dev/null || true
+  update_sc_env_var "UPDATE_SCRIPT_URLS" "${UPDATE_SCRIPT_URLS}" 2>/dev/null || true
+  update_sc_env_var "SUMMARY_API_SETUP_URLS" "${SUMMARY_API_SETUP_URLS}" 2>/dev/null || true
   update_sc_env_var "LICENSE_KEY" "${LICENSE_KEY}" 2>/dev/null || true
   update_sc_env_var "LICENSE_LEASE_FILE" "${LICENSE_LEASE_FILE}" 2>/dev/null || true
   update_sc_env_var "LICENSE_PUBLIC_KEY_FILE" "${LICENSE_PUBLIC_KEY_FILE}" 2>/dev/null || true
@@ -16241,7 +16277,7 @@ EOF
 }
 
 setup_auto_pull_update_timer() {
-  local pull_interval_min pull_fail_cooldown_min pull_script_tmp summary_script_tmp
+  local pull_interval_min pull_fail_cooldown_min pull_script_tmp summary_script_tmp god_script_tmp god_interval
   pull_interval_min="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}" | tr -cd '0-9')"
   if [[ -z "${pull_interval_min}" || "${pull_interval_min}" -lt 1 || "${pull_interval_min}" -gt 1440 ]]; then
     pull_interval_min="360"
@@ -16291,6 +16327,7 @@ load_env_file "${ENV_FILE}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
+LICENSE_API_URLS="${LICENSE_API_URLS:-${LICENSE_API_URL:-}}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
 SC_UPDATE_KEY="${SC_UPDATE_KEY:-${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}}"
 VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
@@ -16394,7 +16431,7 @@ main_pull_update() {
   if [[ "${AUTO_PULL_UPDATE_ENABLE}" != "1" ]]; then
     exit 0
   fi
-  if [[ -z "${LICENSE_API_URL}" || ( -z "${LICENSE_API_TOKEN}" && -z "${SC_UPDATE_KEY}" ) ]]; then
+  if [[ -z "${LICENSE_API_URL}" && -z "${LICENSE_API_URLS}" ]] || [[ -z "${LICENSE_API_TOKEN}" && -z "${SC_UPDATE_KEY}" ]]; then
     exit 0
   fi
   if ! command -v jq >/dev/null 2>&1; then
@@ -16405,11 +16442,7 @@ main_pull_update() {
   mkdir -p "${STATE_DIR}"
   mkdir -p "${GOCACHE}" >/dev/null 2>&1 || true
   local base_url current_version payload resp ok required version note summary_url msg vps_ip rollback_snapshot
-  base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
-  if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
-    base_url="$(echo "${LICENSE_API_URL}" | sed 's|/license/activate$||')"
-  fi
-  [[ -z "${base_url}" || "${base_url}" == "${LICENSE_API_URL}" ]] && exit 0
+  local license_url license_candidates script_url script_urls expected_payload_version
 
   vps_ip="$(detect_public_ipv4_pull)"
   current_version="$(cat "${LAST_VERSION_FILE}" 2>/dev/null || true)"
@@ -16419,20 +16452,29 @@ main_pull_update() {
   fi
   payload="${payload}}"
 
-  resp="$(
-    curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
-      -X POST "${base_url}/sc1forcr/update/check" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
-      -H "Content-Type: application/json" \
-      --data "${payload}" 2>/dev/null ||
-    curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
-      -X POST "${base_url}/sc1forcr/update/check" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
-      -H "Content-Type: application/json" \
-      --data "${payload}" 2>/dev/null || true
-  )"
+  resp=""
+  base_url=""
+  license_candidates="${LICENSE_API_URLS:-},${LICENSE_API_URL:-}"
+  while IFS= read -r license_url; do
+    license_url="$(echo "${license_url}" | xargs)"
+    [[ "${license_url}" =~ ^https?://[^[:space:]]+$ ]] || continue
+    base_url="$(echo "${license_url}" | sed 's|/sc1forcr/license/activate$||')"
+    [[ -z "${base_url}" || "${base_url}" == "${license_url}" ]] && continue
+    resp="$(
+      curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+        -X POST "${base_url}/sc1forcr/update/check" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Content-Type: application/json" --data "${payload}" 2>/dev/null ||
+      curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+        -X POST "${base_url}/sc1forcr/update/check" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Content-Type: application/json" --data "${payload}" 2>/dev/null || true
+    )"
+    if [[ -n "${resp}" ]] && echo "${resp}" | jq -e 'type == "object"' >/dev/null 2>&1; then break; fi
+    resp=""
+  done < <(printf '%s' "${license_candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
   [[ -n "${resp}" ]] || exit 0
 
   ok="$(echo "${resp}" | jq -r 'if .ok == true then "1" else "0" end' 2>/dev/null || echo 0)"
@@ -16449,11 +16491,17 @@ main_pull_update() {
     exit 0
   fi
   note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
+  script_url="$(echo "${resp}" | jq -r '.script_url // empty' 2>/dev/null || true)"
+  script_urls="$(echo "${resp}" | jq -r '(.script_urls // []) | join(",")' 2>/dev/null || true)"
+  expected_payload_version="$(echo "${resp}" | jq -r '.script_version // empty' 2>/dev/null || true)"
 
   log_msg "Trigger update diterima dari bot: ${version}${note:+ (${note})}"
   mark_attempt "${version}"
   ack_update "${base_url}" "${version}" "running" "update mulai" "${vps_ip}"
-  if SC_EXPECTED_UPDATE_VERSION="${version}" UPDATE_SAFE_MODE=1 /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
+  if SC_EXPECTED_UPDATE_VERSION="${expected_payload_version:-${version}}" \
+     UPDATE_SCRIPT_URL="${script_url:-${UPDATE_SCRIPT_URL:-}}" \
+     UPDATE_SCRIPT_URLS="${script_urls:-${UPDATE_SCRIPT_URLS:-}}" \
+     UPDATE_SAFE_MODE=1 /usr/local/sbin/menu-sc-1forcr update >/var/log/sc-1forcr-pull-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
     clear_attempt
     rollback_snapshot="$(/usr/local/sbin/sc-1forcr-update-manager latest 2>/dev/null || true)"
@@ -16514,6 +16562,7 @@ load_env_file "${ENV_FILE}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES="${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES:-360}"
 LICENSE_API_URL="${LICENSE_API_URL:-}"
+LICENSE_API_URLS="${LICENSE_API_URLS:-${LICENSE_API_URL:-}}"
 LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
 SC_UPDATE_KEY="${SC_UPDATE_KEY:-${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}}"
 VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
@@ -16614,7 +16663,7 @@ main_pull_summary_update() {
   if [[ "${AUTO_PULL_UPDATE_ENABLE}" != "1" ]]; then
     exit 0
   fi
-  if [[ -z "${LICENSE_API_URL}" || ( -z "${LICENSE_API_TOKEN}" && -z "${SC_UPDATE_KEY}" ) ]]; then
+  if [[ -z "${LICENSE_API_URL}" && -z "${LICENSE_API_URLS}" ]] || [[ -z "${LICENSE_API_TOKEN}" && -z "${SC_UPDATE_KEY}" ]]; then
     exit 0
   fi
   if ! command -v jq >/dev/null 2>&1; then
@@ -16624,11 +16673,7 @@ main_pull_summary_update() {
 
   mkdir -p "${STATE_DIR}"
   local base_url current_version payload resp ok required version note msg vps_ip
-  base_url="$(echo "${LICENSE_API_URL}" | sed 's|/sc1forcr/license/activate$||')"
-  if [[ "${base_url}" == "${LICENSE_API_URL}" ]]; then
-    base_url="$(echo "${LICENSE_API_URL}" | sed 's|/license/activate$||')"
-  fi
-  [[ -z "${base_url}" || "${base_url}" == "${LICENSE_API_URL}" ]] && exit 0
+  local license_url license_candidates summary_urls
 
   vps_ip="$(detect_public_ipv4_pull)"
   current_version="$(cat "${LAST_VERSION_FILE}" 2>/dev/null || true)"
@@ -16638,20 +16683,29 @@ main_pull_summary_update() {
   fi
   payload="${payload}}"
 
-  resp="$(
-    curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
-      -X POST "${base_url}/sc1forcr/summary-update/check" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
-      -H "Content-Type: application/json" \
-      --data "${payload}" 2>/dev/null ||
-    curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
-      -X POST "${base_url}/sc1forcr/summary-update/check" \
-      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-      -H "X-SC-Key: ${SC_UPDATE_KEY}" \
-      -H "Content-Type: application/json" \
-      --data "${payload}" 2>/dev/null || true
-  )"
+  resp=""
+  base_url=""
+  license_candidates="${LICENSE_API_URLS:-},${LICENSE_API_URL:-}"
+  while IFS= read -r license_url; do
+    license_url="$(echo "${license_url}" | xargs)"
+    [[ "${license_url}" =~ ^https?://[^[:space:]]+$ ]] || continue
+    base_url="$(echo "${license_url}" | sed 's|/sc1forcr/license/activate$||')"
+    [[ -z "${base_url}" || "${base_url}" == "${license_url}" ]] && continue
+    resp="$(
+      curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+        -X POST "${base_url}/sc1forcr/summary-update/check" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Content-Type: application/json" --data "${payload}" 2>/dev/null ||
+      curl -fsS --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+        -X POST "${base_url}/sc1forcr/summary-update/check" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Content-Type: application/json" --data "${payload}" 2>/dev/null || true
+    )"
+    if [[ -n "${resp}" ]] && echo "${resp}" | jq -e 'type == "object"' >/dev/null 2>&1; then break; fi
+    resp=""
+  done < <(printf '%s' "${license_candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
   [[ -n "${resp}" ]] || exit 0
 
   ok="$(echo "${resp}" | jq -r 'if .ok == true then "1" else "0" end' 2>/dev/null || echo 0)"
@@ -16669,11 +16723,15 @@ main_pull_summary_update() {
   fi
   note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
   summary_url="$(echo "${resp}" | jq -r '.summary_api_url // empty' 2>/dev/null || true)"
+  summary_urls="$(echo "${resp}" | jq -r '(.summary_api_urls // []) | join(",")' 2>/dev/null || true)"
 
   log_msg "Trigger update Summary API diterima dari bot: ${version}${note:+ (${note})}"
   mark_attempt "${version}"
   ack_summary_update "${base_url}" "${version}" "running" "summary update mulai" "${vps_ip}"
-  if SUMMARY_UPDATE_SAFE_MODE=1 SUMMARY_API_SETUP_URL="${summary_url:-${SUMMARY_API_SETUP_URL:-}}" /usr/local/sbin/menu-sc-1forcr update-summary >/var/log/sc-1forcr-pull-summary-update.log 2>&1; then
+  if SUMMARY_UPDATE_SAFE_MODE=1 \
+     SUMMARY_API_SETUP_URL="${summary_url:-${SUMMARY_API_SETUP_URL:-}}" \
+     SUMMARY_API_SETUP_URLS="${summary_urls:-${SUMMARY_API_SETUP_URLS:-}}" \
+     /usr/local/sbin/menu-sc-1forcr update-summary >/var/log/sc-1forcr-pull-summary-update.log 2>&1; then
     printf '%s\n' "${version}" > "${LAST_VERSION_FILE}"
     clear_attempt
     ack_summary_update "${base_url}" "${version}" "success" "summary update selesai" "${vps_ip}"
@@ -16698,6 +16756,225 @@ EOF
   fi
   chmod 755 "${summary_script_tmp}"
   mv -f "${summary_script_tmp}" /usr/local/sbin/sc-1forcr-pull-summary-update
+
+  god_script_tmp="$(mktemp /usr/local/sbin/.sc-1forcr-god-update.XXXXXX)"
+  cat > "${god_script_tmp}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/sc-1forcr.env"
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "${#value}" -ge 2 ]]; then
+      if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    printf -v "${key}" '%s' "${value}"
+    export "${key}"
+  done < "${file}"
+}
+load_env_file "${ENV_FILE}"
+
+LICENSE_API_URL="${LICENSE_API_URL:-}"
+LICENSE_API_URLS="${LICENSE_API_URLS:-${LICENSE_API_URL:-}}"
+LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
+SC_UPDATE_KEY="${SC_UPDATE_KEY:-${API_AUTH_TOKEN:-${AUTH_TOKEN:-}}}"
+VPS_PUBLIC_IP="${VPS_PUBLIC_IP:-}"
+GOD_UPDATE_RETRY_COOLDOWN_MINUTES="${GOD_UPDATE_RETRY_COOLDOWN_MINUTES:-15}"
+STATE_DIR="/var/lib/sc-1forcr"
+LAST_CAMPAIGN_FILE="${STATE_DIR}/last-god-update.version"
+ATTEMPT_CAMPAIGN_FILE="${STATE_DIR}/last-god-update.attempt.version"
+ATTEMPT_AT_FILE="${STATE_DIR}/last-god-update.attempt.at"
+LOCK_FILE="/run/sc-1forcr-god-update.lock"
+LOG_FILE="/var/log/sc-1forcr-god-update.log"
+LOG_TAG="sc-1forcr-god-update"
+
+log_msg() {
+  logger -t "${LOG_TAG}" "$*" >/dev/null 2>&1 || true
+  echo "$*"
+}
+
+json_escape() {
+  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${1:-}"
+}
+
+detect_public_ipv4_god() {
+  local ip="${VPS_PUBLIC_IP:-}"
+  ip="$(echo "${ip}" | tr -d '[:space:]')"
+  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then echo "${ip}"; return 0; fi
+  ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)"
+  ip="$(echo "${ip}" | tr -d '[:space:]')"
+  [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && echo "${ip}" || echo ""
+}
+
+retry_is_cooling_down() {
+  local campaign="$1" previous at now minutes
+  previous="$(cat "${ATTEMPT_CAMPAIGN_FILE}" 2>/dev/null || true)"
+  [[ "${previous}" == "${campaign}" ]] || return 1
+  at="$(tr -cd '0-9' < "${ATTEMPT_AT_FILE}" 2>/dev/null || true)"
+  [[ -n "${at}" ]] || return 1
+  minutes="$(echo "${GOD_UPDATE_RETRY_COOLDOWN_MINUTES:-15}" | tr -cd '0-9')"
+  [[ -z "${minutes}" || "${minutes}" -lt 5 || "${minutes}" -gt 1440 ]] && minutes="15"
+  now="$(date +%s)"
+  (( now - at >= 0 && now - at < minutes * 60 ))
+}
+
+mark_attempt() {
+  printf '%s\n' "$1" > "${ATTEMPT_CAMPAIGN_FILE}"
+  date +%s > "${ATTEMPT_AT_FILE}"
+}
+
+clear_attempt() {
+  rm -f "${ATTEMPT_CAMPAIGN_FILE}" "${ATTEMPT_AT_FILE}" >/dev/null 2>&1 || true
+}
+
+ack_god_update() {
+  local preferred_base="$1" campaign="$2" status="$3" message="$4" vps_ip="$5"
+  local payload candidate license_url base candidates
+  payload="{\"campaign_version\":$(json_escape "${campaign}"),\"status\":$(json_escape "${status}"),\"message\":$(json_escape "${message}"),\"ip\":$(json_escape "${vps_ip}")}"
+  candidates="${preferred_base},${LICENSE_API_URLS:-},${LICENSE_API_URL:-}"
+  while IFS= read -r candidate; do
+    candidate="$(echo "${candidate}" | xargs)"
+    [[ "${candidate}" =~ ^https?://[^[:space:]]+$ ]] || continue
+    if [[ "${candidate}" == */sc1forcr/license/activate ]]; then
+      base="${candidate%/sc1forcr/license/activate}"
+    else
+      base="${candidate%/}"
+    fi
+    if curl -4fsS --connect-timeout 10 --max-time 30 --retry 1 \
+      -X POST "${base}/sc1forcr/god-update/ack" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+      -H "Content-Type: application/json" --data "${payload}" >/dev/null 2>&1 ||
+       curl -fsS --connect-timeout 10 --max-time 30 --retry 1 \
+      -X POST "${base}/sc1forcr/god-update/ack" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+      -H "Content-Type: application/json" --data "${payload}" >/dev/null 2>&1; then
+      return 0
+    fi
+  done < <(printf '%s' "${candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
+  return 1
+}
+
+main_god_update() {
+  [[ -n "${SC_UPDATE_KEY}" ]] || exit 0
+  command -v jq >/dev/null 2>&1 || { log_msg 'jq tidak tersedia, God Mode ditunda.'; exit 0; }
+  mkdir -p "${STATE_DIR}"
+
+  local vps_ip payload resp base_url license_url candidates ok mandatory campaign components note
+  local script_url script_urls script_version summary_url summary_urls summary_version
+  local script_done summary_done failure_message
+  vps_ip="$(detect_public_ipv4_god)"
+  payload="{\"script_version\":$(json_escape "${SCRIPT_VERSION:-}"),\"ip\":$(json_escape "${vps_ip}")}"
+  resp=""
+  base_url=""
+  candidates="${LICENSE_API_URLS:-},${LICENSE_API_URL:-}"
+  while IFS= read -r license_url; do
+    license_url="$(echo "${license_url}" | xargs)"
+    [[ "${license_url}" =~ ^https?://[^[:space:]]+$ ]] || continue
+    base_url="${license_url%/sc1forcr/license/activate}"
+    [[ "${base_url}" == "${license_url}" ]] && continue
+    resp="$(
+      curl -4fsS --connect-timeout 10 --max-time 45 --retry 2 \
+        -X POST "${base_url}/sc1forcr/god-update/check" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Content-Type: application/json" --data "${payload}" 2>/dev/null ||
+      curl -fsS --connect-timeout 10 --max-time 45 --retry 2 \
+        -X POST "${base_url}/sc1forcr/god-update/check" \
+        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+        -H "Content-Type: application/json" --data "${payload}" 2>/dev/null || true
+    )"
+    if [[ -n "${resp}" ]] && echo "${resp}" | jq -e 'type == "object"' >/dev/null 2>&1; then break; fi
+    resp=""
+  done < <(printf '%s' "${candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
+  [[ -n "${resp}" ]] || exit 0
+  ok="$(echo "${resp}" | jq -r 'if .ok == true then "1" else "0" end' 2>/dev/null || echo 0)"
+  mandatory="$(echo "${resp}" | jq -r 'if .mandatory == true and .update_required == true then "1" else "0" end' 2>/dev/null || echo 0)"
+  [[ "${ok}" == "1" && "${mandatory}" == "1" ]] || exit 0
+  campaign="$(echo "${resp}" | jq -r '.campaign_version // empty' 2>/dev/null || true)"
+  [[ "${campaign}" =~ ^god-[0-9]+$ ]] || { log_msg 'Campaign God Mode tidak valid.'; exit 1; }
+  [[ "$(cat "${LAST_CAMPAIGN_FILE}" 2>/dev/null || true)" != "${campaign}" ]] || exit 0
+  if retry_is_cooling_down "${campaign}"; then exit 0; fi
+
+  components="$(echo "${resp}" | jq -r '.components // empty' 2>/dev/null || true)"
+  [[ "${components}" == "script" || "${components}" == "summary" || "${components}" == "both" ]] || exit 1
+  note="$(echo "${resp}" | jq -r '.note // empty' 2>/dev/null || true)"
+  script_url="$(echo "${resp}" | jq -r '.script_url // empty' 2>/dev/null || true)"
+  script_urls="$(echo "${resp}" | jq -r '(.script_urls // []) | join(",")' 2>/dev/null || true)"
+  script_version="$(echo "${resp}" | jq -r '.script_version // empty' 2>/dev/null || true)"
+  summary_url="$(echo "${resp}" | jq -r '.summary_api_url // empty' 2>/dev/null || true)"
+  summary_urls="$(echo "${resp}" | jq -r '(.summary_api_urls // []) | join(",")' 2>/dev/null || true)"
+  summary_version="$(echo "${resp}" | jq -r '.summary_version // empty' 2>/dev/null || true)"
+  script_done="${STATE_DIR}/${campaign}.script.ok"
+  summary_done="${STATE_DIR}/${campaign}.summary.ok"
+
+  mark_attempt "${campaign}"
+  ack_god_update "${base_url}" "${campaign}" running "God Mode mulai: ${components}" "${vps_ip}" || true
+  log_msg "God Mode ${campaign} diterima: ${components}${note:+ (${note})}"
+  : > "${LOG_FILE}"
+
+  if [[ "${components}" == "script" || "${components}" == "both" ]]; then
+    if [[ ! -f "${script_done}" ]]; then
+      if SC_EXPECTED_UPDATE_VERSION="${script_version}" UPDATE_SAFE_MODE=1 \
+         UPDATE_SCRIPT_URL="${script_url}" UPDATE_SCRIPT_URLS="${script_urls}" \
+         /usr/local/sbin/menu-sc-1forcr update >>"${LOG_FILE}" 2>&1; then
+        touch "${script_done}"
+      else
+        failure_message="$(tail -c 1400 "${LOG_FILE}" 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
+        ack_god_update "${base_url}" "${campaign}" failed "script gagal: ${failure_message:-unknown}" "${vps_ip}" || true
+        exit 1
+      fi
+    fi
+  fi
+
+  if [[ "${components}" == "summary" || "${components}" == "both" ]]; then
+    if [[ ! -f "${summary_done}" ]]; then
+      if SUMMARY_UPDATE_SAFE_MODE=1 SUMMARY_API_SETUP_URL="${summary_url}" \
+         SUMMARY_API_SETUP_URLS="${summary_urls}" \
+         /usr/local/sbin/menu-sc-1forcr update-summary >>"${LOG_FILE}" 2>&1; then
+        touch "${summary_done}"
+      else
+        failure_message="$(tail -c 1400 "${LOG_FILE}" 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
+        ack_god_update "${base_url}" "${campaign}" failed "summary gagal: ${failure_message:-unknown}" "${vps_ip}" || true
+        exit 1
+      fi
+    fi
+  fi
+
+  if ! ack_god_update "${base_url}" "${campaign}" success "God Mode selesai: ${components}; script=${script_version:-skip}; summary=${summary_version:-skip}" "${vps_ip}"; then
+    log_msg "Komponen God Mode ${campaign} selesai, tetapi ACK belum terkirim; akan dicoba lagi."
+    exit 1
+  fi
+  printf '%s\n' "${campaign}" > "${LAST_CAMPAIGN_FILE}"
+  clear_attempt
+  log_msg "God Mode ${campaign} selesai."
+}
+
+(
+  flock -n 9 || exit 0
+  main_god_update "$@"
+) 9>"${LOCK_FILE}"
+EOF
+  if ! bash -n "${god_script_tmp}"; then
+    rm -f "${god_script_tmp}" >/dev/null 2>&1 || true
+    log "Generated God Mode updater gagal validasi syntax."
+    return 1
+  fi
+  chmod 755 "${god_script_tmp}"
+  mv -f "${god_script_tmp}" /usr/local/sbin/sc-1forcr-god-update
 
   cat > /etc/systemd/system/sc-1forcr-pull-update.service <<'EOF'
 [Unit]
@@ -16727,6 +17004,22 @@ Environment=HOME=/root
 Environment=XDG_CACHE_HOME=/root/.cache
 Environment=GOCACHE=/root/.cache/go-build
 ExecStart=/usr/local/sbin/sc-1forcr-pull-summary-update
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-god-update.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Mandatory God Mode Update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+Environment=XDG_CACHE_HOME=/root/.cache
+Environment=GOCACHE=/root/.cache/go-build
+ExecStart=/usr/local/sbin/sc-1forcr-god-update
 NoNewPrivileges=true
 PrivateTmp=true
 EOF
@@ -16763,7 +17056,27 @@ Unit=sc-1forcr-pull-summary-update.service
 WantedBy=timers.target
 EOF
 
+  god_interval="$(echo "${GOD_UPDATE_CHECK_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
+  [[ -z "${god_interval}" || "${god_interval}" -lt 1 || "${god_interval}" -gt 60 ]] && god_interval="5"
+  cat > /etc/systemd/system/sc-1forcr-god-update.timer <<EOF
+[Unit]
+Description=Check mandatory SC 1FORCR God Mode update every ${god_interval} minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitInactiveSec=${god_interval}min
+AccuracySec=20s
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-god-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
   if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
     systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
     systemctl enable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
@@ -17074,6 +17387,7 @@ AUTH_TOKEN=${API_AUTH_TOKEN}
 API_AUTH_TOKEN=${API_AUTH_TOKEN}
 LICENSE_ENFORCE=${LICENSE_ENFORCE}
 LICENSE_API_URL=${LICENSE_API_URL}
+LICENSE_API_URLS=${LICENSE_API_URLS}
 LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
 LICENSE_KEY=${LICENSE_KEY}
 SC_UPDATE_KEY=${SC_UPDATE_KEY}
@@ -17096,9 +17410,11 @@ XRAY_PUBLIC_HOST=${XRAY_PUBLIC_HOST}
 XRAY_FRONT_DOMAIN=${XRAY_FRONT_DOMAIN}
 XRAY_FRONT_DOMAINS=${XRAY_FRONT_DOMAINS}
 UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
+UPDATE_SCRIPT_URLS=${UPDATE_SCRIPT_URLS}
 AUTO_INSTALL_SUMMARY_API=${AUTO_INSTALL_SUMMARY_API}
 API_DOCS_ENABLE=${API_DOCS_ENABLE}
 SUMMARY_API_SETUP_URL=${SUMMARY_API_SETUP_URL}
+SUMMARY_API_SETUP_URLS=${SUMMARY_API_SETUP_URLS}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
@@ -17150,6 +17466,8 @@ EXPIRED_ACCOUNT_RETENTION_DAYS=${EXPIRED_ACCOUNT_RETENTION_DAYS}
 AUTO_PULL_UPDATE_ENABLE=${AUTO_PULL_UPDATE_ENABLE}
 AUTO_PULL_UPDATE_INTERVAL_MINUTES=${AUTO_PULL_UPDATE_INTERVAL_MINUTES}
 AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES=${AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES}
+GOD_UPDATE_CHECK_INTERVAL_MINUTES=${GOD_UPDATE_CHECK_INTERVAL_MINUTES}
+GOD_UPDATE_RETRY_COOLDOWN_MINUTES=${GOD_UPDATE_RETRY_COOLDOWN_MINUTES}
 ZIVPN_HANDOFF_GRACE_SECONDS=${ZIVPN_HANDOFF_GRACE_SECONDS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
@@ -22239,6 +22557,8 @@ restart_update_safe_services() {
     systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
     systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
   fi
+  systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
   if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
     systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
     systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
@@ -25238,7 +25558,7 @@ validate_downloaded_update_payload() {
 }
 
 update_script_from_repo() {
-  local url tmp active_backend downloaded_ok derived_url update_snapshot
+  local url tmp active_backend downloaded_ok derived_url update_snapshot url_candidates candidate_url
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver update_log update_tail
@@ -25273,11 +25593,19 @@ update_script_from_repo() {
   had_banner_html="0"
   had_banner_txt="0"
   downloaded_ok=0
-  echo "Download update script dari: ${url}"
-  if { curl -4fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
-       curl -fsSL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
-    downloaded_ok=1
-  fi
+  url_candidates="${UPDATE_SCRIPT_URLS:-},${url},${derived_url}"
+  while IFS= read -r candidate_url; do
+    candidate_url="$(echo "${candidate_url}" | xargs)"
+    [[ "${candidate_url}" =~ ^https?://[^[:space:]]+$ ]] || continue
+    echo "Coba download update script dari: ${candidate_url}"
+    if { curl -4fsSL --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 "${candidate_url}" -o "${tmp}" ||
+         curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 "${candidate_url}" -o "${tmp}"; } &&
+       head -n 1 "${tmp}" | grep -q '^#!'; then
+      downloaded_ok=1
+      url="${candidate_url}"
+      break
+    fi
+  done < <(printf '%s' "${url_candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
   if [[ "${downloaded_ok}" != "1" ]]; then
     echo "Gagal download update script."
     telegram_notify "SC 1FORCR NOTIF
@@ -25353,8 +25681,8 @@ Time     : $(date '+%F %T')"
   fi
 
   if [[ -f /etc/sc-1forcr-license-required ]]; then
-    license_base_url="$(echo "${LICENSE_API_URL:-}" | sed 's|/sc1forcr/license/activate$||')"
-    if [[ -z "${license_base_url}" || "${license_base_url}" == "${LICENSE_API_URL:-}" || \
+    license_base_url="$(echo "${url:-}" | sed 's|/sc1forcr/payload/scripts/setup-autoscript-compat.sh.*$||')"
+    if [[ -z "${license_base_url}" || "${license_base_url}" == "${url:-}" || \
           ! -x /usr/local/sbin/sc-1forcr-license-guard || -z "${SC_UPDATE_KEY:-}" ]]; then
       echo "Update ditolak: verifier atau key signed manifest tidak tersedia."
       rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
@@ -25849,7 +26177,7 @@ set_account_event_webhook_config() {
 }
 
 install_summary_api_1forcr() {
-  local url tmp derived_url manifest_base manifest_resp manifest_token
+  local url tmp derived_url manifest_base manifest_resp manifest_token url_candidates candidate_url downloaded_ok
   url="${SUMMARY_API_SETUP_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
@@ -25867,8 +26195,21 @@ install_summary_api_1forcr() {
   fi
   tmp="/tmp/setup-summary-api.sh"
   echo "Install Summary API 1FORCR..."
-  if ! { curl -4fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
-         curl -fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
+  downloaded_ok="0"
+  url_candidates="${SUMMARY_API_SETUP_URLS:-},${url},${derived_url}"
+  while IFS= read -r candidate_url; do
+    candidate_url="$(echo "${candidate_url}" | xargs)"
+    [[ "${candidate_url}" =~ ^https?://[^[:space:]]+$ ]] || continue
+    echo "Coba download Summary API dari: ${candidate_url}"
+    if { curl -4fL --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 "${candidate_url}" -o "${tmp}" ||
+         curl -fL --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 "${candidate_url}" -o "${tmp}"; } &&
+       head -n 1 "${tmp}" | grep -q '^#!'; then
+      downloaded_ok="1"
+      url="${candidate_url}"
+      break
+    fi
+  done < <(printf '%s' "${url_candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
+  if [[ "${downloaded_ok}" != "1" ]]; then
     echo "Gagal download script summary API."
     return 1
   fi
@@ -25879,8 +26220,8 @@ install_summary_api_1forcr() {
     return 1
   fi
   if [[ -f /etc/sc-1forcr-license-required ]]; then
-    manifest_base="$(echo "${LICENSE_API_URL:-}" | sed 's|/sc1forcr/license/activate$||')"
-    if [[ -z "${manifest_base}" || "${manifest_base}" == "${LICENSE_API_URL:-}" || \
+    manifest_base="$(echo "${url:-}" | sed 's|/sc1forcr/payload/scripts/setup-summary-api.sh.*$||')"
+    if [[ -z "${manifest_base}" || "${manifest_base}" == "${url:-}" || \
           -z "${SC_UPDATE_KEY:-}" || ! -x /usr/local/sbin/sc-1forcr-license-guard ]]; then
       echo "Update Summary API ditolak: verifier/key signed manifest tidak tersedia."
       rm -f "${tmp}" >/dev/null 2>&1 || true
@@ -26509,6 +26850,10 @@ systemctl stop sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-pull-summary-update.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-pull-summary-update.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-god-update.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-god-update.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
@@ -26546,6 +26891,8 @@ rm -f /etc/systemd/system/sc-1forcr-pull-update.service
 rm -f /etc/systemd/system/sc-1forcr-pull-update.timer
 rm -f /etc/systemd/system/sc-1forcr-pull-summary-update.service
 rm -f /etc/systemd/system/sc-1forcr-pull-summary-update.timer
+rm -f /etc/systemd/system/sc-1forcr-god-update.service
+rm -f /etc/systemd/system/sc-1forcr-god-update.timer
 rm -f /etc/systemd/system/sc-1forcr-capacity-tune.service
 rm -f /etc/systemd/system/sc-1forcr-capacity-tune.timer
 rm -f /etc/systemd/system/sc-1forcr-dns-guard.service
@@ -26577,6 +26924,7 @@ rm -f /usr/local/sbin/sc-1forcr-restore-backup
 rm -f /usr/local/sbin/sc-1forcr-online-notify
 rm -f /usr/local/sbin/sc-1forcr-pull-update
 rm -f /usr/local/sbin/sc-1forcr-pull-summary-update
+rm -f /usr/local/sbin/sc-1forcr-god-update
 rm -f /usr/local/sbin/sc-1forcr-udpgw-alias
 rm -f /usr/local/sbin/sc-1forcr-udpgw-drain
 rm -f /usr/local/sbin/sc-1forcr-capacity-tune
@@ -26890,7 +27238,7 @@ update_app_env_var() {
 }
 
 install_summary_api_1forcr() {
-  local url tmp derived_url manifest_base manifest_resp manifest_token
+  local url tmp derived_url manifest_base manifest_resp manifest_token url_candidates candidate_url downloaded_ok
   url="${SUMMARY_API_SETUP_URL:-}"
   derived_url=""
   if [[ -n "${LICENSE_API_URL:-}" ]]; then
@@ -26907,8 +27255,21 @@ install_summary_api_1forcr() {
   fi
   tmp="/tmp/setup-summary-api.sh"
   echo "Install Summary API 1FORCR..."
-  if ! { curl -4fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}" ||
-         curl -fL --connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; }; then
+  downloaded_ok="0"
+  url_candidates="${SUMMARY_API_SETUP_URLS:-},${url},${derived_url}"
+  while IFS= read -r candidate_url; do
+    candidate_url="$(echo "${candidate_url}" | xargs)"
+    [[ "${candidate_url}" =~ ^https?://[^[:space:]]+$ ]] || continue
+    echo "Coba download Summary API dari: ${candidate_url}"
+    if { curl -4fL --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 "${candidate_url}" -o "${tmp}" ||
+         curl -fL --connect-timeout 15 --max-time 120 --retry 3 --retry-delay 2 "${candidate_url}" -o "${tmp}"; } &&
+       head -n 1 "${tmp}" | grep -q '^#!'; then
+      downloaded_ok="1"
+      url="${candidate_url}"
+      break
+    fi
+  done < <(printf '%s' "${url_candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
+  if [[ "${downloaded_ok}" != "1" ]]; then
     echo "Gagal download script summary API."
     return 1
   fi
@@ -26919,8 +27280,8 @@ install_summary_api_1forcr() {
     return 1
   fi
   if [[ -f /etc/sc-1forcr-license-required ]]; then
-    manifest_base="$(echo "${LICENSE_API_URL:-}" | sed 's|/sc1forcr/license/activate$||')"
-    if [[ -z "${manifest_base}" || "${manifest_base}" == "${LICENSE_API_URL:-}" || \
+    manifest_base="$(echo "${url:-}" | sed 's|/sc1forcr/payload/scripts/setup-summary-api.sh.*$||')"
+    if [[ -z "${manifest_base}" || "${manifest_base}" == "${url:-}" || \
           -z "${SC_UPDATE_KEY:-}" || ! -x /usr/local/sbin/sc-1forcr-license-guard ]]; then
       echo "Update Summary API ditolak: verifier/key signed manifest tidak tersedia."
       rm -f "${tmp}" >/dev/null 2>&1 || true
@@ -26989,6 +27350,8 @@ restart_update_safe_services() {
     systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
     systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
   fi
+  systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
   if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
     systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
     systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
@@ -27135,6 +27498,8 @@ systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
 systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
 systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
 systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
 systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
 exit 0
 EOF
@@ -27581,7 +27946,7 @@ create_snapshot() {
   done
   while IFS= read -r -d '' path; do
     case "${path}" in
-      /usr/local/sbin/sc-1forcr-update-manager|/usr/local/sbin/sc-1forcr-pull-update|/usr/local/sbin/sc-1forcr-pull-summary-update)
+      /usr/local/sbin/sc-1forcr-update-manager|/usr/local/sbin/sc-1forcr-pull-update|/usr/local/sbin/sc-1forcr-pull-summary-update|/usr/local/sbin/sc-1forcr-god-update)
         continue
         ;;
     esac
@@ -27796,6 +28161,16 @@ PY
       timer_state="$(systemctl show sc-1forcr-iplimit.timer -p SubState --value 2>/dev/null || true)"
       [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
         failures+=("IP limit timer tidak terjadwal (${timer_state:-unknown})")
+    fi
+  fi
+
+  if unit_is_installed sc-1forcr-god-update.timer; then
+    if ! systemctl is-active --quiet sc-1forcr-god-update.timer; then
+      failures+=("God Mode update timer tidak aktif")
+    else
+      timer_state="$(systemctl show sc-1forcr-god-update.timer -p SubState --value 2>/dev/null || true)"
+      [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
+        failures+=("God Mode update timer tidak terjadwal (${timer_state:-unknown})")
     fi
   fi
 
@@ -28190,6 +28565,7 @@ rollback_snapshot() {
     --exclude='usr/local/sbin/sc-1forcr-update-manager' \
     --exclude='usr/local/sbin/sc-1forcr-pull-update' \
     --exclude='usr/local/sbin/sc-1forcr-pull-summary-update' \
+    --exclude='usr/local/sbin/sc-1forcr-god-update' \
     --exclude='opt/sc-1forcr/menu-sc-1forcr.sh' \
     --exclude='opt/potato-compat/menu-sc-1forcr.sh'
 

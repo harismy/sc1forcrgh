@@ -68,12 +68,18 @@ assert(menuSource.includes('.data.link.grpc'), 'gRPC link must come from the API
 assert(menuSource.includes('.data.link.uptls'), 'upgrade TLS link must come from the API response');
 assert(menuSource.includes('.data.city // .data.location.city'), 'VPS city must come from the API response');
 assert(menuSource.includes('.data.isp // .data.location.isp'), 'VPS ISP must come from the API response');
-assert(installer.includes('SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.38}"'));
+assert(installer.includes('SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.39}"'));
 assert(installer.includes('Versi payload   : ${downloaded_version}'));
 assert(installer.includes('marker versi ${new_ver} tidak sama dengan payload ${downloaded_version}'));
 assert(installer.includes('displayed_version="$(tr -d \'[:space:]\' </opt/sc-1forcr/VERSION 2>/dev/null || true)"'));
 assert(installer.includes('Update berhasil. Memuat ulang menu dari runtime terbaru...'));
 assert(installer.includes('XRAY RUNTIME ENFORCEMENT:'));
 assert(installer.includes('config_state="LEAK"'));
+assert(installer.includes('LICENSE_API_URLS="${LICENSE_API_URLS:-${LICENSE_API_URL:-}}"'));
+assert(installer.includes('UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"'));
+assert(installer.includes('SUMMARY_API_SETUP_URLS="${SUMMARY_API_SETUP_URLS:-${SUMMARY_API_SETUP_URL:-}}"'));
+assert(installer.includes('/usr/local/sbin/sc-1forcr-god-update'));
+assert(installer.includes('/etc/systemd/system/sc-1forcr-god-update.timer'));
+assert(installer.includes('systemctl enable --now sc-1forcr-god-update.timer'));
 
 console.log('CLI account output tests: OK');

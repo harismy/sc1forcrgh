@@ -288,6 +288,29 @@ async function initDb() {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (vps_ip, version)
   )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS god_update_campaigns (
+    version TEXT PRIMARY KEY,
+    components TEXT NOT NULL,
+    note TEXT,
+    scheduled_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    created_by INTEGER,
+    status TEXT NOT NULL DEFAULT 'scheduled',
+    expected_total INTEGER NOT NULL DEFAULT 0,
+    started_notice_at INTEGER,
+    report_sent_at INTEGER,
+    completed_at INTEGER
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS god_update_targets (
+    version TEXT NOT NULL,
+    vps_ip TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    message TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (version, vps_ip)
+  )`);
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_god_update_campaign_status ON god_update_campaigns(status, scheduled_at)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_god_update_target_status ON god_update_targets(version, status)');
   await ensureScRegistrationSchema();
   await ensureScServerKeySchema();
   await ensureScUpdateTriggerSchema();
@@ -372,6 +395,46 @@ function getBaseUrl(req) {
   return `${proto}://${host}`.replace(/\/$/, '');
 }
 
+function normalizePublicBaseUrl(value) {
+  try {
+    const parsed = new URL(String(value || '').trim());
+    if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+    if (parsed.username || parsed.password || !parsed.hostname) return '';
+    return parsed.origin;
+  } catch (_) {
+    return '';
+  }
+}
+
+async function getPublicBaseUrls(req) {
+  const requestProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim() || 'https';
+  const requestHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  const requestBase = requestHost ? `${requestProto}://${requestHost}`.replace(/\/$/, '') : '';
+  const configuredBase = LICENSE_PUBLIC_BASE_URL.replace(/\/$/, '');
+  const rows = await dbAll(
+    'SELECT domain FROM api_domains WHERE is_active = 1 ORDER BY updated_at DESC, id DESC'
+  ).catch(() => []);
+  const values = [
+    requestBase,
+    configuredBase,
+    ...rows
+      .map((row) => String(row?.domain || '').trim().toLowerCase())
+      .filter(Boolean)
+      .map((domain) => `https://${domain}`)
+  ];
+  return Array.from(new Set(values.map(normalizePublicBaseUrl).filter(Boolean)));
+}
+
+async function getRuntimeEndpointConfig(req) {
+  const baseUrls = await getPublicBaseUrls(req);
+  return {
+    baseUrls,
+    licenseApiUrls: baseUrls.map((base) => `${base}/sc1forcr/license/activate`),
+    updateScriptUrls: baseUrls.map((base) => `${base}/sc1forcr/payload/scripts/setup-autoscript-compat.sh`),
+    summaryApiUrls: baseUrls.map((base) => `${base}/sc1forcr/payload/scripts/setup-summary-api.sh`)
+  };
+}
+
 function normalizeScriptLineEndings(input) {
   const s = String(input || '');
   return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -388,15 +451,28 @@ function getDistributionId(reg, serverKey) {
     : '';
 }
 
-function personalizeScInstaller(input, reg, serverKey) {
+function personalizeScInstaller(input, reg, serverKey, runtimeConfig = null) {
   const content = normalizeScriptLineEndings(input);
   const distributionId = getDistributionId(reg, serverKey);
-  if (!distributionId) return content;
-  const marker = `# SC_DISTRIBUTION_ID=${distributionId}`;
-  if (content.includes(marker)) return content;
+  const licenseApiUrls = Array.isArray(runtimeConfig?.licenseApiUrls) ? runtimeConfig.licenseApiUrls.filter(Boolean) : [];
+  const updateScriptUrls = Array.isArray(runtimeConfig?.updateScriptUrls) ? runtimeConfig.updateScriptUrls.filter(Boolean) : [];
+  const summaryApiUrls = Array.isArray(runtimeConfig?.summaryApiUrls) ? runtimeConfig.summaryApiUrls.filter(Boolean) : [];
+  if (!distributionId && !licenseApiUrls.length && !updateScriptUrls.length && !summaryApiUrls.length) return content;
+  const injected = [
+    distributionId ? `# SC_DISTRIBUTION_ID=${distributionId}` : '',
+    '# SC_ENDPOINT_FALLBACKS=1',
+    licenseApiUrls.length ? `: "\${LICENSE_API_URLS:=${licenseApiUrls.join(',')}}"` : '',
+    updateScriptUrls.length ? `: "\${UPDATE_SCRIPT_URLS:=${updateScriptUrls.join(',')}}"` : '',
+    summaryApiUrls.length ? `: "\${SUMMARY_API_SETUP_URLS:=${summaryApiUrls.join(',')}}"` : '',
+    licenseApiUrls[0] ? `: "\${LICENSE_API_URL:=${licenseApiUrls[0]}}"` : '',
+    updateScriptUrls[0] ? `: "\${UPDATE_SCRIPT_URL:=${updateScriptUrls[0]}}"` : '',
+    summaryApiUrls[0] ? `: "\${SUMMARY_API_SETUP_URL:=${summaryApiUrls[0]}}"` : '',
+    'export LICENSE_API_URLS UPDATE_SCRIPT_URLS SUMMARY_API_SETUP_URLS LICENSE_API_URL UPDATE_SCRIPT_URL SUMMARY_API_SETUP_URL'
+  ].filter(Boolean).join('\n');
+  if (content.includes('# SC_ENDPOINT_FALLBACKS=1')) return content;
   const firstNewline = content.indexOf('\n');
-  if (firstNewline < 0) return `${content}\n${marker}\n`;
-  return `${content.slice(0, firstNewline + 1)}${marker}\n${content.slice(firstNewline + 1)}`;
+  if (firstNewline < 0) return `${content}\n${injected}\n`;
+  return `${content.slice(0, firstNewline + 1)}${injected}\n${content.slice(firstNewline + 1)}`;
 }
 
 function shellQuote(input) {
@@ -592,6 +668,28 @@ async function requireUpdateClient(req, res, next) {
   }
 }
 
+async function requireKeyedUpdateClient(req, res, next) {
+  try {
+    const serverKey = String(req.headers['x-sc-key'] || '').trim();
+    if (!serverKey) {
+      return res.status(401).json({ ok: false, allowed: false, message: 'X-SC-Key wajib untuk God Mode' });
+    }
+    const reg = await findRegistrationByServerKey(serverKey, { activeOnly: true });
+    if (!reg) {
+      return res.status(403).json({ ok: false, allowed: false, message: 'key VPS tidak valid/expired' });
+    }
+    if (!sourceIpMatchesRegistration(req, reg)) {
+      return res.status(403).json({ ok: false, allowed: false, message: 'source IP mismatch' });
+    }
+    req.scUpdateRegistration = reg;
+    req.scUpdateServerKey = serverKey;
+    req.scUpdateAuth = 'server-key';
+    return next();
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: error.message });
+  }
+}
+
 async function isDomainAllowed(req) {
   const domains = await dbAll('SELECT domain FROM api_domains WHERE is_active = 1');
   if (!domains.length) return true;
@@ -727,6 +825,47 @@ async function getLatestActiveSummaryUpdateTrigger() {
   );
 }
 
+async function getMandatoryGodUpdateForIp(ip) {
+  const safeIp = cleanIp(ip);
+  if (!safeIp) return null;
+  const now = Date.now();
+  return dbGet(
+    `SELECT c.version, c.components, c.note, c.scheduled_at, c.created_at,
+            t.status AS target_status, t.message AS target_message
+     FROM god_update_campaigns c
+     JOIN god_update_targets t ON t.version=c.version
+     WHERE t.vps_ip=? AND c.status IN ('scheduled','active')
+       AND c.scheduled_at<=? AND LOWER(TRIM(t.status))<>'success'
+     ORDER BY c.scheduled_at ASC, c.created_at ASC LIMIT 1`,
+    [safeIp, now]
+  );
+}
+
+async function recordGodUpdateAck(ip, version, status, message) {
+  const safeIp = cleanIp(ip);
+  const safeVersion = String(version || '').trim().slice(0, 80);
+  const rawStatus = String(status || '').trim().toLowerCase();
+  const safeStatus = ['running', 'success', 'failed'].includes(rawStatus) ? rawStatus : '';
+  const safeMessage = String(message || '').replace(/\s+/g, ' ').trim().slice(0, 700);
+  if (!safeIp || !safeVersion || !safeStatus) return { ok: false, message: 'ip/version/status invalid' };
+  const campaign = await dbGet(
+    "SELECT version FROM god_update_campaigns WHERE version=? AND status IN ('scheduled','active') LIMIT 1",
+    [safeVersion]
+  );
+  if (!campaign) return { ok: false, message: 'campaign tidak aktif' };
+  const result = await dbRun(
+    `UPDATE god_update_targets SET status=?, message=?, updated_at=?
+     WHERE version=? AND vps_ip=?`,
+    [safeStatus, safeMessage, Date.now(), safeVersion, safeIp]
+  );
+  if (Number(result?.changes || 0) < 1) return { ok: false, message: 'IP bukan target campaign' };
+  await dbRun(
+    "UPDATE god_update_campaigns SET status='active', started_notice_at=COALESCE(started_notice_at, ?) WHERE version=? AND status='scheduled'",
+    [Date.now(), safeVersion]
+  ).catch(() => {});
+  return { ok: true, ip: safeIp, version: safeVersion, status: safeStatus };
+}
+
 async function recordUpdateAck(ip, version, status, message) {
   const safeIp = cleanIp(ip);
   const safeVersion = String(version || '').trim().slice(0, 80);
@@ -811,7 +950,8 @@ async function sendInstallerScript(req, res) {
 
     const serverKey = await ensureServerKeyForRegistration(reg);
 
-    const baseUrl = getBaseUrl(req);
+    const runtimeConfig = await getRuntimeEndpointConfig(req);
+    const baseUrl = runtimeConfig.baseUrls[0] || getBaseUrl(req);
     const scInstallerPath = resolveScInstallerLocalPath();
     const hasLocalInstaller = fs.existsSync(scInstallerPath);
     if (!hasLocalInstaller) {
@@ -827,7 +967,8 @@ async function sendInstallerScript(req, res) {
     const personalizedInstaller = personalizeScInstaller(
       fs.readFileSync(scInstallerPath, 'utf8'),
       reg,
-      serverKey
+      serverKey,
+      runtimeConfig
     );
     const installerSha256 = crypto
       .createHash('sha256')
@@ -837,9 +978,11 @@ async function sendInstallerScript(req, res) {
       'export LICENSE_ENFORCE=1',
       'export LICENSE_LEASE_REQUIRED=1',
       `export LICENSE_API_URL=${shellQuote(activateUrl)}`,
+      `export LICENSE_API_URLS=${shellQuote(runtimeConfig.licenseApiUrls.join(','))}`,
       "export LICENSE_API_TOKEN=''",
       `export LICENSE_KEY=${shellQuote(`IP_REGISTERED_${ip}`)}`,
       `export UPDATE_SCRIPT_URL=${shellQuote(sourceUrl)}`,
+      `export UPDATE_SCRIPT_URLS=${shellQuote(runtimeConfig.updateScriptUrls.join(','))}`,
       `export INSTALL_AUTH_TOKEN=${shellQuote(serverKey)}`,
       `export API_AUTH_TOKEN=${shellQuote(serverKey)}`,
       `export AUTH_TOKEN=${shellQuote(serverKey)}`,
@@ -848,6 +991,7 @@ async function sendInstallerScript(req, res) {
     ];
     if (hasLocalSummaryApi) {
       envLines.push(`export SUMMARY_API_SETUP_URL=${shellQuote(summaryApiUrl)}`);
+      envLines.push(`export SUMMARY_API_SETUP_URLS=${shellQuote(runtimeConfig.summaryApiUrls.join(','))}`);
     }
     const script = `#!/usr/bin/env bash
 set -euo pipefail
@@ -970,7 +1114,8 @@ app.get('/sc1forcr/payload/setup-autoscript-compat.sh', async (req, res) => {
       return res.status(404).type('text/plain').send('Installer lokal belum diupload admin.');
     }
     const serverKey = await ensureServerKeyForRegistration(reg);
-    const content = personalizeScInstaller(fs.readFileSync(scInstallerPath, 'utf8'), reg, serverKey);
+    const runtimeConfig = await getRuntimeEndpointConfig(req);
+    const content = personalizeScInstaller(fs.readFileSync(scInstallerPath, 'utf8'), reg, serverKey, runtimeConfig);
     return res.type('text/plain').send(content);
   } catch (e) {
     return res.status(500).type('text/plain').send(`Internal error: ${e.message}`);
@@ -996,7 +1141,8 @@ app.get('/sc1forcr/payload/scripts/setup-autoscript-compat.sh', async (req, res)
       return res.status(404).type('text/plain').send('Installer lokal belum diupload admin.');
     }
     const serverKey = await ensureServerKeyForRegistration(reg);
-    const content = personalizeScInstaller(fs.readFileSync(scInstallerPath, 'utf8'), reg, serverKey);
+    const runtimeConfig = await getRuntimeEndpointConfig(req);
+    const content = personalizeScInstaller(fs.readFileSync(scInstallerPath, 'utf8'), reg, serverKey, runtimeConfig);
     return res.type('text/plain').send(content);
   } catch (e) {
     return res.status(500).type('text/plain').send(`Internal error: ${e.message}`);
@@ -1045,7 +1191,8 @@ app.get('/sc1forcr/payload/manifest', requireUpdateClient, async (req, res) => {
       return res.status(404).json({ ok: false, message: 'installer/registrasi tidak tersedia' });
     }
     const serverKey = String(req.scUpdateServerKey || '').trim();
-    const content = personalizeScInstaller(fs.readFileSync(installerPath, 'utf8'), reg, serverKey);
+    const runtimeConfig = await getRuntimeEndpointConfig(req);
+    const content = personalizeScInstaller(fs.readFileSync(installerPath, 'utf8'), reg, serverKey, runtimeConfig);
     const match = content.match(/SC_SCRIPT_VERSION_OVERRIDE:-([^}"\r\n]+)/);
     const version = String(match?.[1] || '').trim();
     const now = Math.floor(Date.now() / 1000);
@@ -1268,7 +1415,8 @@ app.post('/sc1forcr/update/check', requireUpdateClient, async (req, res) => {
     }
 
     const currentVersion = String(req.body?.current_version || '').trim();
-    const baseUrl = getBaseUrl(req);
+    const runtimeConfig = await getRuntimeEndpointConfig(req);
+    const baseUrl = runtimeConfig.baseUrls[0] || getBaseUrl(req);
     const scInstallerPath = resolveScInstallerLocalPath();
     const summaryApiPath = resolveSummaryApiLocalPath();
     const hasInstaller = fs.existsSync(scInstallerPath);
@@ -1276,6 +1424,13 @@ app.post('/sc1forcr/update/check', requireUpdateClient, async (req, res) => {
     const ackStatus = await getUpdateAckStatus(reg.vps_ip, triggerVersion);
     const alreadySucceeded = ackStatus === 'success';
     const scriptUrl = `${baseUrl}/sc1forcr/payload/scripts/setup-autoscript-compat.sh`;
+    let scriptVersion = '';
+    if (hasInstaller) {
+      const serverKey = String(req.scUpdateServerKey || '').trim();
+      const content = personalizeScInstaller(fs.readFileSync(scInstallerPath, 'utf8'), reg, serverKey, runtimeConfig);
+      const match = content.match(/SC_SCRIPT_VERSION_OVERRIDE:-([^}"\r\n]+)/);
+      scriptVersion = String(match?.[1] || '').trim();
+    }
     const summaryApiUrl = fs.existsSync(summaryApiPath)
       ? `${baseUrl}/sc1forcr/payload/scripts/setup-summary-api.sh`
       : '';
@@ -1285,11 +1440,15 @@ app.post('/sc1forcr/update/check', requireUpdateClient, async (req, res) => {
       allowed: true,
       update_required: hasInstaller && !alreadySucceeded && currentVersion !== triggerVersion,
       version: triggerVersion,
+      script_version: scriptVersion,
       note: String(trigger.note || ''),
       target_ip: cleanIp(trigger.target_ip) || null,
       created_at: Number(trigger.created_at || 0) || null,
       script_url: hasInstaller ? scriptUrl : '',
+      script_urls: hasInstaller ? runtimeConfig.updateScriptUrls : [],
       summary_api_url: summaryApiUrl,
+      summary_api_urls: fs.existsSync(summaryApiPath) ? runtimeConfig.summaryApiUrls : [],
+      license_api_urls: runtimeConfig.licenseApiUrls,
       ack_status: ackStatus,
       ip: reg.vps_ip
     });
@@ -1350,7 +1509,8 @@ app.post('/sc1forcr/summary-update/check', requireUpdateClient, async (req, res)
     }
 
     const currentVersion = String(req.body?.current_version || '').trim();
-    const baseUrl = getBaseUrl(req);
+    const runtimeConfig = await getRuntimeEndpointConfig(req);
+    const baseUrl = runtimeConfig.baseUrls[0] || getBaseUrl(req);
     const summaryApiPath = resolveSummaryApiLocalPath();
     const hasInstaller = fs.existsSync(summaryApiPath);
     const triggerVersion = String(trigger.version);
@@ -1366,6 +1526,8 @@ app.post('/sc1forcr/summary-update/check', requireUpdateClient, async (req, res)
       note: String(trigger.note || ''),
       created_at: Number(trigger.created_at || 0) || null,
       summary_api_url: hasInstaller ? summaryApiUrl : '',
+      summary_api_urls: hasInstaller ? runtimeConfig.summaryApiUrls : [],
+      license_api_urls: runtimeConfig.licenseApiUrls,
       ack_status: ackStatus,
       ip: reg.vps_ip
     });
@@ -1392,6 +1554,99 @@ app.post('/sc1forcr/summary-update/ack', requireUpdateClient, async (req, res) =
     return res.json({ ok: true, ...result });
   } catch (e) {
     return res.status(500).json({ ok: false, message: e.message });
+  }
+});
+
+app.post('/sc1forcr/god-update/check', requireKeyedUpdateClient, async (req, res) => {
+  try {
+    const keyedReg = req.scUpdateRegistration || null;
+    const ip = cleanIp(keyedReg?.vps_ip) || cleanIp(req.body?.ip) || getClientIp(req);
+    const reg = keyedReg || (await findActiveRegistrationByIp(ip));
+    if (!reg) {
+      return res.status(403).json({ ok: false, allowed: false, message: 'IP belum terdaftar atau expired', ip });
+    }
+    const campaign = await getMandatoryGodUpdateForIp(reg.vps_ip);
+    if (!campaign?.version) {
+      return res.json({ ok: true, allowed: true, mandatory: false, update_required: false, ip: reg.vps_ip });
+    }
+
+    const components = ['script', 'summary', 'both'].includes(String(campaign.components || '').toLowerCase())
+      ? String(campaign.components).toLowerCase()
+      : '';
+    if (!components) return res.status(500).json({ ok: false, message: 'komponen campaign tidak valid' });
+
+    const runtimeConfig = await getRuntimeEndpointConfig(req);
+    const installerPath = resolveScInstallerLocalPath();
+    const summaryPath = resolveSummaryApiLocalPath();
+    const needsScript = components === 'script' || components === 'both';
+    const needsSummary = components === 'summary' || components === 'both';
+    const hasScript = fs.existsSync(installerPath);
+    const hasSummary = fs.existsSync(summaryPath);
+    if ((needsScript && !hasScript) || (needsSummary && !hasSummary)) {
+      return res.status(503).json({
+        ok: false,
+        allowed: true,
+        mandatory: true,
+        update_required: false,
+        message: needsScript && !hasScript ? 'installer SC tidak tersedia' : 'installer Summary API tidak tersedia'
+      });
+    }
+
+    let scriptVersion = '';
+    if (needsScript) {
+      const serverKey = String(req.scUpdateServerKey || '').trim();
+      const content = personalizeScInstaller(fs.readFileSync(installerPath, 'utf8'), reg, serverKey, runtimeConfig);
+      const match = content.match(/SC_SCRIPT_VERSION_OVERRIDE:-([^}"\r\n]+)/);
+      scriptVersion = String(match?.[1] || '').trim();
+    }
+    let summaryVersion = '';
+    if (needsSummary) {
+      const content = normalizeScriptLineEndings(fs.readFileSync(summaryPath, 'utf8'));
+      summaryVersion = `summary-${crypto.createHash('sha256').update(content, 'utf8').digest('hex').slice(0, 16)}`;
+    }
+
+    return res.json({
+      ok: true,
+      allowed: true,
+      mandatory: true,
+      update_required: true,
+      campaign_version: String(campaign.version),
+      components,
+      note: String(campaign.note || ''),
+      scheduled_at: Number(campaign.scheduled_at || 0) || null,
+      script_version: scriptVersion,
+      summary_version: summaryVersion,
+      script_url: needsScript ? runtimeConfig.updateScriptUrls[0] || '' : '',
+      script_urls: needsScript ? runtimeConfig.updateScriptUrls : [],
+      summary_api_url: needsSummary ? runtimeConfig.summaryApiUrls[0] || '' : '',
+      summary_api_urls: needsSummary ? runtimeConfig.summaryApiUrls : [],
+      license_api_urls: runtimeConfig.licenseApiUrls,
+      target_status: String(campaign.target_status || 'pending'),
+      ip: reg.vps_ip
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: error.message });
+  }
+});
+
+app.post('/sc1forcr/god-update/ack', requireKeyedUpdateClient, async (req, res) => {
+  try {
+    const keyedReg = req.scUpdateRegistration || null;
+    const ip = cleanIp(keyedReg?.vps_ip) || cleanIp(req.body?.ip) || getClientIp(req);
+    const reg = keyedReg || (await findActiveRegistrationByIp(ip));
+    if (!reg) {
+      return res.status(403).json({ ok: false, allowed: false, message: 'IP belum terdaftar atau expired', ip });
+    }
+    const result = await recordGodUpdateAck(
+      reg.vps_ip,
+      req.body?.campaign_version || req.body?.version,
+      req.body?.status,
+      req.body?.message
+    );
+    if (!result.ok) return res.status(400).json(result);
+    return res.json(result);
+  } catch (error) {
+    return res.status(500).json({ ok: false, message: error.message });
   }
 });
 

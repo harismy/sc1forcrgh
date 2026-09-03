@@ -160,7 +160,11 @@ const DEFAULT_SC_H2_REMINDER_INTERVAL_MINUTES = Math.max(
       60
   )
 );
-const SC_IP_CHANGE_MAX = 2;
+const SC_IP_CHANGE_MAX = 5;
+const GOD_UPDATE_REPORT_INTERVAL_MS = Math.max(
+  15000,
+  Number(process.env.GOD_UPDATE_REPORT_INTERVAL_MS || 30000) || 30000
+);
 const MIGRATION_ROLLBACK_TTL_MS = Math.max(
   5 * 60 * 1000,
   Number(process.env.MIGRATION_ROLLBACK_TTL_MS || (2 * 60 * 60 * 1000)) || (2 * 60 * 60 * 1000)
@@ -309,6 +313,29 @@ async function initDb() {
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (vps_ip, version)
   )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS god_update_campaigns (
+    version TEXT PRIMARY KEY,
+    components TEXT NOT NULL,
+    note TEXT,
+    scheduled_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    created_by INTEGER,
+    status TEXT NOT NULL DEFAULT 'scheduled',
+    expected_total INTEGER NOT NULL DEFAULT 0,
+    started_notice_at INTEGER,
+    report_sent_at INTEGER,
+    completed_at INTEGER
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS god_update_targets (
+    version TEXT NOT NULL,
+    vps_ip TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    message TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (version, vps_ip)
+  )`);
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_god_update_campaign_status ON god_update_campaigns(status, scheduled_at)');
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_god_update_target_status ON god_update_targets(version, status)');
   await dbRun(`CREATE TABLE IF NOT EXISTS migration_rollback_jobs (
     token TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,
@@ -547,6 +574,8 @@ async function seedDefaultSettings() {
     '',
     '9. OTOMATISASI & RESOURCE',
     '- Auto update dari trigger bot dengan mode update aman',
+    '- Multi-domain API dengan fallback otomatis berurutan',
+    '- God Mode update wajib admin, bisa dijadwalkan dan dipantau per VPS',
     '- Cooldown update gagal agar tidak restart berulang',
     '- Xray, SSH, SSHWS, dan HAProxy tidak direstart saat safe update',
     '- Auto reboot interval atau harian WIB (opsional)',
@@ -2050,9 +2079,9 @@ async function listActiveScHosts(limit = 1000) {
       "ORDER BY updated_at DESC LIMIT ?",
     [now, safeLimit]
   );
-  return rows
+  return Array.from(new Set(rows
     .map((r) => normalizeHost(r?.vps_ip || ''))
-    .filter((ip) => isIpv4(ip));
+    .filter((ip) => isIpv4(ip))));
 }
 
 async function countActiveScRegistrations() {
@@ -2176,6 +2205,200 @@ async function getSummaryUpdateTriggerAckSummary(version) {
     out.total += total;
   }
   return out;
+}
+
+function normalizeGodUpdateComponents(value) {
+  const component = String(value || '').trim().toLowerCase();
+  return ['script', 'summary', 'both'].includes(component) ? component : '';
+}
+
+function godUpdateComponentLabel(value) {
+  const component = normalizeGodUpdateComponents(value);
+  if (component === 'script') return 'Script SC saja';
+  if (component === 'summary') return 'Summary API saja';
+  if (component === 'both') return 'Script SC + Summary API';
+  return '-';
+}
+
+function parseWibSchedule(input) {
+  const value = String(input || '').trim();
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/);
+  if (!match) return 0;
+  const [, year, month, day, hour, minute] = match;
+  const timestamp = Date.parse(`${year}-${month}-${day}T${hour}:${minute}:00+07:00`);
+  if (!Number.isFinite(timestamp)) return 0;
+  const roundTrip = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jakarta',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(new Date(timestamp));
+  const parts = Object.fromEntries(roundTrip.map((part) => [part.type, part.value]));
+  const normalized = `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+  return normalized === `${year}-${month}-${day} ${hour}:${minute}` ? timestamp : 0;
+}
+
+async function getLatestGodUpdateCampaign() {
+  return dbGet(
+    "SELECT * FROM god_update_campaigns ORDER BY created_at DESC LIMIT 1"
+  );
+}
+
+async function getOpenGodUpdateCampaign() {
+  return dbGet(
+    "SELECT * FROM god_update_campaigns WHERE status IN ('scheduled','active') ORDER BY created_at DESC LIMIT 1"
+  );
+}
+
+async function getGodUpdateCampaignSummary(version) {
+  const safeVersion = String(version || '').trim();
+  const out = { pending: 0, running: 0, failed: 0, success: 0, total: 0 };
+  if (!safeVersion) return out;
+  const rows = await dbAll(
+    'SELECT LOWER(TRIM(status)) AS status, COUNT(1) AS total FROM god_update_targets WHERE version = ? GROUP BY LOWER(TRIM(status))',
+    [safeVersion]
+  );
+  for (const row of rows) {
+    const status = String(row?.status || 'pending').toLowerCase();
+    const total = Number(row?.total || 0);
+    if (Object.prototype.hasOwnProperty.call(out, status)) out[status] += total;
+    out.total += total;
+  }
+  return out;
+}
+
+async function createGodUpdateCampaign(adminId, componentsInput, scheduledAtInput) {
+  const components = normalizeGodUpdateComponents(componentsInput);
+  if (!components) throw new Error('Komponen God Mode tidak valid.');
+  const scheduledAt = Number(scheduledAtInput || 0);
+  if (!Number.isFinite(scheduledAt) || scheduledAt < Date.now() - 60000) {
+    throw new Error('Jadwal update tidak valid atau sudah lewat.');
+  }
+  const existing = await getOpenGodUpdateCampaign();
+  if (existing) {
+    throw new Error(`Masih ada campaign ${existing.version} (${existing.status}). Batalkan atau tunggu selesai.`);
+  }
+  const targets = await listActiveScHosts(5000);
+  if (!targets.length) throw new Error('Tidak ada IP VPS aktif untuk dijadikan target.');
+  const version = `god-${Date.now()}`;
+  const createdAt = Date.now();
+  const note = `mandatory ${components} update by ${Number(adminId || 0)}`;
+  await dbRun('BEGIN IMMEDIATE');
+  try {
+    const concurrent = await dbGet(
+      "SELECT version, status FROM god_update_campaigns WHERE status IN ('scheduled','active') ORDER BY created_at DESC LIMIT 1"
+    );
+    if (concurrent) {
+      throw new Error(`Masih ada campaign ${concurrent.version} (${concurrent.status}).`);
+    }
+    await dbRun(
+      `INSERT INTO god_update_campaigns
+       (version, components, note, scheduled_at, created_at, created_by, status, expected_total)
+       VALUES (?, ?, ?, ?, ?, ?, 'scheduled', ?)`,
+      [version, components, note, scheduledAt, createdAt, Number(adminId || 0) || null, targets.length]
+    );
+    for (const ip of targets) {
+      await dbRun(
+        "INSERT INTO god_update_targets (version, vps_ip, status, message, updated_at) VALUES (?, ?, 'pending', '', ?)",
+        [version, ip, createdAt]
+      );
+    }
+    await dbRun('COMMIT');
+  } catch (error) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw error;
+  }
+  return { version, components, note, scheduled_at: scheduledAt, created_at: createdAt, expected_total: targets.length };
+}
+
+async function cancelGodUpdateCampaign(versionInput, adminId) {
+  const version = String(versionInput || '').trim();
+  if (!version) return false;
+  const result = await dbRun(
+    "UPDATE god_update_campaigns SET status='cancelled', completed_at=?, note=COALESCE(note,'') || ? WHERE version=? AND status IN ('scheduled','active')",
+    [Date.now(), `; cancelled by ${Number(adminId || 0)}`, version]
+  );
+  return Number(result?.changes || 0) > 0;
+}
+
+async function notifyGodUpdateAdmins(message, preferredAdminId = 0) {
+  const ids = Array.from(new Set([
+    Number(preferredAdminId || 0),
+    ...ADMIN_IDS.map((id) => Number(id || 0))
+  ].filter((id) => Number.isInteger(id) && id > 0)));
+  let sent = 0;
+  for (const id of ids) {
+    try {
+      await bot.telegram.sendMessage(id, message);
+      sent += 1;
+    } catch (_) {}
+  }
+  return { sent, total: ids.length };
+}
+
+let godUpdateCampaignJobRunning = false;
+async function processGodUpdateCampaigns() {
+  if (godUpdateCampaignJobRunning) return;
+  godUpdateCampaignJobRunning = true;
+  try {
+    const now = Date.now();
+    const campaigns = await dbAll(
+      "SELECT * FROM god_update_campaigns WHERE status IN ('scheduled','active') OR (status='completed' AND report_sent_at IS NULL) ORDER BY scheduled_at ASC LIMIT 10"
+    );
+    for (const campaign of campaigns) {
+      if (Number(campaign.scheduled_at || 0) > now) continue;
+      if (String(campaign.status) === 'scheduled') {
+        const started = await dbRun(
+          "UPDATE god_update_campaigns SET status='active', started_notice_at=COALESCE(started_notice_at, ?) WHERE version=? AND status='scheduled'",
+          [now, campaign.version]
+        );
+        if (Number(started?.changes || 0) > 0 && !Number(campaign.started_notice_at || 0)) {
+          await notifyGodUpdateAdmins(
+            uiBox('GOD MODE DIMULAI', [
+              `Campaign : ${campaign.version}`,
+              `Paket    : ${godUpdateComponentLabel(campaign.components)}`,
+              `Target   : ${Number(campaign.expected_total || 0)} VPS`,
+              `Mulai    : ${formatDateTime(now)}`,
+              '',
+              'VPS akan mengambil update dari jalur wajib yang terpisah dari setting auto-update biasa.'
+            ]),
+            campaign.created_by
+          );
+        }
+      }
+      const summary = await getGodUpdateCampaignSummary(campaign.version);
+      const expected = Number(campaign.expected_total || summary.total || 0);
+      if (expected > 0 && summary.success >= expected && !Number(campaign.report_sent_at || 0)) {
+        const finishedAt = Date.now();
+        const completed = await dbRun(
+          "UPDATE god_update_campaigns SET status='completed', completed_at=?, report_sent_at=? WHERE version=? AND report_sent_at IS NULL",
+          [finishedAt, finishedAt, campaign.version]
+        );
+        if (Number(completed?.changes || 0) > 0) {
+          const notification = await notifyGodUpdateAdmins(
+            uiBox('GOD MODE SELESAI', [
+              `Campaign : ${campaign.version}`,
+              `Paket    : ${godUpdateComponentLabel(campaign.components)}`,
+              `Berhasil : ${summary.success}/${expected} VPS`,
+              `Gagal    : ${summary.failed}`,
+              `Pending  : ${summary.pending}`,
+              `Selesai  : ${formatDateTime(finishedAt)}`,
+              '',
+              'Semua target campaign sudah mengirim konfirmasi update berhasil.'
+            ]),
+            campaign.created_by
+          );
+          if (Number(notification?.sent || 0) < 1) {
+            await dbRun(
+              'UPDATE god_update_campaigns SET report_sent_at=NULL WHERE version=?',
+              [campaign.version]
+            ).catch(() => {});
+          }
+        }
+      }
+    }
+  } finally {
+    godUpdateCampaignJobRunning = false;
+  }
 }
 
 async function adminRemoveRegisteredIp(ip, adminId) {
@@ -3159,6 +3382,7 @@ function adminMenu() {
     [Markup.button.callback('⬆️ Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('⬆️ Unggah Script Summary API', 'm_admin_upload_summary_api')],
     [Markup.button.callback('🚀 Update SC (Pilih Target)', 'm_admin_trigger_sc_update')],
     [Markup.button.callback('🚀 Trigger Update Summary API', 'm_admin_trigger_summary_update')],
+    [Markup.button.callback('⚡ GOD MODE UPDATE WAJIB', 'm_admin_god_update')],
 
     [Markup.button.callback('💸 Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
     [Markup.button.callback('⚙️ Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('🛠️ Ubah Pengaturan', 'm_admin_env_set')],
@@ -4448,12 +4672,19 @@ async function removeApiDomain(domain) {
 }
 
 async function listApiDomains() {
-  return dbAll('SELECT domain, is_active, updated_at FROM api_domains ORDER BY domain ASC');
+  return dbAll('SELECT domain, is_active, updated_at FROM api_domains ORDER BY is_active DESC, updated_at DESC, id DESC');
+}
+
+async function listActiveApiDomains() {
+  const rows = await dbAll(
+    'SELECT domain FROM api_domains WHERE is_active = 1 ORDER BY updated_at DESC, id DESC'
+  );
+  return Array.from(new Set(rows.map((row) => String(row?.domain || '').trim().toLowerCase()).filter(Boolean)));
 }
 
 async function getPrimaryApiDomain() {
-  const row = await dbGet('SELECT domain FROM api_domains WHERE is_active = 1 ORDER BY updated_at DESC, id DESC LIMIT 1');
-  return String(row?.domain || '').trim();
+  const domains = await listActiveApiDomains();
+  return domains[0] || '';
 }
 
 function escapeHtml(input) {
@@ -4470,21 +4701,24 @@ function shellQuote(input) {
 }
 
 async function buildInstallerQuickCopyText(options = {}) {
-  const domain = await getPrimaryApiDomain();
-  if (!domain) {
+  const domains = await listActiveApiDomains();
+  const domain = domains[0] || '';
+  if (!domains.length) {
     return {
       ok: false,
       text: 'Link installer belum tersedia. Hubungi admin untuk set domain installer.',
       parse_mode: undefined
     };
   }
-  const installerUrl = `https://${domain}/i`;
+  const installerUrls = domains.map((item) => `https://${item}/i`);
+  const installerUrl = installerUrls[0];
   const isGeneral = options?.general === true;
   const serverKey = String(options?.serverKey || '').trim();
   const keyEnv = !isGeneral && serverKey.length >= 8
     ? `INSTALL_AUTH_TOKEN=${shellQuote(serverKey)} API_AUTH_TOKEN=${shellQuote(serverKey)} AUTH_TOKEN=${shellQuote(serverKey)} `
     : '';
-  const cmd = `curl -4fsSL --connect-timeout 15 --retry 5 ${shellQuote(installerUrl)} -o /root/nexus-installer.sh && chmod +x /root/nexus-installer.sh && ${keyEnv}screen -S nexus-sc /root/nexus-installer.sh`;
+  const urlArgs = installerUrls.map(shellQuote).join(' ');
+  const cmd = `rm -f /root/nexus-installer.sh; for u in ${urlArgs}; do if curl -4fsSL --connect-timeout 15 --retry 3 "$u" -o /root/nexus-installer.sh && head -n1 /root/nexus-installer.sh | grep -q '^#!'; then break; fi; rm -f /root/nexus-installer.sh; done; test -s /root/nexus-installer.sh && chmod +x /root/nexus-installer.sh && ${keyEnv}screen -S nexus-sc /root/nexus-installer.sh`;
   const line = '────────────────────────';
   if (isGeneral) {
     return {
@@ -4529,7 +4763,7 @@ async function buildInstallerQuickCopyText(options = {}) {
       `Client        : ${escapeHtml(clientName)}`,
       `VPS Address   : ${escapeHtml(ip)}`,
       `Valid Until   : ${escapeHtml(expired)}`,
-      `Installer Host: ${escapeHtml(domain)}`,
+      `Installer Host: ${escapeHtml(domain)} (${domains.length} domain fallback)`,
       line,
       `Nexus API Key : ${escapeHtml(authText)}`,
       '',
@@ -5119,8 +5353,15 @@ bot.action('m_admin_list_domains', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   const rows = await listApiDomains().catch(() => []);
   if (!rows.length) return ctx.reply('Belum ada domain API tersimpan.', adminMenu());
-  const lines = rows.map((r, i) => `${i + 1}. ${r.domain} (${Number(r.is_active) === 1 ? 'aktif' : 'nonaktif'})`);
-  await ctx.reply(`Domain API:\n${lines.join('\n')}`, adminMenu());
+  const lines = rows.map((r, i) => {
+    const active = Number(r.is_active) === 1;
+    const role = active ? (i === 0 ? 'utama' : `fallback ${i}`) : 'nonaktif';
+    return `${i + 1}. ${r.domain} (${role})`;
+  });
+  await ctx.reply(
+    `Domain API (urutan auto-fallback):\n${lines.join('\n')}\n\nDomain aktif terbaru menjadi domain utama.`,
+    adminMenu()
+  );
 });
 
 bot.action(/m_admin_active_sc_(\d+)/, async (ctx) => {
@@ -5391,6 +5632,156 @@ bot.action('m_admin_trigger_summary_update_confirm', async (ctx) => {
     ]),
     adminMenu()
   );
+});
+
+bot.action('m_admin_god_update', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const [activeCount, latest, openCampaign] = await Promise.all([
+    countActiveScRegistrations().catch(() => 0),
+    getLatestGodUpdateCampaign().catch(() => null),
+    getOpenGodUpdateCampaign().catch(() => null)
+  ]);
+  const summary = latest?.version
+    ? await getGodUpdateCampaignSummary(latest.version).catch(() => null)
+    : null;
+  const rows = [
+    `Target aktif : ${activeCount} IP VPS`,
+    'Jalur        : wajib, terpisah dari auto-update user',
+    'Proteksi     : key VPS + lisensi + signed manifest + rollback',
+    '',
+    latest ? `Campaign terakhir: ${latest.version}` : 'Campaign terakhir: belum ada',
+    latest ? `Status          : ${latest.status}` : '',
+    latest ? `Paket           : ${godUpdateComponentLabel(latest.components)}` : '',
+    latest ? `Jadwal          : ${formatDateTime(latest.scheduled_at)} WIB` : '',
+    summary ? `Hasil           : sukses=${summary.success} jalan=${summary.running} gagal=${summary.failed} pending=${summary.pending}` : '',
+    '',
+    openCampaign
+      ? 'Masih ada campaign berjalan. Lihat status atau batalkan sebelum membuat yang baru.'
+      : 'Pilih paket update wajib yang mau dikirim ke semua VPS aktif.'
+  ];
+  const buttons = [];
+  if (!openCampaign) {
+    buttons.push([Markup.button.callback('Script SC Saja', 'm_admin_god_component_script')]);
+    buttons.push([Markup.button.callback('Summary API Saja', 'm_admin_god_component_summary')]);
+    buttons.push([Markup.button.callback('Script + Summary API', 'm_admin_god_component_both')]);
+  }
+  buttons.push([Markup.button.callback('Cek Status God Mode', 'm_admin_god_status')]);
+  if (openCampaign) buttons.push([Markup.button.callback('Batalkan Campaign', 'm_admin_god_cancel')]);
+  buttons.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
+  return ctx.reply(uiBox('GOD MODE UPDATE WAJIB', rows.filter(Boolean)), Markup.inlineKeyboard(buttons));
+});
+
+bot.action(/^m_admin_god_component_(script|summary|both)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const components = normalizeGodUpdateComponents(ctx.match?.[1]);
+  const scPath = await getScInstallerLocalPath().catch(() => DEFAULT_SC_INSTALLER_LOCAL_PATH);
+  const summaryPath = await getSummaryApiLocalPath().catch(() => DEFAULT_SUMMARY_API_LOCAL_PATH);
+  if ((components === 'script' || components === 'both') && !fs.existsSync(scPath)) {
+    return ctx.reply(`Installer SC belum ada: ${scPath}`, adminMenu());
+  }
+  if ((components === 'summary' || components === 'both') && !fs.existsSync(summaryPath)) {
+    return ctx.reply(`Installer Summary API belum ada: ${summaryPath}`, adminMenu());
+  }
+  return ctx.reply(
+    uiBox('ATUR WAKTU GOD MODE', [
+      `Paket  : ${godUpdateComponentLabel(components)}`,
+      'Target : semua IP VPS yang aktif saat konfirmasi',
+      '',
+      'Pilih jalankan sekarang atau tentukan tanggal dan jam WIB.'
+    ]),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Jalankan Sekarang', `m_admin_god_now_${components}`)],
+      [Markup.button.callback('Atur Tanggal & Jam WIB', `m_admin_god_schedule_${components}`)],
+      [Markup.button.callback('Batal', 'm_admin_god_update')]
+    ])
+  );
+});
+
+bot.action(/^m_admin_god_now_(script|summary|both)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  try {
+    const campaign = await createGodUpdateCampaign(ctx.from.id, ctx.match?.[1], Date.now());
+    await processGodUpdateCampaigns().catch(() => {});
+    return ctx.reply(
+      uiBox('GOD MODE DIJADWALKAN SEKARANG', [
+        `Campaign : ${campaign.version}`,
+        `Paket    : ${godUpdateComponentLabel(campaign.components)}`,
+        `Target   : ${campaign.expected_total} VPS`,
+        `Mulai    : ${formatDateTime(campaign.scheduled_at)} WIB`,
+        '',
+        'Ringkasan otomatis dikirim setelah semua target berhasil.'
+      ]),
+      adminMenu()
+    );
+  } catch (error) {
+    return ctx.reply(`God Mode gagal dibuat: ${parseErr(error)}`, adminMenu());
+  }
+});
+
+bot.action(/^m_admin_god_schedule_(script|summary|both)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const components = normalizeGodUpdateComponents(ctx.match?.[1]);
+  userState.set(ctx.chat.id, { step: 'admin_god_schedule_time', components });
+  return ctx.reply(
+    `Kirim jadwal WIB dengan format YYYY-MM-DD HH:mm\n` +
+      `Contoh: 2026-09-03 23:30\n\n` +
+      `Paket: ${godUpdateComponentLabel(components)}\n` +
+      'Ketik "batal" untuk membatalkan.'
+  );
+});
+
+bot.action('m_admin_god_status', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const campaign = await getLatestGodUpdateCampaign().catch(() => null);
+  if (!campaign) return ctx.reply('Belum ada campaign God Mode.', adminMenu());
+  const summary = await getGodUpdateCampaignSummary(campaign.version);
+  const failed = await dbAll(
+    "SELECT vps_ip, message FROM god_update_targets WHERE version=? AND status='failed' ORDER BY updated_at DESC LIMIT 10",
+    [campaign.version]
+  );
+  const lines = [
+    `Campaign : ${campaign.version}`,
+    `Status   : ${campaign.status}`,
+    `Paket    : ${godUpdateComponentLabel(campaign.components)}`,
+    `Jadwal   : ${formatDateTime(campaign.scheduled_at)} WIB`,
+    `Target   : ${Number(campaign.expected_total || summary.total)}`,
+    `Berhasil : ${summary.success}`,
+    `Berjalan : ${summary.running}`,
+    `Gagal    : ${summary.failed}`,
+    `Pending  : ${summary.pending}`
+  ];
+  if (failed.length) {
+    lines.push('', 'Gagal terakhir:');
+    for (const row of failed) lines.push(`- ${row.vps_ip}: ${String(row.message || '-').slice(0, 90)}`);
+  }
+  return ctx.reply(uiBox('STATUS GOD MODE', lines), adminMenu());
+});
+
+bot.action('m_admin_god_cancel', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const campaign = await getOpenGodUpdateCampaign().catch(() => null);
+  if (!campaign) return ctx.reply('Tidak ada campaign aktif untuk dibatalkan.', adminMenu());
+  return ctx.reply(
+    `Batalkan campaign ${campaign.version}? VPS yang sudah selesai tidak di-rollback.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Ya, Batalkan', `m_admin_god_cancel_confirm_${campaign.version}`)],
+      [Markup.button.callback('Kembali', 'm_admin_god_update')]
+    ])
+  );
+});
+
+bot.action(/^m_admin_god_cancel_confirm_(god-\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const version = String(ctx.match?.[1] || '');
+  const cancelled = await cancelGodUpdateCampaign(version, ctx.from.id);
+  return ctx.reply(cancelled ? `Campaign ${version} dibatalkan.` : 'Campaign sudah selesai/tidak ditemukan.', adminMenu());
 });
 
 bot.action('m_cek_saldo', async (ctx) => {
@@ -6037,6 +6428,36 @@ bot.on('text', async (ctx) => {
     return ctx.reply('Dibatalkan.', mainMenu());
   }
   try {
+    if (state.step === 'admin_god_schedule_time') {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const scheduledAt = parseWibSchedule(text);
+      if (!scheduledAt) {
+        return ctx.reply('Format jadwal tidak valid. Gunakan YYYY-MM-DD HH:mm dalam WIB.');
+      }
+      if (scheduledAt < Date.now() + 60000) {
+        return ctx.reply('Jadwal minimal 1 menit dari sekarang.');
+      }
+      if (scheduledAt > Date.now() + (30 * DAY_MS)) {
+        return ctx.reply('Jadwal maksimal 30 hari dari sekarang.');
+      }
+      const campaign = await createGodUpdateCampaign(ctx.from.id, state.components, scheduledAt);
+      userState.delete(ctx.chat.id);
+      return ctx.reply(
+        uiBox('GOD MODE TERJADWAL', [
+          `Campaign : ${campaign.version}`,
+          `Paket    : ${godUpdateComponentLabel(campaign.components)}`,
+          `Target   : ${campaign.expected_total} VPS`,
+          `Jadwal   : ${formatDateTime(campaign.scheduled_at)} WIB`,
+          '',
+          'Campaign otomatis aktif pada waktunya dan ringkasan dikirim setelah semua target berhasil.'
+        ]),
+        adminMenu()
+      );
+    }
+
     if (state.step === 'admin_broadcast_message') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
@@ -8087,6 +8508,11 @@ async function launchBotWithRetry(maxAttempts = 6) {
 
 function startBackgroundJobs() {
   setInterval(pollPendingTopups, 15000);
+  setInterval(() => {
+    processGodUpdateCampaigns().catch((err) => {
+      console.error('god update campaign job failed:', formatStartError(err));
+    });
+  }, GOD_UPDATE_REPORT_INTERVAL_MS);
   const scExpiryTickMs = getScExpiryTickMs();
   console.log(`[sc-expiry-job] scheduler interval=${Math.round(scExpiryTickMs / 1000)}s`);
   if (scExpirySchedulerTimer) clearInterval(scExpirySchedulerTimer);
@@ -8105,6 +8531,9 @@ function startBackgroundJobs() {
 
   pollPendingTopups().catch((err) => {
     console.error('initial topup poll failed:', formatStartError(err));
+  });
+  processGodUpdateCampaigns().catch((err) => {
+    console.error('initial god update campaign job failed:', formatStartError(err));
   });
   runScExpiryJobOnce('initial').catch((err) => {
     console.error('initial natural expiry job failed:', formatStartError(err));

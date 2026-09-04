@@ -181,7 +181,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.40}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.41}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -2957,7 +2957,8 @@ setup_haproxy_tls_mux() {
   if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then
     haproxy_log_option="    option tcplog"
   else
-    haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
+    haproxy_log_option="    option dontlog-normal
+    option log-separate-errors"
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
     xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2"
@@ -2985,6 +2986,9 @@ defaults
     mode tcp
 ${haproxy_log_option}
     option dontlognull
+    # Deteksi peer yang hilang tanpa memangkas timeout tunnel aktif 12 jam.
+    option clitcpka
+    option srvtcpka
     timeout connect 30s
     # WS tunnel perlu timeout panjang; 2m sering bikin koneksi putus sendiri.
     timeout client  12h
@@ -13502,6 +13506,183 @@ WantedBy=timers.target
 EOF
 }
 
+setup_postboot_health_guard() {
+  cat > /usr/local/sbin/sc-1forcr-postboot-health <<'POSTBOOT_HEALTH_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+LOCK_FILE="/run/sc-1forcr-postboot-health.lock"
+ACCESS_LOCK_FILE="/etc/sc-1forcr-access.lock"
+HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
+declare -a repaired_units=()
+failed=0
+
+mkdir -p /run >/dev/null 2>&1 || true
+exec 9>"${LOCK_FILE}"
+flock -n 9 || exit 0
+
+log_health() {
+  logger -t sc-1forcr-postboot -- "$*" 2>/dev/null || true
+}
+
+unit_managed() {
+  local unit="$1"
+  systemctl is-active --quiet "${unit}" 2>/dev/null || \
+    systemctl is-enabled --quiet "${unit}" 2>/dev/null
+}
+
+listener_present() {
+  local port="$1"
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  ss -H -lnt 2>/dev/null | awk -v want="${port}" '
+    {
+      address=$4;
+      sub(/^.*:/, "", address);
+      if (address == want) found=1;
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+unit_healthy() {
+  local unit="$1"
+  shift
+  systemctl is-active --quiet "${unit}" 2>/dev/null || return 1
+  local port
+  for port in "$@"; do
+    listener_present "${port}" || return 1
+  done
+  return 0
+}
+
+config_valid_for_unit() {
+  local unit="$1"
+  case "${unit}" in
+    nginx.service)
+      nginx -t >/dev/null 2>&1
+      ;;
+    haproxy.service)
+      haproxy -c -f "${HAPROXY_CONFIG}" >/dev/null 2>&1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+repair_unit_if_needed() {
+  local unit="$1"
+  shift
+  unit_managed "${unit}" || return 0
+  unit_healthy "${unit}" "$@" && return 0
+
+  # Konfirmasi sekali lagi agar listener yang baru start tidak dianggap gagal.
+  sleep 3
+  unit_healthy "${unit}" "$@" && return 0
+  if ! config_valid_for_unit "${unit}"; then
+    log_health "SKIP ${unit}: konfigurasi tidak valid"
+    failed=1
+    return 1
+  fi
+  if ! systemctl restart "${unit}" >/dev/null 2>&1; then
+    log_health "GAGAL restart ${unit}"
+    failed=1
+    return 1
+  fi
+
+  local attempt
+  for attempt in {1..10}; do
+    sleep 2
+    if unit_healthy "${unit}" "$@"; then
+      repaired_units+=("${unit}")
+      return 0
+    fi
+  done
+  log_health "GAGAL sehat setelah restart: ${unit}"
+  failed=1
+  return 1
+}
+
+if [[ -f "${ACCESS_LOCK_FILE}" ]]; then
+  log_health "Pemeriksaan dilewati: akses SC sedang dikunci"
+  exit 0
+fi
+
+# Dependensi diperiksa lebih dulu. Unit yang sudah aktif dan listen tidak disentuh.
+repair_unit_if_needed ssh.service || true
+repair_unit_if_needed dropbear.service || true
+repair_unit_if_needed xray.service || true
+repair_unit_if_needed sc-1forcr-api.service || true
+
+declare -a nginx_ports=()
+declare -a sshws_ports=()
+if [[ -r "${HAPROXY_CONFIG}" ]]; then
+  mapfile -t nginx_ports < <(awk '
+    $1 == "server" && ($2 == "nginx_local" || $2 == "nginx_grpc") {
+      n=split($3, address, ":"); port=address[n];
+      if (port ~ /^[0-9]+$/ && !seen[port]++) print port;
+    }
+  ' "${HAPROXY_CONFIG}")
+  mapfile -t sshws_ports < <(awk '
+    $1 == "server" && $2 == "sshws_local" {
+      n=split($3, address, ":"); port=address[n];
+      if (port ~ /^[0-9]+$/ && !seen[port]++) print port;
+    }
+  ' "${HAPROXY_CONFIG}")
+fi
+
+repair_unit_if_needed sc-1forcr-sshws.service "${sshws_ports[@]}" || true
+repair_unit_if_needed nginx.service "${nginx_ports[@]}" || true
+repair_unit_if_needed haproxy.service 443 || true
+
+if [[ "${failed}" == "1" ]]; then
+  log_health "Health-check selesai dengan kegagalan; cek systemctl dan journal"
+  exit 1
+fi
+if (( ${#repaired_units[@]} > 0 )); then
+  log_health "Pulih otomatis: ${repaired_units[*]}"
+else
+  log_health "Semua layanan inti sehat; tidak ada restart"
+fi
+POSTBOOT_HEALTH_EOF
+  bash -n /usr/local/sbin/sc-1forcr-postboot-health
+  chmod 755 /usr/local/sbin/sc-1forcr-postboot-health
+
+  cat > /etc/systemd/system/sc-1forcr-postboot-health.service <<'POSTBOOT_HEALTH_SERVICE_EOF'
+[Unit]
+Description=SC 1FORCR conservative post-boot health recovery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-postboot-health
+TimeoutStartSec=120
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+POSTBOOT_HEALTH_SERVICE_EOF
+
+  cat > /etc/systemd/system/sc-1forcr-postboot-health.timer <<'POSTBOOT_HEALTH_TIMER_EOF'
+[Unit]
+Description=Check SC 1FORCR services after boot
+
+[Timer]
+OnActiveSec=90s
+AccuracySec=10s
+RandomizedDelaySec=15s
+Persistent=false
+Unit=sc-1forcr-postboot-health.service
+
+[Install]
+WantedBy=timers.target
+POSTBOOT_HEALTH_TIMER_EOF
+
+  systemctl daemon-reload >/dev/null
+  systemctl enable --now sc-1forcr-postboot-health.timer >/dev/null
+  systemctl restart sc-1forcr-postboot-health.timer >/dev/null
+}
+
 setup_auto_reboot_timer() {
   local reboot_interval_min reboot_mode reboot_wib_hour
   reboot_interval_min="$(echo "${AUTO_REBOOT_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
@@ -13586,7 +13767,7 @@ fi
 logger -t sc-1forcr "Auto reboot timer triggered (${AUTO_REBOOT_SCHEDULE_MODE})."
 sync
 sleep 2
-/usr/bin/systemctl --force reboot
+/usr/bin/systemctl reboot
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-safe-reboot
 
@@ -13611,6 +13792,7 @@ EOF
   else
     systemctl disable --now sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
   fi
+  setup_postboot_health_guard
 }
 
 setup_auto_backup_timer() {
@@ -23288,7 +23470,8 @@ EONGINX
   if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then
     haproxy_log_option="    option tcplog"
   else
-    haproxy_log_option="    # option tcplog disabled for lower CPU/disk use"
+    haproxy_log_option="    option dontlog-normal
+    option log-separate-errors"
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
     xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2"
@@ -23314,6 +23497,9 @@ defaults
     mode tcp
 ${haproxy_log_option}
     option dontlognull
+    # Deteksi peer yang hilang tanpa memangkas timeout tunnel aktif 12 jam.
+    option clitcpka
+    option srvtcpka
     timeout connect 30s
     # WS tunnel perlu timeout panjang; 2m sering bikin koneksi putus sendiri.
     timeout client  12h
@@ -26910,6 +27096,8 @@ systemctl stop sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-autoreboot.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autoreboot.service >/dev/null 2>&1 || true
+systemctl disable --now sc-1forcr-postboot-health.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-postboot-health.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-autobackup.service >/dev/null 2>&1 || true
@@ -26959,6 +27147,8 @@ rm -f /etc/systemd/system/sc-1forcr-iplimit.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
 rm -f /etc/systemd/system/sc-1forcr-autoreboot.service
 rm -f /etc/systemd/system/sc-1forcr-autoreboot.timer
+rm -f /etc/systemd/system/sc-1forcr-postboot-health.service
+rm -f /etc/systemd/system/sc-1forcr-postboot-health.timer
 rm -f /etc/systemd/system/sc-1forcr-autobackup.service
 rm -f /etc/systemd/system/sc-1forcr-autobackup.timer
 rm -f /etc/systemd/system/sc-1forcr-online-notify.service
@@ -26995,6 +27185,7 @@ rm -f /usr/local/sbin/lanjut-install
 rm -f /usr/local/sbin/uninstall-sc-1forcr
 rm -f /usr/local/sbin/uninstall-potato-compat
 rm -f /usr/local/sbin/sc-1forcr-safe-reboot
+rm -f /usr/local/sbin/sc-1forcr-postboot-health
 rm -f /usr/local/sbin/sc-1forcr-auto-backup
 rm -f /usr/local/sbin/sc-1forcr-restore-backup
 rm -f /usr/local/sbin/sc-1forcr-online-notify
@@ -27511,6 +27702,24 @@ activate_sshws_realip_runtime_if_needed() {
   setup_haproxy_tls_mux || return 1
   systemctl is-active --quiet sc-1forcr-sshws.service haproxy.service nginx.service || return 1
   SSHWS_REALIP_RUNTIME_RESTARTED="1"
+}
+
+activate_haproxy_connection_hardening_if_needed() {
+  local haproxy_conf="/etc/haproxy/haproxy.cfg" expected_log_option
+  if flag_enabled "${HAPROXY_TCPLOG_ENABLE:-0}"; then
+    expected_log_option="option tcplog"
+  else
+    expected_log_option="option dontlog-normal"
+  fi
+  if grep -qE '^[[:space:]]*option[[:space:]]+clitcpka([[:space:]]|$)' "${haproxy_conf}" 2>/dev/null &&
+     grep -qE '^[[:space:]]*option[[:space:]]+srvtcpka([[:space:]]|$)' "${haproxy_conf}" 2>/dev/null &&
+     grep -qF "${expected_log_option}" "${haproxy_conf}" 2>/dev/null; then
+    return 0
+  fi
+
+  log "Hardening koneksi HAProxy: keepalive + log hemat, graceful reload satu kali."
+  setup_haproxy_tls_mux || return 1
+  systemctl is-active --quiet haproxy.service nginx.service sc-1forcr-sshws.service || return 1
 }
 
 install_legacy_runtime_command_shims() {
@@ -28570,7 +28779,7 @@ restore_summary_runtime() {
 }
 
 rollback_snapshot() {
-  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard snapshot_has_udpgw_refactor restore_version
+  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard snapshot_has_udpgw_refactor snapshot_has_postboot_health restore_version
   local SUMMARY_RUNTIME_STATE_RECORDED="0" SUMMARY_SYSTEMD_PRESENT="0" SUMMARY_SYSTEMD_ACTIVE="0" SUMMARY_SYSTEMD_ENABLED="0"
   local SUMMARY_PM2_PRESENT="0" SUMMARY_WATCHDOG_ACTIVE="0" SUMMARY_WATCHDOG_ENABLED="0"
   snapshot_dir="$(verify_snapshot "${1:-latest}")" || return 1
@@ -28626,6 +28835,20 @@ rollback_snapshot() {
       /etc/systemd/system/sc-1forcr-udpgw-drain.service \
       /etc/systemd/system/sc-1forcr-udpgw-drain.timer \
       /etc/systemd/system/sc-1forcr-sshws.service.d/30-udpgw-alias.conf >/dev/null 2>&1 || true
+  fi
+
+  snapshot_has_postboot_health="0"
+  if tar -tzf "${snapshot_dir}/files.tar.gz" 2>/dev/null | \
+     awk '$0=="etc/systemd/system/sc-1forcr-postboot-health.timer" {found=1} END{exit found?0:1}'; then
+    snapshot_has_postboot_health="1"
+  fi
+  if [[ "${snapshot_has_postboot_health}" != "1" ]]; then
+    systemctl disable --now sc-1forcr-postboot-health.timer >/dev/null 2>&1 || true
+    systemctl stop sc-1forcr-postboot-health.service >/dev/null 2>&1 || true
+    rm -f \
+      /usr/local/sbin/sc-1forcr-postboot-health \
+      /etc/systemd/system/sc-1forcr-postboot-health.service \
+      /etc/systemd/system/sc-1forcr-postboot-health.timer >/dev/null 2>&1 || true
   fi
 
   systemctl stop sc-1forcr-license-guard.timer sc-1forcr-license-guard.service >/dev/null 2>&1 || true
@@ -28801,6 +29024,7 @@ main() {
     write_iplimit_checker
     setup_services
     activate_sshws_realip_runtime_if_needed
+    activate_haproxy_connection_hardening_if_needed
     setup_license_guard
     setup_auto_reboot_timer
     setup_auto_backup_timer

@@ -70,10 +70,29 @@ assert(installer.includes('-DCMAKE_POLICY_VERSION_MINIMUM=3.5'));
 assert.strictEqual((installer.match(/certificate_dns_host_valid "\$\{alias_host\}"/g) || []).length, 4);
 assert.strictEqual((installer.match(/log \/dev\/log local0 notice/g) || []).length, 2);
 assert(!installer.includes('log /dev/log local1 notice'));
+assert.strictEqual((installer.match(/option clitcpka/g) || []).length, 2);
+assert.strictEqual((installer.match(/option srvtcpka/g) || []).length, 2);
+assert.strictEqual((installer.match(/haproxy_log_option="    option dontlog-normal/g) || []).length, 2);
+assert(!installer.includes('/usr/bin/systemctl --force reboot'));
+assert(installer.includes('/usr/bin/systemctl reboot'));
+assert(installer.includes('activate_haproxy_connection_hardening_if_needed'));
+assert(installer.includes('setup_postboot_health_guard'));
+assert(installer.includes('OnActiveSec=90s'));
 assert((installer.match(/check inter 2s fall 3 rise 2/g) || []).length >= 10);
 assert(installer.includes('wait_haproxy_local_backends 30'));
 assert(updateManager.includes('tcp_listener_present()'));
 assert(updateManager.includes('backend lokal HAProxy tidak listen'));
+assert(updateManager.includes('snapshot_has_postboot_health'));
+assert(updateManager.includes('systemctl disable --now sc-1forcr-postboot-health.timer'));
+
+const postbootHealth = extract(
+  "cat > /usr/local/sbin/sc-1forcr-postboot-health <<'POSTBOOT_HEALTH_EOF'\n",
+  '\nPOSTBOOT_HEALTH_EOF\n'
+).body;
+const postbootSyntax = spawnSync(bash, ['-n'], { input: postbootHealth, encoding: 'utf8' });
+assert.strictEqual(postbootSyntax.status, 0, `generated post-boot health syntax failed:\n${postbootSyntax.stderr || postbootSyntax.stdout}`);
+assert(postbootHealth.includes('unit_healthy "${unit}" "$@" && return 0'));
+assert(postbootHealth.includes('Pemeriksaan dilewati: akses SC sedang dikunci'));
 
 const certHelperBody = extract(
   'sanitize_domain_host() {\n',

@@ -42,6 +42,61 @@ const updateManager = extract(
 const updateSyntax = spawnSync(bash, ['-n'], { input: updateManager, encoding: 'utf8' });
 assert.strictEqual(updateSyntax.status, 0, `generated update manager syntax failed:\n${updateSyntax.stderr || updateSyntax.stdout}`);
 
+const udpBootfix = extract(
+  "cat > /usr/local/sbin/sc-1forcr-udp-bootfix <<'EOF'\n",
+  '\nEOF\n  chmod +x /usr/local/sbin/sc-1forcr-udp-bootfix'
+).body;
+const udpBootfixSyntax = spawnSync(bash, ['-n'], { input: udpBootfix, encoding: 'utf8' });
+assert.strictEqual(udpBootfixSyntax.status, 0, `generated UDP boot-fix syntax failed:\n${udpBootfixSyntax.stderr || udpBootfixSyntax.stdout}`);
+
+const udpStopHelpers = `udp_backend_active_state() {\n${extract(
+  'udp_backend_active_state() {\n',
+  '\nenforce_single_udp_backend() {\n'
+).body}`;
+const udpStopBehavior = spawnSync(bash, [], {
+  input: `set -euo pipefail
+mock_dir="$(mktemp -d)"
+trap 'rm -rf -- "\${mock_dir}"' EXIT
+mock_state_file="\${mock_dir}/state"
+mock_log_file="\${mock_dir}/calls"
+mock_stop_mode="normal"
+printf 'active\\n' >"\${mock_state_file}"
+systemctl() {
+  local command="\${1:-}"
+  shift || true
+  case "\${command}" in
+    show) cat "\${mock_state_file}" ;;
+    stop)
+      printf 'stop %s\\n' "$*" >>"\${mock_log_file}"
+      [[ "\${mock_stop_mode}" == "normal" ]] && printf 'inactive\\n' >"\${mock_state_file}"
+      ;;
+    kill)
+      printf 'kill %s\\n' "$*" >>"\${mock_log_file}"
+      printf 'inactive\\n' >"\${mock_state_file}"
+      ;;
+    disable|reset-failed) : ;;
+    *) : ;;
+  esac
+}
+pkill() { printf 'pkill %s\\n' "$*" >>"\${mock_log_file}"; }
+sleep() { :; }
+log() { :; }
+${udpStopHelpers}
+stop_disable_udp_backend sc-1forcr-udpcustom udp-custom
+[[ "$(cat "\${mock_state_file}")" == "inactive" ]]
+if grep -q '^kill ' "\${mock_log_file}"; then exit 31; fi
+printf 'active\\n' >"\${mock_state_file}"
+: >"\${mock_log_file}"
+mock_stop_mode="stuck"
+stop_disable_udp_backend sc-1forcr-udpcustom udp-custom
+grep -q '^kill --kill-who=all --signal=SIGKILL sc-1forcr-udpcustom$' "\${mock_log_file}"
+grep -q '^pkill -KILL -x udp-custom$' "\${mock_log_file}"
+[[ "$(cat "\${mock_state_file}")" == "inactive" ]]
+`,
+  encoding: 'utf8'
+});
+assert.strictEqual(udpStopBehavior.status, 0, `UDP backend stop behavior failed:\n${udpStopBehavior.stderr || udpStopBehavior.stdout}`);
+
 const godUpdater = extract(
   'cat > "${god_script_tmp}" <<\'EOF\'\n',
   '\nEOF\n  if ! bash -n "${god_script_tmp}"; then'
@@ -84,6 +139,17 @@ assert(updateManager.includes('tcp_listener_present()'));
 assert(updateManager.includes('backend lokal HAProxy tidak listen'));
 assert(updateManager.includes('snapshot_has_postboot_health'));
 assert(updateManager.includes('systemctl disable --now sc-1forcr-postboot-health.timer'));
+assert(installer.includes('stop_disable_udp_backend()'));
+assert(installer.includes('wait_udp_backend_quiescent "${unit}" 15'));
+assert(installer.includes('systemctl stop --no-block "${unit}"'));
+assert(installer.includes('systemctl kill --kill-who=all --signal=SIGKILL "${unit}"'));
+assert(installer.includes('pkill -KILL -x "${process_name}"'));
+assert(!installer.includes('pkill -9 -f "udp-custom"'));
+assert(!installer.includes('pkill -9 -f "zivpn"'));
+assert(installer.includes('Unit UDP Custom diperbarui tanpa dinyalakan karena backend aktif adalah ZIVPN.'));
+assert(installer.includes('Unit ZIVPN diperbarui tanpa dinyalakan karena backend aktif adalah UDPHC.'));
+assert(udpBootfix.includes('stop_disable_udp_unit "${UDPCUSTOM_SERVICE}" "udp-custom" || exit 1'));
+assert(updateManager.includes('update_stop_disable_udp_unit "${udpcustom_unit}" "udp-custom" || return 1'));
 
 const postbootHealth = extract(
   "cat > /usr/local/sbin/sc-1forcr-postboot-health <<'POSTBOOT_HEALTH_EOF'\n",

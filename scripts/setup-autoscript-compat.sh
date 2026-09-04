@@ -181,7 +181,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.41}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.42}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -3195,6 +3195,7 @@ EOF
 }
 
 setup_zivpn_service_if_possible() {
+  local active_udp_backend
   mkdir -p /etc/zivpn
   ensure_zivpn_tls_assets
   ensure_zivpn_config_schema
@@ -3246,8 +3247,13 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable "${ZIVPN_SERVICE_NAME}" || true
-    systemctl restart "${ZIVPN_SERVICE_NAME}" || true
+    active_udp_backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "${active_udp_backend}" != "udpcustom" && "${active_udp_backend}" != "udp-custom" && "${active_udp_backend}" != "udphc" ]]; then
+      systemctl enable "${ZIVPN_SERVICE_NAME}" || true
+      systemctl restart "${ZIVPN_SERVICE_NAME}" || true
+    else
+      log "Unit ZIVPN diperbarui tanpa dinyalakan karena backend aktif adalah UDPHC."
+    fi
   fi
 }
 
@@ -3530,6 +3536,7 @@ setup_zivpn_udp_nat_rules() {
 }
 
 setup_udpcustom_service_if_possible() {
+  local active_udp_backend
   mkdir -p /root/udp
 
   if [[ ! -x /root/udp/udp-custom ]]; then
@@ -3576,8 +3583,13 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
-  systemctl restart "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+  active_udp_backend="$(printf '%s' "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${active_udp_backend}" == "udpcustom" || "${active_udp_backend}" == "udp-custom" || "${active_udp_backend}" == "udphc" ]]; then
+    systemctl enable "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+    systemctl restart "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+  else
+    log "Unit UDP Custom diperbarui tanpa dinyalakan karena backend aktif adalah ZIVPN."
+  fi
 }
 
 setup_udpcustom_udp_nat_rules() {
@@ -3618,15 +3630,71 @@ setup_udpcustom_udp_nat_rules() {
   fw_persist_rules
 }
 
+udp_backend_active_state() {
+  local unit="${1:-}"
+  [[ -n "${unit}" ]] || return 0
+  systemctl show "${unit}" --property=ActiveState --value 2>/dev/null || true
+}
+
+wait_udp_backend_quiescent() {
+  local unit="${1:-}" timeout_seconds="${2:-15}" state consecutive_quiet=0
+  [[ -n "${unit}" ]] || return 0
+  while (( timeout_seconds > 0 )); do
+    state="$(udp_backend_active_state "${unit}")"
+    case "${state}" in
+      inactive|failed|not-found|"")
+        consecutive_quiet=$((consecutive_quiet + 1))
+        if (( consecutive_quiet >= 2 )); then
+          return 0
+        fi
+        ;;
+      *)
+        consecutive_quiet=0
+        ;;
+    esac
+    sleep 1
+    timeout_seconds=$((timeout_seconds - 1))
+  done
+  return 1
+}
+
+stop_disable_udp_backend() {
+  local unit="${1:-}" process_name="${2:-}" state
+  [[ -n "${unit}" ]] || return 0
+
+  # Disable lebih dulu, lalu kirim stop eksplisit supaya Restart=always tidak
+  # menghidupkan backend lawan lagi saat installer mendekati health-check.
+  systemctl disable "${unit}" >/dev/null 2>&1 || true
+  systemctl stop --no-block "${unit}" >/dev/null 2>&1 || true
+  if wait_udp_backend_quiescent "${unit}" 15; then
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # SIGKILL hanya fallback terakhir untuk proses yang benar-benar macet.
+  systemctl kill --kill-who=all --signal=SIGKILL "${unit}" >/dev/null 2>&1 || true
+  if [[ -n "${process_name}" ]]; then
+    pkill -KILL -x "${process_name}" >/dev/null 2>&1 || true
+  fi
+  systemctl stop --no-block "${unit}" >/dev/null 2>&1 || true
+  if wait_udp_backend_quiescent "${unit}" 10; then
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  state="$(udp_backend_active_state "${unit}")"
+  log "Gagal menghentikan backend UDP lawan: ${unit} (state=${state:-unknown})."
+  return 1
+}
+
 enforce_single_udp_backend() {
   local backend
   backend="$(echo "${ACTIVE_UDP_BACKEND}" | tr '[:upper:]' '[:lower:]')"
   case "${backend}" in
     udpcustom|udp-custom|udphc)
-      systemctl disable --now "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
-      # Force kill kalau service masih bandel (stuck activating)
-      pkill -9 -f "zivpn" >/dev/null 2>&1 || true
-      sleep 1
+      if ! stop_disable_udp_backend "${ZIVPN_SERVICE_NAME}" "zivpn"; then
+        return 1
+      fi
       systemctl enable "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
       if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]] && systemctl is-active --quiet "${UDPCUSTOM_SERVICE_NAME}"; then
         systemctl start "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -3637,10 +3705,9 @@ enforce_single_udp_backend() {
       log "Backend UDP aktif: UDP Custom (${UDPCUSTOM_SERVICE_NAME})"
       ;;
     zivpn|*)
-      systemctl disable --now "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
-      # Force kill kalau service masih bandel (stuck activating)
-      pkill -9 -f "udp-custom" >/dev/null 2>&1 || true
-      sleep 1
+      if ! stop_disable_udp_backend "${UDPCUSTOM_SERVICE_NAME}" "udp-custom"; then
+        return 1
+      fi
       systemctl enable "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
       if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]] && systemctl is-active --quiet "${ZIVPN_SERVICE_NAME}"; then
         systemctl start "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -13416,9 +13483,43 @@ zivpn_port="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null | sed 
 udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
 [[ -z "${udphc_port}" ]] && udphc_port="5667"
 
+udp_unit_active_state() {
+  systemctl show "$1" --property=ActiveState --value 2>/dev/null || true
+}
+
+wait_udp_unit_quiescent() {
+  local unit="$1" timeout_seconds="${2:-15}" state consecutive_quiet=0
+  while (( timeout_seconds > 0 )); do
+    state="$(udp_unit_active_state "${unit}")"
+    case "${state}" in
+      inactive|failed|not-found|"")
+        consecutive_quiet=$((consecutive_quiet + 1))
+        (( consecutive_quiet >= 2 )) && return 0
+        ;;
+      *) consecutive_quiet=0 ;;
+    esac
+    sleep 1
+    timeout_seconds=$((timeout_seconds - 1))
+  done
+  return 1
+}
+
+stop_disable_udp_unit() {
+  local unit="$1" process_name="${2:-}"
+  systemctl disable "${unit}" >/dev/null 2>&1 || true
+  systemctl stop --no-block "${unit}" >/dev/null 2>&1 || true
+  if ! wait_udp_unit_quiescent "${unit}" 15; then
+    systemctl kill --kill-who=all --signal=SIGKILL "${unit}" >/dev/null 2>&1 || true
+    [[ -n "${process_name}" ]] && pkill -KILL -x "${process_name}" >/dev/null 2>&1 || true
+    systemctl stop --no-block "${unit}" >/dev/null 2>&1 || true
+    wait_udp_unit_quiescent "${unit}" 10 || return 1
+  fi
+  systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+}
+
 case "${ACTIVE_UDP_BACKEND}" in
   udpcustom|udp-custom|udphc)
-    systemctl disable --now "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    stop_disable_udp_unit "${ZIVPN_SERVICE}" "zivpn" || exit 1
     systemctl enable "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
     systemctl restart "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
     fw_allow_udp_input "${udphc_port}"
@@ -13427,7 +13528,7 @@ case "${ACTIVE_UDP_BACKEND}" in
     cleanup_zivpn_extra_udp_ports_to_port "${udphc_port}"
     ;;
   *)
-    systemctl disable --now "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
+    stop_disable_udp_unit "${UDPCUSTOM_SERVICE}" "udp-custom" || exit 1
     systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
     systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
     fw_allow_udp_input "${zivpn_port}"
@@ -22670,10 +22771,48 @@ ensure_zivpn_dnat_for_zivpn() {
   done
 }
 
+menu_udp_unit_active_state() {
+  systemctl show "$1" --property=ActiveState --value 2>/dev/null || true
+}
+
+menu_wait_udp_unit_quiescent() {
+  local unit="$1" timeout_seconds="${2:-15}" state consecutive_quiet=0
+  while (( timeout_seconds > 0 )); do
+    state="$(menu_udp_unit_active_state "${unit}")"
+    case "${state}" in
+      inactive|failed|not-found|"")
+        consecutive_quiet=$((consecutive_quiet + 1))
+        (( consecutive_quiet >= 2 )) && return 0
+        ;;
+      *) consecutive_quiet=0 ;;
+    esac
+    sleep 1
+    timeout_seconds=$((timeout_seconds - 1))
+  done
+  return 1
+}
+
+menu_stop_disable_udp_unit() {
+  local unit="$1" process_name="${2:-}" state
+  systemctl disable "${unit}" >/dev/null 2>&1 || true
+  systemctl stop --no-block "${unit}" >/dev/null 2>&1 || true
+  if ! menu_wait_udp_unit_quiescent "${unit}" 15; then
+    systemctl kill --kill-who=all --signal=SIGKILL "${unit}" >/dev/null 2>&1 || true
+    [[ -n "${process_name}" ]] && pkill -KILL -x "${process_name}" >/dev/null 2>&1 || true
+    systemctl stop --no-block "${unit}" >/dev/null 2>&1 || true
+    if ! menu_wait_udp_unit_quiescent "${unit}" 10; then
+      state="$(menu_udp_unit_active_state "${unit}")"
+      echo "Gagal menghentikan backend UDP ${unit} (state=${state:-unknown})."
+      return 1
+    fi
+  fi
+  systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+}
+
 switch_udp_to_zivpn() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
-  systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
+  menu_stop_disable_udp_unit "${udpcustom}" "udp-custom" || return 1
   systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
   systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
   ACTIVE_UDP_BACKEND="zivpn"
@@ -22688,7 +22827,7 @@ switch_udp_to_udpcustom() {
   udpcustom="$(detect_udpcustom_service)"
   udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   [[ -z "${udphc_port}" ]] && udphc_port="5667"
-  systemctl disable --now "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+  menu_stop_disable_udp_unit "${ZIVPN_SERVICE}" "zivpn" || return 1
   systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
   systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
   cleanup_zivpn_dnat_for_udphc
@@ -22720,11 +22859,11 @@ restart_active_udp_backend() {
   ustat="$(systemctl is-active "${udpcustom}" 2>/dev/null || true)"
   if [[ "${zstat}" == "active" && "${ustat}" == "active" ]]; then
     if [[ "${preferred}" == "udpcustom" || "${preferred}" == "udp-custom" || "${preferred}" == "udphc" ]]; then
-      systemctl disable --now "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+      menu_stop_disable_udp_unit "${ZIVPN_SERVICE}" "zivpn" || return 1
       systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
       echo "Keduanya aktif, dipaksa single backend: UDPHC aktif, ZIVPN dimatikan."
     else
-      systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
+      menu_stop_disable_udp_unit "${udpcustom}" "udp-custom" || return 1
       systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
       echo "Keduanya aktif, dipaksa single backend: ZIVPN aktif, UDPHC dimatikan."
     fi
@@ -22948,7 +23087,7 @@ repair_udp_backends() {
 
   if [[ "${zstat}" == "active" && "${ustat}" == "active" ]]; then
     # Single backend policy: default ke ZIVPN saat bentrok.
-    systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
+    menu_stop_disable_udp_unit "${udpcustom}" "udp-custom" || return 1
     systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
     chosen="zivpn"
   elif [[ "${zstat}" == "active" ]]; then
@@ -28669,6 +28808,44 @@ PY
   return 0
 }
 
+update_udp_unit_active_state() {
+  systemctl show "$1" --property=ActiveState --value 2>/dev/null || true
+}
+
+update_wait_udp_unit_quiescent() {
+  local unit="$1" timeout_seconds="${2:-15}" state consecutive_quiet=0
+  while (( timeout_seconds > 0 )); do
+    state="$(update_udp_unit_active_state "${unit}")"
+    case "${state}" in
+      inactive|failed|not-found|"")
+        consecutive_quiet=$((consecutive_quiet + 1))
+        (( consecutive_quiet >= 2 )) && return 0
+        ;;
+      *) consecutive_quiet=0 ;;
+    esac
+    sleep 1
+    timeout_seconds=$((timeout_seconds - 1))
+  done
+  return 1
+}
+
+update_stop_disable_udp_unit() {
+  local unit="$1" process_name="${2:-}" state
+  systemctl disable "${unit}" >/dev/null 2>&1 || true
+  systemctl stop --no-block "${unit}" >/dev/null 2>&1 || true
+  if ! update_wait_udp_unit_quiescent "${unit}" 15; then
+    systemctl kill --kill-who=all --signal=SIGKILL "${unit}" >/dev/null 2>&1 || true
+    [[ -n "${process_name}" ]] && pkill -KILL -x "${process_name}" >/dev/null 2>&1 || true
+    systemctl stop --no-block "${unit}" >/dev/null 2>&1 || true
+    if ! update_wait_udp_unit_quiescent "${unit}" 10; then
+      state="$(update_udp_unit_active_state "${unit}")"
+      log_update_manager "Gagal menghentikan backend UDP ${unit} saat restore (state=${state:-unknown})."
+      return 1
+    fi
+  fi
+  systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+}
+
 restart_after_restore() {
   local unit backend zivpn_unit udpcustom_unit udpgw_ports_raw udpgw_port
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -28696,13 +28873,13 @@ restart_after_restore() {
   zivpn_unit="$(service_unit_name "${ZIVPN_SERVICE:-zivpn}")"
   udpcustom_unit="$(service_unit_name "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}")"
   if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
-    systemctl disable --now "${zivpn_unit}" >/dev/null 2>&1 || true
+    update_stop_disable_udp_unit "${zivpn_unit}" "zivpn" || return 1
     if unit_is_installed "${udpcustom_unit}"; then
       systemctl enable "${udpcustom_unit}" >/dev/null 2>&1 || true
       systemctl restart "${udpcustom_unit}" >/dev/null 2>&1 || true
     fi
   else
-    systemctl disable --now "${udpcustom_unit}" >/dev/null 2>&1 || true
+    update_stop_disable_udp_unit "${udpcustom_unit}" "udp-custom" || return 1
     if unit_is_installed "${zivpn_unit}"; then
       systemctl enable "${zivpn_unit}" >/dev/null 2>&1 || true
       systemctl restart "${zivpn_unit}" >/dev/null 2>&1 || true

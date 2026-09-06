@@ -97,6 +97,53 @@ grep -q '^pkill -KILL -x udp-custom$' "\${mock_log_file}"
 });
 assert.strictEqual(udpStopBehavior.status, 0, `UDP backend stop behavior failed:\n${udpStopBehavior.stderr || udpStopBehavior.stdout}`);
 
+const autoBackupTimerHelper = `ensure_auto_backup_timer_armed() {\n${extract(
+  'ensure_auto_backup_timer_armed() {\n',
+  '\nsetup_auto_backup_timer() {\n'
+).body}`;
+const autoBackupTimerBehavior = spawnSync(bash, [], {
+  input: `set -euo pipefail
+mock_timer_state="waiting"
+systemctl() {
+  case "\${1:-}" in
+    enable|restart) return 0 ;;
+    show) printf '%s\\n' "\${mock_timer_state}" ;;
+    is-active) [[ "\${mock_timer_state}" == "waiting" || "\${mock_timer_state}" == "running" ]] ;;
+    *) return 1 ;;
+  esac
+}
+sleep() { :; }
+log() { :; }
+${autoBackupTimerHelper}
+ensure_auto_backup_timer_armed
+mock_timer_state="elapsed"
+if ensure_auto_backup_timer_armed; then exit 41; fi
+`,
+  encoding: 'utf8'
+});
+assert.strictEqual(autoBackupTimerBehavior.status, 0, `auto-backup timer behavior failed:\n${autoBackupTimerBehavior.stderr || autoBackupTimerBehavior.stdout}`);
+
+const autoBackupDelayHelper = `auto_backup_initial_delay_seconds() {\n${extract(
+  'auto_backup_initial_delay_seconds() {\n',
+  '\nensure_auto_backup_timer_armed() {\n'
+).body}`;
+const autoBackupDelayBehavior = spawnSync(bash, [], {
+  input: `set -euo pipefail
+mock_now=10000
+mock_last=7000
+date() { printf '%s\\n' "\${mock_now}"; }
+cat() { printf '%s\\n' "\${mock_last}"; }
+${autoBackupDelayHelper}
+[[ "$(auto_backup_initial_delay_seconds 60)" == "600" ]]
+mock_last=1000
+[[ "$(auto_backup_initial_delay_seconds 60)" == "60" ]]
+mock_last=9990
+[[ "$(auto_backup_initial_delay_seconds 1)" == "60" ]]
+`,
+  encoding: 'utf8'
+});
+assert.strictEqual(autoBackupDelayBehavior.status, 0, `auto-backup remaining-delay behavior failed:\n${autoBackupDelayBehavior.stderr || autoBackupDelayBehavior.stdout}`);
+
 const godUpdater = extract(
   'cat > "${god_script_tmp}" <<\'EOF\'\n',
   '\nEOF\n  if ! bash -n "${god_script_tmp}"; then'
@@ -119,7 +166,7 @@ assert(botApp.includes('location ^~ /.well-known/acme-challenge/'));
 assert(botApp.includes('writeNginxInstallerVhost(domain, DEFAULT_LICENSE_API_PORT, { tls: true })'));
 
 const acceptedTimerState = '[[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]';
-assert.strictEqual((updateManager.split(acceptedTimerState).length - 1), 3);
+assert.strictEqual((updateManager.split(acceptedTimerState).length - 1), 5);
 
 assert(installer.includes('-DCMAKE_POLICY_VERSION_MINIMUM=3.5'));
 assert.strictEqual((installer.match(/certificate_dns_host_valid "\$\{alias_host\}"/g) || []).length, 4);
@@ -150,6 +197,14 @@ assert(installer.includes('Unit UDP Custom diperbarui tanpa dinyalakan karena ba
 assert(installer.includes('Unit ZIVPN diperbarui tanpa dinyalakan karena backend aktif adalah UDPHC.'));
 assert(udpBootfix.includes('stop_disable_udp_unit "${UDPCUSTOM_SERVICE}" "udp-custom" || exit 1'));
 assert(updateManager.includes('update_stop_disable_udp_unit "${udpcustom_unit}" "udp-custom" || return 1'));
+assert(installer.includes('ensure_auto_backup_timer_armed()'));
+assert(installer.includes('Timer auto-backup tidak terjadwal setelah diaktifkan'));
+assert(updateManager.includes('auto-backup timer tidak terjadwal'));
+assert(updateManager.includes('auto-backup timer masih enabled padahal dinonaktifkan'));
+assert(updateManager.includes('update_ensure_auto_backup_timer_armed || return 1'));
+assert(installer.includes('OnActiveSec=${backup_initial_delay_sec}s'));
+assert(installer.includes('OnActiveSec=${initial_delay_sec}s'));
+assert(installer.includes('remaining="$(( interval_sec - delta ))"'));
 
 const postbootHealth = extract(
   "cat > /usr/local/sbin/sc-1forcr-postboot-health <<'POSTBOOT_HEALTH_EOF'\n",

@@ -68,7 +68,7 @@ assert(menuSource.includes('.data.link.grpc'), 'gRPC link must come from the API
 assert(menuSource.includes('.data.link.uptls'), 'upgrade TLS link must come from the API response');
 assert(menuSource.includes('.data.city // .data.location.city'), 'VPS city must come from the API response');
 assert(menuSource.includes('.data.isp // .data.location.isp'), 'VPS ISP must come from the API response');
-assert(installer.includes('SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.42}"'));
+assert(installer.includes('SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.43}"'));
 assert(installer.includes('Versi payload   : ${downloaded_version}'));
 assert(installer.includes('marker versi ${new_ver} tidak sama dengan payload ${downloaded_version}'));
 assert(installer.includes('displayed_version="$(tr -d \'[:space:]\' </opt/sc-1forcr/VERSION 2>/dev/null || true)"'));
@@ -81,5 +81,7 @@ assert(installer.includes('SUMMARY_API_SETUP_URLS="${SUMMARY_API_SETUP_URLS:-${S
 assert(installer.includes('/usr/local/sbin/sc-1forcr-god-update'));
 assert(installer.includes('/etc/systemd/system/sc-1forcr-god-update.timer'));
 assert(installer.includes('systemctl enable --now sc-1forcr-god-update.timer'));
+assert(menuSource.includes('menu_ensure_auto_backup_timer_armed()'));
+assert(menuSource.includes('menu_ensure_auto_backup_timer_armed || return 1'));
 
 console.log('CLI account output tests: OK');

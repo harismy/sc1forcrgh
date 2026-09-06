@@ -181,7 +181,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.42}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.43}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -13896,8 +13896,51 @@ EOF
   setup_postboot_health_guard
 }
 
+auto_backup_initial_delay_seconds() {
+  local interval_min="${1:-1440}" interval_sec now_epoch last_epoch delta remaining
+  interval_min="$(printf '%s' "${interval_min}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 1 ]] && interval_min="1440"
+  interval_sec="$(( interval_min * 60 ))"
+  now_epoch="$(date +%s)"
+  last_epoch="$(cat /var/lib/sc-1forcr/last-auto-backup-epoch 2>/dev/null || true)"
+  remaining="300"
+  if [[ "${last_epoch}" =~ ^[0-9]+$ ]]; then
+    delta="$(( now_epoch - last_epoch ))"
+    if (( delta >= 0 && delta < interval_sec )); then
+      remaining="$(( interval_sec - delta ))"
+    else
+      remaining="60"
+    fi
+  fi
+  (( remaining < 60 )) && remaining="60"
+  (( remaining > interval_sec )) && remaining="${interval_sec}"
+  printf '%s\n' "${remaining}"
+}
+
+ensure_auto_backup_timer_armed() {
+  local attempt timer_state
+  if ! systemctl enable sc-1forcr-autobackup.timer >/dev/null 2>&1; then
+    log "Gagal enable timer auto-backup."
+    return 1
+  fi
+  if ! systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1; then
+    log "Gagal me-restart timer auto-backup."
+    return 1
+  fi
+  for attempt in 1 2 3 4 5; do
+    timer_state="$(systemctl show sc-1forcr-autobackup.timer -p SubState --value 2>/dev/null || true)"
+    if systemctl is-active --quiet sc-1forcr-autobackup.timer && \
+       [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  log "Timer auto-backup tidak terjadwal setelah diaktifkan (state=${timer_state:-unknown})."
+  return 1
+}
+
 setup_auto_backup_timer() {
-  local backup_interval_min backup_mode backup_wib_hour
+  local backup_interval_min backup_mode backup_wib_hour backup_initial_delay_sec
   backup_interval_min="$(echo "${AUTO_BACKUP_INTERVAL_MINUTES:-1440}" | tr -cd '0-9')"
   if [[ -z "${backup_interval_min}" || "${backup_interval_min}" -lt 1 || "${backup_interval_min}" -gt 10080 ]]; then
     backup_interval_min="1440"
@@ -13914,6 +13957,7 @@ setup_auto_backup_timer() {
     backup_wib_hour="2"
   fi
   AUTO_BACKUP_WIB_HOUR="${backup_wib_hour}"
+  backup_initial_delay_sec="$(auto_backup_initial_delay_seconds "${AUTO_BACKUP_INTERVAL_MINUTES}")"
 
   if [[ "${AUTO_BACKUP_SCHEDULE_MODE}" == "daily_wib" ]]; then
     log "Setup auto backup harian jam $(printf '%02d' "${AUTO_BACKUP_WIB_HOUR}"):00 WIB..."
@@ -14384,8 +14428,29 @@ CREATE TABLE IF NOT EXISTS account_quota_locks (
 );
 SQL
 
+restore_auto_backup_initial_delay_seconds() {
+  local interval_min="${1:-1440}" interval_sec now_epoch last_epoch delta remaining
+  interval_min="$(printf '%s' "${interval_min}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 1 ]] && interval_min="1440"
+  interval_sec="$(( interval_min * 60 ))"
+  now_epoch="$(date +%s)"
+  last_epoch="$(cat /var/lib/sc-1forcr/last-auto-backup-epoch 2>/dev/null || true)"
+  remaining="300"
+  if [[ "${last_epoch}" =~ ^[0-9]+$ ]]; then
+    delta="$(( now_epoch - last_epoch ))"
+    if (( delta >= 0 && delta < interval_sec )); then
+      remaining="$(( interval_sec - delta ))"
+    else
+      remaining="60"
+    fi
+  fi
+  (( remaining < 60 )) && remaining="60"
+  (( remaining > interval_sec )) && remaining="${interval_sec}"
+  printf '%s\n' "${remaining}"
+}
+
 apply_restored_runtime_units() {
-  local iplimit_interval backup_enable backup_mode backup_interval backup_wib_hour
+  local iplimit_interval backup_enable backup_mode backup_interval backup_wib_hour backup_initial_delay_sec
   local auto_reboot_enable auto_reboot_interval auto_reboot_mode auto_reboot_wib_hour pull_enable pull_interval notify_enable notify_interval
 
   load_env_file /etc/sc-1forcr.env
@@ -14419,6 +14484,7 @@ EOF_TIMER
   [[ -z "${backup_interval}" || "${backup_interval}" -lt 1 || "${backup_interval}" -gt 10080 ]] && backup_interval="1440"
   backup_wib_hour="$(echo "${AUTO_BACKUP_WIB_HOUR:-2}" | tr -cd '0-9')"
   [[ -z "${backup_wib_hour}" || "${backup_wib_hour}" -gt 23 ]] && backup_wib_hour="2"
+  backup_initial_delay_sec="$(restore_auto_backup_initial_delay_seconds "${backup_interval}")"
   if [[ -f /etc/systemd/system/sc-1forcr-autobackup.service ]]; then
     if [[ "${backup_mode}" == "daily_wib" ]]; then
       cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF_TIMER
@@ -14440,7 +14506,7 @@ EOF_TIMER
 Description=Run SC 1FORCR auto backup every ${backup_interval} minutes
 
 [Timer]
-OnActiveSec=5m
+OnActiveSec=${backup_initial_delay_sec}s
 OnUnitInactiveSec=${backup_interval}min
 AccuracySec=1s
 Persistent=false
@@ -15089,7 +15155,7 @@ EOF
 Description=Run SC 1FORCR auto backup every ${AUTO_BACKUP_INTERVAL_MINUTES} minutes
 
 [Timer]
-OnActiveSec=5m
+OnActiveSec=${backup_initial_delay_sec}s
 OnUnitInactiveSec=${AUTO_BACKUP_INTERVAL_MINUTES}min
 AccuracySec=1s
 Persistent=false
@@ -15102,7 +15168,11 @@ EOF
   fi
 
   systemctl daemon-reload
-  systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  if [[ "${AUTO_BACKUP_ENABLE}" == "1" ]]; then
+    ensure_auto_backup_timer_armed
+  else
+    systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  fi
 }
 
 setup_ssh_live_tracker() {
@@ -18967,11 +19037,54 @@ WantedBy=timers.target
 EOF
 }
 
+menu_auto_backup_initial_delay_seconds() {
+  local interval_min="${1:-1440}" interval_sec now_epoch last_epoch delta remaining
+  interval_min="$(printf '%s' "${interval_min}" | tr -cd '0-9')"
+  [[ -z "${interval_min}" || "${interval_min}" -lt 1 ]] && interval_min="1440"
+  interval_sec="$(( interval_min * 60 ))"
+  now_epoch="$(date +%s)"
+  last_epoch="$(cat /var/lib/sc-1forcr/last-auto-backup-epoch 2>/dev/null || true)"
+  remaining="300"
+  if [[ "${last_epoch}" =~ ^[0-9]+$ ]]; then
+    delta="$(( now_epoch - last_epoch ))"
+    if (( delta >= 0 && delta < interval_sec )); then
+      remaining="$(( interval_sec - delta ))"
+    else
+      remaining="60"
+    fi
+  fi
+  (( remaining < 60 )) && remaining="60"
+  (( remaining > interval_sec )) && remaining="${interval_sec}"
+  printf '%s\n' "${remaining}"
+}
+
+menu_ensure_auto_backup_timer_armed() {
+  local attempt timer_state
+  systemctl enable sc-1forcr-autobackup.timer >/dev/null 2>&1 || {
+    echo "Gagal enable timer auto-backup."
+    return 1
+  }
+  systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || {
+    echo "Gagal me-restart timer auto-backup."
+    return 1
+  }
+  for attempt in 1 2 3 4 5; do
+    timer_state="$(systemctl show sc-1forcr-autobackup.timer -p SubState --value 2>/dev/null || true)"
+    if systemctl is-active --quiet sc-1forcr-autobackup.timer && \
+       [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "Timer auto-backup tidak terjadwal (state=${timer_state:-unknown})."
+  return 1
+}
+
 write_auto_backup_timer_unit() {
   local mode_raw="$1"
   local interval_min="$2"
   local wib_hour="$3"
-  local mode
+  local mode initial_delay_sec
   mode="$(echo "${mode_raw:-interval}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   if [[ "${mode}" == "daily" || "${mode}" == "wib" ]]; then
     mode="daily_wib"
@@ -18983,6 +19096,7 @@ write_auto_backup_timer_unit() {
   [[ -z "${interval_min}" || "${interval_min}" -lt 1 || "${interval_min}" -gt 10080 ]] && interval_min="1440"
   wib_hour="$(echo "${wib_hour:-2}" | tr -cd '0-9')"
   [[ -z "${wib_hour}" || "${wib_hour}" -lt 0 || "${wib_hour}" -gt 23 ]] && wib_hour="2"
+  initial_delay_sec="$(menu_auto_backup_initial_delay_seconds "${interval_min}")"
 
   if [[ "${mode}" == "daily_wib" ]]; then
     cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<EOF
@@ -19007,7 +19121,7 @@ EOF
 Description=Run SC 1FORCR auto backup every ${interval_min} minutes
 
 [Timer]
-OnActiveSec=5m
+OnActiveSec=${initial_delay_sec}s
 OnUnitInactiveSec=${interval_min}min
 AccuracySec=1s
 Persistent=false
@@ -19493,8 +19607,7 @@ set_auto_backup_config_menu() {
   write_auto_backup_timer_unit "${AUTO_BACKUP_SCHEDULE_MODE}" "${AUTO_BACKUP_INTERVAL_MINUTES}" "${AUTO_BACKUP_WIB_HOUR}"
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [[ "${AUTO_BACKUP_ENABLE}" == "1" ]]; then
-    systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
-    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    menu_ensure_auto_backup_timer_armed || return 1
     systemctl start sc-1forcr-autobackup.service >/dev/null 2>&1 || true
   else
     systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
@@ -22912,7 +23025,11 @@ restart_all_services() {
   systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
-  systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  if [[ "${AUTO_BACKUP_ENABLE:-1}" == "1" ]]; then
+    menu_ensure_auto_backup_timer_armed || true
+  else
+    systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  fi
   systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
   if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
@@ -22940,9 +23057,9 @@ restart_update_safe_services() {
     systemctl stop sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
   fi
   if [[ "${AUTO_BACKUP_ENABLE:-1}" == "1" ]]; then
-    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    menu_ensure_auto_backup_timer_armed || return 1
   else
-    systemctl stop sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
   fi
   if [[ "${ONLINE_NOTIFY_ENABLE:-1}" == "1" ]]; then
     systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
@@ -27742,9 +27859,9 @@ restart_update_safe_services() {
     systemctl stop sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
   fi
   if [[ "${AUTO_BACKUP_ENABLE:-1}" == "1" ]]; then
-    systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    ensure_auto_backup_timer_armed
   else
-    systemctl stop sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
   fi
   if [[ "${ONLINE_NOTIFY_ENABLE:-1}" == "1" ]]; then
     systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
@@ -28539,6 +28656,7 @@ tcp_listener_present() {
 
 health_check() {
   local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok timer_state configured_udp_port udp_state
+  local auto_backup_enabled
   local udpgw_ports_raw udpgw_port udpgw_ok
   local runtime_version runtime_revision strict_xray_monitor xray_port xray_ports_ok xray_config_result xray_capabilities
   local haproxy_backend_ports_raw haproxy_port haproxy_backends_ok
@@ -28595,6 +28713,32 @@ PY
       timer_state="$(systemctl show sc-1forcr-god-update.timer -p SubState --value 2>/dev/null || true)"
       [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
         failures+=("God Mode update timer tidak terjadwal (${timer_state:-unknown})")
+    fi
+  fi
+
+  auto_backup_enabled="${AUTO_BACKUP_ENABLE:-1}"
+  [[ "${auto_backup_enabled}" == "1" ]] || auto_backup_enabled="0"
+  if [[ "${auto_backup_enabled}" == "1" ]]; then
+    if ! unit_is_installed sc-1forcr-autobackup.timer; then
+      failures+=("auto-backup timer tidak terpasang")
+    else
+      if ! systemctl is-enabled --quiet sc-1forcr-autobackup.timer; then
+        failures+=("auto-backup timer tidak enabled")
+      fi
+      if ! systemctl is-active --quiet sc-1forcr-autobackup.timer; then
+        failures+=("auto-backup timer tidak aktif")
+      else
+        timer_state="$(systemctl show sc-1forcr-autobackup.timer -p SubState --value 2>/dev/null || true)"
+        [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
+          failures+=("auto-backup timer tidak terjadwal (${timer_state:-unknown})")
+      fi
+    fi
+  elif unit_is_installed sc-1forcr-autobackup.timer; then
+    if systemctl is-active --quiet sc-1forcr-autobackup.timer; then
+      failures+=("auto-backup timer masih aktif padahal dinonaktifkan")
+    fi
+    if systemctl is-enabled --quiet sc-1forcr-autobackup.timer; then
+      failures+=("auto-backup timer masih enabled padahal dinonaktifkan")
     fi
   fi
 
@@ -28846,6 +28990,28 @@ update_stop_disable_udp_unit() {
   systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
 }
 
+update_ensure_auto_backup_timer_armed() {
+  local attempt timer_state
+  systemctl enable sc-1forcr-autobackup.timer >/dev/null 2>&1 || {
+    log_update_manager "Gagal enable timer auto-backup saat restore."
+    return 1
+  }
+  systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || {
+    log_update_manager "Gagal me-restart timer auto-backup saat restore."
+    return 1
+  }
+  for attempt in 1 2 3 4 5; do
+    timer_state="$(systemctl show sc-1forcr-autobackup.timer -p SubState --value 2>/dev/null || true)"
+    if systemctl is-active --quiet sc-1forcr-autobackup.timer && \
+       [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  log_update_manager "Timer auto-backup tidak terjadwal setelah restore (state=${timer_state:-unknown})."
+  return 1
+}
+
 restart_after_restore() {
   local unit backend zivpn_unit udpcustom_unit udpgw_ports_raw udpgw_port
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -28856,6 +29022,13 @@ restart_after_restore() {
     unit_is_installed "${unit}" && systemctl reload-or-restart "${unit}" >/dev/null 2>&1 || true
   done
   load_update_env
+  if unit_is_installed sc-1forcr-autobackup.timer; then
+    if [[ "${AUTO_BACKUP_ENABLE:-1}" == "1" ]]; then
+      update_ensure_auto_backup_timer_armed || return 1
+    else
+      systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+    fi
+  fi
   udpgw_ports_raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
   if [[ -x /usr/local/sbin/sc-1forcr-udpgw-alias ]] && unit_is_installed sc-1forcr-udpgw-alias.service; then
     systemctl enable --now sc-1forcr-udpgw-alias.service >/dev/null 2>&1 || true

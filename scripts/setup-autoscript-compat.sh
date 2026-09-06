@@ -1318,6 +1318,15 @@ ipv6_supported() {
   [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]] && grep -q . /proc/net/if_inet6 2>/dev/null
 }
 
+# SubState timer systemd yang dianggap sehat. "elapsed" = timer sudah trigger
+# dan unit target masih berjalan (kondisi transient yang normal untuk timer oneshot).
+timer_substate_ok() {
+  case "${1:-}" in
+    waiting|running|elapsed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 write_dns_resolver_guard() {
   mkdir -p /usr/local/sbin
   cat > /usr/local/sbin/sc-1forcr-dns-guard <<'DNS_GUARD_SCRIPT_EOF'
@@ -13930,7 +13939,7 @@ ensure_auto_backup_timer_armed() {
   for attempt in 1 2 3 4 5; do
     timer_state="$(systemctl show sc-1forcr-autobackup.timer -p SubState --value 2>/dev/null || true)"
     if systemctl is-active --quiet sc-1forcr-autobackup.timer && \
-       [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]; then
+       timer_substate_ok "${timer_state}"; then
       return 0
     fi
     sleep 1
@@ -19071,7 +19080,7 @@ menu_ensure_auto_backup_timer_armed() {
   for attempt in 1 2 3 4 5; do
     timer_state="$(systemctl show sc-1forcr-autobackup.timer -p SubState --value 2>/dev/null || true)"
     if systemctl is-active --quiet sc-1forcr-autobackup.timer && \
-       [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]; then
+       timer_substate_ok "${timer_state}"; then
       return 0
     fi
     sleep 1
@@ -28654,6 +28663,13 @@ tcp_listener_present() {
   '
 }
 
+timer_substate_ok() {
+  case "${1:-}" in
+    waiting|running|elapsed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 health_check() {
   local failures=() unit check_result api_ok attempt backend zivpn_unit udpcustom_unit udp_port udp_ok summary_port summary_ok timer_state configured_udp_port udp_state
   local auto_backup_enabled
@@ -28691,7 +28707,7 @@ PY
       failures+=("license guard timer tidak aktif")
     else
       timer_state="$(systemctl show sc-1forcr-license-guard.timer -p SubState --value 2>/dev/null || true)"
-      [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
+      timer_substate_ok "${timer_state}" || \
         failures+=("license guard timer tidak terjadwal (${timer_state:-unknown})")
     fi
   fi
@@ -28701,7 +28717,7 @@ PY
       failures+=("IP limit timer tidak aktif")
     else
       timer_state="$(systemctl show sc-1forcr-iplimit.timer -p SubState --value 2>/dev/null || true)"
-      [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
+      timer_substate_ok "${timer_state}" || \
         failures+=("IP limit timer tidak terjadwal (${timer_state:-unknown})")
     fi
   fi
@@ -28711,7 +28727,7 @@ PY
       failures+=("God Mode update timer tidak aktif")
     else
       timer_state="$(systemctl show sc-1forcr-god-update.timer -p SubState --value 2>/dev/null || true)"
-      [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
+      timer_substate_ok "${timer_state}" || \
         failures+=("God Mode update timer tidak terjadwal (${timer_state:-unknown})")
     fi
   fi
@@ -28729,7 +28745,7 @@ PY
         failures+=("auto-backup timer tidak aktif")
       else
         timer_state="$(systemctl show sc-1forcr-autobackup.timer -p SubState --value 2>/dev/null || true)"
-        [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]] || \
+        timer_substate_ok "${timer_state}" || \
           failures+=("auto-backup timer tidak terjadwal (${timer_state:-unknown})")
       fi
     fi
@@ -29003,7 +29019,7 @@ update_ensure_auto_backup_timer_armed() {
   for attempt in 1 2 3 4 5; do
     timer_state="$(systemctl show sc-1forcr-autobackup.timer -p SubState --value 2>/dev/null || true)"
     if systemctl is-active --quiet sc-1forcr-autobackup.timer && \
-       [[ "${timer_state}" == "waiting" || "${timer_state}" == "running" ]]; then
+       timer_substate_ok "${timer_state}"; then
       return 0
     fi
     sleep 1

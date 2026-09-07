@@ -19067,6 +19067,15 @@ menu_auto_backup_initial_delay_seconds() {
   printf '%s\n' "${remaining}"
 }
 
+# SubState timer yang sehat. Menu adalah file mandiri, jadi helper ini harus
+# didefinisikan di sini (tidak mewarisi timer_substate_ok dari installer utama).
+timer_substate_ok() {
+  case "${1:-}" in
+    waiting|running|elapsed) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 menu_ensure_auto_backup_timer_armed() {
   local attempt timer_state
   systemctl enable sc-1forcr-autobackup.timer >/dev/null 2>&1 || {

@@ -17601,6 +17601,7 @@ Description=Check mandatory SC 1FORCR God Mode update every ${god_interval} minu
 
 [Timer]
 OnBootSec=2m
+OnActiveSec=${god_interval}min
 OnUnitInactiveSec=${god_interval}min
 AccuracySec=20s
 RandomizedDelaySec=0

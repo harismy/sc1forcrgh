@@ -3294,12 +3294,26 @@ rollback_summary_transaction_on_exit() {
 begin_summary_transaction() {
   [[ "${SUMMARY_UPDATE_SAFE_MODE:-0}" == "1" ]] || return 0
   if [[ ! -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
-    log "Update aman membutuhkan sc-1forcr-update-manager terbaru. Update SC utama terlebih dahulu."
-    return 1
+    log "PERINGATAN: sc-1forcr-update-manager tidak ditemukan. Instalasi DILANJUTKAN tanpa mode update aman."
+    SUMMARY_TRANSACTION_SNAPSHOT=""
+    return 0
   fi
-  SUMMARY_TRANSACTION_SNAPSHOT="$(SC_UPDATE_SNAPSHOT_INCLUDE_DB=0 \
-    /usr/local/sbin/sc-1forcr-update-manager snapshot 'pre-summary-systemd-migration')"
-  /usr/local/sbin/sc-1forcr-update-manager verify "${SUMMARY_TRANSACTION_SNAPSHOT}" >/dev/null
+
+  local snap
+  if ! snap="$(SC_UPDATE_SNAPSHOT_INCLUDE_DB=0 \
+      /usr/local/sbin/sc-1forcr-update-manager snapshot 'pre-summary-systemd-migration')" \
+      || [[ -z "${snap}" ]]; then
+    log "PERINGATAN: gagal membuat snapshot. Instalasi DILANJUTKAN tanpa rollback otomatis."
+    SUMMARY_TRANSACTION_SNAPSHOT=""
+    return 0
+  fi
+  SUMMARY_TRANSACTION_SNAPSHOT="${snap}"
+
+  if ! /usr/local/sbin/sc-1forcr-update-manager verify "${SUMMARY_TRANSACTION_SNAPSHOT}" >/dev/null 2>&1; then
+    log "PERINGATAN: verifikasi snapshot gagal. Instalasi DILANJUTKAN tanpa rollback otomatis."
+    SUMMARY_TRANSACTION_SNAPSHOT=""
+    return 0
+  fi
   trap rollback_summary_transaction_on_exit EXIT
 }
 

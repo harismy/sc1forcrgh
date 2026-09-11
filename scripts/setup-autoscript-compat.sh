@@ -181,7 +181,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.43}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.44}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -1315,7 +1315,23 @@ check_supported_os() {
 }
 
 ipv6_supported() {
-  [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]] && grep -q . /proc/net/if_inet6 2>/dev/null
+  # 1) Kernel tidak menonaktifkan IPv6.
+  [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]] || return 1
+  # 2) Kernel mengenali minimal satu interface IPv6.
+  grep -q . /proc/net/if_inet6 2>/dev/null || return 1
+  # 3) Socket AF_INET6 benar-benar bisa dibuat. Ada VPS yang punya /proc/net/if_inet6
+  #    tetapi socket IPv6 gagal (nginx: socket() [::]:80 failed (97: Address family
+  #    not supported by protocol)).
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import socket; socket.socket(socket.AF_INET6, socket.SOCK_STREAM)' >/dev/null 2>&1 || return 1
+  elif command -v ip >/dev/null 2>&1; then
+    ip -6 addr replace ::1/128 dev lo >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+ipv6_global_address_present() {
+  ip -6 addr show scope global 2>/dev/null | grep -q .
 }
 
 # SubState timer systemd yang dianggap sehat. "elapsed" = timer sudah trigger
@@ -1554,6 +1570,7 @@ wait_for_apt_locks() {
 
 repair_dpkg_state() {
   wait_for_apt_locks || return 1
+  neutralize_nginx_package_default_site || true
   if ! DEBIAN_FRONTEND=noninteractive dpkg --configure -a; then
     log "dpkg --configure -a gagal. Selesaikan masalah dpkg lalu jalankan installer lagi."
     return 1
@@ -1566,18 +1583,58 @@ apt_get_safe() {
   DEBIAN_FRONTEND=noninteractive apt-get "$@"
 }
 
+neutralize_nginx_package_default_site() {
+  # Recovery targeted untuk VPS IPv4-only: postinst nginx gagal bind [::]:80 di
+  # default site bawaan paket. Hanya menyentuh default site bawaan paket
+  # (bukan vhost SC) dan hanya jika site tersebut masih memuat [::]:80.
+  ipv6_supported && return 0
+  local available_site enabled_site real backup_dir backup_name
+  available_site="/etc/nginx/sites-available/default"
+  enabled_site="/etc/nginx/sites-enabled/default"
+  [[ -e "${available_site}" ]] || return 0
+  grep -q '\[::\]:80' "${available_site}" 2>/dev/null || return 0
+  if [[ -e "${enabled_site}" || -L "${enabled_site}" ]]; then
+    real="$(readlink -f "${enabled_site}" 2>/dev/null || true)"
+    [[ -z "${real}" || "${real}" == "${available_site}" ]] || return 0
+  fi
+  backup_dir="/var/lib/sc-1forcr/backup/nginx"
+  mkdir -p "${backup_dir}"
+  backup_name="${backup_dir}/default-site.pre-$(date +%s).conf"
+  cp -a "${available_site}" "${backup_name}" >/dev/null 2>&1 || true
+  cat > "${available_site}" <<'EOF_NGINX_DEFAULT'
+server {
+    listen 80 default_server;
+    root /var/www/html;
+    index index.html;
+    server_name _;
+}
+EOF_NGINX_DEFAULT
+  log "Default site Nginx bawaan paket diubah menjadi IPv4-only (backup: ${backup_name})."
+}
+
 install_base_packages() {
   log "Install paket dasar..."
-  apt_get_safe update -y
-  apt_get_safe install -y \
-    curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
-    gnupg lsb-release socat cron unzip \
-    haproxy \
-    nginx certbot \
-    openssh-server dropbear pwgen \
-    build-essential python3 python3-setuptools python3-packaging \
-    make g++ gcc libc6-dev pkg-config libsqlite3-dev bzip2 zlib1g-dev \
+  local -a base_pkgs
+  base_pkgs=(
+    curl wget jq sqlite3 openssl uuid-runtime ca-certificates
+    gnupg lsb-release socat cron unzip
+    haproxy
+    nginx certbot
+    openssh-server dropbear pwgen
+    build-essential python3 python3-setuptools python3-packaging
+    make g++ gcc libc6-dev pkg-config libsqlite3-dev bzip2 zlib1g-dev
     netfilter-persistent iptables-persistent
+  )
+  apt_get_safe update -y
+  if ! apt_get_safe install -y "${base_pkgs[@]}"; then
+    log "Gagal install paket dasar. Coba recovery default site Nginx (IPv4-only) lalu ulangi..."
+    neutralize_nginx_package_default_site || true
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+    apt_get_safe install -y "${base_pkgs[@]}" || {
+      log "Install paket dasar tetap gagal setelah recovery."
+      return 1
+    }
+  fi
 
   # Paket opsional (beberapa distro/repo lama tidak selalu menyediakan).
   install_optional_pkg_if_available python3-certbot-nginx || true
@@ -2511,6 +2568,10 @@ issue_letsencrypt_cert() {
     log "Domain sertifikat TLS kosong. Skip issue cert."
     return 1
   fi
+  if ! ipv6_global_address_present && command -v getent >/dev/null 2>&1 && \
+     timeout 10 getent ahostsv6 "${cert_domain}" >/dev/null 2>&1; then
+    log "PERINGATAN: domain ${cert_domain} memiliki record AAAA tetapi VPS ini tidak punya IPv6 global yang usable. Klien IPv6 bisa gagal konek."
+  fi
 
   if [[ -z "${EMAIL}" || "${EMAIL}" == "admin@example.com" || "${EMAIL}" == *"@example.com" ]]; then
     certbot_email_arg="--register-unsafely-without-email"
@@ -2668,6 +2729,13 @@ EOF_REALIP
   else
     log "IPv6 tidak tersedia di VPS ini. Nginx listen IPv4 saja (port 80)."
   fi
+  nginx_vhost_backup="/var/lib/sc-1forcr/backup/nginx/sc-1forcr.conf.pre-$(date +%s)"
+  nginx_conf_backup="/var/lib/sc-1forcr/backup/nginx/nginx.conf.pre-$(date +%s)"
+  mkdir -p /var/lib/sc-1forcr/backup/nginx 2>/dev/null || true
+  if [[ -e /etc/nginx/sites-available/sc-1forcr.conf ]]; then
+    cp -a /etc/nginx/sites-available/sc-1forcr.conf "${nginx_vhost_backup}" 2>/dev/null || true
+  fi
+  cp -a /etc/nginx/nginx.conf "${nginx_conf_backup}" 2>/dev/null || true
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
 ${sshws_realip_nginx_map}
 ${sshws_nginx_limit_conf}
@@ -2937,7 +3005,19 @@ EOF
       systemctl start nginx
     fi
   else
-    log "PERINGATAN: nginx -t gagal. Port 80 mungkin tidak aktif. Cek /var/lib/sc-1forcr/install.log lalu perbaiki /etc/nginx/sites-available/sc-1forcr.conf."
+    log "ERROR: nginx -t gagal. Mengembalikan konfigurasi Nginx sebelumnya; nginx TIDAK di-reload/start."
+    rm -f /etc/nginx/sites-enabled/sc-1forcr.conf
+    if [[ -n "${nginx_vhost_backup:-}" && -f "${nginx_vhost_backup}" ]]; then
+      cp -a "${nginx_vhost_backup}" /etc/nginx/sites-available/sc-1forcr.conf
+      ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
+    else
+      rm -f /etc/nginx/sites-available/sc-1forcr.conf
+    fi
+    if [[ -n "${nginx_conf_backup:-}" && -f "${nginx_conf_backup}" ]]; then
+      cp -a "${nginx_conf_backup}" /etc/nginx/nginx.conf
+    fi
+    log "Detail: jalankan nginx -t secara manual untuk melihat pesan error lengkapnya."
+    return 1
   fi
 
   if ! issue_letsencrypt_cert; then
@@ -2971,7 +3051,12 @@ setup_haproxy_tls_mux() {
   fi
   if flag_enabled "${XRAY_REAL_IP_ENABLE:-0}"; then
     xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2"
-    xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check inter 2s fall 3 rise 2 send-proxy-v2"
+    if grep -q 'listen 127\.0\.0\.1:8082' /etc/nginx/sites-available/sc-1forcr.conf 2>/dev/null; then
+      xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8082 check inter 2s fall 3 rise 2 send-proxy-v2"
+    else
+      log "PERINGATAN: XRAY_REAL_IP_ENABLE=1 tapi Nginx belum punya listener 8082; HAProxy bk_grpc sementara memakai 8081."
+      xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check inter 2s fall 3 rise 2"
+    fi
   else
     xray_ws_backend_line="    server nginx_local 127.0.0.1:8083 check inter 2s fall 3 rise 2 send-proxy-v2"
     xray_grpc_backend_line="    server nginx_grpc 127.0.0.1:8081 check inter 2s fall 3 rise 2"
@@ -3046,7 +3131,10 @@ backend bk_sshws_tls
     server sshws_local 127.0.0.1:2082 check inter 2s fall 3 rise 2 send-proxy
 EOF
 
-  haproxy -c -f /etc/haproxy/haproxy.cfg
+  if ! haproxy -c -f /etc/haproxy/haproxy.cfg; then
+    log "ERROR: konfigurasi HAProxy tidak valid. HAProxy tidak di-reload/start; jalankan haproxy -c secara manual untuk melihat detailnya."
+    return 1
+  fi
   mkdir -p /etc/systemd/system/haproxy.service.d
   cat > /etc/systemd/system/haproxy.service.d/sc-1forcr-order.conf <<EOF
 [Unit]
@@ -13718,6 +13806,17 @@ if [[ -f "${ACCESS_LOCK_FILE}" ]]; then
   exit 0
 fi
 
+# Self-heal rule ACCEPT service inti agar selalu berada di puncak chain INPUT.
+# Tanpa ini, rule lama (connlimit/hashlimit) bisa diam-diam memblokir port SSH/WS.
+if command -v iptables >/dev/null 2>&1; then
+  iptables -w 10 -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -i lo -j ACCEPT >/dev/null 2>&1 || true
+  iptables -w 10 -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || true
+  iptables -w 10 -C INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || true
+fi
+
 # Dependensi diperiksa lebih dulu. Unit yang sudah aktif dan listen tidak disentuh.
 repair_unit_if_needed ssh.service || true
 repair_unit_if_needed dropbear.service || true
@@ -17961,6 +18060,21 @@ if [[ "${EUID}" -ne 0 ]]; then
   echo "Jalankan sebagai root."
   exit 1
 fi
+
+ipv6_supported() {
+  [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == "0" ]] || return 1
+  grep -q . /proc/net/if_inet6 2>/dev/null || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import socket; socket.socket(socket.AF_INET6, socket.SOCK_STREAM)' >/dev/null 2>&1 || return 1
+  elif command -v ip >/dev/null 2>&1; then
+    ip -6 addr replace ::1/128 dev lo >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+ipv6_global_address_present() {
+  ip -6 addr show scope global 2>/dev/null | grep -q .
+}
 
 sanitize_env_file() {
   local file="$1" tmp
@@ -23464,6 +23578,11 @@ EOF_REALIP
   else
     log "IPv6 tidak tersedia di VPS ini. Nginx listen IPv4 saja (port 80)."
   fi
+  nginx_vhost_backup="/var/lib/sc-1forcr/backup/nginx/sc-1forcr.conf.pre-$(date +%s)"
+  mkdir -p /var/lib/sc-1forcr/backup/nginx 2>/dev/null || true
+  if [[ -e /etc/nginx/sites-available/sc-1forcr.conf ]]; then
+    cp -a /etc/nginx/sites-available/sc-1forcr.conf "${nginx_vhost_backup}" 2>/dev/null || true
+  fi
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
 ${sshws_realip_nginx_map}
 ${sshws_nginx_limit_conf}
@@ -23710,7 +23829,17 @@ EONGINX
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
   tune_nginx_capacity
-  nginx -t || { echo "Konfigurasi nginx invalid."; return; }
+  if ! nginx -t; then
+    echo "Konfigurasi nginx invalid. Mengembalikan konfigurasi sebelumnya (tanpa reload nginx)."
+    rm -f /etc/nginx/sites-enabled/sc-1forcr.conf
+    if [[ -n "${nginx_vhost_backup:-}" && -f "${nginx_vhost_backup}" ]]; then
+      cp -a "${nginx_vhost_backup}" /etc/nginx/sites-available/sc-1forcr.conf
+      ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
+    else
+      rm -f /etc/nginx/sites-available/sc-1forcr.conf
+    fi
+    return
+  fi
   if systemctl is-active --quiet nginx; then
     systemctl reload nginx || true
   else
@@ -29431,6 +29560,20 @@ main() {
       log "Update aman selesai. Migrasi real-IP SSHWS aktif; bridge/HAProxy tadi direstart satu kali."
     else
       log "Update aman selesai. Xray/SSH/SSHWS/HAProxy aktif tidak direstart."
+    fi
+    return 0
+  fi
+  # Re-run guard: jika SC sudah terpasang dan tidak ada pending/checkpoint,
+  # jangan jalankan instalasi penuh lagi (mencegah downtime dan terminate tak terduga).
+  if [[ "${SC_FORCE_REINSTALL:-0}" != "1" ]] && \
+     { { systemctl list-unit-files 2>/dev/null | grep -q '^sc-1forcr-api\.service'; } || \
+       { [[ -x /usr/local/sbin/menu-sc-1forcr ]] && [[ -f /etc/sc-1forcr.env ]]; }; } && \
+     [[ ! -f "${PENDING_OP_FILE}" ]] && [[ ! -f "${INSTALL_STEP_FILE}" ]]; then
+    echo "SC 1FORCR sudah terpasang. Instalasi penuh dilewati."
+    if [[ -x /usr/local/sbin/menu-sc-1forcr && -t 0 && -t 1 ]]; then
+      /usr/local/sbin/menu-sc-1forcr || true
+    else
+      echo "Jalankan perintah: menu"
     fi
     return 0
   fi

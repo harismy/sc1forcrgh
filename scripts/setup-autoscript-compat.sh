@@ -181,7 +181,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.45}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.46}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -28282,10 +28282,18 @@ show_install_progress() {
 }
 
 open_menu_after_install() {
-  if [[ -x /usr/local/sbin/menu-sc-1forcr && -t 0 && -t 1 ]]; then
+  # Pakai status tty ASLI yang direkam sebelum stdout dialihkan ke `tee` di
+  # awal main() (exec > >(tee ...) membuat -t 1 selalu gagal walau sesi
+  # aslinya interaktif, mis. di dalam `screen -S nexus-sc ...`). Tanpa ini,
+  # menu tidak pernah kebuka otomatis dan screen langsung terminate begitu
+  # main() selesai (user cuma lihat "[screen is terminating]").
+  local stdin_tty="${SC_ORIG_STDIN_IS_TTY:-}" stdout_tty="${SC_ORIG_STDOUT_IS_TTY:-}"
+  [[ -z "${stdin_tty}" ]] && { [[ -t 0 ]] && stdin_tty=1 || stdin_tty=0; }
+  [[ -z "${stdout_tty}" ]] && { [[ -t 1 ]] && stdout_tty=1 || stdout_tty=0; }
+  if [[ -x /usr/local/sbin/menu-sc-1forcr && "${stdin_tty}" == "1" && "${stdout_tty}" == "1" ]]; then
     echo
     echo "Membuka menu SC 1FORCR..."
-    /usr/local/sbin/menu-sc-1forcr || true
+    /usr/local/sbin/menu-sc-1forcr </dev/tty >/dev/tty 2>&1 || true
   else
     echo
     echo "Install selesai. Jalankan perintah: menu"
@@ -29494,6 +29502,13 @@ rollback_update_transaction_on_exit() {
 
 main() {
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  # Rekam status tty ASLI sebelum stdout/stderr dialihkan ke `tee` di bawah.
+  # exec > >(tee ...) mengganti fd 1 dengan pipe, jadi -t 1 akan SELALU
+  # gagal setelahnya walau sesi ini sebenarnya interaktif (mis. dijalankan
+  # via `screen -S nexus-sc ...`). Simpan hasil tes sekarang, dipakai lagi
+  # nanti oleh open_menu_after_install() dan guard re-run di bawah.
+  [[ -t 0 ]] && SC_ORIG_STDIN_IS_TTY=1 || SC_ORIG_STDIN_IS_TTY=0
+  [[ -t 1 ]] && SC_ORIG_STDOUT_IS_TTY=1 || SC_ORIG_STDOUT_IS_TTY=0
   if [[ "${INSTALL_LOG_DISABLE:-0}" != "1" ]]; then
     exec > >(tee -a "/var/lib/sc-1forcr/install.log") 2>&1
   fi
@@ -29532,7 +29547,10 @@ main() {
     activate_haproxy_connection_hardening_if_needed
     setup_license_guard
     setup_auto_reboot_timer
-    setup_auto_backup_timer
+    if ! setup_auto_backup_timer; then
+      log "Setup/arm ulang timer auto-backup gagal pasca-update. Rollback otomatis akan dijalankan."
+      return 1
+    fi
     setup_online_notify_timer
     setup_auto_pull_update_timer
     setup_resource_autotune_timer
@@ -29571,8 +29589,8 @@ main() {
        { [[ -x /usr/local/sbin/menu-sc-1forcr ]] && [[ -f /etc/sc-1forcr.env ]]; }; } && \
      [[ ! -f "${PENDING_OP_FILE}" ]] && [[ ! -f "${INSTALL_STEP_FILE}" ]]; then
     echo "SC 1FORCR sudah terpasang. Instalasi penuh dilewati."
-    if [[ -x /usr/local/sbin/menu-sc-1forcr && -t 0 && -t 1 ]]; then
-      /usr/local/sbin/menu-sc-1forcr || true
+    if [[ -x /usr/local/sbin/menu-sc-1forcr && "${SC_ORIG_STDIN_IS_TTY:-0}" == "1" && "${SC_ORIG_STDOUT_IS_TTY:-0}" == "1" ]]; then
+      /usr/local/sbin/menu-sc-1forcr </dev/tty >/dev/tty 2>&1 || true
     else
       echo "Jalankan perintah: menu"
     fi

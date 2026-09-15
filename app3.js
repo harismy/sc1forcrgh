@@ -165,6 +165,14 @@ const GOD_UPDATE_REPORT_INTERVAL_MS = Math.max(
   15000,
   Number(process.env.GOD_UPDATE_REPORT_INTERVAL_MS || 30000) || 30000
 );
+// Kalau campaign God Mode berhenti bikin progres (tidak ada VPS baru yang
+// sukses/gagal/lapor) selama durasi ini, campaign otomatis ditutup dan
+// laporan dikirim dengan sisa target pending ditandai "tidak terjangkau" -
+// supaya campaign tidak menggantung selamanya cuma karena satu VPS mati/expired.
+const GOD_UPDATE_STALL_TIMEOUT_MS = Math.max(
+  30 * 60 * 1000,
+  Number(process.env.GOD_UPDATE_STALL_TIMEOUT_MINUTES || 180) * 60000 || (180 * 60000)
+);
 const MIGRATION_ROLLBACK_TTL_MS = Math.max(
   5 * 60 * 1000,
   Number(process.env.MIGRATION_ROLLBACK_TTL_MS || (2 * 60 * 60 * 1000)) || (2 * 60 * 60 * 1000)
@@ -2266,6 +2274,61 @@ async function getGodUpdateCampaignSummary(version) {
   return out;
 }
 
+// Kapan target campaign ini terakhir bikin progres (status/ack berubah).
+// Dipakai buat deteksi campaign yang macet: kalau tidak ada satupun target
+// yang update selama GOD_UPDATE_STALL_TIMEOUT_MS, campaign dianggap stagnan.
+async function getGodUpdateCampaignLastActivity(version, fallback) {
+  const safeVersion = String(version || '').trim();
+  if (!safeVersion) return Number(fallback || 0);
+  const row = await dbGet(
+    'SELECT MAX(updated_at) AS last_at FROM god_update_targets WHERE version = ?',
+    [safeVersion]
+  );
+  const lastAt = Number(row?.last_at || 0);
+  return lastAt > 0 ? lastAt : Number(fallback || 0);
+}
+
+// Tutup campaign (baik karena semua sukses, macet/timeout, atau ditutup
+// manual oleh admin) dan kirim satu laporan akhir ke admin. Dipakai bareng
+// oleh job otomatis dan tombol "Tuntaskan Sekarang".
+async function finalizeGodUpdateCampaign(campaign, summary, expected, reasonNote) {
+  const finishedAt = Date.now();
+  const completed = await dbRun(
+    "UPDATE god_update_campaigns SET status='completed', completed_at=?, report_sent_at=? WHERE version=? AND report_sent_at IS NULL",
+    [finishedAt, finishedAt, campaign.version]
+  );
+  if (Number(completed?.changes || 0) < 1) return false;
+  const pendingRows = summary.pending > 0
+    ? await dbAll(
+        "SELECT vps_ip FROM god_update_targets WHERE version=? AND LOWER(TRIM(status))='pending' ORDER BY updated_at ASC LIMIT 10",
+        [campaign.version]
+      )
+    : [];
+  const lines = [
+    `Campaign : ${campaign.version}`,
+    `Paket    : ${godUpdateComponentLabel(campaign.components)}`,
+    `Berhasil : ${summary.success}/${expected} VPS`,
+    `Gagal    : ${summary.failed}`,
+    `Berjalan : ${summary.running}`,
+    `Pending  : ${summary.pending}`,
+    `Selesai  : ${formatDateTime(finishedAt)}`,
+    '',
+    reasonNote
+  ];
+  if (pendingRows.length) {
+    lines.push('', `VPS masih pending (${pendingRows.length} dari ${summary.pending} ditampilkan):`);
+    for (const row of pendingRows) lines.push(`- ${row.vps_ip}`);
+  }
+  const notification = await notifyGodUpdateAdmins(uiBox('GOD MODE SELESAI', lines), campaign.created_by);
+  if (Number(notification?.sent || 0) < 1) {
+    await dbRun(
+      'UPDATE god_update_campaigns SET report_sent_at=NULL WHERE version=?',
+      [campaign.version]
+    ).catch(() => {});
+  }
+  return true;
+}
+
 async function createGodUpdateCampaign(adminId, componentsInput, scheduledAtInput) {
   const components = normalizeGodUpdateComponents(componentsInput);
   if (!components) throw new Error('Komponen God Mode tidak valid.');
@@ -2367,31 +2430,31 @@ async function processGodUpdateCampaigns() {
       }
       const summary = await getGodUpdateCampaignSummary(campaign.version);
       const expected = Number(campaign.expected_total || summary.total || 0);
-      if (expected > 0 && summary.success >= expected && !Number(campaign.report_sent_at || 0)) {
-        const finishedAt = Date.now();
-        const completed = await dbRun(
-          "UPDATE god_update_campaigns SET status='completed', completed_at=?, report_sent_at=? WHERE version=? AND report_sent_at IS NULL",
-          [finishedAt, finishedAt, campaign.version]
-        );
-        if (Number(completed?.changes || 0) > 0) {
-          const notification = await notifyGodUpdateAdmins(
-            uiBox('GOD MODE SELESAI', [
-              `Campaign : ${campaign.version}`,
-              `Paket    : ${godUpdateComponentLabel(campaign.components)}`,
-              `Berhasil : ${summary.success}/${expected} VPS`,
-              `Gagal    : ${summary.failed}`,
-              `Pending  : ${summary.pending}`,
-              `Selesai  : ${formatDateTime(finishedAt)}`,
-              '',
-              'Semua target campaign sudah mengirim konfirmasi update berhasil.'
-            ]),
-            campaign.created_by
+      if (expected > 0 && !Number(campaign.report_sent_at || 0)) {
+        if (summary.success >= expected) {
+          await finalizeGodUpdateCampaign(
+            campaign,
+            summary,
+            expected,
+            'Semua target campaign sudah mengirim konfirmasi update berhasil.'
           );
-          if (Number(notification?.sent || 0) < 1) {
-            await dbRun(
-              'UPDATE god_update_campaigns SET report_sent_at=NULL WHERE version=?',
-              [campaign.version]
-            ).catch(() => {});
+        } else if (summary.pending > 0 || summary.running > 0) {
+          // Belum semua sukses, tapi cek dulu apakah campaign ini masih ada
+          // progres (ada VPS yang baru lapor). Kalau sudah lama sekali diam
+          // (tidak ada progres) berarti sisa VPS pending kemungkinan
+          // offline/tidak terjangkau - tutup campaign & kirim laporan apa
+          // adanya alih-alih menggantung selamanya menunggu 100% sukses.
+          const lastActivityAt = await getGodUpdateCampaignLastActivity(
+            campaign.version,
+            campaign.started_notice_at || campaign.created_at
+          );
+          if (now - lastActivityAt >= GOD_UPDATE_STALL_TIMEOUT_MS) {
+            await finalizeGodUpdateCampaign(
+              campaign,
+              summary,
+              expected,
+              `Ditutup otomatis: tidak ada progres baru selama ${Math.round(GOD_UPDATE_STALL_TIMEOUT_MS / 60000)} menit. Sisa VPS pending kemungkinan offline/registrasi expired/tidak terjangkau - cek manual, lalu jalankan campaign baru kalau perlu.`
+            );
           }
         }
       }
@@ -5817,7 +5880,58 @@ bot.action('m_admin_god_status', async (ctx) => {
     lines.push('', 'Gagal terakhir:');
     for (const row of failed) lines.push(`- ${row.vps_ip}: ${String(row.message || '-').slice(0, 90)}`);
   }
-  return ctx.reply(uiBox('STATUS GOD MODE', lines), adminMenu());
+  const isOpen = ['scheduled', 'active'].includes(String(campaign.status || ''));
+  const stillWaiting = summary.pending > 0 || summary.running > 0;
+  const buttons = [];
+  if (isOpen && stillWaiting) {
+    buttons.push([Markup.button.callback('Tuntaskan Sekarang', `m_admin_god_finish_${campaign.version}`)]);
+  }
+  buttons.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
+  return ctx.reply(uiBox('STATUS GOD MODE', lines), Markup.inlineKeyboard(buttons));
+});
+
+bot.action(/^m_admin_god_finish_(god-\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const version = String(ctx.match?.[1] || '');
+  const campaign = await dbGet(
+    "SELECT * FROM god_update_campaigns WHERE version=? AND status IN ('scheduled','active')",
+    [version]
+  );
+  if (!campaign) return ctx.reply('Campaign sudah selesai atau tidak ditemukan.', adminMenu());
+  const summary = await getGodUpdateCampaignSummary(campaign.version);
+  return ctx.reply(
+    `Tuntaskan paksa campaign ${version} sekarang?\n\n` +
+      `Berhasil: ${summary.success}, Gagal: ${summary.failed}, Berjalan: ${summary.running}, Pending: ${summary.pending}\n\n` +
+      'VPS yang belum sukses TIDAK akan ditawari campaign ini lagi setelah ditutup. Laporan akhir akan dikirim apa adanya.',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Ya, Tuntaskan Sekarang', `m_admin_god_finish_confirm_${version}`)],
+      [Markup.button.callback('Kembali', 'm_admin_god_status')]
+    ])
+  );
+});
+
+bot.action(/^m_admin_god_finish_confirm_(god-\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const version = String(ctx.match?.[1] || '');
+  const campaign = await dbGet(
+    "SELECT * FROM god_update_campaigns WHERE version=? AND status IN ('scheduled','active')",
+    [version]
+  );
+  if (!campaign) return ctx.reply('Campaign sudah selesai atau tidak ditemukan.', adminMenu());
+  const summary = await getGodUpdateCampaignSummary(campaign.version);
+  const expected = Number(campaign.expected_total || summary.total || 0);
+  const finalized = await finalizeGodUpdateCampaign(
+    campaign,
+    summary,
+    expected,
+    `Ditutup manual oleh admin (${Number(ctx.from.id || 0)}) sebelum semua VPS sukses.`
+  );
+  return ctx.reply(
+    finalized ? `Campaign ${version} dituntaskan manual. Laporan sudah dikirim.` : 'Campaign sudah selesai atau report sudah terkirim duluan.',
+    adminMenu()
+  );
 });
 
 bot.action('m_admin_god_cancel', async (ctx) => {

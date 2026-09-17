@@ -76,6 +76,8 @@ set -euo pipefail
 #   DROPBEAR_VERSION=2019.78
 #   DROPBEAR_KEEPALIVE_SECONDS=30               (opsional, keepalive server SSH agar NAT HP tidak idle)
 #   DROPBEAR_IDLE_TIMEOUT_SECONDS=0             (opsional, 0=tidak putus karena idle)
+#   SERVICE_HEALTH_INTERVAL_MINUTES=5           (opsional, interval watchdog service inti; 0=sekali saat boot saja)
+#   SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES=15   (opsional, jeda minimal restart ulang unit yang sama oleh watchdog)
 #   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
 #   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
@@ -181,7 +183,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.46}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.47}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -301,6 +303,8 @@ SSHWS_READER_BUFFER_KB="${SSHWS_READER_BUFFER_KB:-auto}"
 SSHWS_TCP_KEEPALIVE_SECONDS="${SSHWS_TCP_KEEPALIVE_SECONDS:-30}"
 DROPBEAR_KEEPALIVE_SECONDS="${DROPBEAR_KEEPALIVE_SECONDS:-30}"
 DROPBEAR_IDLE_TIMEOUT_SECONDS="${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}"
+SERVICE_HEALTH_INTERVAL_MINUTES="${SERVICE_HEALTH_INTERVAL_MINUTES:-5}"
+SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES="${SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES:-15}"
 SC_API_MEMORY_MAX="${SC_API_MEMORY_MAX:-auto}"
 SSHWS_SERVICE_MEMORY_MAX="${SSHWS_SERVICE_MEMORY_MAX:-auto}"
 HAPROXY_TCPLOG_ENABLE="${HAPROXY_TCPLOG_ENABLE:-0}"
@@ -13712,6 +13716,10 @@ set -uo pipefail
 LOCK_FILE="/run/sc-1forcr-postboot-health.lock"
 ACCESS_LOCK_FILE="/etc/sc-1forcr-access.lock"
 HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
+REPAIR_STAMP_DIR="/run/sc-1forcr-health"
+REPAIR_COOLDOWN_SECONDS="$(sed -n 's/^SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES=//p' /etc/sc-1forcr.env 2>/dev/null | tail -n1 | tr -cd '0-9')"
+[[ -z "${REPAIR_COOLDOWN_SECONDS}" ]] && REPAIR_COOLDOWN_SECONDS="15"
+REPAIR_COOLDOWN_SECONDS="$(( REPAIR_COOLDOWN_SECONDS * 60 ))"
 declare -a repaired_units=()
 failed=0
 
@@ -13768,6 +13776,26 @@ config_valid_for_unit() {
   esac
 }
 
+# Watchdog jalan berkala, jadi unit yang rusak permanen tidak boleh
+# di-restart tiap siklus (boros CPU/RAM di VPS kecil dan bisa menutupi
+# crash loop). Simpan stempel waktu restart terakhir di /run (tmpfs).
+repair_cooldown_active() {
+  local unit="$1" stamp_file last now
+  [[ "${REPAIR_COOLDOWN_SECONDS}" -gt 0 ]] || return 1
+  stamp_file="${REPAIR_STAMP_DIR}/${unit//\//_}"
+  [[ -f "${stamp_file}" ]] || return 1
+  last="$(cat "${stamp_file}" 2>/dev/null | tr -cd '0-9')"
+  [[ "${last}" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( now - last < REPAIR_COOLDOWN_SECONDS ))
+}
+
+mark_repair_attempt() {
+  local unit="$1"
+  mkdir -p "${REPAIR_STAMP_DIR}" >/dev/null 2>&1 || return 0
+  date +%s > "${REPAIR_STAMP_DIR}/${unit//\//_}" 2>/dev/null || true
+}
+
 repair_unit_if_needed() {
   local unit="$1"
   shift
@@ -13777,11 +13805,17 @@ repair_unit_if_needed() {
   # Konfirmasi sekali lagi agar listener yang baru start tidak dianggap gagal.
   sleep 3
   unit_healthy "${unit}" "$@" && return 0
+  if repair_cooldown_active "${unit}"; then
+    log_health "SKIP ${unit}: masih dalam cooldown restart watchdog"
+    failed=1
+    return 1
+  fi
   if ! config_valid_for_unit "${unit}"; then
     log_health "SKIP ${unit}: konfigurasi tidak valid"
     failed=1
     return 1
   fi
+  mark_repair_attempt "${unit}"
   if ! systemctl restart "${unit}" >/dev/null 2>&1; then
     log_health "GAGAL restart ${unit}"
     failed=1
@@ -13872,12 +13906,28 @@ NoNewPrivileges=true
 PrivateTmp=true
 POSTBOOT_HEALTH_SERVICE_EOF
 
-  cat > /etc/systemd/system/sc-1forcr-postboot-health.timer <<'POSTBOOT_HEALTH_TIMER_EOF'
+  local health_interval_min repeat_line
+  health_interval_min="$(echo "${SERVICE_HEALTH_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
+  [[ -z "${health_interval_min}" ]] && health_interval_min="5"
+  # 0 = perilaku lama (sekali saat boot). >0 = watchdog berkala.
+  if [[ "${health_interval_min}" -gt 0 ]]; then
+    (( health_interval_min < 2 )) && health_interval_min="2"
+    (( health_interval_min > 60 )) && health_interval_min="60"
+    repeat_line="OnUnitInactiveSec=${health_interval_min}min"
+  else
+    repeat_line=""
+  fi
+
+  # PENTING: tanpa OnUnitInactiveSec, timer ini hanya jalan SEKALI (90 detik
+  # setelah boot) lalu tidak pernah lagi. Service inti yang macet di tengah
+  # jalan jadi tidak pernah dipulihkan otomatis dan user harus restart manual.
+  cat > /etc/systemd/system/sc-1forcr-postboot-health.timer <<POSTBOOT_HEALTH_TIMER_EOF
 [Unit]
-Description=Check SC 1FORCR services after boot
+Description=Check SC 1FORCR core services after boot and every ${health_interval_min} minutes
 
 [Timer]
 OnActiveSec=90s
+${repeat_line}
 AccuracySec=10s
 RandomizedDelaySec=15s
 Persistent=false
@@ -17979,6 +18029,8 @@ DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 DROPBEAR_VERSION=${DROPBEAR_VERSION}
 DROPBEAR_KEEPALIVE_SECONDS=${DROPBEAR_KEEPALIVE_SECONDS}
 DROPBEAR_IDLE_TIMEOUT_SECONDS=${DROPBEAR_IDLE_TIMEOUT_SECONDS}
+SERVICE_HEALTH_INTERVAL_MINUTES=${SERVICE_HEALTH_INTERVAL_MINUTES}
+SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES=${SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -28350,6 +28402,7 @@ persist_pending_install_env() {
     SSH_TUNNEL_SHELL SSH_TUNNEL_BLOCK_OUTBOUND_SSH
     SSH_TUNNEL_BLOCK_OUTBOUND_PORTS TUNNEL_ABUSE_GUARD_ENABLE TUNNEL_ABUSE_BLOCK_TCP_PORTS ACTIVE_UDP_BACKEND
     DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION DROPBEAR_KEEPALIVE_SECONDS DROPBEAR_IDLE_TIMEOUT_SECONDS
+    SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS

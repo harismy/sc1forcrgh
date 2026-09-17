@@ -183,7 +183,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.47}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.48}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -4629,6 +4629,8 @@ function accountEventLabel(action) {
   if (a === 'delete' || a === 'deleted') return 'DELETE ACCOUNT';
   if (a === 'trial') return 'CREATE TRIAL';
   if (a === 'create' || a === 'created') return 'CREATE ACCOUNT';
+  if (a === 'renew' || a === 'renewed') return 'RENEW ACCOUNT';
+  if (a === 'recover' || a === 'recovered') return 'RECOVER ACCOUNT';
   return notifyValue(action).toUpperCase();
 }
 
@@ -4966,7 +4968,62 @@ function formatSshCreateNotification(action, service, account = {}, location = {
   ].join('\n');
 }
 
+function isRenewLikeAction(action) {
+  const a = String(action || '').trim().toLowerCase();
+  return a === 'renew' || a === 'renewed' || a === 'recover' || a === 'recovered';
+}
+
+// Notifikasi renew/recover sengaja ringkas: yang penting bagi penjual adalah
+// masa aktif sebelum dan sesudah, bukan ulangan detail koneksi seperti saat
+// akun baru dibuat.
+function formatRenewNotification(action, service, account = {}, owner = {}, location = {}) {
+  if (!isRenewLikeAction(action)) return '';
+  const username = notifyValue(account.username);
+  const kind = /^trial/i.test(username) ? 'TRIAL' : 'REGULER';
+  const fromExp = notifyValue(account.from);
+  const toExp = notifyValue(account.to || account.exp || account.expired || account.date_exp);
+  const addedDays = Number(account.added_days || 0);
+  const quotaAdded = Number(account.quota_added || 0);
+  const status = notifyValue(account.status || 'AKTIF').toUpperCase();
+  const ownerUser = notifyOwnerValue(owner, 'ownerTelegramId', 'owner_telegram_id');
+  const ownerChat = notifyOwnerValue(owner, 'ownerTelegramChatId', 'owner_telegram_chat_id');
+
+  return [
+    'SC 1FORCR NOTIF',
+    '==============================',
+    `Event    : ${accountEventLabel(action)}`,
+    `Layanan  : ${serviceLabel(service)}`,
+    `Kategori : ${kind}`,
+    `Status   : ${status}`,
+    '',
+    'VPS',
+    `Domain   : ${notifyValue(DOMAIN)}`,
+    `City     : ${notifyValue(account.city || location.city)}`,
+    `ISP      : ${notifyValue(account.isp || location.isp)}`,
+    '',
+    'MASA AKTIF',
+    `Username : ${username}`,
+    `Dari     : ${fromExp}`,
+    `Sampai   : ${toExp}`,
+    ...(addedDays > 0 ? [`Tambah   : ${addedDays} hari`] : []),
+    '',
+    'PAKET',
+    `Quota    : ${accountQuotaValue(account)}`,
+    ...(quotaAdded > 0 ? [`Quota +  : ${quotaAdded} GB`] : []),
+    `Limit IP : ${notifyValue(account.limitip ?? account.iplimit ?? 0, '0')}`,
+    '',
+    'OWNER',
+    `TG User  : ${ownerUser}`,
+    `TG Chat  : ${ownerChat}`,
+    `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`,
+    '=============================='
+  ].join('\n');
+}
+
 function formatAccountNotification(action, service, account = {}, owner = {}, location = {}) {
+  const renewMessage = formatRenewNotification(action, service, account, owner, location);
+  if (renewMessage) return renewMessage;
+
   const sshMessage = formatSshCreateNotification(action, service, account, location);
   if (sshMessage) return sshMessage;
 
@@ -6863,7 +6920,7 @@ async function renewSsh(req, res) {
       );
       syncZivpnUser(username, true);
       syncUdpcustomUser(pass, true);
-      return ok(res, {
+      const recoverPayload = {
         username,
         from: '-',
         to: expDate,
@@ -6874,7 +6931,9 @@ async function renewSsh(req, res) {
         recovered: true,
         status: 'AKTIF',
         time: nowTime()
-      });
+      };
+      await notifyAccountEvent('recover', 'ssh/zivpn', { ...recoverPayload, added_days: exp }, owner);
+      return ok(res, recoverPayload);
     }
 
     const oldPass = String(row?.password || '').trim();
@@ -6900,7 +6959,7 @@ async function renewSsh(req, res) {
     }
     if (oldPass && oldPass !== pass) syncUdpcustomUser(oldPass, false);
     if (quotaUnlock.ok) syncUdpcustomUser(pass, true);
-    return ok(res, {
+    const renewPayload = {
       username,
       from: fromExp,
       to: expDate,
@@ -6914,7 +6973,9 @@ async function renewSsh(req, res) {
       limitip: String(nextLimitIp),
       created: false,
       time: nowTime()
-    });
+    };
+    await notifyAccountEvent('renew', 'ssh/zivpn', { ...renewPayload, added_days: exp }, owner);
+    return ok(res, renewPayload);
   } catch (e) {
     return fail(res, 500, e.message);
   }
@@ -7166,7 +7227,7 @@ async function renewXray(table, username, exp, req) {
       [username, secret, expDate, 'AKTIF', nextQuota, nextLimitIp, owner.ownerTelegramId, owner.ownerTelegramChatId]
     );
     await renderAndReloadXray();
-    return {
+    const recoverPayload = {
       username,
       from: '-',
       to: expDate,
@@ -7177,6 +7238,8 @@ async function renewXray(table, username, exp, req) {
       status: 'AKTIF',
       time: nowTime()
     };
+    await notifyAccountEvent('recover', xrayTableMeta(table).protocol, { ...recoverPayload, added_days: exp }, owner);
+    return recoverPayload;
   }
 
   const currentQuota = Number(row?.quota || 0);
@@ -7197,7 +7260,7 @@ async function renewXray(table, username, exp, req) {
     await releaseTempLockNow(meta.protocol, username).catch(() => {});
   }
   await renderAndReloadXray();
-  return {
+  const renewPayload = {
     username,
     from: fromExp,
     to: expDate,
@@ -7212,6 +7275,8 @@ async function renewXray(table, username, exp, req) {
     created: false,
     time: nowTime()
   };
+  await notifyAccountEvent('renew', meta.protocol, { ...renewPayload, added_days: exp }, owner);
+  return renewPayload;
 }
 function xrayTableMeta(table) {
   const t = String(table || '').trim();
@@ -20871,7 +20936,9 @@ Sampai       : ${to_date}
 Quota        : ${quota}
 IP Limit     : ${limitip}
 EOT_RENEW
-  telegram_notify_action "RENEW" "${type}" "${username}"
+  # Notifikasi RENEW dikirim oleh API (notifyAccountEvent) supaya renew dari
+  # menu maupun dari bot sama-sama terkirim dan formatnya seragam dengan
+  # notifikasi create account. Jangan kirim lagi dari sini (dobel).
 }
 
 recover_expired_account() {
@@ -20965,7 +21032,7 @@ EOT_RECOVERY
   if [[ "${status}" == "LOCK_QUOTA" ]]; then
     echo "Catatan: masa aktif pulih, tetapi akun tetap lock karena quota habis."
   fi
-  telegram_notify_action "RECOVERY" "${type}" "${username}"
+  # Notifikasi dikirim oleh API lewat notifyAccountEvent (RENEW/RECOVER).
 }
 
 sync_xray_from_summary_api() {

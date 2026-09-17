@@ -183,7 +183,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.48}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.49}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -9064,6 +9064,80 @@ function safeExec(cmd, args, input) {
   }
 }
 
+// Kumpulkan PID sesi SSH milik satu akun, dibaca SEGAR saat mau diputus.
+// Ini melengkapi pkill berbasis pola yang sering meleset:
+//   - sesi tunnel murni (tanpa shell) di dropbear tidak selalu punya proses
+//     milik akun tersebut, jadi `pkill -u` tidak kena;
+//   - OpenSSH 9.8+ memakai judul "sshd-session:", bukan lagi "sshd:", jadi
+//     pola lama tidak cocok.
+// Dibaca segar (bukan snapshot awal siklus) supaya tidak ada risiko PID
+// sudah didaur ulang ke proses lain saat dibunuh.
+function collectSshSessionPids(username) {
+  const u = String(username || '').trim().toLowerCase();
+  if (!u || u === 'root' || !/^[a-z0-9._-]+$/.test(u)) return [];
+  let psOut = '';
+  try {
+    psOut = execFileSync('ps', ['-eo', 'pid=,user=,args='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+  } catch (_) {
+    return [];
+  }
+  const out = new Set();
+  for (const lineRaw of String(psOut || '').split('\n')) {
+    const m = String(lineRaw || '').match(/^\s*(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const owner = String(m[2] || '').trim().toLowerCase();
+    const args = String(m[3] || '').trim();
+    if (!Number.isInteger(pid) || pid <= 1) continue;
+    if (pid === process.pid || pid === process.ppid) continue;
+    if (!args) continue;
+    let hit = false;
+    // sshd / sshd-session: "sshd: user@notty", "sshd-session: user@notty"
+    const sshdMatch = args.match(/^sshd(?:-session)?:\s*(\S+)/i);
+    if (sshdMatch) {
+      const who = String(sshdMatch[1] || '').replace(/@.*$/, '').replace(/\[.*$/, '').toLowerCase();
+      if (who === u) hit = true;
+    }
+    // dropbear: judul proses memuat "[username]"
+    if (!hit && /dropbear/i.test(args)) {
+      const brack = args.match(/\[([^\]]+)\]/);
+      if (brack && String(brack[1] || '').trim().toLowerCase() === u) hit = true;
+    }
+    // proses apa pun yang memang dimiliki akun tunnel itu sendiri
+    if (!hit && owner === u) hit = true;
+    if (hit) out.add(pid);
+  }
+  return Array.from(out);
+}
+
+function killSshSessionsForUser(username) {
+  const pids = collectSshSessionPids(username);
+  let killed = 0;
+  for (const pid of pids) {
+    if (safeExec('kill', ['-KILL', String(pid)])) killed += 1;
+  }
+  return { attempted: pids.length, killed };
+}
+
+// Dipanggil setelah semua upaya pemutusan supaya kegagalan memutus sesi
+// tidak lagi senyap seperti sebelumnya.
+async function verifySshSessionsClosed(username, context) {
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const leftover = collectSshSessionPids(username);
+    if (leftover.length > 0) {
+      console.error(`[iplimit-lock] ${context} user=${username}: ${leftover.length} sesi SSH masih hidup setelah lock (pid=${leftover.slice(0, 10).join(',')}). Cek dukungan 'ss -K' dan judul proses SSH di VPS ini.`);
+      return false;
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function ensureTunnelHoldShell() {
   try {
     fs.mkdirSync('/usr/local/sbin', { recursive: true });
@@ -10913,10 +10987,14 @@ async function lockSshForQuota(row, usedBytes, quotaBytes) {
   const user = String(row?.username || '').trim();
   const pass = String(row?.password || '').trim();
   if (!user || await isQuotaLocked('ssh', user)) return { zivpnChanged: false, udpcustomChanged: false };
+  // Sama seperti lock multi-login: bunuh per-PID dulu, pkill pola sebagai cadangan.
+  killSshSessionsForUser(user);
   safeExec('pkill', ['-KILL', '-u', user]);
   safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
   safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
   safeExec('passwd', ['-l', user]);
+  killSshSessionsForUser(user);
+  await verifySshSessionsClosed(user, 'quota');
   const zivpnChanged = removeZivpnUser(user);
   let udpcustomChanged = false;
   if (pass && removeUdpcustomUser(pass)) udpcustomChanged = true;
@@ -11547,6 +11625,10 @@ async function lockIfExceeded(nowTs) {
     if (exists) continue;
 
     // Putuskan sesi aktif SSH user yang baru di-lock.
+    // Bunuh per-PID lebih dulu: ini yang paling andal karena tidak bergantung
+    // pada format judul proses maupun kepemilikan proses. pkill pola lama
+    // tetap dijalankan sebagai lapisan cadangan.
+    killSshSessionsForUser(user);
     safeExec('pkill', ['-KILL', '-u', user]);
     safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
     safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
@@ -11555,6 +11637,9 @@ async function lockIfExceeded(nowTs) {
     const sessionPorts = Array.from(extractClientPortsFromSessionKeys(setUnionValues(sshSessionMap)));
     disconnectSshWsByClientPorts(Array.from(new Set([...activeWsPorts, ...recentAuthPorts, ...sessionPorts])));
     safeExec('passwd', ['-l', user]);
+    // Sapuan kedua: sesi yang sempat lolos saat proses pertama masih hidup.
+    killSshSessionsForUser(user);
+    await verifySshSessionsClosed(user, 'multi-login');
 
     // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
     const zivpnLockIps = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)

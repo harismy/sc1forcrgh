@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.54}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.55}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -5342,6 +5342,22 @@ function writeXrayConfigAndReload(cfg, forceRestart = false) {
   const tmpPath = `${cfgDir}/.config.${process.pid}.tmp.json`;
   fs.mkdirSync(cfgDir, { recursive: true });
   const cfgText = `${JSON.stringify(cfg, null, 2)}\n`;
+
+  // Xray tidak punya ExecReload, jadi setiap "reload" pada praktiknya berujung
+  // systemctl restart yang MEMUTUS seluruh pengguna vmess/vless/trojan.
+  // renderAndReloadXray dipanggil dari banyak operasi akun, termasuk renew
+  // yang sama sekali tidak mengubah daftar client. Config yang isinya tidak
+  // berubah tidak boleh sampai menyentuh service.
+  if (!forceRestart) {
+    try {
+      if (fs.existsSync(cfgPath) &&
+          fs.readFileSync(cfgPath, 'utf8') === cfgText &&
+          safeExec('systemctl', ['is-active', '--quiet', 'xray'])) {
+        return true;
+      }
+    } catch (_) {}
+  }
+
   fs.writeFileSync(tmpPath, cfgText, { encoding: 'utf8', mode: 0o644 });
 
   // Validasi bersifat "best effort".
@@ -11625,7 +11641,7 @@ async function enforceExpiredAccounts() {
     await markIpLimitHistoryUnlocked('ssh', user, Math.floor(Date.now() / 1000), 'account-expired');
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
-    await run("DELETE FROM temp_ip_long_history WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
+    await run("DELETE FROM temp_ip_long_history WHERE account_type='ssh' AND username=?", [String(user || '').toLowerCase()]).catch(() => {});
     await run("DELETE FROM iplimit_longterm_alerts WHERE account_type='ssh' AND LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND LOWER(username)=LOWER(?)", [user]).catch(() => {});
   }
@@ -11758,7 +11774,7 @@ async function unlockExpired(nowTs) {
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     // Reset long-term IP history saat unlock (beri kesempatan bersih).
-    await run("DELETE FROM temp_ip_long_history WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+    await run("DELETE FROM temp_ip_long_history WHERE account_type=? AND username=?", [t, String(u || '').toLowerCase()]).catch(() => {});
     await run("DELETE FROM iplimit_longterm_alerts WHERE account_type=? AND LOWER(username)=LOWER(?)", [t, u]).catch(() => {});
     // Simpan grace dengan username lowercase agar cocok dengan lookup
     // graceMap di lockIfExceeded (yang memakai userKey lowercase).
@@ -11915,13 +11931,18 @@ async function lockIfExceeded(nowTs) {
       await run(
         `INSERT OR REPLACE INTO temp_ip_long_history(account_type, username, ip, first_seen, last_seen)
          VALUES('ssh', ?, ?, COALESCE((SELECT first_seen FROM temp_ip_long_history WHERE account_type='ssh' AND username=? AND ip=?), ?), ?)`,
-        [user, ip, userKey, ip, nowTs, nowTs]
+        // Disimpan lowercase supaya konsisten dengan subselect dan supaya
+        // SELECT di bawah bisa memakai primary key index.
+        [userKey, ip, userKey, ip, nowTs, nowTs]
       ).catch(() => {});
     }
     // Hitung unique IP 24 jam dengan toleransi subnet CGNAT.
     const longTermRows = await all(
-      "SELECT ip FROM temp_ip_long_history WHERE account_type='ssh' AND LOWER(username)=LOWER(?) AND last_seen >= ?",
-      [user, longTermCutoff]
+      // Tanpa LOWER() di kolom: query ini jalan untuk SETIAP akun tiap siklus,
+      // dan LOWER(username) membuat SQLite tidak bisa memakai primary key
+      // index sehingga biayanya tumbuh kuadratik saat akun banyak.
+      "SELECT ip FROM temp_ip_long_history WHERE account_type='ssh' AND username=? AND last_seen >= ?",
+      [userKey, longTermCutoff]
     ).catch(() => []);
     const longTermIpSet = new Set();
     for (const row of longTermRows) {

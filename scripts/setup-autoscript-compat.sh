@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.57}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.58}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -1660,10 +1660,33 @@ install_base_packages() {
     log "Gagal install paket dasar. Coba recovery default site Nginx (IPv4-only) lalu ulangi..."
     neutralize_nginx_package_default_site || true
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
-    apt_get_safe install -y "${base_pkgs[@]}" || {
-      log "Install paket dasar tetap gagal setelah recovery."
-      return 1
-    }
+    if ! apt_get_safe install -y "${base_pkgs[@]}"; then
+      # Batch gagal sering kali cuma karena SATU nama paket tidak ada di rilis
+      # ini, misalnya paket transisi yang sudah dihapus di Debian/Ubuntu baru.
+      # apt membatalkan SELURUH transaksi kalau begitu, jadi seluruh instalasi
+      # ikut mati padahal paket lain sebenarnya tersedia. Pasang satu per satu,
+      # lalu putuskan lanjut/berhenti hanya berdasarkan paket kritis.
+      log "Batch gagal. Pasang paket dasar satu per satu supaya satu nama yang hilang tidak menggagalkan semuanya..."
+      local pkg missing_pkgs="" crit missing_crit=""
+      for pkg in "${base_pkgs[@]}"; do
+        if ! apt_get_safe install -y "${pkg}" >/dev/null 2>&1; then
+          missing_pkgs="${missing_pkgs}${missing_pkgs:+ }${pkg}"
+        fi
+      done
+      if [[ -n "${missing_pkgs}" ]]; then
+        log "Paket dasar yang tidak terpasang di distro ini: ${missing_pkgs}"
+      fi
+      for crit in curl jq sqlite3 openssl nginx haproxy python3; do
+        if ! command -v "${crit}" >/dev/null 2>&1 && ! dpkg -s "${crit}" >/dev/null 2>&1; then
+          missing_crit="${missing_crit}${missing_crit:+ }${crit}"
+        fi
+      done
+      if [[ -n "${missing_crit}" ]]; then
+        log "Install paket dasar gagal: paket kritis tidak tersedia: ${missing_crit}"
+        return 1
+      fi
+      log "Paket kritis lengkap, instalasi dilanjutkan."
+    fi
   fi
 
   # Paket opsional (beberapa distro/repo lama tidak selalu menyediakan).

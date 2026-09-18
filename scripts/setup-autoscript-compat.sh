@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.58}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.59}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -831,7 +831,14 @@ enforce_install_license() {
      { ! command -v jq >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v base64 >/dev/null 2>&1; }; then
     log "Menyiapkan dependency verifikasi signed license..."
     apt_update_tolerant
-    apt_get_safe install -y jq openssl coreutils ca-certificates >/dev/null
+    # Tidak boleh mematikan instalasi. Kegagalan di sini biasanya karena daftar
+    # paket apt basi (404 saat ambil .deb), dan itu bisa dipulihkan sendiri.
+    if ! apt_install_with_refresh jq openssl coreutils ca-certificates; then
+      log "PERINGATAN: sebagian dependency verifikasi lisensi gagal dipasang. Instalasi tetap dilanjutkan."
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+      log "PERINGATAN: jq belum tersedia. Validasi lisensi memakai mode tanpa jq."
+    fi
   fi
 
   log "Validasi lisensi ke server..."
@@ -1613,6 +1620,32 @@ apt_update_tolerant() {
   return 0
 }
 
+# Kalau apt-get update gagal, apt tetap memakai daftar paket LAMA. Daftar lama
+# itu menunjuk ke versi .deb yang sudah digantikan dan dihapus dari mirror,
+# sehingga apt-get install berujung "404 Not Found" untuk paket yang jelas ada.
+# Obatnya membuang cache dan daftar lama, lalu mengambil ulang dari awal.
+apt_refresh_lists_hard() {
+  log "Daftar paket apt kemungkinan basi. Bersihkan cache dan ambil ulang daftar paket..."
+  DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
+  rm -rf /var/lib/apt/lists/* >/dev/null 2>&1 || true
+  mkdir -p /var/lib/apt/lists/partial >/dev/null 2>&1 || true
+  apt_update_tolerant
+  return 0
+}
+
+# Pasang paket dengan pemulihan otomatis kalau kegagalannya karena daftar basi.
+apt_install_with_refresh() {
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1; then
+    return 0
+  fi
+  apt_refresh_lists_hard
+  if DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1; then
+    return 0
+  fi
+  # Upaya terakhir: abaikan arsip yang memang tidak bisa diambil.
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing "$@" >/dev/null 2>&1
+}
+
 neutralize_nginx_package_default_site() {
   # Recovery targeted untuk VPS IPv4-only: postinst nginx gagal bind [::]:80 di
   # default site bawaan paket. Hanya menyentuh default site bawaan paket
@@ -1660,6 +1693,10 @@ install_base_packages() {
     log "Gagal install paket dasar. Coba recovery default site Nginx (IPv4-only) lalu ulangi..."
     neutralize_nginx_package_default_site || true
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null 2>&1 || true
+    # Kegagalan berikutnya sering karena daftar paket apt basi: apt merujuk
+    # versi .deb yang sudah dihapus dari mirror sehingga muncul 404 padahal
+    # paketnya ada. Ambil ulang daftar paket lalu coba sekali lagi.
+    apt_refresh_lists_hard
     if ! apt_get_safe install -y "${base_pkgs[@]}"; then
       # Batch gagal sering kali cuma karena SATU nama paket tidak ada di rilis
       # ini, misalnya paket transisi yang sudah dihapus di Debian/Ubuntu baru.

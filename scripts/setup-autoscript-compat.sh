@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.56}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.57}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -830,7 +830,7 @@ enforce_install_license() {
   if [[ "${LICENSE_LEASE_REQUIRED:-1}" == "1" ]] && \
      { ! command -v jq >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1 || ! command -v base64 >/dev/null 2>&1; }; then
     log "Menyiapkan dependency verifikasi signed license..."
-    apt_get_safe update -y >/dev/null
+    apt_update_tolerant
     apt_get_safe install -y jq openssl coreutils ca-certificates >/dev/null
   fi
 
@@ -1592,6 +1592,27 @@ apt_get_safe() {
   DEBIAN_FRONTEND=noninteractive apt-get "$@"
 }
 
+# apt-get update keluar dengan kode error kalau ADA SATU saja repo yang rusak,
+# misalnya repo pihak ketiga bawaan image VPS yang Release file-nya hilang.
+# Karena script memakai set -e, kegagalan itu dulu mematikan seluruh instalasi
+# padahal repo resmi Debian/Ubuntu-nya sendiri baik-baik saja dan paket yang
+# dibutuhkan tetap bisa dipasang. Jadi kegagalan update dicatat sebagai
+# peringatan, bukan dijadikan alasan berhenti.
+apt_update_tolerant() {
+  local out rc=0
+  repair_dpkg_state || true
+  out="$(DEBIAN_FRONTEND=noninteractive apt-get update -y 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    log "PERINGATAN: apt-get update tidak bersih (rc=${rc}). Repo bermasalah diabaikan, instalasi tetap dilanjutkan."
+    # WAJIB diakhiri '|| true'. Script ini memakai set -o pipefail, jadi grep
+    # yang tidak menemukan baris cocok (exit 1) atau head yang menutup pipe
+    # lebih dulu akan membuat pipeline gagal, dan set -e akan mematikan
+    # installer - persis masalah yang fungsi ini coba hindari.
+    printf '%s\n' "${out}" | grep -E '^(E|W):' | head -n 5 || true
+  fi
+  return 0
+}
+
 neutralize_nginx_package_default_site() {
   # Recovery targeted untuk VPS IPv4-only: postinst nginx gagal bind [::]:80 di
   # default site bawaan paket. Hanya menyentuh default site bawaan paket
@@ -1634,7 +1655,7 @@ install_base_packages() {
     make g++ gcc libc6-dev pkg-config libsqlite3-dev bzip2 zlib1g-dev
     netfilter-persistent iptables-persistent
   )
-  apt_get_safe update -y
+  apt_update_tolerant
   if ! apt_get_safe install -y "${base_pkgs[@]}"; then
     log "Gagal install paket dasar. Coba recovery default site Nginx (IPv4-only) lalu ulangi..."
     neutralize_nginx_package_default_site || true
@@ -1660,7 +1681,7 @@ install_node_if_missing() {
     return
   fi
   log "Install Node.js (prioritas NodeSource 20, fallback 22/18)..."
-  apt_get_safe update -y
+  apt_update_tolerant
   apt_get_safe install -y curl ca-certificates gnupg
   for node_major in 20 22 18; do
     log "Coba install Node.js ${node_major} (NodeSource)..."
@@ -1674,7 +1695,7 @@ install_node_if_missing() {
   done
 
   log "NodeSource tidak mendukung distro ini. Fallback: paket nodejs dari repo distro..."
-  apt_get_safe update -y
+  apt_update_tolerant
   if apt-cache show nodejs >/dev/null 2>&1 && apt_get_safe install -y nodejs npm; then
     if command -v node >/dev/null 2>&1; then
       log "Node terpasang dari repo distro: $(node -v)"
@@ -1718,7 +1739,7 @@ install_go_if_missing() {
     return
   fi
   log "Install Go..."
-  apt_get_safe update -y
+  apt_update_tolerant
   apt_get_safe install -y golang-go
   log "Go installed: $(go version)"
 }
@@ -27827,8 +27848,14 @@ set_html_banner_menu() {
       1)
         if ! command -v nano >/dev/null 2>&1; then
           echo "GNU nano belum ada, install nano..."
-          apt_get_safe update -y
-          apt_get_safe install -y nano
+          # Mandiri: runtime menu tidak memuat helper apt milik installer.
+          # Kegagalan update (mis. repo pihak ketiga rusak) tidak boleh
+          # menggagalkan pemasangan nano dari repo resmi yang masih sehat.
+          DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 ||             echo "Catatan: apt-get update tidak bersih, repo bermasalah diabaikan."
+          if ! DEBIAN_FRONTEND=noninteractive apt-get install -y nano >/dev/null 2>&1; then
+            echo "Gagal memasang nano. Pasang manual: apt-get install -y nano"
+            return
+          fi
         fi
         [[ -s "${banner_file}" ]] || write_default_banner_html
         echo "GNU nano akan dibuka."

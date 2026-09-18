@@ -184,7 +184,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.50}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.51}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -2951,6 +2951,18 @@ ${xray_realip_grpc_listener}
     server_name _;
 
     include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
+
+    # Browser memakai HTTP/2 (ALPN h2), dan HAProxy mengarahkan semua koneksi
+    # h2 ke backend gRPC ini. Tanpa location /vps/ di sini, halaman web yang
+    # dilayani API (mis. /vps/backup-ui) selalu jatuh ke "location /" dan
+    # balasannya 404 dari nginx, padahal lewat HTTP/1.1 normal saja.
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
 
     location /vmess-grpc {
         access_log off;
@@ -24296,6 +24308,18 @@ ${xray_realip_grpc_listener}
     server_name _;
 
     include /etc/nginx/snippets/sc-1forcr-api-docs.conf;
+
+    # Browser memakai HTTP/2 (ALPN h2), dan HAProxy mengarahkan semua koneksi
+    # h2 ke backend gRPC ini. Tanpa location /vps/ di sini, halaman web yang
+    # dilayani API (mis. /vps/backup-ui) selalu jatuh ke "location /" dan
+    # balasannya 404 dari nginx, padahal lewat HTTP/1.1 normal saja.
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
 
     location /vmess-grpc {
         access_log off;

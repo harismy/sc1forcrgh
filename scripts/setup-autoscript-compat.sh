@@ -184,7 +184,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.51}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.52}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -6646,13 +6646,14 @@ function busy(m){var l=document.getElementById('log');l.className='mut';l.textCo
 function sz(n){n=Number(n)||0;if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(2)+' MB'}
 function dt(s){try{return new Date(Number(s)*1000).toLocaleString('id-ID')}catch(e){return '-'}}
 function api(path,opt){opt=opt||{};opt.headers=Object.assign({'Authorization':'Bearer '+tok()},opt.headers||{});return fetch(path,opt)}
+function unwrap(j){var c=j&&j.meta?Number(j.meta.code):0;if(c!==200)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');return j.data}
 function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function loadList(){
   if(!tok())return say('Isi API token dulu.',1);
   busy('Memuat daftar backup...');
   api('/vps/backup/list').then(function(r){return r.json()}).then(function(j){
-    if(!j||j.ok!==true)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');
-    var rows=(j.data||[]);var tb=document.getElementById('tb');
+    var d=unwrap(j);
+    var rows=(d||[]);var tb=document.getElementById('tb');
     if(!rows.length){tb.innerHTML='<tr><td colspan="4" class="mut">Belum ada file backup.</td></tr>';return say('Tidak ada file backup.')}
     tb.innerHTML=rows.map(function(f){var n=esc(f.name);return '<tr><td>'+n+'</td><td>'+sz(f.size)+'</td><td>'+dt(f.mtime)+'</td><td class="act">'+
       '<button class="sec" onclick="dl(\\''+n+'\\')">Unduh</button>'+
@@ -6664,16 +6665,24 @@ function mkBackup(){
   if(!tok())return say('Isi API token dulu.',1);
   var b=document.getElementById('mk');b.disabled=true;busy('Membuat backup, mohon tunggu...');
   api('/vps/backup/create',{method:'POST'}).then(function(r){return r.json()}).then(function(j){
-    if(!j||j.ok!==true)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');
-    say('Backup selesai.');loadList()
+    var d=unwrap(j);
+    var files=(d&&d.files)||[];
+    loadList();
+    if(files.length&&files[0].name){
+      busy('Backup selesai, mengunduh '+files[0].name+'...');
+      return dl(files[0].name,1).then(function(okDl){
+        say(okDl?('Backup selesai dan file diunduh: '+files[0].name):('Backup selesai: '+files[0].name+' (unduh otomatis gagal, pakai tombol Unduh di daftar)'),okDl?0:1)
+      })
+    }
+    say('Backup selesai.')
   }).catch(function(e){say('Backup gagal: '+e.message,1)}).then(function(){b.disabled=false})
 }
-function dl(name){
-  if(!tok())return say('Isi API token dulu.',1);
-  busy('Menyiapkan unduhan...');
-  api('/vps/backup/file/'+encodeURIComponent(name)).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.blob()})
-  .then(function(b){var u=URL.createObjectURL(b);var a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u);say('File diunduh.')})
-  .catch(function(e){say('Unduh gagal: '+e.message,1)})
+function dl(name,quiet){
+  if(!tok()){say('Isi API token dulu.',1);return Promise.resolve(false)}
+  if(!quiet)busy('Menyiapkan unduhan...');
+  return api('/vps/backup/file/'+encodeURIComponent(name)).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.blob()})
+  .then(function(b){var u=URL.createObjectURL(b);var a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(u)},4000);if(!quiet)say('File diunduh.');return true})
+  .catch(function(e){say('Unduh gagal: '+e.message,1);return false})
 }
 function rs(name){
   if(!tok())return say('Isi API token dulu.',1);
@@ -6681,7 +6690,7 @@ function rs(name){
   busy('Restore berjalan, jangan tutup halaman...');
   api('/vps/backup/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:name})})
   .then(function(r){return r.json()}).then(function(j){
-    if(!j||j.ok!==true)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');
+    var d=unwrap(j);
     say('Restore selesai dari '+name+'.')
   }).catch(function(e){say('Restore gagal: '+e.message,1)})
 }
@@ -6697,7 +6706,7 @@ function upRestore(){
     try{body=JSON.stringify({content:JSON.parse(fr.result)})}catch(e){return say('File bukan JSON valid.',1)}
     api('/vps/backup/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:body})
     .then(function(r){return r.json()}).then(function(j){
-      if(!j||j.ok!==true)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');
+      var d=unwrap(j);
       say('Restore selesai dari file unggahan.');loadList()
     }).catch(function(e){say('Restore gagal: '+e.message,1)})
   };

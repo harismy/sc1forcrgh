@@ -67,7 +67,10 @@ set -euo pipefail
 #   SSHWS_UDPGW_CLIENT_SNDBUF=262144            (opsional, buffer TCP per client untuk kurangi backpressure)
 #   SSHWS_ACCOUNT_SESSION_HARD_LIMIT=auto       (opsional, batas sesi SSHWS per akun termasuk limitip=0)
 #   SSH_TUNNEL_SHELL=/usr/local/sbin/sc-1forcr-tunnel-shell (tunnel-only, tahan sesi HTTP Custom tanpa shell VPS)
-#   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1            (blok akun tunnel konek keluar ke port SSH)
+#   SSH_TUNNEL_BLOCK_OUTBOUND_SSH=0            (0=default, akun tunnel BOLEH konek ke port SSH.
+#                                               Kalau 1, hanya pengguna Xray yang terblokir karena
+#                                               Xray jalan sebagai user nobody, sedangkan forwarding
+#                                               dropbear jalan sebagai root sehingga lolos.)
 #   SSH_TUNNEL_BLOCK_OUTBOUND_PORTS=22,2222     (port keluar yang diblok untuk UID non-root)
 #   TUNNEL_ABUSE_GUARD_ENABLE=1                (blok port abuse untuk UID non-root: RDP/VNC/SMB/SMTP)
 #   TUNNEL_ABUSE_BLOCK_TCP_PORTS=3389,5900,5901,5902,445,135,139,25,465,587
@@ -184,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.53}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.54}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -225,7 +228,7 @@ SSHWS_UDPGW_BIND_ADDR="${SSHWS_UDPGW_BIND_ADDR:-127.0.0.1}"
 SSHWS_UDPGW_CLIENT_SNDBUF="${SSHWS_UDPGW_CLIENT_SNDBUF:-262144}"
 SSHWS_ACCOUNT_SESSION_HARD_LIMIT="${SSHWS_ACCOUNT_SESSION_HARD_LIMIT:-auto}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
-SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-1}"
+SSH_TUNNEL_BLOCK_OUTBOUND_SSH="${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0}"
 SSH_TUNNEL_BLOCK_OUTBOUND_PORTS="${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}"
 TUNNEL_ABUSE_GUARD_ENABLE="${TUNNEL_ABUSE_GUARD_ENABLE:-1}"
 TUNNEL_ABUSE_BLOCK_TCP_PORTS="${TUNNEL_ABUSE_BLOCK_TCP_PORTS:-3389,5900,5901,5902,445,135,139,25,465,587}"
@@ -2181,7 +2184,20 @@ apply_tunnel_outbound_guard_rules() {
       applied=1
       log "Outbound SSH guard aktif untuk UID non-root: tcp/${ssh_ports}."
     else
-      log "Outbound SSH guard nonaktif (SSH_TUNNEL_BLOCK_OUTBOUND_SSH=${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0})."
+      # PENTING: rule lama wajib dihapus, bukan cuma dilewati. Kalau hanya
+      # dilewati, VPS yang sudah pernah memasang rule ini akan tetap memblokir
+      # dan sudah ikut tersimpan oleh netfilter-persistent, jadi bertahan
+      # walau sudah reboot.
+      local del_ports
+      for del_ports in "${ssh_ports}" "22,2222" "22"; do
+        [[ -z "${del_ports}" ]] && continue
+        while iptables -w 10 -D OUTPUT -p tcp -m multiport --dports "${del_ports}"           -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1; do :; done
+        if command -v ip6tables >/dev/null 2>&1; then
+          while ip6tables -w 10 -D OUTPUT -p tcp -m multiport --dports "${del_ports}"             -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1; do :; done
+        fi
+      done
+      applied=1
+      log "Outbound SSH guard nonaktif: rule blokir tcp/${ssh_ports} dibersihkan (Xray kini bisa SSH ke VPS lain)."
     fi
 
     if [[ "${abuse_enabled}" == "1" || "${abuse_enabled}" == "true" || "${abuse_enabled}" == "yes" || "${abuse_enabled}" == "on" ]]; then
@@ -18629,6 +18645,22 @@ safe_source_env_file() {
 safe_source_env_file /etc/sc-1forcr.env
 
 # --- MIGRASI: upgrade default lama ke nilai optimal (dijalankan saat install & update) ---
+# Guard SSH outbound dimatikan sekali jalan. Dulu default 1, tapi efeknya
+# timpang: Xray (user nobody) terblokir, sedangkan tunnel SSH lolos karena
+# forwarding dropbear berjalan sebagai root. Akibatnya pelanggan Xray tidak
+# bisa SSH ke VPS sendiri lewat Termius/JuiceSSH/PuTTY. Pakai penanda supaya
+# admin yang sengaja menyalakannya lagi tidak tertimpa tiap update.
+if [[ ! -f /var/lib/sc-1forcr/migrated-outbound-ssh-guard ]]; then
+  if [[ "${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0}" != "0" ]]; then
+    SSH_TUNNEL_BLOCK_OUTBOUND_SSH="0"
+    if [[ -f /etc/sc-1forcr.env ]]; then
+      sed -i 's/^SSH_TUNNEL_BLOCK_OUTBOUND_SSH=.*/SSH_TUNNEL_BLOCK_OUTBOUND_SSH=0/' /etc/sc-1forcr.env
+    fi
+    log "Migrasi: SSH_TUNNEL_BLOCK_OUTBOUND_SSH 1 -> 0 (Xray kini bisa SSH ke VPS lain)"
+  fi
+  mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
+  : > /var/lib/sc-1forcr/migrated-outbound-ssh-guard 2>/dev/null || true
+fi
 if [[ "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-0}" == "0" ]]; then
   DROPBEAR_IDLE_TIMEOUT_SECONDS="300"
   if [[ -f /etc/sc-1forcr.env ]]; then

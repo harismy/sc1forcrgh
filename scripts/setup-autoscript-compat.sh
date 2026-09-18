@@ -35,6 +35,7 @@ set -euo pipefail
 #   UPDATE_SCRIPT_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-autoscript-compat.sh
 #   AUTO_INSTALL_SUMMARY_API=1                   (opsional, 1=auto install summary API saat install SC)
 #   API_DOCS_ENABLE=0                           (opsional, 1=aktifkan web dokumentasi API)
+#   BACKUP_WEB_ENABLE=0                         (opsional, 1=aktifkan web backup/restore di /vps/backup-ui)
 #   SUMMARY_API_SETUP_URL=https://<domain-bot>/sc1forcr/payload/scripts/setup-summary-api.sh
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
@@ -183,11 +184,12 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.49}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.50}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
 API_DOCS_ENABLE="${API_DOCS_ENABLE:-0}"
+BACKUP_WEB_ENABLE="${BACKUP_WEB_ENABLE:-0}"
 SUMMARY_API_SETUP_URL="${SUMMARY_API_SETUP_URL:-}"
 SUMMARY_API_SETUP_URLS="${SUMMARY_API_SETUP_URLS:-${SUMMARY_API_SETUP_URL:-}}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
@@ -3852,6 +3854,7 @@ PORT=${API_PORT}
 DB_PATH=${DB_PATH}
 DOMAIN=${DOMAIN}
 API_DOCS_ENABLE=${API_DOCS_ENABLE}
+BACKUP_WEB_ENABLE=${BACKUP_WEB_ENABLE}
 WILDCARD_BUG_PREFIX=${WILDCARD_BUG_PREFIX}
 WILDCARD_BUG_PREFIXES=${WILDCARD_BUG_PREFIXES}
 WILDCARD_XRAY_HOST=${WILDCARD_XRAY_HOST}
@@ -4071,6 +4074,8 @@ const XRAY_OUTBOUND_DOMAIN_STRATEGY = (() => {
   return 'UseIPv4';
 })();
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
+const BACKUP_WEB_ENABLE = String(process.env.BACKUP_WEB_ENABLE || '0').trim() === '1';
+const BACKUP_DIR = String(process.env.AUTO_BACKUP_DIR || '/root/backup-sc-1forcr').trim() || '/root/backup-sc-1forcr';
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
 const ZIVPN_AUTH_MODE = String(process.env.ZIVPN_AUTH_MODE || 'http').trim().toLowerCase();
@@ -6506,7 +6511,259 @@ app.post('/internal/sc-access-lock', auth, (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Web Backup & Restore (ringan): halaman statis disajikan langsung oleh API
+// yang sudah jalan, dan nginx sudah mem-proxy /vps/ ke sini. Tidak ada proses
+// baru, tidak ada perubahan konfigurasi nginx, jadi biaya idle-nya nol.
+// Halaman HTML-nya publik (tidak memuat data apa pun, hanya form token),
+// sedangkan semua endpoint datanya tetap di belakang auth token.
+// ---------------------------------------------------------------------------
+function backupFileSafeName(input) {
+  const name = String(input || '').trim();
+  if (!name || name.length > 200) return '';
+  if (!/^[A-Za-z0-9._-]+$/.test(name)) return '';
+  if (name.includes('..')) return '';
+  if (!/\.json$/i.test(name)) return '';
+  return name;
+}
+
+function backupFileFullPath(name) {
+  const safe = backupFileSafeName(name);
+  if (!safe) return '';
+  const path = require('path');
+  const full = path.resolve(BACKUP_DIR, safe);
+  const rootPrefix = path.resolve(BACKUP_DIR) + path.sep;
+  if (!full.startsWith(rootPrefix)) return '';
+  return full;
+}
+
+function listBackupFiles() {
+  try {
+    return fs.readdirSync(BACKUP_DIR)
+      .filter((name) => backupFileSafeName(name))
+      .map((name) => {
+        try {
+          const st = fs.statSync(require('path').join(BACKUP_DIR, name));
+          if (!st.isFile()) return null;
+          return { name, size: st.size, mtime: Math.floor(st.mtimeMs / 1000) };
+        } catch (_) {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, 100);
+  } catch (_) {
+    return [];
+  }
+}
+
+const BACKUP_WEB_PAGE = `<!doctype html>
+<html lang="id"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>SC 1FORCR - Backup &amp; Restore</title>
+<style>
+:root{--bg:#0f1720;--card:#16212e;--line:#24374a;--fg:#dbe6f0;--mut:#8aa0b6;--ok:#36d399;--bad:#f87272;--acc:#4aa3f0}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Menlo,Consolas,monospace;padding:16px}
+.wrap{max-width:860px;margin:0 auto}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:var(--mut);margin:0 0 16px;font-size:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px}
+.card h2{font-size:13px;margin:0 0 10px;color:var(--acc);text-transform:uppercase;letter-spacing:.5px}
+input,button{font:inherit;border-radius:6px;border:1px solid var(--line)}
+input{background:#0d151e;color:var(--fg);padding:8px 10px;width:100%}
+input[type=file]{padding:6px}
+button{background:var(--acc);color:#04121f;padding:8px 14px;border:0;cursor:pointer;font-weight:600}
+button.sec{background:#243447;color:var(--fg)}
+button.danger{background:var(--bad);color:#2a0606}
+button:disabled{opacity:.5;cursor:not-allowed}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.row>*{flex:0 0 auto}
+.grow{flex:1 1 220px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase}
+td.act{white-space:nowrap}
+td.act button{padding:5px 9px;font-size:12px;margin-right:4px}
+#log{margin-top:4px;padding:10px;border-radius:6px;background:#0d151e;border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;min-height:20px;font-size:12px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
+.warn{border-left:3px solid var(--bad);padding-left:10px;color:var(--mut);font-size:12px}
+@media(max-width:560px){td.act button{margin-bottom:4px}}
+</style></head><body><div class="wrap">
+<h1>SC 1FORCR - Backup &amp; Restore</h1>
+<p class="sub">Backup akun dan auth ZIVPN. Semua aksi butuh API token server ini.</p>
+
+<div class="card">
+<h2>API Token</h2>
+<div class="row"><input id="tok" type="password" class="grow" placeholder="Masukkan API token" autocomplete="off">
+<button onclick="saveTok()">Simpan</button><button class="sec" onclick="clearTok()">Hapus</button></div>
+<p class="sub" style="margin:8px 0 0">Token disimpan di sessionStorage browser dan hilang saat tab ditutup.</p>
+</div>
+
+<div class="card">
+<h2>Buat Backup</h2>
+<div class="row"><button id="mk" onclick="mkBackup()">Backup Sekarang</button>
+<span class="mut">Menjalankan proses backup yang sama dengan menu CLI.</span></div>
+</div>
+
+<div class="card">
+<h2>Daftar Backup</h2>
+<div class="row" style="margin-bottom:10px"><button class="sec" onclick="loadList()">Muat Ulang</button></div>
+<table><thead><tr><th>File</th><th>Ukuran</th><th>Tanggal</th><th>Aksi</th></tr></thead>
+<tbody id="tb"><tr><td colspan="4" class="mut">Belum dimuat.</td></tr></tbody></table>
+</div>
+
+<div class="card">
+<h2>Restore dari File</h2>
+<p class="warn">Restore menimpa data akun dan me-restart layanan. Koneksi pengguna aktif akan terputus sesaat.</p>
+<div class="row" style="margin-top:10px"><input id="up" type="file" accept=".json,application/json" class="grow">
+<button class="danger" onclick="upRestore()">Restore File Ini</button></div>
+</div>
+
+<div class="card"><h2>Status</h2><div id="log" class="mut">Siap.</div></div>
+</div>
+<script>
+var TK='sc1forcr_backup_token';
+function tok(){return sessionStorage.getItem(TK)||''}
+function saveTok(){var v=document.getElementById('tok').value.trim();if(!v){return say('Token kosong.',1)}sessionStorage.setItem(TK,v);say('Token disimpan.');loadList()}
+function clearTok(){sessionStorage.removeItem(TK);document.getElementById('tok').value='';say('Token dihapus.')}
+function say(m,bad){var l=document.getElementById('log');l.className=bad?'bad':'ok';l.textContent=m}
+function busy(m){var l=document.getElementById('log');l.className='mut';l.textContent=m}
+function sz(n){n=Number(n)||0;if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(1)+' KB';return (n/1048576).toFixed(2)+' MB'}
+function dt(s){try{return new Date(Number(s)*1000).toLocaleString('id-ID')}catch(e){return '-'}}
+function api(path,opt){opt=opt||{};opt.headers=Object.assign({'Authorization':'Bearer '+tok()},opt.headers||{});return fetch(path,opt)}
+function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function loadList(){
+  if(!tok())return say('Isi API token dulu.',1);
+  busy('Memuat daftar backup...');
+  api('/vps/backup/list').then(function(r){return r.json()}).then(function(j){
+    if(!j||j.ok!==true)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');
+    var rows=(j.data||[]);var tb=document.getElementById('tb');
+    if(!rows.length){tb.innerHTML='<tr><td colspan="4" class="mut">Belum ada file backup.</td></tr>';return say('Tidak ada file backup.')}
+    tb.innerHTML=rows.map(function(f){var n=esc(f.name);return '<tr><td>'+n+'</td><td>'+sz(f.size)+'</td><td>'+dt(f.mtime)+'</td><td class="act">'+
+      '<button class="sec" onclick="dl(\\''+n+'\\')">Unduh</button>'+
+      '<button class="danger" onclick="rs(\\''+n+'\\')">Restore</button></td></tr>'}).join('');
+    say('Ada '+rows.length+' file backup.')
+  }).catch(function(e){say('Gagal memuat: '+e.message,1)})
+}
+function mkBackup(){
+  if(!tok())return say('Isi API token dulu.',1);
+  var b=document.getElementById('mk');b.disabled=true;busy('Membuat backup, mohon tunggu...');
+  api('/vps/backup/create',{method:'POST'}).then(function(r){return r.json()}).then(function(j){
+    if(!j||j.ok!==true)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');
+    say('Backup selesai.');loadList()
+  }).catch(function(e){say('Backup gagal: '+e.message,1)}).then(function(){b.disabled=false})
+}
+function dl(name){
+  if(!tok())return say('Isi API token dulu.',1);
+  busy('Menyiapkan unduhan...');
+  api('/vps/backup/file/'+encodeURIComponent(name)).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.blob()})
+  .then(function(b){var u=URL.createObjectURL(b);var a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u);say('File diunduh.')})
+  .catch(function(e){say('Unduh gagal: '+e.message,1)})
+}
+function rs(name){
+  if(!tok())return say('Isi API token dulu.',1);
+  if(!confirm('Restore dari '+name+'?\\n\\nData akun akan ditimpa dan layanan di-restart.'))return;
+  busy('Restore berjalan, jangan tutup halaman...');
+  api('/vps/backup/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:name})})
+  .then(function(r){return r.json()}).then(function(j){
+    if(!j||j.ok!==true)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');
+    say('Restore selesai dari '+name+'.')
+  }).catch(function(e){say('Restore gagal: '+e.message,1)})
+}
+function upRestore(){
+  if(!tok())return say('Isi API token dulu.',1);
+  var f=document.getElementById('up').files[0];
+  if(!f)return say('Pilih file .json dulu.',1);
+  if(!confirm('Restore dari file '+f.name+'?\\n\\nData akun akan ditimpa dan layanan di-restart.'))return;
+  busy('Mengunggah dan restore...');
+  var fr=new FileReader();
+  fr.onload=function(){
+    var body;
+    try{body=JSON.stringify({content:JSON.parse(fr.result)})}catch(e){return say('File bukan JSON valid.',1)}
+    api('/vps/backup/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:body})
+    .then(function(r){return r.json()}).then(function(j){
+      if(!j||j.ok!==true)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');
+      say('Restore selesai dari file unggahan.');loadList()
+    }).catch(function(e){say('Restore gagal: '+e.message,1)})
+  };
+  fr.onerror=function(){say('Gagal membaca file.',1)};
+  fr.readAsText(f)
+}
+(function(){var t=tok();if(t){document.getElementById('tok').value=t;loadList()}})();
+</script></body></html>`;
+
+// Halaman UI: publik (tidak memuat data), didaftarkan SEBELUM middleware auth.
+app.get('/vps/backup-ui', (_req, res) => {
+  if (!BACKUP_WEB_ENABLE) return res.status(404).type('text/plain').send('not found');
+  res.set('Cache-Control', 'no-store');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  return res.type('text/html; charset=utf-8').send(BACKUP_WEB_PAGE);
+});
+
 app.use('/vps', runtimeLicenseGuard, auth);
+
+// --- Endpoint data Backup & Restore (di belakang auth /vps) ---------------
+app.get('/vps/backup/list', (_req, res) => {
+  if (!BACKUP_WEB_ENABLE) return fail(res, 404, 'web backup nonaktif');
+  return ok(res, listBackupFiles());
+});
+
+app.post('/vps/backup/create', (_req, res) => {
+  if (!BACKUP_WEB_ENABLE) return fail(res, 404, 'web backup nonaktif');
+  try {
+    execFileSync('/usr/local/sbin/sc-1forcr-auto-backup', ['manual'], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 180000
+    });
+    return ok(res, { created: true, files: listBackupFiles().slice(0, 5) });
+  } catch (e) {
+    return fail(res, 500, `backup gagal: ${e.message}`);
+  }
+});
+
+app.get('/vps/backup/file/:name', (req, res) => {
+  if (!BACKUP_WEB_ENABLE) return fail(res, 404, 'web backup nonaktif');
+  const full = backupFileFullPath(req.params?.name);
+  if (!full || !fs.existsSync(full)) return fail(res, 404, 'file backup tidak ditemukan');
+  res.set('Cache-Control', 'no-store');
+  return res.download(full);
+});
+
+app.post('/vps/backup/restore', express.json({ limit: '64mb' }), (req, res) => {
+  if (!BACKUP_WEB_ENABLE) return fail(res, 404, 'web backup nonaktif');
+  const body = req.body || {};
+  let target = '';
+  let tempFile = '';
+  try {
+    if (body.file) {
+      target = backupFileFullPath(body.file);
+      if (!target || !fs.existsSync(target)) return fail(res, 404, 'file backup tidak ditemukan');
+    } else if (body.content && typeof body.content === 'object') {
+      if (!body.content.data) return fail(res, 400, 'isi backup tidak valid: field data tidak ada');
+      fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      tempFile = require('path').join(BACKUP_DIR, `upload-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.json`);
+      fs.writeFileSync(tempFile, JSON.stringify(body.content), { mode: 0o600 });
+      target = tempFile;
+    } else {
+      return fail(res, 400, 'kirim field file atau content');
+    }
+    execFileSync('/usr/local/sbin/sc-1forcr-restore-backup', [target], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      timeout: 600000
+    });
+    return ok(res, { restored: true, source: body.file ? String(body.file) : 'upload' });
+  } catch (e) {
+    return fail(res, 500, `restore gagal: ${e.message}`);
+  } finally {
+    if (tempFile) {
+      try { fs.unlinkSync(tempFile); } catch (_) {}
+    }
+  }
+});
 
 app.get('/vps/capacity', (_req, res) => ok(res, readCapacityState()));
 
@@ -18151,6 +18408,7 @@ UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
 UPDATE_SCRIPT_URLS=${UPDATE_SCRIPT_URLS}
 AUTO_INSTALL_SUMMARY_API=${AUTO_INSTALL_SUMMARY_API}
 API_DOCS_ENABLE=${API_DOCS_ENABLE}
+BACKUP_WEB_ENABLE=${BACKUP_WEB_ENABLE}
 SUMMARY_API_SETUP_URL=${SUMMARY_API_SETUP_URL}
 SUMMARY_API_SETUP_URLS=${SUMMARY_API_SETUP_URLS}
 DB_PATH=${DB_PATH}
@@ -23660,17 +23918,58 @@ service_menu() {
   esac
 }
 
+set_backup_web_config_menu() {
+  local current_enable enable_in desired_state current_url
+  current_enable="$(normalize_bool_01 "${BACKUP_WEB_ENABLE:-0}")"
+  current_url="https://${DOMAIN}/vps/backup-ui"
+  echo "SETTING WEB BACKUP & RESTORE"
+  echo "Status sekarang : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "URL saat aktif  : ${current_url}"
+  echo "Auth            : wajib API token server ini"
+  echo
+  echo "Catatan: lewat web ini akun bisa di-restore (menimpa data)."
+  echo "Aktifkan hanya kalau API token kamu memang aman."
+  echo
+  prompt_input enable_in "Aktifkan web backup/restore? [1/0, enter=keep]: " || return
+  enable_in="$(echo "${enable_in:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${enable_in}" in
+    1|true|yes|on) desired_state="1" ;;
+    0|false|no|off) desired_state="0" ;;
+    "") desired_state="${current_enable}" ;;
+    *) echo "Input tidak valid, status lama dipakai."; desired_state="${current_enable}" ;;
+  esac
+
+  BACKUP_WEB_ENABLE="${desired_state}"
+  update_sc_env_var "BACKUP_WEB_ENABLE" "${BACKUP_WEB_ENABLE}"
+  update_app_env_var "BACKUP_WEB_ENABLE" "${BACKUP_WEB_ENABLE}"
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+
+  echo
+  echo "Berhasil update web backup/restore:"
+  echo "- Status : $([[ "${BACKUP_WEB_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  if [[ "${BACKUP_WEB_ENABLE}" == "1" ]]; then
+    echo "- URL    : ${current_url}"
+    echo "- Token  : ${API_AUTH_TOKEN:-${AUTH_TOKEN:-lihat /etc/sc-1forcr.env}}"
+  else
+    echo "- URL    : nonaktif"
+  fi
+}
+
 backup_restore_menu() {
   local full_file
   draw_menu_panel "BACKUP/RESTORE" \
     "0) Kembali" \
     "1) BACKUP AKUN + AUTH ZIVPN (1 file JSON) & kirim ke Telegram" \
-    "2) Restore AKUN + AUTH ZIVPN (.json) dari path file"
-  prompt_input b "Pilih [0-2]: " || return
+    "2) Restore AKUN + AUTH ZIVPN (.json) dari path file" \
+    "3) Web Backup & Restore (on/off + link)"
+  prompt_input b "Pilih [0-3]: " || return
   clear
   case "$b" in
     0)
       return
+      ;;
+    3)
+      set_backup_web_config_menu
       ;;
     1)
       if [[ -x /usr/local/sbin/sc-1forcr-auto-backup ]]; then
@@ -28539,7 +28838,7 @@ persist_pending_install_env() {
     LICENSE_ENFORCE LICENSE_API_URL LICENSE_KEY SC_UPDATE_KEY
     LICENSE_LEASE_REQUIRED LICENSE_PUBLIC_KEY_B64 LICENSE_LEASE_REFRESH_MINUTES
     LICENSE_LEASE_FILE LICENSE_PUBLIC_KEY_FILE LICENSE_REQUIRED_MARKER
-    UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API API_DOCS_ENABLE SUMMARY_API_SETUP_URL
+    UPDATE_SCRIPT_URL AUTO_INSTALL_SUMMARY_API API_DOCS_ENABLE BACKUP_WEB_ENABLE SUMMARY_API_SETUP_URL
     WILDCARD_ENABLE WILDCARD_BASE_DOMAIN WILDCARD_CF_API_TOKEN WILDCARD_CF_EMAIL WILDCARD_CF_API_KEY
     WILDCARD_BUG_PREFIX WILDCARD_BUG_PREFIXES WILDCARD_XRAY_HOST WILDCARD_XRAY_HOSTS XRAY_PUBLIC_HOST
     XRAY_FRONT_DOMAIN XRAY_FRONT_DOMAINS

@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.55}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.56}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -18146,12 +18146,19 @@ EOF
 Description=Check mandatory SC 1FORCR God Mode update every ${god_interval} minutes
 
 [Timer]
+# Sengaja disederhanakan dan disamakan bentuknya dengan timer lain yang
+# terbukti jalan stabil (mis. sc-1forcr-udpgw-drain). Versi lama menumpuk
+# OnBootSec + OnActiveSec + OnUnitInactiveSec sekaligus DITAMBAH
+# Persistent=true, dan di lapangan ditemukan timer ini berhenti memicu
+# selama berhari-hari: LastTrigger mandek mengikuti file stamp persisten
+# di /var/lib/systemd/timers, padahal semua timer SC lain normal.
+# Persistent hanya punya arti terdokumentasi untuk OnCalendar, bukan untuk
+# timer monotonic seperti ini.
 OnBootSec=2m
-OnActiveSec=${god_interval}min
 OnUnitInactiveSec=${god_interval}min
 AccuracySec=20s
-RandomizedDelaySec=0
-Persistent=true
+RandomizedDelaySec=5s
+Persistent=false
 Unit=sc-1forcr-god-update.service
 
 [Install]
@@ -18159,6 +18166,11 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload >/dev/null 2>&1 || true
+  # Buang stamp persisten lama. Pernah ditemukan di lapangan file ini mandek
+  # berhari-hari sehingga LastTrigger ikut mandek dan timer berhenti memicu
+  # update wajib, padahal timer SC lain normal. Sekali dibuang, penjadwalan
+  # kembali dihitung bersih dari sekarang.
+  rm -f /var/lib/systemd/timers/stamp-sc-1forcr-god-update.timer >/dev/null 2>&1 || true
   systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
   if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then

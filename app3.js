@@ -2438,12 +2438,16 @@ async function processGodUpdateCampaigns() {
             expected,
             'Semua target campaign sudah mengirim konfirmasi update berhasil.'
           );
-        } else if (summary.pending > 0 || summary.running > 0) {
+        } else {
           // Belum semua sukses, tapi cek dulu apakah campaign ini masih ada
           // progres (ada VPS yang baru lapor). Kalau sudah lama sekali diam
           // (tidak ada progres) berarti sisa VPS pending kemungkinan
           // offline/tidak terjangkau - tutup campaign & kirim laporan apa
           // adanya alih-alih menggantung selamanya menunggu 100% sukses.
+          // Cabang ini sengaja menangkap SEMUA kondisi belum-sukses, termasuk
+          // saat semua target berstatus failed. Kalau hanya pending/running
+          // yang dicek, campaign yang seluruh targetnya gagal permanen tidak
+          // akan pernah ditutup dan laporannya tidak pernah muncul.
           const lastActivityAt = await getGodUpdateCampaignLastActivity(
             campaign.version,
             campaign.started_notice_at || campaign.created_at
@@ -5881,9 +5885,12 @@ bot.action('m_admin_god_status', async (ctx) => {
     for (const row of failed) lines.push(`- ${row.vps_ip}: ${String(row.message || '-').slice(0, 90)}`);
   }
   const isOpen = ['scheduled', 'active'].includes(String(campaign.status || ''));
-  const stillWaiting = summary.pending > 0 || summary.running > 0;
+  // Termasuk kasus semua target gagal: di situ pending dan running nol, tapi
+  // campaign tetap perlu bisa dituntaskan manual supaya laporannya keluar.
+  const expectedTotal = Number(campaign.expected_total || summary.total || 0);
+  const notFullySuccessful = expectedTotal > 0 && summary.success < expectedTotal;
   const buttons = [];
-  if (isOpen && stillWaiting) {
+  if (isOpen && notFullySuccessful) {
     buttons.push([Markup.button.callback('Tuntaskan Sekarang', `m_admin_god_finish_${campaign.version}`)]);
   }
   buttons.push([Markup.button.callback('Kembali', 'm_admin_menu')]);

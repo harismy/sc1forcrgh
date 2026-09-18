@@ -184,7 +184,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.52}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.53}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -3990,12 +3990,20 @@ const express = require('express');
 const fs = require('fs');
 const https = require('https');
 const sqlite3 = require('sqlite3').verbose();
-const { execFileSync } = require('child_process');
+const { execFileSync, execFile } = require('child_process');
 const crypto = require('crypto');
 try { require('dotenv').config(); } catch (_) {}
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+const jsonBodyParser = express.json({ limit: '1mb' });
+// Endpoint restore backup memakai parser sendiri (teks mentah, batas lebih
+// besar). Parser global harus melewatinya, sebab kalau body sudah dibaca di
+// sini maka parser milik route tidak pernah berlaku dan unggahan di atas 1mb
+// selalu ditolak 413.
+app.use((req, res, next) => {
+  if (req.path === '/vps/backup/restore') return next();
+  return jsonBodyParser(req, res, next);
+});
 
 process.on('unhandledRejection', (reason) => {
   console.error('[runtime] unhandledRejection:', reason?.stack || reason?.message || reason);
@@ -6570,6 +6578,32 @@ function listBackupFiles() {
   }
 }
 
+// Skrip backup/restore bisa berjalan lama (upload Telegram sampai 90 detik,
+// restore me-restart layanan). execFileSync akan memblokir event loop Node
+// sehingga SELURUH API ikut beku, termasuk /internal/zivpn-auth yang dipakai
+// ZIVPN untuk auth tiap koneksi UDP. Karena itu wajib versi async.
+function runScriptAsync(cmd, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        const detail = String(stderr || err.message || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+        return reject(new Error(detail || 'gagal'));
+      }
+      return resolve(String(stdout || ''));
+    });
+  });
+}
+
+// Restore menerima dua bentuk: JSON kecil {file:"nama.json"} untuk file yang
+// sudah ada di server, atau teks mentah isi file backup saat diunggah. Teks
+// mentah tidak di-JSON.parse di server supaya hemat RAM di VPS 1GB; validasi
+// isinya tetap dikerjakan skrip restore memakai jq.
+function restoreBodyParser(req, res, next) {
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  if (ct.includes('application/json')) return express.json({ limit: '1mb' })(req, res, next);
+  return express.text({ limit: '16mb', type: () => true })(req, res, next);
+}
+
 const BACKUP_WEB_PAGE = `<!doctype html>
 <html lang="id"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -6702,9 +6736,9 @@ function upRestore(){
   busy('Mengunggah dan restore...');
   var fr=new FileReader();
   fr.onload=function(){
-    var body;
-    try{body=JSON.stringify({content:JSON.parse(fr.result)})}catch(e){return say('File bukan JSON valid.',1)}
-    api('/vps/backup/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:body})
+    try{JSON.parse(fr.result)}catch(e){return say('File bukan JSON valid.',1)}
+    // Dikirim sebagai teks mentah supaya server tidak perlu JSON.parse ulang.
+    api('/vps/backup/restore',{method:'POST',headers:{'Content-Type':'text/plain'},body:fr.result})
     .then(function(r){return r.json()}).then(function(j){
       var d=unwrap(j);
       say('Restore selesai dari file unggahan.');loadList()
@@ -6733,13 +6767,10 @@ app.get('/vps/backup/list', (_req, res) => {
   return ok(res, listBackupFiles());
 });
 
-app.post('/vps/backup/create', (_req, res) => {
+app.post('/vps/backup/create', async (_req, res) => {
   if (!BACKUP_WEB_ENABLE) return fail(res, 404, 'web backup nonaktif');
   try {
-    execFileSync('/usr/local/sbin/sc-1forcr-auto-backup', ['manual'], {
-      stdio: ['ignore', 'ignore', 'ignore'],
-      timeout: 180000
-    });
+    await runScriptAsync('/usr/local/sbin/sc-1forcr-auto-backup', ['manual'], 180000);
     return ok(res, { created: true, files: listBackupFiles().slice(0, 5) });
   } catch (e) {
     return fail(res, 500, `backup gagal: ${e.message}`);
@@ -6754,29 +6785,29 @@ app.get('/vps/backup/file/:name', (req, res) => {
   return res.download(full);
 });
 
-app.post('/vps/backup/restore', express.json({ limit: '64mb' }), (req, res) => {
+app.post('/vps/backup/restore', restoreBodyParser, async (req, res) => {
   if (!BACKUP_WEB_ENABLE) return fail(res, 404, 'web backup nonaktif');
-  const body = req.body || {};
+  const body = req.body;
   let target = '';
   let tempFile = '';
+  let source = 'upload';
   try {
-    if (body.file) {
+    if (body && typeof body === 'object' && body.file) {
+      source = String(body.file);
       target = backupFileFullPath(body.file);
       if (!target || !fs.existsSync(target)) return fail(res, 404, 'file backup tidak ditemukan');
-    } else if (body.content && typeof body.content === 'object') {
-      if (!body.content.data) return fail(res, 400, 'isi backup tidak valid: field data tidak ada');
+    } else if (typeof body === 'string' && body.trim()) {
+      // Ditulis apa adanya tanpa JSON.parse supaya tidak boros RAM.
+      // Skrip restore yang memvalidasi isinya dengan jq.
       fs.mkdirSync(BACKUP_DIR, { recursive: true });
       tempFile = require('path').join(BACKUP_DIR, `upload-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.json`);
-      fs.writeFileSync(tempFile, JSON.stringify(body.content), { mode: 0o600 });
+      fs.writeFileSync(tempFile, body, { mode: 0o600 });
       target = tempFile;
     } else {
-      return fail(res, 400, 'kirim field file atau content');
+      return fail(res, 400, 'kirim JSON {file:"nama.json"} atau isi file backup sebagai teks');
     }
-    execFileSync('/usr/local/sbin/sc-1forcr-restore-backup', [target], {
-      stdio: ['ignore', 'ignore', 'ignore'],
-      timeout: 600000
-    });
-    return ok(res, { restored: true, source: body.file ? String(body.file) : 'upload' });
+    await runScriptAsync('/usr/local/sbin/sc-1forcr-restore-backup', [target], 600000);
+    return ok(res, { restored: true, source });
   } catch (e) {
     return fail(res, 500, `restore gagal: ${e.message}`);
   } finally {

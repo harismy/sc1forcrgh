@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.59}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.60}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -16775,17 +16775,25 @@ if [[ "${ONLINE_NOTIFY_ENABLE}" != "1" && "${ONLINE_NOTIFY_STATE_ONLY}" != "1" ]
   exit 0
 fi
 if [[ "${ONLINE_NOTIFY_STATE_ONLY}" != "1" ]] && { [[ -z "${TELEGRAM_BOT_TOKEN}" ]] || [[ -z "${TELEGRAM_CHAT_ID}" ]]; }; then
+  echo "[online-notify] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID belum diisi di /etc/sc-1forcr.env; notif online dilewati." >&2
   exit 0
 fi
 
+SEND_TG_ERROR=""
+# Tanpa parse_mode: isi pesan plain text, dan HTML mode membuat Telegram menolak
+# pesan (400) kalau ada karakter < > & dari domain atau username.
 send_tg() {
-  local text="$1"
+  local text="$1" resp
+  SEND_TG_ERROR=""
   [[ -z "${text}" ]] && return 0
-  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  resp="$(curl -sS --max-time 30 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     -d "chat_id=${TELEGRAM_CHAT_ID}" \
-    -d "parse_mode=HTML" \
     -d "disable_web_page_preview=true" \
-    --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+    --data-urlencode "text=${text}" 2>&1 || true)"
+  [[ "${resp}" == *'"ok":true'* ]] && return 0
+  SEND_TG_ERROR="$(printf '%s' "${resp}" | tr -d '\n' | cut -c1-300)"
+  [[ -z "${SEND_TG_ERROR}" ]] && SEND_TG_ERROR="tidak ada respons dari api.telegram.org"
+  return 1
 }
 
 should_send_online_report() {
@@ -17393,8 +17401,14 @@ $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}" "IP")
 "
 
 if should_send_online_report; then
-  send_tg "${msg}"
-  mark_online_report_sent
+  if send_tg "${msg}"; then
+    mark_online_report_sent
+  else
+    # Jangan tandai terkirim kalau Telegram menolak, supaya siklus berikutnya
+    # mencoba lagi dan tidak terkunci diam selama satu interval penuh.
+    echo "[online-notify] gagal kirim notif online ke Telegram: ${SEND_TG_ERROR:-unknown}" >&2
+    exit 1
+  fi
 fi
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-online-notify
@@ -22726,12 +22740,16 @@ trigger_online_notify_now() {
     echo "Script notifier tidak ditemukan: ${notify_bin}"
     return 1
   fi
-  if ONLINE_NOTIFY_ENABLE=1 FORCE_ONLINE_NOTIFY=1 "${notify_bin}"; then
+  local notify_err notify_rc
+  notify_rc=0
+  notify_err="$(ONLINE_NOTIFY_ENABLE=1 FORCE_ONLINE_NOTIFY=1 "${notify_bin}" 2>&1 >/dev/null)" || notify_rc=$?
+  if [[ "${notify_rc}" -eq 0 && -z "${notify_err}" ]]; then
     echo "Notifikasi online berhasil dikirim ke Telegram."
-  else
-    echo "Gagal mengirim notifikasi online manual."
-    return 1
+    return 0
   fi
+  echo "Gagal mengirim notifikasi online manual."
+  [[ -n "${notify_err}" ]] && echo "${notify_err}"
+  return 1
 }
 
 set_wildcard_config_menu() {

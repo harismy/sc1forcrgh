@@ -1666,11 +1666,12 @@ function writeOnlineNotifyTimerUnit(settings) {
   if (!fs.existsSync('/etc/systemd/system/sc-1forcr-online-notify.service')) return false;
   const interval = intSetting(settings, 'ONLINE_NOTIFY_INTERVAL_HOURS', 3, 1, 168);
   fs.writeFileSync('/etc/systemd/system/sc-1forcr-online-notify.timer', `[Unit]
-Description=Run SC 1FORCR online account notifier every ${interval} hours
+Description=Check SC 1FORCR online account notifier every 15 minutes (report every ${interval} hours)
 
 [Timer]
+# Timer hanya memeriksa; jadwal kirim dijaga script lewat stempel kirim terakhir.
 OnActiveSec=10min
-OnUnitInactiveSec=${interval}h
+OnUnitInactiveSec=15min
 AccuracySec=1min
 RandomizedDelaySec=0
 Persistent=false

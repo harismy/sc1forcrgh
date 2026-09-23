@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.60}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.61}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -15346,11 +15346,12 @@ EOF_TIMER
   if [[ -f /etc/systemd/system/sc-1forcr-online-notify.service ]]; then
     cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF_TIMER
 [Unit]
-Description=Run SC 1FORCR online account notifier every ${notify_interval} hours
+Description=Check SC 1FORCR online account notifier every 15 minutes (report every ${notify_interval} hours)
 
 [Timer]
+# Timer hanya memeriksa; jadwal kirim dijaga script lewat stempel kirim terakhir.
 OnActiveSec=10min
-OnUnitInactiveSec=${notify_interval}h
+OnUnitInactiveSec=15min
 AccuracySec=1min
 RandomizedDelaySec=0
 Persistent=false
@@ -16737,7 +16738,9 @@ load_env_file() {
     [[ -z "${line//[[:space:]]/}" || "${line}" =~ ^[[:space:]]*# || "${line}" != *"="* ]] && continue
     key="${line%%=*}"
     value="${line#*=}"
-    key="$(printf '%s' "${key}" | tr -d '[:space:]')"
+    # Trim tanpa subshell: timer memanggil script ini tiap 15 menit, jadi
+    # ratusan fork printf|tr per siklus idle tidak sepadan.
+    key="${key//[[:space:]]/}"
     [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
@@ -16764,6 +16767,7 @@ ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECON
 SSH_HC_AUTH_LOOKBACK_HOURS="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-24}" | tr -cd '0-9')"
 ZIVPN_HANDOFF_GRACE_SECONDS="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
 ONLINE_NOTIFY_STATE_FILE="/var/lib/sc-1forcr/online-notify.last"
+ONLINE_NOTIFY_STATUS_FILE="/var/lib/sc-1forcr/online-notify.status"
 ONLINE_NOTIFY_LIVE_STATE_FILE="${ONLINE_NOTIFY_LIVE_STATE_FILE:-/var/lib/sc-1forcr/online-live.env}"
 ONLINE_NOTIFY_STATE_ONLY="${ONLINE_NOTIFY_STATE_ONLY:-0}"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
@@ -16780,35 +16784,122 @@ if [[ "${ONLINE_NOTIFY_STATE_ONLY}" != "1" ]] && { [[ -z "${TELEGRAM_BOT_TOKEN}"
 fi
 
 SEND_TG_ERROR=""
+SEND_TG_TRANSIENT="0"
+SEND_TG_PARTS="0"
 # Tanpa parse_mode: isi pesan plain text, dan HTML mode membuat Telegram menolak
 # pesan (400) kalau ada karakter < > & dari domain atau username.
 send_tg() {
-  local text="$1" resp
+  local text="$1" resp attempt code wait_sec
   SEND_TG_ERROR=""
+  SEND_TG_TRANSIENT="0"
   [[ -z "${text}" ]] && return 0
-  resp="$(curl -sS --max-time 30 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    -d "chat_id=${TELEGRAM_CHAT_ID}" \
-    -d "disable_web_page_preview=true" \
-    --data-urlencode "text=${text}" 2>&1 || true)"
-  [[ "${resp}" == *'"ok":true'* ]] && return 0
-  SEND_TG_ERROR="$(printf '%s' "${resp}" | tr -d '\n' | cut -c1-300)"
-  [[ -z "${SEND_TG_ERROR}" ]] && SEND_TG_ERROR="tidak ada respons dari api.telegram.org"
+  for attempt in 1 2; do
+    resp="$(curl -sS --connect-timeout 10 --max-time 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d "chat_id=${TELEGRAM_CHAT_ID}" \
+      -d "disable_web_page_preview=true" \
+      --data-urlencode "text=${text}" 2>&1 || true)"
+    [[ "${resp}" == *'"ok":true'* ]] && return 0
+    SEND_TG_ERROR="$(printf '%s' "${resp}" | tr -d '\n' | cut -c1-300)"
+    [[ -z "${SEND_TG_ERROR}" ]] && SEND_TG_ERROR="tidak ada respons dari api.telegram.org"
+    code="$(printf '%s' "${resp}" | sed -n 's/.*"error_code":\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    # 4xx selain 429 (token salah, chat tidak ada, bot diblokir) tidak sembuh
+    # dengan diulang. Gangguan jaringan, 429, dan 5xx layak dicoba sekali lagi.
+    if [[ -n "${code}" && "${code}" != "429" && "${code}" -lt 500 ]]; then
+      return 1
+    fi
+    SEND_TG_TRANSIENT="1"
+    if [[ "${attempt}" -ge 2 ]]; then
+      break
+    fi
+    wait_sec="$(printf '%s' "${resp}" | sed -n 's/.*"retry_after":\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    [[ "${wait_sec}" =~ ^[0-9]+$ && "${wait_sec}" -ge 1 ]] || wait_sec=5
+    [[ "${wait_sec}" -gt 20 ]] && wait_sec=20
+    echo "[online-notify] kirim gagal (${SEND_TG_ERROR:0:120}); ulang dalam ${wait_sec} detik."
+    sleep "${wait_sec}"
+  done
   return 1
+}
+
+# Telegram menolak pesan di atas 4096 karakter (400 message is too long). VPS
+# ramai dengan ratusan akun online mudah melewatinya, jadi laporan dipecah di
+# batas baris dan dianggap terkirim hanya bila semua bagian diterima.
+send_tg_report() {
+  local text="$1" limit=3800 chunk="" line total idx part
+  local -a chunks=()
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if [[ "${#line}" -gt "${limit}" ]]; then
+      line="${line:0:${limit}}"
+    fi
+    if [[ -n "${chunk}" && $(( ${#chunk} + ${#line} + 1 )) -gt "${limit}" ]]; then
+      chunks+=("${chunk}")
+      chunk=""
+    fi
+    if [[ -n "${chunk}" ]]; then
+      chunk+=$'\n'"${line}"
+    else
+      chunk="${line}"
+    fi
+  done <<< "${text}"
+  if [[ -n "${chunk}" ]]; then
+    chunks+=("${chunk}")
+  fi
+  total="${#chunks[@]}"
+  SEND_TG_PARTS="${total}"
+  for (( idx = 0; idx < total; idx++ )); do
+    part="${chunks[idx]}"
+    if [[ "${idx}" -gt 0 ]]; then
+      part="SC 1FORCR NOTIF (lanjutan $(( idx + 1 ))/${total})"$'\n'"${part}"
+      sleep 1
+    fi
+    send_tg "${part}" || return 1
+  done
+  return 0
+}
+
+write_online_notify_status() {
+  local result="$1" retry_at="${2:-}" error="${3:-}" tmp
+  mkdir -p "$(dirname "${ONLINE_NOTIFY_STATUS_FILE}")" >/dev/null 2>&1 || true
+  tmp="${ONLINE_NOTIFY_STATUS_FILE}.$$"
+  {
+    printf 'ONLINE_NOTIFY_LAST_RESULT=%s\n' "${result}"
+    printf 'ONLINE_NOTIFY_LAST_ATTEMPT_AT=%s\n' "$(date +%s 2>/dev/null || echo 0)"
+    if [[ -n "${retry_at}" ]]; then
+      printf 'ONLINE_NOTIFY_RETRY_AFTER=%s\n' "${retry_at}"
+    fi
+    if [[ -n "${error}" ]]; then
+      printf 'ONLINE_NOTIFY_LAST_ERROR=%s\n' "${error}"
+    fi
+  } > "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${ONLINE_NOTIFY_STATUS_FILE}" >/dev/null 2>&1 || true
 }
 
 should_send_online_report() {
   if [[ "${FORCE_ONLINE_NOTIFY:-0}" == "1" ]]; then
     return 0
   fi
-  local now_ts last_ts interval_sec
+  local now_ts last_ts interval_sec retry_at
   now_ts="$(date +%s 2>/dev/null || echo 0)"
   [[ -z "${now_ts}" || ! "${now_ts}" =~ ^[0-9]+$ ]] && now_ts=0
+  # Jeda setelah gagal kirim, supaya pemicu beruntun saat update tidak
+  # masing-masing menunggu timeout Telegram dan VPS kecil tidak dibebani.
+  retry_at="$(awk -F= '$1 == "ONLINE_NOTIFY_RETRY_AFTER" { print $2; exit }' "${ONLINE_NOTIFY_STATUS_FILE}" 2>/dev/null | tr -cd '0-9' || true)"
+  # Jeda terpanjang 1 jam; nilai lebih jauh berarti jam VPS sempat meloncat
+  # atau file rusak, abaikan supaya notif tidak terkunci lama.
+  if [[ "${retry_at}" =~ ^[0-9]{1,12}$ && "${now_ts}" -gt 0 && "${now_ts}" -lt "${retry_at}" && \
+        "${retry_at}" -le $(( now_ts + 3600 )) ]]; then
+    return 1
+  fi
   interval_sec=$(( ONLINE_NOTIFY_INTERVAL_HOURS * 3600 ))
   [[ "${interval_sec}" -lt 3600 ]] && interval_sec=3600
   last_ts=0
   if [[ -f "${ONLINE_NOTIFY_STATE_FILE}" ]]; then
     last_ts="$(tr -cd '0-9' < "${ONLINE_NOTIFY_STATE_FILE}" 2>/dev/null || echo 0)"
-    [[ -z "${last_ts}" || ! "${last_ts}" =~ ^[0-9]+$ ]] && last_ts=0
+    [[ -z "${last_ts}" || ! "${last_ts}" =~ ^[0-9]{1,12}$ ]] && last_ts=0
+  fi
+  # Stempel di masa depan (jam VPS sempat maju lalu dikoreksi NTP) dulu bisa
+  # memblokir notif sampai waktu itu tiba. Anggap tidak valid.
+  if [[ "${now_ts}" -gt 0 && "${last_ts}" -gt "${now_ts}" ]]; then
+    last_ts=0
   fi
   if [[ "${last_ts}" -gt 0 && "${now_ts}" -gt 0 && $(( now_ts - last_ts )) -lt "${interval_sec}" ]]; then
     return 1
@@ -16822,7 +16913,30 @@ mark_online_report_sent() {
   [[ -z "${now_ts}" || ! "${now_ts}" =~ ^[0-9]+$ ]] && return 0
   mkdir -p "$(dirname "${ONLINE_NOTIFY_STATE_FILE}")" >/dev/null 2>&1 || true
   printf '%s\n' "${now_ts}" > "${ONLINE_NOTIFY_STATE_FILE}" 2>/dev/null || true
+  write_online_notify_status "ok"
 }
+
+mark_online_report_failed() {
+  local now_ts backoff
+  now_ts="$(date +%s 2>/dev/null || echo 0)"
+  [[ "${now_ts}" =~ ^[0-9]+$ ]] || now_ts=0
+  # Gangguan sementara (jaringan, 429, 5xx) dicoba lagi di cek 15 menit
+  # berikutnya. Penolakan tetap (token salah, chat tidak ada, bot diblokir)
+  # baru diulang 1 jam lagi, atau segera setelah setting diubah dari menu.
+  if [[ "${SEND_TG_TRANSIENT}" == "1" ]]; then
+    backoff=600
+  else
+    backoff=3600
+  fi
+  write_online_notify_status "gagal" "$(( now_ts + backoff ))" "${SEND_TG_ERROR:-unknown}"
+}
+
+# Cek jadwal SEBELUM mengumpulkan data. Timer memeriksa tiap 15 menit, jadi
+# siklus yang belum waktunya harus selesai murah tanpa journalctl/ss/sqlite.
+# Mode STATE_ONLY (capacity analyzer) selalu mengumpulkan data dan tidak kirim.
+if [[ "${ONLINE_NOTIFY_STATE_ONLY}" != "1" ]] && ! should_send_online_report; then
+  exit 0
+fi
 
 detect_udphc_service() {
   if systemctl is-active --quiet sc-1forcr-udpcustom 2>/dev/null; then
@@ -17262,7 +17376,9 @@ zivpn_cnt=0
 if [[ -f "${DB_PATH}" ]]; then
   has_zivpn_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
   if [[ "${has_zivpn_live_table}" == "1" ]]; then
-    refresh_zivpn_live_from_api_log
+    # Pipeline journalctl di dalamnya jalan dengan pipefail; kalau journal
+    # rusak, jangan sampai seluruh laporan batal terkirim.
+    refresh_zivpn_live_from_api_log || true
     zivpn_users="$(sqlite3 -separator '|' "${DB_PATH}" "
       WITH active AS (
         SELECT LOWER(z.username) AS username, z.ip, z.last_seen
@@ -17400,15 +17516,15 @@ $(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}" "SESI")
 $(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}" "IP")
 "
 
-if should_send_online_report; then
-  if send_tg "${msg}"; then
-    mark_online_report_sent
-  else
-    # Jangan tandai terkirim kalau Telegram menolak, supaya siklus berikutnya
-    # mencoba lagi dan tidak terkunci diam selama satu interval penuh.
-    echo "[online-notify] gagal kirim notif online ke Telegram: ${SEND_TG_ERROR:-unknown}" >&2
-    exit 1
-  fi
+if send_tg_report "${msg}"; then
+  mark_online_report_sent
+  echo "[online-notify] laporan online terkirim ke Telegram (${SEND_TG_PARTS} pesan, ${online_total_detected} akun online)."
+else
+  # Jangan tandai terkirim kalau Telegram menolak, supaya cek berikutnya
+  # mencoba lagi dan tidak terkunci diam selama satu interval penuh.
+  mark_online_report_failed
+  echo "[online-notify] gagal kirim notif online ke Telegram: ${SEND_TG_ERROR:-unknown}" >&2
+  exit 1
 fi
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-online-notify
@@ -17422,6 +17538,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/sc-1forcr-online-notify
+# Oneshot yang menggantung tidak pernah "inactive", sehingga OnUnitInactiveSec
+# tidak pernah terpicu lagi dan notif diam selamanya. Batasi durasinya.
+TimeoutStartSec=10min
 Nice=10
 CPUQuota=50%
 MemoryMax=256M
@@ -17431,11 +17550,14 @@ EOF
 
   cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF
 [Unit]
-Description=Run SC 1FORCR online account notifier every ${notify_interval_h} hours
+Description=Check SC 1FORCR online account notifier every 15 minutes (report every ${notify_interval_h} hours)
 
 [Timer]
+# Timer hanya memeriksa. Jadwal kirim ${notify_interval_h} jam dijaga script lewat stempel
+# /var/lib/sc-1forcr/online-notify.last, jadi kiriman gagal dicoba lagi di cek
+# berikutnya dan restart timer saat update tidak menggeser jadwal kirim.
 OnActiveSec=10min
-OnUnitInactiveSec=${notify_interval_h}h
+OnUnitInactiveSec=15min
 AccuracySec=1min
 RandomizedDelaySec=0
 Persistent=false
@@ -19818,11 +19940,12 @@ write_online_notify_timer_unit() {
   local interval_h="$1"
   cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF
 [Unit]
-Description=Run SC 1FORCR online account notifier every ${interval_h} hours
+Description=Check SC 1FORCR online account notifier every 15 minutes (report every ${interval_h} hours)
 
 [Timer]
+# Timer hanya memeriksa; jadwal kirim dijaga script lewat stempel kirim terakhir.
 OnActiveSec=10min
-OnUnitInactiveSec=${interval_h}h
+OnUnitInactiveSec=15min
 AccuracySec=1min
 RandomizedDelaySec=0
 Persistent=false
@@ -22654,6 +22777,39 @@ set_autolock_realtime_tuning_menu() {
   echo "- ZIVPN handoff grace         : ${ZIVPN_HANDOFF_GRACE_SECONDS} detik"
 }
 
+online_notify_status_value() {
+  local key="$1"
+  awk -F= -v k="${key}" '$1 == k { print substr($0, index($0, "=") + 1); exit }' \
+    /var/lib/sc-1forcr/online-notify.status 2>/dev/null || true
+}
+
+# Hapus jeda retry setelah gagal kirim, supaya setting baru langsung dicoba.
+reset_online_notify_retry() {
+  rm -f /var/lib/sc-1forcr/online-notify.status >/dev/null 2>&1 || true
+}
+
+show_online_notify_delivery_status() {
+  local last_sent result retry_at error
+  last_sent="$(tr -cd '0-9' 2>/dev/null < /var/lib/sc-1forcr/online-notify.last || true)"
+  result="$(online_notify_status_value ONLINE_NOTIFY_LAST_RESULT)"
+  retry_at="$(online_notify_status_value ONLINE_NOTIFY_RETRY_AFTER | tr -cd '0-9')"
+  error="$(online_notify_status_value ONLINE_NOTIFY_LAST_ERROR)"
+  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+    echo "Pengiriman         : TIDAK JALAN, Token/Chat ID BOT belum diisi (Tools > 5)"
+  fi
+  if [[ "${last_sent}" =~ ^[0-9]+$ && "${last_sent}" -gt 0 ]]; then
+    echo "Terakhir terkirim  : $(date -d "@${last_sent}" '+%F %T' 2>/dev/null || echo "${last_sent}")"
+  else
+    echo "Terakhir terkirim  : belum pernah"
+  fi
+  if [[ "${result}" == "gagal" ]]; then
+    echo "Percobaan terakhir : GAGAL, ${error:-tanpa keterangan}"
+    if [[ "${retry_at}" =~ ^[0-9]+$ ]]; then
+      echo "Dicoba lagi        : $(date -d "@${retry_at}" '+%F %T' 2>/dev/null || echo "${retry_at}")"
+    fi
+  fi
+}
+
 set_online_notify_config_menu() {
   local current_enable current_interval current_window enable_in interval_in window_in
   current_enable="${ONLINE_NOTIFY_ENABLE:-1}"
@@ -22667,6 +22823,7 @@ set_online_notify_config_menu() {
   echo "Status saat ini    : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "Interval saat ini  : ${current_interval} jam"
   echo "Window realtime    : ${current_window} detik (XRAY last seen)"
+  show_online_notify_delivery_status
   echo
   echo "Kosongkan input untuk mempertahankan nilai lama."
   echo "Ketik 'batal' untuk kembali."
@@ -22715,6 +22872,7 @@ set_online_notify_config_menu() {
   update_app_env_var "ONLINE_NOTIFY_INTERVAL_HOURS" "${ONLINE_NOTIFY_INTERVAL_HOURS}"
   update_app_env_var "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS" "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}"
   write_online_notify_timer_unit "${ONLINE_NOTIFY_INTERVAL_HOURS}"
+  reset_online_notify_retry
 
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [[ "${ONLINE_NOTIFY_ENABLE}" == "1" ]]; then
@@ -27511,6 +27669,7 @@ set_telegram_notif_config() {
     update_app_env_var "TELEGRAM_CHAT_ID" "${TELEGRAM_CHAT_ID}"
   fi
   systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+  reset_online_notify_retry
   systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
 

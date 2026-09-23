@@ -112,6 +112,8 @@ Jangan buang waktu mengejar dua ini saat mengerjakan hal lain. Kalau memperbaiki
 - Campaign God Mode bersifat **pull**: VPS yang memanggil `/sc1forcr/god-update/check` secara berkala. Bot tidak punya akses SSH ke VPS dan tidak bisa mendorong perintah.
 - Karena itu campaign bisa menggantung kalau ada VPS yang tidak pernah lapor lagi. Penanganannya: auto-timeout saat tidak ada progres (`GOD_UPDATE_STALL_TIMEOUT_MINUTES`, default 180) plus tombol admin "Tuntaskan Sekarang".
 - Konfigurasi VPS disimpan di `/etc/sc-1forcr.env` dan dibaca ulang saat update. Variabel baru yang perlu bertahan lintas update harus ditambahkan ke dump env di `write_cli_menu()` dan ke daftar di `persist_pending_install_env()`.
+- `app3.js` memakai satu koneksi SQLite, dan `dbRun` mengantrekan blok `BEGIN` sampai `COMMIT`/`ROLLBACK`. Setiap `BEGIN` **wajib** diakhiri `COMMIT` atau `ROLLBACK` di semua jalur, dan jangan memanggil jaringan (Telegram, axios, API VPS) di dalam transaksi: antrean menahan semua transaksi lain sampai blok itu selesai.
+- Pembayaran QRIS memakai tabel `pending_deposits_app3`. Kolom `purpose` membedakan top up saldo (`topup`) dari perpanjang SC langsung (`sc_renewal`). QRIS perpanjang dikreditkan lalu langsung dipakai perpanjang dalam satu transaksi (`settleScRenewalDeposit`); kalau perpanjangan ditolak, dana tetap di saldo pembeli. Test: `npm run test:sc-renewal-payment`.
 
 ## Bahasa
 

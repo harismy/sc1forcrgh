@@ -193,13 +193,68 @@ const RESTORE_BACKUP_MAX_BYTES = Math.max(
   Number(process.env.RESTORE_BACKUP_MAX_BYTES || (50 * 1024 * 1024)) || (50 * 1024 * 1024)
 );
 
-function dbRun(sql, params = []) {
+function dbRunRaw(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function onRun(err) {
       if (err) return reject(err);
       resolve(this);
     });
   });
+}
+
+// Bot memakai SATU koneksi SQLite. Tanpa antrean, BEGIN dari alur kedua yang
+// berjalan bersamaan (mis. tap ganda "Cek Status", poller QRIS, atau dua user
+// perpanjang di detik yang sama) langsung gagal dengan "cannot start a
+// transaction within a transaction" dan operasinya batal dengan error. Blok
+// BEGIN sampai COMMIT/ROLLBACK diantrekan di sini. Semua transaksi di file ini
+// hanya berisi query DB (tanpa jaringan), jadi antrean selalu cepat lepas.
+const DB_TX_BEGIN_RE = /^\s*BEGIN\b/i;
+const DB_TX_END_RE = /^\s*(COMMIT|END|ROLLBACK)(\s+TRANSACTION)?\s*;?\s*$/i;
+let dbTxQueueTail = Promise.resolve();
+let dbTxRelease = null;
+
+function acquireDbTxLock() {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const ready = dbTxQueueTail.then(() => release);
+  dbTxQueueTail = dbTxQueueTail.then(() => held);
+  return ready;
+}
+
+function releaseDbTxLock() {
+  const release = dbTxRelease;
+  dbTxRelease = null;
+  if (release) release();
+}
+
+async function dbRun(sql, params = []) {
+  const text = String(sql || '');
+  if (DB_TX_BEGIN_RE.test(text)) {
+    const release = await acquireDbTxLock();
+    try {
+      const result = await dbRunRaw(text, params);
+      dbTxRelease = release;
+      return result;
+    } catch (err) {
+      release();
+      throw err;
+    }
+  }
+  if (DB_TX_END_RE.test(text)) {
+    try {
+      const result = await dbRunRaw(text, params);
+      releaseDbTxLock();
+      return result;
+    } catch (err) {
+      // COMMIT gagal berarti transaksi masih terbuka dan pemanggil akan
+      // ROLLBACK; ROLLBACK yang gagal berarti memang tidak ada transaksi.
+      if (/^\s*ROLLBACK/i.test(text)) releaseDbTxLock();
+      throw err;
+    }
+  }
+  return dbRunRaw(text, params);
 }
 
 function dbGet(sql, params = []) {
@@ -441,6 +496,21 @@ async function ensurePendingDepositSchema() {
   }
   if (!hasQrMsgId) {
     await dbRun('ALTER TABLE pending_deposits_app3 ADD COLUMN qr_message_id INTEGER');
+  }
+  // Tujuan pembayaran: 'topup' (saldo) atau 'sc_renewal' (QRIS langsung untuk
+  // perpanjang SC, data perpanjangan disimpan di purpose_payload).
+  const names = new Set(cols.map((c) => String(c?.name || '').toLowerCase()));
+  const purposeColumns = [
+    ['purpose', "TEXT DEFAULT 'topup'"],
+    ['purpose_payload', 'TEXT'],
+    ['purpose_status', 'TEXT'],
+    ['purpose_result', 'TEXT']
+  ];
+  for (const [name, type] of purposeColumns) {
+    if (names.has(name)) continue;
+    await dbRun(`ALTER TABLE pending_deposits_app3 ADD COLUMN ${name} ${type}`).catch((e) => {
+      if (!/duplicate column name/i.test(String(e?.message || ''))) throw e;
+    });
   }
 }
 
@@ -948,6 +1018,8 @@ async function notifyAdminsScRenewal(payload = {}) {
     `IP VPS: ${ip}`,
     `Tambah Durasi: ${days} hari`,
     `Biaya: Rp ${fee.toLocaleString('id-ID')}`,
+    payload.paymentMethod ? `Metode Bayar: ${cleanNotifyText(payload.paymentMethod, 40)}` : null,
+    payload.paymentRef ? `Ref: ${cleanNotifyText(payload.paymentRef, 80)}` : null,
     Number.isFinite(saldoNow) ? `Sisa Saldo: Rp ${saldoNow.toLocaleString('id-ID')}` : null,
     `Status Sebelumnya: ${prevStatus}`,
     `Expired Sebelumnya: ${formatDateTime(previousExpiresAt)}`,
@@ -3068,6 +3140,55 @@ async function registerScIp(userId, ip, clientName, days, totalFee) {
   }
 }
 
+// Inti perpanjangan: potong saldo pembayar lalu tambah masa aktif. WAJIB
+// dipanggil di dalam transaksi yang sudah dibuka pemanggil. Validasi owner
+// dilempar sebagai error sebelum ada saldo yang dipotong.
+async function applyScRenewalInTransaction(payerId, ownerId, host, clientName, days, totalFee) {
+  const now = Date.now();
+  await markExpiredScRegistrations(now);
+
+  const active = await getActiveScRegistrationByIp(host, now);
+  if (active && Number(active.user_id || 0) !== ownerId) {
+    throw new Error('IP VPS ini sedang aktif di owner lain. Masukkan ID Telegram owner yang benar.');
+  }
+
+  const existing = await dbGet(
+    "SELECT id, user_id, status, expires_at, client_name FROM sc_registrations " +
+      "WHERE user_id = ? AND LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
+      "ORDER BY updated_at DESC LIMIT 1",
+    [ownerId, host]
+  );
+  if (!existing) {
+    throw new Error('IP VPS tidak ditemukan untuk Telegram ID owner tersebut.');
+  }
+
+  const ok = await deductSaldoAtomic(payerId, totalFee);
+  if (!ok) return { insufficient: true };
+
+  const prevStatus = String(existing?.status || '').trim().toLowerCase();
+  const previousExpiresAt = Number(existing?.expires_at || 0);
+  const baseExpiry = Math.max(now, previousExpiresAt);
+  const nextExpiry = baseExpiry + (days * DAY_MS);
+  const finalClientName = normalizeClientName(clientName || existing?.client_name || host) || host;
+
+  await dbRun(
+    'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ?, client_name = ?, vps_ip = ? WHERE id = ? AND user_id = ?',
+    ['active', now, nextExpiry, finalClientName, host, Number(existing.id || 0), ownerId]
+  );
+  await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [ownerId, host]);
+  await saveTransaction(payerId, -totalFee, 'sc_renewal', `sc_renew_${payerId}_owner_${ownerId}_${host}_${days}d_${now}`);
+  return {
+    success: true,
+    actorId: payerId,
+    targetUserId: ownerId,
+    expiresAt: nextExpiry,
+    previousExpiresAt,
+    clientName: finalClientName,
+    prevStatus,
+    reactivatedFromExpired: prevStatus === 'expired'
+  };
+}
+
 async function extendScRegistration(actorId, targetUserId, ip, clientName, days, totalFee) {
   const payerId = Number(actorId || 0);
   const ownerId = Number(targetUserId || 0);
@@ -3079,53 +3200,13 @@ async function extendScRegistration(actorId, targetUserId, ip, clientName, days,
 
   await dbRun('BEGIN IMMEDIATE TRANSACTION');
   try {
-    const now = Date.now();
-    await markExpiredScRegistrations(now);
-
-    const active = await getActiveScRegistrationByIp(host, now);
-    if (active && Number(active.user_id || 0) !== ownerId) {
-      throw new Error('IP VPS ini sedang aktif di owner lain. Masukkan ID Telegram owner yang benar.');
-    }
-
-    const existing = await dbGet(
-      "SELECT id, user_id, status, expires_at, client_name FROM sc_registrations " +
-        "WHERE user_id = ? AND LOWER(TRIM(REPLACE(REPLACE(vps_ip, char(13), ''), char(10), ''))) = LOWER(TRIM(?)) " +
-        "ORDER BY updated_at DESC LIMIT 1",
-      [ownerId, host]
-    );
-    if (!existing) {
-      throw new Error('IP VPS tidak ditemukan untuk Telegram ID owner tersebut.');
-    }
-
-    const ok = await deductSaldoAtomic(payerId, totalFee);
-    if (!ok) {
+    const result = await applyScRenewalInTransaction(payerId, ownerId, host, clientName, days, totalFee);
+    if (result.insufficient) {
       await dbRun('ROLLBACK');
-      return { insufficient: true };
+      return result;
     }
-
-    const prevStatus = String(existing?.status || '').trim().toLowerCase();
-    const previousExpiresAt = Number(existing?.expires_at || 0);
-    const baseExpiry = Math.max(now, previousExpiresAt);
-    const nextExpiry = baseExpiry + (days * DAY_MS);
-    const finalClientName = normalizeClientName(clientName || existing?.client_name || host) || host;
-
-    await dbRun(
-      'UPDATE sc_registrations SET status = ?, updated_at = ?, expires_at = ?, client_name = ?, vps_ip = ? WHERE id = ? AND user_id = ?',
-      ['active', now, nextExpiry, finalClientName, host, Number(existing.id || 0), ownerId]
-    );
-    await dbRun('DELETE FROM sc_notify_state WHERE user_id = ? AND vps_ip = ?', [ownerId, host]);
-    await saveTransaction(payerId, -totalFee, 'sc_renewal', `sc_renew_${payerId}_owner_${ownerId}_${host}_${days}d_${now}`);
     await dbRun('COMMIT');
-    return {
-      success: true,
-      actorId: payerId,
-      targetUserId: ownerId,
-      expiresAt: nextExpiry,
-      previousExpiresAt,
-      clientName: finalClientName,
-      prevStatus,
-      reactivatedFromExpired: prevStatus === 'expired'
-    };
+    return result;
   } catch (e) {
     await dbRun('ROLLBACK').catch(() => {});
     throw e;
@@ -3425,6 +3506,14 @@ async function registerScMenu() {
     [Markup.button.callback(`SC Unlimited (Rp ${Number(unlimitedPrice).toLocaleString('id-ID')})`, 'm_register_sc_unlimited')],
     [Markup.button.callback('Jadi Reseller', 'm_become_reseller')],
     [Markup.button.callback('Kembali', 'm_register_sc_back')]
+  ]);
+}
+
+function scRenewPayMethodKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('💰 Bayar pakai Saldo', 'm_extend_pay_saldo')],
+    [Markup.button.callback('📱 Bayar pakai QRIS', 'm_extend_pay_qris')],
+    [Markup.button.callback('Batal', 'm_extend_pay_cancel')]
   ]);
 }
 
@@ -3810,7 +3899,8 @@ async function getTopupHistoryPage(period, page = 0, pageSize = 10) {
   const size = Math.max(1, Math.min(10, Number(pageSize) || 10));
   const offset = safePage * size;
   return dbAll(
-    `SELECT user_id, amount, original_amount, admin_fee, status, gateway_provider, reference_id, unique_code, created_at
+    `SELECT user_id, amount, original_amount, admin_fee, status, gateway_provider, reference_id, unique_code, created_at,
+            purpose, purpose_payload, purpose_status
      FROM pending_deposits_app3
      WHERE created_at >= ? AND created_at < ?
      ORDER BY created_at DESC
@@ -4960,18 +5050,264 @@ async function cleanupTopupQrMessage(row) {
   return true;
 }
 
+async function sendDepositQrMessage(ctx, code, qrUrl, caption) {
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('Cek Status', `m_check_topup_${code}`)],
+    [Markup.button.callback('Batalkan', `m_cancel_topup_${code}`)]
+  ]);
+  let sent;
+  try {
+    sent = await ctx.replyWithPhoto(qrUrl, { caption, ...keyboard });
+  } catch (_) {
+    sent = await ctx.reply(`${caption}\nQR: ${qrUrl}`, keyboard);
+  }
+  await dbRun(
+    'UPDATE pending_deposits_app3 SET qr_message_chat_id = ?, qr_message_id = ? WHERE unique_code = ?',
+    [Number(ctx.chat?.id || 0), Number(sent?.message_id || 0), code]
+  ).catch(() => {});
+}
+
+const SC_RENEWAL_DEPOSIT_PURPOSE = 'sc_renewal';
+
+function isScRenewalDeposit(row) {
+  return String(row?.purpose || '').trim().toLowerCase() === SC_RENEWAL_DEPOSIT_PURPOSE;
+}
+
+function depositLabel(row) {
+  return isScRenewalDeposit(row) ? 'Pembayaran Perpanjang SC' : 'Top Up Saldo';
+}
+
+function formatDepositStatus(row) {
+  if (isScRenewalDeposit(row) && row?.status === 'paid' && row?.purpose_status === 'failed') {
+    return 'dibayar, dana masuk saldo (perpanjang gagal)';
+  }
+  return formatTopupStatus(row?.status);
+}
+
+function parseDepositPayload(row) {
+  try {
+    const parsed = JSON.parse(String(row?.purpose_payload || '{}'));
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+// Tanya gateway apakah transaksi pending sudah dibayar. Tidak mengubah saldo.
+async function checkPendingDepositPaid(row) {
+  const provider = String(row?.gateway_provider || 'gopay').toLowerCase();
+  if (provider !== 'gopay') {
+    const check = await checkOrderKuotaPaidByAmount(Number(row?.amount || 0));
+    if (check && check.amounts instanceof Set) {
+      await syncOrderKuotaAmountLocks(check.amounts).catch(() => {});
+    }
+    if (check && check.paid === true) {
+      await lockOrderKuotaAmount(Number(row?.amount || 0)).catch(() => {});
+      return { paid: true, status: 'paid' };
+    }
+    return { paid: false, status: 'pending' };
+  }
+  const st = await checkGoPayStatus(String(row?.provider_tx_id || ''));
+  return { paid: st.settled === true, status: st.status || 'pending' };
+}
+
+// QRIS perpanjang SC: dana dikreditkan ke saldo lalu langsung dipakai perpanjang
+// dalam SATU transaksi, jadi tidak ada keadaan setengah jadi kalau bot mati di
+// tengah. Kalau perpanjangan ditolak (mis. IP sudah aktif di owner lain), hanya
+// bagian perpanjangan yang dibatalkan lewat savepoint; dana tetap di saldo.
+async function settleScRenewalDeposit(row) {
+  const payload = parseDepositPayload(row);
+  const payerId = Number(row?.user_id || 0);
+  const ownerId = Number(payload.targetUserId || payerId);
+  const host = normalizeHost(payload.ip || '');
+  const days = Math.floor(Number(payload.days || 0));
+  const paidAmount = Math.floor(Number(row?.original_amount || row?.amount || 0));
+  const base = { payload, payerId, ownerId, host, days, paidAmount };
+  if (!payerId) throw new Error('Transaksi tanpa user pembayar.');
+  await ensureUser(payerId);
+  if (ownerId) await ensureUser(ownerId);
+
+  await dbRun('BEGIN IMMEDIATE TRANSACTION');
+  try {
+    const latest = await dbGet('SELECT status FROM pending_deposits_app3 WHERE unique_code = ?', [row.unique_code]);
+    if (!latest || latest.status !== 'pending') {
+      await dbRun('ROLLBACK');
+      return { ...base, credited: false };
+    }
+    await addSaldo(payerId, paidAmount);
+    await dbRun("UPDATE pending_deposits_app3 SET status='paid' WHERE unique_code = ?", [row.unique_code]);
+    await saveTransaction(payerId, paidAmount, 'deposit', String(row.reference_id || row.unique_code));
+
+    let renewal = null;
+    let failure = '';
+    await dbRun('SAVEPOINT sc_renewal_qris');
+    try {
+      if (!ownerId || !isIpv4(host) || days < 1 || paidAmount < 1) {
+        throw new Error('Data perpanjangan pada transaksi tidak valid.');
+      }
+      const result = await applyScRenewalInTransaction(payerId, ownerId, host, payload.clientName, days, paidAmount);
+      if (result.insufficient) throw new Error('Saldo tidak cukup untuk perpanjang.');
+      await dbRun('RELEASE SAVEPOINT sc_renewal_qris');
+      renewal = result;
+    } catch (err) {
+      failure = cleanNotifyText(parseErr(err), 200) || 'unknown';
+      await dbRun('ROLLBACK TO SAVEPOINT sc_renewal_qris');
+      await dbRun('RELEASE SAVEPOINT sc_renewal_qris');
+    }
+    await dbRun(
+      'UPDATE pending_deposits_app3 SET purpose_status = ?, purpose_result = ? WHERE unique_code = ?',
+      [renewal ? 'done' : 'failed', renewal ? '' : failure, row.unique_code]
+    );
+    await dbRun('COMMIT');
+    return { ...base, credited: true, renewal, failure };
+  } catch (e) {
+    await dbRun('ROLLBACK').catch(() => {});
+    throw e;
+  }
+}
+
+async function announceScRenewalDeposit(row, outcome, send) {
+  const { payload, payerId, ownerId, host, days, paidAmount } = outcome;
+  const chatId = Number(payload.chatId || payerId || 0);
+  const provider = String(row?.gateway_provider || 'gopay').toUpperCase();
+  const ref = String(row?.reference_id || row?.unique_code || '-');
+  const result = outcome.renewal;
+  if (!result) {
+    await notifyAdminsTopupSuccess(row).catch(() => {});
+    const saldoNow = await getSaldo(payerId).catch(() => 0);
+    await send(
+      `Pembayaran QRIS diterima dan masuk ke saldo kamu, tapi perpanjang SC gagal.\n` +
+        `IP: ${host || '-'}\n` +
+        `Alasan: ${outcome.failure || '-'}\n` +
+        `Saldo masuk: Rp ${paidAmount.toLocaleString('id-ID')}\n` +
+        `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}\n` +
+        `Ref: ${ref}\n\n` +
+        'Ulangi dari menu "Daftar / Perpanjang SC" lalu pilih bayar pakai saldo.'
+    );
+    return;
+  }
+
+  const clientName = result.clientName || normalizeClientName(payload.clientName || host) || host;
+  const saldoNow = await getSaldo(payerId).catch(() => NaN);
+  const activeServerKey = await ensureServerKeyForHost(ownerId, host, '').catch(() => '');
+  notifyAdminsScRenewal({
+    user: payload.payer || { id: payerId },
+    actorId: payerId,
+    targetUserId: ownerId,
+    chatId,
+    ip: host,
+    clientName,
+    days,
+    totalFee: paidAmount,
+    saldoNow,
+    previousExpiresAt: result.previousExpiresAt,
+    expiresAt: result.expiresAt,
+    prevStatus: result.prevStatus,
+    reactivatedFromExpired: result.reactivatedFromExpired,
+    paymentMethod: `QRIS ${provider}`,
+    paymentRef: ref
+  }).catch(() => {});
+  await send(
+    `Pembayaran QRIS diterima, perpanjang SC berhasil.\n` +
+      `Nama Client: ${clientName}\n` +
+      `IP: ${host}\n` +
+      `${ownerId !== payerId ? `Owner ID: ${ownerId}\n` : ''}` +
+      `Durasi tambah: ${days} hari\n` +
+      `Dibayar via QRIS: Rp ${Number(row?.amount || paidAmount).toLocaleString('id-ID')}\n` +
+      `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
+      `Ref: ${ref}` +
+      `${result.reactivatedFromExpired
+        ? '\nUnlock menu VPS otomatis: diproses background'
+        : ''}`
+  );
+  schedulePostRegistrationHostSync({
+    userId: ownerId,
+    chatId,
+    ip: host,
+    key: activeServerKey,
+    unlock: result.reactivatedFromExpired,
+    unlockReason: 'renew_after_natural_expired',
+    meta: {
+      status: 'active',
+      client_name: clientName,
+      expires_at: Number(result.expiresAt || 0)
+    }
+  });
+}
+
+// Selesaikan QRIS perpanjang yang sudah terkonfirmasi lunas. Aman dipanggil
+// berulang (poller, Cek Status, Batalkan): hanya panggilan pertama yang
+// memproses, sisanya mendapat false.
+async function completeScRenewalDeposit(row, send) {
+  const outcome = await settleScRenewalDeposit(row);
+  if (!outcome.credited) return false;
+  await cleanupTopupQrMessage(row).catch(() => {});
+  await announceScRenewalDeposit(row, outcome, send).catch((err) => {
+    console.error(`[sc-renewal-qris] notifikasi ${row.unique_code} gagal: ${parseErr(err)}`);
+  });
+  return true;
+}
+
+function scRenewalDepositSender(row) {
+  const chatId = Number(parseDepositPayload(row).chatId || row?.user_id || 0);
+  return (text) => bot.telegram.sendMessage(chatId, text, mainMenu()).catch(() => {});
+}
+
+async function checkScRenewalDepositFromChat(ctx, row) {
+  const label = depositLabel(row);
+  if (row.status !== 'pending') return ctx.reply(`Status ${label}: ${formatDepositStatus(row)}`);
+  let check;
+  try {
+    check = await checkPendingDepositPaid(row);
+  } catch (err) {
+    return ctx.reply(`Gagal cek status: ${String(err?.message || err)}`);
+  }
+  if (check.paid) {
+    try {
+      const done = await completeScRenewalDeposit(row, (text) => ctx.reply(text, mainMenu()));
+      if (!done) return ctx.reply(`${label} sudah diproses sebelumnya.`);
+      return null;
+    } catch (err) {
+      return ctx.reply(`Pembayaran terdeteksi tetapi gagal diproses: ${parseErr(err)}\nTekan "Cek Status" lagi.`);
+    }
+  }
+  // Cek pembayaran dulu baru kedaluwarsa, supaya yang bayar mepet waktu lalu
+  // menekan "Cek Status" sedikit terlambat tidak dianggap hangus.
+  const expiresAt = Number(row.expires_at || 0);
+  if (expiresAt > 0 && Date.now() > expiresAt) {
+    await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ? AND status = 'pending'", [row.unique_code]);
+    await cleanupTopupQrMessage(row).catch(() => {});
+    return ctx.reply(`${label} sudah kedaluwarsa. Ulangi dari menu "Daftar / Perpanjang SC".`);
+  }
+  return ctx.reply(`${label} masih menunggu pembayaran. Status gateway: ${formatTopupStatus(check.status || 'pending')}`);
+}
+
 async function pollPendingTopups() {
   try {
     const now = Date.now();
     const rows = await dbAll("SELECT * FROM pending_deposits_app3 WHERE status = 'pending' ORDER BY created_at ASC LIMIT 30");
     for (const row of rows) {
+      const renewal = isScRenewalDeposit(row);
       const expiresAt = Number(row.expires_at || 0);
       if (expiresAt > 0 && now > expiresAt) {
-        await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ?", [row.unique_code]);
+        if (renewal) {
+          // Cek gateway sekali lagi sebelum hangus: bayar di detik terakhir,
+          // atau OrderKuota yang lupa ditekan "Cek Status", tetap diperpanjang.
+          const check = await checkPendingDepositPaid(row).catch(() => null);
+          if (check?.paid) {
+            await completeScRenewalDeposit(row, scRenewalDepositSender(row)).catch((err) => {
+              console.error(`[sc-renewal-qris] proses ${row.unique_code} gagal: ${parseErr(err)}`);
+            });
+            continue;
+          }
+        }
+        await dbRun("UPDATE pending_deposits_app3 SET status='expired' WHERE unique_code = ? AND status = 'pending'", [row.unique_code]);
         await cleanupTopupQrMessage(row).catch(() => {});
         await bot.telegram.sendMessage(
           row.user_id,
-          `Top Up Saldo kedaluwarsa.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}`
+          renewal
+            ? `Pembayaran perpanjang SC kedaluwarsa.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}\nUlangi dari menu "Daftar / Perpanjang SC".`
+            : `Top Up Saldo kedaluwarsa.\nRef: ${row.reference_id || row.unique_code}\nNominal: Rp ${Number(row.amount || 0).toLocaleString('id-ID')}`
         ).catch(() => {});
         continue;
       }
@@ -4981,6 +5317,12 @@ async function pollPendingTopups() {
       const st = await checkGoPayStatus(String(row.provider_tx_id || '')).catch(() => null);
       if (!st || st.pending) continue;
       if (st.settled) {
+        if (renewal) {
+          await completeScRenewalDeposit(row, scRenewalDepositSender(row)).catch((err) => {
+            console.error(`[sc-renewal-qris] proses ${row.unique_code} gagal: ${parseErr(err)}`);
+          });
+          continue;
+        }
         const credited = await markPendingPaid(row);
         if (credited) {
           await cleanupTopupQrMessage(row).catch(() => {});
@@ -5109,11 +5451,13 @@ bot.action(/m_admin_topup_hist_(today|yesterday|month)_(\d+)/, async (ctx) => {
     const nominal = Number(r?.original_amount || r?.amount || 0);
     const fee = Number(r?.admin_fee || 0);
     const billed = Number(r?.amount || 0);
-    const status = formatTopupStatus(r?.status);
+    const status = formatDepositStatus(r);
     const provider = String(r?.gateway_provider || 'gopay').toUpperCase();
     const ref = String(r?.reference_id || r?.unique_code || '-');
     const at = formatDateTime(r?.created_at);
-    return `${no}. uid=${uid} | ${provider} | ${status}\nnominal=Rp ${nominal.toLocaleString('id-ID')} | fee=Rp ${fee.toLocaleString('id-ID')} | billed=Rp ${billed.toLocaleString('id-ID')}\nref=${ref}\n${at}`;
+    const renewal = isScRenewalDeposit(r) ? parseDepositPayload(r) : null;
+    const kind = renewal ? `\njenis=PERPANJANG SC ${renewal.ip || '-'} ${Number(renewal.days || 0)} hari` : '';
+    return `${no}. uid=${uid} | ${provider} | ${status}\nnominal=Rp ${nominal.toLocaleString('id-ID')} | fee=Rp ${fee.toLocaleString('id-ID')} | billed=Rp ${billed.toLocaleString('id-ID')}\nref=${ref}${kind}\n${at}`;
   });
   const text = uiBox(`HISTORI TOPUP ${meta.label} (PAGE ${safePage + 1}/${totalPages})`, [
     `Total data: ${total}`,
@@ -6092,10 +6436,212 @@ bot.action('m_register_sc_extend', async (ctx) => {
         '',
         'Kalau IP milik akun lain, user biasa wajib memasukkan Telegram User ID owner IP.',
         'Admin bisa perpanjang semua IP tanpa input owner ID.',
+        'Pembayaran bisa pakai saldo atau langsung QRIS.',
         '',
         'Ketik "batal" untuk membatalkan.'
       ])
   );
+});
+
+const SC_RENEW_SESSION_INACTIVE_TEXT = 'Sesi perpanjang SC sudah tidak aktif. Ulangi dari menu "Daftar / Perpanjang SC".';
+
+// Klaim sesi pilih-bayar secara sinkron sebelum await pertama, supaya tap ganda
+// pada tombol tidak memotong saldo atau membuat QRIS dua kali.
+function claimScRenewPayState(ctx) {
+  const chatId = ctx.chat?.id;
+  const state = userState.get(chatId);
+  if (!state || state.step !== 'extend_sc_pay_method') return null;
+  if (Number(state.payerId || 0) !== Number(ctx.from?.id || 0)) return null;
+  state.step = 'extend_sc_paying';
+  return state;
+}
+
+function releaseScRenewPayState(chatId, state) {
+  state.step = 'extend_sc_pay_method';
+  userState.set(chatId, state);
+}
+
+// Harga dihitung ulang saat tombol ditekan, sama seperti alur lama yang
+// menghitung harga tepat saat saldo dipotong.
+async function quoteScRenewal(userId, state) {
+  const [{ pricePerDay }, minDays] = await Promise.all([getRegistrationPricePerDayForUser(userId), getRegistrationMinDays()]);
+  const days = Math.floor(Number(state?.days || 0));
+  if (!isIpv4(String(state?.ip || '').trim())) {
+    throw new Error('State perpanjangan tidak valid. Ulangi dari menu perpanjang.');
+  }
+  if (!Number.isFinite(days) || days < minDays) {
+    throw new Error(`Jumlah hari tidak valid. Minimal ${minDays} hari.`);
+  }
+  return { pricePerDay, days, totalFee: days * pricePerDay };
+}
+
+bot.action('m_extend_pay_saldo', async (ctx) => {
+  const state = claimScRenewPayState(ctx);
+  await ctx.answerCbQuery().catch(() => {});
+  if (!state) return ctx.reply(SC_RENEW_SESSION_INACTIVE_TEXT, mainMenu());
+  try {
+    const ip = String(state.ip || '').trim();
+    const { days, totalFee } = await quoteScRenewal(ctx.from.id, state);
+    const clientName = normalizeClientName(state.clientName || ip) || ip;
+    const serverKey = String(state.serverKey || '').trim();
+    const targetUserId = Number(state.targetUserId || ctx.from.id);
+    const result = await extendScRegistration(ctx.from.id, targetUserId, ip, clientName, days, totalFee);
+    if (result.insufficient) {
+      const saldo = await getSaldo(ctx.from.id);
+      // Sesi dibiarkan terbuka supaya bisa langsung pilih QRIS.
+      releaseScRenewPayState(ctx.chat.id, state);
+      return ctx.reply(
+        `Saldo tidak cukup untuk perpanjang SC.\n` +
+          `Nama Client: ${clientName}\n` +
+          `IP: ${ip}\n` +
+          `${targetUserId !== Number(ctx.from.id || 0) ? `Owner ID: ${targetUserId}\n` : ''}` +
+          `Durasi: ${days} hari\n` +
+          `Total biaya: Rp ${totalFee.toLocaleString('id-ID')}\n` +
+          `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n\n` +
+          'Pilih "Bayar pakai QRIS" di bawah, atau top up dulu via menu "Top Up Saldo".',
+        scRenewPayMethodKeyboard()
+      );
+    }
+
+    const saldoNow = await getSaldo(ctx.from.id);
+    const activeServerKey = await ensureServerKeyForHost(targetUserId, ip, serverKey);
+    userState.delete(ctx.chat.id);
+    notifyAdminsScRenewal({
+      user: ctx.from,
+      actorId: ctx.from.id,
+      targetUserId,
+      chatId: ctx.chat.id,
+      ip,
+      clientName: result.clientName || clientName,
+      days,
+      totalFee,
+      saldoNow,
+      previousExpiresAt: result.previousExpiresAt,
+      expiresAt: result.expiresAt,
+      prevStatus: result.prevStatus,
+      reactivatedFromExpired: result.reactivatedFromExpired,
+      paymentMethod: 'Saldo'
+    }).catch(() => {});
+    await ctx.reply(
+      `Perpanjang SC berhasil.\n` +
+        `Nama Client: ${result.clientName || clientName}\n` +
+        `IP: ${ip}\n` +
+        `${targetUserId !== Number(ctx.from.id || 0) ? `Owner ID: ${targetUserId}\n` : ''}` +
+        `Durasi tambah: ${days} hari\n` +
+        `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
+        `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
+        `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
+        `${result.reactivatedFromExpired
+          ? '\nUnlock menu VPS otomatis: diproses background'
+          : ''}`,
+      mainMenu()
+    );
+    schedulePostRegistrationHostSync({
+      userId: targetUserId,
+      chatId: ctx.chat.id,
+      ip,
+      key: activeServerKey,
+      unlock: result.reactivatedFromExpired,
+      unlockReason: 'renew_after_natural_expired',
+      meta: {
+        status: 'active',
+        client_name: result.clientName || clientName,
+        expires_at: Number(result.expiresAt || 0)
+      }
+    });
+    return null;
+  } catch (err) {
+    userState.delete(ctx.chat.id);
+    return ctx.reply(`Gagal: ${parseErr(err)}`, mainMenu());
+  }
+});
+
+bot.action('m_extend_pay_qris', async (ctx) => {
+  const state = claimScRenewPayState(ctx);
+  await ctx.answerCbQuery().catch(() => {});
+  if (!state) return ctx.reply(SC_RENEW_SESSION_INACTIVE_TEXT, mainMenu());
+  try {
+    const ip = String(state.ip || '').trim();
+    const { days, totalFee, pricePerDay } = await quoteScRenewal(ctx.from.id, state);
+    const clientName = normalizeClientName(state.clientName || ip) || ip;
+    const targetUserId = Number(state.targetUserId || ctx.from.id);
+    const gatewayMin = Number(getGatewayMinTopup() || 0);
+    if (gatewayMin > 0 && totalFee < gatewayMin) {
+      releaseScRenewPayState(ctx.chat.id, state);
+      return ctx.reply(
+        `Total Rp ${totalFee.toLocaleString('id-ID')} di bawah minimal QRIS Rp ${gatewayMin.toLocaleString('id-ID')}.\n` +
+          'Bayar pakai saldo, atau ketik "batal" lalu ulangi dengan durasi lebih panjang.',
+        scRenewPayMethodKeyboard()
+      );
+    }
+
+    await ctx.reply('Membuat QRIS perpanjang SC, tunggu...');
+    const code = makeUniqueCode(ctx.from.id);
+    const now = Date.now();
+    const expireMs = await getTopupExpireMs();
+    const ref = `SCRENEW_APP3_${ctx.from.id}_${now}`;
+    const qr = await createPaymentQrByMode(totalFee, ref);
+    const gatewayProvider = String(qr.provider || 'gopay').toLowerCase();
+    const billedAmount = Number(qr.billedAmount || totalFee);
+    const originalAmount = Number(qr.originalAmount || totalFee);
+    const adminFee = Number(qr.adminFee || 0);
+    const payload = {
+      ip,
+      targetUserId,
+      clientName,
+      days,
+      pricePerDay,
+      chatId: Number(ctx.chat?.id || 0),
+      payer: {
+        id: Number(ctx.from?.id || 0),
+        username: String(ctx.from?.username || ''),
+        first_name: String(ctx.from?.first_name || ''),
+        last_name: String(ctx.from?.last_name || '')
+      }
+    };
+    await dbRun(
+      `INSERT INTO pending_deposits_app3
+       (unique_code, user_id, amount, original_amount, admin_fee, status, provider_tx_id, qr_url, reference_id, created_at, expires_at,
+        gateway_provider, purpose, purpose_payload, purpose_status)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+      [
+        code, ctx.from.id, billedAmount, originalAmount, adminFee, qr.providerTxId, qr.qrUrl, ref, now, now + expireMs,
+        gatewayProvider, SC_RENEWAL_DEPOSIT_PURPOSE, JSON.stringify(payload)
+      ]
+    );
+    userState.delete(ctx.chat.id);
+
+    const caption = [
+      'Pembayaran Perpanjang SC dibuat.',
+      `Nama Client: ${clientName}`,
+      `IP: ${ip}`,
+      targetUserId !== Number(ctx.from.id || 0) ? `Owner ID: ${targetUserId}` : null,
+      `Durasi: ${days} hari`,
+      `Harga: Rp ${originalAmount.toLocaleString('id-ID')}`,
+      adminFee > 0 ? `Fee Unik: Rp ${adminFee.toLocaleString('id-ID')}` : null,
+      `Total Transfer: Rp ${billedAmount.toLocaleString('id-ID')}`,
+      `Gateway: ${gatewayProvider.toUpperCase()}`,
+      `Ref: ${ref}`,
+      `Expired: ${Math.floor(expireMs / 60000)} menit`,
+      '',
+      gatewayProvider === 'gopay'
+        ? 'SC otomatis diperpanjang begitu pembayaran terdeteksi.'
+        : 'Setelah bayar, tekan "Cek Status" supaya SC langsung diperpanjang.'
+    ].filter((line) => line !== null).join('\n');
+    await sendDepositQrMessage(ctx, code, qr.qrUrl, caption);
+    return null;
+  } catch (err) {
+    releaseScRenewPayState(ctx.chat.id, state);
+    return ctx.reply(`Gagal membuat QRIS: ${parseErr(err)}\nCoba lagi, atau pilih bayar pakai saldo.`, scRenewPayMethodKeyboard());
+  }
+});
+
+bot.action('m_extend_pay_cancel', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (state?.step === 'extend_sc_paying') return ctx.reply('Pembayaran sedang diproses, tunggu sebentar.');
+  if (state && String(state.step || '').startsWith('extend_sc_')) userState.delete(ctx.chat.id);
+  return ctx.reply('Perpanjang SC dibatalkan.', mainMenu());
 });
 
 bot.action('m_register_sc_change_ip', async (ctx) => {
@@ -6152,6 +6698,7 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
   if (!code) return;
   const row = await dbGet('SELECT * FROM pending_deposits_app3 WHERE unique_code = ? AND user_id = ?', [code, ctx.from.id]);
   if (!row) return ctx.reply('Transaksi Top Up Saldo tidak ditemukan.');
+  if (isScRenewalDeposit(row)) return checkScRenewalDepositFromChat(ctx, row);
   if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${formatTopupStatus(row.status)}`);
 
   const now = Date.now();
@@ -6202,10 +6749,24 @@ bot.action(/m_cancel_topup_(.+)/, async (ctx) => {
   if (!code) return;
   const row = await dbGet('SELECT * FROM pending_deposits_app3 WHERE unique_code = ? AND user_id = ?', [code, ctx.from.id]);
   if (!row) return ctx.reply('Transaksi Top Up Saldo tidak ditemukan.');
-  if (row.status !== 'pending') return ctx.reply(`Status Top Up Saldo: ${formatTopupStatus(row.status)}`);
-  await dbRun("UPDATE pending_deposits_app3 SET status='cancelled' WHERE unique_code = ?", [code]);
+  const label = depositLabel(row);
+  if (row.status !== 'pending') return ctx.reply(`Status ${label}: ${formatDepositStatus(row)}`);
+  if (isScRenewalDeposit(row)) {
+    // Jangan batalkan yang ternyata sudah dibayar; langsung proses perpanjangannya.
+    const check = await checkPendingDepositPaid(row).catch(() => null);
+    if (check?.paid) {
+      try {
+        const done = await completeScRenewalDeposit(row, (text) => ctx.reply(text, mainMenu()));
+        if (!done) return ctx.reply(`${label} sudah diproses sebelumnya.`);
+        return null;
+      } catch (err) {
+        return ctx.reply(`Pembayaran terdeteksi tetapi gagal diproses: ${parseErr(err)}\nTekan "Cek Status".`);
+      }
+    }
+  }
+  await dbRun("UPDATE pending_deposits_app3 SET status='cancelled' WHERE unique_code = ? AND status = 'pending'", [code]);
   await cleanupTopupQrMessage(row).catch(() => {});
-  return ctx.reply('Top Up Saldo dibatalkan.');
+  return ctx.reply(`${label} dibatalkan.`);
 });
 
 bot.action('m_delete_all_accounts', async (ctx) => {
@@ -7990,71 +8551,37 @@ bot.on('text', async (ctx) => {
 
       const totalFee = Math.floor(days) * pricePerDay;
       const clientName = normalizeClientName(state.clientName || ip) || ip;
-      const serverKey = String(state.serverKey || '').trim();
       const targetUserId = Number(state.targetUserId || ctx.from.id);
-      const result = await extendScRegistration(ctx.from.id, targetUserId, ip, clientName, Math.floor(days), totalFee);
-      if (result.insufficient) {
-        const saldo = await getSaldo(ctx.from.id);
-        userState.delete(ctx.chat.id);
-        return ctx.reply(
-          `Saldo tidak cukup untuk perpanjang SC.\n` +
-            `Nama Client: ${clientName}\n` +
-            `IP: ${ip}\n` +
-            `${targetUserId !== Number(ctx.from.id || 0) ? `Owner ID: ${targetUserId}\n` : ''}` +
-            `Durasi: ${Math.floor(days)} hari\n` +
-            `Total biaya: Rp ${totalFee.toLocaleString('id-ID')}\n` +
-            `Saldo kamu: Rp ${Number(saldo).toLocaleString('id-ID')}\n\n` +
-            'Silakan top up dulu via menu "Top Up Saldo".',
-          mainMenu()
-        );
-      }
-
-      const saldoNow = await getSaldo(ctx.from.id);
-      const activeServerKey = await ensureServerKeyForHost(targetUserId, ip, serverKey);
-      userState.delete(ctx.chat.id);
-      notifyAdminsScRenewal({
-        user: ctx.from,
-        actorId: ctx.from.id,
-        targetUserId,
-        chatId: ctx.chat.id,
-        ip,
-        clientName: result.clientName || clientName,
-        days: Math.floor(days),
-        totalFee,
-        saldoNow,
-        previousExpiresAt: result.previousExpiresAt,
-        expiresAt: result.expiresAt,
-        prevStatus: result.prevStatus,
-        reactivatedFromExpired: result.reactivatedFromExpired
-      }).catch(() => {});
-      await ctx.reply(
-        `Perpanjang SC berhasil.\n` +
-          `Nama Client: ${result.clientName || clientName}\n` +
-          `IP: ${ip}\n` +
-          `${targetUserId !== Number(ctx.from.id || 0) ? `Owner ID: ${targetUserId}\n` : ''}` +
-          `Durasi tambah: ${Math.floor(days)} hari\n` +
-          `Biaya potong saldo: Rp ${totalFee.toLocaleString('id-ID')}\n` +
-          `Expired baru: ${formatDateTime(result.expiresAt)}\n` +
-          `Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}` +
-          `${result.reactivatedFromExpired
-            ? '\nUnlock menu VPS otomatis: diproses background'
-            : ''}`,
-        mainMenu()
+      const saldo = await getSaldo(ctx.from.id);
+      state.step = 'extend_sc_pay_method';
+      state.days = Math.floor(days);
+      state.clientName = clientName;
+      state.targetUserId = targetUserId;
+      state.payerId = Number(ctx.from.id || 0);
+      userState.set(ctx.chat.id, state);
+      return ctx.reply(
+        uiBox('PILIH METODE PEMBAYARAN', [
+          `Nama Client   : ${clientName}`,
+          `IP VPS        : ${ip}`,
+          targetUserId !== Number(ctx.from.id || 0) ? `Owner ID      : ${targetUserId}` : null,
+          `Durasi        : ${Math.floor(days)} hari`,
+          `Total Bayar   : Rp ${totalFee.toLocaleString('id-ID')}`,
+          `Saldo Kamu    : Rp ${Number(saldo).toLocaleString('id-ID')}`,
+          '',
+          saldo >= totalFee
+            ? 'Bayar pakai saldo, atau langsung scan QRIS.'
+            : `Saldo kurang Rp ${(totalFee - saldo).toLocaleString('id-ID')}, bisa langsung bayar pakai QRIS.`
+        ].filter((line) => line !== null)),
+        scRenewPayMethodKeyboard()
       );
-      schedulePostRegistrationHostSync({
-        userId: targetUserId,
-        chatId: ctx.chat.id,
-        ip,
-        key: activeServerKey,
-        unlock: result.reactivatedFromExpired,
-        unlockReason: 'renew_after_natural_expired',
-        meta: {
-          status: 'active',
-          client_name: result.clientName || clientName,
-          expires_at: Number(result.expiresAt || 0)
-        }
-      });
-      return;
+    }
+
+    if (state.step === 'extend_sc_paying') {
+      return ctx.reply('Pembayaran perpanjang SC sedang diproses, tunggu sebentar.');
+    }
+
+    if (state.step === 'extend_sc_pay_method') {
+      return ctx.reply('Pilih metode pembayaran lewat tombol di bawah, atau ketik "batal".', scRenewPayMethodKeyboard());
     }
 
     if (state.step === 'topup_amount') {
@@ -8093,31 +8620,7 @@ bot.on('text', async (ctx) => {
         `Ref: ${ref}\n` +
         `Expired: ${Math.floor(topupExpireMs / 60000)} menit`;
 
-      try {
-        const sent = await ctx.replyWithPhoto(qr.qrUrl, {
-          caption,
-          ...Markup.inlineKeyboard([
-            [Markup.button.callback('Cek Status', `m_check_topup_${code}`)],
-            [Markup.button.callback('Batalkan', `m_cancel_topup_${code}`)]
-          ])
-        });
-        await dbRun(
-          'UPDATE pending_deposits_app3 SET qr_message_chat_id = ?, qr_message_id = ? WHERE unique_code = ?',
-          [Number(ctx.chat?.id || 0), Number(sent?.message_id || 0), code]
-        ).catch(() => {});
-      } catch (_) {
-        const sent = await ctx.reply(
-          `${caption}\nQR: ${qr.qrUrl}`,
-          Markup.inlineKeyboard([
-            [Markup.button.callback('Cek Status', `m_check_topup_${code}`)],
-            [Markup.button.callback('Batalkan', `m_cancel_topup_${code}`)]
-          ])
-        );
-        await dbRun(
-          'UPDATE pending_deposits_app3 SET qr_message_chat_id = ?, qr_message_id = ? WHERE unique_code = ?',
-          [Number(ctx.chat?.id || 0), Number(sent?.message_id || 0), code]
-        ).catch(() => {});
-      }
+      await sendDepositQrMessage(ctx, code, qr.qrUrl, caption);
       return;
     }
 

@@ -56,6 +56,14 @@ Klien -> HAProxy :443 (TLS, deteksi payload)
 
 Kalau menyentuh HAProxy, nginx, atau sshws: perubahan harus lolos `haproxy -c -f` dan `nginx -t` **sebelum** reload. Pola ini sudah ada di `setup_haproxy_tls_mux()`; ikuti, jangan dilewati.
 
+### Config Xray dan hot-add user
+
+Xray tidak punya reload, jadi restart memutus **semua** pengguna vmess/vless/trojan. Aturannya:
+
+- Akun baru, trial, dan perpanjangan akun expired ditambahkan tanpa restart lewat `HandlerService` (`xray api adu`), lihat `writeXrayConfigAndReload()` di api.js. Penghapusan, pergantian kredensial, dan lock/unlock tetap restart, karena hanya restart yang memutus sesi lama user yang dicabut.
+- `buildXrayRuntimeConfig()` ada di api.js **dan** iplimit-checker.js, dan isinya harus identik termasuk tag inbound. Config yang strukturnya berbeda selalu jatuh ke restart. `npm run test:xray-hot-add` menjaga ini.
+- `HandlerService` bisa membuat akun, jadi hanya aktif kalau rule iptables "hanya root ke 127.0.0.1:10085" dari `apply_tunnel_outbound_guard_rules()` terpasang dan Xray tidak jalan sebagai root. Jangan hapus rule itu.
+
 Timeout HAProxy sengaja panjang (`timeout client/server 12h`) supaya tunnel WS tidak putus sendiri. Yang menjaga socket mati tidak menumpuk adalah `option clitcpka`/`srvtcpka` plus sysctl keepalive agresif (`tcp_keepalive_time=60`, `intvl=15`, `probes=4`). Ketiganya satu paket. Jangan hapus salah satu tanpa mengganti mekanisme penggantinya.
 
 ## Aturan systemd timer (penting, pernah jadi bug nyata)

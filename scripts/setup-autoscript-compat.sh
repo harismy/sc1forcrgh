@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.62}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.63}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -2254,6 +2254,14 @@ apply_tunnel_outbound_guard_rules() {
     [[ -z "${ssh_ports}" ]] && ssh_ports="22"
     [[ -z "${abuse_ports}" ]] && abuse_ports="3389"
     applied=0
+
+    # Port API Xray hanya untuk proses root. Pengguna tunnel SSH (UID user) dan
+    # sesi Xray (nobody) bisa menjangkau 127.0.0.1 lewat forwarding; tanpa rule
+    # ini HandlerService membuat mereka bisa menambah akun sendiri. API dan
+    # IP-limit baru mengaktifkan HandlerService kalau rule ini terpasang.
+    iptables -w 10 -C OUTPUT -o lo -p tcp -d 127.0.0.1 --dport 10085 -m owner ! --uid-owner 0 -j REJECT --reject-with tcp-reset >/dev/null 2>&1 || \
+      iptables -w 10 -I OUTPUT -o lo -p tcp -d 127.0.0.1 --dport 10085 -m owner ! --uid-owner 0 -j REJECT --reject-with tcp-reset >/dev/null 2>&1 || true
+    applied=1
 
     if [[ "${ssh_enabled}" == "1" || "${ssh_enabled}" == "true" || "${ssh_enabled}" == "yes" || "${ssh_enabled}" == "on" ]]; then
       iptables -w 10 -C OUTPUT -p tcp -m multiport --dports "${ssh_ports}" -m owner ! --uid-owner 0 -j REJECT >/dev/null 2>&1 || \
@@ -5417,6 +5425,146 @@ function stopXrayFailClosed() {
   safeExec('systemctl', ['stop', 'xray']);
   safeExec('service', ['xray', 'stop']);
 }
+
+// Hot-add user Xray. Xray tidak punya reload, jadi restart memutus SEMUA
+// pengguna vmess/vless/trojan. Akun baru, trial, dan perpanjangan akun yang
+// sudah expired cukup ditambahkan lewat HandlerService (xray api adu).
+// Penghapusan dan pergantian kredensial tetap restart: hanya restart yang
+// memutus sesi lama milik user yang dicabut.
+function canonicalXrayJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalXrayJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalXrayJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+function stripXrayClients(cfg) {
+  const copy = JSON.parse(JSON.stringify(cfg || {}));
+  for (const inbound of Array.isArray(copy.inbounds) ? copy.inbounds : []) {
+    if (inbound && inbound.settings && Array.isArray(inbound.settings.clients)) inbound.settings.clients = [];
+  }
+  return copy;
+}
+// Hasilnya daftar inbound yang hanya berisi user baru, atau null kalau
+// perubahan tidak aman diterapkan tanpa restart: HandlerService belum aktif
+// di config yang berjalan, struktur selain daftar client berubah, ada user
+// yang hilang, atau kredensial user lama berganti.
+function planXrayUserHotAdd(runningCfg, nextCfg) {
+  const services = runningCfg?.api?.services;
+  if (!Array.isArray(services) || !services.includes('HandlerService')) return null;
+  if (canonicalXrayJson(stripXrayClients(runningCfg)) !== canonicalXrayJson(stripXrayClients(nextCfg))) return null;
+  const runningInbounds = Array.isArray(runningCfg.inbounds) ? runningCfg.inbounds : [];
+  const nextInbounds = Array.isArray(nextCfg.inbounds) ? nextCfg.inbounds : [];
+  const plan = [];
+  for (let i = 0; i < nextInbounds.length; i += 1) {
+    const nextClients = nextInbounds[i]?.settings?.clients;
+    if (!Array.isArray(nextClients)) continue;
+    const runningClients = runningInbounds[i]?.settings?.clients;
+    if (!Array.isArray(runningClients)) return null;
+    const running = new Map();
+    for (const client of runningClients) {
+      const email = String(client?.email || '');
+      if (!email || running.has(email)) return null;
+      running.set(email, canonicalXrayJson(client));
+    }
+    const seen = new Set();
+    const added = [];
+    for (const client of nextClients) {
+      const email = String(client?.email || '');
+      if (!email || seen.has(email)) return null;
+      seen.add(email);
+      if (!running.has(email)) added.push(client);
+      else if (running.get(email) !== canonicalXrayJson(client)) return null;
+    }
+    for (const email of running.keys()) {
+      if (!seen.has(email)) return null;
+    }
+    if (!added.length) continue;
+    const tag = String(nextInbounds[i]?.tag || '');
+    if (!tag) return null;
+    plan.push({ ...nextInbounds[i], settings: { ...nextInbounds[i].settings, clients: added } });
+  }
+  return plan;
+}
+function parseXrayAddedUserCount(output) {
+  const match = String(output || '').match(/Added\s+(\d+)\s+user\(s\)\s+in total/);
+  return match ? Number(match[1]) : -1;
+}
+
+// Rule iptables yang dipasang apply_tunnel_outbound_guard_rules. HandlerService
+// hanya aktif kalau port API tertutup untuk pengguna tunnel dan Xray tidak
+// jalan sebagai root (sesi Xray bisa menjangkau 127.0.0.1 lewat freedom).
+const XRAY_API_GUARD_RULE = ['OUTPUT', '-o', 'lo', '-p', 'tcp', '-d', '127.0.0.1', '--dport', '10085',
+  '-m', 'owner', '!', '--uid-owner', '0', '-j', 'REJECT', '--reject-with', 'tcp-reset'];
+let xrayApiGuardCache = { at: 0, value: false };
+function xrayApiServices() {
+  const now = Date.now();
+  if (now - xrayApiGuardCache.at > 10 * 60 * 1000) {
+    const ruleOk = safeExec('iptables', ['-w', '5', '-C', ...XRAY_API_GUARD_RULE]);
+    const xrayUser = String(readExec('systemctl', ['show', 'xray', '-p', 'User', '--value']) || '').trim();
+    xrayApiGuardCache = { at: now, value: ruleOk && xrayUser !== '' && xrayUser !== 'root' };
+  }
+  return xrayApiGuardCache.value ? ['HandlerService', 'StatsService'] : ['StatsService'];
+}
+function readXrayProcessInfo() {
+  const out = String(readExec('systemctl', ['show', 'xray', '-p', 'MainPID', '-p', 'ExecMainStartTimestampMonotonic']) || '');
+  const pid = Number((out.match(/^MainPID=(\d+)$/m) || [])[1] || 0);
+  const startMonoUs = Number((out.match(/^ExecMainStartTimestampMonotonic=(\d+)$/m) || [])[1] || 0);
+  if (!pid || !startMonoUs) return null;
+  const nowMonoUs = Number(process.hrtime.bigint() / 1000n);
+  return { pid, startedAtMs: Date.now() - Math.max(0, nowMonoUs - startMonoUs) / 1000 };
+}
+// Config yang benar-benar dimuat proses Xray. File config tidak selalu sama:
+// Summary API menghapus akun dengan menulis file tanpa restart. Tanpa catatan
+// hot-add untuk proses ini, file hanya dipercaya kalau tidak diubah sejak
+// Xray start; selain itu kembali ke restart.
+let xrayAppliedSnapshot = null;
+function prepareXrayUserHotAdd(cfgPath, cfg) {
+  try {
+    const proc = readXrayProcessInfo();
+    if (!proc) return null;
+    let running = null;
+    if (xrayAppliedSnapshot && xrayAppliedSnapshot.pid === proc.pid) {
+      running = xrayAppliedSnapshot.cfg;
+    } else if (fs.statSync(cfgPath).mtimeMs <= proc.startedAtMs) {
+      running = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    }
+    if (!running) return null;
+    const inbounds = planXrayUserHotAdd(running, JSON.parse(JSON.stringify(cfg)));
+    return inbounds ? { pid: proc.pid, inbounds } : null;
+  } catch (_) {
+    return null;
+  }
+}
+function applyXrayUserHotAdd(inbounds) {
+  const expected = inbounds.reduce((total, inbound) => total + inbound.settings.clients.length, 0);
+  if (expected === 0) return true;
+  const xrayBin = ['/usr/local/bin/xray', '/usr/bin/xray'].find((bin) => fs.existsSync(bin)) || 'xray';
+  const tmpPath = `/usr/local/etc/xray/.sc-adu-${process.pid}.json`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify({ inbounds }), { encoding: 'utf8', mode: 0o600 });
+    const out = execFileSync(xrayBin, ['api', 'adu', '--server=127.0.0.1:10085', tmpPath], {
+      encoding: 'utf8',
+      timeout: 20000,
+      maxBuffer: 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    // adu tetap exit 0 walau sebagian user gagal; hitungannya yang menentukan.
+    const added = parseXrayAddedUserCount(out);
+    if (added !== expected) {
+      console.error(`[xray-hot-add] hanya ${added}/${expected} user masuk; fallback restart`);
+      return false;
+    }
+    console.log(`[xray-hot-add] ${added} user ditambahkan tanpa restart Xray`);
+    return true;
+  } catch (error) {
+    console.error(`[xray-hot-add] gagal: ${String(error?.message || error).slice(0, 200)}; fallback restart`);
+    return false;
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
+  }
+}
+
 function writeXrayConfigAndReload(cfg, forceRestart = false) {
   const cfgDir = '/usr/local/etc/xray';
   const cfgPath = `${cfgDir}/config.json`;
@@ -5438,6 +5586,9 @@ function writeXrayConfigAndReload(cfg, forceRestart = false) {
       }
     } catch (_) {}
   }
+
+  // Dihitung sebelum file ditimpa karena acuannya config yang sedang berjalan.
+  const hotAdd = forceRestart ? null : prepareXrayUserHotAdd(cfgPath, cfg);
 
   fs.writeFileSync(tmpPath, cfgText, { encoding: 'utf8', mode: 0o644 });
 
@@ -5464,7 +5615,10 @@ function writeXrayConfigAndReload(cfg, forceRestart = false) {
   } catch (_) {}
 
   let applied = false;
-  if (forceRestart) {
+  if (hotAdd && applyXrayUserHotAdd(hotAdd.inbounds)) {
+    xrayAppliedSnapshot = { pid: hotAdd.pid, cfg: JSON.parse(cfgText) };
+    applied = true;
+  } else if (forceRestart) {
     applied = safeExec('systemctl', ['restart', 'xray']) || safeExec('service', ['xray', 'restart']);
   } else {
     applied = reloadXrayServiceSafe();
@@ -6003,12 +6157,11 @@ async function loadEnforceableXrayRows(table, secretColumn, protocol) {
   return selected.rows;
 }
 
-async function renderAndReloadXray(forceRestart = false) {
-  const vmessRows = await loadEnforceableXrayRows('account_vmesses', 'uuid', 'vmess');
-  const vlessRows = await loadEnforceableXrayRows('account_vlesses', 'uuid', 'vless');
-  const trojanRows = await loadEnforceableXrayRows('account_trojans', 'password', 'trojan');
-
-  const cfg = {
+// Tag inbound wajib ada dan harus sama dengan buildXrayRuntimeConfig di
+// iplimit-checker: HandlerService menyasar inbound lewat tag, dan config yang
+// strukturnya berbeda selalu berujung restart.
+function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
+  return {
     log: {
       access: '/var/log/xray/access.log',
       error: '/var/log/xray/error.log',
@@ -6023,32 +6176,32 @@ async function renderAndReloadXray(forceRestart = false) {
         settings: { address: '127.0.0.1' }
       },
       {
-        port: 10001, listen: '127.0.0.1', protocol: 'vmess',
+        tag: 'vmess-ws', port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
       },
       {
-        port: 10002, listen: '127.0.0.1', protocol: 'vless',
+        tag: 'vless-ws', port: 10002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
       },
       {
-        port: 10003, listen: '127.0.0.1', protocol: 'trojan',
+        tag: 'trojan-ws', port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
       },
       {
-        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+        tag: 'vmess-grpc', port: 11001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
       },
       {
-        port: 11002, listen: '127.0.0.1', protocol: 'vless',
+        tag: 'vless-grpc', port: 11002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
       },
       {
-        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+        tag: 'trojan-grpc', port: 11003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
       }
@@ -6059,7 +6212,7 @@ async function renderAndReloadXray(forceRestart = false) {
       settings: { domainStrategy: XRAY_OUTBOUND_DOMAIN_STRATEGY }
     }],
     stats: {},
-    api: { tag: 'api', services: ['StatsService'] },
+    api: { tag: 'api', services: xrayApiServices() },
     policy: {
       levels: { '0': xrayLevelZeroStatsPolicy() },
       system: {
@@ -6073,6 +6226,13 @@ async function renderAndReloadXray(forceRestart = false) {
       rules: [{ type: 'field', inboundTag: ['api'], outboundTag: 'api' }]
     }
   };
+}
+
+async function renderAndReloadXray(forceRestart = false) {
+  const vmessRows = await loadEnforceableXrayRows('account_vmesses', 'uuid', 'vmess');
+  const vlessRows = await loadEnforceableXrayRows('account_vlesses', 'uuid', 'vless');
+  const trojanRows = await loadEnforceableXrayRows('account_trojans', 'password', 'trojan');
+  const cfg = buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows);
   if (!writeXrayConfigAndReload(cfg, forceRestart)) {
     throw new Error('Xray config could not be applied to the running service.');
   }
@@ -7765,71 +7925,7 @@ async function setStatusXray(table, username, status) {
   const vmessRows = await loadEnforceableXrayRows('account_vmesses', 'uuid', 'vmess');
   const vlessRows = await loadEnforceableXrayRows('account_vlesses', 'uuid', 'vless');
   const trojanRows = await loadEnforceableXrayRows('account_trojans', 'password', 'trojan');
-  const cfg = {
-    log: {
-      access: '/var/log/xray/access.log',
-      error: '/var/log/xray/error.log',
-      loglevel: 'warning'
-    },
-    inbounds: [
-      {
-        tag: 'api',
-        listen: '127.0.0.1',
-        port: 10085,
-        protocol: 'dokodemo-door',
-        settings: { address: '127.0.0.1' }
-      },
-      {
-        port: 10001, listen: '127.0.0.1', protocol: 'vmess',
-        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
-        streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
-      },
-      {
-        port: 10002, listen: '127.0.0.1', protocol: 'vless',
-        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
-        streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
-      },
-      {
-        port: 10003, listen: '127.0.0.1', protocol: 'trojan',
-        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
-        streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
-      },
-      {
-        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
-        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
-        streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
-      },
-      {
-        port: 11002, listen: '127.0.0.1', protocol: 'vless',
-        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
-        streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
-      },
-      {
-        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
-        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
-        streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
-      }
-    ],
-    outbounds: [{
-      protocol: 'freedom',
-      tag: 'direct',
-      settings: { domainStrategy: XRAY_OUTBOUND_DOMAIN_STRATEGY }
-    }],
-    stats: {},
-    api: { tag: 'api', services: ['StatsService'] },
-    policy: {
-      levels: { '0': xrayLevelZeroStatsPolicy() },
-      system: {
-        statsInboundUplink: true,
-        statsInboundDownlink: true,
-        statsOutboundUplink: true,
-        statsOutboundDownlink: true
-      }
-    },
-    routing: {
-      rules: [{ type: 'field', inboundTag: ['api'], outboundTag: 'api' }]
-    }
-  };
+  const cfg = buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows);
   if (!writeXrayConfigAndReload(cfg, true)) {
     throw new Error('Xray lock/unlock could not be applied to the running service.');
   }
@@ -12449,6 +12545,22 @@ async function detectLockedUsersStillInXrayConfig() {
   return findLockedXrayUsersInSnapshot(lockedRows, readXrayConfigAuthSnapshot());
 }
 
+// Harus sama dengan xrayApiServices di api.js supaya config dari checker dan
+// API berstruktur sama. HandlerService (tambah/hapus user) hanya aktif kalau
+// port API tertutup untuk pengguna tunnel dan Xray tidak jalan sebagai root.
+let xrayApiServicesCache = null;
+function xrayApiServices() {
+  if (xrayApiServicesCache === null) {
+    const ruleOk = safeExec('iptables', ['-w', '5', '-C', 'OUTPUT', '-o', 'lo', '-p', 'tcp', '-d', '127.0.0.1',
+      '--dport', '10085', '-m', 'owner', '!', '--uid-owner', '0', '-j', 'REJECT', '--reject-with', 'tcp-reset']);
+    const xrayUser = String(readExec('systemctl', ['show', 'xray', '-p', 'User', '--value']) || '').trim();
+    xrayApiServicesCache = ruleOk && xrayUser !== '' && xrayUser !== 'root'
+      ? ['HandlerService', 'StatsService']
+      : ['StatsService'];
+  }
+  return xrayApiServicesCache.slice();
+}
+
 function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
   return {
     log: {
@@ -12465,32 +12577,32 @@ function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
         settings: { address: '127.0.0.1' }
       },
       {
-        port: 10001, listen: '127.0.0.1', protocol: 'vmess',
+        tag: 'vmess-ws', port: 10001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', wsSettings: { path: XRAY_PATH_VMESS } })
       },
       {
-        port: 10002, listen: '127.0.0.1', protocol: 'vless',
+        tag: 'vless-ws', port: 10002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_VLESS } })
       },
       {
-        port: 10003, listen: '127.0.0.1', protocol: 'trojan',
+        tag: 'trojan-ws', port: 10003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'ws', security: 'none', wsSettings: { path: XRAY_PATH_TROJAN } })
       },
       {
-        port: 11001, listen: '127.0.0.1', protocol: 'vmess',
+        tag: 'vmess-grpc', port: 11001, listen: '127.0.0.1', protocol: 'vmess',
         settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', grpcSettings: { serviceName: 'vmess-grpc' } })
       },
       {
-        port: 11002, listen: '127.0.0.1', protocol: 'vless',
+        tag: 'vless-grpc', port: 11002, listen: '127.0.0.1', protocol: 'vless',
         settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'vless-grpc' } })
       },
       {
-        port: 11003, listen: '127.0.0.1', protocol: 'trojan',
+        tag: 'trojan-grpc', port: 11003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
       }
@@ -12501,7 +12613,7 @@ function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
       settings: { domainStrategy: XRAY_OUTBOUND_DOMAIN_STRATEGY }
     }],
     stats: {},
-    api: { tag: 'api', services: ['StatsService'] },
+    api: { tag: 'api', services: xrayApiServices() },
     policy: {
       levels: { '0': xrayLevelZeroStatsPolicy() },
       system: {

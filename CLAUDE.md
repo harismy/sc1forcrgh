@@ -72,6 +72,11 @@ OnActiveSec=90s
 OnUnitInactiveSec=5min
 ```
 
+**`OnActiveSec=` direset setiap `daemon-reload`, dan `OnUnitInactiveSec=` belum punya acuan sampai service jalan sekali di boot itu.** Jadi setelah reboot, timer yang langkah pertamanya hanya `OnActiveSec=` bisa tertunda selamanya kalau ada reload yang lebih sering dari jedanya. Ini juga pernah terjadi sungguhan: `sc-1forcr-udpgw-drain` (tiap 2 menit) memanggil `systemctl disable` yang diam-diam ikut `daemon-reload`, sehingga notif online, auto-backup, dan pull-update tidak jalan sama sekali setelah auto-reboot harian. Aturannya:
+
+- Script berkala **tidak boleh** memicu reload. Pakai `systemctl enable/disable --no-reload`, dan panggil hanya kalau statusnya memang perlu diubah.
+- Timer yang wajib jalan setelah reboot diberi `OnBootSec=` juga. Catatan: `OnBootSec=` yang sudah lewat langsung terpicu saat timer di-restart, jadi jangan dipakai untuk job berat yang tidak punya penjaga jadwal sendiri (misalnya backup).
+
 Watchdog `/usr/local/sbin/sc-1forcr-postboot-health` memeriksa `ssh`, `dropbear`, `xray`, `sc-1forcr-api`, `sc-1forcr-sshws`, `nginx`, dan `haproxy` — bukan cuma status aktif, tapi juga port benar-benar listen. Restart ulang unit yang sama dibatasi `SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES` (default 15 menit) supaya unit yang rusak permanen tidak di-restart tiap siklus dan membebani VPS kecil.
 
 ## Aturan mengedit installer

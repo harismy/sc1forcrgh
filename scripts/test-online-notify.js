@@ -44,8 +44,30 @@ assert.strictEqual(summaryTimers.length, 1, `expected 1 online-notify timer writ
 for (const block of [...installerTimers, ...summaryTimers]) {
   assert(/^OnUnitInactiveSec=15min$/m.test(block), `online-notify timer must re-check every 15min:\n${block}`);
   assert(/^OnActiveSec=10min$/m.test(block), `online-notify timer must keep its first run:\n${block}`);
+  // Setelah reboot service belum pernah jalan, jadi OnUnitInactiveSec belum
+  // punya acuan, dan OnActiveSec direset setiap daemon-reload. Tanpa OnBootSec
+  // notif diam seharian di VPS dengan auto-reboot harian.
+  assert(/^OnBootSec=10min$/m.test(block), `online-notify timer must survive daemon-reload after boot:\n${block}`);
   assert(!/OnUnitInactiveSec=\$\{[a-z_]+\}h/.test(block), `online-notify timer must not wait a full interval:\n${block}`);
 }
+
+// Drain UDPGW jalan tiap 2 menit. `systemctl disable` tanpa --no-reload memicu
+// daemon-reload yang mereset OnActiveSec semua timer, sehingga timer yang
+// menunggu lebih dari 2 menit setelah boot tidak pernah jalan.
+const drainStart = installer.indexOf("cat > /usr/local/sbin/sc-1forcr-udpgw-drain <<'EOF'\n");
+assert(drainStart >= 0, 'udpgw-drain writer not found');
+const drainBlock = installer.slice(drainStart, installer.indexOf('\nEOF\n', drainStart));
+const drainCalls = drainBlock.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n');
+assert(!/systemctl\s+(enable|disable|daemon-reload)\b(?![^\n]*--no-reload)/.test(drainCalls),
+  'periodic udpgw-drain must not trigger daemon-reload');
+
+// UDP Custom dan ZIVPN berbagi port. API tidak boleh menyalakan UDP Custom saat
+// backend ZIVPN, karena unit itu gagal bind lalu restart tiap 2 detik tanpa henti.
+const udpReloadStart = installer.indexOf('function udpcustomReload() {');
+assert(udpReloadStart >= 0, 'udpcustomReload not found');
+const udpReloadBlock = installer.slice(udpReloadStart, installer.indexOf('\n}\n', udpReloadStart));
+assert(/ACTIVE_UDP_BACKEND/.test(udpReloadBlock) && /'try-restart'/.test(udpReloadBlock),
+  'udpcustomReload must not start UDP Custom when it is not the active backend');
 const serviceStart = installer.indexOf("cat > /etc/systemd/system/sc-1forcr-online-notify.service <<'EOF'\n");
 assert(serviceStart >= 0, 'online-notify service writer not found');
 const serviceBlock = installer.slice(serviceStart, installer.indexOf('\nEOF\n', serviceStart));

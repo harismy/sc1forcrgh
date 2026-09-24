@@ -1670,6 +1670,8 @@ Description=Check SC 1FORCR online account notifier every 15 minutes (report eve
 
 [Timer]
 # Timer hanya memeriksa; jadwal kirim dijaga script lewat stempel kirim terakhir.
+# OnBootSec menjamin cek pertama setelah reboot walau ada daemon-reload.
+OnBootSec=10min
 OnActiveSec=10min
 OnUnitInactiveSec=15min
 AccuracySec=1min

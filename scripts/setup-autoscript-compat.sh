@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.61}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.62}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -5637,6 +5637,15 @@ function scheduleZivpnReload(delayMs = 8000) {
 }
 
 function udpcustomReload() {
+  // UDP Custom dan ZIVPN memakai port yang sama. Restart tanpa cek backend dulu
+  // ikut menyalakan UDP Custom saat backend ZIVPN, lalu unit gagal bind dan
+  // restart tiap 2 detik tanpa henti. Di luar backend UDP Custom cukup
+  // try-restart, yang tidak menyalakan unit yang sedang mati.
+  const backend = String(process.env.ACTIVE_UDP_BACKEND || 'zivpn').trim().toLowerCase();
+  if (!['udpcustom', 'udp-custom', 'udphc'].includes(backend)) {
+    safeExec('systemctl', ['try-restart', UDPCUSTOM_SERVICE]);
+    return;
+  }
   if (!safeExec('systemctl', ['restart', UDPCUSTOM_SERVICE])) {
     safeExec('service', [UDPCUSTOM_SERVICE, 'restart']);
   }
@@ -13749,7 +13758,13 @@ mapfile -t ports < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=6553
 
 for alias_port in "${ports[@]:1}"; do
   unit="sc-1forcr-udpgw@${alias_port}.service"
-  systemctl disable "${unit}" >/dev/null 2>&1 || true
+  # `systemctl disable` tanpa --no-reload ikut menjalankan daemon-reload penuh.
+  # Drain jalan tiap 2 menit, dan reload beruntun itu mereset OnActiveSec timer
+  # lain, sehingga notif online, auto-backup, dan pull-update tidak pernah jalan
+  # setelah reboot. Disable hanya bila masih enabled, dan tanpa reload.
+  if [[ "$(systemctl is-enabled "${unit}" 2>/dev/null || true)" == enabled* ]]; then
+    systemctl disable --no-reload "${unit}" >/dev/null 2>&1 || true
+  fi
   if ! systemctl is-active --quiet "${unit}"; then
     systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
     continue
@@ -15350,6 +15365,8 @@ Description=Check SC 1FORCR online account notifier every 15 minutes (report eve
 
 [Timer]
 # Timer hanya memeriksa; jadwal kirim dijaga script lewat stempel kirim terakhir.
+# OnBootSec menjamin cek pertama setelah reboot walau ada daemon-reload.
+OnBootSec=10min
 OnActiveSec=10min
 OnUnitInactiveSec=15min
 AccuracySec=1min
@@ -15848,8 +15865,10 @@ chmod 644 /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
 apply_restored_runtime_units
 systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
 systemctl restart xray >/dev/null 2>&1 || true
-systemctl restart "${ZIVPN_SERVICE:-zivpn}" >/dev/null 2>&1 || true
-systemctl restart "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}" >/dev/null 2>&1 || true
+# ZIVPN dan UDP Custom berbagi port; restart paksa keduanya menyalakan backend
+# yang sengaja mati lalu membuatnya gagal bind dan restart tanpa henti.
+systemctl try-restart "${ZIVPN_SERVICE:-zivpn}" >/dev/null 2>&1 || true
+systemctl try-restart "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}" >/dev/null 2>&1 || true
 systemctl restart sc-1forcr-sshws nginx >/dev/null 2>&1 || true
 systemctl restart haproxy >/dev/null 2>&1 || true
 systemctl restart ssh >/dev/null 2>&1 || true
@@ -17556,6 +17575,9 @@ Description=Check SC 1FORCR online account notifier every 15 minutes (report eve
 # Timer hanya memeriksa. Jadwal kirim ${notify_interval_h} jam dijaga script lewat stempel
 # /var/lib/sc-1forcr/online-notify.last, jadi kiriman gagal dicoba lagi di cek
 # berikutnya dan restart timer saat update tidak menggeser jadwal kirim.
+# OnBootSec wajib ada: setelah reboot service belum pernah jalan, jadi
+# OnUnitInactiveSec belum punya acuan, dan OnActiveSec direset tiap daemon-reload.
+OnBootSec=10min
 OnActiveSec=10min
 OnUnitInactiveSec=15min
 AccuracySec=1min
@@ -19944,6 +19966,8 @@ Description=Check SC 1FORCR online account notifier every 15 minutes (report eve
 
 [Timer]
 # Timer hanya memeriksa; jadwal kirim dijaga script lewat stempel kirim terakhir.
+# OnBootSec menjamin cek pertama setelah reboot walau ada daemon-reload.
+OnBootSec=10min
 OnActiveSec=10min
 OnUnitInactiveSec=15min
 AccuracySec=1min

@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.63}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.64}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -5658,6 +5658,19 @@ function safeExec(cmd, args, input) {
     return true;
   } catch (_) {
     return false;
+  }
+}
+
+function readExec(cmd, args) {
+  try {
+    return execFileSync(cmd, args, {
+      encoding: 'utf8',
+      timeout: SAFE_EXEC_TIMEOUT_MS,
+      maxBuffer: 2 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+  } catch (_) {
+    return '';
   }
 }
 

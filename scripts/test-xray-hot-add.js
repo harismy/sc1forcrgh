@@ -133,4 +133,115 @@ const jsRule = (source, startMarker, endMarker) => extract(source, startMarker, 
 assert.strictEqual(jsRule(apiSource, 'const XRAY_API_GUARD_RULE = [', '];').join(' '), installerRule, 'API guard check must match the installer rule');
 assert.strictEqual(jsRule(checkerSource, "const ruleOk = safeExec('iptables'", ');').join(' '), installerRule, 'checker guard check must match the installer rule');
 
+// Jalur tulis config API dijalankan utuh dengan definisi milik api.js sendiri
+// (bukan salinan checker), supaya fungsi yang tidak ada di api.js langsung
+// gagal. V.1FSC.63 sempat terkirim dengan readExec yang hanya ada di checker.
+function runApiWriter({ guard = true } = {}) {
+  const state = { pid: 4242, startMonoUs: 5_000_000_000, nowMonoUs: 5_060_000_000, aduOutput: '', aduPayloads: [], calls: [] };
+  const files = new Map();
+  const fsStub = {
+    existsSync: (file) => files.has(file) || file === '/usr/local/bin/xray',
+    mkdirSync: () => {},
+    statSync: (file) => {
+      if (!files.has(file)) throw new Error(`ENOENT ${file}`);
+      return { mtimeMs: files.get(file).mtimeMs };
+    },
+    readFileSync: (file) => {
+      if (!files.has(file)) throw new Error(`ENOENT ${file}`);
+      return files.get(file).text;
+    },
+    writeFileSync: (file, text) => files.set(file, { text: String(text), mtimeMs: Date.now() }),
+    renameSync: (from, to) => { files.set(to, files.get(from)); files.delete(from); },
+    unlinkSync: (file) => files.delete(file)
+  };
+  const execFileSync = (cmd, args) => {
+    const line = [cmd, ...args].join(' ');
+    state.calls.push(line);
+    if (cmd === 'iptables') {
+      if (!guard) throw new Error('rule not found');
+      return '';
+    }
+    if (cmd === 'systemctl') {
+      if (line === 'systemctl show xray -p User --value') return 'nobody\n';
+      if (line === 'systemctl show xray -p MainPID -p ExecMainStartTimestampMonotonic') {
+        return `MainPID=${state.pid}\nExecMainStartTimestampMonotonic=${state.startMonoUs}\n`;
+      }
+      if (args[0] === 'is-active') return '';
+      if (args[0] === 'restart') {
+        state.pid += 1;
+        state.startMonoUs = state.nowMonoUs;
+        return '';
+      }
+      throw new Error(`unsupported: ${line}`);
+    }
+    if (cmd.endsWith('xray')) {
+      if (args[0] === 'api' && args[1] === 'adu') {
+        state.aduPayloads.push(JSON.parse(files.get(args[3]).text));
+        return state.aduOutput;
+      }
+      return '';
+    }
+    throw new Error(`unexpected command: ${line}`);
+  };
+  const ctx = vm.createContext({
+    fs: fsStub,
+    execFileSync,
+    console: { log: () => {}, error: () => {} },
+    process: { pid: 1234, env: {}, hrtime: { bigint: () => BigInt(state.nowMonoUs) * 1000n } },
+    SAFE_EXEC_TIMEOUT_MS: 15000,
+    XRAY_REAL_IP_ENABLE: false,
+    XRAY_TRUSTED_PROXY_HEADER: 'X-SC-Real-IP-Proxy',
+    XRAY_PATH_VMESS: '/vmess',
+    XRAY_PATH_VLESS: '/vless',
+    XRAY_PATH_TROJAN: '/trojan',
+    XRAY_OUTBOUND_DOMAIN_STRATEGY: 'UseIPv4'
+  });
+  for (const [start, end] of [
+    ['function safeExec(', '\nfunction ensureTunnelHoldShell('],
+    ['function withXrayRealIp(', '\nconst XRAY_PUBLIC_HOST_IS_CUSTOM'],
+    ['function reloadXrayServiceSafe(', '\nfunction run(sql'],
+    ['function buildXrayRuntimeConfig(', '\nasync function renderAndReloadXray(']
+  ]) {
+    new vm.Script(extract(apiSource, start, end), { filename: 'api.js' }).runInContext(ctx);
+  }
+  const rows = (...names) => names.map((name) => ({ username: name, secret: `${name}-0000-0000-0000-000000000000` }));
+  const build = (...names) => JSON.parse(JSON.stringify(ctx.buildXrayRuntimeConfig(rows(...names), [], [])));
+  const write = (cfg, forceRestart = false) => {
+    const before = state.calls.length;
+    const ok = ctx.writeXrayConfigAndReload(cfg, forceRestart);
+    const calls = state.calls.slice(before);
+    return { ok, restarted: calls.includes('systemctl restart xray'), adu: calls.some((line) => line.includes(' api adu ')) };
+  };
+  const cfgPath = '/usr/local/etc/xray/config.json';
+  return { state, files, cfgPath, build, write };
+}
+
+{
+  const t = runApiWriter();
+  const running = t.build('alice');
+  assert.deepStrictEqual(running.api.services, ['HandlerService', 'StatsService']);
+  t.files.set(t.cfgPath, { text: `${JSON.stringify(running, null, 2)}\n`, mtimeMs: Date.now() - 120_000 });
+
+  t.state.aduOutput = 'Added 2 user(s) in total.\n';
+  assert.deepStrictEqual(t.write(t.build('alice', 'carol')), { ok: true, restarted: false, adu: true }, 'new account must not restart Xray');
+  assert.deepStrictEqual(t.state.aduPayloads[0].inbounds.map((inbound) => inbound.tag), ['vmess-ws', 'vmess-grpc']);
+  assert.deepStrictEqual(t.state.aduPayloads[0].inbounds[0].settings.clients.map((client) => client.email), ['carol']);
+
+  // File sudah lebih baru dari proses Xray; acuannya catatan hot-add sebelumnya.
+  assert.deepStrictEqual(t.write(t.build('alice', 'carol', 'dave')), { ok: true, restarted: false, adu: true }, 'consecutive additions must stay restart-free');
+
+  assert.deepStrictEqual(t.write(t.build('alice', 'dave')), { ok: true, restarted: true, adu: false }, 'removed account must restart Xray');
+
+  t.state.aduOutput = 'Added 1 user(s) in total.\n';
+  assert.deepStrictEqual(t.write(t.build('alice', 'dave', 'erin')), { ok: true, restarted: true, adu: true }, 'partial adu must fall back to restart');
+
+  t.state.aduOutput = 'Added 2 user(s) in total.\n';
+  assert.deepStrictEqual(t.write(t.build('alice', 'dave', 'erin', 'fred'), true), { ok: true, restarted: true, adu: false }, 'forced restart must skip hot-add');
+}
+
+{
+  const t = runApiWriter({ guard: false });
+  assert.deepStrictEqual(t.build('alice').api.services, ['StatsService'], 'HandlerService must stay off without the iptables guard');
+}
+
 console.log('xray hot-add tests passed');

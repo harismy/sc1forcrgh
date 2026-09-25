@@ -51,6 +51,10 @@ install
 nexus-installer.sh
 backup-sc-*.json
 sc1forcr-restore-*
+# Backup pindah server bot (berisi token, key lisensi, dan database)
+server-backups/
+*.sc1bak
+.server-migrated-away
 sgdo.duniavpn.web.id-129.226.84.95-19_18_05.zip
 _tools
 # Workspace tool lokal

@@ -1,4 +1,6 @@
 const fs = require('fs');
+const os = require('os');
+const dns = require('dns');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
@@ -9,6 +11,7 @@ const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const { buildPayload, headers, API_URL } = require('./api-cekpayment-orkut');
 const { parseForeignBackupBuffer } = require('./lib/foreign-backup-parser');
+const serverMigration = require('./lib/server-migration');
 
 const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
 if (!BOT_TOKEN) {
@@ -192,6 +195,20 @@ const RESTORE_BACKUP_MAX_BYTES = Math.max(
   1024 * 1024,
   Number(process.env.RESTORE_BACKUP_MAX_BYTES || (50 * 1024 * 1024)) || (50 * 1024 * 1024)
 );
+// Pindah server bot (menu admin "Pindah Server Bot").
+const SERVER_ENV_FILE = path.join(__dirname, '.env');
+const SERVER_VARS_FILE = path.join(__dirname, '.vars.json');
+const SERVER_BACKUP_DIR = path.join(__dirname, 'server-backups');
+const SERVER_BACKUP_KEEP_FILES = 5;
+// Kalau file ini ada, bot dan expiry job di server ini diam (server sudah dipindah).
+const SERVER_MIGRATED_MARKER = path.join(__dirname, '.server-migrated-away');
+const LETSENCRYPT_DIR = '/etc/letsencrypt';
+// Batas Bot API: bot hanya bisa mengunduh file <= 20MB dan mengirim <= 50MB.
+const TELEGRAM_BOT_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024;
+const TELEGRAM_BOT_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+const PM2_APP_BOT = 'sc1forcr-nexus-bot';
+const PM2_APP_LICENSE_API = 'sc1forcr-license-api';
+const PM2_APP_EXPIRY_JOB = 'sc1forcr-expiry-job';
 
 function dbRunRaw(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -3542,7 +3559,18 @@ function adminMenu() {
 
     [Markup.button.callback('💸 Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
     [Markup.button.callback('⚙️ Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('🛠️ Ubah Pengaturan', 'm_admin_env_set')],
+    [Markup.button.callback('🚚 Pindah Server Bot (Backup/Restore)', 'm_admin_srv_menu')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
+  ]);
+}
+
+function adminServerMigrationMenu() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📦 Backup Server Bot', 'm_admin_srv_backup')],
+    [Markup.button.callback('♻️ Restore dari Backup', 'm_admin_srv_restore')],
+    [Markup.button.callback('🧊 Bekukan Bot di Server Ini', 'm_admin_srv_freeze')],
+    [Markup.button.callback('📖 Panduan Pindah Server', 'm_admin_srv_guide')],
+    [Markup.button.callback('Kembali', 'm_admin_menu')]
   ]);
 }
 
@@ -4900,6 +4928,424 @@ async function listActiveApiDomains() {
 async function getPrimaryApiDomain() {
   const domains = await listActiveApiDomains();
   return domains[0] || '';
+}
+
+// ---------------------------------------------------------------------------
+// Pindah server bot: backup & restore seluruh state produksi server ini.
+
+let serverMigrationBusy = false;
+
+function isRootProcess() {
+  return typeof process.getuid === 'function' && process.getuid() === 0;
+}
+
+function isRunningUnderPm2() {
+  return process.env.pm_id !== undefined;
+}
+
+// Koneksi SQLite terpisah untuk snapshot/restore, supaya tidak ikut antrean
+// transaksi koneksi utama bot.
+function openSqliteFileAdapter(file) {
+  return new Promise((resolve, reject) => {
+    const conn = new sqlite3.Database(file, (err) => {
+      if (err) return reject(err);
+      conn.configure('busyTimeout', 30000);
+      return resolve({
+        run: (sql, params = []) => new Promise((res, rej) => {
+          conn.run(sql, params, function onRun(runErr) {
+            if (runErr) return rej(runErr);
+            return res(this);
+          });
+        }),
+        all: (sql, params = []) => new Promise((res, rej) => {
+          conn.all(sql, params, (allErr, rows) => (allErr ? rej(allErr) : res(rows || [])));
+        }),
+        close: () => new Promise((res) => conn.close(() => res()))
+      });
+    });
+  });
+}
+
+function localServerId() {
+  let machineId = '';
+  try { machineId = fs.readFileSync('/etc/machine-id', 'utf8').trim(); } catch (_) {}
+  return crypto.createHash('sha256').update(`${machineId}|${os.hostname()}|${__dirname}`).digest('hex').slice(0, 12);
+}
+
+function readServerMigratedMarker() {
+  try {
+    return JSON.parse(fs.readFileSync(SERVER_MIGRATED_MARKER, 'utf8')) || { frozen_at: 0 };
+  } catch (_) {
+    // File ada tapi rusak tetap dianggap beku.
+    return fs.existsSync(SERVER_MIGRATED_MARKER) ? { frozen_at: 0 } : null;
+  }
+}
+
+function formatMegabytes(bytes) {
+  return `${(Number(bytes || 0) / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function serverBackupFileName(prefix) {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
+  const host = String(os.hostname() || 'server').replace(/[^a-zA-Z0-9.-]/g, '_').slice(0, 40);
+  return `${prefix}-${host}-${stamp}${serverMigration.SERVER_BACKUP_EXTENSION}`;
+}
+
+function saveServerBackupLocally(buffer, fileName) {
+  fs.mkdirSync(SERVER_BACKUP_DIR, { recursive: true, mode: 0o700 });
+  const file = path.join(SERVER_BACKUP_DIR, fileName);
+  fs.writeFileSync(file, buffer, { mode: 0o600 });
+  const files = fs.readdirSync(SERVER_BACKUP_DIR)
+    .filter((name) => name.endsWith(serverMigration.SERVER_BACKUP_EXTENSION))
+    .map((name) => ({ name, mtime: fs.statSync(path.join(SERVER_BACKUP_DIR, name)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime);
+  for (const old of files.slice(SERVER_BACKUP_KEEP_FILES)) {
+    try { fs.rmSync(path.join(SERVER_BACKUP_DIR, old.name), { force: true }); } catch (_) {}
+  }
+  return file;
+}
+
+function latestManualServerBackupAt() {
+  try {
+    const times = fs.readdirSync(SERVER_BACKUP_DIR)
+      .filter((name) => name.startsWith('sc1forcr-server-') && name.endsWith(serverMigration.SERVER_BACKUP_EXTENSION))
+      .map((name) => fs.statSync(path.join(SERVER_BACKUP_DIR, name)).mtimeMs);
+    return times.length ? Math.max(...times) : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function buildServerBackup(password, label) {
+  return serverMigration.createServerBackup({
+    password,
+    openDb: openSqliteFileAdapter,
+    dbPath: path.resolve(DB_PATH),
+    appDir: __dirname,
+    env: process.env,
+    envFile: SERVER_ENV_FILE,
+    varsFile: SERVER_VARS_FILE,
+    scInstallerFile: await getScInstallerLocalPath(),
+    summaryApiFile: await getSummaryApiLocalPath(),
+    letsencryptDir: isRootProcess() ? LETSENCRYPT_DIR : null,
+    hostname: os.hostname(),
+    label
+  });
+}
+
+function formatServerBackupSummary(manifest) {
+  const s = manifest?.summary || {};
+  const fingerprint = String(manifest?.license_key_fingerprint || '');
+  return [
+    `Dibuat      : ${formatDateTime(manifest?.created_at_ms)} WIB`,
+    `Server asal : ${manifest?.source?.hostname || '-'}`,
+    `User        : ${Number(s.users || 0)} (saldo total Rp ${Number(s.saldo_total || 0).toLocaleString('id-ID')})`,
+    `IP SC aktif : ${Number(s.registrations_active || 0)} dari ${Number(s.registrations_total || 0)}`,
+    `Key VPS     : ${Number(s.server_keys || 0)}`,
+    `Transaksi   : ${Number(s.transactions || 0)}`,
+    `QRIS pending: ${Number(s.pending_topups || 0)}`,
+    `Domain API  : ${(s.domains || []).join(', ') || '-'}`,
+    `SSL ikut    : ${(s.ssl_domains || []).join(', ') || '-'}`,
+    `Key lisensi : ${fingerprint ? `${fingerprint.slice(0, 16)}...` : 'TIDAK ADA'}`,
+    `Script SC   : ${manifest?.sc_installer_version || '-'}`
+  ];
+}
+
+function commandErrorText(err) {
+  const parts = [err?.stderr, err?.stdout, err?.message]
+    .map((value) => (Buffer.isBuffer(value) ? value.toString('utf8') : String(value || '')).trim())
+    .filter(Boolean);
+  return Array.from(new Set(parts)).join(' | ').slice(-500);
+}
+
+// Tanpa --update-env: env lama bot (hasil dotenv) tidak boleh terbawa ke proses
+// lain. Setelah restart, tiap proses membaca .env hasil restore sendiri.
+function restartPm2Apps(names) {
+  const env = {
+    PATH: process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+    HOME: process.env.HOME || '/root'
+  };
+  if (process.env.PM2_HOME) env.PM2_HOME = process.env.PM2_HOME;
+  return names.map((name) => {
+    try {
+      runCmd('pm2', ['restart', name], { env, timeout: 60000 });
+      return `PM2 ${name}: restart OK`;
+    } catch (err) {
+      return `PM2 ${name}: gagal restart (${commandErrorText(err)}). Jalankan manual: pm2 restart ${name}`;
+    }
+  });
+}
+
+// Vhost nginx domain API ditulis ulang di server ini. HTTPS dipakai kalau
+// sertifikat domain sudah ada (ikut dari backup atau dibuat sebelumnya).
+async function reprovisionInstallerVhostsAfterRestore(domains, port) {
+  const list = (domains || []).filter(isProvisionableDomain);
+  if (!list.length) return ['Nginx: tidak ada domain API aktif.'];
+  if (!isRootProcess()) return ['Nginx: dilewati, bot tidak jalan sebagai root.'];
+  if (!(await getAutoProvisionDomain())) return ['Nginx: dilewati karena Auto Setup Domain = 0 (atur vhost manual).'];
+  try {
+    runCmd('nginx', ['-v']);
+  } catch (_) {
+    return ['Nginx: belum terpasang. Jalankan "apt install -y nginx certbot", lalu Tambah Domain ulang untuk tiap domain.'];
+  }
+
+  const lines = [];
+  const previous = new Map();
+  for (const domain of list) {
+    const confPath = `/etc/nginx/sites-available/sc1forcr-installer-${domain}.conf`;
+    previous.set(domain, fs.existsSync(confPath) ? fs.readFileSync(confPath, 'utf8') : null);
+    const tls = fs.existsSync(`/etc/letsencrypt/live/${domain}/fullchain.pem`) &&
+      fs.existsSync(`/etc/letsencrypt/live/${domain}/privkey.pem`);
+    writeNginxInstallerVhost(domain, port, { tls });
+    lines.push(`Nginx ${domain}: ${tls ? 'HTTPS siap' : 'HTTP saja, SSL belum ada (Tambah Domain ulang setelah DNS pindah)'}`);
+  }
+  try {
+    runCmd('nginx', ['-t']);
+  } catch (err) {
+    // Kembalikan vhost lama supaya nginx tetap bisa reload untuk situs lain.
+    for (const [domain, content] of previous) {
+      const confPath = `/etc/nginx/sites-available/sc1forcr-installer-${domain}.conf`;
+      const linkPath = `/etc/nginx/sites-enabled/sc1forcr-installer-${domain}.conf`;
+      try {
+        if (content === null) {
+          fs.rmSync(linkPath, { force: true });
+          fs.rmSync(confPath, { force: true });
+        } else {
+          fs.writeFileSync(confPath, content, 'utf8');
+        }
+      } catch (_) {}
+    }
+    return [`Nginx: konfigurasi baru gagal "nginx -t", vhost dikembalikan. ${commandErrorText(err)}`];
+  }
+  try {
+    runCmd('systemctl', ['reload-or-restart', 'nginx']);
+  } catch (err) {
+    lines.push(`Nginx: gagal reload (${commandErrorText(err)}). Jalankan manual: systemctl restart nginx`);
+  }
+  return lines;
+}
+
+async function describeDomainDnsTargets(domains) {
+  const localIps = new Set();
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const item of list || []) {
+      if (!item.internal && (item.family === 'IPv4' || item.family === 4)) localIps.add(item.address);
+    }
+  }
+  const lines = [];
+  for (const domain of domains || []) {
+    const ips = await Promise.race([
+      dns.promises.resolve4(domain).catch(() => []),
+      waitMs(5000).then(() => [])
+    ]);
+    if (!ips.length) lines.push(`DNS ${domain}: belum ter-resolve`);
+    else if (ips.some((ip) => localIps.has(ip))) lines.push(`DNS ${domain}: sudah mengarah ke server ini`);
+    else lines.push(`DNS ${domain}: masih ke ${ips.join(', ')}, ubah record A ke IP server ini`);
+  }
+  if (lines.length && localIps.size) lines.push(`IP server ini: ${Array.from(localIps).join(', ')}`);
+  return lines;
+}
+
+async function performServerRestore(archive, password, restartApps) {
+  // Snapshot server ini dulu (password sama) supaya restore bisa dibatalkan.
+  const pre = await buildServerBackup(password, 'pre-restore');
+  const prePath = saveServerBackupLocally(pre.buffer, serverBackupFileName('pre-restore'));
+  let report;
+  try {
+    report = await serverMigration.restoreServerBackup({
+      archive,
+      openDb: openSqliteFileAdapter,
+      dbPath: path.resolve(DB_PATH),
+      appDir: __dirname,
+      envFile: SERVER_ENV_FILE,
+      varsFile: SERVER_VARS_FILE,
+      scInstallerFile: await getScInstallerLocalPath(),
+      summaryApiFile: await getSummaryApiLocalPath(),
+      letsencryptDir: isRootProcess() ? LETSENCRYPT_DIR : null
+    });
+  } catch (err) {
+    throw new Error(`${formatStartError(err)}\nKondisi sebelum restore tersimpan di ${prePath} (password sama).`);
+  }
+
+  const lines = [
+    `Database    : ${report.database.tables.length} tabel, ${report.database.rows} baris dipulihkan`,
+    `.env        : ${report.env ? 'dipulihkan (BOT_TOKEN dan path folder server ini dipertahankan)' : 'tidak diubah'}`,
+    ...(report.env?.notes || []).map((note) => `  - ${note}`),
+    `Payment     : .vars.json ${report.vars}`,
+    `Key lisensi : ${report.license ? `dipulihkan (${report.license.fingerprint.slice(0, 16)}...)` : 'TIDAK ADA DI BACKUP'}`
+  ];
+  for (const script of report.scripts) {
+    if (script.action === 'same') lines.push(`${script.label}: sama dengan server ini`);
+    else if (script.action === 'kept') lines.push(`${script.label}: dipertahankan ${script.currentVersion} (backup ${script.backupVersion} lebih lama)`);
+    else lines.push(`${script.label}: dipulihkan${script.backupVersion ? ` ${script.backupVersion}` : ''}`);
+  }
+  if (report.ssl.restored.length) lines.push(`SSL dipulihkan: ${report.ssl.restored.join(', ')}`);
+  if (report.ssl.skipped.length) lines.push(`SSL sudah ada di server ini: ${report.ssl.skipped.join(', ')}`);
+  if (report.ssl.note) lines.push(`SSL: ${report.ssl.note}`);
+
+  // License API dimuat ulang dulu (key lisensi baru) sebelum nginx meneruskan trafik.
+  lines.push(...restartPm2Apps(restartApps));
+  lines.push(...await reprovisionInstallerVhostsAfterRestore(report.domains, report.licenseApiPort));
+  lines.push(...await describeDomainDnsTargets(report.domains));
+  for (const warning of report.warnings) lines.push(`PERINGATAN: ${warning}`);
+  lines.push(
+    `Snapshot sebelum restore: ${prePath} (password sama)`,
+    '',
+    'Langkah berikutnya:',
+    '1. Cek menu admin: saldo user, Semua SC Aktif, Daftar Domain.',
+    '2. Ubah record A semua domain API ke IP server ini.',
+    `3. Setelah DNS pindah, di server lama jalankan: pm2 stop ${PM2_APP_LICENSE_API}`
+  );
+  return lines;
+}
+
+async function deleteServerPasswordMessage(ctx) {
+  await ctx.deleteMessage().catch(() => {});
+}
+
+// Konfirmasi update terakhir ke Telegram sebelum proses keluar, supaya tombol
+// yang baru ditekan tidak dikirim ulang ke bot berikutnya dengan token sama.
+async function stopBotPollingAndAck(ctx) {
+  try { bot.stop('server-migration'); } catch (_) {}
+  const updateId = Number(ctx?.update?.update_id || 0);
+  if (updateId > 0) {
+    await ctx.telegram.callApi('getUpdates', { offset: updateId + 1, limit: 1, timeout: 0 }).catch(() => {});
+  }
+}
+
+async function sendServerBackupToAdmin(ctx, password) {
+  if (serverMigrationBusy) {
+    return ctx.reply('Backup/restore server lain sedang berjalan. Tunggu sebentar.', adminServerMigrationMenu());
+  }
+  serverMigrationBusy = true;
+  try {
+    await ctx.reply('Membuat backup server, tunggu...');
+    const { buffer, manifest } = await buildServerBackup(password, 'manual');
+    const fileName = serverBackupFileName('sc1forcr-server');
+    const lines = [...formatServerBackupSummary(manifest), `Ukuran      : ${formatMegabytes(buffer.length)}`];
+    try {
+      lines.push(`Salinan lokal: ${saveServerBackupLocally(buffer, fileName)}`);
+    } catch (err) {
+      lines.push(`Salinan lokal gagal disimpan: ${formatStartError(err)}`);
+    }
+    if (buffer.length <= TELEGRAM_BOT_UPLOAD_MAX_BYTES) {
+      await ctx.replyWithDocument(
+        { source: buffer, filename: fileName },
+        { caption: 'Backup server bot SC 1FORCR. Simpan file ini dan ingat password-nya.' }
+      );
+      if (buffer.length > TELEGRAM_BOT_DOWNLOAD_MAX_BYTES) {
+        lines.push('File lebih dari 20MB: restore di server baru lewat CLI (lihat Panduan).');
+      }
+    } else {
+      lines.push('File lebih dari 50MB, tidak bisa dikirim lewat Telegram. Salin file lokal di atas ke server baru lalu restore lewat CLI.');
+    }
+    for (const warning of manifest.warnings || []) lines.push(`PERINGATAN: ${warning}`);
+    lines.push('', 'Berikutnya: tekan "Bekukan Bot di Server Ini" sebelum menjalankan bot di server baru.');
+    return ctx.reply(uiBox('BACKUP SERVER SELESAI', lines), adminServerMigrationMenu());
+  } catch (err) {
+    return ctx.reply(`Backup server gagal: ${formatStartError(err)}`, adminServerMigrationMenu());
+  } finally {
+    serverMigrationBusy = false;
+  }
+}
+
+const SERVER_MIGRATION_GUIDE_TEXT = [
+  'PANDUAN PINDAH SERVER BOT',
+  '',
+  'Di server LAMA:',
+  '1. Pindah Server Bot > Backup Server Bot. Buat password (min 8 karakter), simpan file .sc1bak yang dikirim bot.',
+  '2. Tekan "Bekukan Bot di Server Ini". Bot, top up, reminder, dan God Mode berhenti di server lama. License API tetap melayani VPS sampai DNS pindah.',
+  '',
+  'Di server BARU:',
+  '3. apt install -y git curl nginx certbot, clone repo bot, lalu jalankan ./start.sh. Pakai BOT_TOKEN dan ADMIN_IDS yang sama. Isian lain boleh sembarang, nanti ditimpa restore.',
+  '4. Buka /admin > Pindah Server Bot > Restore dari Backup. Upload file .sc1bak, kirim password, lalu konfirmasi.',
+  '5. Bot restart sendiri. Cek saldo user, Semua SC Aktif, dan Daftar Domain.',
+  '6. Ubah record A semua domain API ke IP server baru. Jangan ubah DNS sebelum restore selesai.',
+  `7. Setelah https://DOMAIN/health menjawab dari server baru, di server lama: pm2 stop ${PM2_APP_LICENSE_API}`,
+  '',
+  'Yang ikut pindah: database (user, saldo, transaksi, IP SC, key VPS, domain, setting, God Mode, QRIS pending), .env, .vars.json (payment gateway), signing key lisensi, script installer & Summary API, sertifikat SSL domain API.',
+  '',
+  'Signing key lisensi wajib ikut. Kalau server baru memakai key lain, semua VPS pelanggan menolak lisensinya.',
+  '',
+  'File lebih dari 20MB tidak bisa diunduh bot. Salin file ke server baru lalu jalankan:',
+  'node app3.js --server-restore /path/file.sc1bak',
+  'Backup lewat CLI: node app3.js --server-backup',
+  '',
+  'Batal pindah (aktifkan lagi server lama):',
+  `rm ${SERVER_MIGRATED_MARKER}`,
+  `pm2 restart ${PM2_APP_BOT} ${PM2_APP_EXPIRY_JOB}`
+].join('\n');
+
+function cliArgAfter(flag) {
+  const index = process.argv.indexOf(flag);
+  const value = index >= 0 ? String(process.argv[index + 1] || '') : '';
+  return value && !value.startsWith('--') ? value : '';
+}
+
+function promptCli(question, hidden = false) {
+  const readline = require('readline');
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY) });
+    let muted = false;
+    if (hidden) {
+      rl._writeToOutput = (chunk) => {
+        if (!muted) rl.output.write(chunk);
+      };
+    }
+    rl.question(question, (answer) => {
+      rl.close();
+      if (hidden) process.stdout.write('\n');
+      resolve(String(answer || '').trim());
+    });
+    muted = hidden;
+  });
+}
+
+async function runServerBackupCli() {
+  const envPassword = String(process.env.SERVER_BACKUP_PASSWORD || '');
+  const password = envPassword || await promptCli(`Password backup (min ${serverMigration.SERVER_BACKUP_PASSWORD_MIN} karakter): `, true);
+  serverMigration.assertBackupPassword(password);
+  if (!envPassword && password !== await promptCli('Ulangi password: ', true)) {
+    throw new Error('Password tidak sama.');
+  }
+  const { buffer, manifest } = await buildServerBackup(password, 'cli');
+  const outArg = cliArgAfter('--server-backup');
+  let target;
+  if (outArg) {
+    target = path.resolve(outArg);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, buffer, { mode: 0o600 });
+  } else {
+    target = saveServerBackupLocally(buffer, serverBackupFileName('sc1forcr-server'));
+  }
+  console.log([
+    ...formatServerBackupSummary(manifest),
+    `Ukuran      : ${formatMegabytes(buffer.length)}`,
+    `File        : ${target}`,
+    ...(manifest.warnings || []).map((warning) => `PERINGATAN: ${warning}`)
+  ].join('\n'));
+}
+
+async function runServerRestoreCli() {
+  const file = cliArgAfter('--server-restore');
+  if (!file) throw new Error('Pakai: node app3.js --server-restore /path/file.sc1bak');
+  const buffer = fs.readFileSync(path.resolve(file));
+  const password = String(process.env.SERVER_BACKUP_PASSWORD || '') || await promptCli('Password backup: ', true);
+  const archive = await serverMigration.decodeServerBackup(buffer, password);
+  console.log(formatServerBackupSummary(archive.manifest).join('\n'));
+  for (const warning of archive.manifest.warnings || []) console.log(`PERINGATAN: ${warning}`);
+  if (!process.argv.includes('--yes')) {
+    const answer = await promptCli('Seluruh data bot di server ini akan diganti isi backup. Ketik YA untuk lanjut: ');
+    if (answer.toUpperCase() !== 'YA') {
+      console.log('Dibatalkan.');
+      return;
+    }
+  }
+  const lines = await performServerRestore(archive, password, [PM2_APP_LICENSE_API, PM2_APP_EXPIRY_JOB, PM2_APP_BOT]);
+  console.log(lines.join('\n'));
+  if (readServerMigratedMarker()) {
+    console.log(`Catatan: server ini sedang dibekukan. Hapus ${SERVER_MIGRATED_MARKER} lalu restart PM2 untuk mengaktifkan bot.`);
+  }
 }
 
 function escapeHtml(input) {
@@ -7157,6 +7603,154 @@ bot.action('m_restore_upload', async (ctx) => {
   );
 });
 
+bot.action('m_admin_srv_menu', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.delete(ctx.chat.id);
+  return ctx.reply(
+    uiBox('PINDAH SERVER BOT', [
+      `Server ini: ${os.hostname()}`,
+      'Backup semua data produksi bot ke satu file terkunci password, lalu restore di server baru.',
+      'Isi: database, .env, .vars.json, signing key lisensi, script installer, dan SSL domain API.',
+      '',
+      'Baca Panduan dulu sebelum mulai.'
+    ]),
+    adminServerMigrationMenu()
+  );
+});
+
+bot.action('m_admin_srv_guide', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  return ctx.reply(SERVER_MIGRATION_GUIDE_TEXT, adminServerMigrationMenu());
+});
+
+bot.action('m_admin_srv_backup', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_srv_backup_password' });
+  return ctx.reply(
+    uiBox('BACKUP SERVER BOT', [
+      `Kirim password untuk mengunci file backup (minimal ${serverMigration.SERVER_BACKUP_PASSWORD_MIN} karakter).`,
+      'Password ini wajib saat restore. Tanpa password, file tidak bisa dibuka.',
+      'Pesan password langsung dihapus dari chat.',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action('m_admin_srv_restore', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_srv_restore_wait_file' });
+  return ctx.reply(
+    uiBox('RESTORE SERVER BOT', [
+      `PERHATIAN: seluruh data bot di server INI (${os.hostname()}) akan diganti isi backup.`,
+      'Pastikan bot di server lama sudah dibekukan.',
+      'Supaya nginx dan SSL domain ikut disiapkan, pasang dulu: apt install -y nginx certbot',
+      '',
+      `Upload file backup (${serverMigration.SERVER_BACKUP_EXTENSION}), maksimal 20MB.`,
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action('m_admin_srv_restore_cancel', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  userState.delete(ctx.chat.id);
+  return ctx.reply('Restore dibatalkan. Tidak ada yang diubah.', adminServerMigrationMenu());
+});
+
+bot.action('m_admin_srv_restore_confirm', async (ctx) => {
+  const state = userState.get(ctx.chat.id);
+  const ready = isAdmin(ctx.from.id) && state?.step === 'admin_srv_restore_confirm' && Buffer.isBuffer(state.buffer);
+  // Tandai sebelum await pertama supaya klik ganda tidak menjalankan restore dua kali.
+  if (ready) state.step = 'admin_srv_restoring';
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  if (!ready) {
+    return ctx.reply('Sesi restore tidak ditemukan atau sedang berjalan. Ulangi dari menu Pindah Server Bot.', adminServerMigrationMenu());
+  }
+  if (serverMigrationBusy) {
+    userState.delete(ctx.chat.id);
+    return ctx.reply('Backup/restore server lain sedang berjalan. Ulangi setelah selesai.', adminServerMigrationMenu());
+  }
+  serverMigrationBusy = true;
+  let restored = false;
+  try {
+    await ctx.reply('Restore berjalan, jangan kirim perintah lain sampai selesai...');
+    const archive = await serverMigration.decodeServerBackup(state.buffer, state.password);
+    const lines = await performServerRestore(archive, state.password, [PM2_APP_LICENSE_API, PM2_APP_EXPIRY_JOB]);
+    restored = true;
+    userState.delete(ctx.chat.id);
+    lines.push('', isRunningUnderPm2()
+      ? 'Bot restart otomatis dalam beberapa detik untuk memuat konfigurasi hasil restore.'
+      : `Bot tidak jalan di PM2. Restart manual: pm2 restart ${PM2_APP_BOT} (atau jalankan ulang node app3.js).`);
+    await replyTelegramTextChunks(ctx, uiDocumentBox('RESTORE SERVER SELESAI', lines.join('\n')));
+  } catch (err) {
+    userState.delete(ctx.chat.id);
+    return ctx.reply(`Restore server gagal: ${formatStartError(err)}`, adminServerMigrationMenu());
+  } finally {
+    serverMigrationBusy = false;
+  }
+  if (restored && isRunningUnderPm2()) {
+    await stopBotPollingAndAck(ctx);
+    setTimeout(() => process.exit(0), 1500);
+  }
+  return undefined;
+});
+
+bot.action('m_admin_srv_freeze', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  const lastBackup = latestManualServerBackupAt();
+  const recent = lastBackup && Date.now() - lastBackup < 6 * 60 * 60 * 1000;
+  return ctx.reply(
+    uiBox('BEKUKAN BOT DI SERVER INI', [
+      `Server: ${os.hostname()}`,
+      `Backup terakhir: ${lastBackup ? `${formatDateTime(lastBackup)} WIB` : 'BELUM ADA'}`,
+      ...(recent ? [] : ['PERINGATAN: belum ada backup baru. Data setelah backup terakhir tidak ikut pindah.']),
+      '',
+      'Setelah dibekukan:',
+      '- Bot berhenti membalas dan tidak lagi memproses top up, reminder, maupun God Mode.',
+      '- Tetap beku walau server reboot.',
+      '- License API tetap melayani VPS sampai DNS domain pindah ke server baru.',
+      '',
+      `Membatalkan: rm ${SERVER_MIGRATED_MARKER} lalu pm2 restart ${PM2_APP_BOT} ${PM2_APP_EXPIRY_JOB}`
+    ]),
+    Markup.inlineKeyboard([
+      [Markup.button.callback('🧊 Ya, Bekukan Sekarang', `m_admin_srv_freeze_confirm_${localServerId()}`)],
+      [Markup.button.callback('Batal', 'm_admin_srv_menu')]
+    ])
+  );
+});
+
+bot.action(/^m_admin_srv_freeze_confirm_([a-f0-9]{12})$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  // Update tombol ini bisa sampai ke bot di server baru (token sama). Hanya
+  // server tempat tombol dibuat yang boleh membekukan dirinya.
+  const messageAgeSec = Math.floor(Date.now() / 1000) - Number(ctx.callbackQuery?.message?.date || 0);
+  if (ctx.match[1] !== localServerId() || messageAgeSec > 15 * 60) {
+    return ctx.reply('Tombol ini kedaluwarsa atau dibuat di server lain. Buka lagi menu Pindah Server Bot.', adminServerMigrationMenu());
+  }
+  fs.writeFileSync(
+    SERVER_MIGRATED_MARKER,
+    `${JSON.stringify({ frozen_at: Date.now(), frozen_by: ctx.from.id, hostname: os.hostname() })}\n`,
+    { mode: 0o600 }
+  );
+  await ctx.reply(
+    uiBox('BOT DIBEKUKAN', [
+      `Server ${os.hostname()} tidak lagi menjalankan bot.`,
+      'Sekarang jalankan bot di server baru (start.sh dengan BOT_TOKEN yang sama), lalu restore dari menu Pindah Server Bot.'
+    ])
+  );
+  await stopBotPollingAndAck(ctx);
+  setTimeout(() => process.exit(0), 1500);
+  return undefined;
+});
+
 bot.on('text', async (ctx) => {
   const state = userState.get(ctx.chat.id);
   if (!state) return;
@@ -7168,6 +7762,80 @@ bot.on('text', async (ctx) => {
     return ctx.reply('Dibatalkan.', mainMenu());
   }
   try {
+    if (state.step === 'admin_srv_backup_password') {
+      await deleteServerPasswordMessage(ctx);
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      if (text.length < serverMigration.SERVER_BACKUP_PASSWORD_MIN) {
+        return ctx.reply(`Password minimal ${serverMigration.SERVER_BACKUP_PASSWORD_MIN} karakter. Kirim ulang.`);
+      }
+      userState.set(ctx.chat.id, { step: 'admin_srv_backup_password_confirm', password: text });
+      return ctx.reply('Kirim ulang password yang sama untuk konfirmasi.');
+    }
+
+    if (state.step === 'admin_srv_backup_password_confirm') {
+      await deleteServerPasswordMessage(ctx);
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      if (text !== state.password) {
+        userState.set(ctx.chat.id, { step: 'admin_srv_backup_password' });
+        return ctx.reply('Password tidak sama. Kirim password dari awal.');
+      }
+      userState.delete(ctx.chat.id);
+      return sendServerBackupToAdmin(ctx, text);
+    }
+
+    if (state.step === 'admin_srv_restore_password') {
+      await deleteServerPasswordMessage(ctx);
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      let archive;
+      try {
+        archive = await serverMigration.decodeServerBackup(state.buffer, text);
+      } catch (err) {
+        if (err?.code === 'BAD_PASSWORD') {
+          state.attempts = Number(state.attempts || 0) + 1;
+          if (state.attempts >= 5) {
+            userState.delete(ctx.chat.id);
+            return ctx.reply('Password salah 5 kali. Restore dibatalkan.', adminServerMigrationMenu());
+          }
+          return ctx.reply(`Password salah (percobaan ${state.attempts}/5). Kirim ulang password.`);
+        }
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`File backup tidak bisa dibuka: ${formatStartError(err)}`, adminServerMigrationMenu());
+      }
+      userState.set(ctx.chat.id, { step: 'admin_srv_restore_confirm', buffer: state.buffer, password: text });
+      const { manifest } = archive;
+      const currentFingerprint = serverMigration.licenseKeyFingerprintOfFile(
+        serverMigration.resolveLicenseKeyPaths(process.env, __dirname).privateKeyFile
+      );
+      return ctx.reply(
+        uiBox('KONFIRMASI RESTORE SERVER', [
+          ...formatServerBackupSummary(manifest),
+          ...(manifest.warnings || []).map((warning) => `PERINGATAN BACKUP: ${warning}`),
+          '',
+          `Yang terjadi di server ini (${os.hostname()}):`,
+          '- Seluruh isi database diganti isi backup.',
+          '- .env, .vars.json, script, dan SSL dipulihkan. BOT_TOKEN dan path folder server ini tetap.',
+          currentFingerprint && currentFingerprint === manifest.license_key_fingerprint
+            ? '- Key lisensi sama dengan server ini.'
+            : '- Key lisensi server ini diganti key dari backup (wajib, agar VPS pelanggan tetap valid).',
+          '- Kondisi server ini disimpan dulu (password sama) supaya bisa dibatalkan.',
+          '- Bot, License API, dan expiry job restart otomatis.'
+        ]),
+        Markup.inlineKeyboard([
+          [Markup.button.callback('✅ Ya, Restore Sekarang', 'm_admin_srv_restore_confirm')],
+          [Markup.button.callback('Batal', 'm_admin_srv_restore_cancel')]
+        ])
+      );
+    }
+
     if (state.step === 'admin_god_schedule_time') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
@@ -8945,6 +9613,44 @@ bot.on('document', async (ctx) => {
     }
   }
 
+  if (state.step === 'admin_srv_restore_wait_file') {
+    try {
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const doc = ctx.message.document;
+      const fileName = String(doc?.file_name || '').toLowerCase();
+      if (!fileName.endsWith(serverMigration.SERVER_BACKUP_EXTENSION)) {
+        return ctx.reply(`File harus ${serverMigration.SERVER_BACKUP_EXTENSION} hasil Backup Server Bot.`);
+      }
+      if (Number(doc?.file_size || 0) > TELEGRAM_BOT_DOWNLOAD_MAX_BYTES) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(
+          'File lebih dari 20MB, bot Telegram tidak bisa mengunduhnya. Salin file ke server ini lalu jalankan:\n' +
+            'node app3.js --server-restore /path/file.sc1bak',
+          adminServerMigrationMenu()
+        );
+      }
+      const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+      const fileResp = await axios.get(fileLink.toString(), {
+        timeout: 120000,
+        responseType: 'arraybuffer',
+        maxContentLength: TELEGRAM_BOT_DOWNLOAD_MAX_BYTES,
+        maxBodyLength: TELEGRAM_BOT_DOWNLOAD_MAX_BYTES
+      });
+      const buffer = Buffer.from(fileResp.data || '');
+      if (!serverMigration.looksLikeServerBackup(buffer)) {
+        return ctx.reply('File ini bukan backup server SC 1FORCR. Upload file .sc1bak yang benar.');
+      }
+      userState.set(ctx.chat.id, { step: 'admin_srv_restore_password', buffer, attempts: 0 });
+      return ctx.reply('File diterima. Kirim password backup (pesan langsung dihapus).');
+    } catch (err) {
+      userState.delete(ctx.chat.id);
+      return ctx.reply(`Gagal menerima file backup: ${formatStartError(err)}`, adminServerMigrationMenu());
+    }
+  }
+
   if (state.step !== 'restore_wait_file') return;
 
   try {
@@ -9126,6 +9832,7 @@ function formatStartError(err) {
 
 let scExpiryJobRunning = false;
 let scExpirySchedulerTimer = null;
+let scExpiryFrozenLogged = false;
 
 function logScExpirySummary(source, summary, durationMs) {
   const data = summary || {};
@@ -9159,6 +9866,13 @@ function getScExpiryTickMs() {
 }
 
 async function runScExpiryJobOnce(source = 'timer') {
+  // Server yang sudah dibekukan tidak boleh ikut mengirim reminder/lock, karena
+  // server baru menjalankan job yang sama.
+  if (fs.existsSync(SERVER_MIGRATED_MARKER)) {
+    if (!scExpiryFrozenLogged) console.log('[sc-expiry-job] berhenti: server ini sudah dibekukan untuk pindah server');
+    scExpiryFrozenLogged = true;
+    return;
+  }
   if (scExpiryJobRunning) {
     console.error(`[sc-expiry-job] skip ${source}: job sebelumnya masih berjalan`);
     return;
@@ -9244,6 +9958,27 @@ function startScExpiryOnlyScheduler() {
 (async () => {
   try {
     await initDb();
+    for (const [flag, run] of [['--server-backup', runServerBackupCli], ['--server-restore', runServerRestoreCli]]) {
+      if (!process.argv.includes(flag)) continue;
+      try {
+        await run();
+        process.exit(0);
+      } catch (err) {
+        console.error(`${flag} gagal: ${formatStartError(err)}`);
+        process.exit(1);
+      }
+    }
+    const migratedMarker = readServerMigratedMarker();
+    if (migratedMarker) {
+      console.log(
+        `[server-migration] bot dibekukan sejak ${formatDateTime(migratedMarker.frozen_at)} WIB karena sudah pindah server. ` +
+          `Hapus ${SERVER_MIGRATED_MARKER} lalu restart untuk mengaktifkan lagi.`
+      );
+      // Tetap hidup tanpa polling Telegram dan tanpa job, supaya PM2 tidak
+      // restart berulang dan token bot tidak direbut dari server baru.
+      setInterval(() => {}, 60 * 60 * 1000);
+      return;
+    }
     if (process.argv.includes('--run-sc-expiry-job')) {
       const started = Date.now();
       const summary = await runNaturalScExpiryJobs();

@@ -6826,7 +6826,7 @@ bot.action('m_register_sc', async (ctx) => {
       'Pilih jenis layanan:',
       '- Registrasi Baru',
       '- Perpanjang SC',
-      '- Ganti IP VPS (maks 2x)',
+      `- Ganti IP VPS (maks ${SC_IP_CHANGE_MAX}x per IP)`,
       '- SC Unlimited',
       '',
       `Harga           : Rp ${pricePerDay.toLocaleString('id-ID')} / hari${isReseller ? ' (RESELLER)' : ''}`,

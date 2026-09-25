@@ -55,16 +55,19 @@ function inferTelegramButtonStyle(button) {
   const explicit = String(button.style || '').trim().toLowerCase();
   if (TELEGRAM_BUTTON_STYLES.has(explicit)) return explicit;
 
-  const text = String(button.text || '').toLowerCase();
-  const action = String(button.callback_data || button.url || '').toLowerCase();
-  const key = `${text} ${action}`;
-
-  if (/(kembali|back|prev|next|refresh|pilih periode)/i.test(key)) return '';
-  if (/(batal|batalkan|hapus|delete|remove|nonaktif|disable|rollback|gajadi|delall)/i.test(key)) return 'danger';
-  if (/(unlock|perpanjang|extend|top ?up|saldo|restore|backup|hubungi|wa admin|aktif|cek status|success|paid)/i.test(key)) {
-    return 'success';
-  }
+  // Warna hanya ditentukan dari label, supaya tombol sejenis selalu sewarna:
+  // tanpa warna untuk navigasi/batal, merah untuk aksi yang menghapus atau
+  // mematikan, hijau untuk konfirmasi dan pembayaran, sisanya biru. Menu yang
+  // diatur per baris (menu utama) memberi style sendiri lewat coloredButton().
+  const text = String(button.text || '').trim().toLowerCase();
+  if (/^(kembali|batal|batalkan|prev|next|refresh|pilih periode|ganti target)$/.test(text)) return '';
+  if (/(hapus|nonaktif|rollback|gajadi|bekukan|batalkan)/.test(text)) return 'danger';
+  if (/^(ya, |bayar |hubungi |cek status$|jalankan sekarang$)/.test(text)) return 'success';
   return 'primary';
+}
+
+function coloredButton(text, action, style) {
+  return { ...Markup.button.callback(text, action), style };
 }
 
 function withTelegramButtonStyle(button) {
@@ -2035,25 +2038,25 @@ function buildMainMenuMessageHtml(data = {}) {
   const line = (...parts) => parts.join('');
   return [
     `<code>${TOP}</code>`,
-    `<b>🚀 BOT SC 1FORCR NEXUS</b>`,
+    `<b>BOT SC 1FORCR NEXUS</b>`,
     `<code>${BOT}</code>`,
     '',
     `<code>${TOP}</code>`,
-    `<b>👤 INFORMASI PENGGUNA</b>`,
+    `<b>INFORMASI PENGGUNA</b>`,
     `<code>${MID}</code>`,
-    line('• 👤 <b>Nama</b>    : ', e(data.userName || '-')),
-    line('• 🆔 <b>ID</b>      : <code>', e(data.userId || '-'), '</code>'),
-    line('• 💰 <b>Saldo</b>   : <code>Rp ', e(money(data.saldo)), '</code>'),
-    line('• 🏷️ <b>Status</b>  : ', e(data.statusReseller || 'NON-RESELLER')),
+    line('• <b>Nama</b>    : ', e(data.userName || '-')),
+    line('• <b>ID</b>      : <code>', e(data.userId || '-'), '</code>'),
+    line('• <b>Saldo</b>   : <code>Rp ', e(money(data.saldo)), '</code>'),
+    line('• <b>Status</b>  : ', e(data.statusReseller || 'NON-RESELLER')),
     `<code>${BOT}</code>`,
     '',
     `<code>${TOP}</code>`,
-    `<b>📈 STATUS SISTEM</b>`,
+    `<b>STATUS SISTEM</b>`,
     `<code>${MID}</code>`,
-    line('• 👥 <b>Total Pengguna</b>     : ', e(data.totalUsers)),
-    line('• 🛰️ <b>Total IP Terdaftar</b> : ', e(data.totalRegisteredIps)),
-    line('• 💳 <b>Harga / Hari</b>       : Rp ', e(money(data.pricePerDay)), data.isReseller ? ' (RESELLER)' : ''),
-    line('• ⏳ <b>Minimal Order Hari</b> : ', e(data.minDays), ' hari'),
+    line('• <b>Total Pengguna</b>     : ', e(data.totalUsers)),
+    line('• <b>Total IP Terdaftar</b> : ', e(data.totalRegisteredIps)),
+    line('• <b>Harga / Hari</b>       : Rp ', e(money(data.pricePerDay)), data.isReseller ? ' (RESELLER)' : ''),
+    line('• <b>Minimal Order Hari</b> : ', e(data.minDays), ' hari'),
     `<code>${BOT}</code>`
   ].join('\n');
 }
@@ -3466,15 +3469,17 @@ async function replaceScRegisteredIp(userId, oldIp, newIp) {
 }
 
 function mainMenu() {
+  // Satu warna per baris: layanan SC dan saldo hijau, alat lain biru,
+  // hapus merah (dari aturan label).
   return Markup.inlineKeyboard([
-    [Markup.button.callback('🛒 Daftar / Perpanjang SC', 'm_register_sc'), Markup.button.callback('🔁 Ganti IP VPS', 'm_register_sc_change_ip')],
-    [Markup.button.callback('✅ Info SC Aktif', 'm_my_sc'), Markup.button.callback('⏳ Cek Expired IP VPS', 'm_check_sc_ip_expiry')],
-    [Markup.button.callback('💳 Top Up Saldo', 'm_topup_saldo'), Markup.button.callback('💰 Cek Saldo', 'm_cek_saldo')],
-    [Markup.button.callback('🔗 Link Instalasi', 'm_install_link'), Markup.button.callback('✨ Fitur SC 1FORCR NEXUS', 'm_sc_features')],
-    [Markup.button.callback('🚚 Migrasi Akun', 'm_migrate_accounts'), Markup.button.callback('🧹 Hapus Semua Akun', 'm_delete_all_accounts')],
-    [Markup.button.callback('🗂️ Backup SC', 'm_backup_now'), Markup.button.callback('♻️ Restore SC', 'm_restore_upload')],
-    [Markup.button.callback('💼 Jadi Reseller', 'm_become_reseller'), Markup.button.callback('👥 Grup SC 1FORCR', 'm_group_sc_1forcr')],
-    [Markup.button.callback('🛠️ Menu Admin', 'm_admin_menu')]
+    [coloredButton('Daftar / Perpanjang SC', 'm_register_sc', 'success'), coloredButton('Ganti IP VPS', 'm_register_sc_change_ip', 'success')],
+    [coloredButton('Info SC Aktif', 'm_my_sc', 'success'), coloredButton('Cek Expired IP VPS', 'm_check_sc_ip_expiry', 'success')],
+    [coloredButton('Top Up Saldo', 'm_topup_saldo', 'success'), coloredButton('Cek Saldo', 'm_cek_saldo', 'success')],
+    [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Fitur SC 1FORCR NEXUS', 'm_sc_features')],
+    [Markup.button.callback('Migrasi Akun', 'm_migrate_accounts'), Markup.button.callback('Hapus Semua Akun', 'm_delete_all_accounts')],
+    [Markup.button.callback('Backup SC', 'm_backup_now'), Markup.button.callback('Restore SC', 'm_restore_upload')],
+    [Markup.button.callback('Jadi Reseller', 'm_become_reseller'), Markup.button.callback('Grup SC 1FORCR', 'm_group_sc_1forcr')],
+    [Markup.button.callback('Menu Admin', 'm_admin_menu')]
   ]);
 }
 const ACCOUNT_PROTOCOLS = [
@@ -3528,48 +3533,48 @@ async function registerScMenu() {
 
 function scRenewPayMethodKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('💰 Bayar pakai Saldo', 'm_extend_pay_saldo')],
-    [Markup.button.callback('📱 Bayar pakai QRIS', 'm_extend_pay_qris')],
+    [Markup.button.callback('Bayar pakai Saldo', 'm_extend_pay_saldo')],
+    [Markup.button.callback('Bayar pakai QRIS', 'm_extend_pay_qris')],
     [Markup.button.callback('Batal', 'm_extend_pay_cancel')]
   ]);
 }
 
 function adminMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('💳 Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('💰 Cek Saldo User', 'm_admin_check_saldo')],
+    [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Cek Saldo User', 'm_admin_check_saldo')],
     [Markup.button.callback('Tambah Saldo Semua User', 'm_admin_add_saldo_all')],
-    [Markup.button.callback('📜 Histori TopUp', 'm_admin_topup_history')],
-    [Markup.button.callback('📢 Broadcast Semua User', 'm_admin_broadcast'), Markup.button.callback('♾️ Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
+    [Markup.button.callback('Histori TopUp', 'm_admin_topup_history')],
+    [Markup.button.callback('Broadcast Semua User', 'm_admin_broadcast'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
 
-    [Markup.button.callback('👥 Jadikan Reseller', 'm_admin_reseller_enable'), Markup.button.callback('🚫 Nonaktifkan Reseller', 'm_admin_reseller_disable')],
-    [Markup.button.callback('📱 Set WA Admin Reseller', 'm_admin_set_reseller_wa'), Markup.button.callback('✨ Edit Info Fitur SC', 'm_admin_set_sc_features_info')],
+    [Markup.button.callback('Jadikan Reseller', 'm_admin_reseller_enable'), Markup.button.callback('Nonaktifkan Reseller', 'm_admin_reseller_disable')],
+    [Markup.button.callback('Set WA Admin Reseller', 'm_admin_set_reseller_wa'), Markup.button.callback('Edit Info Fitur SC', 'm_admin_set_sc_features_info')],
 
-    [Markup.button.callback('✅ Semua SC Aktif', 'm_admin_active_sc_0'), Markup.button.callback('🧾 IP + KEY + ID', 'm_admin_list_ip_keys_0')],
-    [Markup.button.callback('🗑️ Hapus IP VPS', 'm_admin_remove_sc_ip')],
-    [Markup.button.callback('🔓 Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('ℹ️ Info Detail IP VPS', 'm_admin_ip_info')],
-    [Markup.button.callback('🔄 Reset Binding VPS', 'm_admin_reset_machine_binding')],
-    [Markup.button.callback('⏱️ Set Masa Aktif IP (Jam)', 'm_admin_set_sc_expiry_ip')],
+    [Markup.button.callback('Semua SC Aktif', 'm_admin_active_sc_0'), Markup.button.callback('IP + KEY + ID', 'm_admin_list_ip_keys_0')],
+    [Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
+    [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Info Detail IP VPS', 'm_admin_ip_info')],
+    [Markup.button.callback('Reset Binding VPS', 'm_admin_reset_machine_binding')],
+    [Markup.button.callback('Set Masa Aktif IP (Jam)', 'm_admin_set_sc_expiry_ip')],
 
-    [Markup.button.callback('🌐 Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('📚 Daftar Domain', 'm_admin_list_domains')],
-    [Markup.button.callback('❌ Hapus Domain', 'm_admin_remove_domain')],
-    [Markup.button.callback('⬆️ Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('⬆️ Unggah Script Summary API', 'm_admin_upload_summary_api')],
-    [Markup.button.callback('🚀 Update SC (Pilih Target)', 'm_admin_trigger_sc_update')],
-    [Markup.button.callback('🚀 Trigger Update Summary API', 'm_admin_trigger_summary_update')],
-    [Markup.button.callback('⚡ GOD MODE UPDATE WAJIB', 'm_admin_god_update')],
+    [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
+    [Markup.button.callback('Hapus Domain', 'm_admin_remove_domain')],
+    [Markup.button.callback('Unggah Script SC', 'm_admin_upload_sc'), Markup.button.callback('Unggah Script Summary API', 'm_admin_upload_summary_api')],
+    [Markup.button.callback('Update SC (Pilih Target)', 'm_admin_trigger_sc_update')],
+    [Markup.button.callback('Trigger Update Summary API', 'm_admin_trigger_summary_update')],
+    [Markup.button.callback('GOD MODE UPDATE WAJIB', 'm_admin_god_update')],
 
-    [Markup.button.callback('💸 Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
-    [Markup.button.callback('⚙️ Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('🛠️ Ubah Pengaturan', 'm_admin_env_set')],
-    [Markup.button.callback('🚚 Pindah Server Bot (Backup/Restore)', 'm_admin_srv_menu')],
+    [Markup.button.callback('Setting Payment Gateway', 'm_admin_payment_gateway_menu')],
+    [Markup.button.callback('Lihat Pengaturan', 'm_admin_env_show'), Markup.button.callback('Ubah Pengaturan', 'm_admin_env_set')],
+    [Markup.button.callback('Pindah Server Bot (Backup/Restore)', 'm_admin_srv_menu')],
     [Markup.button.callback('Kembali', 'm_admin_back')]
   ]);
 }
 
 function adminServerMigrationMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('📦 Backup Server Bot', 'm_admin_srv_backup')],
-    [Markup.button.callback('♻️ Restore dari Backup', 'm_admin_srv_restore')],
-    [Markup.button.callback('🧊 Bekukan Bot di Server Ini', 'm_admin_srv_freeze')],
-    [Markup.button.callback('📖 Panduan Pindah Server', 'm_admin_srv_guide')],
+    [Markup.button.callback('Backup Server Bot', 'm_admin_srv_backup')],
+    [Markup.button.callback('Restore dari Backup', 'm_admin_srv_restore')],
+    [Markup.button.callback('Bekukan Bot di Server Ini', 'm_admin_srv_freeze')],
+    [Markup.button.callback('Panduan Pindah Server', 'm_admin_srv_guide')],
     [Markup.button.callback('Kembali', 'm_admin_menu')]
   ]);
 }
@@ -3653,7 +3658,7 @@ function buildBroadcastCopyMarkup(copyTextsInput) {
 
   return {
     inline_keyboard: eligible.map((value, index) => ([{
-      text: eligible.length === 1 ? '📋 Salin teks' : `📋 Salin teks ${index + 1}`,
+      text: eligible.length === 1 ? 'Salin teks' : `Salin teks ${index + 1}`,
       copy_text: { text: value },
       style: 'success'
     }]))
@@ -4534,7 +4539,7 @@ async function startMigrationRollbackJob(tokenInput) {
 
 function migrationRollbackKeyboard(token) {
   const rows = [
-    [Markup.button.callback('↩️ Gajadi Migrasi (Rollback)', `m_migrate_rollback_view_${token}`)]
+    [Markup.button.callback('Gajadi Migrasi (Rollback)', `m_migrate_rollback_view_${token}`)]
   ];
   const menuRows = mainMenu()?.reply_markup?.inline_keyboard;
   if (Array.isArray(menuRows)) rows.push(...menuRows);
@@ -7720,7 +7725,7 @@ bot.action('m_admin_srv_freeze', async (ctx) => {
       `Membatalkan: rm ${SERVER_MIGRATED_MARKER} lalu pm2 restart ${PM2_APP_BOT} ${PM2_APP_EXPIRY_JOB}`
     ]),
     Markup.inlineKeyboard([
-      [Markup.button.callback('🧊 Ya, Bekukan Sekarang', `m_admin_srv_freeze_confirm_${localServerId()}`)],
+      [Markup.button.callback('Ya, Bekukan Sekarang', `m_admin_srv_freeze_confirm_${localServerId()}`)],
       [Markup.button.callback('Batal', 'm_admin_srv_menu')]
     ])
   );
@@ -7830,7 +7835,7 @@ bot.on('text', async (ctx) => {
           '- Bot, License API, dan expiry job restart otomatis.'
         ]),
         Markup.inlineKeyboard([
-          [Markup.button.callback('✅ Ya, Restore Sekarang', 'm_admin_srv_restore_confirm')],
+          [Markup.button.callback('Ya, Restore Sekarang', 'm_admin_srv_restore_confirm')],
           [Markup.button.callback('Batal', 'm_admin_srv_restore_cancel')]
         ])
       );

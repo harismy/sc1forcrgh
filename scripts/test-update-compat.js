@@ -158,7 +158,7 @@ assert(licenseApi.includes("app.post('/sc1forcr/god-update/ack', requireKeyedUpd
 assert(licenseApi.includes('script_urls: needsScript ? runtimeConfig.updateScriptUrls : []'));
 assert(licenseApi.includes('licenseApiUrls: baseUrls.map'));
 assert(botApp.includes("const SC_IP_CHANGE_MAX = 5;"));
-assert(botApp.includes("Markup.button.callback('⚡ GOD MODE UPDATE WAJIB', 'm_admin_god_update')"));
+assert(botApp.includes("Markup.button.callback('GOD MODE UPDATE WAJIB', 'm_admin_god_update')"));
 assert(botApp.includes("setInterval(() => {\n    processGodUpdateCampaigns()"));
 assert(botApp.includes("'certonly', '--webroot', '-w', '/var/www/certbot'"));
 assert(botApp.includes('verifyInstallerAcmeWebroot(domain)'));

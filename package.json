@@ -4,7 +4,7 @@
   "private": true,
   "main": "app3.js",
   "scripts": {
-    "test": "npm run test:license && npm run test:xray-iplimit && npm run test:xray-hot-add && npm run test:xray-monitor && npm run test:online-notify && npm run test:sc-renewal-payment && npm run test:dns-guard && npm run test:foreign-backup && npm run test:server-migration && npm run test:update-compat && npm run test:cli-output",
+    "test": "npm run test:license && npm run test:xray-iplimit && npm run test:xray-hot-add && npm run test:xray-monitor && npm run test:online-notify && npm run test:sc-renewal-payment && npm run test:dns-guard && npm run test:foreign-backup && npm run test:server-migration && npm run test:button-style && npm run test:update-compat && npm run test:cli-output",
     "start": "node app3.js",
     "start:api": "node license-api.js",
     "start:expiry": "node app3.js --run-sc-expiry-scheduler",
@@ -18,6 +18,7 @@
     "test:dns-guard": "node scripts/test-dns-resolver-guard.js",
     "test:foreign-backup": "node scripts/test-foreign-backup-parser.js",
     "test:server-migration": "node scripts/test-server-migration.js",
+    "test:button-style": "node scripts/test-button-style.js",
     "test:update-compat": "node scripts/test-update-compat.js",
     "test:cli-output": "node scripts/test-cli-account-output.js"
   },

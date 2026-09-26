@@ -69,7 +69,7 @@ function render(cols, mode, locale) {
   const script = path.join(tmpDir, 'render.sh');
   fs.writeFileSync(script, `set -euo pipefail\n${engine}\n${dashboard}\n${fixture}\n` +
     `MENU_COLOR_FILE='${toBashPath(colorFile)}'\nMENU_COLS=${cols}\nUI_MODE=''\n` +
-    'dashboard_render\ndraw_main_options\ndraw_menu_panel "MENU TOOLS" "1) Informasi Key Script" "18) Tema Warna Menu" "0) Kembali"\n' +
+    'dashboard_render\ndraw_main_options\ndraw_menu_panel "MENU TOOLS" "1) Informasi Key Script" "17) Tema Warna Menu" "0) Kembali"\n' +
     'draw_menu_header "RESOURCE AUTO TUNE"\n');
   const result = spawnSync(bash, [toBashPath(script)], {
     encoding: 'utf8',
@@ -309,6 +309,18 @@ DB_PATH=/tidak/ada.db; ZIVPN_SERVICE=zivpn; DOMAIN=vpn.example.com; SCRIPT_VERSI
   assert.strictEqual(fs.readFileSync(monCount, 'utf8').trim().split('\n').length, 1, 'snapshot mode must collect data exactly once');
   assert(monOut.stdout.includes(`${OK}ONLINE`), 'captured monitor frame must still be colored');
   assert(stripAnsi(monOut.stdout).includes('[r] ambil ulang'), 'monitor footer must show the refresh key');
+
+  // Menu Tools: nomor di panel, di case, dan rentang prompt harus sama.
+  // Setelah menu dihapus/dinomori ulang, satu nomor yang meleset membuat
+  // pilihan membuka fungsi yang salah.
+  const tools = extract(menuRuntime, 'tools_menu() {', '\n}\n');
+  const panelNums = [...tools.matchAll(/^\s*"(\d+)\) [^"]+"/gm)].map((m) => Number(m[1])).sort((a, b) => a - b);
+  const caseNums = [...tools.matchAll(/^\s*(\d+)\) /gm)].map((m) => Number(m[1])).sort((a, b) => a - b);
+  const promptMax = Number((tools.match(/Pilih menu \[0-(\d+)\]/) || [])[1]);
+  assert.deepStrictEqual(caseNums, panelNums, 'tools menu case numbers must match the panel');
+  assert.strictEqual(promptMax, Math.max(...panelNums), 'tools menu prompt range must match the last item');
+  panelNums.forEach((n, i) => assert.strictEqual(n, i, `tools menu numbering must be contiguous (missing ${i})`));
+  assert(!menuRuntime.includes('set_wildcard_config_menu'), 'wildcard settings menu was removed (set manually in Cloudflare DNS)');
 
   console.log('menu ui tests passed');
 } finally {

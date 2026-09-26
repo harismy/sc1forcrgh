@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.69}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.70}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -21162,7 +21162,7 @@ EOT_ZIVPN
       ;;
     vmess|vless|trojan)
       local title host user secret exp exp_time exp_text quota lim city isp domain sni tls none grpc any_port path_ws path_upgrade service_name
-      local linktls linknone linkgrpc linkuptls linkupntls linkbug linkbugs linkbugntls linkbugsntls aliases fronts
+      local linktls linknone linkgrpc linkuptls linkupntls
       title="${type^^}"
       host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
       user="$(created_json_value "${raw}" '.data.username')"
@@ -21191,12 +21191,6 @@ EOT_ZIVPN
       linkgrpc="$(created_json_value "${raw}" '.data.link.grpc // .data.link.grpc_tls')"
       linkuptls="$(created_json_value "${raw}" '.data.link.uptls // .data.link.up_tls // .data.link.tls')"
       linkupntls="$(created_json_value "${raw}" '.data.link.upntls // .data.link.up_ntls // .data.link.none // .data.link.ntls')"
-      linkbug="$(echo "${raw}" | jq -r '.data.link.bugtls // .data.link.front_tls // ""' 2>/dev/null || true)"
-      linkbugs="$(echo "${raw}" | jq -r 'if ((.data.link.front_tls_all // []) | type) == "array" and ((.data.link.front_tls_all // []) | length) > 0 then (.data.link.front_tls_all[] | "BUG " + (.address // "-") + " | SNI " + (.sni // .address // "-") + " -> Host " + (.host // "-") + ":\n" + (.link // "")) else empty end' 2>/dev/null || true)"
-      linkbugntls="$(echo "${raw}" | jq -r '.data.link.bugntls // .data.link.front_none // ""' 2>/dev/null || true)"
-      linkbugsntls="$(echo "${raw}" | jq -r 'if ((.data.link.front_none_all // []) | type) == "array" and ((.data.link.front_none_all // []) | length) > 0 then (.data.link.front_none_all[] | "BUG " + (.address // "-") + " -> " + (.host // "-") + ":\n" + (.link // "")) else empty end' 2>/dev/null || true)"
-      aliases="$(echo "${raw}" | jq -r '(.data.wildcard_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
-      fronts="$(echo "${raw}" | jq -r '(.data.front_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
       cat <<EOT_XRAY | ui_fx
 =============================
         ${title} ACCOUNT
@@ -21259,45 +21253,6 @@ ${linkuptls}
 Up Non-TLS:
 ${linkupntls}
 EOT_XRAY_LINKS
-      if [[ -n "${aliases:-}" || -n "${fronts:-}" ]]; then
-        cat <<EOT_XRAY_HOSTS | ui_fx
-
-[ FRONT/BUG HOSTS ]
------------------------------
-Wildcard    : ${aliases:--}
-Front bug   : ${fronts:--}
-EOT_XRAY_HOSTS
-      fi
-      if [[ -n "${linkbugs:-}" ]]; then
-        cat <<EOT_XRAY_BUGS | ui_fx
-
-[ FRONT/BUG URL TLS ]
------------------------------
-${linkbugs}
-EOT_XRAY_BUGS
-      elif [[ -n "${linkbug:-}" && "${linkbug}" != "null" && "${linkbug}" != "-" ]]; then
-        cat <<EOT_XRAY_BUG | ui_fx
-
-[ FRONT/BUG URL TLS ]
------------------------------
-${linkbug}
-EOT_XRAY_BUG
-      fi
-      if [[ -n "${linkbugsntls:-}" ]]; then
-        cat <<EOT_XRAY_BUGS_NTLS | ui_fx
-
-[ FRONT/BUG URL NON-TLS ]
------------------------------
-${linkbugsntls}
-EOT_XRAY_BUGS_NTLS
-      elif [[ -n "${linkbugntls:-}" && "${linkbugntls}" != "null" && "${linkbugntls}" != "-" ]]; then
-        cat <<EOT_XRAY_BUG_NTLS | ui_fx
-
-[ FRONT/BUG URL NON-TLS ]
------------------------------
-${linkbugntls}
-EOT_XRAY_BUG_NTLS
-      fi
       cat <<EOT_XRAY_FOOTER | ui_fx
 
 [ HOST INFORMATION ]
@@ -23300,142 +23255,6 @@ trigger_online_notify_now() {
   return 1
 }
 
-set_wildcard_config_menu() {
-  local ans base cf_email cf_key prefixes exacts fronts aliases nginx_server_names pem
-  aliases="$(build_xray_alias_hosts)"
-  echo "SETTING WILDCARD CLOUDFLARE"
-  echo "Domain utama       : ${DOMAIN}"
-  echo "Wildcard cert      : ${WILDCARD_ENABLE:-0}"
-  echo "Base domain        : ${WILDCARD_BASE_DOMAIN:-}"
-  if [[ -n "${WILDCARD_CF_EMAIL:-}" && -n "${WILDCARD_CF_API_KEY:-}" ]]; then
-    echo "CF credential      : Global API Key (${WILDCARD_CF_EMAIL})"
-  else
-    echo "CF credential      : none"
-  fi
-  echo "Bug prefixes       : ${WILDCARD_BUG_PREFIXES:-${WILDCARD_BUG_PREFIX:-}}"
-  echo "Exact alias hosts  : ${WILDCARD_XRAY_HOSTS:-${WILDCARD_XRAY_HOST:-}}"
-  echo "Front bug domains  : ${XRAY_FRONT_DOMAINS:-${XRAY_FRONT_DOMAIN:-}}"
-  echo "Alias aktif        : ${aliases:-none}"
-  echo
-  echo "Link Xray tetap memakai domain utama. Alias wildcard hanya agar host/SNI bug tetap diterima server."
-  echo "Pisahkan banyak bug dengan koma. Contoh: support.zoom.us,ava.game,blog"
-  echo "Front bug domain adalah server address luar, contoh: support.zoom.us"
-  echo "Ketik '-' untuk mengosongkan value."
-  echo
-
-  prompt_input ans "Aktifkan wildcard cert Cloudflare? [1/0, enter=keep]: " || return
-  ans="$(echo "${ans:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-  case "${ans}" in
-    1|true|yes|on) WILDCARD_ENABLE="1" ;;
-    0|false|no|off) WILDCARD_ENABLE="0" ;;
-    "") ;;
-    *) echo "Input wildcard enable tidak valid, value lama dipakai." ;;
-  esac
-
-  prompt_input base "Base domain wildcard [enter=keep]: " || return
-  if [[ "${base:-}" == "-" ]]; then
-    WILDCARD_BASE_DOMAIN=""
-  elif [[ -n "${base:-}" ]]; then
-    WILDCARD_BASE_DOMAIN="$(sanitize_domain_host "${base}")"
-  fi
-
-  WILDCARD_CF_API_TOKEN=""
-
-  prompt_input cf_email "Cloudflare email untuk Global API Key [enter=keep, -=hapus]: " || return
-  if [[ "${cf_email:-}" == "-" ]]; then
-    WILDCARD_CF_EMAIL=""
-  elif [[ -n "${cf_email:-}" ]]; then
-    WILDCARD_CF_EMAIL="$(trim_env_value "${cf_email}")"
-  fi
-
-  prompt_input cf_key "Cloudflare Global API Key [enter=keep, -=hapus]: " || return
-  if [[ "${cf_key:-}" == "-" ]]; then
-    WILDCARD_CF_API_KEY=""
-  elif [[ -n "${cf_key:-}" ]]; then
-    WILDCARD_CF_API_KEY="$(clean_cloudflare_secret "${cf_key}")"
-  fi
-
-  prompt_input prefixes "Bug prefixes [enter=keep, -=hapus]: " || return
-  if [[ "${prefixes:-}" == "-" ]]; then
-    WILDCARD_BUG_PREFIXES=""
-    WILDCARD_BUG_PREFIX=""
-  elif [[ -n "${prefixes:-}" ]]; then
-    WILDCARD_BUG_PREFIXES="$(normalize_domain_host_list "${prefixes}")"
-    WILDCARD_BUG_PREFIX="$(csv_first_item "${WILDCARD_BUG_PREFIXES}")"
-  fi
-
-  prompt_input exacts "Exact alias hosts [enter=keep, -=hapus]: " || return
-  if [[ "${exacts:-}" == "-" ]]; then
-    WILDCARD_XRAY_HOSTS=""
-    WILDCARD_XRAY_HOST=""
-  elif [[ -n "${exacts:-}" ]]; then
-    WILDCARD_XRAY_HOSTS="$(normalize_domain_host_list "${exacts}")"
-    WILDCARD_XRAY_HOST="$(csv_first_item "${WILDCARD_XRAY_HOSTS}")"
-  fi
-
-  prompt_input fronts "Front bug server address [enter=keep, -=hapus]: " || return
-  if [[ "${fronts:-}" == "-" ]]; then
-    XRAY_FRONT_DOMAINS=""
-    XRAY_FRONT_DOMAIN=""
-  elif [[ -n "${fronts:-}" ]]; then
-    XRAY_FRONT_DOMAINS="$(normalize_domain_host_list "${fronts}")"
-    XRAY_FRONT_DOMAIN="$(csv_first_item "${XRAY_FRONT_DOMAINS}")"
-  fi
-
-  if [[ -z "${WILDCARD_BUG_PREFIXES:-}${WILDCARD_BUG_PREFIX:-}${WILDCARD_XRAY_HOSTS:-}${WILDCARD_XRAY_HOST:-}" ]]; then
-    XRAY_PUBLIC_HOST=""
-  fi
-  XRAY_PUBLIC_HOST="$(build_xray_public_host)"
-  aliases="$(build_xray_alias_hosts)"
-
-  update_sc_env_var "WILDCARD_ENABLE" "${WILDCARD_ENABLE:-0}"
-  update_sc_env_var "WILDCARD_BASE_DOMAIN" "${WILDCARD_BASE_DOMAIN:-}"
-  update_sc_env_var "WILDCARD_CF_API_TOKEN" "${WILDCARD_CF_API_TOKEN:-}"
-  update_sc_env_var "WILDCARD_CF_EMAIL" "${WILDCARD_CF_EMAIL:-}"
-  update_sc_env_var "WILDCARD_CF_API_KEY" "${WILDCARD_CF_API_KEY:-}"
-  update_sc_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
-  update_sc_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
-  update_sc_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
-  update_sc_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
-  update_sc_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
-  update_sc_env_var "XRAY_FRONT_DOMAIN" "${XRAY_FRONT_DOMAIN:-}"
-  update_sc_env_var "XRAY_FRONT_DOMAINS" "${XRAY_FRONT_DOMAINS:-}"
-
-  update_app_env_var "WILDCARD_BUG_PREFIX" "${WILDCARD_BUG_PREFIX:-}"
-  update_app_env_var "WILDCARD_BUG_PREFIXES" "${WILDCARD_BUG_PREFIXES:-}"
-  update_app_env_var "WILDCARD_XRAY_HOST" "${WILDCARD_XRAY_HOST:-}"
-  update_app_env_var "WILDCARD_XRAY_HOSTS" "${WILDCARD_XRAY_HOSTS:-}"
-  update_app_env_var "XRAY_PUBLIC_HOST" "${XRAY_PUBLIC_HOST:-}"
-  update_app_env_var "XRAY_FRONT_DOMAIN" "${XRAY_FRONT_DOMAIN:-}"
-  update_app_env_var "XRAY_FRONT_DOMAINS" "${XRAY_FRONT_DOMAINS:-}"
-
-  nginx_server_names="$(build_nginx_server_names)"
-  if [[ -f /etc/nginx/sites-available/sc-1forcr.conf ]]; then
-    sed -i "0,/server_name[[:space:]].*;/s//server_name ${nginx_server_names};/" /etc/nginx/sites-available/sc-1forcr.conf
-    if nginx -t; then
-      systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
-    else
-      echo "Peringatan: konfigurasi nginx invalid setelah update server_name."
-    fi
-  fi
-
-  if [[ -n "${aliases}" ]] || flag_enabled "${WILDCARD_ENABLE:-0}"; then
-    if issue_letsencrypt_cert; then
-      pem="$(prepare_haproxy_pem)" || pem=""
-      [[ -n "${pem}" ]] && { systemctl reload haproxy >/dev/null 2>&1 || systemctl restart haproxy >/dev/null 2>&1; } || true
-    else
-      echo "Peringatan: issue cert gagal. Alias bisa DNS resolve, tapi TLS bisa mismatch sampai cert berhasil."
-    fi
-  fi
-
-  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
-  echo
-  echo "Setting wildcard selesai."
-  echo "- Link Xray tetap : ${DOMAIN}"
-  echo "- Alias wildcard  : ${aliases:-none}"
-  echo "- Front bug       : ${XRAY_FRONT_DOMAINS:-none}"
-}
-
 api_docs_nginx_snippet_path() {
   echo "/etc/nginx/snippets/sc-1forcr-api-docs.conf"
 }
@@ -24061,13 +23880,12 @@ tools_menu() {
       "12) Setting Interval Auto Backup" \
       "13) Setting Interval Auto Reboot" \
       "14) Setting Auto Update Bot" \
-      "15) Setting Wildcard Cloudflare" \
-      "16) Diagnosa/Repair Routing Jaringan" \
-      "17) Setting Web Dokumentasi API" \
-      "18) Tema Warna Menu" \
+      "15) Diagnosa/Repair Routing Jaringan" \
+      "16) Setting Web Dokumentasi API" \
+      "17) Tema Warna Menu" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-18]: "; then
+    if ! prompt_input tm "Pilih menu [0-17]: "; then
       return
     fi
     clear
@@ -24086,10 +23904,9 @@ tools_menu() {
       12) set_auto_backup_config_menu || true ;;
       13) set_auto_reboot_config_menu || true ;;
       14) set_auto_pull_update_config_menu || true ;;
-      15) set_wildcard_config_menu || true ;;
-      16) network_compatibility_menu || true ;;
-      17) set_api_docs_config_menu || true ;;
-      18) set_menu_color_menu || true ;;
+      15) network_compatibility_menu || true ;;
+      16) set_api_docs_config_menu || true ;;
+      17) set_menu_color_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac

@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.64}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.65}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -4708,9 +4708,30 @@ app.post('/internal/zivpn-auth', async (req, res) => {
     return res.json({ ok: false, id: '' });
   }
 });
-function telegramNotify(text) {
+// Notifikasi Telegram dikirim sebagai plain text (tanpa parse_mode), jadi
+// karakter apa pun di username atau domain tidak bisa membuat Telegram menolak
+// pesan. Pesan di atas batas 4096 karakter dipecah per baris.
+const TELEGRAM_TEXT_LIMIT = 3800;
+const NOTIFY_RULE = '━━━━━━━━━━━━━━━━━━━━━━';
+const NOTIFY_SUBRULE = '──────────────────────';
+
+function splitTelegramText(text, limit = TELEGRAM_TEXT_LIMIT) {
+  const chunks = [];
+  let current = '';
+  for (const rawLine of String(text || '').split('\n')) {
+    const line = rawLine.length > limit ? rawLine.slice(0, limit) : rawLine;
+    if (current && current.length + line.length + 1 > limit) {
+      chunks.push(current);
+      current = '';
+    }
+    current = current ? `${current}\n${line}` : line;
+  }
+  if (current.trim()) chunks.push(current);
+  return chunks;
+}
+
+function telegramSendText(text) {
   return new Promise((resolve) => {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !text) return resolve(false);
     const payload = `chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&disable_web_page_preview=true&text=${encodeURIComponent(String(text))}`;
     const req = https.request({
       hostname: 'api.telegram.org',
@@ -4722,7 +4743,7 @@ function telegramNotify(text) {
       }
     }, (res) => {
       res.on('data', () => {});
-      res.on('end', () => resolve(true));
+      res.on('end', () => resolve(Number(res.statusCode || 0) < 300));
     });
     req.on('error', () => resolve(false));
     req.setTimeout(4500, () => {
@@ -4734,9 +4755,52 @@ function telegramNotify(text) {
   });
 }
 
+async function telegramNotify(text) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !text) return false;
+  let ok = true;
+  for (const chunk of splitTelegramText(text)) {
+    if (!(await telegramSendText(chunk))) ok = false;
+  }
+  return ok;
+}
+
 function notifyValue(value, fallback = '-') {
   const s = sanitizeInfoText(value ?? '').trim();
   return s || fallback;
+}
+
+// WIB = UTC+7 tanpa DST; dihitung manual supaya tidak bergantung data ICU Node.
+function notifyTimeWib(ms = Date.now()) {
+  const d = new Date(Number(ms) + 7 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getUTCDate())}-${pad(d.getUTCMonth() + 1)}-${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} WIB`;
+}
+
+// Baris "Label    : nilai". Nilai kosong atau "-" menghasilkan null, jadi
+// barisnya tidak ikut dan notifikasi tidak berisi baris yang tidak informatif.
+function notifyRow(label, value) {
+  const text = value === null || value === undefined ? '' : notifyValue(String(value), '');
+  if (!text || text === '-') return null;
+  return `${String(label).padEnd(9, ' ')}: ${text}`;
+}
+
+// Susunan semua notifikasi: judul, garis tebal, bagian-bagian yang dipisah
+// garis tipis, lalu penutup berisi domain VPS dan waktu WIB.
+function notifyMessage(title, sections = [], note = '') {
+  const lines = [String(title || 'SC 1FORCR'), NOTIFY_RULE];
+  let count = 0;
+  for (const section of sections) {
+    const body = (section?.lines || []).filter((line) => line !== null && line !== undefined && line !== false);
+    if (!body.some((line) => String(line).trim())) continue;
+    if (count > 0) lines.push(NOTIFY_SUBRULE);
+    if (section.title) lines.push(section.title);
+    lines.push(...body);
+    count += 1;
+  }
+  lines.push(NOTIFY_RULE);
+  if (note) lines.push(note);
+  lines.push(`SC 1FORCR • ${notifyValue(DOMAIN)}`, notifyTimeWib());
+  return lines.join('\n');
 }
 
 function notifyPortValue(port, keys, fallback = '-') {
@@ -4744,56 +4808,92 @@ function notifyPortValue(port, keys, fallback = '-') {
   const list = Array.isArray(keys) ? keys : [keys];
   for (const key of list) {
     const v = notifyValue(p[key], '');
-    if (v) return v;
+    if (v && v !== '-') return v;
   }
   return fallback;
 }
 
-function notifyOwnerValue(owner, camel, snake) {
-  const n = Number(owner?.[camel] ?? owner?.[snake] ?? 0);
-  return Number.isInteger(n) && n !== 0 ? String(n) : '-';
+function notifyOwnerId(owner = {}) {
+  const o = owner || {};
+  for (const value of [o.ownerTelegramId, o.owner_telegram_id, o.ownerTelegramChatId, o.owner_telegram_chat_id]) {
+    const n = Number(value || 0);
+    if (Number.isInteger(n) && n !== 0) return `ID ${n}`;
+  }
+  return '';
+}
+
+function notifyLimitIp(value) {
+  const n = Math.floor(Number(value || 0));
+  return Number.isFinite(n) && n > 0 ? String(n) : 'Tanpa batas';
+}
+
+function notifyQuota(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) && n > 0 ? `${n} GB` : 'Tanpa batas';
+}
+
+function notifyLocation(account = {}, location = {}) {
+  return [account.city || location.city, account.isp || location.isp]
+    .map((v) => notifyValue(v, ''))
+    .filter((v) => v && v !== '-')
+    .join(' • ');
+}
+
+function notifyParseLocalDate(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(String(value || '').trim());
+  if (!m) return null;
+  const d = new Date(
+    Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+    m[4] === undefined ? 23 : Number(m[4]),
+    m[5] === undefined ? 59 : Number(m[5]),
+    m[6] === undefined ? 59 : Number(m[6])
+  );
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+// "2026-10-26 23:59", opsional dengan sisa waktu "(30 hari lagi)".
+function notifyExpiry(value, withRemaining = false) {
+  const raw = notifyValue(value, '');
+  if (!raw || raw === '-') return '';
+  const m = /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}))?/.exec(raw);
+  const shown = m ? (m[2] ? `${m[1]} ${m[2]}` : m[1]) : raw;
+  if (!withRemaining) return shown;
+  const date = notifyParseLocalDate(raw);
+  if (!date) return shown;
+  const minutes = Math.round((date.getTime() - Date.now()) / 60000);
+  if (minutes <= 0) return `${shown} (sudah lewat)`;
+  if (minutes < 60) return `${shown} (${minutes} menit lagi)`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${shown} (${hours} jam lagi)`;
+  return `${shown} (${Math.floor(hours / 24)} hari lagi)`;
+}
+
+function notifyStatusLabel(status) {
+  const s = String(status || '').trim().toUpperCase();
+  if (s === 'LOCK_QUOTA') return 'Terkunci (quota habis)';
+  if (s === 'LOCK_TMP') return 'Terkunci sementara';
+  if (s === 'LOCK' || s === 'LOCKED') return 'Terkunci';
+  if (s === 'EXPIRED' || s === 'RECOVERY') return 'Expired';
+  return s || '-';
 }
 
 function accountEventLabel(action) {
   const a = String(action || '').trim().toLowerCase();
-  if (a === 'delete' || a === 'deleted') return 'DELETE ACCOUNT';
-  if (a === 'trial') return 'CREATE TRIAL';
-  if (a === 'create' || a === 'created') return 'CREATE ACCOUNT';
-  if (a === 'renew' || a === 'renewed') return 'RENEW ACCOUNT';
-  if (a === 'recover' || a === 'recovered') return 'RECOVER ACCOUNT';
-  return notifyValue(action).toUpperCase();
+  if (a === 'delete' || a === 'deleted') return 'AKUN DIHAPUS';
+  if (a === 'trial') return 'AKUN TRIAL';
+  if (a === 'create' || a === 'created') return 'AKUN BARU';
+  if (a === 'renew' || a === 'renewed') return 'AKUN DIPERPANJANG';
+  if (a === 'recover' || a === 'recovered') return 'AKUN DIPULIHKAN';
+  return `AKUN ${notifyValue(action).toUpperCase()}`;
 }
 
 function serviceLabel(service) {
   const s = String(service || '').trim().toLowerCase();
-  if (s === 'ssh' || s === 'zivpn' || s === 'ssh/zivpn') return 'SSH / ZIVPN';
+  if (normalizedSshService(s)) return 'SSH';
   if (s === 'vmess') return 'VMESS';
   if (s === 'vless') return 'VLESS';
   if (s === 'trojan') return 'TROJAN';
   return notifyValue(service).toUpperCase();
-}
-
-function accountSecretInfo(service, account = {}) {
-  const s = String(service || '').trim().toLowerCase();
-  if (s === 'vmess' || s === 'vless') {
-    return { label: 'UUID', value: notifyValue(account.uuid || account.secret || account.id) };
-  }
-  return { label: 'Password', value: notifyValue(account.password || account.secret || account.uuid || account.id) };
-}
-
-function accountPathValue(account = {}) {
-  const path = account.path;
-  if (typeof path === 'string') return notifyValue(path);
-  if (path && typeof path === 'object') return notifyValue(path.ws || path.stn || path.upgrade || path.multi);
-  return notifyValue(account.ws_path || account.wsAltPath || account.ws_alt_path);
-}
-
-function accountQuotaValue(account = {}) {
-  const raw = account.quota ?? account.kuota ?? account.quota_gb;
-  if (raw === null || raw === undefined || raw === '') return '0 GB';
-  const n = Number(raw);
-  if (Number.isFinite(n)) return `${n} GB`;
-  return notifyValue(raw);
 }
 
 function accountLinkValue(value) {
@@ -4827,8 +4927,22 @@ function normalizedXrayService(service) {
   return ['vmess', 'vless', 'trojan'].includes(serviceText) ? serviceText : '';
 }
 
+function normalizedSshService(service) {
+  const serviceText = String(service || '').trim().toLowerCase();
+  return ['ssh', 'zivpn', 'ssh/zivpn', 'ssh/zivpn/udphc', 'sshvpn'].includes(serviceText) ? 'ssh' : '';
+}
+
 function isCreateLikeAction(action) {
   return ['create', 'created', 'trial'].includes(String(action || '').trim().toLowerCase());
+}
+
+function isTrialAction(action, username = '') {
+  return String(action || '').trim().toLowerCase() === 'trial' || /^trial/i.test(String(username || ''));
+}
+
+function isRenewLikeAction(action) {
+  const a = String(action || '').trim().toLowerCase();
+  return a === 'renew' || a === 'renewed' || a === 'recover' || a === 'recovered';
 }
 
 function accountXrayLinkBundle(service, account = {}) {
@@ -4849,20 +4963,14 @@ function accountXrayLinkBundle(service, account = {}) {
         if (!tls) tls = accountLinkValue(vmessLink(host, secret, true, username));
         if (!ntls) ntls = accountLinkValue(vmessLink(host, secret, false, username));
         if (!grpc) grpc = accountLinkValue(vmessGrpcLink(host, secret, username));
-        if (!uptls) uptls = accountLinkValue(vmessLink(host, secret, true, username));
-        if (!upntls) upntls = accountLinkValue(vmessLink(host, secret, false, username));
       } else if (serviceText === 'vless') {
         if (!tls) tls = accountLinkValue(vlessLink(host, secret, true, username));
         if (!ntls) ntls = accountLinkValue(vlessLink(host, secret, false, username));
         if (!grpc) grpc = accountLinkValue(vlessGrpcLink(host, secret, username));
-        if (!uptls) uptls = accountLinkValue(vlessLink(host, secret, true, username));
-        if (!upntls) upntls = accountLinkValue(vlessLink(host, secret, false, username));
       } else if (serviceText === 'trojan') {
         if (!tls) tls = accountLinkValue(trojanLink(host, secret, true, username));
         if (!ntls) ntls = accountLinkValue(trojanLink(host, secret, false, username));
         if (!grpc) grpc = accountLinkValue(trojanGrpcLink(host, secret, username));
-        if (!uptls) uptls = accountLinkValue(trojanLink(host, secret, true, username));
-        if (!upntls) upntls = accountLinkValue(trojanLink(host, secret, false, username));
       }
     }
   }
@@ -4875,25 +4983,6 @@ function accountXrayLinkBundle(service, account = {}) {
   };
 }
 
-function accountXrayLinkLines(action, service, account = {}) {
-  if (!isCreateLikeAction(action)) return [];
-  const serviceText = normalizedXrayService(service);
-  if (!serviceText) return [];
-  const { tls, ntls, grpc } = accountXrayLinkBundle(serviceText, account);
-  if (!tls && !ntls && !grpc) return [];
-  return [
-    '',
-    'LINK XRAY',
-    `Link TLS : ${tls || '-'}`,
-    `Link NTLS: ${ntls || '-'}`,
-    `Link GRPC: ${grpc || '-'}`
-  ];
-}
-
-function notifyRow(label, value) {
-  return `${String(label || '').padEnd(12, ' ')}: ${notifyValue(value)}`;
-}
-
 function accountPathPart(account = {}, key = 'ws', fallback = '-') {
   const path = account.path;
   if (path && typeof path === 'object') {
@@ -4904,43 +4993,58 @@ function accountPathPart(account = {}, key = 'ws', fallback = '-') {
   return notifyValue(account[`${key}_path`] || fallback);
 }
 
-function accountExpiredText(account = {}) {
-  const expired = notifyValue(account.exp || account.expired || account.date_exp || account.to);
-  if (expired === '-') return expired;
-  if (expired.includes(' - ')) return expired;
-  const match = expired.match(/\b(\d{2}:\d{2}:\d{2})\b/);
-  return match ? `${expired} - ${match[1]}` : expired;
+function accountExpiryValue(account = {}) {
+  return account.exp || account.expired || account.date_exp || account.to;
 }
 
-function accountIpLimitText(account = {}) {
-  const raw = account.limitip ?? account.iplimit ?? 0;
-  const n = Number(raw);
-  if (Number.isFinite(n)) return `${n} pengguna`;
-  return notifyValue(raw);
+function formatSshCreateNotification(action, service, account = {}, owner = {}, location = {}) {
+  if (!isCreateLikeAction(action) || !normalizedSshService(service)) return '';
+  const port = account.port || {};
+  const host = notifyValue(account.hostname || account.host || DOMAIN);
+  const username = notifyValue(account.username);
+  const password = notifyValue(account.password || account.secret);
+  const tlsPort = notifyPortValue(port, ['tls', 'ssl', 'any'], '443');
+  const ntlsPort = notifyPortValue(port, ['none', 'ntls', 'ws'], '80');
+  const udpgw = notifyPortValue(port, ['udpgw'], Array.isArray(account.udpgw?.ports) ? account.udpgw.ports.join(',') : '');
+  const udpCustom = notifyPortValue(port, ['udpcustom', 'udp_custom', 'udphc'], notifyValue(account.udpcustom_port || account.udp_custom_port, ''));
+
+  return notifyMessage(isTrialAction(action, username) ? 'AKUN TRIAL SSH' : 'AKUN SSH BARU', [
+    {
+      lines: [
+        notifyRow('Username', username),
+        notifyRow('Password', password),
+        notifyRow('Expired', notifyExpiry(accountExpiryValue(account), true)),
+        notifyRow('Limit IP', notifyLimitIp(account.limitip ?? account.iplimit)),
+        notifyRow('Quota', notifyQuota(account.quota)),
+        notifyRow('Pembeli', notifyOwnerId(owner))
+      ]
+    },
+    {
+      title: 'KONEKSI',
+      lines: [
+        notifyRow('Host', host),
+        notifyRow('SSH WS', ntlsPort),
+        notifyRow('SSH SSL', tlsPort),
+        notifyRow('UDP Custom', udpCustom),
+        notifyRow('UDPGW', udpgw),
+        notifyRow('Lokasi', notifyLocation(account, location))
+      ]
+    },
+    {
+      title: 'FORMAT HTTP CUSTOM',
+      lines: [
+        `${host}:${ntlsPort}@${username}:${password}`,
+        `${host}:${tlsPort}@${username}:${password}`
+      ]
+    },
+    {
+      title: 'PAYLOAD WS',
+      lines: ['GET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]']
+    }
+  ]);
 }
 
-function accountProtocolDetailRows(serviceText, secretValue) {
-  if (serviceText === 'vmess') {
-    return [
-      notifyRow('UUID', secretValue),
-      notifyRow('ALTER ID', '0'),
-      notifyRow('SECURITY', 'auto')
-    ];
-  }
-  if (serviceText === 'vless') {
-    return [
-      notifyRow('UUID', secretValue),
-      notifyRow('ENCRYPTION', 'none'),
-      notifyRow('SECURITY', 'tls / none')
-    ];
-  }
-  return [
-    notifyRow('PASSWORD', secretValue),
-    notifyRow('SECURITY', 'tls / none')
-  ];
-}
-
-function formatXrayCreateNotification(action, service, account = {}, location = {}) {
+function formatXrayCreateNotification(action, service, account = {}, owner = {}, location = {}) {
   if (!isCreateLikeAction(action)) return '';
   const serviceText = normalizedXrayService(service);
   if (!serviceText) return '';
@@ -4948,270 +5052,123 @@ function formatXrayCreateNotification(action, service, account = {}, location = 
   const title = serviceLabel(serviceText);
   const username = notifyValue(account.username);
   const port = account.port || {};
-  const tlsPort = notifyPortValue(port, ['tls', 'any'], '443');
-  const ntlsPort = notifyPortValue(port, ['none', 'ntls'], '80');
-  const grpcPort = notifyPortValue(port, ['grpc'], '443');
-  const anyPort = notifyPortValue(port, ['any', 'tls'], '443');
   const host = notifyValue(account.hostname || account.host || XRAY_LINK_HOST || DOMAIN);
+  const sni = notifyValue(account.sni || account.server_name, '');
   const secret = notifyValue(account.uuid || account.password || account.secret || account.id);
-  const pathWs = accountPathPart(account, 'ws', `/${serviceText}`);
-  const pathUpgrade = accountPathPart(account, 'upgrade', `/up${serviceText}`);
-  const serviceName = notifyValue(account.serviceName || `${serviceText}-grpc`);
-  const city = notifyValue(account.city || location.city);
-  const isp = notifyValue(account.isp || location.isp);
-  const domain = notifyValue(DOMAIN || host);
-  const sni = notifyValue(account.sni || account.server_name || host);
   const links = accountXrayLinkBundle(serviceText, account);
+  // Link upgrade biasanya sama persis dengan TLS/Non-TLS; hanya ditampilkan kalau berbeda.
+  const linkLines = [];
+  const pushLink = (label, value) => {
+    if (!value) return;
+    if (linkLines.length) linkLines.push('');
+    linkLines.push(`${label}:`, value);
+  };
+  pushLink('TLS', links.tls);
+  pushLink('Non-TLS', links.ntls);
+  pushLink('gRPC', links.grpc);
+  if (links.uptls && links.uptls !== links.tls) pushLink('Upgrade TLS', links.uptls);
+  if (links.upntls && links.upntls !== links.ntls) pushLink('Upgrade Non-TLS', links.upntls);
 
-  return [
-    '=============================',
-    `        ${title} ACCOUNT`,
-    '=============================',
-    '',
-    `[ ${title} DETAILS ]`,
-    '-----------------------------',
-    notifyRow('REMARKS', username),
-    notifyRow('HOST', host),
-    notifyRow('PORT TLS', tlsPort),
-    notifyRow('PORT NTLS', ntlsPort),
-    notifyRow('PORT GRPC', grpcPort),
-    notifyRow('PORT ANY', anyPort),
-    ...accountProtocolDetailRows(serviceText, secret),
-    notifyRow('NETWORK', 'ws, grpc, upgrade'),
-    notifyRow('PATH WS', pathWs),
-    notifyRow('SERVICE', serviceName),
-    notifyRow('PATH UPGRADE', pathUpgrade),
-    notifyRow('EXPIRED', accountExpiredText(account)),
-    notifyRow('QUOTA', accountQuotaValue(account)),
-    notifyRow('IP LIMIT', accountIpLimitText(account)),
-    '',
-    `[ ${title} URL ]`,
-    '-----------------------------',
-    'TLS:',
-    links.tls || '-',
-    '',
-    'Non-TLS:',
-    links.ntls || '-',
-    '',
-    'gRPC:',
-    links.grpc || '-',
-    '',
-    'Up TLS:',
-    links.uptls || '-',
-    '',
-    'Up Non-TLS:',
-    links.upntls || '-',
-    '',
-    '[ HOST INFORMATION ]',
-    '-----------------------------',
-    notifyRow('Domain', domain),
-    notifyRow('SNI', sni),
-    notifyRow('City', city),
-    notifyRow('ISP', isp),
-    '',
-    '[ PORTS ]',
-    '-----------------------------',
-    notifyRow('WS TLS', tlsPort),
-    notifyRow('WS NTLS', ntlsPort),
-    notifyRow('GRPC TLS', grpcPort),
-    notifyRow('ANY PORT', anyPort),
-    '-----------------------------',
-    'Terima kasih telah menggunakan layanan kami.'
-  ].join('\n');
+  return notifyMessage(isTrialAction(action, username) ? `AKUN TRIAL ${title}` : `AKUN ${title} BARU`, [
+    {
+      lines: [
+        notifyRow('Username', username),
+        notifyRow('Expired', notifyExpiry(accountExpiryValue(account), true)),
+        notifyRow('Limit IP', notifyLimitIp(account.limitip ?? account.iplimit)),
+        notifyRow('Quota', notifyQuota(account.quota)),
+        notifyRow('Pembeli', notifyOwnerId(owner))
+      ]
+    },
+    {
+      title: 'KONEKSI',
+      lines: [
+        notifyRow('Host', host),
+        sni && sni !== host ? notifyRow('SNI', sni) : null,
+        notifyRow('Port TLS', notifyPortValue(port, ['tls', 'any'], '443')),
+        notifyRow('Non-TLS', notifyPortValue(port, ['none', 'ntls'], '80')),
+        notifyRow('gRPC', notifyPortValue(port, ['grpc'], '443')),
+        notifyRow(serviceText === 'trojan' ? 'Password' : 'UUID', secret),
+        notifyRow('Path WS', accountPathPart(account, 'ws', `/${serviceText}`)),
+        notifyRow('Upgrade', accountPathPart(account, 'upgrade', `/up${serviceText}`)),
+        notifyRow('Service', notifyValue(account.serviceName || `${serviceText}-grpc`)),
+        notifyRow('Lokasi', notifyLocation(account, location))
+      ]
+    },
+    { title: 'LINK', lines: linkLines }
+  ]);
 }
 
-function normalizedSshService(service) {
-  const serviceText = String(service || '').trim().toLowerCase();
-  return ['ssh', 'zivpn', 'ssh/zivpn', 'ssh/zivpn/udphc', 'sshvpn'].includes(serviceText) ? 'ssh' : '';
-}
-
-function sshExpiryTime(account = {}) {
-  const expired = notifyValue(account.exp || account.expired || account.date_exp || account.to);
-  const match = expired.match(/\b(\d{2}:\d{2}:\d{2})\b/);
-  return match ? match[1] : notifyValue(account.time);
-}
-
-function formatSshCreateNotification(action, service, account = {}, location = {}) {
-  if (!isCreateLikeAction(action)) return '';
-  if (!normalizedSshService(service)) return '';
-
-  const port = account.port || {};
-  const host = notifyValue(account.hostname || account.host || DOMAIN);
-  const username = notifyValue(account.username);
-  const password = notifyValue(account.password || account.secret);
-  const tlsPort = notifyPortValue(port, ['tls', 'ssl', 'any'], '443');
-  const ntlsPort = notifyPortValue(port, ['none', 'ntls', 'ws'], '80');
-  const dnsPort = notifyPortValue(port, ['dns', 'dnsslow', 'dnslow'], '5300');
-  const ovpnTcp = notifyPortValue(port, ['ovpntcp', 'ovpn_tcp'], '1194');
-  const ovpnUdp = notifyPortValue(port, ['ovpnudp', 'ovpn_udp'], '2200');
-  const sshOhp = notifyPortValue(port, ['sshohp', 'ssh_ohp'], '8181');
-  const udpCustom = notifyPortValue(
-    port,
-    ['udpcustom', 'udp_custom', 'udphc'],
-    notifyValue(account.udpcustom_port || account.udp_custom_port || process.env.UDPCUSTOM_LISTEN_PORT || 'undefined')
-  );
-  const city = notifyValue(account.city || location.city);
-  const isp = notifyValue(account.isp || location.isp);
-  const expired = notifyValue(account.exp || account.expired || account.date_exp || account.to);
-
-  return [
-    '=============================',
-    ' SSH ACCOUNT CREATED',
-    '=============================',
-    '',
-    '[ SSH PREMIUM DETAILS ]',
-    '-----------------------------',
-    notifyRow('SSH WS', `${host}:${ntlsPort}@${username}:${password}`),
-    notifyRow('SSH SSL', `${host}:${tlsPort}@${username}:${password}`),
-    notifyRow('DNS SELOW', `${host}:${dnsPort}@${username}:${password}`),
-    '',
-    '[ HOST INFORMATION ]',
-    '-----------------------------',
-    notifyRow('Hostname', host),
-    notifyRow('City', city),
-    notifyRow('ISP', isp),
-    notifyRow('Username', username),
-    notifyRow('Password', password),
-    notifyRow('Expiry Date', expired),
-    notifyRow('Expiry Time', sshExpiryTime(account)),
-    notifyRow('IP Limit', notifyValue(account.limitip ?? account.iplimit ?? 0, '0')),
-    '',
-    '[ PORTS ]',
-    '------------------------------',
-    notifyRow('TLS', tlsPort),
-    notifyRow('Non-TLS', ntlsPort),
-    notifyRow('OVPN TCP', ovpnTcp),
-    notifyRow('OVPN UDP', ovpnUdp),
-    notifyRow('SSH OHP', sshOhp),
-    notifyRow('UDP Custom', udpCustom),
-    '',
-    '[ PAYLOAD WS ]',
-    '------------------------------',
-    'GET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]',
-    '',
-    '[ PAYLOAD ENHANCED + SPLIT ]',
-    '------------------------------',
-    'PATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection:',
-    'Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]',
-    '------------------------------',
-    'Terima kasih telah menggunakan layanan kami.'
-  ].join('\n');
-}
-
-function isRenewLikeAction(action) {
-  const a = String(action || '').trim().toLowerCase();
-  return a === 'renew' || a === 'renewed' || a === 'recover' || a === 'recovered';
-}
-
-// Notifikasi renew/recover sengaja ringkas: yang penting bagi penjual adalah
-// masa aktif sebelum dan sesudah, bukan ulangan detail koneksi seperti saat
-// akun baru dibuat.
-function formatRenewNotification(action, service, account = {}, owner = {}, location = {}) {
+// Renew/recover sengaja ringkas: yang penting bagi penjual adalah masa aktif
+// sebelum dan sesudah, bukan ulangan detail koneksi seperti saat akun dibuat.
+function formatRenewNotification(action, service, account = {}, owner = {}) {
   if (!isRenewLikeAction(action)) return '';
   const username = notifyValue(account.username);
-  const kind = /^trial/i.test(username) ? 'TRIAL' : 'REGULER';
-  const fromExp = notifyValue(account.from);
-  const toExp = notifyValue(account.to || account.exp || account.expired || account.date_exp);
   const addedDays = Number(account.added_days || 0);
   const quotaAdded = Number(account.quota_added || 0);
   const status = notifyValue(account.status || 'AKTIF').toUpperCase();
-  const ownerUser = notifyOwnerValue(owner, 'ownerTelegramId', 'owner_telegram_id');
-  const ownerChat = notifyOwnerValue(owner, 'ownerTelegramChatId', 'owner_telegram_chat_id');
+  const quotaText = `${notifyQuota(account.quota)}${quotaAdded > 0 ? ` (+${quotaAdded} GB)` : ''}`;
 
-  return [
-    'SC 1FORCR NOTIF',
-    '==============================',
-    `Event    : ${accountEventLabel(action)}`,
-    `Layanan  : ${serviceLabel(service)}`,
-    `Kategori : ${kind}`,
-    `Status   : ${status}`,
-    '',
-    'VPS',
-    `Domain   : ${notifyValue(DOMAIN)}`,
-    `City     : ${notifyValue(account.city || location.city)}`,
-    `ISP      : ${notifyValue(account.isp || location.isp)}`,
-    '',
-    'MASA AKTIF',
-    `Username : ${username}`,
-    `Dari     : ${fromExp}`,
-    `Sampai   : ${toExp}`,
-    ...(addedDays > 0 ? [`Tambah   : ${addedDays} hari`] : []),
-    '',
-    'PAKET',
-    `Quota    : ${accountQuotaValue(account)}`,
-    ...(quotaAdded > 0 ? [`Quota +  : ${quotaAdded} GB`] : []),
-    `Limit IP : ${notifyValue(account.limitip ?? account.iplimit ?? 0, '0')}`,
-    '',
-    'OWNER',
-    `TG User  : ${ownerUser}`,
-    `TG Chat  : ${ownerChat}`,
-    `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`,
-    '=============================='
-  ].join('\n');
+  return notifyMessage(accountEventLabel(action), [
+    {
+      lines: [
+        notifyRow('Layanan', serviceLabel(service)),
+        notifyRow('Username', username),
+        isTrialAction('', username) ? notifyRow('Kategori', 'Trial') : null,
+        notifyRow('Pembeli', notifyOwnerId(owner))
+      ]
+    },
+    {
+      title: 'MASA AKTIF',
+      lines: [
+        notifyRow('Dari', notifyExpiry(account.from)),
+        notifyRow('Sampai', notifyExpiry(account.to || accountExpiryValue(account), true)),
+        addedDays > 0 ? notifyRow('Tambah', `${addedDays} hari`) : null
+      ]
+    },
+    {
+      title: 'PAKET',
+      lines: [
+        notifyRow('Quota', quotaText),
+        notifyRow('Limit IP', notifyLimitIp(account.limitip ?? account.iplimit)),
+        status !== 'AKTIF' ? notifyRow('Status', notifyStatusLabel(status)) : null
+      ]
+    }
+  ], status === 'LOCK_QUOTA' ? 'Akun masih terkunci: pemakaian sudah melewati quota baru.' : '');
+}
+
+// Akun yang dihapus cukup identitasnya; password, port, dan link tidak dikirim lagi.
+function formatDeleteNotification(action, service, account = {}, owner = {}) {
+  const a = String(action || '').trim().toLowerCase();
+  if (a !== 'delete' && a !== 'deleted') return '';
+  return notifyMessage('AKUN DIHAPUS', [
+    {
+      lines: [
+        notifyRow('Layanan', serviceLabel(service)),
+        notifyRow('Username', account.username),
+        notifyRow('Expired', notifyExpiry(accountExpiryValue(account))),
+        notifyRow('Pembeli', notifyOwnerId(owner))
+      ]
+    }
+  ]);
 }
 
 function formatAccountNotification(action, service, account = {}, owner = {}, location = {}) {
-  const renewMessage = formatRenewNotification(action, service, account, owner, location);
-  if (renewMessage) return renewMessage;
-
-  const sshMessage = formatSshCreateNotification(action, service, account, location);
-  if (sshMessage) return sshMessage;
-
-  const xrayMessage = formatXrayCreateNotification(action, service, account, location);
-  if (xrayMessage) return xrayMessage;
-
-  const username = notifyValue(account.username);
-  const kind = /^trial/i.test(username) || String(action || '').trim().toLowerCase() === 'trial' ? 'TRIAL' : 'REGULER';
-  const secret = accountSecretInfo(service, account);
-  const port = account.port || {};
-  const tlsPort = notifyPortValue(port, ['tls', 'any'], service === 'ssh/zivpn' ? '443' : '443');
-  const ntlsPort = notifyPortValue(port, ['none', 'ntls'], '80');
-  const grpcPort = notifyPortValue(port, ['grpc'], '-');
-  const udpgwPort = notifyPortValue(port, ['udpgw'], Array.isArray(account.udpgw?.ports) ? account.udpgw.ports.join(',') : '-');
-  const host = notifyValue(account.hostname || account.host || (String(service || '').includes('ssh') ? DOMAIN : XRAY_LINK_HOST || DOMAIN));
-  const city = notifyValue(account.city || location.city);
-  const isp = notifyValue(account.isp || location.isp);
-  const status = String(action || '').trim().toLowerCase() === 'delete'
-    ? 'DELETED'
-    : notifyValue(account.status || 'AKTIF').toUpperCase();
-  const ownerUser = notifyOwnerValue(owner, 'ownerTelegramId', 'owner_telegram_id');
-  const ownerChat = notifyOwnerValue(owner, 'ownerTelegramChatId', 'owner_telegram_chat_id');
-
-  return [
-    'SC 1FORCR NOTIF',
-    '==============================',
-    `Event    : ${accountEventLabel(action)}`,
-    `Layanan  : ${serviceLabel(service)}`,
-    `Kategori : ${kind}`,
-    `Status   : ${status}`,
-    '',
-    'VPS',
-    `Domain   : ${notifyValue(DOMAIN)}`,
-    `Host     : ${host}`,
-    `City     : ${city}`,
-    `ISP      : ${isp}`,
-    '',
-    'AKUN',
-    `Username : ${username}`,
-    `${secret.label.padEnd(8, ' ')} : ${secret.value}`,
-    `Expired  : ${notifyValue(account.exp || account.expired || account.date_exp || account.to)}`,
-    `Limit IP : ${notifyValue(account.limitip ?? account.iplimit ?? 0, '0')}`,
-    `Quota    : ${accountQuotaValue(account)}`,
-    '',
-    'KONEKSI',
-    `TLS      : ${tlsPort}`,
-    `NTLS     : ${ntlsPort}`,
-    `GRPC     : ${grpcPort}`,
-    `WS Path  : ${accountPathValue(account)}`,
-    `UDPGW    : ${udpgwPort}`,
-    ...accountXrayLinkLines(action, service, account),
-    '',
-    'OWNER',
-    `TG User  : ${ownerUser}`,
-    `TG Chat  : ${ownerChat}`,
-    `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`,
-    '=============================='
-  ].join('\n');
+  return formatRenewNotification(action, service, account, owner)
+    || formatDeleteNotification(action, service, account, owner)
+    || formatSshCreateNotification(action, service, account, owner, location)
+    || formatXrayCreateNotification(action, service, account, owner, location)
+    || notifyMessage(accountEventLabel(action), [
+      {
+        lines: [
+          notifyRow('Layanan', serviceLabel(service)),
+          notifyRow('Username', account.username),
+          notifyRow('Expired', notifyExpiry(accountExpiryValue(account), true)),
+          notifyRow('Limit IP', notifyLimitIp(account.limitip ?? account.iplimit)),
+          notifyRow('Quota', notifyQuota(account.quota)),
+          notifyRow('Pembeli', notifyOwnerId(owner))
+        ]
+      }
+    ]);
 }
 
 async function notifyAccountEvent(action, service, account, owner) {
@@ -5221,32 +5178,38 @@ async function notifyAccountEvent(action, service, account, owner) {
     await telegramNotify(formatAccountNotification(action, service, account || {}, owner || {}, location));
   } catch (_) {}
 }
+
+function formatExpiredAccountNotification(service, account = {}, owner = {}) {
+  const username = notifyValue(account?.username);
+  return notifyMessage('AKUN EXPIRED', [
+    {
+      lines: [
+        notifyRow('Layanan', serviceLabel(service)),
+        notifyRow('Username', username),
+        isTrialAction('', username) ? notifyRow('Kategori', 'Trial') : null,
+        notifyRow('Expired', notifyExpiry(accountExpiryValue(account || {}))),
+        notifyRow('Pembeli', notifyOwnerId(owner))
+      ]
+    }
+  ]);
+}
+
+function formatExpiredAccountsBatchNotification(service, list = []) {
+  const rows = list.slice(0, 30).map((acc, idx) => {
+    const user = notifyValue(acc?.username);
+    const exp = notifyExpiry(acc?.date_exp || acc?.exp || acc?.expired);
+    return `${idx + 1}. ${user}${exp ? ` • ${exp}` : ''}`;
+  });
+  return notifyMessage(`AKUN EXPIRED (${list.length})`, [
+    { lines: [notifyRow('Layanan', serviceLabel(service))] },
+    { title: 'DAFTAR AKUN', lines: [...rows, list.length > 30 ? `+${list.length - 30} akun lainnya` : null] }
+  ]);
+}
+
 async function notifyExpiredAccountEvent(service, account = {}, owner = {}) {
   try {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    const userId = Number(owner?.ownerTelegramId || owner?.owner_telegram_id || 0) !== 0
-      ? String(owner.ownerTelegramId ?? owner.owner_telegram_id)
-      : '-';
-    const chatId = Number(owner?.ownerTelegramChatId || owner?.owner_telegram_chat_id || 0) !== 0
-      ? String(owner.ownerTelegramChatId ?? owner.owner_telegram_chat_id)
-      : '-';
-    const username = String(account?.username || '-');
-    const exp = String(account?.exp || account?.expired || account?.date_exp || '-');
-    const limitip = String(account?.limitip ?? account?.iplimit ?? '0');
-    const kind = /^trial/i.test(username) ? 'TRIAL' : 'REGULER';
-    const msg =
-      `SC 1FORCR NOTIF\n` +
-      `Event    : EXPIRED\n` +
-      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
-      `Domain   : ${DOMAIN || '-'}\n` +
-      `Username : ${username}\n` +
-      `Kategori : ${kind}\n` +
-      `Expired  : ${exp}\n` +
-      `Limit IP : ${limitip}\n` +
-      `TG User  : ${userId}\n` +
-      `TG Chat  : ${chatId}\n` +
-      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
-    await telegramNotify(msg);
+    await telegramNotify(formatExpiredAccountNotification(service, account, owner));
   } catch (_) {}
 }
 async function notifyExpiredAccountsBatchEvent(service, accounts = []) {
@@ -5254,25 +5217,10 @@ async function notifyExpiredAccountsBatchEvent(service, accounts = []) {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const list = await filterStillExpiredBatchForNotify(service, accounts);
     if (list.length === 0) return;
-    const rows = list.slice(0, 30).map((acc, idx) => {
-      const user = String(acc?.username || '-').trim() || '-';
-      const exp = String(acc?.date_exp || acc?.exp || acc?.expired || '-').trim() || '-';
-      const lim = String(acc?.limitip ?? '0').trim() || '0';
-      return `${idx + 1}. ${user} | exp ${exp} | lim ${lim}`;
-    });
-    const remain = list.length > 30 ? `\n... +${list.length - 30} akun lainnya` : '';
-    const msg =
-      `SC 1FORCR NOTIF\n` +
-      `Event    : EXPIRED_BATCH\n` +
-      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
-      `Domain   : ${DOMAIN || '-'}\n` +
-      `Total    : ${list.length}\n` +
-      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n\n` +
-      rows.join('\n') +
-      remain;
-    await telegramNotify(msg);
+    await telegramNotify(formatExpiredAccountsBatchNotification(service, list));
   } catch (_) {}
 }
+
 function expiredNotifyTableForService(service) {
   const s = String(service || '').trim().toLowerCase();
   if (s.includes('ssh') || s.includes('zivpn') || s.includes('udphc')) return 'account_sshs';
@@ -6392,26 +6340,20 @@ async function notifyDeletedExpiredAccountsBatch(removedRows) {
       for (const row of rows) {
         if (names.length >= 30) break;
         const username = String(row?.username || '').trim();
-        if (username) names.push(`${type.toUpperCase()}: ${username}`);
+        if (username) names.push(`${names.length + 1}. ${notifyValue(username)} (${serviceLabel(type)})`);
       }
     }
     const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
     if (total < 1) return;
     const remaining = Math.max(0, total - names.length);
-    const detail = names.length > 0 ? `\n\n${names.join('\n')}` : '';
-    const suffix = remaining > 0 ? `\n... +${remaining} akun lainnya` : '';
-    await telegramNotify(
-      `SC 1FORCR NOTIF\n` +
-      `Event    : DELETE_EXPIRED_ALL\n` +
-      `Domain   : ${DOMAIN || '-'}\n` +
-      `Total    : ${total}\n` +
-      `SSH      : ${counts.ssh}\n` +
-      `VMESS    : ${counts.vmess}\n` +
-      `VLESS    : ${counts.vless}\n` +
-      `TROJAN   : ${counts.trojan}\n` +
-      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}` +
-      detail + suffix
-    );
+    await telegramNotify(notifyMessage(`AKUN EXPIRED DIHAPUS (${total})`, [
+      {
+        lines: ['ssh', 'vmess', 'vless', 'trojan']
+          .filter((type) => counts[type] > 0)
+          .map((type) => notifyRow(serviceLabel(type), `${counts[type]} akun`))
+      },
+      { title: 'DAFTAR AKUN', lines: [...names, remaining > 0 ? `+${remaining} akun lainnya` : null] }
+    ]));
   } catch (_) {}
 }
 
@@ -9176,6 +9118,71 @@ function telegramNotify(text) {
   return telegramNotifyTo(TELEGRAM_CHAT_ID, text);
 }
 
+// Tampilan notifikasi sama dengan api.js: judul, garis tebal, bagian dipisah
+// garis tipis, penutup domain + waktu WIB. Plain text, tanpa parse_mode.
+const NOTIFY_RULE = '━━━━━━━━━━━━━━━━━━━━━━';
+const NOTIFY_SUBRULE = '──────────────────────';
+
+function notifyText(value) {
+  return String(value ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+}
+
+// WIB = UTC+7 tanpa DST; dihitung manual supaya tidak bergantung data ICU Node.
+function notifyTimeWib(ms = Date.now()) {
+  const d = new Date(Number(ms) + 7 * 3600 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getUTCDate())}-${pad(d.getUTCMonth() + 1)}-${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} WIB`;
+}
+
+function notifyRow(label, value) {
+  const text = notifyText(value);
+  if (!text || text === '-') return null;
+  return `${String(label).padEnd(9, ' ')}: ${text}`;
+}
+
+function notifyMessage(title, sections = [], note = '') {
+  const lines = [String(title || 'SC 1FORCR'), NOTIFY_RULE];
+  let count = 0;
+  for (const section of sections) {
+    const body = (section?.lines || []).filter((line) => line !== null && line !== undefined && line !== false);
+    if (!body.some((line) => String(line).trim())) continue;
+    if (count > 0) lines.push(NOTIFY_SUBRULE);
+    if (section.title) lines.push(section.title);
+    lines.push(...body);
+    count += 1;
+  }
+  lines.push(NOTIFY_RULE);
+  if (note) lines.push(note);
+  lines.push(`SC 1FORCR • ${notifyText(DOMAIN) || '-'}`, notifyTimeWib());
+  return lines.join('\n');
+}
+
+function notifyOwnerId(...values) {
+  for (const value of values) {
+    const n = Number(value || 0);
+    if (Number.isInteger(n) && n !== 0) return `ID ${n}`;
+  }
+  return '';
+}
+
+function notifyServiceLabel(service) {
+  const s = String(service || '').trim().toLowerCase();
+  if (s.includes('ssh') || s.includes('zivpn') || s.includes('udphc')) return 'SSH';
+  return notifyText(service).toUpperCase() || '-';
+}
+
+function notifyLimitIp(value) {
+  const n = Math.floor(Number(value || 0));
+  return Number.isFinite(n) && n > 0 ? String(n) : 'Tanpa batas';
+}
+
+function notifyExpiry(value) {
+  const raw = notifyText(value);
+  const m = /^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}))?/.exec(raw);
+  if (!m) return raw === '-' ? '' : raw;
+  return m[2] ? `${m[1]} ${m[2]}` : m[1];
+}
+
 function postJsonResult(urlRaw, payload, token = '') {
   return new Promise((resolve) => {
     if (!urlRaw || !payload) return resolve({ ok: false, statusCode: 0, error: 'webhook-not-configured' });
@@ -9281,23 +9288,30 @@ function normalizeMultiLoginEvidence(service, detected, ips = [], extra = null) 
 
 function buildMultiLoginMessage(event) {
   const list = Array.isArray(event?.ips) ? event.ips.filter(Boolean).slice(0, 8) : [];
-  return (
-    `SC 1FORCR NOTIF\n` +
-    `Event    : MULTI_LOGIN\n` +
-    `Action   : LOCK_TMP\n` +
-    `Domain   : ${event?.source_domain || '-'}\n` +
-    `Layanan  : ${String(event?.service || '-').toUpperCase()}\n` +
-    `Username : ${String(event?.username || '-')}\n` +
-    `Limit IP : ${Number(event?.limitip || 0)}\n` +
-    `Detected : ${Number(event?.detected || 0)}\n` +
-    `${Number(event?.observed_ip_raw_count || 0) > Number(event?.detected || 0) ? `IP Audit : ${Number(event.observed_ip_raw_count)} mentah\n` : ''}` +
-    `${event?.lock_reason ? `Reason   : ${event.lock_reason}\n` : ''}` +
-    `${event?.device_detected_label ? `Info     : ${event.device_detected_label}\n` : ''}` +
-    `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
-    `Unlock   : ${Number(event?.unlock_minutes || LOCK_MINUTES || 15)} menit\n` +
-    `TG User  : ${event?.owner_telegram_id || '-'}\n` +
-    `TG Chat  : ${event?.owner_telegram_chat_id || '-'}`
-  );
+  const isXray = ['vmess', 'vless', 'trojan'].includes(String(event?.service || '').trim().toLowerCase());
+  const detected = Number(event?.detected || 0);
+  const observed = Number(event?.observed_ip_raw_count || 0);
+  const label = notifyText(event?.device_detected_label);
+  return notifyMessage('AKUN DIKUNCI: MULTI LOGIN', [
+    {
+      lines: [
+        notifyRow('Layanan', notifyServiceLabel(event?.service)),
+        notifyRow('Username', event?.username),
+        notifyRow('Limit IP', notifyLimitIp(event?.limitip)),
+        notifyRow('Deteksi', `${detected} ${isXray ? 'jaringan' : 'IP'}`),
+        notifyRow('Dibuka', `otomatis ${Number(event?.unlock_minutes || LOCK_MINUTES || 15)} menit lagi`),
+        notifyRow('Pembeli', notifyOwnerId(event?.owner_telegram_id, event?.owner_telegram_chat_id))
+      ]
+    },
+    {
+      title: 'BUKTI',
+      lines: [
+        notifyRow('Alasan', event?.lock_reason),
+        label || (observed > detected ? `${observed} IP mentah teramati` : null),
+        ...list.map((ip, idx) => `${idx + 1}. ${notifyText(ip)}`)
+      ]
+    }
+  ]);
 }
 
 async function deliverMultiLoginNotifications(event, historyId = 0, previous = null) {
@@ -9407,17 +9421,17 @@ async function notifyLongTermIpWarning(username, limitip, detected, ips = [], no
   if (previousAt > 0 && count <= previousCount && (ts - previousAt) < cooldownSeconds) return false;
 
   const list = Array.from(new Set((Array.isArray(ips) ? ips : []).map((v) => String(v || '').trim()).filter(Boolean))).slice(0, 8);
-  const message =
-    `SC 1FORCR NOTIF\n` +
-    `Event    : IP_HISTORY_WARNING\n` +
-    `Action   : NO_LOCK\n` +
-    `Domain   : ${DOMAIN || '-'}\n` +
-    `Username : ${user}\n` +
-    `Limit IP : ${limit}\n` +
-    `IP 24 Jam: ${count}\n` +
-    `Info     : Riwayat IP melewati ambang audit; akun tidak dikunci.\n` +
-    (list.length > 0 ? `IPs      : ${list.join(', ')}\n` : '') +
-    `Time     : ${new Date(ts * 1000).toISOString()}`;
+  const message = notifyMessage('PERINGATAN RIWAYAT IP', [
+    {
+      lines: [
+        notifyRow('Layanan', 'SSH'),
+        notifyRow('Username', user),
+        notifyRow('Limit IP', notifyLimitIp(limit)),
+        notifyRow('IP 24 jam', String(count))
+      ]
+    },
+    { title: 'IP TERAKHIR', lines: list.map((ip, idx) => `${idx + 1}. ${notifyText(ip)}`) }
+  ], 'Hanya catatan audit, akun tidak dikunci.');
 
   console.warn(`[iplimit-warning] user=${user} ip24h=${count} limit=${limit} action=no-lock`);
   if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
@@ -9466,35 +9480,21 @@ async function notifyQuotaLock(service, username, quotaBytes, usedBytes, ownerId
     };
     await notifyAccountBotMultiLogin(event);
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    const msg =
-      `SC 1FORCR NOTIF\n` +
-      `==============================\n` +
-      `Event    : QUOTA HABIS\n` +
-      `Action   : LOCK_QUOTA\n` +
-      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
-      `Username : ${username}\n` +
-      `Quota    : ${bytesToGbText(quotaBytes)}\n` +
-      `Terpakai : ${bytesToGbText(usedBytes)}\n` +
-      `Status   : LOCK sampai admin tambah/edit quota\n` +
-      `TG User  : ${ownerIdNum > 0 ? ownerIdNum : '-'}\n` +
-      `TG Chat  : ${ownerChatTarget ? ownerChatIdNum : '-'}\n` +
-      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n` +
-      `==============================`;
+    const usageLines = [
+      notifyRow('Layanan', notifyServiceLabel(service)),
+      notifyRow('Username', username),
+      notifyRow('Quota', bytesToGbText(quotaBytes)),
+      notifyRow('Terpakai', bytesToGbText(usedBytes))
+    ];
+    const msg = notifyMessage('AKUN DIKUNCI: QUOTA HABIS', [
+      { lines: [...usageLines, notifyRow('Pembeli', notifyOwnerId(ownerIdNum, ownerChatIdNum))] }
+    ], 'Terbuka lagi setelah quota ditambah atau akun diperpanjang.');
     await telegramNotify(msg);
     if (ownerTarget && ownerTarget !== String(TELEGRAM_CHAT_ID || '').trim()) {
-      const ownerMsg =
-        `SC 1FORCR\n` +
-        `==============================\n` +
-        `Event    : QUOTA HABIS\n` +
-        `Layanan  : ${String(service || '-').toUpperCase()}\n` +
-        `Username : ${username}\n` +
-        `Domain   : ${DOMAIN || '-'}\n` +
-        `Quota    : ${bytesToGbText(quotaBytes)}\n` +
-        `Terpakai : ${bytesToGbText(usedBytes)}\n` +
-        `Status   : Akun dikunci otomatis\n` +
-        `Info     : Hubungi admin untuk tambah quota agar akun bisa dibuka kembali.\n` +
-        `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n` +
-        `==============================`;
+      // Pesan untuk pemilik akun: tanpa ID Telegram dan data internal lain.
+      const ownerMsg = notifyMessage('QUOTA AKUN HABIS', [
+        { lines: usageLines }
+      ], 'Akun dikunci otomatis. Hubungi admin untuk menambah quota.');
       await telegramNotifyTo(ownerTarget, ownerMsg);
     }
   } catch (_) {}
@@ -9504,18 +9504,17 @@ async function notifyExpiredAccount(service, username, exp, limitip = 0, ownerId
   try {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const user = String(username || '-').trim() || '-';
-    const kind = /^trial/i.test(user) ? 'TRIAL' : 'REGULER';
-    const msg =
-      `SC 1FORCR NOTIF\n` +
-      `Event    : EXPIRED\n` +
-      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
-      `Username : ${user}\n` +
-      `Kategori : ${kind}\n` +
-      `Expired  : ${String(exp || '-')}\n` +
-      `Limit IP : ${Number(limitip || 0)}\n` +
-      `TG User  : ${ownerId || '-'}\n` +
-      `TG Chat  : ${ownerChatId || '-'}\n` +
-      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+    const msg = notifyMessage('AKUN EXPIRED', [
+      {
+        lines: [
+          notifyRow('Layanan', notifyServiceLabel(service)),
+          notifyRow('Username', user),
+          /^trial/i.test(user) ? notifyRow('Kategori', 'Trial') : null,
+          notifyRow('Expired', notifyExpiry(exp)),
+          notifyRow('Pembeli', notifyOwnerId(ownerId, ownerChatId))
+        ]
+      }
+    ]);
     await telegramNotify(msg);
   } catch (_) {}
 }
@@ -9525,20 +9524,14 @@ async function notifyExpiredAccountsBatch(service, accounts = []) {
     const list = await filterStillExpiredBatchForNotify(service, accounts);
     if (list.length === 0) return;
     const rows = list.slice(0, 30).map((acc, idx) => {
-      const user = String(acc?.username || '-').trim() || '-';
-      const exp = String(acc?.exp || acc?.date_exp || '-').trim() || '-';
-      const lim = Number(acc?.limitip || 0);
-      return `${idx + 1}. ${user} | exp ${exp} | lim ${lim}`;
+      const user = notifyText(acc?.username) || '-';
+      const exp = notifyExpiry(acc?.exp || acc?.date_exp);
+      return `${idx + 1}. ${user}${exp ? ` • ${exp}` : ''}`;
     });
-    const remain = list.length > 30 ? `\n... +${list.length - 30} akun lainnya` : '';
-    const msg =
-      `SC 1FORCR NOTIF\n` +
-      `Event    : EXPIRED_BATCH\n` +
-      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
-      `Total    : ${list.length}\n` +
-      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}\n\n` +
-      rows.join('\n') +
-      remain;
+    const msg = notifyMessage(`AKUN EXPIRED (${list.length})`, [
+      { lines: [notifyRow('Layanan', notifyServiceLabel(service))] },
+      { title: 'DAFTAR AKUN', lines: [...rows, list.length > 30 ? `+${list.length - 30} akun lainnya` : null] }
+    ]);
     await telegramNotify(msg);
   } catch (_) {}
 }
@@ -15155,21 +15148,25 @@ if [[ -n "${TELEGRAM_BOT_TOKEN}" && -n "${TELEGRAM_CHAT_ID}" ]]; then
   tg_err_log="/var/log/sc-1forcr-autobackup-telegram.err"
   TELEGRAM_BOT_TOKEN="$(echo "${TELEGRAM_BOT_TOKEN}" | tr -d '[:space:]')"
   TELEGRAM_CHAT_ID="$(echo "${TELEGRAM_CHAT_ID}" | tr -d '[:space:]')"
-  host="$(hostname 2>/dev/null || echo vps)"
   ssh_count="$(jq -r '.data.ssh | length' "${backup_json}" 2>/dev/null || echo 0)"
   vmess_count="$(jq -r '.data.vmess | length' "${backup_json}" 2>/dev/null || echo 0)"
   vless_count="$(jq -r '.data.vless | length' "${backup_json}" 2>/dev/null || echo 0)"
   trojan_count="$(jq -r '.data.trojan | length' "${backup_json}" 2>/dev/null || echo 0)"
-  banner_html_on="$(jq -r 'if (.data.banner_html // "") != "" then "yes" else "no" end' "${backup_json}" 2>/dev/null || echo no)"
-  banner_txt_on="$(jq -r 'if (.data.banner_txt // "") != "" then "yes" else "no" end' "${backup_json}" 2>/dev/null || echo no)"
-  caption="SC 1FORCR NOTIF
-Event    : AUTO_BACKUP
-Domain   : ${DOMAIN}
-Host     : ${host}
-WIB      : $(TZ=Asia/Jakarta date '+%F %T')
-File     : $(basename "${backup_json}")
-Akun     : SSH/ZIVPN=${ssh_count} VMESS=${vmess_count} VLESS=${vless_count} TROJAN=${trojan_count}
-Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
+  total_count=0
+  for n in "${ssh_count}" "${vmess_count}" "${vless_count}" "${trojan_count}"; do
+    [[ "${n}" =~ ^[0-9]+$ ]] && total_count=$(( total_count + n ))
+  done
+  # Susunan sama dengan notifikasi lain: judul, garis, isi, garis, domain + waktu WIB.
+  notify_rule="━━━━━━━━━━━━━━━━━━━━━━"
+  caption_body="File     : $(basename "${backup_json}")
+Total    : ${total_count} akun
+SSH      : ${ssh_count}
+VMESS    : ${vmess_count}
+VLESS    : ${vless_count}
+TROJAN   : ${trojan_count}"
+  caption_footer="${notify_rule}
+SC 1FORCR • ${DOMAIN:--}
+$(TZ=Asia/Jakarta date '+%d-%m-%Y %H:%M WIB')"
 
   tg_api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
   if curl --http1.1 -fsS --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 90 -X POST "${tg_api}/sendDocument" \
@@ -15178,7 +15175,10 @@ Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
     # Kirim ringkasan terpisah agar upload dokumen tetap kompatibel di jaringan yang sensitif multipart.
     curl --http1.1 -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
       -d "chat_id=${TELEGRAM_CHAT_ID}" \
-      --data-urlencode "text=${caption}" >/dev/null 2>>"${tg_err_log}" || true
+      --data-urlencode "text=BACKUP OTOMATIS
+${notify_rule}
+${caption_body}
+${caption_footer}" >/dev/null 2>>"${tg_err_log}" || true
   else
     {
       echo "[$(date '+%F %T')] sendDocument gagal untuk file: ${backup_json}"
@@ -15187,8 +15187,11 @@ Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
     # Fallback: minimal kirim notifikasi teks jika upload dokumen gagal.
     curl --http1.1 -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
       -d "chat_id=${TELEGRAM_CHAT_ID}" \
-      --data-urlencode "text=${caption}
-Backup file tersimpan lokal: ${backup_json}" >/dev/null 2>>"${tg_err_log}" || true
+      --data-urlencode "text=BACKUP OTOMATIS (FILE GAGAL DIKIRIM)
+${notify_rule}
+${caption_body}
+Lokasi   : ${backup_json}
+${caption_footer}" >/dev/null 2>>"${tg_err_log}" || true
     logger -t sc-1forcr "Auto-backup Telegram sendDocument gagal, fallback sendMessage dipakai."
   fi
 fi
@@ -16992,7 +16995,7 @@ send_tg_report() {
   for (( idx = 0; idx < total; idx++ )); do
     part="${chunks[idx]}"
     if [[ "${idx}" -gt 0 ]]; then
-      part="SC 1FORCR NOTIF (lanjutan $(( idx + 1 ))/${total})"$'\n'"${part}"
+      part="LAPORAN AKUN ONLINE (lanjutan $(( idx + 1 ))/${total})"$'\n'"━━━━━━━━━━━━━━━━━━━━━━"$'\n'"${part}"
       sleep 1
     fi
     send_tg "${part}" || return 1
@@ -17599,24 +17602,37 @@ format_user_rows() {
     }
     END {
       if (n == 0) {
-        printf "  - -\n"
+        printf "-\n"
         exit
       }
       for (i = 1; i <= n; i++) {
-        printf "  - %s (%s %s)\n", users[i], vals[i], unit
+        printf "%d. %s (%s %s)\n", i, users[i], vals[i], tolower(unit)
       }
     }
   '
 }
 
+# Protokol tanpa akun online tidak ditampilkan, supaya laporan tetap ringkas.
 format_protocol_block() {
   local proto="$1" cnt="$2" users="$3" unit="${4:-SESI}"
-  printf -- "\n[%s] %s akun\n" "${proto}" "${cnt}"
   if [[ -z "${cnt}" || ! "${cnt}" =~ ^[0-9]+$ || "${cnt}" -le 0 ]]; then
-    echo "  - -"
-    return
+    return 0
   fi
+  printf 'ONLINE %s (%s)\n' "${proto}" "${cnt}"
   format_user_rows "${users}" "${unit}"
+}
+
+online_blocks=""
+append_protocol_block() {
+  local block
+  block="$(format_protocol_block "$@")"
+  if [[ -z "${block}" ]]; then
+    return 0
+  fi
+  if [[ -n "${online_blocks}" ]]; then
+    online_blocks+=$'\n\n'
+  fi
+  online_blocks+="${block}"
 }
 
 online_total_detected="$((ssh_cnt + xray_cnt + udphc_cnt + zivpn_cnt))"
@@ -17639,26 +17655,31 @@ if [[ "${ONLINE_NOTIFY_STATE_ONLY}" == "1" ]]; then
   exit 0
 fi
 
-msg="SC 1FORCR NOTIF
-Event: ONLINE_REPORT
-Domain: ${DOMAIN}
-Waktu: $(date '+%F %T')
-Interval: ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
-Monitor XRAY: ${xray_monitor_mode}
-Handoff ZIVPN: ${ZIVPN_HANDOFF_GRACE_SECONDS} detik
+append_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}" "SESI"
+append_protocol_block "XRAY" "${xray_cnt}" "${xray_users}" "JARINGAN"
+append_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}" "SESI"
+append_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}" "IP"
+if [[ -z "${online_blocks}" ]]; then
+  online_blocks="Tidak ada akun yang online saat ini."
+fi
 
-RINGKASAN AKUN AKTIF
-- SSH/UDPHC: ${acct_ssh}
-- VMESS: ${acct_vmess}
-- VLESS: ${acct_vless}
-- TROJAN: ${acct_trojan}
-
-ONLINE TERDETEKSI
-$(format_protocol_block "SSH" "${ssh_cnt}" "${ssh_users}" "SESI")
-$(format_protocol_block "XRAY" "${xray_cnt}" "${xray_users}" "JARINGAN")
-$(format_protocol_block "UDPHC" "${udphc_cnt}" "${udphc_users}" "SESI")
-$(format_protocol_block "ZIVPN" "${zivpn_cnt}" "${zivpn_users}" "IP")
-"
+NOTIFY_RULE="━━━━━━━━━━━━━━━━━━━━━━"
+NOTIFY_SUBRULE="──────────────────────"
+msg="LAPORAN AKUN ONLINE
+${NOTIFY_RULE}
+Online   : ${online_total_detected} akun
+Interval : tiap ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
+${NOTIFY_SUBRULE}
+AKUN AKTIF
+SSH      : ${acct_ssh}
+VMESS    : ${acct_vmess}
+VLESS    : ${acct_vless}
+TROJAN   : ${acct_trojan}
+${NOTIFY_SUBRULE}
+${online_blocks}
+${NOTIFY_RULE}
+SC 1FORCR • ${DOMAIN:--}
+$(TZ=Asia/Jakarta date '+%d-%m-%Y %H:%M WIB')"
 
 if send_tg_report "${msg}"; then
   mark_online_report_sent
@@ -19994,14 +20015,35 @@ telegram_notify() {
   echo "${resp}" | jq -e '.ok == true' >/dev/null 2>&1
 }
 
+# Susunan sama dengan notifikasi API: judul, garis, baris isi, garis, lalu
+# domain + waktu WIB. Pakai: telegram_notify_box "JUDUL" "Label    : nilai" ...
+telegram_notify_box() {
+  local title="$1" rule="━━━━━━━━━━━━━━━━━━━━━━" body="" line
+  shift
+  for line in "$@"; do
+    if [[ -n "${line}" ]]; then
+      body+="${line}"$'\n'
+    fi
+  done
+  telegram_notify "${title}
+${rule}
+${body}${rule}
+SC 1FORCR • ${DOMAIN:--}
+$(TZ=Asia/Jakarta date '+%d-%m-%Y %H:%M WIB')"
+}
+
 telegram_notify_action() {
-  local action="$1" type="$2" username="$3"
-  telegram_notify "SC 1FORCR
-Event    : ${action}
-Layanan  : ${type}
-Domain   : ${DOMAIN}
-Username : ${username}
-Time     : $(date '+%F %T')"
+  local action="$1" type="$2" username="$3" title
+  case "${action}" in
+    LOCK) title="AKUN DIKUNCI" ;;
+    UNLOCK) title="AKUN DIBUKA" ;;
+    CHANGE_PASSWORD) title="PASSWORD AKUN DIGANTI" ;;
+    *) title="AKUN ${action}" ;;
+  esac
+  telegram_notify_box "${title}" \
+    "Layanan  : $(printf '%s' "${type}" | tr '[:lower:]' '[:upper:]')" \
+    "Username : ${username}" \
+    "Oleh     : Menu VPS"
 }
 
 cancelled() {
@@ -27265,7 +27307,7 @@ update_script_from_repo() {
   local url tmp active_backend downloaded_ok derived_url update_snapshot url_candidates candidate_url
   local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
-  local update_note ts_now new_ver update_log update_tail
+  local new_ver update_log update_tail
   local downloaded_version current_version expected_version downloaded_revision current_revision
   local license_base_url manifest_resp manifest_token
   # Undrop rule burst SSHWS lama saat update agar koneksi tidak nyangkut.
@@ -27312,12 +27354,7 @@ update_script_from_repo() {
   done < <(printf '%s' "${url_candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
   if [[ "${downloaded_ok}" != "1" ]]; then
     echo "Gagal download update script."
-    telegram_notify "SC 1FORCR NOTIF
-Event    : UPDATE_SCRIPT
-Status   : GAGAL
-Domain   : ${DOMAIN}
-Alasan   : gagal download script update
-Time     : $(date '+%F %T')"
+    telegram_notify_box "UPDATE SCRIPT GAGAL"       "Alasan   : gagal download script update"       "Status   : versi lama tetap berjalan"
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
   fi
@@ -27326,22 +27363,12 @@ Time     : $(date '+%F %T')"
   chmod +x "${tmp}"
   if ! bash -n "${tmp}"; then
     echo "Update script gagal validasi syntax (bash -n)."
-    telegram_notify "SC 1FORCR NOTIF
-Event    : UPDATE_SCRIPT
-Status   : GAGAL
-Domain   : ${DOMAIN}
-Alasan   : validasi syntax script gagal
-Time     : $(date '+%F %T')"
+    telegram_notify_box "UPDATE SCRIPT GAGAL"       "Alasan   : validasi syntax script gagal"       "Status   : versi lama tetap berjalan"
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
   fi
   if ! validate_downloaded_update_payload "${tmp}"; then
-    telegram_notify "SC 1FORCR NOTIF
-Event    : UPDATE_SCRIPT
-Status   : GAGAL
-Domain   : ${DOMAIN}
-Alasan   : payload update tidak lengkap, helper wajib tidak ditemukan
-Time     : $(date '+%F %T')"
+    telegram_notify_box "UPDATE SCRIPT GAGAL"       "Alasan   : payload update tidak lengkap, helper wajib tidak ditemukan"       "Status   : versi lama tetap berjalan"
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
   fi
@@ -27598,15 +27625,13 @@ Time     : $(date '+%F %T')"
     ACTIVE_UDP_BACKEND="${active_backend}" \
     bash "${tmp}" 2>&1 | tee "${update_log}"; then
     echo "Update script gagal dijalankan."
-    update_tail="$(tail -c 1800 "${update_log}" 2>/dev/null | tr '\n' ' ' | cut -c1-1400)"
-    [[ -z "${update_tail}" ]] && update_tail="cek ${update_log} atau /var/log/sc-1forcr-pull-update.log"
-    telegram_notify "SC 1FORCR NOTIF
-Event    : UPDATE_SCRIPT
-Status   : GAGAL
-Domain   : ${DOMAIN}
-Alasan   : installer update exit non-zero
-Log      : ${update_tail}
-Time     : $(date '+%F %T')"
+    # Cukup ujung log (bagian yang memuat error); log lengkap tetap di VPS.
+    update_tail="$(tail -c 600 "${update_log}" 2>/dev/null | tr '\n' ' ' | tr -s ' ')"
+    [[ -z "${update_tail}" ]] && update_tail="-"
+    telegram_notify_box "UPDATE SCRIPT GAGAL" \
+      "Alasan   : installer update exit non-zero" \
+      "Log VPS  : ${update_log}" \
+      "Akhir log: ${update_tail}"
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
   fi
@@ -27651,34 +27676,21 @@ Time     : $(date '+%F %T')"
     echo "Semua service selesai direstart otomatis setelah update."
   fi
 
-  ts_now="$(date '+%F %T')"
   new_ver="-"
   if [[ -f /etc/sc-1forcr-version ]]; then
     new_ver="$(awk -F= '/^SCRIPT_VERSION=/{print $2}' /etc/sc-1forcr-version | head -n1)"
     [[ -z "${new_ver}" ]] && new_ver="-"
   fi
   if [[ "${new_ver}" != "${downloaded_version}" ]]; then
-    update_note="SC 1FORCR NOTIF
-Event    : UPDATE_SCRIPT
-Status   : GAGAL
-Domain   : ${DOMAIN}
-Alasan   : marker versi ${new_ver} tidak sama dengan payload ${downloaded_version}
-Time     : ${ts_now}"
-    telegram_notify "${update_note}"
+    telegram_notify_box "UPDATE SCRIPT GAGAL" \
+      "Alasan   : marker versi ${new_ver} tidak sama dengan payload ${downloaded_version}"
     echo "Update gagal diverifikasi: marker ${new_ver}, payload ${downloaded_version}."
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return 1
   fi
-  update_note="SC 1FORCR NOTIF
-Event    : UPDATE_SCRIPT
-Status   : BERHASIL
-Domain   : ${DOMAIN}
-Version  : ${new_ver}
-Time     : ${ts_now}
-IPLimit  : ${IPLIMIT_CHECK_INTERVAL_MINUTES}m/${IPLIMIT_LOCK_MINUTES}m
-Backup   : ${AUTO_BACKUP_ENABLE}
-Online   : ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h win=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}s"
-  telegram_notify "${update_note}"
+  telegram_notify_box "UPDATE SCRIPT BERHASIL" \
+    "Versi    : ${new_ver}" \
+    "Mode     : $([[ "${UPDATE_SAFE_MODE:-0}" == "1" ]] && echo "aman, tanpa restart penuh" || echo "semua service direstart")"
 
   rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
   return 0
@@ -27829,10 +27841,8 @@ set_telegram_notif_config() {
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
     if prompt_input ans "Kirim pesan test sekarang? [y/N]: "; then
       if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
-        if telegram_notify "SC 1FORCR NOTIF
-Event    : TEST_NOTIF
-Domain   : ${DOMAIN}
-Time     : $(date '+%F %T')"; then
+        if telegram_notify_box "TES NOTIFIKASI" \
+          "Status   : notifikasi Telegram VPS ini aktif"; then
           echo "Pesan test dikirim (cek chat Telegram)."
         else
           echo "Gagal kirim pesan test Telegram (token/chat_id/bot permission kemungkinan belum benar)."

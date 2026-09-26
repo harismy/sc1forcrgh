@@ -50,7 +50,7 @@ const checkerForPolicyTest = `${checkerSource.slice(0, mainCallIndex)}
 globalThis.__xrayPolicy = {
   selectXrayRecentIpMap,
   countIpGroups,
-  countXrayEffectiveDevices,
+  countEffectiveDevices,
   xrayRepresentativeIps,
   normalizeMultiLoginEvidence,
   xrayViolationSignal,
@@ -190,22 +190,22 @@ assert.notStrictEqual(
 );
 
 assert.strictEqual(
-  policy.countXrayEffectiveDevices(new Set(['140.213.1.1', '140.213.200.2']), 16),
+  policy.countEffectiveDevices(new Set(['140.213.1.1', '140.213.200.2']), 16),
   1,
   'carrier handoff addresses in one /16 must count as one device'
 );
 assert.strictEqual(
-  policy.countXrayEffectiveDevices(new Set(['140.213.1.1', '182.5.10.2']), 16),
+  policy.countEffectiveDevices(new Set(['140.213.1.1', '182.5.10.2']), 16),
   2,
   'two active IPv4 carrier groups must count as two devices'
 );
 assert.strictEqual(
-  policy.countXrayEffectiveDevices(new Set(['140.213.1.1', '2001:db8::1']), 16),
+  policy.countEffectiveDevices(new Set(['140.213.1.1', '2001:db8::1']), 16),
   1,
   'one IPv4 plus one IPv6 address must be treated as dual-stack'
 );
 assert.strictEqual(
-  policy.countXrayEffectiveDevices(new Set(['2001:db8::1', '2001:db8::abcd']), 16),
+  policy.countEffectiveDevices(new Set(['2001:db8::1', '2001:db8::abcd']), 16),
   1,
   'IPv6 privacy addresses in one /64 must count as one device'
 );

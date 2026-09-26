@@ -30,7 +30,8 @@ Dukungan hemat resource lain yang sudah ada dan tidak boleh dihapus tanpa pengga
 
 - Swapfile 1 GB dibuat otomatis kalau VPS belum punya swap, dengan `vm.swappiness=10`.
 - `MemoryMax=` pada semua service Node/Go, plus `Nice=10` dan `CPUQuota=50%` untuk job periodik berat seperti IP-limit checker.
-- Journald dibatasi `SystemMaxUse=100M`, plus logrotate untuk log service.
+- Journald dibatasi `SystemMaxUse=100M`, plus logrotate untuk log service. Log Xray punya `maxsize 50M` dan `logrotate.timer` dibuat per jam supaya batas itu berlaku. Jangan cantumkan log nginx di `/etc/logrotate.d/sc-1forcr`: paket nginx sudah punya config sendiri, dan file yang tercantum di dua config membuat logrotate menolak bloknya.
+- ZIVPN dan UDP Custom berbagi port. Drop-in `20-sc-udp-exclusive.conf` (`ExecCondition`) menolak start satu backend selama lawannya aktif, supaya tidak ada crash-loop tiap 2 detik. Capacity analyzer jalan tiap 15 menit dengan batas `Nice`/`CPUQuota`/`MemoryMax`. `npm run test:resource-guards` menjaga keduanya.
 - `RESOURCE_TARGET_USAGE_PERCENT` default 85 sebagai batas atas pemakaian yang dianggap sehat.
 
 Kalau menambah service baru: **wajib** ada `MemoryMax=`, dan `Nice=`/`CPUQuota=` kalau sifatnya batch/periodik.
@@ -63,6 +64,16 @@ Xray tidak punya reload, jadi restart memutus **semua** pengguna vmess/vless/tro
 - Akun baru, trial, dan perpanjangan akun expired ditambahkan tanpa restart lewat `HandlerService` (`xray api adu`), lihat `writeXrayConfigAndReload()` di api.js. Penghapusan, pergantian kredensial, dan lock/unlock tetap restart, karena hanya restart yang memutus sesi lama user yang dicabut.
 - `buildXrayRuntimeConfig()` ada di api.js **dan** iplimit-checker.js, dan isinya harus identik termasuk tag inbound. Config yang strukturnya berbeda selalu jatuh ke restart. `npm run test:xray-hot-add` menjaga ini.
 - `HandlerService` bisa membuat akun, jadi hanya aktif kalau rule iptables "hanya root ke 127.0.0.1:10085" dari `apply_tunnel_outbound_guard_rules()` terpasang dan Xray tidak jalan sebagai root. Jangan hapus rule itu.
+
+### IP-limit (auto lock multi-login)
+
+Lock yang salah langsung merugikan pembeli, jadi aturannya condong menghindari false positive:
+
+- Semua protokol memakai `countEffectiveDevices()` di iplimit-checker.js: IPv4 per `XRAY_IP_GROUP_MASK` (default `/16`, pool CGNAT operator), IPv6 per `/64`, dan IPv4+IPv6 yang aktif bersamaan dihitung satu perangkat. Jangan menghitung IP mentah untuk keputusan lock.
+- Lock butuh dua pengecekan berturut-turut dengan sidik jari kelompok IP yang sama (`sampleSshDeviceLimit`, `sampleXrayIpLimit`). Tidak boleh ada jalur lock dari satu sampel.
+- Sesi SSH-WS hanya dihitung kalau klien masih mengirim data sejak pengecekan sebelumnya (kolom `ClientToSSH` di `sshws-quota.tsv`), supaya sesi lama yang mati setelah HP ganti IP tidak terbaca sebagai perangkat kedua.
+- Toleransi ZIVPN limit 1 (maksimal 2 IP dihitung 1) sengaja dipertahankan. Jangan diperketat tanpa data dari `iplimit_lock_history`.
+- Test: `npm run test:iplimit-devices` dan `npm run test:xray-iplimit`.
 
 Timeout HAProxy sengaja panjang (`timeout client/server 12h`) supaya tunnel WS tidak putus sendiri. Yang menjaga socket mati tidak menumpuk adalah `option clitcpka`/`srvtcpka` plus sysctl keepalive agresif (`tcp_keepalive_time=60`, `intvl=15`, `probes=4`). Ketiganya satu paket. Jangan hapus salah satu tanpa mengganti mekanisme penggantinya.
 

@@ -109,7 +109,7 @@ set -euo pipefail
 #   XRAY_LIVE_NATIVE_POLL_SECONDS=15              (opsional, cache query native online Xray agar tetap ringan)
 #   RESOURCE_AUTOTUNE_ENABLE=1                   (opsional, 1=auto tune RAM/CPU service dan capacity analyzer)
 #   RESOURCE_TARGET_USAGE_PERCENT=85             (opsional, target maksimum RAM/CPU sebelum dianggap penuh)
-#   RESOURCE_AUTOTUNE_INTERVAL_MINUTES=5         (opsional, interval analyzer kapasitas)
+#   RESOURCE_AUTOTUNE_INTERVAL_MINUTES=15        (opsional, interval analyzer kapasitas)
 #   RESOURCE_CAPACITY_STATE_FILE=/var/lib/sc-1forcr/capacity.env
 #   EXPIRED_ACCOUNT_RETENTION_DAYS=30            (akun expired dihapus permanen setelah masa recovery)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=3             (opsional, interval checker iplimit dalam menit)
@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.65}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.66}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -255,7 +255,7 @@ ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
 RESOURCE_AUTOTUNE_ENABLE="${RESOURCE_AUTOTUNE_ENABLE:-1}"
 RESOURCE_TARGET_USAGE_PERCENT="${RESOURCE_TARGET_USAGE_PERCENT:-85}"
-RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}"
+RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-15}"
 RESOURCE_CAPACITY_STATE_FILE="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}"
 EXPIRED_ACCOUNT_RETENTION_DAYS="${EXPIRED_ACCOUNT_RETENTION_DAYS:-30}"
 AUTO_PULL_UPDATE_ENABLE="${AUTO_PULL_UPDATE_ENABLE:-1}"
@@ -1166,8 +1166,12 @@ auto_tune_resource_vars() {
   enabled="$(normalize_bool_01 "${RESOURCE_AUTOTUNE_ENABLE}")"
   RESOURCE_AUTOTUNE_ENABLE="${enabled}"
   RESOURCE_TARGET_USAGE_PERCENT="$(sanitize_percent_value "${RESOURCE_TARGET_USAGE_PERCENT}" "85")"
-  RESOURCE_AUTOTUNE_INTERVAL_MINUTES="$(echo "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
-  [[ -z "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" || "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" -lt 1 || "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" -gt 60 ]] && RESOURCE_AUTOTUNE_INTERVAL_MINUTES="5"
+  RESOURCE_AUTOTUNE_INTERVAL_MINUTES="$(echo "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-15}" | tr -cd '0-9')"
+  # Analyzer ikut menjalankan pengumpul data notif online penuh, jadi 5 menit
+  # terlalu mahal untuk VPS 1 GB. Nilai 5 di env VPS lama adalah default lama
+  # yang ikut tersimpan (tidak ada menu untuk mengubahnya), bukan pilihan pemilik.
+  [[ "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" == "5" ]] && RESOURCE_AUTOTUNE_INTERVAL_MINUTES="15"
+  [[ -z "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" || "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" -lt 1 || "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES}" -gt 60 ]] && RESOURCE_AUTOTUNE_INTERVAL_MINUTES="15"
   [[ -z "${RESOURCE_CAPACITY_STATE_FILE}" ]] && RESOURCE_CAPACITY_STATE_FILE="/var/lib/sc-1forcr/capacity.env"
 
   ram_mib="$(get_total_ram_mib)"
@@ -2643,9 +2647,12 @@ EOF
 
 setup_logrotate_optimizations() {
   log "Setup logrotate ringkas..."
+  # Log akses Xray mencatat setiap koneksi dan bisa ratusan MB per hari di VPS
+  # ramai. maxsize merotasinya lebih awal tanpa menunggu jadwal harian.
   cat > /etc/logrotate.d/sc-1forcr <<'EOF'
-/var/log/xray/*.log /var/log/nginx/*.log {
+/var/log/xray/*.log {
   daily
+  maxsize 50M
   rotate 7
   compress
   delaycompress
@@ -2654,6 +2661,22 @@ setup_logrotate_optimizations() {
   copytruncate
 }
 EOF
+  # Log nginx tidak dicantumkan: paket nginx (Debian maupun nginx.org) sudah
+  # membawa /etc/logrotate.d/nginx. File log yang tercantum di dua config
+  # membuat logrotate menolak blok tersebut, dan dulu log Xray satu blok
+  # dengan nginx sehingga bisa ikut tidak dirotasi.
+  # logrotate.timer bawaan hanya harian, padahal maxsize baru berlaku saat
+  # logrotate jalan. Tiap jam cukup murah: file yang belum waktunya hanya di-stat.
+  if systemctl cat logrotate.timer >/dev/null 2>&1; then
+    mkdir -p /etc/systemd/system/logrotate.timer.d
+    cat > /etc/systemd/system/logrotate.timer.d/10-sc-1forcr-hourly.conf <<'EOF'
+[Timer]
+OnCalendar=
+OnCalendar=hourly
+EOF
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart logrotate.timer >/dev/null 2>&1 || true
+  fi
 }
 
 setup_vnstat() {
@@ -3907,8 +3930,34 @@ stop_disable_udp_backend() {
   return 1
 }
 
+# ZIVPN dan UDP Custom berbagi port. Menyalakan satu unit saat lawannya aktif
+# hanya berujung gagal bind lalu restart tiap 2-3 detik tanpa henti, dan tiap
+# percobaan ikut menjalankan cek lisensi Node. ExecCondition yang gagal membuat
+# unit dilewati tanpa dianggap gagal, sehingga Restart=always tidak mengulangnya.
+# Syaratnya "lawan tidak aktif", bukan isi env: menu menyalakan backend baru
+# sebelum menulis ACTIVE_UDP_BACKEND, tapi selalu mematikan backend lama dulu.
+write_udp_backend_exclusive_dropins() {
+  local unit other dropin_file content changed=0
+  for unit in "${ZIVPN_SERVICE_NAME}" "${UDPCUSTOM_SERVICE_NAME}"; do
+    other="${ZIVPN_SERVICE_NAME}"
+    [[ "${unit}" == "${ZIVPN_SERVICE_NAME}" ]] && other="${UDPCUSTOM_SERVICE_NAME}"
+    dropin_file="/etc/systemd/system/${unit}.service.d/20-sc-udp-exclusive.conf"
+    content="[Service]
+ExecCondition=/bin/sh -c '! systemctl is-active --quiet ${other}.service'"
+    if [[ "$(cat "${dropin_file}" 2>/dev/null || true)" != "${content}" ]]; then
+      mkdir -p "$(dirname "${dropin_file}")"
+      printf '%s\n' "${content}" > "${dropin_file}"
+      changed=1
+    fi
+  done
+  if [[ "${changed}" == "1" ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
 enforce_single_udp_backend() {
   local backend
+  write_udp_backend_exclusive_dropins
   backend="$(echo "${ACTIVE_UDP_BACKEND}" | tr '[:upper:]' '[:lower:]')"
   case "${backend}" in
     udpcustom|udp-custom|udphc)
@@ -10441,7 +10490,10 @@ function countIpGroups(ipSet, mask) {
   return groups.size;
 }
 
-function countXrayEffectiveDevices(ipSet, mask) {
+// Hitungan perangkat untuk semua protokol (Xray, SSH, SSH-WS, UDPHC, ZIVPN):
+// IP dalam subnet yang sama (pool CGNAT operator) dihitung satu, dan IPv4+IPv6
+// yang aktif bersamaan adalah satu perangkat dual-stack.
+function countEffectiveDevices(ipSet, mask) {
   const ipv4Groups = new Set();
   const ipv6Groups = new Set();
   for (const ipRaw of ipSet || []) {
@@ -10477,14 +10529,19 @@ function xrayRepresentativeIps(ipSet, mask) {
     .map(([, ip]) => ip);
 }
 
-function xrayViolationSignal(ipSet) {
+// Sidik jari kelompok IP pelanggaran. Konfirmasi dua siklus hanya dihitung
+// kalau kelompoknya sama, jadi IP yang berganti-ganti tidak saling menguatkan.
+function ipGroupFingerprint(ipSet) {
   const groups = Array.from(new Set(
     Array.from(ipSet || [])
       .map((ip) => ipSubnetPrefix(ip, XRAY_IP_GROUP_MASK))
       .filter(Boolean)
   )).sort();
-  const fingerprint = crypto.createHash('sha256').update(groups.join('|')).digest('hex').slice(0, 16);
-  return `xray-ip-${fingerprint}`;
+  return crypto.createHash('sha256').update(groups.join('|')).digest('hex').slice(0, 16);
+}
+
+function xrayViolationSignal(ipSet) {
+  return `xray-ip-${ipGroupFingerprint(ipSet)}`;
 }
 
 function readXrayLiveSocketMap() {
@@ -11323,23 +11380,54 @@ function readDropbearAuthPortUserMap() {
   return map;
 }
 
+// Setelah HP berganti IP, sesi lama bisa tetap tercatat aktif sampai keepalive
+// memutusnya, lalu terbaca sebagai IP kedua. Sesi dihitung hanya kalau klien
+// masih mengirim data (kolom ClientToSSH naik) sejak pengecekan sebelumnya.
+const SSHWS_ACTIVITY_STATE_FILE = '/var/lib/sc-1forcr/iplimit-sshws-activity.json';
+const SSHWS_ACTIVITY_MAX_AGE_SECONDS = Math.max(900, CHECK_INTERVAL_MINUTES * 180);
+let sshWsActivePortIpCache = null;
 function readSshWsActivePortIpMap() {
+  if (sshWsActivePortIpCache) return sshWsActivePortIpCache;
   const out = new Map();
+  const nowTs = Math.floor(Date.now() / 1000);
+  let previous = {};
   try {
-    if (!SSHWS_QUOTA_STATE_FILE || !fs.existsSync(SSHWS_QUOTA_STATE_FILE)) return out;
-    const raw = fs.readFileSync(SSHWS_QUOTA_STATE_FILE, 'utf8');
-    for (const lineRaw of String(raw || '').split(/\r?\n/)) {
-      const line = String(lineRaw || '').trim();
-      if (!line || line.startsWith('#')) continue;
-      const parts = line.split('\t');
-      if (parts.length < 7) continue;
-      const port = String(parts[1] || '').trim();
-      const active = String(parts[5] || '').trim();
-      const ip = extractIp(String(parts[6] || '').trim());
-      if (!/^[0-9]{1,5}$/.test(port) || active !== '1' || !ip || isLoopbackIp(ip)) continue;
-      out.set(port, ip);
+    const state = JSON.parse(fs.readFileSync(SSHWS_ACTIVITY_STATE_FILE, 'utf8'));
+    const age = nowTs - Number(state?.updatedAt || 0);
+    if (age >= 0 && age <= SSHWS_ACTIVITY_MAX_AGE_SECONDS && state?.sessions && typeof state.sessions === 'object') {
+      previous = state.sessions;
     }
   } catch (_) {}
+  const current = {};
+  try {
+    if (SSHWS_QUOTA_STATE_FILE && fs.existsSync(SSHWS_QUOTA_STATE_FILE)) {
+      const raw = fs.readFileSync(SSHWS_QUOTA_STATE_FILE, 'utf8');
+      for (const lineRaw of String(raw || '').split(/\r?\n/)) {
+        const line = String(lineRaw || '').trim();
+        if (!line || line.startsWith('#')) continue;
+        const parts = line.split('\t');
+        if (parts.length < 7) continue;
+        const id = String(parts[0] || '').trim();
+        const port = String(parts[1] || '').trim();
+        const clientBytes = Number(parts[2] || 0);
+        const active = String(parts[5] || '').trim();
+        const ip = extractIp(String(parts[6] || '').trim());
+        if (!/^[0-9]{1,5}$/.test(port) || active !== '1' || !ip || isLoopbackIp(ip)) continue;
+        if (id && Number.isFinite(clientBytes)) current[id] = clientBytes;
+        // Sesi baru belum punya pembanding, jadi tetap dihitung; konfirmasi dua
+        // siklus memastikan sesi yang ternyata mati tidak ikut memicu lock.
+        const previousBytes = id ? previous[id] : undefined;
+        if (previousBytes !== undefined && !(clientBytes > Number(previousBytes))) continue;
+        out.set(port, ip);
+      }
+    }
+  } catch (_) {}
+  try {
+    const tmp = `${SSHWS_ACTIVITY_STATE_FILE}.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ updatedAt: nowTs, sessions: current }), { mode: 0o600 });
+    fs.renameSync(tmp, SSHWS_ACTIVITY_STATE_FILE);
+  } catch (_) {}
+  sshWsActivePortIpCache = out;
   return out;
 }
 
@@ -11719,16 +11807,27 @@ async function sampleSshwsHardLimit(username, detected, nowTs) {
   );
 }
 
-async function sampleSshwsIpLimit(username, detected, limit, nowTs) {
+// Pelanggaran limit akun SSH (SSH langsung, SSH-WS, UDPHC, ZIVPN) baru
+// terkonfirmasi kalau kelompok IP yang sama melewati limit di dua pengecekan
+// berturut-turut. 'sshws-real-ip' adalah sinyal lama yang ikut dibersihkan.
+async function sampleSshDeviceLimit(username, evidenceIps, detected, limit, nowTs) {
+  const user = String(username || '').trim().toLowerCase();
   const count = Math.max(0, Number(detected || 0));
   const accountLimit = Math.max(0, Number(limit || 0));
-  return sampleSshwsViolation(
-    username,
-    'sshws-real-ip',
-    count,
-    accountLimit > 0 && count > accountLimit,
-    nowTs
-  );
+  const candidate = accountLimit > 0 && count > accountLimit && evidenceIps.size > 0;
+  if (!candidate) {
+    await run(
+      "DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND username=? AND (signal LIKE 'ssh-dev-%' OR signal='sshws-real-ip')",
+      [user]
+    ).catch(() => {});
+    return { candidate: false, confirmed: false, hits: 0 };
+  }
+  const signal = `ssh-dev-${ipGroupFingerprint(evidenceIps)}`;
+  await run(
+    "DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND username=? AND (signal LIKE 'ssh-dev-%' OR signal='sshws-real-ip') AND signal<>?",
+    [user, signal]
+  ).catch(() => {});
+  return sampleSshwsViolation(user, signal, count, true, nowTs);
 }
 
 async function sampleXrayIpLimit(accountTypeRaw, username, ipSet, detected, limit, nowTs) {
@@ -12056,14 +12155,14 @@ async function lockIfExceeded(nowTs) {
       return out;
     };
     const lim = Number(r.limitip || 0);
-    // Toleransi CGNAT: grup IP dalam subnet yang sama sebagai 1 device
-    // (pakai XRAY_IP_GROUP_MASK global, sama dengan checker Xray).
+    // Toleransi CGNAT dan dual-stack sama dengan checker Xray: IP dalam subnet
+    // yang sama, atau pasangan IPv4+IPv6 yang aktif bersamaan, dihitung 1 device.
     const countGroupedForMap = (m) => {
       let max = 0;
       for (const k of keyCandidates) {
         if (!m.has(k)) continue;
         const grouped = XRAY_IP_GROUP_MASK < 32
-          ? countIpGroups(m.get(k), XRAY_IP_GROUP_MASK)
+          ? countEffectiveDevices(m.get(k), XRAY_IP_GROUP_MASK)
           : m.get(k).size;
         if (grouped > max) max = grouped;
       }
@@ -12077,6 +12176,11 @@ async function lockIfExceeded(nowTs) {
       ...Array.from(setUnionValues(sshWsIpMap))
     ]);
     const cntSshCombinedRaw = sshCombinedIpSet.size;
+    // Dulu IP SSH-WS dihitung mentah, sehingga dua IP satu pool operator atau
+    // pasangan IPv4+IPv6 dari satu HP terbaca dua perangkat.
+    const cntSshCombined = XRAY_IP_GROUP_MASK < 32
+      ? countEffectiveDevices(sshCombinedIpSet, XRAY_IP_GROUP_MASK)
+      : cntSshCombinedRaw;
     const cntSession = setMaxSize(sshSessionMap);
     const cntWsPorts = setMaxSize(sshWsClientPortMap);
     const cntRecent = setMaxSize(sshRecentAuthMap);
@@ -12103,12 +12207,25 @@ async function lockIfExceeded(nowTs) {
     if (lim === 1 && cntZivpnRaw > 0 && cntZivpnRaw <= 2) {
       cntZivpnEffective = 1;
     }
-    // limitip hanya memakai sinyal IP/device nyata. IP SSHWS dihitung exact
-    // dari state mux, sedangkan sesi/proses/client-port tidak dianggap device.
+    // limitip hanya memakai sinyal IP/device nyata; sesi/proses/client-port
+    // tidak dianggap device.
+    const zivpnIpSet = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
+      ? setUnionValues(sshZivpnLiveIpMap)
+      : new Set([...setUnionValues(sshZivpnIpMap), ...setUnionValues(sshZivpnLiveIpMap)]);
     const cntImmediate = Math.max(cntIp, cntUdphcIp, cntZivpnEffective);
-    const cnt = Math.max(cntImmediate, cntSshCombinedRaw);
-    const sshwsIpSample = await sampleSshwsIpLimit(userKey, cntSshCombinedRaw, lim, nowTs);
-    const sshwsIpExceeded = sshwsIpSample.confirmed;
+    const cnt = Math.max(cntImmediate, cntSshCombined);
+    // Semua sumber wajib melewati limit di dua pengecekan berturut-turut dengan
+    // kelompok IP yang sama, seperti Xray. Satu sampel sesaat (reconnect,
+    // pindah jaringan) tidak cukup untuk mengunci akun pembeli.
+    const deviceEvidenceIps = new Set();
+    for (const [count, ips] of [
+      [cntSshCombined, sshCombinedIpSet],
+      [cntUdphcIp, setUnionValues(sshUdphcIpMap)],
+      [cntZivpnEffective, zivpnIpSet]
+    ]) {
+      if (lim > 0 && count > lim) for (const ip of ips) deviceEvidenceIps.add(ip);
+    }
+    const deviceSample = await sampleSshDeviceLimit(userKey, deviceEvidenceIps, cnt, lim, nowTs);
     // SSHWS menutupi IP asal dengan 127.0.0.1. Jumlah socket hanya menjadi
     // pengaman abuse terpisah dan wajib bertahan dua siklus pemeriksaan.
     const sshwsHardSample = await sampleSshwsHardLimit(userKey, cntWsPorts, nowTs);
@@ -12146,13 +12263,12 @@ async function lockIfExceeded(nowTs) {
       ? countIpGroups(longTermIpSet, XRAY_IP_GROUP_MASK)
       : longTermIpSet.size;
     const longTermAlert = lim > 0 && longTermIpCount > lim * 3;
-    const immediateLimitExceeded = lim > 0 && cntImmediate > lim;
     // Riwayat 24 jam tidak membuktikan pemakaian serentak. Mode pesawat,
     // CGNAT dan pergantian gateway operator dapat menghasilkan banyak IP.
     // Karena itu, hanya kirim audit warning; jangan jadikan alasan auto-lock.
-    const accountLimitExceeded = immediateLimitExceeded || sshwsIpExceeded;
+    const accountLimitExceeded = deviceSample.confirmed;
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardCandidate=${sshwsHardSample.candidate ? 1 : 0} hardHits=${sshwsHardSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntIpRaw=${cntIpRaw} cntWsIpRaw=${cntWsIpRaw} cntSshCombinedRaw=${cntSshCombinedRaw} wsIpCandidate=${sshwsIpSample.candidate ? 1 : 0} wsIpHits=${sshwsIpSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} wsIpExceeded=${sshwsIpExceeded ? 1 : 0} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIpG=${cntZivpnIpGrouped} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIpG=${cntZivpnLiveIpGrouped} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cntImmediate=${cntImmediate} cntDeviceIp=${cnt} mask=${XRAY_IP_GROUP_MASK} cnt24h=${longTermIpCount} longTermAlert=${longTermAlert ? 1 : 0}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} hard=${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} hardCandidate=${sshwsHardSample.candidate ? 1 : 0} hardHits=${sshwsHardSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} hardExceeded=${hardSessionExceeded ? 1 : 0} cntIp=${cntIp} cntIpRaw=${cntIpRaw} cntWsIpRaw=${cntWsIpRaw} cntSshCombinedRaw=${cntSshCombinedRaw} cntSshCombined=${cntSshCombined} deviceCandidate=${deviceSample.candidate ? 1 : 0} deviceHits=${deviceSample.hits}/${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} deviceExceeded=${accountLimitExceeded ? 1 : 0} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntZivpn=${cntZivpn} cntZivpnIpG=${cntZivpnIpGrouped} cntZivpnLive=${cntZivpnLive} cntZivpnLiveIpG=${cntZivpnLiveIpGrouped} cntZivpnRaw=${cntZivpnRaw} cntZivpnEff=${cntZivpnEffective} useLive=${hasLiveZivpn ? 1 : 0} cntProc=${cntProc} cntRecent=${cntRecent} cntImmediate=${cntImmediate} cntDeviceIp=${cnt} mask=${XRAY_IP_GROUP_MASK} cnt24h=${longTermIpCount} longTermAlert=${longTermAlert ? 1 : 0}`);
     }
     if (longTermAlert) {
       await notifyLongTermIpWarning(user, lim, longTermIpCount, Array.from(longTermIpSet), nowTs);
@@ -12180,12 +12296,7 @@ async function lockIfExceeded(nowTs) {
     await verifySshSessionsClosed(user, 'multi-login');
 
     // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
-    const zivpnLockIps = (ZIVPN_AUTH_MODE === 'http' && hasLiveZivpn)
-      ? Array.from(setUnionValues(sshZivpnLiveIpMap))
-      : Array.from(new Set([
-          ...Array.from(setUnionValues(sshZivpnIpMap)),
-          ...Array.from(setUnionValues(sshZivpnLiveIpMap))
-        ]));
+    const zivpnLockIps = Array.from(zivpnIpSet);
     const lockIps = Array.from(new Set([
       ...Array.from(setUnionValues(sshIpMap)),
       ...Array.from(setUnionValues(sshWsIpMap)),
@@ -12215,27 +12326,23 @@ async function lockIfExceeded(nowTs) {
     if (lim === 1 && cntZivpnRaw === 2 && cntZivpnEffective === 1) {
       zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
     }
-    const lockBySshwsIp = sshwsIpExceeded && !immediateLimitExceeded;
     const lockByHardSession = hardSessionExceeded && !accountLimitExceeded;
-    let lockReasonText = lockByHardSession
+    const lockReasonText = lockByHardSession
       ? `sesi SSHWS aktif melewati batas aman ${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`
-      : 'pemakaian perangkat/IP melewati limit akun';
-    if (lockBySshwsIp) {
-      lockReasonText = `IP asli SSHWS aktif melewati limit akun selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`;
-    }
+      : `pemakaian perangkat/IP melewati limit akun selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`;
+    // Urutan stabil: kalau SSH langsung dan SSH-WS sama besar, SSH langsung
+    // yang disebut; SSH-WS disebut hanya kalau IP-nya yang menambah hitungan.
     const ipSourceCounts = [
       { service: 'ssh', count: cntIp },
-      { service: 'sshws-real-ip', count: cntWsIpRaw },
+      { service: 'sshws-real-ip', count: cntSshCombined },
       { service: 'udphc', count: cntUdphcIp },
       { service: 'zivpn', count: cntZivpnEffective }
     ].sort((a, b) => b.count - a.count);
     const notifyService = lockByHardSession
       ? 'sshws'
-      : (lockBySshwsIp ? 'sshws-real-ip' : (ipSourceCounts[0]?.service || 'ssh'));
+      : (ipSourceCounts[0]?.service || 'ssh');
     const notifyLimit = lockByHardSession ? SSHWS_ACCOUNT_SESSION_HARD_LIMIT : lim;
-    const notifyDetected = lockByHardSession
-      ? cntWsPorts
-      : (lockBySshwsIp ? cntSshCombinedRaw : cnt);
+    const notifyDetected = lockByHardSession ? cntWsPorts : cnt;
     const notifyDetectedRaw = lockByHardSession
       ? cntWsPorts
       : Math.max(cntIpRaw, cntWsIpRaw, cntSshCombinedRaw, cntUdphcIpRaw, cntZivpnRaw);
@@ -12291,7 +12398,7 @@ async function lockIfExceeded(nowTs) {
       const cntRaw = lockIpSet.size;
       // CGNAT tolerance: grup IP dalam subnet yang sama sebagai 1 device.
       // XRAY_IP_GROUP_MASK: 24 = /24 (moderate), 16 = /16 (aggressive), 32 = exact match.
-      const cntGrouped = countXrayEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK);
+      const cntGrouped = countEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK);
       const cnt = cntGrouped;
       const liveSocketCount = Number(xrayLive.sockets.get(`${item.type}|${userKey}`) || 0);
       const hasSocketEvidence = xrayLive.available && liveSocketCount > 0;
@@ -13409,8 +13516,8 @@ EOF
 
 setup_resource_autotune_timer() {
   local interval
-  interval="$(echo "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
-  [[ -z "${interval}" || "${interval}" -lt 1 || "${interval}" -gt 60 ]] && interval="5"
+  interval="$(echo "${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-15}" | tr -cd '0-9')"
+  [[ -z "${interval}" || "${interval}" -lt 1 || "${interval}" -gt 60 ]] && interval="15"
 
   log "Setup resource auto-tune analyzer tiap ${interval} menit..."
   cat > /usr/local/sbin/sc-1forcr-capacity-tune <<'EOF'
@@ -13497,59 +13604,6 @@ conn_user_guess="$(( (conn_count + 2) / 3 ))"
 active_user_estimate="${uniq_ip_count}"
 (( conn_user_guess > active_user_estimate )) && active_user_estimate="${conn_user_guess}"
 
-ssh_user_count="$(ps -eo args= 2>/dev/null | awk '
-  {
-    u="";
-    if ($0 ~ /^sshd:/) {
-      u=$0;
-      sub(/^sshd:[[:space:]]*/, "", u);
-      sub(/[[:space:]].*$/, "", u);
-      sub(/@.*$/, "", u);
-      sub(/\[.*$/, "", u);
-    } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
-      u=$0;
-      sub(/^.*\[/, "", u);
-      sub(/\].*$/, "", u);
-    }
-    u=tolower(u);
-    if (u ~ /^[a-z0-9._-]+$/ && u!="root" && u!="priv" && u!="net" && u!="unknown") seen[u]=1;
-  }
-  END { for (u in seen) n++; print n+0; }' | tr -cd '0-9')"
-[[ -z "${ssh_user_count}" ]] && ssh_user_count="0"
-(( ssh_user_count > active_user_estimate )) && active_user_estimate="${ssh_user_count}"
-
-xray_user_count="0"
-if [[ -f /var/log/xray/access.log ]]; then
-  xray_active_window="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
-  [[ -z "${xray_active_window}" || "${xray_active_window}" -lt 30 ]] && xray_active_window="60"
-  xray_cutoff="$(( $(date +%s) - xray_active_window ))"
-  xray_user_count="$(tail -n 10000 /var/log/xray/access.log 2>/dev/null | awk -v cutoff="${xray_cutoff}" '
-    function ts_from_line(line, stamp, ts) {
-      if (line !~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return systime();
-      stamp=substr(line,1,19);
-      gsub(/\//," ",stamp); gsub(/:/," ",stamp); gsub(/[[:space:]]+/," ",stamp);
-      ts=mktime(stamp);
-      return ts > 0 ? ts : systime();
-    }
-    {
-      ts=ts_from_line($0);
-      if (ts < cutoff) next;
-      email="";
-      if (match($0, /"email":"[^"]+"/)) {
-        email=substr($0, RSTART+9, RLENGTH-10);
-      } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
-        email=substr($0, RSTART, RLENGTH);
-        sub(/email:[[:space:]]*/, "", email);
-      }
-      gsub(/[[:space:]]/, "", email);
-      email=tolower(email);
-      if (email ~ /^[a-z0-9._-]+$/) seen[email]=1;
-    }
-    END { for (u in seen) n++; print n+0; }' | tr -cd '0-9')"
-fi
-[[ -z "${xray_user_count}" ]] && xray_user_count="0"
-(( xray_user_count > active_user_estimate )) && active_user_estimate="${xray_user_count}"
-
 udphc_user_count="0"
 zivpn_user_count="0"
 online_source="capacity_fallback"
@@ -13576,6 +13630,63 @@ if [[ "${online_total_detected}" =~ ^[0-9]+$ ]]; then
   [[ -z "${udphc_user_count}" || ! "${udphc_user_count}" =~ ^[0-9]+$ ]] && udphc_user_count="0"
   [[ -z "${zivpn_user_count}" || ! "${zivpn_user_count}" =~ ^[0-9]+$ ]] && zivpn_user_count="0"
   online_source="online_notify"
+fi
+
+# Hitung manual hanya kalau data notif online tidak tersedia; kalau tersedia,
+# hasil ini selalu ditimpa, padahal tail 10 ribu baris log Xray tidak murah.
+if [[ "${online_source}" != "online_notify" ]]; then
+  ssh_user_count="$(ps -eo args= 2>/dev/null | awk '
+    {
+      u="";
+      if ($0 ~ /^sshd:/) {
+        u=$0;
+        sub(/^sshd:[[:space:]]*/, "", u);
+        sub(/[[:space:]].*$/, "", u);
+        sub(/@.*$/, "", u);
+        sub(/\[.*$/, "", u);
+      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+        u=$0;
+        sub(/^.*\[/, "", u);
+        sub(/\].*$/, "", u);
+      }
+      u=tolower(u);
+      if (u ~ /^[a-z0-9._-]+$/ && u!="root" && u!="priv" && u!="net" && u!="unknown") seen[u]=1;
+    }
+    END { for (u in seen) n++; print n+0; }' | tr -cd '0-9')"
+  [[ -z "${ssh_user_count}" ]] && ssh_user_count="0"
+  (( ssh_user_count > active_user_estimate )) && active_user_estimate="${ssh_user_count}"
+
+  xray_user_count="0"
+  if [[ -f /var/log/xray/access.log ]]; then
+    xray_active_window="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-60}" | tr -cd '0-9')"
+    [[ -z "${xray_active_window}" || "${xray_active_window}" -lt 30 ]] && xray_active_window="60"
+    xray_cutoff="$(( $(date +%s) - xray_active_window ))"
+    xray_user_count="$(tail -n 10000 /var/log/xray/access.log 2>/dev/null | awk -v cutoff="${xray_cutoff}" '
+      function ts_from_line(line, stamp, ts) {
+        if (line !~ /^[0-9][0-9][0-9][0-9]\/[0-9][0-9]\/[0-9][0-9][[:space:]]+[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) return systime();
+        stamp=substr(line,1,19);
+        gsub(/\//," ",stamp); gsub(/:/," ",stamp); gsub(/[[:space:]]+/," ",stamp);
+        ts=mktime(stamp);
+        return ts > 0 ? ts : systime();
+      }
+      {
+        ts=ts_from_line($0);
+        if (ts < cutoff) next;
+        email="";
+        if (match($0, /"email":"[^"]+"/)) {
+          email=substr($0, RSTART+9, RLENGTH-10);
+        } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
+          email=substr($0, RSTART, RLENGTH);
+          sub(/email:[[:space:]]*/, "", email);
+        }
+        gsub(/[[:space:]]/, "", email);
+        email=tolower(email);
+        if (email ~ /^[a-z0-9._-]+$/) seen[email]=1;
+      }
+      END { for (u in seen) n++; print n+0; }' | tr -cd '0-9')"
+  fi
+  [[ -z "${xray_user_count}" ]] && xray_user_count="0"
+  (( xray_user_count > active_user_estimate )) && active_user_estimate="${xray_user_count}"
 fi
 
 active_account_total="0"
@@ -13698,6 +13809,12 @@ Type=oneshot
 EnvironmentFile=-/etc/sc-1forcr.env
 EnvironmentFile=-/opt/sc-1forcr/.env
 ExecStart=/usr/local/sbin/sc-1forcr-capacity-tune
+# Pengumpul data notif online jalan di dalam unit ini, jadi batas milik
+# service notif online tidak berlaku di sini; batasi di unit ini juga.
+TimeoutStartSec=5min
+Nice=10
+CPUQuota=50%
+MemoryMax=256M
 NoNewPrivileges=true
 PrivateTmp=true
 EOF
@@ -17094,11 +17211,14 @@ detect_udphc_service() {
     echo "udp-custom"
     return
   fi
-  if systemctl list-unit-files | grep -q '^sc-1forcr-udpcustom\.service'; then
+  # systemctl cat mengecek satu unit saja. list-unit-files memuat semua unit,
+  # dan dengan pipefail grep -q bisa membuat systemctl kena SIGPIPE sehingga
+  # unit yang ada dianggap tidak ada.
+  if systemctl cat sc-1forcr-udpcustom.service >/dev/null 2>&1; then
     echo "sc-1forcr-udpcustom"
     return
   fi
-  if systemctl list-unit-files | grep -q '^udp-custom\.service'; then
+  if systemctl cat udp-custom.service >/dev/null 2>&1; then
     echo "udp-custom"
     return
   fi
@@ -25230,11 +25350,14 @@ detect_udpcustom_service() {
     echo "udp-custom"
     return
   fi
-  if systemctl list-unit-files | grep -q '^sc-1forcr-udpcustom\.service'; then
+  # systemctl cat mengecek satu unit saja. list-unit-files memuat semua unit,
+  # dan dengan pipefail grep -q bisa membuat systemctl kena SIGPIPE sehingga
+  # unit yang ada dianggap tidak ada.
+  if systemctl cat sc-1forcr-udpcustom.service >/dev/null 2>&1; then
     echo "sc-1forcr-udpcustom"
     return
   fi
-  if systemctl list-unit-files | grep -q '^udp-custom\.service'; then
+  if systemctl cat udp-custom.service >/dev/null 2>&1; then
     echo "udp-custom"
     return
   fi
@@ -27618,7 +27741,7 @@ update_script_from_repo() {
     ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" \
     RESOURCE_AUTOTUNE_ENABLE="${RESOURCE_AUTOTUNE_ENABLE:-1}" \
     RESOURCE_TARGET_USAGE_PERCENT="${RESOURCE_TARGET_USAGE_PERCENT:-85}" \
-    RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-5}" \
+    RESOURCE_AUTOTUNE_INTERVAL_MINUTES="${RESOURCE_AUTOTUNE_INTERVAL_MINUTES:-15}" \
     RESOURCE_CAPACITY_STATE_FILE="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}" \
     UPDATE_SAFE_MODE="${UPDATE_SAFE_MODE:-0}" \
     UPDATE_TRANSACTION_SNAPSHOT="${update_snapshot}" \
@@ -30610,6 +30733,7 @@ main() {
     setup_online_notify_timer
     setup_auto_pull_update_timer
     setup_resource_autotune_timer
+    setup_logrotate_optimizations
     write_cli_menu
     reapply_api_docs_site_runtime
     setup_auto_menu_login

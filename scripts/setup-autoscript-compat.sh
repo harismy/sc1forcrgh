@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.70}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.71}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23927,9 +23927,9 @@ set_menu_color_menu() {
   draw_menu_panel "TEMA WARNA MENU" \
     "Mode sekarang : ${current} (otomatis terdeteksi: ${detected})" \
     "" \
-    "1) Otomatis" \
+    "1) Otomatis (default, truecolor)" \
     "2) Truecolor 24-bit (gradasi paling halus)" \
-    "3) 256 warna (Termius, JuiceSSH, PuTTY)" \
+    "3) 256 warna (kalau warna truecolor aneh)" \
     "4) 16 warna (terminal lama)" \
     "5) Tanpa warna" \
     "0) Kembali"
@@ -28385,12 +28385,16 @@ UI_16_R=(205 0 205 0 205 0 229 127 255 0 255 92 255 0 255)
 UI_16_G=(0 205 205 0 0 205 229 127 0 255 255 92 0 255 255)
 UI_16_B=(0 0 0 238 205 205 229 127 0 0 0 255 255 255 255)
 
+# Default truecolor (gradasi paling halus, beban VPS sama dengan 256 warna).
+# Hanya terminal yang jelas tidak mendukungnya yang turun: konsol teks
+# provider/VNC ke 16 warna, GNU screen ke 256 (tmux mengonversi sendiri).
+# Pilihan manual di Tools > Tema Warna Menu selalu menang.
 ui_color_mode_auto() {
   if [[ -n "${NO_COLOR:-}" ]]; then printf 'none'; return 0; fi
-  case "${COLORTERM:-}" in *truecolor*|*24bit*) printf 'truecolor'; return 0 ;; esac
   case "${TERM:-}" in
     ''|dumb|linux|vt100|vt102|vt220|ansi|cons25) printf '16' ;;
-    *) printf '256' ;;
+    screen*) if [[ -n "${TMUX:-}" ]]; then printf 'truecolor'; else printf '256'; fi ;;
+    *) printf 'truecolor' ;;
   esac
 }
 

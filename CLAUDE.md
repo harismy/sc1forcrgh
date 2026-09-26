@@ -143,7 +143,7 @@ Jangan buang waktu mengejar dua ini saat mengerjakan hal lain. Kalau memperbaiki
 
 ## Tampilan menu CLI
 
-Menu (`menu-sc-1forcr`, heredoc `MENU_SCRIPT_EOF`) memakai mesin tampilan `ui_*`: bingkai dan banner bergradasi, lebar mengikuti terminal (`ui_layout`, 40–78 kolom), dan empat mode warna (truecolor, 256, 16, none). Mode otomatis memakai 256 warna karena klien SSH jarang meneruskan `COLORTERM`; pilihan manual ada di Tools > Tema Warna Menu dan disimpan di `/etc/sc-1forcr/menu-color`.
+Menu (`menu-sc-1forcr`, heredoc `MENU_SCRIPT_EOF`) memakai mesin tampilan `ui_*`: bingkai dan banner bergradasi, lebar mengikuti terminal (`ui_layout`, 40–78 kolom), dan empat mode warna (truecolor, 256, 16, none). Mode otomatis memakai truecolor (keputusan pemilik; beban CPU/RAM sama dengan 256 warna, hanya ±9 KB lebih banyak per layar lewat SSH), kecuali konsol teks lama (`TERM=linux`/`vt100`/...) ke 16 warna dan GNU screen ke 256. Pilihan manual di Tools > Tema Warna Menu disimpan di `/etc/sc-1forcr/menu-color` dan selalu menang atas mode otomatis.
 
 - Baris kotak digambar lewat `ui_row`/`ui_kv`/`ui_kv_parts`, yang mengukur lebar tanpa kode warna dan tanpa bergantung locale VPS. Teks bebas dari luar (OS, ISP, kota, nama klien) lewat `ui_fit` supaya dipotong dengan aman.
 - Baris dengan beberapa info memakai `ui_kv_parts`: potongan yang tidak muat di layar HP dilewati, bukan dibiarkan menjebol bingkai.

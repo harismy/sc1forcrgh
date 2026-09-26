@@ -310,6 +310,28 @@ DB_PATH=/tidak/ada.db; ZIVPN_SERVICE=zivpn; DOMAIN=vpn.example.com; SCRIPT_VERSI
   assert(monOut.stdout.includes(`${OK}ONLINE`), 'captured monitor frame must still be colored');
   assert(stripAnsi(monOut.stdout).includes('[r] ambil ulang'), 'monitor footer must show the refresh key');
 
+  // Mode warna: default truecolor, konsol teks lama turun ke 16, GNU screen
+  // ke 256 (tmux mengonversi sendiri), dan pilihan manual selalu menang.
+  const modeSh = path.join(tmpDir, 'mode.sh');
+  const forcedFile = path.join(tmpDir, 'mode-forced');
+  fs.writeFileSync(forcedFile, '256\n');
+  const modeCases = [
+    ['xterm-256color', '', '', 'truecolor'],
+    ['xterm', '', '', 'truecolor'],
+    ['linux', '', '', '16'],
+    ['vt100', '', '', '16'],
+    ['screen', '', '', '256'],
+    ['screen-256color', '/tmp/tmux-0/default,1,0', '', 'truecolor'],
+    ['xterm-256color', '', toBashPath(forcedFile), '256']
+  ];
+  fs.writeFileSync(modeSh, `set -euo pipefail\n${engine}\n` + modeCases.map(([term, tmux, file]) =>
+    `MENU_COLOR_FILE='${file || '/tidak/ada'}' TERM='${term}' TMUX='${tmux}' NO_COLOR='' ui_color_mode; builtin echo`).join('\n') + '\n');
+  const modeOut = spawnSync(bash, [toBashPath(modeSh)], { encoding: 'utf8' });
+  assert.strictEqual(modeOut.status, 0, `ui_color_mode failed:\n${modeOut.stderr}`);
+  const modes = modeOut.stdout.trim().split('\n');
+  modeCases.forEach(([term, tmux, file, want], i) => assert.strictEqual(modes[i], want,
+    `color mode TERM=${term} TMUX=${tmux ? 'set' : 'unset'} forced=${file ? '256' : 'none'}: expected ${want}, got ${modes[i]}`));
+
   // Menu Tools: nomor di panel, di case, dan rentang prompt harus sama.
   // Setelah menu dihapus/dinomori ulang, satu nomor yang meleset membuat
   // pilihan membuka fungsi yang salah.

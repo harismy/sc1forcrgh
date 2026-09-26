@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.67}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.68}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -24034,9 +24034,10 @@ tools_menu() {
       "15) Setting Wildcard Cloudflare" \
       "16) Diagnosa/Repair Routing Jaringan" \
       "17) Setting Web Dokumentasi API" \
+      "18) Tema Warna Menu" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-17]: "; then
+    if ! prompt_input tm "Pilih menu [0-18]: "; then
       return
     fi
     clear
@@ -24058,12 +24059,56 @@ tools_menu() {
       15) set_wildcard_config_menu || true ;;
       16) network_compatibility_menu || true ;;
       17) set_api_docs_config_menu || true ;;
+      18) set_menu_color_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
     echo
     read -rp "Enter untuk lanjut..." _ || true
   done
+}
+
+# Deteksi otomatis tidak bisa tahu kemampuan aplikasi SSH di HP/PC, jadi
+# pemilik VPS bisa memaksa mode warna. Truecolor memberi gradasi paling halus.
+set_menu_color_menu() {
+  local current="" detected choice mode=""
+  if [[ -r "${MENU_COLOR_FILE}" ]]; then
+    current="$(tr -cd 'a-z0-9' < "${MENU_COLOR_FILE}" 2>/dev/null || true)"
+  fi
+  if [[ -z "${current}" ]]; then current="auto"; fi
+  detected="$(ui_color_mode_auto)"
+  draw_menu_panel "TEMA WARNA MENU" \
+    "Mode sekarang : ${current} (otomatis terdeteksi: ${detected})" \
+    "" \
+    "1) Otomatis" \
+    "2) Truecolor 24-bit (gradasi paling halus)" \
+    "3) 256 warna (Termius, JuiceSSH, PuTTY)" \
+    "4) 16 warna (terminal lama)" \
+    "5) Tanpa warna" \
+    "0) Kembali"
+  echo
+  if ! prompt_input choice "Pilih [0-5]: "; then
+    return 0
+  fi
+  case "${choice}" in
+    1) mode="auto" ;;
+    2) mode="truecolor" ;;
+    3) mode="256" ;;
+    4) mode="16" ;;
+    5) mode="none" ;;
+    0) return 0 ;;
+    *) echo "Pilihan tidak valid."; return 0 ;;
+  esac
+  if [[ "${mode}" == "auto" ]]; then
+    rm -f "${MENU_COLOR_FILE}" >/dev/null 2>&1 || true
+  else
+    mkdir -p "$(dirname "${MENU_COLOR_FILE}")"
+    printf '%s\n' "${mode}" > "${MENU_COLOR_FILE}"
+  fi
+  UI_MODE=""
+  ui_init
+  echo "Tema warna menu disimpan: ${mode}."
+  echo "Kalau gradasi terlihat kotak-kotak atau warnanya aneh, pilih 256 atau 16 warna."
 }
 
 udp_backend_status() {
@@ -25844,143 +25889,114 @@ read_vnstat_stats() {
   fi
 }
 
-draw_dashboard() {
-  local os_name ram_mb swap_mb uptime_s uptime_h uptime_m
-  local ip city isp udpcustom
-  local ssh_on xray_on ws_on loadblc_on zivpn_on udphc_on
-  local c_ssh c_vmess c_vless c_trojan
-  local health
-  local cap_ram_gb cap_cores cap_tier cap_est cap_mode
-  local live_status live_active live_cap live_add live_ram live_cpu
-  local estimate_text live_capacity_text
-
-  # Standard ANSI colors (compatible all terminals incl mobile)
-  local ESC=$'\033'
-  local R="${ESC}[31m" G="${ESC}[32m" Y="${ESC}[33m"
-  local B="${ESC}[34m" C="${ESC}[36m" M="${ESC}[35m" WH="${ESC}[37m"
-  local DIM="${ESC}[2m" BOLD="${ESC}[1m" NC="${ESC}[0m"
-  local BG_BLUE="${ESC}[44m" BG_RESET="${ESC}[49m"
-
-  # Fixed width (seperti original, stabil di semua device)
-  local W=58  # inner content width
-  local HW=27  # half width for side-by-side
-
-  # Hitung lebar teks tanpa kode ANSI (pakai ESC byte asli via printf)
-  visible_len() {
-    local esc cleaned
-    printf -v esc '\033'
-    cleaned="$(printf '%s' "$1" | sed "s/${esc}\[[0-9;]*[mK]//g")"
-    echo "${#cleaned}"
-  }
-
-  pad_right() {
-    local t="$1" w="$2" vl pad
-    vl="$(visible_len "$t")"; pad=$((w - vl)); [[ $pad -lt 0 ]] && pad=0
-    printf '%s%*s' "$t" "$pad" ""
-  }
-
-  # Simple horizontal line (safe for all terminals, uses for-loop not tr)
-  hline() {
-    local c="${1:--}" w="${2:-$W}" i
-    for ((i=0; i<w; i++)); do printf '%s' "$c"; done
-    printf '\n'
-  }
-
-  # Top border with optional title
-  block_top() {
-    local title="$1" tw
-    if [[ -n "${title}" ]]; then
-      tw=$((W - ${#title} - 4))
-      printf ' %s┌%s %s %s┐%s\n' "${C}" "$(hline '─' "$tw")" "${title}" "$(hline '─' 0)" "${C}" "${NC}"
-    else
-      printf ' %s┌%s┐%s\n' "${C}" "$(hline '─' "$W")" "${C}" "${NC}"
+# Info jaringan publik (IP, kota, ISP) disimpan 6 jam. Dulu tiga curl berbatas
+# 3 detik jalan setiap kali menu digambar, jadi menu bisa tertahan beberapa
+# detik saat jaringan lambat. Cache hanya ditulis kalau IP publik didapat.
+dashboard_net_info() {
+  local cache="/var/lib/sc-1forcr/menu-netinfo.cache" now ts="" ip="" city="" isp="" fresh_ip=""
+  now="$(date +%s 2>/dev/null || echo 0)"
+  if [[ -r "${cache}" ]]; then
+    IFS='|' read -r ts ip city isp < "${cache}" || true
+  fi
+  if [[ ! "${ts}" =~ ^[0-9]+$ || -z "${ip}" ]] || (( now - ts > 21600 || now < ts )); then
+    fresh_ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)"
+    if [[ "${fresh_ip}" =~ ^[0-9a-fA-F:.]+$ ]]; then
+      ip="${fresh_ip}"
+      city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || true)"
+      isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || true)"
+      city="${city//[|$'\n'$'\r']/}"
+      isp="${isp//[|$'\n'$'\r']/}"
+      mkdir -p /var/lib/sc-1forcr 2>/dev/null || true
+      if printf '%s|%s|%s|%s\n' "${now}" "${ip}" "${city}" "${isp}" > "${cache}.tmp" 2>/dev/null; then
+        mv -f "${cache}.tmp" "${cache}" 2>/dev/null || true
+      fi
+    elif [[ -z "${ip}" ]]; then
+      ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     fi
-  }
+  fi
+  D_IP="${ip:-unknown}"
+  D_CITY="${city:--}"
+  D_ISP="${isp:--}"
+  return 0
+}
 
-  # Bottom border
-  block_bot() { printf ' %s└%s┘%s\n' "${C}" "$(hline '─' "$W")" "${C}" "${NC}"; }
-
-  # Single row
-  row() { local t="$1"; printf ' %s│%s %s %s│%s\n' "${C}" "${NC}" "$(pad_right "$t" "$W")" "${C}" "${NC}"; }
-
-  # Key-value row: "  key : value"
-  kv() {
-    local k="$1" v="$2" kw=14
-    if (( W < 55 )); then kw=10; fi
-    row "  ${DIM}$(printf "%-${kw}s" "$k")${NC} ${C}:${NC} ${WH}${v}${NC}"
-  }
-
-  # Center row
-  crow() {
-    local t="$1" vl left right
-    vl="$(visible_len "$t")"
-    if (( vl >= W )); then row "$t"; return; fi
-    left=$(((W - vl) / 2)); right=$((W - vl - left))
-    printf ' %s│%s %*s%s%*s %s│%s\n' "${C}" "${NC}" "$left" "" "$t" "$right" "" "${C}" "${NC}"
-  }
-
-  # Section header
-  sec() {
-    local t="$1"
-    printf ' %s│%s %s %s %s│%s\n' "${C}" "${NC}" "${C}▸${NC} ${WH}${BOLD}${t}${NC}" "$(hline '─' "$((W - ${#t} - 5))")" "${C}" "${NC}"
-  }
-
-  # Data collection
-  os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
-  ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {printf "%dM / %dM", $3, $2}')"
-  swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {printf "%dM / %dM", $3, $2}')"
-  uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
-  uptime_h="$((uptime_s / 3600))"
-  uptime_m="$(((uptime_s % 3600) / 60))"
-
-  ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
-  ip="${ip:-unknown}"
-  refresh_license_cache_guard
-  city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
-  isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
-  local license_distribution license_client_name license_status license_expires_raw expiry_in_text
+dashboard_collect() {
+  local uptime_s days hours mins udpcustom active_where counts load_rest=""
+  local license_client_name license_status license_expires_raw
   local sc_meta_status sc_meta_client sc_meta_expires
-  license_distribution="$(read_license_value_global "LICENSE_DISTRIBUTION")"
+  local cap_ram_gb cap_cores cap_tier cap_est live_status live_active live_cap live_add live_ram live_cpu
+
+  D_OS="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
+  D_KERNEL="$(uname -r 2>/dev/null || echo '-')"
+  read -r D_RAM_USED D_RAM_TOTAL D_SWAP_USED D_SWAP_TOTAL <<< "$(free -m 2>/dev/null | awk '/^Mem:/ {mu=$3; mt=$2} /^Swap:/ {su=$3; st=$2} END {printf "%d %d %d %d\n", mu, mt, su, st}' || true)"
+  D_RAM_PCT=0
+  if [[ "${D_RAM_TOTAL:-}" =~ ^[0-9]+$ && "${D_RAM_USED:-}" =~ ^[0-9]+$ ]] && (( D_RAM_TOTAL > 0 )); then
+    D_RAM_PCT=$(( D_RAM_USED * 100 / D_RAM_TOTAL ))
+  fi
+  read -r D_DISK_USED D_DISK_TOTAL D_DISK_PCT <<< "$(df -P -BG / 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/%/,"",$5); print $3, $2, $5}' || true)"
+  D_LOAD1="-"; D_LOAD5="-"; D_LOAD15="-"
+  read -r D_LOAD1 D_LOAD5 D_LOAD15 load_rest 2>/dev/null < /proc/loadavg || true
+
+  uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+  if [[ ! "${uptime_s}" =~ ^[0-9]+$ ]]; then uptime_s=0; fi
+  days=$(( uptime_s / 86400 )); hours=$(( (uptime_s % 86400) / 3600 )); mins=$(( (uptime_s % 3600) / 60 ))
+  if (( days > 0 )); then D_UPTIME="${days}d ${hours}h ${mins}m"; else D_UPTIME="${hours}h ${mins}m"; fi
+  D_TIME="$(date '+%d %b %Y  %H:%M %Z' 2>/dev/null || echo '-')"
+
+  dashboard_net_info
+  refresh_license_cache_guard
+
   license_client_name="$(read_license_value_global "LICENSE_CLIENT_NAME")"
   license_status="$(echo "$(read_license_value_global "LICENSE_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
   license_expires_raw="$(read_license_value_global "LICENSE_EXPIRES_AT")"
   sc_meta_status="$(echo "$(read_sc_meta_value_global "SC_STATUS")" | tr '[:upper:]' '[:lower:]' | xargs)"
   sc_meta_client="$(read_sc_meta_value_global "SC_CLIENT_NAME")"
   sc_meta_expires="$(read_sc_meta_value_global "SC_EXPIRES_AT")"
-  [[ -z "${license_distribution}" ]] && license_distribution="Community / Open Source"
   if [[ -n "${sc_meta_client}" ]]; then license_client_name="${sc_meta_client}"
-  elif [[ -z "${license_client_name}" ]]; then license_client_name="${ip}"; fi
+  elif [[ -z "${license_client_name}" ]]; then license_client_name="${D_IP}"; fi
+  D_CLIENT="${license_client_name}"
   if sc_access_state_is_valid "${sc_meta_status}" "${sc_meta_expires}"; then
-    expiry_in_text="$(format_expiry_in "${sc_meta_expires}")"
+    D_EXPIRY="$(format_expiry_in "${sc_meta_expires}")"
   elif sc_access_state_is_valid "${license_status}" "${license_expires_raw}"; then
-    expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
+    D_EXPIRY="$(format_expiry_in "${license_expires_raw}")"
   elif [[ -n "${license_expires_raw}" ]]; then
-    expiry_in_text="$(format_expiry_in "${license_expires_raw}")"
+    D_EXPIRY="$(format_expiry_in "${license_expires_raw}")"
   else
-    expiry_in_text="$(format_expiry_in "${sc_meta_expires}")"
+    D_EXPIRY="$(format_expiry_in "${sc_meta_expires}")"
   fi
+  D_VERSION="$(tr -d '[:space:]' </opt/sc-1forcr/VERSION 2>/dev/null || true)"
+  if [[ ! "${D_VERSION}" =~ ^V\.1FSC\.[0-9]+$ ]]; then D_VERSION="${SCRIPT_VERSION:-V.1FSC}"; fi
 
   udpcustom="$(detect_udpcustom_service)"
-  ssh_on="$(onoff_word ssh)"
-  xray_on="$(onoff_word xray)"
-  ws_on="$(onoff_word sc-1forcr-sshws)"
-  loadblc_on="$(onoff_word haproxy)"
-  zivpn_on="$(onoff_word "${ZIVPN_SERVICE}")"
-  udphc_on="$(onoff_word "${udpcustom}")"
+  D_SVC_SSH="$(onoff_word ssh)"
+  D_SVC_DROPBEAR="$(onoff_word dropbear)"
+  D_SVC_WS="$(onoff_word sc-1forcr-sshws)"
+  D_SVC_HAPROXY="$(onoff_word haproxy)"
+  D_SVC_NGINX="$(onoff_word nginx)"
+  D_SVC_XRAY="$(onoff_word xray)"
+  D_SVC_ZIVPN="$(onoff_word "${ZIVPN_SERVICE}")"
+  D_SVC_UDPHC="$(onoff_word "${udpcustom}")"
+  D_UDP_BACKEND="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+  D_HEALTH="CHECK"
+  if [[ "${D_SVC_XRAY}" == "ON" && "${D_SVC_WS}" == "ON" && "${D_SVC_HAPROXY}" == "ON" ]]; then D_HEALTH="GOOD"; fi
 
-  health="CHECK"
-  [[ "${xray_on}" == "ON" && "${ws_on}" == "ON" && "${loadblc_on}" == "ON" ]] && health="GOOD"
-  local health_d="${Y}CHECK${NC}"; [[ "${health}" == "GOOD" ]] && health_d="${G}GOOD${NC}"
-
-  local active_account_where
-  active_account_where="$(account_active_where_expr)"
-  c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs WHERE ${active_account_where};" 2>/dev/null || echo 0)"
-  c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses WHERE ${active_account_where};" 2>/dev/null || echo 0)"
-  c_vless="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vlesses WHERE ${active_account_where};" 2>/dev/null || echo 0)"
-  c_trojan="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_trojans WHERE ${active_account_where};" 2>/dev/null || echo 0)"
+  # Satu proses sqlite3 untuk keempat jumlah akun (dulu empat proses).
+  active_where="$(account_active_where_expr)"
+  counts="$(sqlite3 -separator '|' "${DB_PATH}" "SELECT
+      (SELECT COUNT(*) FROM account_sshs WHERE ${active_where}),
+      (SELECT COUNT(*) FROM account_vmesses WHERE ${active_where}),
+      (SELECT COUNT(*) FROM account_vlesses WHERE ${active_where}),
+      (SELECT COUNT(*) FROM account_trojans WHERE ${active_where});" 2>/dev/null || true)"
+  IFS='|' read -r D_ACC_SSH D_ACC_VMESS D_ACC_VLESS D_ACC_TROJAN <<< "${counts}"
+  if [[ ! "${D_ACC_SSH:-}" =~ ^[0-9]+$ ]]; then D_ACC_SSH=0; fi
+  if [[ ! "${D_ACC_VMESS:-}" =~ ^[0-9]+$ ]]; then D_ACC_VMESS=0; fi
+  if [[ ! "${D_ACC_VLESS:-}" =~ ^[0-9]+$ ]]; then D_ACC_VLESS=0; fi
+  if [[ ! "${D_ACC_TROJAN:-}" =~ ^[0-9]+$ ]]; then D_ACC_TROJAN=0; fi
 
   read_vnstat_stats
   IFS='|' read -r cap_ram_gb cap_cores cap_tier cap_est <<< "$(get_server_capacity_profile)"
+  D_CORES="${cap_cores:-1}"
+  D_SPEC="${cap_ram_gb:-?}GB / ${cap_cores:-?} vCPU / tier ${cap_tier:-?}"
   ensure_capacity_state_once
   live_status="$(read_capacity_state_value CAPACITY_STATUS)"
   live_active="$(read_capacity_state_value ACTIVE_USER_ESTIMATE)"
@@ -25988,110 +26004,121 @@ draw_dashboard() {
   live_add="$(read_capacity_state_value RECOMMENDED_ADD_BATCH)"
   live_ram="$(read_capacity_state_value AVG_RAM_USED_PERCENT)"
   live_cpu="$(read_capacity_state_value AVG_CPU_USED_PERCENT)"
-  [[ -z "${live_status}" ]] && live_status="WAIT"
-  [[ -z "${live_active}" ]] && live_active="0"
-  [[ -z "${live_cap}" ]] && live_cap="${cap_est}"
-  [[ -z "${live_add}" ]] && live_add="0"
-  [[ -z "${live_ram}" ]] && live_ram="-"
-  [[ -z "${live_cpu}" ]] && live_cpu="-"
-  estimate_text="~${cap_est} user"
-  if [[ "${live_status}" != "WAIT" && "${live_cap}" =~ ^[0-9]+$ ]]; then
-    estimate_text="~${live_cap} user"
-    [[ "${live_add}" =~ ^[0-9]+$ && "${live_add}" -gt 0 ]] && estimate_text="${estimate_text} +${live_add}"
+  D_LIVE_STATUS="${live_status:-WAIT}"
+  D_LIVE_ONLINE="${live_active:-0}"
+  D_LIVE_RAM="${live_ram:--}"
+  D_LIVE_CPU="${live_cpu:--}"
+  D_CAP_TEXT="~${cap_est} user"
+  if [[ "${D_LIVE_STATUS}" != "WAIT" && "${live_cap:-}" =~ ^[0-9]+$ ]]; then
+    D_CAP_TEXT="~${live_cap} user"
+    if [[ "${live_add:-}" =~ ^[0-9]+$ ]] && (( live_add > 0 )); then D_CAP_TEXT="${D_CAP_TEXT} +${live_add}"; fi
   fi
-  live_capacity_text="${live_status} | Online:${live_active} | RAM:${live_ram}% | CPU:${live_cpu}%"
+  D_CAP_MODE="AUTO"
+  if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" != "1" ]]; then D_CAP_MODE="MANUAL"; fi
+  return 0
+}
 
-  cap_mode="AUTO"
-  [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" != "1" ]] && cap_mode="MANUAL"
+# Titik status layanan: hijau aktif, merah mati. Backend UDP yang memang
+# tidak dipakai (ZIVPN vs UDPHC) tampil redup, bukan merah.
+dashboard_svc() {
+  local label="$1" state="$2" standby="${3:-0}" dot
+  if [[ "${state}" == "ON" ]]; then dot="${UI_OK}●"
+  elif [[ "${standby}" == "1" ]]; then dot="${UI_MUTED}○"
+  else dot="${UI_BAD}○"; fi
+  UI_OUT="${dot}${UI_NC} ${UI_VAL}${label}${UI_NC}"
+}
 
-  # Service status with ON/OFF colors
-  local on="${G}●${NC}" off="${R}○${NC}"
-  local so="${on}" sx="${on}" sw="${on}" sl="${on}" sz="${on}" su="${off}"
-  [[ "$ssh_on" != "ON" ]] && so="${off}"
-  [[ "$xray_on" != "ON" ]] && sx="${off}"
-  [[ "$ws_on" != "ON" ]] && sw="${off}"
-  [[ "$loadblc_on" != "ON" ]] && sl="${off}"
-  [[ "$zivpn_on" != "ON" ]] && sz="${off}"
-  [[ "$udphc_on" == "ON" ]] && su="${on}"
+dashboard_render() {
+  local valw bar_len exp_color days sub cap_color health_color live_color zivpn_standby=0 udphc_standby=0
+  local -a svc=() acc=()
+  ui_layout
+  valw=$(( UI_IW - 2 - 11 ))
+  bar_len=$(( valw - 20 ))
+  if (( bar_len > 20 )); then bar_len=20; fi
+  if (( bar_len < 6 )); then bar_len=6; fi
 
-  # ── Pre-compute borders (W+2 lebar baris horizontal agar sejajar dengan row) ──
-  local btop bsep bbot BW
-  BW=$((W + 2))
-  btop="$(printf ' %s┌%s┐%s' "${C}" "$(hline '─' "$BW")" "${NC}")"
-  bsep="$(printf ' %s├%s┤%s' "${C}" "$(hline '─' "$BW")" "${NC}")"
-  bbot="$(printf ' %s└%s┘%s' "${C}" "$(hline '─' "$BW")" "${NC}")"
-
-  # === RENDER DASHBOARD ===
   clear
   printf '\n'
+  ui_banner "S C   1 F O R C R   N E X U S"
 
-  # ── HEADER ──
-  printf '%s\n' "${btop}"
-  crow "${WH}${BOLD}SC 1FORCR NEXUS${NC}"
-  local displayed_version=""
-  displayed_version="$(tr -d '[:space:]' </opt/sc-1forcr/VERSION 2>/dev/null || true)"
-  if [[ ! "${displayed_version}" =~ ^V\.1FSC\.[0-9]+$ ]]; then
-    displayed_version="${SCRIPT_VERSION:-V.1FSC}"
+  exp_color="${UI_OK}"
+  if [[ "${D_EXPIRY}" == "Expired" ]]; then
+    exp_color="${UI_BAD}"
+  elif [[ "${D_EXPIRY}" =~ ^([0-9]+)d ]]; then
+    days="${BASH_REMATCH[1]}"
+    if (( days < 3 )); then exp_color="${UI_WARN}"; fi
+  elif [[ "${D_EXPIRY}" != "Unlimited" ]]; then
+    exp_color="${UI_WARN}"
   fi
-  local sub="${license_client_name}  |  ${displayed_version}  |  ${expiry_in_text}"
-  crow "${DIM}${sub}${NC}"
-  printf '%s\n' "${bbot}"
-  printf '\n'
+  local client_max=$(( UI_BW - 34 ))
+  if (( client_max > 24 )); then client_max=24; fi
+  if (( client_max < 6 )); then client_max=6; fi
+  ui_fit "${D_CLIENT}" "${client_max}"
+  sub="${UI_VAL}${UI_BOLD}${UI_OUT}${UI_NC}  ${UI_ACC2}◆${UI_NC}  ${UI_ACC}${D_VERSION}${UI_NC}  ${UI_ACC2}◆${UI_NC}  ${exp_color}${D_EXPIRY}${UI_NC}"
+  ui_width "${sub}"
+  ui_pad "$(( (UI_BW - UI_W) / 2 ))"
+  printf ' %s%s\n' "${UI_TMP}" "${sub}"
 
-  # ── SYSTEM ──
-  printf '%s\n' "${btop}"
-  row "  ${WH}${BOLD}▸ SYSTEM${NC}"
-  printf '%s\n' "${bsep}"
-  kv "OS" "${os_name}"
-  kv "RAM" "${ram_mb:-"-"}  ${DIM}SWAP${NC} ${swap_mb:-"-"}"
-  kv "Uptime" "${uptime_h}h ${uptime_m}m  ${DIM}Spec${NC} ${cap_ram_gb}GB / ${cap_cores}vCPU (tier ${cap_tier})"
-  kv "Capacity" "${cap_mode}  ${estimate_text}"
-  kv "Realtime" "${live_capacity_text}"
-  printf '%s\n' "${bbot}"
-  printf '\n'
+  ui_line_top "SERVER"
+  ui_kv_text "OS" "${D_OS}"
+  ui_kv_text "KERNEL" "${D_KERNEL}"
+  ui_kv_parts "CPU" "${UI_VAL}${D_CORES} vCPU${UI_NC}" "${UI_MUTED}load${UI_NC} ${UI_VAL}${D_LOAD1} ${D_LOAD5} ${D_LOAD15}${UI_NC}"
+  ui_bar "${D_RAM_PCT}" "${bar_len}"
+  ui_kv_parts "RAM" "${UI_OUT} ${UI_VAL}${D_RAM_PCT}%${UI_NC}" "${UI_MUTED}${D_RAM_USED:-?}M/${D_RAM_TOTAL:-?}M${UI_NC}"
+  ui_bar "${D_DISK_PCT:-0}" "${bar_len}"
+  ui_kv_parts "DISK" "${UI_OUT} ${UI_VAL}${D_DISK_PCT:-0}%${UI_NC}" "${UI_MUTED}${D_DISK_USED:-?}G/${D_DISK_TOTAL:-?}G${UI_NC}"
+  ui_kv_parts "UPTIME" "${UI_VAL}${D_UPTIME}${UI_NC}" "${UI_MUTED}swap${UI_NC} ${UI_VAL}${D_SWAP_USED:-0}M/${D_SWAP_TOTAL:-0}M${UI_NC}"
+  ui_kv_text "TIME" "${D_TIME}"
+  ui_line_sep "NETWORK"
+  ui_fit "${D_CITY}" 16
+  ui_kv_parts "IP" "${UI_VAL}${D_IP}${UI_NC}" "${UI_MUTED}${UI_OUT}${UI_NC}"
+  ui_kv_text "ISP" "${D_ISP}"
+  ui_kv_text "DOMAIN" "${DOMAIN:--}"
+  ui_line_sep "TRAFFIC"
+  ui_kv_parts "TODAY" "${UI_VAL}${VNSTAT_DAY_TOTAL}${UI_NC}" "${UI_OK}▼${UI_NC}${UI_VAL}${VNSTAT_DAY_RX}${UI_NC}" "${UI_ACC}▲${UI_NC}${UI_VAL}${VNSTAT_DAY_TX}${UI_NC}"
+  ui_kv_parts "MONTH" "${UI_VAL}${VNSTAT_MONTH_TOTAL}${UI_NC}" "${UI_OK}▼${UI_NC}${UI_VAL}${VNSTAT_MONTH_RX}${UI_NC}" "${UI_ACC}▲${UI_NC}${UI_VAL}${VNSTAT_MONTH_TX}${UI_NC}"
+  ui_kv_parts "SPEED" "${UI_VAL}${VNSTAT_RATE}${UI_NC}" "${UI_MUTED}${VNSTAT_MONTH_NAME}${UI_NC}"
+  ui_line_bot
 
-  # ── NETWORK ──
-  printf '%s\n' "${btop}"
-  row "  ${WH}${BOLD}▸ NETWORK${NC}"
-  printf '%s\n' "${bsep}"
-  kv "IP" "${ip}  ${DIM}${city}${NC}"
-  kv "ISP" "${isp}"
-  kv "Domain" "${DOMAIN:-"-"}"
-  printf '%s\n' "${bbot}"
-  printf '\n'
+  case "${D_UDP_BACKEND}" in
+    udpcustom|udp-custom|udphc) zivpn_standby=1 ;;
+    *) udphc_standby=1 ;;
+  esac
+  dashboard_svc "SSH" "${D_SVC_SSH}"; svc+=("${UI_OUT}")
+  dashboard_svc "DROPBEAR" "${D_SVC_DROPBEAR}"; svc+=("${UI_OUT}")
+  dashboard_svc "SSH-WS" "${D_SVC_WS}"; svc+=("${UI_OUT}")
+  dashboard_svc "HAPROXY" "${D_SVC_HAPROXY}"; svc+=("${UI_OUT}")
+  dashboard_svc "NGINX" "${D_SVC_NGINX}"; svc+=("${UI_OUT}")
+  dashboard_svc "XRAY" "${D_SVC_XRAY}"; svc+=("${UI_OUT}")
+  dashboard_svc "ZIVPN" "${D_SVC_ZIVPN}" "${zivpn_standby}"; svc+=("${UI_OUT}")
+  dashboard_svc "UDPHC" "${D_SVC_UDPHC}" "${udphc_standby}"; svc+=("${UI_OUT}")
+  health_color="${UI_WARN}"
+  if [[ "${D_HEALTH}" == "GOOD" ]]; then health_color="${UI_OK}"; fi
+  live_color="${UI_OK}"
+  case "${D_LIVE_STATUS}" in
+    WAIT|WATCH) live_color="${UI_WARN}" ;;
+    FULL|CRITICAL) live_color="${UI_BAD}" ;;
+  esac
+  cap_color="${UI_ACC}"
+  ui_line_top "SERVICES"
+  ui_flow 3 "${svc[@]}"
+  ui_kv_parts "HEALTH" "${health_color}${UI_BOLD}${D_HEALTH}${UI_NC}" "${UI_MUTED}spec${UI_NC} ${UI_VAL}${D_SPEC}${UI_NC}"
+  ui_kv_parts "CAPACITY" "${cap_color}${D_CAP_MODE}${UI_NC}" "${UI_VAL}${D_CAP_TEXT}${UI_NC}"
+  ui_kv_parts "LIVE" "${live_color}${D_LIVE_STATUS}${UI_NC}" "${UI_MUTED}online${UI_NC} ${UI_VAL}${D_LIVE_ONLINE}${UI_NC}" "${UI_MUTED}ram${UI_NC} ${UI_VAL}${D_LIVE_RAM}%${UI_NC}" "${UI_MUTED}cpu${UI_NC} ${UI_VAL}${D_LIVE_CPU}%${UI_NC}"
+  ui_line_sep "ACCOUNTS"
+  acc+=("${UI_MUTED}SSH${UI_NC} ${UI_ACC}${UI_BOLD}${D_ACC_SSH}${UI_NC}")
+  acc+=("${UI_MUTED}VMESS${UI_NC} ${UI_ACC}${UI_BOLD}${D_ACC_VMESS}${UI_NC}")
+  acc+=("${UI_MUTED}VLESS${UI_NC} ${UI_ACC}${UI_BOLD}${D_ACC_VLESS}${UI_NC}")
+  acc+=("${UI_MUTED}TROJAN${UI_NC} ${UI_ACC}${UI_BOLD}${D_ACC_TROJAN}${UI_NC}")
+  acc+=("${UI_MUTED}TOTAL${UI_NC} ${UI_ACC2}${UI_BOLD}$(( D_ACC_SSH + D_ACC_VMESS + D_ACC_VLESS + D_ACC_TROJAN ))${UI_NC}")
+  ui_flow 3 "${acc[@]}"
+  ui_line_bot
+  return 0
+}
 
-  # ── TRAFFIC ──
-  printf '%s\n' "${btop}"
-  row "  ${WH}${BOLD}▸ TRAFFIC${NC}"
-  printf '%s\n' "${bsep}"
-  kv "Month" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]  ${DIM}▼${NC}${VNSTAT_MONTH_RX}  ${DIM}▲${NC}${VNSTAT_MONTH_TX}"
-  kv "Day"   "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]  ${DIM}▼${NC}${VNSTAT_DAY_RX}  ${DIM}▲${NC}${VNSTAT_DAY_TX}"
-  kv "Now"   "${VNSTAT_RATE}"
-  printf '%s\n' "${bbot}"
-  printf '\n'
-
-  # ── SERVICES ──
-  printf '%s\n' "${btop}"
-  row "  ${WH}${BOLD}▸ SERVICES${NC}"
-  printf '%s\n' "${bsep}"
-  if (( W >= 58 )); then
-    row "  ${so} SSH      ${sz} ZIVPN    ${sl} LOADBLC   ${DIM}Health${NC} ${health_d}"
-    row "  ${sx} XRAY     ${su} UDPHC    ${sw} SSH-WS"
-  else
-    row "  ${so} SSH        ${sz} ZIVPN       ${sx} XRAY"
-    row "  ${sw} SSH-WS     ${su} UDPHC       ${sl} LOADBLC"
-    row "  ${DIM}Health${NC} ${health_d}"
-  fi
-  printf '%s\n' "${bbot}"
-  printf '\n'
-
-  # ── ACCOUNTS ──
-  printf '%s\n' "${btop}"
-  row "  ${WH}${BOLD}▸ ACCOUNTS${NC}"
-  printf '%s\n' "${bsep}"
-  row "  SSH/OVPN ${WH}${c_ssh}${NC}    VMESS ${WH}${c_vmess}${NC}    VLESS ${WH}${c_vless}${NC}    TROJAN ${WH}${c_trojan}${NC}"
-  printf '%s\n' "${bbot}"
-  printf '\n'
+draw_dashboard() {
+  dashboard_collect
+  dashboard_render
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
@@ -28505,16 +28532,344 @@ MENU_DIM="${MENU_ESC}[2m"
 MENU_BOLD="${MENU_ESC}[1m"
 MENU_NC="${MENU_ESC}[0m"
 
+# ── Mesin tampilan: warna gradasi dan kotak responsif ───────────────────────
+# Mode warna: truecolor (24-bit), 256, 16, none. Klien SSH jarang meneruskan
+# COLORTERM, jadi mode otomatis memakai 256 warna untuk TERM modern dan 16
+# warna untuk konsol lama. Pilihan manual (Tools > Tema Warna Menu) disimpan di
+# MENU_COLOR_FILE, bukan di env, jadi tidak perlu ikut dump env lintas update.
+MENU_COLOR_FILE="/etc/sc-1forcr/menu-color"
+UI_MODE=""
+UI_NC="${MENU_NC}"
+UI_BOLD="${MENU_BOLD}"
+UI_LABEL=""; UI_VAL=""; UI_MUTED=""; UI_OK=""; UI_WARN=""; UI_BAD=""; UI_ACC=""; UI_ACC2=""; UI_INK=""
+UI_BW=0
+UI_IW=0
+UI_W=0
+UI_R=0; UI_G=0; UI_B=0; UI_L=0; UI_N16=37
+UI_OUT=""
+UI_TMP=""
+UI_GRAD=()
+UI_GRAD_BG=()
+UI_GRAD_KEY=""
+# Titik gradasi neon: cyan -> biru -> ungu -> magenta.
+UI_SR=(0 41 150 255)
+UI_SG=(229 121 70 64)
+UI_SB=(255 255 255 170)
+UI_16_CODE=(31 32 33 34 35 36 37 90 91 92 93 94 95 96 97)
+UI_16_R=(205 0 205 0 205 0 229 127 255 0 255 92 255 0 255)
+UI_16_G=(0 205 205 0 0 205 229 127 0 255 255 92 0 255 255)
+UI_16_B=(0 0 0 238 205 205 229 127 0 0 0 255 255 255 255)
+
+ui_color_mode_auto() {
+  if [[ -n "${NO_COLOR:-}" ]]; then printf 'none'; return 0; fi
+  case "${COLORTERM:-}" in *truecolor*|*24bit*) printf 'truecolor'; return 0 ;; esac
+  case "${TERM:-}" in
+    ''|dumb|linux|vt100|vt102|vt220|ansi|cons25) printf '16' ;;
+    *) printf '256' ;;
+  esac
+}
+
+ui_color_mode() {
+  local forced=""
+  if [[ -r "${MENU_COLOR_FILE}" ]]; then
+    forced="$(tr -cd 'a-z0-9' < "${MENU_COLOR_FILE}" 2>/dev/null || true)"
+  fi
+  case "${forced}" in
+    truecolor|256|16|none) printf '%s' "${forced}" ;;
+    *) ui_color_mode_auto ;;
+  esac
+}
+
+# Level kubus xterm-256 (0,95,135,175,215,255) terdekat untuk satu kanal.
+ui_cube_level() {
+  local v="$1"
+  if (( v < 48 )); then UI_L=0; elif (( v < 115 )); then UI_L=1; else UI_L=$(( (v - 35) / 40 )); fi
+}
+
+ui_nearest16() {
+  local r="$1" g="$2" b="$3" i d dr dg db best=0 bestd=-1
+  for ((i=0; i<${#UI_16_CODE[@]}; i++)); do
+    dr=$(( r - UI_16_R[i] )); dg=$(( g - UI_16_G[i] )); db=$(( b - UI_16_B[i] ))
+    d=$(( dr * dr + dg * dg + db * db ))
+    if (( bestd < 0 || d < bestd )); then bestd="${d}"; best="${i}"; fi
+  done
+  UI_N16="${UI_16_CODE[best]}"
+}
+
+# ui_color_to NAMA_VAR r g b [38=teks|48=latar]
+ui_color_to() {
+  local __var="$1" r="$2" g="$3" b="$4" layer="${5:-38}" lr lg lb
+  case "${UI_MODE}" in
+    truecolor) printf -v "${__var}" '\033[%d;2;%d;%d;%dm' "${layer}" "${r}" "${g}" "${b}" ;;
+    256)
+      ui_cube_level "${r}"; lr="${UI_L}"
+      ui_cube_level "${g}"; lg="${UI_L}"
+      ui_cube_level "${b}"; lb="${UI_L}"
+      printf -v "${__var}" '\033[%d;5;%dm' "${layer}" "$(( 16 + 36 * lr + 6 * lg + lb ))" ;;
+    16)
+      ui_nearest16 "${r}" "${g}" "${b}"
+      if [[ "${layer}" == "48" ]]; then
+        printf -v "${__var}" '\033[%dm' "$(( UI_N16 + 10 ))"
+      else
+        printf -v "${__var}" '\033[%dm' "${UI_N16}"
+      fi ;;
+    *) printf -v "${__var}" '%s' '' ;;
+  esac
+}
+
+# Warna gradasi pada posisi 0..1000 -> UI_R UI_G UI_B.
+ui_grad_rgb() {
+  local pos="$1" nseg seg f
+  nseg=$(( ${#UI_SR[@]} - 1 ))
+  seg=$(( pos * nseg / 1000 ))
+  if (( seg >= nseg )); then seg=$(( nseg - 1 )); fi
+  f=$(( pos * nseg - seg * 1000 ))
+  UI_R=$(( UI_SR[seg] + (UI_SR[seg + 1] - UI_SR[seg]) * f / 1000 ))
+  UI_G=$(( UI_SG[seg] + (UI_SG[seg + 1] - UI_SG[seg]) * f / 1000 ))
+  UI_B=$(( UI_SB[seg] + (UI_SB[seg + 1] - UI_SB[seg]) * f / 1000 ))
+}
+
+ui_init() {
+  UI_MODE="$(ui_color_mode)"
+  if [[ "${UI_MODE}" == "none" ]]; then
+    UI_NC=""; UI_BOLD=""
+  else
+    UI_NC=$'\033[0m'; UI_BOLD=$'\033[1m'
+  fi
+  ui_color_to UI_LABEL 128 146 178
+  ui_color_to UI_VAL 236 242 255
+  ui_color_to UI_MUTED 88 100 128
+  ui_color_to UI_OK 0 230 118
+  ui_color_to UI_WARN 255 196 0
+  ui_color_to UI_BAD 255 82 82
+  ui_color_to UI_ACC 0 229 255
+  ui_color_to UI_ACC2 190 110 255
+  ui_color_to UI_INK 12 14 32
+  # Di mode 16 warna, teks gelap di atas latar gradasi cukup hitam biasa.
+  if [[ "${UI_MODE}" == "16" ]]; then UI_INK=$'\033[30m'; fi
+  UI_GRAD_KEY=""
+  return 0
+}
+
+# Siapkan gradasi untuk kotak selebar bw kolom (termasuk kedua bingkai).
+ui_prepare() {
+  local bw="$1" i pos key
+  if (( bw < 12 )); then bw=12; fi
+  if [[ -z "${UI_MODE}" ]]; then ui_init; fi
+  UI_BW="${bw}"
+  UI_IW=$(( bw - 2 ))
+  key="${UI_MODE}:${bw}"
+  if [[ "${UI_GRAD_KEY}" == "${key}" ]]; then return 0; fi
+  UI_GRAD=(); UI_GRAD_BG=()
+  for ((i=0; i<bw; i++)); do
+    pos=$(( i * 1000 / (bw - 1) ))
+    ui_grad_rgb "${pos}"
+    ui_color_to "UI_GRAD[${i}]" "${UI_R}" "${UI_G}" "${UI_B}"
+    ui_color_to "UI_GRAD_BG[${i}]" "${UI_R}" "${UI_G}" "${UI_B}" 48
+  done
+  UI_GRAD_KEY="${key}"
+  return 0
+}
+
+# Lebar kotak mengikuti terminal: 3 kolom menu di layar lebar, 2 di HP.
+ui_layout() {
+  local cols="${MENU_COLS:-}"
+  if [[ ! "${cols}" =~ ^[0-9]+$ ]]; then cols="$(tput cols 2>/dev/null || true)"; fi
+  if [[ ! "${cols}" =~ ^[0-9]+$ || "${cols}" -lt 30 ]]; then cols=62; fi
+  cols=$(( cols - 2 ))
+  if (( cols > 78 )); then cols=78; fi
+  if (( cols < 40 )); then cols=40; fi
+  ui_prepare "${cols}"
+}
+
+# Lebar tampak: kode warna dibuang, byte lanjutan UTF-8 tidak dihitung.
+# Tidak bergantung locale VPS (sering POSIX) dan tanpa subshell.
+ui_width() {
+  local LC_ALL=C s="$1" re=$'\033''\[[0-9;]*m' cont
+  while [[ "${s}" =~ ${re} ]]; do s="${s//"${BASH_REMATCH[0]}"/}"; done
+  cont="${s//[^$'\x80'-$'\xbf']/}"
+  UI_W=$(( ${#s} - ${#cont} ))
+}
+
+# Teks bebas (OS, ISP, kota, nama klien) dibatasi ASCII tercetak supaya lebar
+# dan pemotongan selalu tepat, lalu dipotong ke max kolom.
+ui_fit() {
+  local LC_ALL=C s="$1" max="$2"
+  s="${s//[^[:print:]]/}"
+  if (( ${#s} > max )); then
+    if (( max > 2 )); then s="${s:0:max-2}.."; else s="${s:0:max}"; fi
+  fi
+  UI_OUT="${s}"
+}
+
+ui_pad() {
+  local n="$1"
+  if (( n < 0 )); then n=0; fi
+  printf -v UI_TMP '%*s' "${n}" ''
+}
+
+# Garis bingkai: kiri kanan [judul] [center]
+ui_line() {
+  local left="$1" right="$2" title="${3:-}" align="${4:-left}" out col=1 i seg start
+  out=" ${UI_GRAD[0]}${left}"
+  if [[ -n "${title}" ]]; then
+    seg="[ ${title} ]"
+    if (( ${#seg} > UI_BW - 4 )); then seg=""; fi
+  else
+    seg=""
+  fi
+  start=2
+  if [[ -n "${seg}" && "${align}" == "center" ]]; then start=$(( (UI_BW - ${#seg}) / 2 )); fi
+  while (( col < UI_BW - 1 )); do
+    if [[ -n "${seg}" ]] && (( col == start )); then
+      for ((i=0; i<${#seg}; i++)); do
+        out+="${UI_GRAD[col]}${UI_BOLD}${seg:i:1}${UI_NC}"
+        col=$(( col + 1 ))
+      done
+      continue
+    fi
+    out+="${UI_GRAD[col]}─"
+    col=$(( col + 1 ))
+  done
+  out+="${UI_GRAD[UI_BW - 1]}${right}${UI_NC}"
+  printf '%s\n' "${out}"
+}
+ui_line_top() { ui_line '╭' '╮' "${1:-}" "${2:-left}"; }
+ui_line_sep() { ui_line '├' '┤' "${1:-}" "${2:-left}"; }
+ui_line_bot() { ui_line '╰' '╯'; }
+
+ui_row() {
+  local content="$1"
+  ui_width "${content}"
+  ui_pad "$(( UI_IW - 2 - UI_W ))"
+  printf ' %s│%s %s%s %s│%s\n' "${UI_GRAD[0]}" "${UI_NC}" "${content}" "${UI_TMP}" "${UI_GRAD[UI_BW - 1]}" "${UI_NC}"
+}
+
+ui_center() {
+  local content="$1" left right
+  ui_width "${content}"
+  left=$(( (UI_IW - 2 - UI_W) / 2 ))
+  if (( left < 0 )); then left=0; fi
+  right=$(( UI_IW - 2 - UI_W - left ))
+  if (( right < 0 )); then right=0; fi
+  printf ' %s│%s %*s%s%*s %s│%s\n' "${UI_GRAD[0]}" "${UI_NC}" "${left}" '' "${content}" "${right}" '' "${UI_GRAD[UI_BW - 1]}" "${UI_NC}"
+}
+
+# Teks ASCII diwarnai mengikuti gradasi mulai kolom start -> UI_OUT.
+ui_gtext() {
+  local text="$1" start="${2:-0}" i col out=""
+  for ((i=0; i<${#text}; i++)); do
+    col=$(( start + i ))
+    if (( col > UI_BW - 1 )); then col=$(( UI_BW - 1 )); fi
+    out+="${UI_GRAD[col]}${text:i:1}"
+  done
+  UI_OUT="${out}${UI_NC}"
+}
+
+# Banner judul: latar gradasi penuh dengan tepi setengah blok atas-bawah.
+ui_banner() {
+  local text=" $1 " out col start len ch top="" bottom=""
+  len=${#text}
+  start=$(( (UI_BW - len) / 2 ))
+  if (( start < 0 )); then start=0; fi
+  out=" "
+  for ((col=0; col<UI_BW; col++)); do
+    ch=" "
+    if [[ "${UI_MODE}" == "none" ]]; then ch="="; fi
+    if (( col >= start && col < start + len )); then ch="${text:col-start:1}"; fi
+    out+="${UI_GRAD_BG[col]}${UI_INK}${UI_BOLD}${ch}"
+    top+="${UI_GRAD[col]}▄"
+    bottom+="${UI_GRAD[col]}▀"
+  done
+  if [[ "${UI_MODE}" != "none" ]]; then printf ' %s%s\n' "${top}" "${UI_NC}"; fi
+  printf '%s%s\n' "${out}" "${UI_NC}"
+  if [[ "${UI_MODE}" != "none" ]]; then printf ' %s%s\n' "${bottom}" "${UI_NC}"; fi
+}
+
+# Bar pemakaian: hijau -> kuning -> merah sepanjang bar -> UI_OUT.
+ui_bar() {
+  local pct="$1" len="$2" fill i pos r g out=""
+  if [[ ! "${pct}" =~ ^[0-9]+$ ]]; then pct=0; fi
+  if (( pct > 100 )); then pct=100; fi
+  if (( len < 1 )); then len=1; fi
+  fill=$(( (pct * len + 50) / 100 ))
+  if (( pct > 0 && fill == 0 )); then fill=1; fi
+  for ((i=0; i<len; i++)); do
+    if (( i < fill )); then
+      pos=$(( i * 1000 / (len > 1 ? len - 1 : 1) ))
+      if (( pos < 500 )); then r=$(( pos * 255 / 500 )); g=230; else r=255; g=$(( 230 - (pos - 500) * 170 / 500 )); fi
+      ui_color_to UI_TMP "${r}" "${g}" 90
+      out+="${UI_TMP}█"
+    else
+      out+="${UI_MUTED}░"
+    fi
+  done
+  UI_OUT="${out}${UI_NC}"
+}
+
+# Label rata kiri + nilai berwarna. Ruang nilai = UI_IW - 2 - 11.
+ui_kv() {
+  local label="$1" value="$2" key
+  printf -v key '%-8s' "${label}"
+  ui_row "${UI_LABEL}${key}${UI_NC} ${UI_ACC}›${UI_NC} ${value}"
+}
+
+# Label + teks bebas yang dibersihkan dan dipotong agar muat.
+ui_kv_text() {
+  ui_fit "$2" "$(( UI_IW - 2 - 11 ))"
+  ui_kv "$1" "${UI_VAL}${UI_OUT}${UI_NC}"
+}
+
+# Label + beberapa potongan info berwarna. Potongan yang tidak muat di layar
+# sempit dilewati, jadi info utama tetap tampil dan bingkai tidak jebol.
+ui_kv_parts() {
+  local label="$1" part value="" used=0 room
+  shift
+  room=$(( UI_IW - 2 - 11 ))
+  for part in "$@"; do
+    if [[ -z "${part}" ]]; then continue; fi
+    ui_width "${part}"
+    if (( used > 0 )); then
+      if (( used + 2 + UI_W > room )); then continue; fi
+      value+="  "
+      used=$(( used + 2 ))
+    fi
+    value+="${part}"
+    used=$(( used + UI_W ))
+  done
+  ui_kv "${label}" "${value}"
+}
+
+# Susun potongan berwarna berjajar dan pindah baris bila penuh.
+ui_flow() {
+  local gap="$1" item line="" line_w=0
+  shift
+  for item in "$@"; do
+    ui_width "${item}"
+    if (( line_w > 0 && line_w + gap + UI_W > UI_IW - 2 )); then
+      ui_row "${line}"
+      line=""; line_w=0
+    fi
+    if (( line_w > 0 )); then
+      ui_pad "${gap}"
+      line+="${UI_TMP}"
+      line_w=$(( line_w + gap ))
+    fi
+    line+="${item}"
+    line_w=$(( line_w + UI_W ))
+  done
+  if (( line_w > 0 )); then ui_row "${line}"; fi
+  return 0
+}
+
 menu_hline() {
   local char="${1:--}" count="${2:-58}" i
   for ((i=0; i<count; i++)); do printf '%s' "$char"; done
 }
 
 menu_visible_len() {
-  local esc cleaned
-  printf -v esc '\033'
-  cleaned="$(printf '%s' "${1}" | sed "s/${esc}\[[0-9;]*[mK]//g")"
-  echo "${#cleaned}"
+  ui_width "${1}"
+  echo "${UI_W}"
 }
 
 menu_pad_right() {
@@ -28527,44 +28882,93 @@ menu_pad_right() {
 
 menu_print_line() {
   local text="$1" width="${2:-58}" padded
+  ui_prepare "$(( width + 2 ))"
   padded="$(menu_pad_right "${text}" "${width}")"
-  printf ' %s│%s%s%s│%s\n' "${MENU_C}" "${MENU_NC}" "${padded}" "${MENU_C}" "${MENU_NC}"
+  printf ' %s│%s%s%s│%s\n' "${UI_GRAD[0]}" "${UI_NC}" "${padded}" "${UI_GRAD[UI_BW - 1]}" "${UI_NC}"
 }
 
+# Judul submenu: kotak tertutup dengan judul bergradasi. Isi submenu dicetak
+# pemanggil di bawahnya tanpa bingkai.
 draw_menu_header() {
-  local title="$1" width="${2:-58}" title_len
-  title_len="$(menu_visible_len "  ${title}")"
-  (( title_len > width )) && width="${title_len}"
-  printf ' %s┌%s┐%s\n' "${MENU_C}" "$(menu_hline '─' "${width}")" "${MENU_NC}"
-  menu_print_line "  ${MENU_BOLD}${title}${MENU_NC}" "${width}"
+  local title="$1" width="${2:-}"
+  if [[ -z "${width}" ]]; then ui_layout; width=$(( UI_BW - 2 )); if (( width > 58 )); then width=58; fi; fi
+  ui_width "  ${title}"
+  if (( UI_W > width )); then width="${UI_W}"; fi
+  ui_prepare "$(( width + 2 ))"
+  ui_line_top
+  ui_gtext "${title}" 3
+  menu_print_line "  ${UI_BOLD}${UI_OUT}" "${width}"
+  ui_line_bot
 }
 
+# Nomor pilihan ("1)", "0)", "a)") diberi warna aksen supaya mudah dipindai.
+menu_panel_item() {
+  local item="$1" re='^([0-9]+|[a-zA-Z])\)(.*)$'
+  if [[ "${item}" =~ ${re} ]]; then
+    UI_OUT="${UI_ACC}${UI_BOLD}${BASH_REMATCH[1]})${UI_NC}${BASH_REMATCH[2]}"
+  else
+    UI_OUT="${item}"
+  fi
+}
+
+# Lebar dasar 58 (seperti dulu), menyempit di layar HP, dan tetap melebar
+# mengikuti item terpanjang supaya teks tidak terpotong.
 draw_menu_panel() {
-  local title="$1" width=58 item item_len title_len
+  local title="$1" width item
   shift || true
-  title_len="$(menu_visible_len "  ${title}")"
-  (( title_len > width )) && width="${title_len}"
+  ui_layout
+  width=$(( UI_BW - 2 ))
+  if (( width > 58 )); then width=58; fi
+  ui_width "    ${title}"
+  if (( UI_W > width )); then width="${UI_W}"; fi
   for item in "$@"; do
-    item_len="$(menu_visible_len "  ${item}")"
-    (( item_len > width )) && width="${item_len}"
+    ui_width "  ${item}"
+    if (( UI_W > width )); then width="${UI_W}"; fi
   done
-  draw_menu_header "${title}" "${width}"
+  ui_prepare "$(( width + 2 ))"
+  ui_line_top "${title}"
   for item in "$@"; do
-    menu_print_line "  ${item}" "${width}"
+    menu_panel_item "${item}"
+    menu_print_line "  ${UI_OUT}" "${width}"
   done
-  printf ' %s└%s┘%s\n' "${MENU_C}" "$(menu_hline '─' "${width}")" "${MENU_NC}"
+  ui_line_bot
 }
 
 draw_main_options() {
-  local W=56
-  printf ' %s┌%s┐%s\n' "${MENU_C}" "$(menu_hline '─' "$W")" "${MENU_NC}"
-  menu_print_line "  ${MENU_DIM}1)${MENU_NC} MENU AKUN         ${MENU_DIM}5)${MENU_NC} MONITOR USER LOCK"  "$W"
-  menu_print_line "  ${MENU_DIM}2)${MENU_NC} SERVICE MENU      ${MENU_DIM}6)${MENU_NC} MONITOR USER LOGIN" "$W"
-  menu_print_line "  ${MENU_DIM}3)${MENU_NC} BACKUP/RESTORE    ${MENU_DIM}7)${MENU_NC} TOOLS MENU"        "$W"
-  menu_print_line "  ${MENU_DIM}4)${MENU_NC} CHANGE DOMAIN"   "$W"
-  menu_print_line "  ${MENU_DIM}m)${MENU_NC} MENU UTAMA"       "$W"
-  menu_print_line "  ${MENU_DIM}x)${MENU_NC} EXIT"             "$W"
-  printf ' %s└%s┘%s\n' "${MENU_C}" "$(menu_hline '─' "$W")" "${MENU_NC}"
+  local -a items=(
+    "01|MENU AKUN" "02|SERVICE MENU" "03|BACKUP/RESTORE"
+    "04|CHANGE DOMAIN" "05|MONITOR USER LOCK" "06|MONITOR USER LOGIN"
+    "07|TOOLS MENU" " M|MENU UTAMA" " X|EXIT"
+  )
+  local colw=24 per rows r c idx key label key_color line cell
+  ui_layout
+  per=$(( (UI_IW - 2) / colw ))
+  if (( per > 3 )); then per=3; fi
+  if (( per < 1 )); then per=1; fi
+  rows=$(( (${#items[@]} + per - 1) / per ))
+  ui_line_top "MAIN MENU" center
+  for ((r=0; r<rows; r++)); do
+    line=""
+    for ((c=0; c<per; c++)); do
+      idx=$(( c * rows + r ))
+      if (( idx >= ${#items[@]} )); then continue; fi
+      key="${items[idx]%%|*}"
+      label="${items[idx]#*|}"
+      case "${key}" in
+        " M") key_color="${UI_WARN}" ;;
+        " X") key_color="${UI_BAD}" ;;
+        *) key_color="${UI_ACC}" ;;
+      esac
+      cell="${UI_MUTED}[${UI_NC}${key_color}${UI_BOLD}${key}${UI_NC}${UI_MUTED}]${UI_NC} ${UI_VAL}${label}${UI_NC}"
+      if (( c < per - 1 )); then
+        ui_pad "$(( colw - 5 - ${#label} ))"
+        cell+="${UI_TMP}"
+      fi
+      line+="${cell}"
+    done
+    ui_row "${line}"
+  done
+  ui_line_bot
 }
 
 if [[ "${1:-}" == "update" ]]; then
@@ -28617,10 +29021,15 @@ while true; do
 
   draw_main_options
   echo
-  if ! prompt_input m "Select From Options [1-7, m, x] : "; then
+  printf -v menu_prompt ' %s◆%s %sSelect From Options%s %s[1-7, m, x]%s %s›%s ' \
+    "${UI_ACC2}" "${UI_NC}" "${UI_VAL}" "${UI_NC}" "${UI_MUTED}" "${UI_NC}" "${UI_ACC}" "${UI_NC}"
+  if ! prompt_input m "${menu_prompt}"; then
     SHOW_FULL_MENU=0
     continue
   fi
+  # Menu menampilkan nomor dua digit ([01]..[07]); keduanya diterima.
+  m="${m//[[:space:]]/}"
+  if [[ "${m}" =~ ^0[1-7]$ ]]; then m="${m#0}"; fi
   clear
   case "$m" in
     1) akun_menu || true ;;

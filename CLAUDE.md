@@ -141,6 +141,15 @@ Jangan buang waktu mengejar dua ini saat mengerjakan hal lain. Kalau memperbaiki
 - Server lama dibekukan dengan file `.server-migrated-away`: bot tidak polling Telegram dan expiry job berhenti, walau server reboot. License API tetap jalan sampai DNS pindah. CLI cadangan untuk file di atas 20MB: `node app3.js --server-backup` / `--server-restore FILE`.
 - Pembayaran QRIS memakai tabel `pending_deposits_app3`. Kolom `purpose` membedakan top up saldo (`topup`) dari perpanjang SC langsung (`sc_renewal`). QRIS perpanjang dikreditkan lalu langsung dipakai perpanjang dalam satu transaksi (`settleScRenewalDeposit`); kalau perpanjangan ditolak, dana tetap di saldo pembeli. Test: `npm run test:sc-renewal-payment`.
 
+## Tampilan menu CLI
+
+Menu (`menu-sc-1forcr`, heredoc `MENU_SCRIPT_EOF`) memakai mesin tampilan `ui_*`: bingkai dan banner bergradasi, lebar mengikuti terminal (`ui_layout`, 40–78 kolom), dan empat mode warna (truecolor, 256, 16, none). Mode otomatis memakai 256 warna karena klien SSH jarang meneruskan `COLORTERM`; pilihan manual ada di Tools > Tema Warna Menu dan disimpan di `/etc/sc-1forcr/menu-color`.
+
+- Baris kotak digambar lewat `ui_row`/`ui_kv`/`ui_kv_parts`, yang mengukur lebar tanpa kode warna dan tanpa bergantung locale VPS. Teks bebas dari luar (OS, ISP, kota, nama klien) lewat `ui_fit` supaya dipotong dengan aman.
+- Baris dengan beberapa info memakai `ui_kv_parts`: potongan yang tidak muat di layar HP dilewati, bukan dibiarkan menjebol bingkai.
+- Fungsi di menu jalan dengan `set -euo pipefail`: jangan akhiri fungsi dengan `[[ ... ]] && ...`, pakai `if` atau `return 0`.
+- Test: `npm run test:menu-ui` menggambar dashboard dan menu di 5 lebar layar, 4 mode warna, dan 2 locale, lalu memastikan semua bingkai lurus.
+
 ## Bahasa
 
 Komentar, log, dan teks menu memakai bahasa Indonesia. Ikuti gaya yang sudah ada.

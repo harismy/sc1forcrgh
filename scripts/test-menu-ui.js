@@ -157,6 +157,159 @@ DB_PATH=/tidak/ada.db; ZIVPN_SERVICE=zivpn; DOMAIN=vpn.example.com; SCRIPT_VERSI
   assert(/ACC=0\/0\/0\/0 LIVE=WAIT IP=\S+ EXP=Unlimited/.test(worst.stdout), `unexpected degraded values:\n${worst.stdout.slice(-300)}`);
   assert(stripAnsi(worst.stdout).includes('[ MAIN MENU ]'), 'main menu must render after a degraded dashboard');
 
+  // Filter gaya ui_fx dipakai di tabel, detail akun, dan layar info.
+  const sample = [
+    'USERNAME                 STATUS       LIMIT_IP   SESI_AKTIF    IP_AKTIF',
+    '------------------------ ------------ ---------- ------------- ----------',
+    'iwhebk0872               AMAN         3          1             1',
+    'send4567                 LOCK_TMP     4          3             3',
+    'kaze3333                 RECENT       2          0             1',
+    '',
+    'Total User SSH : 25',
+    'Catatan: SOCKET_AKTIF bukan jumlah perangkat/orang.',
+    'ONLINE berarti ada socket hidup atau autentikasi akun.',
+    '',
+    '=============================',
+    ' INFO QUOTA AKUN SSH',
+    '=============================',
+    'Username     : demo',
+    'Status       : AKTIF',
+    '=============================',
+    '=== DIAGNOSA JARINGAN ===',
+    '- Default route : default via 10.0.0.1',
+    'type    username  unlock_at            remain_sec',
+    '------  --------  -------------------  ----------',
+    'ssh     demo      2026-09-26 15:10:00  120',
+    '[ FRONT/BUG HOSTS ]',
+    'Tidak ada user SSH yang sedang online.'
+  ].join('\n') + '\n';
+  const samplePath = path.join(tmpDir, 'sample.txt');
+  fs.writeFileSync(samplePath, sample);
+  const runFx = (mode, force) => {
+    const cf = path.join(tmpDir, `fx-${mode}`);
+    fs.writeFileSync(cf, `${mode}\n`);
+    const sh = path.join(tmpDir, 'fx.sh');
+    fs.writeFileSync(sh, `set -euo pipefail\n${engine}\nMENU_COLOR_FILE='${toBashPath(cf)}'\nMENU_COLS=80\nUI_MODE=''\n` +
+      `${force ? 'UI_FX_FORCE=1 ' : ''}ui_fx < '${toBashPath(samplePath)}'\n`);
+    const r = spawnSync(bash, [toBashPath(sh)], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `ui_fx failed mode=${mode}:\n${r.stderr}`);
+    return r.stdout;
+  };
+  assert.strictEqual(runFx('truecolor', false), sample, 'ui_fx must pass output through untouched when stdout is not a terminal');
+  const fx = runFx('truecolor', true);
+  const fxLines = fx.split('\n');
+  const inLines = sample.split('\n');
+  assert.strictEqual(fxLines.length, inLines.length, 'ui_fx must keep the line count');
+  const expectedPlain = inLines.map((l) => {
+    if (/^[ \t]*[-=][-= \t]*$/.test(l) && /---|===/.test(l)) return l.replace(/[-=]/g, '─');
+    if (/^=== .* ===$/.test(l)) return `◆ ${l.replace(/^=== /, '').replace(/ ===$/, '')}`;
+    return l;
+  });
+  fxLines.forEach((l, i) => assert.strictEqual(stripAnsi(l), expectedPlain[i], `ui_fx changed text on line ${i + 1}`));
+  const OK = '\x1b[38;2;0;230;118m';
+  const BAD = '\x1b[38;2;255;82;82m';
+  const WARN = '\x1b[38;2;255;196;0m';
+  const ACC = '\x1b[38;2;0;229;255m';
+  const MUT = '\x1b[38;2;88;100;128m';
+  assert(fxLines[0].startsWith(ACC), 'table header must use the accent color');
+  assert(fxLines[2].includes(`${OK}AMAN`), 'AMAN must be green');
+  assert(fxLines[3].includes(`${BAD}LOCK_TMP`), 'LOCK_TMP must be red');
+  assert(fxLines[4].includes(`${WARN}RECENT`), 'RECENT must be amber');
+  assert(fxLines[8].startsWith(MUT) && !fxLines[8].includes(OK), 'status words inside a note block stay muted');
+  assert(fxLines[18].startsWith(ACC), 'lowercase sqlite -column header above a dash rule must be styled as a header');
+  assert(fxLines[11].startsWith(ACC), 'block title between two rules must be styled as a header');
+  assert(fxLines[14].startsWith('[38;2;128;146;178m'), 'a label/value line right above a closing rule must keep the label style');
+  assert(fxLines[16].includes('◆ DIAGNOSA JARINGAN') && fxLines[16].startsWith(ACC), 'a rule must end the muted note block');
+  assert(fxLines[22].startsWith(MUT), 'empty-state messages are muted');
+  assert(!runFx('none', true).includes('\x1b['), 'mode none must not emit color codes from ui_fx');
+
+  // echo ke layar memakai aturan gaya yang sama, jadi layar setting dan pesan
+  // berhasil/gagal ikut seragam. Tanpa terminal (pipe, file, $(...)) echo
+  // tetap builtin polos supaya data yang dibaca skrip lain tidak berubah.
+  const menuKv = extract(menuRuntime, 'menu_kv() {', '\nmask_secret() {');
+  const sayLines = [
+    'Status saat ini   : AKTIF',
+    'Gagal update quota.',
+    'Berhasil update auto reboot:',
+    'Peringatan: config haproxy invalid, restart haproxy dilewati.',
+    'Cooldown gagal    : 15 menit',
+    'Gagal : 0',
+    'Jika sync/restart Xray gagal, pakai format: uuid',
+    'Install pending belum berhasil dilanjutkan.',
+    'Input status tidak valid. Gunakan 1 atau 0.',
+    'Update ditolak: signature/checksum manifest installer tidak valid.',
+    'ID tersimpan di DB, tapi sync/restart Xray gagal.',
+    '1) Update SC aman (backup otomatis)',
+    'Nilai saat ini:',
+    'Status : NONAKTIF',
+    'Cooldown mencegah retry versi gagal terus-menerus yang bisa memutus tunnel.'
+  ];
+  const sayBody = sayLines.map((l) => `echo '${l}'`).join('\n') + '\n' +
+    'menu_kv "TOTAL" "3"\n' +
+    'echo "-----------"\n' +
+    'echo "baris" "dua"\n' +
+    'IFS=$\'\\t\'; echo "a" "b"; IFS=$\' \\t\\n\'\n' +
+    'echo -n "tanpa-newline"; echo\n' +
+    'echo -e "x\\ty"\n' +
+    'printf -v ml \'Label satu : AKTIF\\nGagal kedua.\'; echo "${ml}"\n';
+  const expectedSay = [...sayLines, 'TOTAL        : 3', '-----------', 'baris dua', 'a b', 'tanpa-newline', 'x\ty',
+    'Label satu : AKTIF', 'Gagal kedua.'].join('\n') + '\n';
+  const runSay = (mode, force) => {
+    const cf = path.join(tmpDir, `say-${mode}`);
+    fs.writeFileSync(cf, `${mode}\n`);
+    const sh = path.join(tmpDir, 'say.sh');
+    fs.writeFileSync(sh, `set -euo pipefail\n${engine}\n${menuKv}\nMENU_COLOR_FILE='${toBashPath(cf)}'\nMENU_COLS=80\nUI_MODE=''\n` +
+      `say_all() {\n${sayBody}}\n${force ? 'UI_SAY_FORCE=1 ' : ''}say_all\n` +
+      'captured="$(echo "Status : AKTIF")"\n[[ "${captured}" == "Status : AKTIF" ]] || { builtin echo "CAPTURE_STYLED" >&2; exit 3; }\n');
+    const r = spawnSync(bash, [toBashPath(sh)], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `styled echo failed mode=${mode}:\n${r.stderr}`);
+    return r.stdout;
+  };
+  assert.strictEqual(runSay('truecolor', false), expectedSay, 'echo must stay plain builtin output when stdout is not a terminal');
+  assert.strictEqual(runSay('none', true), expectedSay, 'theme none must keep echo output byte-identical');
+  const say = runSay('truecolor', true).split('\n');
+  const expectedSayLines = expectedSay.split('\n');
+  assert.strictEqual(say.length, expectedSayLines.length, 'styled echo must keep the line count');
+  say.forEach((l, i) => assert.strictEqual(stripAnsi(l), expectedSayLines[i].replace(/^-+$/, (d) => '─'.repeat(d.length)),
+    `styled echo changed text on line ${i + 1}`));
+  const LBL = '\x1b[38;2;128;146;178m';
+  assert(say[0].startsWith(LBL) && say[0].includes(`${OK}AKTIF`), 'settings value line must use label style and green status');
+  assert(say[1].startsWith(BAD), '"Gagal ..." must be red');
+  assert(say[2].startsWith(OK), '"Berhasil ..." must be green');
+  assert(say[3].startsWith(WARN), '"Peringatan: ..." must be amber');
+  assert(say[4].startsWith(LBL), 'a padded settings label containing "gagal" must stay a label');
+  assert(say[5].startsWith(LBL), 'a zero failure counter must not be painted as an error');
+  assert(!say[6].startsWith(BAD), 'instructions ("Jika ... gagal") must not be painted as an error');
+  assert(say[7].startsWith(WARN), '"belum berhasil" is a warning, not a success');
+  assert(say[8].startsWith(BAD), 'validation errors must be red');
+  assert(say[9].startsWith(BAD), '"Update ditolak: ..." must be red, not a label');
+  assert(say[10].startsWith(WARN), 'partial success ("tersimpan, tapi ... gagal") must be amber');
+  assert(say[11].startsWith(ACC), 'numbered options must highlight the number like menu panels');
+  assert(say[12].startsWith(ACC), 'section lines ending with a colon must be styled as a heading');
+  assert(say[13].includes(`${MUT}NONAKTIF`), 'NONAKTIF must be muted');
+  assert(!say[14].startsWith(BAD), 'an explanation mentioning "gagal" late in the sentence is not an error');
+  assert(say[15].startsWith(LBL), 'menu_kv lines must use the label style');
+  assert(say[16].includes('─'), 'rules printed with echo must become gradient lines');
+  assert(!say[19].includes('\x1b[') && !say[20].includes('\x1b['), 'echo -n/-e must pass through untouched');
+  assert(say[21].startsWith(LBL) && say[22].startsWith(BAD), 'multi-line echo must be styled line by line');
+
+  // ui_monitor: data diambil sekali saat dibuka (bukan tiap detik), frame
+  // tetap berwarna walau ditangkap, dan keluar bersih. Tanpa terminal, tombol
+  // terbaca sebagai [q].
+  const monCf = path.join(tmpDir, 'mon-truecolor');
+  fs.writeFileSync(monCf, 'truecolor\n');
+  const monCount = path.join(tmpDir, 'mon-count');
+  const mon = path.join(tmpDir, 'mon.sh');
+  fs.writeFileSync(mon, `set -euo pipefail\n${engine}\nclear() { :; }\nMENU_COLOR_FILE='${toBashPath(monCf)}'\nMENU_COLS=80\nUI_MODE=''\n` +
+    `fake_screen() { echo x >> '${toBashPath(monCount)}'; draw_menu_header "VMESS USER LOGIN"; printf '%-10s %-8s\\n' USERNAME STATUS; printf '%-10s %-8s\\n' ---------- --------; printf '%-10s %-8s\\n' demo ONLINE; return 1; }\n` +
+    'ui_monitor fake_screen\necho "EXIT_OK"\n');
+  const monOut = spawnSync(bash, [toBashPath(mon)], { encoding: 'utf8' });
+  assert.strictEqual(monOut.status, 0, `ui_monitor failed:\n${monOut.stderr}`);
+  assert(monOut.stdout.includes('EXIT_OK'), 'ui_monitor must return cleanly');
+  assert.strictEqual(fs.readFileSync(monCount, 'utf8').trim().split('\n').length, 1, 'snapshot mode must collect data exactly once');
+  assert(monOut.stdout.includes(`${OK}ONLINE`), 'captured monitor frame must still be colored');
+  assert(stripAnsi(monOut.stdout).includes('[r] ambil ulang'), 'monitor footer must show the refresh key');
+
   console.log('menu ui tests passed');
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });

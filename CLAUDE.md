@@ -148,7 +148,11 @@ Menu (`menu-sc-1forcr`, heredoc `MENU_SCRIPT_EOF`) memakai mesin tampilan `ui_*`
 - Baris kotak digambar lewat `ui_row`/`ui_kv`/`ui_kv_parts`, yang mengukur lebar tanpa kode warna dan tanpa bergantung locale VPS. Teks bebas dari luar (OS, ISP, kota, nama klien) lewat `ui_fit` supaya dipotong dengan aman.
 - Baris dengan beberapa info memakai `ui_kv_parts`: potongan yang tidak muat di layar HP dilewati, bukan dibiarkan menjebol bingkai.
 - Fungsi di menu jalan dengan `set -euo pipefail`: jangan akhiri fungsi dengan `[[ ... ]] && ...`, pakai `if` atau `return 0`.
-- Test: `npm run test:menu-ui` menggambar dashboard dan menu di 5 lebar layar, 4 mode warna, dan 2 locale, lalu memastikan semua bingkai lurus.
+- Satu mesin gaya, `ui_style_line`, dipakai dua jalur. Blok teks lama (tabel, detail akun, layar info) lewat `... | ui_fx`. Semua `echo` yang menuju terminal juga ikut bergaya, karena `menu_styled_echo_enable` mengganti `echo` dengan fungsi. Isi teks tidak berubah, hanya diwarnai: label, status, pesan `Gagal`/`tidak valid` merah, `Peringatan`/`belum tersedia` kuning, `Berhasil` hijau. Echo ke file, pipe, atau `$(...)` tetap builtin polos, begitu juga `echo -n`/`-e` dan tema `none`, jadi data yang dibaca skrip lain tidak tersentuh. Tulis pesan baru dengan `echo` biasa; kata depannya menentukan warnanya.
+- Jangan pakai `ui_fx` pada fungsi yang meminta input; bungkus bagian tabelnya saja. Pemilih akun menulis tabelnya ke stderr (`| ui_fx >&2`) karena stdout-nya membawa username yang dipilih. Untuk jeda pakai `menu_pause`, untuk baris `printf "%-12s : %s"` pakai `menu_kv`.
+- `ui_style_line` murni bash dan jalan per baris, termasuk di tabel ratusan akun. Setiap aturan regex baru wajib dijaga glob murah dulu (`[[ $s == *kata* && $s =~ ... ]]`), karena bash mengompilasi ulang regex di tiap baris. Baris tabel (spasi kolom ganda, tanpa `": "`) lewat jalur pendek yang hanya mewarnai status.
+- Layar monitor memakai `ui_monitor NAMA_FUNGSI`: data diambil sekali, `[r]` ambil ulang, `[l]` live tiap 5 detik, dan redraw tanpa `clear`. Jangan kembali ke loop `clear` + kumpulkan data tiap 1 detik; itu membuat layar berkedip dan membebani VPS kecil.
+- Test: `npm run test:menu-ui` menggambar dashboard dan menu di 5 lebar layar, 4 mode warna, dan 2 locale, lalu memastikan semua bingkai lurus. Test yang sama memeriksa warna pesan `echo` (termasuk kasus yang tidak boleh salah warna, seperti "Cooldown gagal : 15 menit" dan "Jika ... gagal") dan bahwa echo tanpa terminal tetap polos.
 
 ## Bahasa
 

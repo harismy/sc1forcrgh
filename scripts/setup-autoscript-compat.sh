@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.68}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.69}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -19297,10 +19297,14 @@ resume_pending_operation_prompt() {
   type="${PENDING_TYPE:-unknown}"
   note="${PENDING_NOTE:-pending operation}"
   [[ -z "${cmd}" ]] && return 0
-  printf '\nAda proses %s yang belum selesai.\n' "${type}" >/dev/tty
-  printf 'Info : %s\n' "${note}" >/dev/tty
-  printf 'Cmd  : %s\n' "${cmd}" >/dev/tty
-  printf 'Tekan Enter untuk lanjutkan, atau ketik '\''skip'\'' untuk nanti: ' >/dev/tty
+  {
+    printf '\nAda proses %s yang belum selesai.\n' "${type}"
+    printf 'Info : %s\n' "${note}"
+    printf 'Cmd  : %s\n' "${cmd}"
+  } | ui_fx >/dev/tty
+  if [[ -z "${UI_MODE:-}" ]]; then ui_init; fi
+  printf ' %s◆%s %sTekan Enter untuk lanjutkan, atau ketik %sskip%s%s untuk nanti:%s ' \
+    "${UI_ACC2}" "${UI_NC}" "${UI_VAL}" "${UI_ACC}" "${UI_NC}" "${UI_VAL}" "${UI_NC}" >/dev/tty
   read -r ans </dev/tty || true
   [[ "${ans,,}" == "skip" ]] && return 0
   rm -f "${PENDING_OP_FILE}" >/dev/null 2>&1 || true
@@ -19387,7 +19391,7 @@ pending_install_gate_menu() {
           set_pending_operation "${type}" "${cmd}" "${note}"
           echo
           echo "Install pending belum berhasil dilanjutkan."
-          read -rp "Enter untuk kembali ke menu pending..." _ || true
+          menu_pause "Enter untuk kembali ke menu pending..."
         else
           return 0
         fi
@@ -20070,14 +20074,14 @@ network_compatibility_menu() {
     fi
     clear
     case "${nm}" in
-      1) show_network_diagnostics ;;
+      1) show_network_diagnostics | ui_fx ;;
       2) enable_network_compatibility ;;
       3) disable_network_compatibility ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
     echo
-    read -rp "Enter untuk lanjut..." _ || true
+    menu_pause
   done
 }
 
@@ -20222,11 +20226,32 @@ cancelled() {
 
 prompt_input() {
   local var_name="$1" prompt="$2"
+  # Prompt polos diberi gaya menu; prompt yang sudah berwarna dibiarkan.
+  if [[ "${prompt}" != *$'\033'* ]] && declare -F ui_init >/dev/null 2>&1; then
+    if [[ -z "${UI_MODE:-}" ]]; then ui_init; fi
+    prompt=" ${UI_ACC2}◆${UI_NC} ${UI_VAL}${prompt}${UI_NC}"
+  fi
   if ! read -rp "${prompt}" "${var_name}" </dev/tty; then
     cancelled
     return 130
   fi
   return 0
+}
+
+# Jeda "Enter untuk lanjut" dengan gaya prompt menu. Tetap membaca stdin
+# seperti read -rp sebelumnya.
+menu_pause() {
+  local msg="${1:-Enter untuk lanjut...}"
+  if [[ -z "${UI_MODE:-}" ]] && declare -F ui_init >/dev/null 2>&1; then ui_init; fi
+  read -rp " ${UI_ACC2:-}◆${UI_NC:-} ${UI_MUTED:-}${msg}${UI_NC:-}" _ || true
+  return 0
+}
+
+# Satu baris "Label        : nilai" lewat echo, jadi ikut gaya menu.
+menu_kv() {
+  local line
+  printf -v line '%-12s : %s' "${1:-}" "${2:-}"
+  echo "${line}"
 }
 
 mask_secret() {
@@ -21055,7 +21080,7 @@ print_created_account() {
       ovpn_udp="$(created_json_value "${raw}" '.data.port.ovpnudp // .data.port.ovpn_udp' '2200')"
       ssh_ohp="$(created_json_value "${raw}" '.data.port.sshohp // .data.port.ssh_ohp' '8181')"
       udp_custom="$(created_json_value "${raw}" '.data.port.udpcustom // .data.port.udp_custom // .data.port.udphc // .data.udpcustom_port // .data.udp_custom_port')"
-      cat <<EOT_SSH
+      cat <<EOT_SSH | ui_fx
 =============================
  SSH ACCOUNT CREATED
 =============================
@@ -21112,7 +21137,7 @@ EOT_SSH
       if [[ "${backend}" == "zivpn" ]]; then
         udp_port="${ZIVPN_LISTEN_PORT:-5667}"
       fi
-      cat <<EOT_ZIVPN
+      cat <<EOT_ZIVPN | ui_fx
 =============================
  ZIVPN ACCOUNT CREATED
 =============================
@@ -21172,7 +21197,7 @@ EOT_ZIVPN
       linkbugsntls="$(echo "${raw}" | jq -r 'if ((.data.link.front_none_all // []) | type) == "array" and ((.data.link.front_none_all // []) | length) > 0 then (.data.link.front_none_all[] | "BUG " + (.address // "-") + " -> " + (.host // "-") + ":\n" + (.link // "")) else empty end' 2>/dev/null || true)"
       aliases="$(echo "${raw}" | jq -r '(.data.wildcard_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
       fronts="$(echo "${raw}" | jq -r '(.data.front_hosts // []) | if type=="array" and length>0 then join(", ") else "" end' 2>/dev/null || true)"
-      cat <<EOT_XRAY
+      cat <<EOT_XRAY | ui_fx
 =============================
         ${title} ACCOUNT
 =============================
@@ -21188,27 +21213,27 @@ PORT ANY    : ${any_port}
 EOT_XRAY
       case "${type}" in
         vmess)
-          cat <<EOT_VMESS_DETAIL
+          cat <<EOT_VMESS_DETAIL | ui_fx
 UUID        : ${secret}
 ALTER ID    : 0
 SECURITY    : auto
 EOT_VMESS_DETAIL
           ;;
         vless)
-          cat <<EOT_VLESS_DETAIL
+          cat <<EOT_VLESS_DETAIL | ui_fx
 UUID        : ${secret}
 ENCRYPTION  : none
 SECURITY    : tls / none
 EOT_VLESS_DETAIL
           ;;
         trojan)
-          cat <<EOT_TROJAN_DETAIL
+          cat <<EOT_TROJAN_DETAIL | ui_fx
 PASSWORD    : ${secret}
 SECURITY    : tls / none
 EOT_TROJAN_DETAIL
           ;;
       esac
-      cat <<EOT_XRAY_LINKS
+      cat <<EOT_XRAY_LINKS | ui_fx
 NETWORK     : ws, grpc, upgrade
 PATH WS     : ${path_ws}
 SERVICE     : ${service_name}
@@ -21235,7 +21260,7 @@ Up Non-TLS:
 ${linkupntls}
 EOT_XRAY_LINKS
       if [[ -n "${aliases:-}" || -n "${fronts:-}" ]]; then
-        cat <<EOT_XRAY_HOSTS
+        cat <<EOT_XRAY_HOSTS | ui_fx
 
 [ FRONT/BUG HOSTS ]
 -----------------------------
@@ -21244,14 +21269,14 @@ Front bug   : ${fronts:--}
 EOT_XRAY_HOSTS
       fi
       if [[ -n "${linkbugs:-}" ]]; then
-        cat <<EOT_XRAY_BUGS
+        cat <<EOT_XRAY_BUGS | ui_fx
 
 [ FRONT/BUG URL TLS ]
 -----------------------------
 ${linkbugs}
 EOT_XRAY_BUGS
       elif [[ -n "${linkbug:-}" && "${linkbug}" != "null" && "${linkbug}" != "-" ]]; then
-        cat <<EOT_XRAY_BUG
+        cat <<EOT_XRAY_BUG | ui_fx
 
 [ FRONT/BUG URL TLS ]
 -----------------------------
@@ -21259,21 +21284,21 @@ ${linkbug}
 EOT_XRAY_BUG
       fi
       if [[ -n "${linkbugsntls:-}" ]]; then
-        cat <<EOT_XRAY_BUGS_NTLS
+        cat <<EOT_XRAY_BUGS_NTLS | ui_fx
 
 [ FRONT/BUG URL NON-TLS ]
 -----------------------------
 ${linkbugsntls}
 EOT_XRAY_BUGS_NTLS
       elif [[ -n "${linkbugntls:-}" && "${linkbugntls}" != "null" && "${linkbugntls}" != "-" ]]; then
-        cat <<EOT_XRAY_BUG_NTLS
+        cat <<EOT_XRAY_BUG_NTLS | ui_fx
 
 [ FRONT/BUG URL NON-TLS ]
 -----------------------------
 ${linkbugntls}
 EOT_XRAY_BUG_NTLS
       fi
-      cat <<EOT_XRAY_FOOTER
+      cat <<EOT_XRAY_FOOTER | ui_fx
 
 [ HOST INFORMATION ]
 -----------------------------
@@ -21624,7 +21649,7 @@ change_ssh_password_account() {
   local username password payload resp code message host exp limitip
   echo "GANTI PASSWORD SSH/ZIVPN/UDPHC"
   username="$(pick_existing_username "ssh")" || return
-  printf "%-12s : %s\n" "Username" "${username}"
+  menu_kv "Username" "${username}"
   prompt_input password "Password baru: " || return
   password="$(echo "${password}" | tr -d '\r')"
   validate_ssh_password_cli "${password}" || return
@@ -21641,7 +21666,7 @@ change_ssh_password_account() {
   host="${DOMAIN}"
   exp="$(echo "${resp}" | jq -r '.data.exp // "-"' 2>/dev/null || echo "-")"
   limitip="$(echo "${resp}" | jq -r '.data.limitip // "0"' 2>/dev/null || echo "0")"
-  cat <<EOT_PASS_SSH
+  cat <<EOT_PASS_SSH | ui_fx
 =============================
  PASSWORD SSH BERHASIL DIGANTI
 =============================
@@ -21867,7 +21892,7 @@ pick_existing_username() {
   fi
 
   echo "LIST AKUN ${type^^} - ${mode^^}" >&2
-  if ! print_account_picker_table "${type}" "0" "${mode}" >&2; then
+  if ! print_account_picker_table "${type}" "0" "${mode}" | ui_fx >&2; then
     echo "Tidak ada data akun untuk ditampilkan." >&2
   fi
   prompt_input input "Pilih nomor atau isi username: " || return 1
@@ -21923,7 +21948,7 @@ pick_locked_username() {
   fi
 
   echo "LIST AKUN LOCK ${type^^}" >&2
-  if ! print_account_picker_table "${type}" "1" >&2; then
+  if ! print_account_picker_table "${type}" "1" | ui_fx >&2; then
     echo "Tidak ada data lock untuk ditampilkan." >&2
   fi
   prompt_input input "Pilih nomor atau isi username: " || return 1
@@ -21950,7 +21975,7 @@ renew_account() {
   [[ -z "$ep" ]] && { echo "Endpoint renew tidak ada."; return; }
   echo "RENEW AKUN ${type^^} - AKTIF/NON-EXPIRED"
   username="$(pick_existing_username "$type" "nonexpired")" || return
-  printf "%-12s : %s\n" "Username" "${username}"
+  menu_kv "Username" "${username}"
   prompt_input exp "Tambah expired (hari) [30]: " || return
   exp="${exp:-30}"
   resp="$(api_call "POST" "${ep}/${username}/${exp}")"
@@ -21964,7 +21989,7 @@ renew_account() {
   to_date="$(echo "${resp}" | jq -r '.data.to // .data.exp // "-"' 2>/dev/null || echo "-")"
   quota="$(echo "${resp}" | jq -r '.data.quota // "0"' 2>/dev/null || echo "0")"
   limitip="$(echo "${resp}" | jq -r '.data.limitip // "0"' 2>/dev/null || echo "0")"
-  cat <<EOT_RENEW
+  cat <<EOT_RENEW | ui_fx
 =============================
  RENEW ${type^^} BERHASIL
 =============================
@@ -22006,14 +22031,16 @@ recover_expired_account() {
 
   echo "RECOVERY AKUN EXPIRED"
   echo "Masa recovery: ${EXPIRED_ACCOUNT_RETENTION_DAYS:-30} hari sejak tanggal expired."
-  printf "%-4s %-9s %-24s %-20s %-10s\n" "NO" "TYPE" "USERNAME" "EXPIRED" "STATUS"
-  printf "%-4s %-9s %-24s %-20s %-10s\n" "----" "---------" "------------------------" "--------------------" "----------"
   local i=0 row_type row_user row_exp row_status
-  while IFS='|' read -r row_type row_user row_exp row_status; do
-    [[ -z "${row_user}" ]] && continue
-    i=$((i + 1))
-    printf "%-4s %-9s %-24s %-20s %-10s\n" "${i}" "${row_type^^}" "${row_user}" "${row_exp:--}" "EXPIRED"
-  done <<< "${rows}"
+  {
+    printf "%-4s %-9s %-24s %-20s %-10s\n" "NO" "TYPE" "USERNAME" "EXPIRED" "STATUS"
+    printf "%-4s %-9s %-24s %-20s %-10s\n" "----" "---------" "------------------------" "--------------------" "----------"
+    while IFS='|' read -r row_type row_user row_exp row_status; do
+      [[ -z "${row_user}" ]] && continue
+      i=$((i + 1))
+      printf "%-4s %-9s %-24s %-20s %-10s\n" "${i}" "${row_type^^}" "${row_user}" "${row_exp:--}" "EXPIRED"
+    done <<< "${rows}"
+  } | ui_fx
 
   prompt_input choice "Pilih nomor atau username akun [0=kembali]: " || return
   choice="$(echo "${choice}" | tr -d '[:space:]')"
@@ -22057,7 +22084,7 @@ recover_expired_account() {
   fi
   to_date="$(echo "${resp}" | jq -r '.data.to // .data.exp // "-"' 2>/dev/null || echo "-")"
   status="$(echo "${resp}" | jq -r '.data.status // "AKTIF"' 2>/dev/null || echo "AKTIF")"
-  cat <<EOT_RECOVERY
+  cat <<EOT_RECOVERY | ui_fx
 =============================
  RECOVERY ${type^^} BERHASIL
 =============================
@@ -22289,7 +22316,7 @@ delete_account() {
   [[ -z "$ep" ]] && { echo "Endpoint delete tidak ada."; return; }
   echo "DELETE AKUN ${type^^} - ${label}"
   username="$(pick_existing_username "$type" "$mode")" || return
-  printf "%-12s : %s\n" "Username" "${username}"
+  menu_kv "Username" "${username}"
   prompt_input confirm "Ketik HAPUS untuk konfirmasi: " || return
   [[ "${confirm^^}" != "HAPUS" ]] && { echo "Dibatalkan."; return; }
   resp="$(api_call "DELETE" "${ep}/${username}")"
@@ -22319,11 +22346,11 @@ delete_all_expired_accounts() {
 
   echo "HAPUS SEMUA ACCOUNT EXPIRED"
   echo "Akun trial expired yang masih tersisa juga akan dihapus."
-  printf "%-12s : %s\n" "SSH/ZIVPN" "${ssh_count}"
-  printf "%-12s : %s\n" "VMESS" "${vmess_count}"
-  printf "%-12s : %s\n" "VLESS" "${vless_count}"
-  printf "%-12s : %s\n" "TROJAN" "${trojan_count}"
-  printf "%-12s : %s\n" "TOTAL" "${total}"
+  menu_kv "SSH/ZIVPN" "${ssh_count}"
+  menu_kv "VMESS" "${vmess_count}"
+  menu_kv "VLESS" "${vless_count}"
+  menu_kv "TROJAN" "${trojan_count}"
+  menu_kv "TOTAL" "${total}"
   if [[ "${total}" -lt 1 ]]; then
     echo "Tidak ada akun expired yang perlu dihapus."
     return
@@ -22350,11 +22377,11 @@ delete_all_expired_accounts() {
   sync_ssh="$(echo "${resp}" | jq -r '.data.sync.ssh_backends // true' 2>/dev/null || echo true)"
   sync_xray="$(echo "${resp}" | jq -r '.data.sync.xray // true' 2>/dev/null || echo true)"
   echo "Semua akun yang masih berstatus expired berhasil diproses."
-  printf "%-12s : %s\n" "SSH/ZIVPN" "${deleted_ssh}"
-  printf "%-12s : %s\n" "VMESS" "${deleted_vmess}"
-  printf "%-12s : %s\n" "VLESS" "${deleted_vless}"
-  printf "%-12s : %s\n" "TROJAN" "${deleted_trojan}"
-  printf "%-12s : %s\n" "TOTAL" "${deleted_total}"
+  menu_kv "SSH/ZIVPN" "${deleted_ssh}"
+  menu_kv "VMESS" "${deleted_vmess}"
+  menu_kv "VLESS" "${deleted_vless}"
+  menu_kv "TROJAN" "${deleted_trojan}"
+  menu_kv "TOTAL" "${deleted_total}"
   if [[ "${sync_ssh}" != "true" ]]; then
     echo "Peringatan: sinkronisasi backend SSH/UDP perlu dijalankan ulang."
   fi
@@ -22372,7 +22399,7 @@ lock_account() {
   [[ -z "$ep" ]] && { echo "Endpoint lock tidak ada."; return; }
   echo "LOCK AKUN ${type^^} - AKTIF"
   username="$(pick_existing_username "$type" "active")" || return
-  printf "%-12s : %s\n" "Username" "${username}"
+  menu_kv "Username" "${username}"
   prompt_input confirm "Ketik LOCK untuk konfirmasi: " || return
   [[ "${confirm^^}" != "LOCK" ]] && { echo "Dibatalkan."; return; }
   resp="$(api_call "PATCH" "${ep}/${username}")"
@@ -22480,7 +22507,7 @@ unlock_all_accounts() {
 }
 
 list_accounts() {
-  print_account_table() {
+  print_account_table_rows() {
     local table="$1" title="$2" mode="${3:-active}" acct_type trial_expr where rows total active_total trial_total expired_total active_where expired_where rem_expr
     acct_type="$(account_type_for_table "${table}")"
     trial_expr="(LOWER(username) LIKE 'trial%' OR EXISTS (SELECT 1 FROM account_trial_flags f WHERE f.account_type='${acct_type}' AND LOWER(f.username)=LOWER(${table}.username)))"
@@ -22507,7 +22534,7 @@ list_accounts() {
     active_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE ${active_where} AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
     trial_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE ${trial_expr};" 2>/dev/null || echo 0)"
     expired_total="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE (${expired_where}) AND NOT ${trial_expr};" 2>/dev/null || echo 0)"
-    echo "LIST AKUN ${title} - ${mode^^}"
+    draw_menu_header "LIST AKUN ${title} - ${mode^^}"
     echo "Summary: aktif=${active_total:-0} | trial=${trial_total:-0} | expired=${expired_total:-0} | total_db=${total:-0}"
     printf "%-4s %-22s %-10s %-8s %-7s %-24s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP" "QUOTA"
     printf "%-4s %-22s %-10s %-8s %-7s %-24s\n" "----" "----------------------" "----------" "--------" "-------" "------------------------"
@@ -22528,6 +22555,9 @@ list_accounts() {
       quota_text="$(quota_usage_label_for_account "$(quota_type_from_table "${table}")" "${u}" "${quota:-0}")"
       printf "%-4s %-22s %-10s %-8s %-7s %-24s\n" "${i}" "${u}" "${display_st}" "${sisa_human}" "${lim:-0}" "${quota_text}"
     done <<< "${rows}"
+  }
+  print_account_table() {
+    print_account_table_rows "$@" | ui_fx
   }
 
   draw_menu_panel "Pilih list akun:" \
@@ -22618,7 +22648,7 @@ show_account_detail() {
       fi
       IFS='|' read -r d_user d_pass d_exp d_status d_quota d_limit <<< "${row}"
       d_quota_usage="$(quota_usage_label_for_account "ssh" "${d_user}" "${d_quota}")"
-      cat <<EOT_SSH_DETAIL
+      cat <<EOT_SSH_DETAIL | ui_fx
 =============================
  DETAIL AKUN ${type^^}
 =============================
@@ -22645,7 +22675,7 @@ EOT_SSH_DETAIL
       d_quota_usage="$(quota_usage_label_for_account "vmess" "${d_user}" "${d_quota}")"
       vmess_tls="$(printf '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/vmess","tls":"tls","sni":"%s"}' "${d_user}" "${DOMAIN}" "${d_uuid}" "${DOMAIN}" "${DOMAIN}" | base64 -w 0 2>/dev/null || true)"
       vmess_ntls="$(printf '{"v":"2","ps":"%s","add":"%s","port":"80","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/vmess","tls":"none","sni":"%s"}' "${d_user}" "${DOMAIN}" "${d_uuid}" "${DOMAIN}" "${DOMAIN}" | base64 -w 0 2>/dev/null || true)"
-      cat <<EOT_VMESS_DETAIL
+      cat <<EOT_VMESS_DETAIL | ui_fx
 =============================
  DETAIL AKUN VMESS
 =============================
@@ -22670,7 +22700,7 @@ EOT_VMESS_DETAIL
       fi
       IFS='|' read -r d_user d_uuid d_exp d_status d_quota d_limit <<< "${row}"
       d_quota_usage="$(quota_usage_label_for_account "vless" "${d_user}" "${d_quota}")"
-      cat <<EOT_VLESS_DETAIL
+      cat <<EOT_VLESS_DETAIL | ui_fx
 =============================
  DETAIL AKUN VLESS
 =============================
@@ -22695,7 +22725,7 @@ EOT_VLESS_DETAIL
       fi
       IFS='|' read -r d_user d_pass d_exp d_status d_quota d_limit <<< "${row}"
       d_quota_usage="$(quota_usage_label_for_account "trojan" "${d_user}" "${d_quota}")"
-      cat <<EOT_TROJAN_DETAIL
+      cat <<EOT_TROJAN_DETAIL | ui_fx
 =============================
  DETAIL AKUN TROJAN
 =============================
@@ -22755,7 +22785,7 @@ show_account_quota_info() {
   locked="$(sqlite3 "${DB_PATH}" "SELECT used_bytes FROM account_quota_locks WHERE account_type='${usage_type}' AND LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
   locked_at="$(sqlite3 "${DB_PATH}" "SELECT datetime(locked_at,'unixepoch','localtime') FROM account_quota_locks WHERE account_type='${usage_type}' AND LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
 
-  cat <<EOT_QUOTA_INFO
+  cat <<EOT_QUOTA_INFO | ui_fx
 =============================
  INFO QUOTA AKUN ${type^^}
 =============================
@@ -22772,7 +22802,7 @@ EOT_QUOTA_INFO
 
 account_menu_pause() {
   echo
-  read -rp "Enter untuk kembali..." _ || true
+  menu_pause "Enter untuk kembali..."
 }
 
 account_lifetime_menu() {
@@ -24042,7 +24072,7 @@ tools_menu() {
     fi
     clear
     case "${tm}" in
-      1) show_sc_key_info || true ;;
+      1) show_sc_key_info | ui_fx || true ;;
       2) install_summary_api_1forcr || true ;;
       3) set_html_banner_menu || true ;;
       4) update_rollback_menu || true ;;
@@ -24064,7 +24094,7 @@ tools_menu() {
       *) echo "Pilihan tidak valid." ;;
     esac
     echo
-    read -rp "Enter untuk lanjut..." _ || true
+    menu_pause
   done
 }
 
@@ -24677,7 +24707,7 @@ service_menu() {
       switch_udp_to_udpcustom
       ;;
     6)
-      udp_backend_status
+      udp_backend_status | ui_fx
       ;;
     7)
       repair_udp_backends
@@ -24689,7 +24719,7 @@ service_menu() {
       if [[ -x /usr/local/sbin/sc-1forcr-capacity-tune ]]; then
         /usr/local/sbin/sc-1forcr-capacity-tune >/dev/null 2>&1 || true
       fi
-      show_capacity_report
+      show_capacity_report | ui_fx
       ;;
     *)
       echo "Pilihan tidak valid."
@@ -25668,7 +25698,7 @@ EOF
     fi
     clear
     if [[ "${lock_reason}" == "natural_expired" ]]; then
-      cat <<EOF
+      cat <<EOF | ui_fx
 ============================================================
                SC 1FORCR NEXUS - AKSES DITOLAK            
 ============================================================
@@ -25682,7 +25712,7 @@ Setelah perpanjang berhasil, silakan ulangi install/update.
 ============================================================
 EOF
     else
-      cat <<EOF
+      cat <<EOF | ui_fx
 ============================================================
                SC 1FORCR NEXUS - AKSES DITOLAK            
 ============================================================
@@ -25713,7 +25743,7 @@ EOF
        [[ "${expires_epoch}" -le 0 || "${now_epoch}" -ge "${expires_epoch}" ]]; } || \
      [[ "${expires_epoch}" -gt 0 && "${now_epoch}" -ge "${expires_epoch}" ]]; then
     clear
-    cat <<EOF
+    cat <<EOF | ui_fx
 ============================================================
                SC 1FORCR NEXUS - AKSES DITOLAK            
 ============================================================
@@ -26603,6 +26633,7 @@ show_combined_online() {
 
   echo "Users Login SSH/Dropbear + UDP Custom"
 
+  draw_menu_header "SSH + UDP CUSTOM USER LOGIN"
   if [[ ! -s "${tmp_count}" ]]; then
     echo "Tidak ada user online terdeteksi."
     echo
@@ -26611,7 +26642,6 @@ show_combined_online() {
     return
   fi
 
-  echo "LIST USER LOGIN"
   printf "%-24s %-12s %-10s %-10s %-10s\n" "USERNAME" "STATUS" "SSH_SESI" "UDPHC" "TOTAL"
   printf "%-24s %-12s %-10s %-10s %-10s\n" "------------------------" "------------" "----------" "----------" "----------"
   awk '
@@ -26905,7 +26935,7 @@ show_ssh_only_online() {
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
-  echo "LIST USER LOGIN SSH (${source_mode})"
+  draw_menu_header "SSH USER LOGIN (${source_mode})"
   if [[ ! -s "${tmp_ip_count}" ]]; then
     echo "Tidak ada user SSH yang sedang online."
     echo
@@ -27251,18 +27281,7 @@ show_xray_online_by_table() {
 }
 
 show_xray_online_realtime_by_table() {
-  local table="$1" label="$2" key=""
-  while true; do
-    clear
-    show_xray_online_by_table "${table}" "${label}" "realtime"
-    echo
-    echo "Realtime refresh tiap 1 detik. Tekan q untuk keluar."
-    if read -r -s -n 1 -t 1 key; then
-      case "${key}" in
-        q|Q) break ;;
-      esac
-    fi
-  done
+  ui_monitor show_xray_online_by_table "$1" "$2" "realtime"
 }
 
 show_udpcustom_online() {
@@ -27456,18 +27475,7 @@ show_zivpn_online() {
 }
 
 show_zivpn_online_realtime() {
-  local key=""
-  while true; do
-    clear
-    show_zivpn_online
-    echo
-    echo "Realtime refresh tiap 1 detik. Tekan q untuk keluar."
-    if read -r -s -n 1 -t 1 key; then
-      case "${key}" in
-        q|Q) break ;;
-      esac
-    fi
-  done
+  ui_monitor show_zivpn_online
 }
 
 normalize_downloaded_script_file() {
@@ -27941,7 +27949,7 @@ manual_rollback_latest_update() {
   fi
   echo "Snapshot : ${latest_snapshot}"
   echo
-  /usr/local/sbin/sc-1forcr-update-manager list | head -n 7 || true
+  /usr/local/sbin/sc-1forcr-update-manager list | head -n 7 | ui_fx || true
   echo
   echo "Rollback memulihkan database, konfigurasi, runtime SC, dan unit service."
   echo "SSH utama/network tidak dihentikan agar akses root tetap tersedia."
@@ -27958,17 +27966,16 @@ manual_rollback_latest_update() {
 update_rollback_menu() {
   local choice latest_snapshot
   while true; do
-    draw_menu_header "UPDATE / ROLLBACK SC"
     latest_snapshot="-"
     if [[ -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
       latest_snapshot="$(/usr/local/sbin/sc-1forcr-update-manager latest 2>/dev/null || echo '-')"
     fi
-    echo "Snapshot terbaru: ${latest_snapshot}"
-    echo
-    echo "1) Update SC aman (backup otomatis)"
-    echo "2) Rollback update terakhir"
-    echo "3) Daftar snapshot update"
-    echo "0) Kembali"
+    draw_menu_panel "UPDATE / ROLLBACK SC" \
+      "1) Update SC aman (backup otomatis)" \
+      "2) Rollback update terakhir" \
+      "3) Daftar snapshot update" \
+      "0) Kembali"
+    echo "Snapshot terbaru : ${latest_snapshot}"
     echo
     if ! prompt_input choice "Pilih [0-3]: "; then
       return 0
@@ -27978,7 +27985,7 @@ update_rollback_menu() {
       2) manual_rollback_latest_update || true ;;
       3)
         if [[ -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
-          /usr/local/sbin/sc-1forcr-update-manager list || true
+          /usr/local/sbin/sc-1forcr-update-manager list | ui_fx || true
         else
           echo "Belum ada snapshot update."
         fi
@@ -27987,7 +27994,7 @@ update_rollback_menu() {
       *) echo "Pilihan tidak valid." ;;
     esac
     echo
-    read -rp "Enter untuk lanjut..." _ || true
+    menu_pause
     clear >/dev/null 2>&1 || true
   done
 }
@@ -28410,7 +28417,7 @@ set_dropbear_version_menu() {
       3) major_choice="2020" ;;
       4) major_choice="2022" ;;
       0) return ;;
-      *) echo "Pilihan tidak valid."; read -rp "Enter untuk lanjut..." _ || true; continue ;;
+      *) echo "Pilihan tidak valid."; menu_pause; continue ;;
     esac
     if apply_dropbear_version_with_lock "${major_choice}"; then
       DROPBEAR_VERSION="$(resolve_dropbear_release_from_menu "${major_choice}")"
@@ -28419,7 +28426,7 @@ set_dropbear_version_menu() {
       echo "Gagal set versi Dropbear ${major_choice}."
     fi
     echo
-    read -rp "Enter untuk lanjut..." _ || true
+    menu_pause
   done
 }
 
@@ -28489,7 +28496,7 @@ set_html_banner_menu() {
         ;;
     esac
     echo
-    read -rp "Enter untuk lanjut..." _ || true
+    menu_pause
     clear
   done
 }
@@ -28511,17 +28518,18 @@ monitor_online_menu() {
     fi
     clear
     case "${o}" in
-      1) show_ssh_only_online ;;
-      2) show_ssh_online ;;
-      3) show_xray_online_realtime_by_table "account_vmesses" "VMESS" ;;
-      4) show_xray_online_realtime_by_table "account_vlesses" "VLESS" ;;
-      5) show_xray_online_realtime_by_table "account_trojans" "TROJAN" ;;
-      6) show_zivpn_online_realtime ;;
+      # Monitor punya tombol keluar sendiri ([q]/Enter), jadi tanpa jeda "Enter untuk lanjut".
+      1) ui_monitor show_ssh_only_online; continue ;;
+      2) ui_monitor show_ssh_online; continue ;;
+      3) show_xray_online_realtime_by_table "account_vmesses" "VMESS"; continue ;;
+      4) show_xray_online_realtime_by_table "account_vlesses" "VLESS"; continue ;;
+      5) show_xray_online_realtime_by_table "account_trojans" "TROJAN"; continue ;;
+      6) show_zivpn_online_realtime; continue ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
     echo
-    read -rp "Enter untuk lanjut..." _ || true
+    menu_pause
   done
 }
 
@@ -28674,7 +28682,10 @@ ui_prepare() {
 # Lebar kotak mengikuti terminal: 3 kolom menu di layar lebar, 2 di HP.
 ui_layout() {
   local cols="${MENU_COLS:-}"
-  if [[ ! "${cols}" =~ ^[0-9]+$ ]]; then cols="$(tput cols 2>/dev/null || true)"; fi
+  # stty membaca /dev/tty langsung, jadi tetap benar saat output sedang
+  # dilewatkan ke filter atau ditangkap; tput cols gagal di kondisi itu.
+  if [[ ! "${cols}" =~ ^[0-9]+$ ]]; then ui_tty_size; cols="${UI_TTY_COLS}"; fi
+  if [[ ! "${cols}" =~ ^[0-9]+$ || "${cols}" -lt 30 ]]; then cols="$(tput cols 2>/dev/null || true)"; fi
   if [[ ! "${cols}" =~ ^[0-9]+$ || "${cols}" -lt 30 ]]; then cols=62; fi
   cols=$(( cols - 2 ))
   if (( cols > 78 )); then cols=78; fi
@@ -28862,6 +28873,338 @@ ui_flow() {
   return 0
 }
 
+# Mesin gaya untuk teks biasa (tabel, detail akun, layar setting, pesan):
+# isi dan lebar kolom tidak berubah, hanya diwarnai. Header beraksen, garis
+# ---- dan ==== jadi garis gradasi, "Label : nilai" dibedakan, status
+# AKTIF/LOCK/GAGAL berwarna, pesan gagal merah, peringatan kuning, pesan
+# berhasil hijau, catatan dan petunjuk diredupkan. Baris yang sudah berwarna
+# dilewatkan. Satu aturan dipakai dua jalur: ui_fx (blok, dengan lookahead
+# header tabel) dan echo ke layar (per baris). Hasil di UI_SAY.
+#
+# Hemat CPU: bash mengompilasi ulang regex di setiap [[ =~ ]], jadi setiap
+# aturan dijaga dulu oleh pencocokan glob yang murah dan regex hanya jalan
+# kalau kata kuncinya ada. Baris tabel lewat jalur pendek (hanya warna
+# status). Ukuran kasar: ±0,7 ms per baris tabel di mesin uji, jadi daftar
+# ratusan akun tidak terasa; jangan tambah aturan regex tanpa penjaga glob.
+UI_NOTE=0
+UI_SAY=""
+UI_TOK=""
+UI_KV_LAB=""
+UI_WORDS=()
+UI_RE_NOTE='^[[:space:]]*(Catatan|Keterangan|Note)'
+UI_RE_BANNER='^[[:space:]]*(===+|---+) (.*) (===+|---+)[[:space:]]*$'
+UI_RE_BRACKET='^[[:space:]]*\[ .* \][[:space:]]*$'
+UI_RE_CAPSTOK='^[[:upper:][:digit:]_/()%+.#&-]+:?$'
+UI_RE_KV='^[[:space:]]*(- )?[[:alpha:]][[:alnum:] /()._-]*[[:alnum:])][[:space:]]*: '
+UI_RE_ITEM='^([[:space:]]*)([[:digit:]]{1,2}|[xXmMqQ])\)( .*)$'
+UI_RE_SECTION='^[[:space:]]*[[:alnum:]][^:]{0,46}:$'
+UI_RE_EMPTY='^[[:space:]]*(\(kosong\)|Tidak ada|Belum ada|Data .* tidak ditemukan)'
+UI_RE_HINT='^[[:space:]]*(Kosongkan input|Ketik .batal.|Tekan Enter|Enter untuk|Dibatalkan)'
+# Pesan diawali "Gagal"/"Peringatan"/"Berhasil" diwarnai utuh, kecuali
+# penghitung seperti "Gagal : 0". Pesan lain dikenali dari isinya ("Xray
+# gagal restart", "tidak boleh kosong", "belum tersedia", "Akun X berhasil
+# dihapus"), tapi bukan pada label rata ("Cooldown gagal    : 15 menit"),
+# kalimat petunjuk ("Jika ... gagal", "Pastikan ... berhasil"), atau
+# kalimat negatif ("belum berhasil").
+UI_RE_MSG_WARN_START='^[[:space:]]*(Peringatan|PERINGATAN|Warning|WARNING)([^[:alpha:]]|$)'
+UI_RE_MSG_BAD_START='^[[:space:]]*(Gagal|GAGAL|Error|ERROR)([^[:alpha:]]|$)'
+UI_RE_MSG_OK_START='^[[:space:]]*(Berhasil|BERHASIL|Sukses|SUKSES|Selesai)([^[:alpha:]]|$)'
+UI_RE_MSG_HINTWORD='^[[:space:]]*(Jika|Kalau|Bila|Apabila|Pastikan|Tunggu|Coba|Setelah|Sebelum)[[:space:]]'
+UI_RE_MSG_NEG='(belum|tidak|gagal|akan|bisa) (berhasil|selesai|tersimpan)'
+UI_RE_MSG_BAD='tidak valid|harus (angka|[[:digit:]])|tidak boleh|terlalu (panjang|pendek)|hanya boleh|sudah ada di database|tidak ditemukan|ada yang gagal|[[:space:]]invalid([^[:alpha:]]|$)|^[[:space:]]*([^[:space:]]+[[:space:]]+){1,3}(gagal|ditolak)([.,:;!)]|[[:space:]]+[^[:space:]:]|$)'
+UI_RE_MSG_WARN='(belum|tidak) (tersedia|terdeteksi|terpasang|terjadwal|valid|aktif)|belum ada|belum berhasil|dilewati'
+UI_RE_MSG_OK='^[[:space:]]*([^[:space:]]+[[:space:]]+){1,6}(berhasil|selesai|tersimpan)([^[:alpha:]]|$)'
+
+# Garis: hanya spasi, "-" dan "=", dengan minimal "---" atau "===".
+ui_is_rule() {
+  [[ "$1" != *[![:space:]=-]* && ( "$1" == *---* || "$1" == *===* ) ]]
+}
+
+ui_is_kv() {
+  UI_KV_LAB=""
+  if [[ "$1" == *": "* && "$1" =~ ${UI_RE_KV} ]] && (( ${#BASH_REMATCH[0]} <= 44 )); then
+    UI_KV_LAB="${BASH_REMATCH[0]}"
+    return 0
+  fi
+  return 1
+}
+
+# Pecah $1 per spasi ke UI_WORDS tanpa ekspansi nama file. Jauh lebih murah
+# daripada memotong string kata demi kata dengan ${var%%pola}.
+ui_split_words() {
+  local IFS=$' \t\n' keepf=0
+  if [[ "$-" == *f* ]]; then keepf=1; fi
+  set -f
+  UI_WORDS=($1)
+  if (( ! keepf )); then set +f; fi
+  return 0
+}
+
+ui_is_caps_header() {
+  local tok caps=0
+  if [[ "$1" == *[[:lower:]]* ]]; then return 1; fi
+  ui_split_words "$1"
+  for tok in ${UI_WORDS[@]+"${UI_WORDS[@]}"}; do
+    if [[ ! "${tok}" =~ ${UI_RE_CAPSTOK} ]]; then return 1; fi
+    if [[ "${tok}" == *[[:upper:]][[:upper:]]* ]]; then caps=$(( caps + 1 )); fi
+  done
+  (( caps >= 2 ))
+}
+
+# Garis ---- / ==== menjadi ─ bergradasi (kolom demi kolom seperti bingkai).
+ui_rule_line() {
+  local s="$1" out="" i n c ng="${#UI_GRAD[@]}"
+  n="${#s}"
+  for ((i=0; i<n; i++)); do
+    c="${s:i:1}"
+    if [[ "${c}" == "-" || "${c}" == "=" ]]; then
+      if (( ng > 0 )); then out+="${UI_GRAD[i < ng ? i : ng - 1]}─"; else out+="─"; fi
+    else
+      out+="${c}"
+    fi
+  done
+  UI_SAY="${out}${UI_NC}"
+}
+
+# Warnai kata status utuh (boleh diakhiri , . ; :), sisanya dibiarkan.
+# $2 = warna yang dipasang lagi sesudah kata status (warna nilai). Kata
+# diganti di tempat (dibatasi spasi), jadi spasi kolom tabel tidak berubah;
+# kata yang sama berulang terganti sekali per kemunculan di UI_WORDS.
+ui_paint_tokens() {
+  local src="$1" base="${2:-}" s tok core color
+  UI_TOK="${src}"
+  # Semua kata status minimal dua huruf kapital berurutan.
+  if [[ "${src}" != *[[:upper:]][[:upper:]]* ]]; then return 0; fi
+  ui_split_words "${src}"
+  s=" ${src} "
+  for tok in ${UI_WORDS[@]+"${UI_WORDS[@]}"}; do
+    core="${tok%[,.;:]}"; color=""
+    # Username dan angka dilewati sebelum case yang panjang.
+    if [[ -z "${core}" || "${core}" == *[![:upper:]_]* ]]; then continue; fi
+    case "${core}" in
+      AMAN|ONLINE|AKTIF|ACTIVE|ON|OK|GOOD|SEHAT|SUKSES|BERHASIL|YA|IN_CONFIG|RUNNING) color="${UI_OK}" ;;
+      LOCK|LOCK_TMP|LOCK_QUOTA|LOCKED|EXPIRED|OFFLINE|OFF|DELETED|BLOCKED|FAIL|FAILED|GAGAL|ERROR|MATI|STOPPED|TIDAK_TERDETEKSI|DENY|DITOLAK) color="${UI_BAD}" ;;
+      RECENT|WAIT|WARN|WARNING|IDLE|PENDING|TRIAL|CHECK|MISMATCH|LEGACY|WATCH|FULL|UNKNOWN) color="${UI_WARN}" ;;
+      NONAKTIF|INACTIVE|DISABLED) color="${UI_MUTED}" ;;
+    esac
+    if [[ -n "${color}" ]]; then
+      s="${s/" ${tok} "/" ${color}${core}${UI_NC}${base}${tok:${#core}} "}"
+    fi
+  done
+  s="${s# }"
+  UI_TOK="${s% }"
+  return 0
+}
+
+ui_style_line() {
+  local s="$1" lab hintword=0
+  UI_SAY="${s}"
+  if [[ "${s}" == *$'\033'* ]]; then return 0; fi
+  if [[ "${s}" != *[![:space:]]* ]]; then UI_NOTE=0; return 0; fi
+  if (( UI_NOTE )); then UI_SAY="${UI_MUTED}${s}${UI_NC}"; return 0; fi
+  if [[ ( "${s}" == *Catatan* || "${s}" == *Keterangan* || "${s}" == *Note* ) && "${s}" =~ ${UI_RE_NOTE} ]]; then
+    UI_NOTE=1; UI_SAY="${UI_MUTED}${s}${UI_NC}"; return 0
+  fi
+  if ui_is_rule "${s}"; then ui_rule_line "${s}"; return 0; fi
+  if [[ ( "${s}" == *===* || "${s}" == *---* ) && "${s}" =~ ${UI_RE_BANNER} ]]; then
+    UI_SAY="${UI_ACC}${UI_BOLD}◆ ${BASH_REMATCH[2]}${UI_NC}"; return 0
+  fi
+  if [[ "${s}" == *"[ "*" ]"* && "${s}" =~ ${UI_RE_BRACKET} ]] || ui_is_caps_header "${s}"; then
+    UI_SAY="${UI_ACC}${UI_BOLD}${s}${UI_NC}"; return 0
+  fi
+  # Baris tabel (kolom dipisah spasi ganda, bukan "Label : nilai") cukup
+  # diwarnai statusnya; aturan pesan di bawah hanya untuk kalimat. Ini jalur
+  # utama tabel besar, jadi dibuat sependek mungkin.
+  if [[ "${s}" == *[![:space:]]"  "*[![:space:]]* && "${s}" != *": "* ]]; then
+    ui_paint_tokens "${s}" ""
+    UI_SAY="${UI_TOK}"
+    return 0
+  fi
+  if [[ ( "${s}" == *kosong* || "${s}" == *"Tidak ada"* || "${s}" == *"Belum ada"* || "${s}" == *"tidak ditemukan"* ) && "${s}" =~ ${UI_RE_EMPTY} ]] ||
+     [[ ( "${s}" == *Kosongkan* || "${s}" == *batal* || "${s}" == *Enter* || "${s}" == *Dibatalkan* ) && "${s}" =~ ${UI_RE_HINT} ]]; then
+    UI_SAY="${UI_MUTED}${s}${UI_NC}"; return 0
+  fi
+  if [[ ( "${s}" == *Peringatan* || "${s}" == *PERINGATAN* || "${s}" == *Warning* || "${s}" == *WARNING* ) && "${s}" =~ ${UI_RE_MSG_WARN_START} ]]; then
+    UI_SAY="${UI_WARN}${s}${UI_NC}"; return 0
+  fi
+  if [[ "${s}" == *Gagal* || "${s}" == *GAGAL* || "${s}" == *Error* || "${s}" == *ERROR* ]] && [[ "${s}" =~ ${UI_RE_MSG_BAD_START} ]]; then
+    if ! ui_is_kv "${s}" || [[ "${s:${#UI_KV_LAB}}" == *[![:space:][:digit:]]* ]]; then
+      UI_SAY="${UI_BAD}${s}${UI_NC}"; return 0
+    fi
+  fi
+  if [[ "${s}" == *Berhasil* || "${s}" == *BERHASIL* || "${s}" == *Sukses* || "${s}" == *SUKSES* || "${s}" == *Selesai* ]] && [[ "${s}" =~ ${UI_RE_MSG_OK_START} ]]; then
+    if ! ui_is_kv "${s}" || [[ "${s:${#UI_KV_LAB}}" == *[![:space:][:digit:]]* ]]; then
+      UI_SAY="${UI_OK}${s}${UI_NC}"; return 0
+    fi
+  fi
+  if [[ ( "${s}" == Jika* || "${s}" == Kalau* || "${s}" == Bila* || "${s}" == Apabila* || "${s}" == Pastikan* || "${s}" == Tunggu* || "${s}" == Coba* || "${s}" == Setelah* || "${s}" == Sebelum* || "${s}" == [[:space:]]* ) && "${s}" =~ ${UI_RE_MSG_HINTWORD} ]]; then
+    hintword=1
+  fi
+  if (( ! hintword )) && [[ "${s}" == *tidak* || "${s}" == *harus* || "${s}" == *terlalu* || "${s}" == *boleh* || "${s}" == *database* || "${s}" == *gagal* || "${s}" == *ditolak* || "${s}" == *invalid* ]] && [[ "${s}" =~ ${UI_RE_MSG_BAD} ]]; then
+    UI_SAY="${UI_BAD}${s}${UI_NC}"; return 0
+  fi
+  if ui_is_kv "${s}"; then
+    lab="${UI_KV_LAB}"
+    ui_paint_tokens "${s:${#lab}}" "${UI_VAL}"
+    UI_SAY="${UI_LABEL}${lab%%:*}${UI_NC}${UI_ACC}:${UI_NC}${lab#*:}${UI_VAL}${UI_TOK}${UI_NC}"
+    return 0
+  fi
+  if (( ! hintword )); then
+    if [[ "${s}" == *belum* || "${s}" == *tidak* || "${s}" == *dilewati* ]] && [[ "${s}" =~ ${UI_RE_MSG_WARN} ]]; then
+      UI_SAY="${UI_WARN}${s}${UI_NC}"; return 0
+    fi
+    if [[ "${s}" == *berhasil* || "${s}" == *selesai* || "${s}" == *tersimpan* ]] && [[ "${s}" =~ ${UI_RE_MSG_OK} && ! "${s}" =~ ${UI_RE_MSG_NEG} ]]; then
+      # "X tersimpan, tapi Y gagal" = berhasil sebagian.
+      if [[ "${s}" == *gagal* ]]; then UI_SAY="${UI_WARN}${s}${UI_NC}"; else UI_SAY="${UI_OK}${s}${UI_NC}"; fi
+      return 0
+    fi
+  fi
+  if [[ "${s}" == *")"* && "${s}" =~ ${UI_RE_ITEM} ]]; then
+    UI_SAY="${BASH_REMATCH[1]}${UI_ACC}${UI_BOLD}${BASH_REMATCH[2]})${UI_NC}${BASH_REMATCH[3]}"; return 0
+  fi
+  if [[ "${s}" == *: && "${s}" =~ ${UI_RE_SECTION} ]]; then
+    UI_SAY="${UI_ACC}${UI_BOLD}${s}${UI_NC}"; return 0
+  fi
+  ui_paint_tokens "${s}" ""
+  UI_SAY="${UI_TOK}"
+  return 0
+}
+
+# Filter untuk blok output yang sudah ada (tabel, detail akun, layar info).
+# Baris tepat di atas garis dianggap header tabel/judul blok, jadi header
+# huruf kecil dari sqlite -column tetap beraksen. Hanya mewarnai kalau
+# keluarannya terminal, supaya output yang ditangkap ke variabel atau file
+# (misalnya untuk dikirim ke Telegram) tetap polos.
+ui_fx() {
+  if [[ "${UI_FX_FORCE:-0}" != "1" && ! -t 1 ]]; then cat; return 0; fi
+  if [[ -z "${UI_MODE}" ]]; then ui_init; fi
+  if [[ "${UI_BW:-0}" -lt 12 ]]; then ui_layout; fi
+  local line prev="" have=0
+  UI_NOTE=0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    if ui_is_rule "${line}"; then
+      # Kecuali baris kosong atau "Label : nilai" (garis penutup detail akun).
+      if (( have )); then
+        if [[ "${prev}" != *[![:space:]]* || "${prev}" == *$'\033'* ]] || ui_is_kv "${prev}"; then
+          ui_style_line "${prev}"
+        else
+          UI_SAY="${UI_ACC}${UI_BOLD}${prev}${UI_NC}"
+        fi
+        printf '%s\n' "${UI_SAY}"
+        have=0
+      fi
+      UI_NOTE=0
+      ui_rule_line "${line}"
+      printf '%s\n' "${UI_SAY}"
+      continue
+    fi
+    if (( have )); then ui_style_line "${prev}"; printf '%s\n' "${UI_SAY}"; fi
+    prev="${line}"; have=1
+  done
+  if (( have )); then ui_style_line "${prev}"; printf '%s\n' "${UI_SAY}"; fi
+  UI_NOTE=0
+  return 0
+}
+
+# echo ke layar ikut gaya menu, jadi layar setting, pesan berhasil/gagal,
+# dan submenu lama seragam tanpa mengubah ratusan baris echo. Hanya berlaku
+# kalau keluarannya terminal: echo ke file, pipe, atau $(...) tetap builtin
+# polos, jadi data yang dibaca skrip lain tidak tersentuh. Opsi -n/-e/-E
+# diteruskan apa adanya, dan tema warna "none" mematikan gayanya.
+# UI_SAY_FORCE=1 hanya untuk test (stdout test bukan terminal).
+ui_say() {
+  local msg part
+  printf -v msg '%s ' "$@"
+  msg="${msg% }"
+  if [[ -z "${UI_MODE:-}" ]]; then ui_init; fi
+  if [[ -z "${UI_NC}" ]]; then printf '%s\n' "${msg}"; return 0; fi
+  if [[ "${UI_BW:-0}" -lt 12 ]]; then ui_layout; fi
+  UI_NOTE=0
+  while [[ "${msg}" == *$'\n'* ]]; do
+    part="${msg%%$'\n'*}"; msg="${msg#*$'\n'}"
+    ui_style_line "${part}"
+    printf '%s\n' "${UI_SAY}"
+  done
+  ui_style_line "${msg}"
+  UI_NOTE=0
+  printf '%s\n' "${UI_SAY}"
+}
+
+# Cek terminal lebih dulu: echo ke file/pipe (pengumpulan data monitor, jalur
+# update God Mode) langsung ke builtin tanpa regex, jadi tambahannya hanya
+# satu pemanggilan fungsi.
+menu_styled_echo_enable() {
+  echo() {
+    if [[ ! -t 1 && "${UI_SAY_FORCE:-0}" != "1" ]] || (( $# == 0 )); then
+      builtin echo "$@"
+      return
+    fi
+    # Opsi echo (-n, -e, -E, -ne, ...) diteruskan apa adanya.
+    if [[ "${1}" == -?* && -z "${1//[-neE]/}" && "${1:1}" != *-* ]]; then
+      builtin echo "$@"
+      return
+    fi
+    ui_say "$@"
+  }
+}
+
+# Layar monitor tanpa kedip. Dulu monitor login di-clear lalu seluruh data
+# (tracker Xray, ss, journal) dikumpulkan ulang tiap 1 detik, jadi layar
+# terlihat loading terus dan VPS kecil terbebani. Sekarang data diambil sekali
+# saat dibuka; [r] ambil ulang, [l] live ringan tiap 5 detik, [q]/Enter kembali.
+# Saat menggambar ulang, data dikumpulkan dulu lalu layar ditimpa dari atas.
+UI_MONITOR_LIVE_SECONDS=5
+ui_tty_size() {
+  local size=""
+  size="$(stty size </dev/tty 2>/dev/null || true)"
+  if [[ "${size}" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
+    UI_TTY_ROWS="${BASH_REMATCH[1]}"; UI_TTY_COLS="${BASH_REMATCH[2]}"
+  else
+    UI_TTY_ROWS=0; UI_TTY_COLS=0
+  fi
+}
+
+ui_monitor() {
+  local key="" live=0 frame footer stamp line lines cols_before="${MENU_COLS:-}"
+  ui_tty_size
+  if (( UI_TTY_COLS > 0 )); then MENU_COLS="${UI_TTY_COLS}"; fi
+  ui_layout
+  clear
+  while true; do
+    frame="$(UI_FX_FORCE=1 "$@" 2>&1 | UI_FX_FORCE=1 ui_fx || true)"
+    stamp="$(date '+%H:%M:%S' 2>/dev/null || true)"
+    if (( live )); then
+      footer=" ${UI_OK}●${UI_NC} ${UI_VAL}LIVE${UI_NC} ${UI_MUTED}tiap ${UI_MONITOR_LIVE_SECONDS} detik · ${stamp}${UI_NC}   ${UI_ACC}[l]${UI_NC} jeda   ${UI_ACC}[r]${UI_NC} ambil ulang   ${UI_ACC}[q]${UI_NC} kembali"
+    else
+      footer=" ${UI_ACC2}◆${UI_NC} ${UI_VAL}Data ${stamp}${UI_NC}   ${UI_ACC}[r]${UI_NC} ambil ulang   ${UI_ACC}[l]${UI_NC} live ${UI_MONITOR_LIVE_SECONDS} detik   ${UI_ACC}[q]${UI_NC} kembali"
+    fi
+    ui_tty_size
+    lines="$(printf '%s\n' "${frame}" | wc -l)"
+    if (( UI_TTY_ROWS > 0 && lines + 2 <= UI_TTY_ROWS )); then
+      printf '\033[H'
+      while IFS= read -r line; do printf '%s\033[K\n' "${line}"; done <<< "${frame}"
+      printf '\033[K\n%s\033[K\n\033[J' "${footer}"
+    else
+      clear
+      printf '%s\n\n%s\n' "${frame}" "${footer}"
+    fi
+    key=""
+    if (( live )); then
+      if ! read -r -s -n 1 -t "${UI_MONITOR_LIVE_SECONDS}" key </dev/tty; then key="__tick__"; fi
+    else
+      read -r -s -n 1 key </dev/tty || key="q"
+    fi
+    case "${key}" in
+      q|Q|''|$'\033') break ;;
+      l|L) live=$(( 1 - live )) ;;
+      *) ;;
+    esac
+  done
+  MENU_COLS="${cols_before}"
+  clear
+  return 0
+}
+
 menu_hline() {
   local char="${1:--}" count="${2:-58}" i
   for ((i=0; i<count; i++)); do printf '%s' "$char"; done
@@ -28971,6 +29314,8 @@ draw_main_options() {
   ui_line_bot
 }
 
+menu_styled_echo_enable
+
 if [[ "${1:-}" == "update" ]]; then
   clear >/dev/null 2>&1 || true
   UPDATE_SAFE_MODE="${UPDATE_SAFE_MODE:-1}" update_script_locked
@@ -29008,7 +29353,8 @@ while true; do
   if ! enforce_menu_license_access; then
     echo
     echo "Status lisensi belum aktif. Tekan Enter untuk cek ulang atau ketik x untuk keluar."
-    read -r -p "> " _sc_expired_choice || true
+    if [[ -z "${UI_MODE:-}" ]]; then ui_init; fi
+    read -r -p " ${UI_ACC2}◆${UI_NC} ${UI_ACC}›${UI_NC} " _sc_expired_choice || true
     [[ "${_sc_expired_choice:-}" =~ ^[xX]$ ]] && exit 0
     SHOW_FULL_MENU=1
     continue
@@ -29036,7 +29382,7 @@ while true; do
     2) service_menu || true ;;
     3) backup_restore_menu || true ;;
     4) change_domain_menu || true ;;
-    5) monitor_temp_lock_menu || true ;;
+    5) ui_monitor monitor_temp_lock_menu || true; SHOW_FULL_MENU=0; continue ;;
     6) monitor_online_menu || true ;;
     7) tools_menu || true ;;
     m|M)
@@ -29048,7 +29394,7 @@ while true; do
   esac
   SHOW_FULL_MENU=0
   echo
-  read -rp "Enter untuk lanjut..." _ || true
+  menu_pause
 done
 MENU_SCRIPT_EOF
 

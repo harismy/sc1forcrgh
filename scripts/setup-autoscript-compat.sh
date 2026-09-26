@@ -187,7 +187,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.66}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.67}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -9974,6 +9974,21 @@ function parseZivpnAuthLogLine(lineRaw) {
   return { username, ip };
 }
 
+// parseSshAndUdpUsage dan readDropbearAuthPortUserMap membaca log dropbear
+// dengan argumen yang sama; satu siklus checker cukup sekali per argumen.
+const journalReadCache = new Map();
+function readJournalOnce(args) {
+  const key = args.join('\u0000');
+  if (!journalReadCache.has(key)) {
+    let out = '';
+    try {
+      out = execFileSync('journalctl', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+    } catch (_) {}
+    journalReadCache.set(key, out);
+  }
+  return journalReadCache.get(key);
+}
+
 function parseSshAndUdpUsage() {
   const ipMap = new Map();
   const sessionMap = new Map();
@@ -10053,14 +10068,7 @@ function parseSshAndUdpUsage() {
 
   // Dropbear auth sessions (HC/WS friendly):
   // map "password auth succeeded" -> active client port on localhost tunnel.
-  let dropbearLog = '';
-  try {
-    dropbearLog = execFileSync(
-      'journalctl',
-      ['-u', 'dropbear', '-n', String(DROPBEAR_LOG_MAX_LINES), '--no-pager'],
-      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }
-    );
-  } catch (_) {}
+  const dropbearLog = readJournalOnce(['-u', 'dropbear', '-n', String(DROPBEAR_LOG_MAX_LINES), '--no-pager']);
   const activeDropbearAuthByPid = new Map();
   const activeDropbearAuthWithoutPid = new Map();
   for (const lineRaw of String(dropbearLog || '').split('\n')) {
@@ -10096,14 +10104,7 @@ function parseSshAndUdpUsage() {
   }
 
   // Recent auth fallback (HC often rotates sessions quickly, so active socket mapping can miss).
-  let dropbearRecent = '';
-  try {
-    dropbearRecent = execFileSync(
-      'journalctl',
-      ['-u', 'dropbear', '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', String(DROPBEAR_RECENT_LOG_MAX_LINES), '--no-pager'],
-      { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }
-    );
-  } catch (_) {}
+  const dropbearRecent = readJournalOnce(['-u', 'dropbear', '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', String(DROPBEAR_RECENT_LOG_MAX_LINES), '--no-pager']);
   const recentAuthByPid = new Map();
   for (const lineRaw of String(dropbearRecent || '').split('\n')) {
     const auth = parseDropbearAuthLine(lineRaw);
@@ -11357,16 +11358,9 @@ function readDropbearAuthPortUserMap() {
       }
     }
   } catch (_) {}
-  const readLogs = (args) => {
-    try {
-      return execFileSync('journalctl', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
-    } catch (_) {
-      return '';
-    }
-  };
   const logs = [
-    readLogs(['-u', 'dropbear', '-n', String(DROPBEAR_LOG_MAX_LINES), '--no-pager']),
-    readLogs(['-u', 'dropbear', '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', String(DROPBEAR_RECENT_LOG_MAX_LINES), '--no-pager'])
+    readJournalOnce(['-u', 'dropbear', '-n', String(DROPBEAR_LOG_MAX_LINES), '--no-pager']),
+    readJournalOnce(['-u', 'dropbear', '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', String(DROPBEAR_RECENT_LOG_MAX_LINES), '--no-pager'])
   ].join('\n');
   for (const lineRaw of String(logs || '').split('\n')) {
     const parsed = parseDropbearAuthLine(lineRaw);
@@ -11599,6 +11593,58 @@ function queryXrayUserTrafficDelta(username) {
   return 0;
 }
 
+// Total trafik per email dari satu output statsquery. JSON (Xray modern)
+// dibaca utuh; format teks lama dibaca per blok stat, karena nilai 0 tidak
+// dicetak dan pencocokan bebas bisa memasangkan nama dengan nilai stat lain.
+function parseXrayAllUserTraffic(out) {
+  const totals = new Map();
+  const add = (name, value) => {
+    const match = String(name || '').toLowerCase().match(/^user>>>(.+)>>>traffic>>>(?:uplink|downlink)$/);
+    const bytes = Number(value || 0);
+    if (!match || !Number.isFinite(bytes) || bytes <= 0) return;
+    totals.set(match[1], (totals.get(match[1]) || 0) + bytes);
+  };
+  try {
+    const walk = (node) => {
+      if (!node || typeof node !== 'object') return;
+      if (node.name !== undefined && node.value !== undefined) add(node.name, node.value);
+      for (const v of Object.values(node)) {
+        if (Array.isArray(v)) v.forEach(walk);
+        else if (v && typeof v === 'object') walk(v);
+      }
+    };
+    walk(JSON.parse(out));
+    return totals;
+  } catch (_) {}
+  for (const block of String(out || '').split(/(?=name:\s*")/)) {
+    const name = block.match(/^name:\s*"([^"]+)"/);
+    if (!name) continue;
+    const value = block.match(/value:\s*"?([0-9]+)/);
+    add(name[1], value ? value[1] : 0);
+  }
+  return totals;
+}
+
+// Satu query untuk semua akun per siklus. Dulu tiap akun menjalankan program
+// xray sendiri, hingga 4 proses untuk akun tanpa trafik (±20 ms CPU tiap
+// proses). Reset sekaligus aman karena loop kuota memproses semua akun Xray
+// aktif. null berarti perintahnya gagal (belum ada counter yang ter-reset),
+// dan pemanggil kembali ke query per akun.
+function queryAllXrayUserTraffic() {
+  const bins = ['/usr/local/bin/xray', '/usr/bin/xray', 'xray'];
+  const argSets = [
+    ['api', 'statsquery', '--server=127.0.0.1:10085', '-pattern', 'user>>>', '-reset=true'],
+    ['api', 'statsquery', '--server=127.0.0.1:10085', '-pattern', 'user>>>', '-reset']
+  ];
+  for (const bin of bins) {
+    for (const args of argSets) {
+      const out = readExec(bin, args);
+      if (String(out || '').trim()) return parseXrayAllUserTraffic(out);
+    }
+  }
+  return null;
+}
+
 async function isQuotaLocked(type, username) {
   const row = await get("SELECT 1 AS ok FROM account_quota_locks WHERE account_type=? AND LOWER(username)=LOWER(?)", [type, username]).catch(() => null);
   return !!row;
@@ -11682,6 +11728,7 @@ async function enforceQuotaLimits() {
     { type: 'vless', table: 'account_vlesses' },
     { type: 'trojan', table: 'account_trojans' }
   ];
+  const xrayTraffic = queryAllXrayUserTraffic();
   for (const item of xrayScan) {
     const rows = await all(
       `SELECT username, quota, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
@@ -11691,7 +11738,9 @@ async function enforceQuotaLimits() {
       const user = String(row?.username || '').trim();
       const quotaBytes = quotaToBytes(row?.quota);
       if (!user) continue;
-      const delta = queryXrayUserTrafficDelta(user);
+      const delta = xrayTraffic
+        ? Number(xrayTraffic.get(user.toLowerCase()) || 0)
+        : queryXrayUserTrafficDelta(user);
       const used = await addQuotaDelta(item.type, user, delta, null);
       if (IPLIMIT_DEBUG) console.log(`[quota-debug][${item.type}] user=${user} quota=${quotaBytes} used=${used} delta=${delta}`);
       if (quotaBytes > 0 && used >= quotaBytes) {

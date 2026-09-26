@@ -30,6 +30,9 @@ globalThis.__devicePolicy = {
   countEffectiveDevices,
   readSshWsActivePortIpMap,
   sampleSshDeviceLimit,
+  parseXrayAllUserTraffic,
+  queryAllXrayUserTraffic,
+  readJournalOnce,
   minGap: SSHWS_HARD_LIMIT_MIN_GAP_SECONDS
 };
 `;
@@ -86,7 +89,7 @@ class FakeDatabase {
 }
 
 // Setiap siklus timer adalah proses checker baru, jadi dimuat ulang per siklus.
-function loadChecker() {
+function loadChecker({ execFileSync } = {}) {
   const context = vm.createContext({
     Buffer,
     console,
@@ -94,6 +97,7 @@ function loadChecker() {
     require(name) {
       if (name === 'sqlite3') return { verbose: () => ({ Database: FakeDatabase }) };
       if (name === 'fs') return fakeFs;
+      if (name === 'child_process' && execFileSync) return { ...require('child_process'), execFileSync };
       return require(name);
     }
   });
@@ -173,6 +177,46 @@ function loadChecker() {
   assert(/\? countEffectiveDevices\(m\.get\(k\), XRAY_IP_GROUP_MASK\)/.test(sshBlock), 'direct SSH, UDPHC and ZIVPN must use the shared device count');
   // Toleransi ZIVPN limit 1 sengaja dipertahankan sampai ada data lock nyata.
   assert(/if \(lim === 1 && cntZivpnRaw > 0 && cntZivpnRaw <= 2\)/.test(sshBlock));
+
+  // --- Kuota Xray: satu query untuk semua akun ------------------------------
+  const quota = loadChecker();
+  const json = JSON.stringify({ stat: [
+    { name: 'user>>>Alice>>>traffic>>>uplink', value: '100' },
+    { name: 'user>>>alice>>>traffic>>>downlink', value: '250' },
+    { name: 'user>>>bob>>>traffic>>>uplink' },
+    { name: 'user>>>bob>>>traffic>>>downlink', value: '7' },
+    { name: 'inbound>>>vmess-ws>>>traffic>>>uplink', value: '999' }
+  ] });
+  assert.deepStrictEqual(Object.fromEntries(quota.parseXrayAllUserTraffic(json)), { alice: 350, bob: 7 },
+    'JSON stats must be summed per user; zero values are omitted by protojson');
+  // alice tidak punya nilai (0); pencocokan bebas akan memberi alice nilai milik bob.
+  const text = 'stat: <\n  name: "user>>>alice>>>traffic>>>uplink"\n>\nstat: <\n  name: "user>>>bob>>>traffic>>>downlink"\n  value: 5\n>\nstat: <\n  name: "user>>>carol>>>traffic>>>uplink"\n  value: 9\n>\n';
+  assert.deepStrictEqual(Object.fromEntries(quota.parseXrayAllUserTraffic(text)), { bob: 5, carol: 9 },
+    'text stats without a value must not borrow the next stat value');
+
+  const calls = [];
+  const okExec = (cmd, args) => { calls.push([cmd, ...args].join(' ')); return json; };
+  const traffic = loadChecker({ execFileSync: okExec }).queryAllXrayUserTraffic();
+  assert.strictEqual(calls.length, 1, 'all users must be read with a single xray process');
+  assert(/statsquery .*-pattern user>>> -reset/.test(calls[0]));
+  assert.strictEqual(traffic.get('alice'), 350);
+
+  const failedCalls = [];
+  const failExec = (cmd, args) => { failedCalls.push(cmd); throw new Error('api unreachable'); };
+  assert.strictEqual(loadChecker({ execFileSync: failExec }).queryAllXrayUserTraffic(), null,
+    'a failed query must return null so the per-user fallback runs');
+
+  const quotaBlock = extract(checkerSource, 'const xrayTraffic = queryAllXrayUserTraffic();', '\n  return { zivpnChanged');
+  assert(/xrayTraffic\s*\?\s*Number\(xrayTraffic\.get\(user\.toLowerCase\(\)\) \|\| 0\)\s*:\s*queryXrayUserTrafficDelta\(user\)/.test(quotaBlock),
+    'quota loop must use the single query and fall back per user only when it failed');
+
+  // --- Log dropbear dibaca sekali per argumen per siklus --------------------
+  const journalCalls = [];
+  const journal = loadChecker({ execFileSync: (cmd, args) => { journalCalls.push(args.join(' ')); return 'log'; } });
+  journal.readJournalOnce(['-u', 'dropbear', '-n', '12000', '--no-pager']);
+  journal.readJournalOnce(['-u', 'dropbear', '-n', '12000', '--no-pager']);
+  journal.readJournalOnce(['-u', 'dropbear', '--since', '-5 min', '--no-pager']);
+  assert.strictEqual(journalCalls.length, 2, 'identical journal reads in one cycle must be served from cache');
 
   console.log('iplimit device tests passed');
 })().catch((error) => {

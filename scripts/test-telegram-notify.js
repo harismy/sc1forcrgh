@@ -139,6 +139,27 @@ function assertLayout(text, title) {
   assert.strictEqual(msg.split(link(443)).length - 1, 1, 'link upgrade yang sama dengan TLS tidak diulang');
   assert(msg.includes('Limit IP : Tanpa batas'));
   assert(!msg.includes('Pembeli'), 'akun tanpa pembeli tidak menampilkan baris Pembeli');
+  assert(!msg.includes('XHTTP') && !msg.includes('OneRing'), 'link opsional yang tidak dikirim API tidak tampil');
+
+  // Link httpupgrade asli (beda dari WS), XHTTP, dan OneRing ikut tampil.
+  const vlink = (tag) => `vless://uuid-2@sg1.contoh.com:443?type=${tag}#citra`;
+  await A.notifyAccountEvent('create', 'vless', {
+    username: 'citra', uuid: 'uuid-2', exp: ymdPlus(30), limitip: '1', quota: '50',
+    port: { tls: '443', none: '80', grpc: '443' }, path: { ws: '/vless', upgrade: '/upvless', xhttp: '/xhvless' }, serviceName: 'vless-grpc',
+    link: {
+      tls: vlink('ws'), none: vlink('ws-ntls'), grpc: vlink('grpc'), uptls: vlink('httpupgrade'), upntls: vlink('httpupgrade-ntls'),
+      xhttptls: vlink('xhttp'), xhttpntls: vlink('xhttp-ntls'), onering: vlink('onering')
+    }
+  }, owner);
+  [msg] = take();
+  assertLayout(msg, 'AKUN VLESS BARU');
+  for (const [label, value] of [
+    ['Upgrade TLS', 'httpupgrade'], ['Upgrade Non-TLS', 'httpupgrade-ntls'],
+    ['XHTTP TLS', 'xhttp'], ['XHTTP Non-TLS', 'xhttp-ntls'], ['OneRing (1FTunnel)', 'onering']
+  ]) {
+    assert(msg.includes(`${label}:\n${vlink(value)}`), `link ${label} harus tampil:\n${msg}`);
+  }
+  assert(msg.includes('XHTTP    : /xhvless'), 'path XHTTP tampil di bagian koneksi');
 
   await A.notifyAccountEvent('delete', 'trojan', { username: 'citra', password: 'rahasia-jangan-tampil', exp: ymdPlus(5) }, owner);
   [msg] = take();

@@ -344,6 +344,90 @@ DB_PATH=/tidak/ada.db; ZIVPN_SERVICE=zivpn; DOMAIN=vpn.example.com; SCRIPT_VERSI
   panelNums.forEach((n, i) => assert.strictEqual(n, i, `tools menu numbering must be contiguous (missing ${i})`));
   assert(!menuRuntime.includes('set_wildcard_config_menu'), 'wildcard settings menu was removed (set manually in Cloudflare DNS)');
 
+  // Menu utama: nomor [0N], case, dan rentang prompt harus sama.
+  const mainItems = extract(menuRuntime, 'draw_main_options() {', '\n}\n');
+  const mainNums = [...mainItems.matchAll(/"0(\d)\|/g)].map((m) => Number(m[1]));
+  const mainLoopStart = menuRuntime.indexOf('while true; do\n  normalize_pending_operation');
+  assert(mainLoopStart >= 0, 'main menu loop not found');
+  const mainLoop = menuRuntime.slice(mainLoopStart);
+  const mainCase = [...mainLoop.matchAll(/^\s{4}(\d)\) /gm)].map((m) => Number(m[1]));
+  assert.deepStrictEqual(mainCase, mainNums, 'main menu case numbers must match the items');
+  assert(mainLoop.includes(`[1-${Math.max(...mainNums)}, m, x]`), 'main menu prompt range must match the last item');
+  assert(mainLoop.includes(`^0[1-${Math.max(...mainNums)}]$`), 'two-digit main menu input must accept the last item');
+  assert(/8\) service_toggle_menu/.test(mainLoop), 'main menu [08] must open ON/OFF LAYANAN');
+
+  // Menu ON/OFF LAYANAN: nomor panel, case, dan prompt sama.
+  const toggleMenu = extract(menuRuntime, 'service_toggle_menu() {', '\n}\n');
+  const toggleNums = [
+    ...[...toggleMenu.matchAll(/service_toggle_item (\d+) /g)].map((m) => Number(m[1])),
+    ...[...toggleMenu.matchAll(/^\s*"(\d+)\) [^"]+"/gm)].map((m) => Number(m[1]))
+  ].sort((a, b) => a - b);
+  const toggleCase = [...toggleMenu.matchAll(/^\s{6}(\d+)\)/gm)].map((m) => Number(m[1])).sort((a, b) => a - b);
+  assert.deepStrictEqual(toggleCase, toggleNums, 'ON/OFF menu case numbers must match the panel');
+  assert.strictEqual(Number((toggleMenu.match(/Pilih \[0-(\d+)\]/) || [])[1]), Math.max(...toggleNums), 'ON/OFF menu prompt range');
+  toggleNums.forEach((n, i) => assert.strictEqual(n, i, `ON/OFF menu numbering must be contiguous (missing ${i})`));
+
+  // Panel ON/OFF memakai status berwarna; bingkainya tetap lurus di semua layar.
+  const toggleItems = extract(menuRuntime, 'service_toggle_label() {', '\nservice_toggle_explain() {');
+  for (const mode of ['truecolor', '16', 'none']) {
+    for (const cols of [44, 80]) {
+      const cf = path.join(tmpDir, `toggle-${mode}`);
+      fs.writeFileSync(cf, `${mode}\n`);
+      const sh = path.join(tmpDir, 'toggle.sh');
+      fs.writeFileSync(sh, `set -euo pipefail\n${engine}\n${toggleItems}\nMENU_COLOR_FILE='${toBashPath(cf)}'\nMENU_COLS=${cols}\nUI_MODE=''\nui_init\n` +
+        'draw_menu_panel "ON/OFF LAYANAN" "$(service_toggle_item 1 ssh ON -)" "$(service_toggle_item 3 vless OFF TERPASANG)" ' +
+        '"$(service_toggle_item 5 udp OFF BELUM)" "$(service_toggle_item 6 xhttp OFF -)" "7) Terapkan ulang (repair rule)" "0) Kembali"\n');
+      const r = spawnSync(bash, [toBashPath(sh)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8' } });
+      assert.strictEqual(r.status, 0, `ON/OFF panel failed mode=${mode} cols=${cols}:\n${r.stderr}`);
+      const panelLines = r.stdout.split('\n').filter((l) => l.length > 0);
+      const w = width(panelLines[0]);
+      assert(w <= Math.max(cols, 44), `ON/OFF panel wider than the terminal cols=${cols}`);
+      panelLines.forEach((l) => assert.strictEqual(width(l), w, `ON/OFF panel misaligned mode=${mode} cols=${cols}:\n${stripAnsi(l)}`));
+      const plain = stripAnsi(r.stdout);
+      assert(/1\) SSH WS\/SSL\/Dropbear +ON/.test(plain) && plain.includes('OFF*'), `ON/OFF panel content:\n${plain}`);
+      if (mode === 'truecolor') {
+        assert(r.stdout.includes(`${OK}\x1b[1mON`), 'ON must be green');
+        assert(r.stdout.includes(`${BAD}\x1b[1mOFF`), 'OFF must be red');
+        assert(r.stdout.includes(`${WARN}\x1b[1mOFF*`), 'OFF without an active rule must be amber');
+      }
+    }
+  }
+
+  // Alur menu ON/OFF di bawah set -euo pipefail: pilihan + "y" memanggil gate
+  // dengan arah kebalikan status sekarang, "n" tidak mengubah apa pun, gate
+  // yang gagal tampil sebagai Gagal, dan menu keluar bersih.
+  const toggleFlow = extract(menuRuntime, 'SERVICE_GATE_BIN="/usr/local/sbin/sc-1forcr-service-gate"', '\nservice_menu() {');
+  const gateLog = path.join(tmpDir, 'gate-stub.log');
+  const gateStub = path.join(tmpDir, 'gate-stub.sh');
+  fs.writeFileSync(gateStub, `#!/usr/bin/env bash
+case "$1" in
+  status) printf '%s\\n' 'ssh ON -' 'vmess ON -' 'vless OFF TERPASANG' 'trojan ON -' 'udp OFF BELUM' 'xhttp OFF -' ;;
+  set) echo "set $2 $3" >> '${toBashPath(gateLog)}'; [[ "$2" == "trojan" ]] && exit 1; exit 0 ;;
+  apply) echo "apply" >> '${toBashPath(gateLog)}' ;;
+esac
+`);
+  fs.chmodSync(gateStub, 0o755);
+  const flowCf = path.join(tmpDir, 'flow-none');
+  fs.writeFileSync(flowCf, 'none\n');
+  const flowSh = path.join(tmpDir, 'flow.sh');
+  fs.writeFileSync(flowSh, `set -euo pipefail\n${engine}\n${toggleFlow}\n` +
+    `SERVICE_GATE_BIN='${toBashPath(gateStub)}'\nMENU_COLOR_FILE='${toBashPath(flowCf)}'\nMENU_COLS=80\nUI_MODE=''\n` +
+    'clear() { :; }\nmenu_pause() { :; }\n' +
+    'ANSWERS=(2 y 6 n 5 y 4 y 7 9 0)\n' +
+    'prompt_input() { printf -v "$1" \'%s\' "${ANSWERS[0]}"; ANSWERS=("${ANSWERS[@]:1}"); }\n' +
+    'service_toggle_menu\necho "MENU_EXIT_OK left=${#ANSWERS[@]}"\n');
+  const flow = spawnSync(bash, [toBashPath(flowSh)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8' } });
+  assert.strictEqual(flow.status, 0, `ON/OFF menu flow failed:\n${flow.stderr}`);
+  const flowOut = stripAnsi(flow.stdout);
+  assert(flowOut.includes('MENU_EXIT_OK left=0'), `ON/OFF menu must consume all answers and exit cleanly:\n${flowOut.slice(-400)}`);
+  assert.deepStrictEqual(fs.readFileSync(gateLog, 'utf8').trim().split('\n'),
+    ['set vmess off', 'set udp on', 'set trojan off', 'apply'], 'ON/OFF menu must call the gate with the toggled state');
+  assert(flowOut.includes('Berhasil: VMess sekarang OFF.'), 'successful toggle must be reported');
+  assert(flowOut.includes('Dibatalkan.'), 'answering n must cancel');
+  assert(flowOut.includes('Gagal mengubah Trojan. Status lama dipertahankan.'), 'failed toggle must be reported');
+  assert(flowOut.includes('Peringatan: layanan bertanda OFF* belum tertutup'), 'OFF without an active rule must be flagged');
+  assert(flowOut.includes('Pilihan tidak valid.'), 'invalid choice must be rejected');
+
   console.log('menu ui tests passed');
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });

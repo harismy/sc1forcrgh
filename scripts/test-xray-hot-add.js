@@ -114,7 +114,7 @@ assert(/writeXrayConfigAndReload\(cfg, true\)/.test(setStatus), 'manual lock/unl
 // sekecil apa pun membuat penambahan user berikutnya jatuh ke restart.
 const builder = (source) => extract(source, 'function buildXrayRuntimeConfig(', '\n}\n');
 assert.strictEqual(builder(apiSource), builder(checkerSource), 'API and checker must build identical Xray configs');
-for (const tag of ['vmess-ws', 'vless-ws', 'trojan-ws', 'vmess-grpc', 'vless-grpc', 'trojan-grpc']) {
+for (const tag of ['vmess-ws', 'vless-ws', 'trojan-ws', 'vmess-grpc', 'vless-grpc', 'trojan-grpc', 'vmess-hu', 'vless-hu', 'trojan-hu']) {
   assert(builder(apiSource).includes(`tag: '${tag}'`), `inbound tag ${tag} missing`);
 }
 const serviceLists = (source) => extract(source, 'function xrayApiServices() {', '\n}\n')
@@ -222,9 +222,10 @@ function runApiWriter({ guard = true } = {}) {
   assert.deepStrictEqual(running.api.services, ['HandlerService', 'StatsService']);
   t.files.set(t.cfgPath, { text: `${JSON.stringify(running, null, 2)}\n`, mtimeMs: Date.now() - 120_000 });
 
-  t.state.aduOutput = 'Added 2 user(s) in total.\n';
+  // User vmess baru kini disebar ke inbound ws, grpc, dan httpupgrade (3 inbound).
+  t.state.aduOutput = 'Added 3 user(s) in total.\n';
   assert.deepStrictEqual(t.write(t.build('alice', 'carol')), { ok: true, restarted: false, adu: true }, 'new account must not restart Xray');
-  assert.deepStrictEqual(t.state.aduPayloads[0].inbounds.map((inbound) => inbound.tag), ['vmess-ws', 'vmess-grpc']);
+  assert.deepStrictEqual(t.state.aduPayloads[0].inbounds.map((inbound) => inbound.tag), ['vmess-ws', 'vmess-grpc', 'vmess-hu']);
   assert.deepStrictEqual(t.state.aduPayloads[0].inbounds[0].settings.clients.map((client) => client.email), ['carol']);
 
   // File sudah lebih baru dari proses Xray; acuannya catatan hot-add sebelumnya.

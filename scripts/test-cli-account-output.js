@@ -59,6 +59,9 @@ assert.strictEqual(syntax.status, 0, `generated menu syntax failed:\n${syntax.st
   '[ ${title} URL ]',
   'gRPC:',
   'Up Non-TLS:',
+  'XHTTP TLS:',
+  'XHTTP Non-TLS:',
+  'OneRing (1FTunnel):',
   '[ HOST INFORMATION ]',
   'Terima kasih telah menggunakan layanan kami.'
 ].forEach((marker) => requireText(menuSource, marker));
@@ -66,6 +69,7 @@ assert.strictEqual(syntax.status, 0, `generated menu syntax failed:\n${syntax.st
 assert(menuSource.includes('vmess|vless|trojan)'), 'all Xray account types must use the rich formatter');
 assert(menuSource.includes('.data.link.grpc'), 'gRPC link must come from the API response');
 assert(menuSource.includes('.data.link.uptls'), 'upgrade TLS link must come from the API response');
+assert(menuSource.includes('.data.link.xhttptls') && menuSource.includes('.data.link.onering'), 'XHTTP and OneRing links must come from the API response');
 assert(menuSource.includes('.data.city // .data.location.city'), 'VPS city must come from the API response');
 assert(menuSource.includes('.data.isp // .data.location.isp'), 'VPS ISP must come from the API response');
 assert(installer.includes('SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.43}"'));

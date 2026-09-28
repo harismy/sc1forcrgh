@@ -93,7 +93,7 @@ const generatedConfig = JSON.parse(JSON.stringify(policy.buildXrayRuntimeConfig(
   [{ username: 'vless-user', secret: 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb' }],
   [{ username: 'trojan-user', secret: 'CaseSensitiveSecret' }]
 )));
-assert.strictEqual(generatedConfig.inbounds.length, 7, 'runtime config must contain API and six Xray inbounds');
+assert.strictEqual(generatedConfig.inbounds.length, 10, 'runtime config must contain API, six ws/grpc inbounds, and three httpupgrade inbounds');
 const generatedVmessWs = generatedConfig.inbounds.find((inbound) => inbound.port === 10001);
 assert.strictEqual(generatedVmessWs.settings.clients[0].email, 'vmess-user');
 assert.deepStrictEqual(

@@ -64,6 +64,7 @@ Xray tidak punya reload, jadi restart memutus **semua** pengguna vmess/vless/tro
 - Akun baru, trial, dan perpanjangan akun expired ditambahkan tanpa restart lewat `HandlerService` (`xray api adu`), lihat `writeXrayConfigAndReload()` di api.js. Penghapusan, pergantian kredensial, dan lock/unlock tetap restart, karena hanya restart yang memutus sesi lama user yang dicabut.
 - `buildXrayRuntimeConfig()` ada di api.js **dan** iplimit-checker.js, dan isinya harus identik termasuk tag inbound. Config yang strukturnya berbeda selalu jatuh ke restart. `npm run test:xray-hot-add` menjaga ini.
 - `HandlerService` bisa membuat akun, jadi hanya aktif kalau rule iptables "hanya root ke 127.0.0.1:10085" dari `apply_tunnel_outbound_guard_rules()` terpasang dan Xray tidak jalan sebagai root. Jangan hapus rule itu.
+- Link akun (`createXray` di api.js): WS, gRPC, HTTPUpgrade (`uptls`/`upntls`, path `/up<protokol>`), OneRing untuk aplikasi 1FTunnel (WS TLS dengan SNI `onering:<domain>:<domain>`), dan XHTTP VLESS (`xhttptls`/`xhttpntls`) hanya saat `XRAY_XHTTP_ENABLE=1`. Path link wajib sama dengan inbound di `buildXrayRuntimeConfig()` dan location nginx (`/xhvless` ada di blok 80/8083 lewat HTTP/1.1 dan di blok 8081 lewat h2). `npm run test:xray-links` menjaga ini.
 
 ### IP-limit (auto lock multi-login)
 
@@ -74,6 +75,16 @@ Lock yang salah langsung merugikan pembeli, jadi aturannya condong menghindari f
 - Sesi SSH-WS hanya dihitung kalau klien masih mengirim data sejak pengecekan sebelumnya (kolom `ClientToSSH` di `sshws-quota.tsv`), supaya sesi lama yang mati setelah HP ganti IP tidak terbaca sebagai perangkat kedua.
 - Toleransi ZIVPN limit 1 (maksimal 2 IP dihitung 1) sengaja dipertahankan. Jangan diperketat tanpa data dari `iplimit_lock_history`.
 - Test: `npm run test:iplimit-devices` dan `npm run test:xray-iplimit`.
+
+### ON/OFF layanan (menu [08])
+
+`/usr/local/sbin/sc-1forcr-service-gate` (heredoc `SERVICE_GATE_EOF`) mematikan layanan dengan menolak trafiknya di iptables, **bukan** dengan stop/mask service. Watchdog, update, dan restart chain me-restart service yang mati, jadi service systemd harus tetap jalan.
+
+- Status disimpan di `SERVICE_{SSH,VMESS,VLESS,TROJAN,UDP}_ENABLE` (default 1) plus `XRAY_XHTTP_ENABLE`. Chain `SC1FORCR_SVC_OUT` (port lokal: sshws 2082, inbound Xray per protokol) dan `SC1FORCR_SVC_IN` (Dropbear publik, port listen UDP). Semua ON = tidak ada chain sama sekali.
+- Jump ke chain harus rule **pertama** di INPUT/OUTPUT, supaya sesi yang sudah tersambung juga putus dan rule ACCEPT 80/443/109/143 tidak mendahuluinya. `apply` memeriksa posisinya dan dipanggil di akhir install/update, di heal SSHWS, dan tiap siklus watchdog.
+- Port sshd tidak pernah ikut ditutup (akses admin). Menutup VMess/VLESS/Trojan tidak me-restart Xray. XHTTP satu-satunya yang me-restart Xray (lewat restart API), dan status lamanya dipulihkan kalau Xray tidak memuat inbound baru.
+- API menolak akun baru (503) untuk layanan yang OFF. Akun SSH baru hanya ditolak kalau SSH **dan** UDP OFF, karena akun SSH juga dipakai login ZIVPN/UDP Custom.
+- Port inbound Xray baru wajib ditambahkan ke `VMESS_PORTS`/`VLESS_PORTS`/`TROJAN_PORTS` di script ini, atau layanan itu tidak ikut tertutup. Test: `npm run test:service-gate`.
 
 Timeout HAProxy sengaja panjang (`timeout client/server 12h`) supaya tunnel WS tidak putus sendiri. Yang menjaga socket mati tidak menumpuk adalah `option clitcpka`/`srvtcpka` plus sysctl keepalive agresif (`tcp_keepalive_time=60`, `intvl=15`, `probes=4`). Ketiganya satu paket. Jangan hapus salah satu tanpa mengganti mekanisme penggantinya.
 
@@ -152,6 +163,8 @@ Menu (`menu-sc-1forcr`, heredoc `MENU_SCRIPT_EOF`) memakai mesin tampilan `ui_*`
 - Jangan pakai `ui_fx` pada fungsi yang meminta input; bungkus bagian tabelnya saja. Pemilih akun menulis tabelnya ke stderr (`| ui_fx >&2`) karena stdout-nya membawa username yang dipilih. Untuk jeda pakai `menu_pause`, untuk baris `printf "%-12s : %s"` pakai `menu_kv`.
 - `ui_style_line` murni bash dan jalan per baris, termasuk di tabel ratusan akun. Setiap aturan regex baru wajib dijaga glob murah dulu (`[[ $s == *kata* && $s =~ ... ]]`), karena bash mengompilasi ulang regex di tiap baris. Baris tabel (spasi kolom ganda, tanpa `": "`) lewat jalur pendek yang hanya mewarnai status.
 - Layar monitor memakai `ui_monitor NAMA_FUNGSI`: data diambil sekali, `[r]` ambil ulang, `[l]` live tiap 5 detik, dan redraw tanpa `clear`. Jangan kembali ke loop `clear` + kumpulkan data tiap 1 detik; itu membuat layar berkedip dan membebani VPS kecil.
+- Data monitor online diambil lewat collector bersama (`collect_ssh_online_rows`, `collect_xray_online_rows`, `collect_udphc_online_pairs`, `zivpn_online_sql`). Layar per layanan dan layar SEMUA AKUN ONLINE (menu monitor [7]) memakai collector yang sama, jadi perubahan aturan status cukup di satu tempat. Layar SEMUA AKUN mengambil tracker dan log Xray sekali untuk tiga protokol, dan live-nya tiap 10 detik. Test: `npm run test:online-monitor`.
+- `trap ... RETURN` yang dipasang fungsi yang dipanggil **menimpa** trap RETURN pemanggilnya. Fungsi yang memanggil collector (yang punya trap sendiri) wajib memasang trap cleanup-nya **setelah** pemanggilan itu; kalau tidak, file temp-nya bocor tiap refresh.
 - Test: `npm run test:menu-ui` menggambar dashboard dan menu di 5 lebar layar, 4 mode warna, dan 2 locale, lalu memastikan semua bingkai lurus. Test yang sama memeriksa warna pesan `echo` (termasuk kasus yang tidak boleh salah warna, seperti "Cooldown gagal : 15 menit" dan "Jika ... gagal") dan bahwa echo tanpa terminal tetap polos.
 
 ## Bahasa

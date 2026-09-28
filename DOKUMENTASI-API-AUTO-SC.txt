@@ -55,6 +55,19 @@ Response gagal standar:
   "message": "unauthorized"
 }
 
+Layanan dinonaktifkan admin VPS (menu ON/OFF LAYANAN):
+Endpoint buat akun dan trial (sshvpn, vmessall, vlessall, trojanall, dan
+versi trial-nya) menjawab code 503 kalau layanannya OFF. Akun SSH baru hanya
+ditolak kalau SSH dan UDP sama-sama OFF. Perpanjang, hapus, lock/unlock, dan
+cek akun tetap jalan.
+{
+  "meta": {
+    "code": 503,
+    "message": "Layanan VMESS sedang dinonaktifkan admin VPS. Akun baru tidak bisa dibuat."
+  },
+  "message": "Layanan VMESS sedang dinonaktifkan admin VPS. Akun baru tidak bisa dibuat."
+}
+
 
 Summary API /internal/*
 -----------------------
@@ -356,7 +369,8 @@ Response data umum:
     "any": "443"
   },
   "path": {
-    "ws": "/vmess"
+    "ws": "/vmess",
+    "upgrade": "/upvmess"
   },
   "serviceName": "vmess-grpc",
   "limitip": "1",
@@ -366,9 +380,21 @@ Response data umum:
     "none": "vmess://...",
     "grpc": "vmess://...",
     "uptls": "vmess://...",
-    "upntls": "vmess://..."
+    "upntls": "vmess://...",
+    "onering": "vmess://..."
   }
 }
+
+Arti field link (sama untuk VMess, VLESS, Trojan):
+- tls / none      : WebSocket TLS (443) / non-TLS (80)
+- grpc            : gRPC TLS (443)
+- uptls / upntls  : HTTPUpgrade TLS (443) / non-TLS (80), path /up<protokol>
+- onering         : WebSocket TLS untuk aplikasi 1FTunnel, SNI
+                    "onering:<bug>:<domain>". Bug berisi domain server; ganti
+                    dengan bug operator di aplikasi.
+- xhttptls / xhttpntls (VLESS saja, hanya kalau XHTTP diaktifkan di menu
+  ON/OFF LAYANAN): XHTTP TLS (443, h2) / non-TLS (80), path /xhvless. Kalau
+  XHTTP mati, field ini tidak dikirim.
 
 
 Buat Trial VMess

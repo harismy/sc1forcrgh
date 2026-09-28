@@ -129,8 +129,14 @@ set -euo pipefail
 #   XRAY_ACTIVE_WINDOW_SECONDS=60                (opsional, jendela detik untuk kandidat IP aktif xray)
 #   XRAY_MIN_HITS_PER_IP=2                       (opsional, minimal hit/log per IP pada jendela aktif)
 #   XRAY_REAL_IP_ENABLE=0                        (canary: 1=teruskan IP asli HAProxy->Nginx->Xray)
+#   XRAY_XHTTP_ENABLE=0                          (opsional: 1=aktifkan inbound XHTTP VLESS di /xhvless)
+#   SERVICE_SSH_ENABLE=1                         (menu ON/OFF LAYANAN: 0=tolak SSH-WS/SSL/Dropbear; sshd 22 tetap buka)
+#   SERVICE_VMESS_ENABLE=1                       (0=tolak trafik VMess tanpa restart Xray)
+#   SERVICE_VLESS_ENABLE=1                       (0=tolak trafik VLESS termasuk XHTTP)
+#   SERVICE_TROJAN_ENABLE=1                      (0=tolak trafik Trojan)
+#   SERVICE_UDP_ENABLE=1                         (0=tolak ZIVPN/UDP Custom)
 #   XRAY_MIRROR_BASE=                            (opsional, base URL mirror binary Xray, mis. https://installer.domain/xray)
-#   XRAY_VERSION=                                (opsional, pin versi Xray, mis. v2.6.3.27)
+#   XRAY_VERSION=                                (opsional, pin versi Xray, mis. v26.3.27)
 #   XRAY_LIVE_IP_TTL_SECONDS=90                  (retensi histori IP monitor; bukan jumlah socket/perangkat)
 #   Catatan monitor Xray: socket aktif bukan jumlah perangkat. IP loopback proxy
 #   tidak pernah dihitung sebagai IP pengguna.
@@ -187,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.71}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.75}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -295,6 +301,12 @@ XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}"
 XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}"
 XRAY_VERSION="${XRAY_VERSION:-}"
 XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
+XRAY_XHTTP_ENABLE="${XRAY_XHTTP_ENABLE:-0}"
+SERVICE_SSH_ENABLE="${SERVICE_SSH_ENABLE:-1}"
+SERVICE_VMESS_ENABLE="${SERVICE_VMESS_ENABLE:-1}"
+SERVICE_VLESS_ENABLE="${SERVICE_VLESS_ENABLE:-1}"
+SERVICE_TROJAN_ENABLE="${SERVICE_TROJAN_ENABLE:-1}"
+SERVICE_UDP_ENABLE="${SERVICE_UDP_ENABLE:-1}"
 XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-90}"
 XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS:-/vmess}"
 XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS:-/vless}"
@@ -1886,7 +1898,7 @@ install_xray_manual_from_sources() {
       https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
       | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
   fi
-  [[ -z "${ver}" ]] && ver="v2.6.3.27"
+  [[ -z "${ver}" ]] && ver="v26.3.27"
 
   urls=""
   if [[ "${mode}" == "internal" ]]; then
@@ -2994,6 +3006,71 @@ ${xray_proxy_realip_headers}
         proxy_buffering off;
     }
 
+    location /upvmess {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10004;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+${xray_proxy_realip_headers}
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
+    }
+
+    location /upvless {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10005;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+${xray_proxy_realip_headers}
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
+    }
+
+    location /uptrojan {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10006;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+${xray_proxy_realip_headers}
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
+    }
+
+    # XHTTP VLESS lewat HTTP/1.1: non-TLS port 80 dan TLS dengan ALPN http/1.1.
+    # Unduhan (GET panjang) dan unggahan (POST) harus mengalir tanpa buffer.
+    # Inbound hanya ada bila XRAY_XHTTP_ENABLE=1.
+    location /xhvless {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:12002;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+${xray_proxy_realip_headers}
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+    }
+
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
@@ -3117,6 +3194,16 @@ ${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
+    }
+
+    # XHTTP VLESS (stream-up lewat H2). Inbound hanya ada bila XRAY_XHTTP_ENABLE=1.
+    location /xhvless {
+        access_log off;
+        grpc_set_header Host \$host;
+${xray_grpc_realip_headers}
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:12002;
     }
 
     location / {
@@ -4084,6 +4171,12 @@ XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
+XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
+SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
+SERVICE_VMESS_ENABLE=${SERVICE_VMESS_ENABLE}
+SERVICE_VLESS_ENABLE=${SERVICE_VLESS_ENABLE}
+SERVICE_TROJAN_ENABLE=${SERVICE_TROJAN_ENABLE}
+SERVICE_UDP_ENABLE=${SERVICE_UDP_ENABLE}
 XRAY_LIVE_IP_TTL_SECONDS=${XRAY_LIVE_IP_TTL_SECONDS}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
@@ -4996,7 +5089,7 @@ function isRenewLikeAction(action) {
 
 function accountXrayLinkBundle(service, account = {}) {
   const serviceText = normalizedXrayService(service);
-  if (!serviceText) return { tls: '', ntls: '', grpc: '', uptls: '', upntls: '' };
+  if (!serviceText) return { tls: '', ntls: '', grpc: '', uptls: '', upntls: '', xhttptls: '', xhttpntls: '', onering: '' };
   const links = account.link && typeof account.link === 'object' ? account.link : {};
   let tls = accountFirstLinkValue(links.tls, links.ws_tls, links.uptls, links.bugtls, links.front_tls, links.bugtls_all, links.front_tls_all);
   let ntls = accountFirstLinkValue(links.none, links.ntls, links.ws_ntls, links.upntls, links.bugntls, links.front_none, links.bugntls_all, links.front_none_all);
@@ -5028,7 +5121,10 @@ function accountXrayLinkBundle(service, account = {}) {
     ntls,
     grpc,
     uptls: uptls || tls,
-    upntls: upntls || ntls
+    upntls: upntls || ntls,
+    xhttptls: accountFirstLinkValue(links.xhttptls, links.xhttp_tls),
+    xhttpntls: accountFirstLinkValue(links.xhttpntls, links.xhttp_ntls),
+    onering: accountFirstLinkValue(links.onering)
   };
 }
 
@@ -5105,7 +5201,8 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
   const sni = notifyValue(account.sni || account.server_name, '');
   const secret = notifyValue(account.uuid || account.password || account.secret || account.id);
   const links = accountXrayLinkBundle(serviceText, account);
-  // Link upgrade biasanya sama persis dengan TLS/Non-TLS; hanya ditampilkan kalau berbeda.
+  // Link upgrade dari versi lama sama persis dengan TLS/Non-TLS (bukan httpupgrade);
+  // hanya ditampilkan kalau berbeda. XHTTP hanya ada kalau inbound-nya aktif.
   const linkLines = [];
   const pushLink = (label, value) => {
     if (!value) return;
@@ -5117,6 +5214,9 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
   pushLink('gRPC', links.grpc);
   if (links.uptls && links.uptls !== links.tls) pushLink('Upgrade TLS', links.uptls);
   if (links.upntls && links.upntls !== links.ntls) pushLink('Upgrade Non-TLS', links.upntls);
+  pushLink('XHTTP TLS', links.xhttptls);
+  pushLink('XHTTP Non-TLS', links.xhttpntls);
+  pushLink('OneRing (1FTunnel)', links.onering);
 
   return notifyMessage(isTrialAction(action, username) ? `AKUN TRIAL ${title}` : `AKUN ${title} BARU`, [
     {
@@ -5139,6 +5239,7 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
         notifyRow(serviceText === 'trojan' ? 'Password' : 'UUID', secret),
         notifyRow('Path WS', accountPathPart(account, 'ws', `/${serviceText}`)),
         notifyRow('Upgrade', accountPathPart(account, 'upgrade', `/up${serviceText}`)),
+        links.xhttptls || links.xhttpntls ? notifyRow('XHTTP', accountPathPart(account, 'xhttp', '/xhvless')) : null,
         notifyRow('Service', notifyValue(account.serviceName || `${serviceText}-grpc`)),
         notifyRow('Lokasi', notifyLocation(account, location))
       ]
@@ -6081,6 +6182,77 @@ function trojanGrpcLink(host, pass, username = '') {
   const remark = encodeURIComponent(String(username || `trojan-grpc-${host}`).trim() || `trojan-grpc-${host}`);
   return `trojan://${pass}@${host}:443?type=grpc&serviceName=trojan-grpc&security=tls&sni=${host}&alpn=h2#${remark}`;
 }
+
+// Path inbound httpupgrade dan XHTTP di buildXrayRuntimeConfig.
+const XRAY_UPGRADE_PATH = { vmess: '/upvmess', vless: '/upvless', trojan: '/uptrojan' };
+const XRAY_XHTTP_PATH_VLESS = '/xhvless';
+// Dibaca sama seperti di buildXrayRuntimeConfig: inbound XHTTP hanya ada kalau
+// XRAY_XHTTP_ENABLE=1, jadi link XHTTP juga hanya dibuat saat itu.
+const XRAY_XHTTP_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.XRAY_XHTTP_ENABLE || '').trim());
+
+// HTTPUpgrade: TLS lewat 443, non-TLS lewat 80 (nginx /up<protokol>).
+function vmessUpgradeLink(host, id, tls, username = '') {
+  const remark = String(username || `vmess-${host}`).trim() || `vmess-${host}`;
+  const allowInsecure = VMESS_BUG_PROFILE_ALLOW_INSECURE ? '1' : '0';
+  const payload = {
+    v: '2', ps: remark, add: host, port: tls ? '443' : '80', id, aid: '0',
+    net: 'httpupgrade', type: 'none', host, path: XRAY_UPGRADE_PATH.vmess, tls: tls ? 'tls' : 'none', sni: host,
+    allowInsecure, alpn: 'http/1.1'
+  };
+  return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+}
+function vlessUpgradeLink(host, id, tls, username = '') {
+  const remark = encodeURIComponent(String(username || `vless-${host}`).trim() || `vless-${host}`);
+  const path = encodeURIComponent(XRAY_UPGRADE_PATH.vless);
+  if (tls) {
+    return `vless://${id}@${host}:443?type=httpupgrade&path=${path}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1&encryption=none#${remark}`;
+  }
+  return `vless://${id}@${host}:80?type=httpupgrade&path=${path}&security=none&host=${host}&encryption=none#${remark}`;
+}
+function trojanUpgradeLink(host, pass, tls, username = '') {
+  const remark = encodeURIComponent(String(username || `trojan-${host}`).trim() || `trojan-${host}`);
+  const path = encodeURIComponent(XRAY_UPGRADE_PATH.trojan);
+  if (tls) {
+    return `trojan://${pass}@${host}:443?type=httpupgrade&path=${path}&security=tls&sni=${host}&host=${host}&alpn=http%2F1.1#${remark}`;
+  }
+  return `trojan://${pass}@${host}:80?type=httpupgrade&path=${path}&security=none&host=${host}#${remark}`;
+}
+
+// XHTTP (VLESS saja). TLS memakai h2 (HAProxy -> nginx :8081 -> Xray),
+// non-TLS memakai HTTP/1.1 lewat port 80 (nginx /xhvless -> Xray).
+function vlessXhttpLink(host, id, tls, username = '') {
+  const remark = encodeURIComponent(String(username || `vless-xhttp-${host}`).trim() || `vless-xhttp-${host}`);
+  const path = encodeURIComponent(XRAY_XHTTP_PATH_VLESS);
+  if (tls) {
+    return `vless://${id}@${host}:443?type=xhttp&path=${path}&host=${host}&mode=auto&security=tls&sni=${host}&alpn=h2&encryption=none#${remark}`;
+  }
+  return `vless://${id}@${host}:80?type=xhttp&path=${path}&host=${host}&mode=auto&security=none&encryption=none#${remark}`;
+}
+
+// OneRing khusus aplikasi 1FTunnel: link WS TLS biasa dengan SNI
+// "onering:<bug>:<domain>". Server tidak perlu diubah. Bug diisi domain yang
+// terdaftar di server; pembeli bisa menggantinya dengan bug operatornya.
+function oneringSni(host) {
+  const domain = normalizeHost(host);
+  return `onering:${domain}:${domain}`;
+}
+function vmessOneringLink(host, id, username = '') {
+  const remark = `${String(username || `vmess-${host}`).trim() || `vmess-${host}`}-onering`;
+  const payload = {
+    v: '2', ps: remark, add: host, port: '443', id, aid: '0', scy: 'auto',
+    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: 'tls', sni: oneringSni(host),
+    alpn: 'http/1.1', allowInsecure: '1'
+  };
+  return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+}
+function vlessOneringLink(host, id, username = '') {
+  const remark = encodeURIComponent(`${String(username || `vless-${host}`).trim() || `vless-${host}`}-onering`);
+  return `vless://${id}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=tls&sni=${encodeURIComponent(oneringSni(host))}&host=${host}&alpn=http%2F1.1&allowInsecure=1&encryption=none#${remark}`;
+}
+function trojanOneringLink(host, pass, username = '') {
+  const remark = encodeURIComponent(`${String(username || `trojan-${host}`).trim() || `trojan-${host}`}-onering`);
+  return `trojan://${pass}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${encodeURIComponent(oneringSni(host))}&host=${host}&alpn=http%2F1.1&allowInsecure=1#${remark}`;
+}
 function addFrontBugLink(protocol, links, secret, username = '') {
   if (!Array.isArray(XRAY_FRONT_TARGETS) || XRAY_FRONT_TARGETS.length < 1) return links;
   const frontTlsLinks = [];
@@ -6171,6 +6343,11 @@ async function loadEnforceableXrayRows(table, secretColumn, protocol) {
 // iplimit-checker: HandlerService menyasar inbound lewat tag, dan config yang
 // strukturnya berbeda selalu berujung restart.
 function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
+  // XHTTP VLESS opsional dan mati default (hemat RAM di VPS 1 GB). Diaktifkan
+  // lewat XRAY_XHTTP_ENABLE=1 di /etc/sc-1forcr.env, lalu render ulang config.
+  const xhttpVlessEnabled = /^(1|true|yes|on)$/i.test(
+    String((typeof process !== 'undefined' && process.env && process.env.XRAY_XHTTP_ENABLE) || '').trim()
+  );
   return {
     log: {
       access: '/var/log/xray/access.log',
@@ -6214,7 +6391,27 @@ function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
         tag: 'trojan-grpc', port: 11003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
-      }
+      },
+      {
+        tag: 'vmess-hu', port: 10004, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
+        streamSettings: withXrayRealIp({ network: 'httpupgrade', httpupgradeSettings: { path: '/upvmess' } })
+      },
+      {
+        tag: 'vless-hu', port: 10005, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
+        streamSettings: withXrayRealIp({ network: 'httpupgrade', security: 'none', httpupgradeSettings: { path: '/upvless' } })
+      },
+      {
+        tag: 'trojan-hu', port: 10006, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
+        streamSettings: withXrayRealIp({ network: 'httpupgrade', security: 'none', httpupgradeSettings: { path: '/uptrojan' } })
+      },
+      ...(xhttpVlessEnabled ? [{
+        tag: 'vless-xhttp', port: 12002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
+        streamSettings: withXrayRealIp({ network: 'xhttp', security: 'none', xhttpSettings: { path: '/xhvless', scMaxBufferedPosts: 16 } })
+      }] : [])
     ],
     outbounds: [{
       protocol: 'freedom',
@@ -7298,7 +7495,47 @@ function validateSshUsername(usernameRaw) {
   return username;
 }
 
+// Layanan yang dimatikan lewat menu ON/OFF LAYANAN (sc-1forcr-service-gate).
+// Trafiknya sudah ditolak di iptables; di sini akun baru ikut ditolak supaya
+// pembeli tidak membayar layanan yang mati. Dibaca ulang dari .env (cache per
+// mtime/ukuran), jadi mengubah status tidak perlu restart API.
+const SERVICE_TOGGLE_ENV_PATH = `${__dirname}/.env`;
+let serviceToggleCache = { stamp: '', values: {} };
+function readServiceToggles() {
+  try {
+    const stat = fs.statSync(SERVICE_TOGGLE_ENV_PATH);
+    const stamp = `${stat.mtimeMs}:${stat.size}`;
+    if (stamp !== serviceToggleCache.stamp) {
+      const values = {};
+      for (const line of fs.readFileSync(SERVICE_TOGGLE_ENV_PATH, 'utf8').split('\n')) {
+        const match = line.match(/^(SERVICE_[A-Z]+_ENABLE)=(.*)$/);
+        if (match) values[match[1]] = match[2].replace(/["'\r]/g, '').trim();
+      }
+      serviceToggleCache = { stamp, values };
+    }
+  } catch (_) {}
+  return serviceToggleCache.values;
+}
+function serviceToggleEnabled(service) {
+  const raw = readServiceToggles()[`SERVICE_${String(service).toUpperCase()}_ENABLE`];
+  if (raw === undefined || raw === '') return true;
+  return !/^(0|false|no|off)$/i.test(raw);
+}
+// Akun SSH juga dipakai login ZIVPN/UDP Custom, jadi baru ditolak kalau SSH
+// dan UDP sama-sama dimatikan.
+function assertServiceOpenForNewAccount(protocol) {
+  const open = protocol === 'ssh'
+    ? serviceToggleEnabled('ssh') || serviceToggleEnabled('udp')
+    : serviceToggleEnabled(protocol);
+  if (open) return;
+  const label = protocol === 'ssh' ? 'SSH/UDP' : String(protocol).toUpperCase();
+  const err = new Error(`Layanan ${label} sedang dinonaktifkan admin VPS. Akun baru tidak bisa dibuat.`);
+  err.statusCode = 503;
+  throw err;
+}
+
 async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
+  assertServiceOpenForNewAccount('ssh');
   const isTrial = forcedDays !== null;
   let username = String(body?.username || '').trim().toLowerCase();
   if (!username && isTrial) {
@@ -7633,6 +7870,7 @@ app.patch('/vps/unlocksshvpn/:username/pw', async (req, res) => {
 });
 
 async function createXray(req, protocol, username, expDays, quota, limitip, trial) {
+  assertServiceOpenForNewAccount(protocol);
   const protocolTable = {
     vmess: 'account_vmesses',
     vless: 'account_vlesses',
@@ -7690,12 +7928,19 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: '/upvmess', aliases: XRAY_PATHS_VMESS },
+      path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: XRAY_UPGRADE_PATH.vmess, aliases: XRAY_PATHS_VMESS },
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
       quota: String(quota || 0),
-      link: addFrontBugLink('vmess', { tls: vmessLink(xrayHost, uuid, true, finalUsername), none: vmessLink(xrayHost, uuid, false, finalUsername), grpc: vmessGrpcLink(xrayHost, uuid, finalUsername), uptls: vmessLink(xrayHost, uuid, true, finalUsername), upntls: vmessLink(xrayHost, uuid, false, finalUsername) }, uuid, finalUsername),
+      link: addFrontBugLink('vmess', {
+        tls: vmessLink(xrayHost, uuid, true, finalUsername),
+        none: vmessLink(xrayHost, uuid, false, finalUsername),
+        grpc: vmessGrpcLink(xrayHost, uuid, finalUsername),
+        uptls: vmessUpgradeLink(xrayHost, uuid, true, finalUsername),
+        upntls: vmessUpgradeLink(xrayHost, uuid, false, finalUsername),
+        onering: vmessOneringLink(xrayHost, uuid, finalUsername)
+      }, uuid, finalUsername),
       bug_profile: bugCfg ? { config: bugCfg, vmess: bugVmess } : null
     };
   } else if (protocol === 'vless') {
@@ -7711,12 +7956,26 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: '/upvless', aliases: XRAY_PATHS_VLESS },
+      path: {
+        ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: XRAY_UPGRADE_PATH.vless, aliases: XRAY_PATHS_VLESS,
+        ...(XRAY_XHTTP_ENABLED ? { xhttp: XRAY_XHTTP_PATH_VLESS } : {})
+      },
       serviceName: 'vless-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
       quota: String(quota || 0),
-      link: addFrontBugLink('vless', { tls: vlessLink(xrayHost, uuid, true, finalUsername), none: vlessLink(xrayHost, uuid, false, finalUsername), grpc: vlessGrpcLink(xrayHost, uuid, finalUsername), uptls: vlessLink(xrayHost, uuid, true, finalUsername), upntls: vlessLink(xrayHost, uuid, false, finalUsername) }, uuid, finalUsername)
+      link: addFrontBugLink('vless', {
+        tls: vlessLink(xrayHost, uuid, true, finalUsername),
+        none: vlessLink(xrayHost, uuid, false, finalUsername),
+        grpc: vlessGrpcLink(xrayHost, uuid, finalUsername),
+        uptls: vlessUpgradeLink(xrayHost, uuid, true, finalUsername),
+        upntls: vlessUpgradeLink(xrayHost, uuid, false, finalUsername),
+        ...(XRAY_XHTTP_ENABLED ? {
+          xhttptls: vlessXhttpLink(xrayHost, uuid, true, finalUsername),
+          xhttpntls: vlessXhttpLink(xrayHost, uuid, false, finalUsername)
+        } : {}),
+        onering: vlessOneringLink(xrayHost, uuid, finalUsername)
+      }, uuid, finalUsername)
     };
   } else if (protocol === 'trojan') {
     await ensureUsernameNotExists('account_trojans', finalUsername);
@@ -7731,12 +7990,19 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: '/uptrojan', aliases: XRAY_PATHS_TROJAN },
+      path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: XRAY_UPGRADE_PATH.trojan, aliases: XRAY_PATHS_TROJAN },
       serviceName: 'trojan-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
       quota: String(quota || 0),
-      link: addFrontBugLink('trojan', { tls: trojanLink(xrayHost, pass, true, finalUsername), none: trojanLink(xrayHost, pass, false, finalUsername), grpc: trojanGrpcLink(xrayHost, pass, finalUsername), uptls: trojanLink(xrayHost, pass, true, finalUsername), upntls: trojanLink(xrayHost, pass, false, finalUsername) }, pass, finalUsername)
+      link: addFrontBugLink('trojan', {
+        tls: trojanLink(xrayHost, pass, true, finalUsername),
+        none: trojanLink(xrayHost, pass, false, finalUsername),
+        grpc: trojanGrpcLink(xrayHost, pass, finalUsername),
+        uptls: trojanUpgradeLink(xrayHost, pass, true, finalUsername),
+        upntls: trojanUpgradeLink(xrayHost, pass, false, finalUsername),
+        onering: trojanOneringLink(xrayHost, pass, finalUsername)
+      }, pass, finalUsername)
     };
   }
   if (trial) await markTrialAccount(protocol, finalUsername);
@@ -12724,6 +12990,11 @@ function xrayApiServices() {
 }
 
 function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
+  // XHTTP VLESS opsional dan mati default (hemat RAM di VPS 1 GB). Diaktifkan
+  // lewat XRAY_XHTTP_ENABLE=1 di /etc/sc-1forcr.env, lalu render ulang config.
+  const xhttpVlessEnabled = /^(1|true|yes|on)$/i.test(
+    String((typeof process !== 'undefined' && process.env && process.env.XRAY_XHTTP_ENABLE) || '').trim()
+  );
   return {
     log: {
       access: '/var/log/xray/access.log',
@@ -12767,7 +13038,27 @@ function buildXrayRuntimeConfig(vmessRows, vlessRows, trojanRows) {
         tag: 'trojan-grpc', port: 11003, listen: '127.0.0.1', protocol: 'trojan',
         settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
         streamSettings: withXrayRealIp({ network: 'grpc', security: 'none', grpcSettings: { serviceName: 'trojan-grpc' } })
-      }
+      },
+      {
+        tag: 'vmess-hu', port: 10004, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: r.secret, alterId: 0, email: r.username })) },
+        streamSettings: withXrayRealIp({ network: 'httpupgrade', httpupgradeSettings: { path: '/upvmess' } })
+      },
+      {
+        tag: 'vless-hu', port: 10005, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
+        streamSettings: withXrayRealIp({ network: 'httpupgrade', security: 'none', httpupgradeSettings: { path: '/upvless' } })
+      },
+      {
+        tag: 'trojan-hu', port: 10006, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: r.secret, email: r.username })) },
+        streamSettings: withXrayRealIp({ network: 'httpupgrade', security: 'none', httpupgradeSettings: { path: '/uptrojan' } })
+      },
+      ...(xhttpVlessEnabled ? [{
+        tag: 'vless-xhttp', port: 12002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: r.secret, email: r.username })), decryption: 'none' },
+        streamSettings: withXrayRealIp({ network: 'xhttp', security: 'none', xhttpSettings: { path: '/xhvless', scMaxBufferedPosts: 16 } })
+      }] : [])
     ],
     outbounds: [{
       protocol: 'freedom',
@@ -14727,6 +15018,14 @@ if command -v iptables >/dev/null 2>&1; then
     iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || true
 fi
 
+# Layanan yang dimatikan lewat menu ON/OFF LAYANAN: gerbang iptables-nya
+# dipasang ulang kalau hilang (reboot tanpa netfilter-persistent) atau
+# tergeser dari puncak chain oleh rule ACCEPT di atas. Semua ON = no-op.
+if [[ -x /usr/local/sbin/sc-1forcr-service-gate ]]; then
+  /usr/local/sbin/sc-1forcr-service-gate apply >/dev/null 2>&1 || \
+    log_health "GAGAL menerapkan status ON/OFF layanan"
+fi
+
 # Dependensi diperiksa lebih dulu. Unit yang sudah aktif dan listen tidak disentuh.
 repair_unit_if_needed ssh.service || true
 repair_unit_if_needed dropbear.service || true
@@ -15159,6 +15458,12 @@ SETTINGS_KEYS = [
     "XRAY_ACTIVE_WINDOW_SECONDS",
     "XRAY_MIN_HITS_PER_IP",
     "XRAY_REAL_IP_ENABLE",
+    "XRAY_XHTTP_ENABLE",
+    "SERVICE_SSH_ENABLE",
+    "SERVICE_VMESS_ENABLE",
+    "SERVICE_VLESS_ENABLE",
+    "SERVICE_TROJAN_ENABLE",
+    "SERVICE_UDP_ENABLE",
     "XRAY_LIVE_IP_TTL_SECONDS",
     "XRAY_PATHS_VMESS",
     "XRAY_PATHS_VLESS",
@@ -15977,6 +16282,12 @@ SETTINGS_KEYS = [
     "XRAY_ACTIVE_WINDOW_SECONDS",
     "XRAY_MIN_HITS_PER_IP",
     "XRAY_REAL_IP_ENABLE",
+    "XRAY_XHTTP_ENABLE",
+    "SERVICE_SSH_ENABLE",
+    "SERVICE_VMESS_ENABLE",
+    "SERVICE_VLESS_ENABLE",
+    "SERVICE_TROJAN_ENABLE",
+    "SERVICE_UDP_ENABLE",
     "XRAY_LIVE_IP_TTL_SECONDS",
     "XRAY_PATHS_VMESS",
     "XRAY_PATHS_VLESS",
@@ -16703,9 +17014,9 @@ ss -Htnp state established 2>/dev/null | awk '
     return "";
   }
   BEGIN {
-    proto[10001]="vmess"; proto[11001]="vmess";
-    proto[10002]="vless"; proto[11002]="vless";
-    proto[10003]="trojan"; proto[11003]="trojan";
+    proto[10001]="vmess"; proto[11001]="vmess"; proto[10004]="vmess";
+    proto[10002]="vless"; proto[11002]="vless"; proto[10005]="vless"; proto[12002]="vless";
+    proto[10003]="trojan"; proto[11003]="trojan"; proto[10006]="trojan";
   }
   {
     # Hindari mengambil endpoint nginx/HAProxy pada sisi seberang socket.
@@ -18845,8 +19156,12 @@ patch_nginx_realip() {
       print "}";
       print "";
     }
+    # Semua location yang diteruskan ke Xray: ws, grpc, httpupgrade (/up*),
+    # XHTTP (/xhvless), dan /yourbug. Location yang terlewat tidak mendapat
+    # header IP asli, padahal inbound-nya sudah mempercayai header itu.
     function is_xray_location(line) {
-      return line ~ /^[[:space:]]*location[[:space:]]+\/(vmess|vless|trojan)(-grpc)?([[:space:]]|\{)/ ||
+      return line ~ /^[[:space:]]*location[[:space:]]+\/(up)?(vmess|vless|trojan)(-grpc)?([[:space:]]|\{)/ ||
+        line ~ /^[[:space:]]*location[[:space:]]+\/xhvless([[:space:]]|\{)/ ||
         line ~ /^[[:space:]]*location[[:space:]]+\/yourbug(\/(vless|trojan))?([[:space:]]|\{)/;
     }
     function brace_delta(line, work, opens, closes) {
@@ -18927,9 +19242,9 @@ patch_xray_mode() {
   local mode="$1" tmp filter
   tmp="$(mktemp "$(dirname "${XRAY_CONF}")/.sc-xray-realip-xray.XXXXXX")"
   if [[ "${mode}" == "enable" ]]; then
-    filter='.inbounds |= map(if (((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc")) then .streamSettings.sockopt = ((.streamSettings.sockopt // {}) + {"trustedXForwardedFor":["X-SC-Real-IP-Proxy"]}) else . end)'
+    filter='.inbounds |= map(if ((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc") or ((.streamSettings.network // "") == "httpupgrade") or ((.streamSettings.network // "") == "xhttp") then .streamSettings.sockopt = ((.streamSettings.sockopt // {}) + {"trustedXForwardedFor":["X-SC-Real-IP-Proxy"]}) else . end)'
   else
-    filter='.inbounds |= map(if (((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc")) then del(.streamSettings.sockopt.trustedXForwardedFor) else . end)'
+    filter='.inbounds |= map(if ((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc") or ((.streamSettings.network // "") == "httpupgrade") or ((.streamSettings.network // "") == "xhttp") then del(.streamSettings.sockopt.trustedXForwardedFor) else . end)'
   fi
   jq "${filter}" "${XRAY_CONF}" > "${tmp}"
   chmod --reference="${XRAY_CONF}" "${tmp}" 2>/dev/null || chmod 644 "${tmp}"
@@ -18980,7 +19295,7 @@ show_status() {
   fi
   grep -q 'server nginx_local 127\.0\.0\.1:8083 .*send-proxy' "${HAPROXY_CONF}" 2>/dev/null && route="proxy-ip" || true
   [[ "${env_mode}" == "1" && "${route}" == "proxy-ip" ]] && route="real-ip"
-  jq -e '.inbounds[]? | select(((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc")) | select((.streamSettings.sockopt.trustedXForwardedFor // []) | index("X-SC-Real-IP-Proxy"))' "${XRAY_CONF}" >/dev/null 2>&1 && trusted="yes" || true
+  jq -e '.inbounds[]? | select(((.streamSettings.network // "") == "ws") or ((.streamSettings.network // "") == "grpc") or ((.streamSettings.network // "") == "httpupgrade") or ((.streamSettings.network // "") == "xhttp")) | select((.streamSettings.sockopt.trustedXForwardedFor // []) | index("X-SC-Real-IP-Proxy"))' "${XRAY_CONF}" >/dev/null 2>&1 && trusted="yes" || true
   grep -q 'sc-1forcr-trusted-realip-v2' "${NGINX_CONF}" 2>/dev/null && cf_trust="cloudflare-only" || true
   ss -H -lnt 2>/dev/null | awk '$4 ~ /:8083$/ {ok=1} END {exit(ok?0:1)}' && ws_listener="yes" || true
   ss -H -lnt 2>/dev/null | awk '$4 ~ /:8082$/ {ok=1} END {exit(ok?0:1)}' && grpc_listener="yes" || true
@@ -19021,12 +19336,417 @@ XRAY_REALIP_MANAGER_EOF
   chmod 700 /usr/local/sbin/sc-1forcr-xray-realip
 }
 
+install_service_gate_manager() {
+  cat > /usr/local/sbin/sc-1forcr-service-gate <<'SERVICE_GATE_EOF'
+#!/usr/bin/env bash
+# ON/OFF layanan SC 1FORCR (menu ON/OFF LAYANAN).
+#
+# Layanan dimatikan dengan menolak trafiknya di iptables, bukan dengan
+# stop/mask service systemd. Watchdog, update, dan restart chain tetap melihat
+# semua service sehat sehingga tidak ada yang menyalakannya lagi, dan layanan
+# lain tidak ikut terputus:
+# - ssh    : 127.0.0.1:2082 (sshws: SSH-WS dan SSL/CONNECT lewat HAProxy/nginx)
+#            dan port Dropbear publik. Port sshd (22) tidak pernah ditutup
+#            supaya admin tetap bisa masuk ke VPS.
+# - vmess/vless/trojan : port inbound Xray lokal (ws, grpc, httpupgrade,
+#            xhttp) yang dituju nginx. Xray tidak direstart.
+# - udp    : port listen ZIVPN/UDP Custom.
+# - xhttp  : bukan gerbang firewall. XRAY_XHTTP_ENABLE menambah/menghapus
+#            inbound, jadi Xray direstart sekali lewat API.
+# Semua layanan ON berarti tidak ada rule sama sekali.
+set -euo pipefail
+
+SC_ENV="/etc/sc-1forcr.env"
+XRAY_CONF="/usr/local/etc/xray/config.json"
+LOCK_FILE="/run/sc-1forcr-service-gate.lock"
+CHAIN_OUT="SC1FORCR_SVC_OUT"
+CHAIN_IN="SC1FORCR_SVC_IN"
+SERVICES=(ssh vmess vless trojan udp xhttp)
+SSHWS_PORT="2082"
+VMESS_PORTS="10001,11001,10004"
+VLESS_PORTS="10002,11002,10005,12002"
+TROJAN_PORTS="10003,11003,10006"
+RULES_OUT=()
+RULES_IN=()
+
+die() { echo "Gagal: $*" >&2; exit 1; }
+
+acquire_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"${LOCK_FILE}"
+  flock -w 60 9 || die "proses lain sedang mengubah status layanan"
+}
+
+app_env_path() {
+  local dir
+  dir="$(systemctl show sc-1forcr-api -p WorkingDirectory --value 2>/dev/null || true)"
+  if [[ -n "${dir}" && -f "${dir}/.env" ]]; then
+    echo "${dir}/.env"
+    return 0
+  fi
+  for dir in /opt/sc-1forcr /opt/potato-compat; do
+    if [[ -f "${dir}/.env" ]]; then
+      echo "${dir}/.env"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+env_get() {
+  local file="$1" key="$2"
+  [[ -n "${file}" && -r "${file}" ]] || return 0
+  sed -n "s/^${key}=//p" "${file}" | tail -n1 | tr -d "\r\"'[:space:]"
+}
+
+set_env_value() {
+  local file="$1" key="$2" value="$3" tmp
+  [[ -n "${file}" ]] || return 0
+  mkdir -p "$(dirname "${file}")"
+  [[ -f "${file}" ]] || : > "${file}"
+  tmp="$(mktemp "$(dirname "${file}")/.sc-service-gate-env.XXXXXX")"
+  awk -F= -v key="${key}" -v value="${value}" '
+    BEGIN { done=0 }
+    $1==key { if (!done) print key "=" value; done=1; next }
+    { print }
+    END { if (!done) print key "=" value }
+  ' "${file}" > "${tmp}"
+  chmod --reference="${file}" "${tmp}" 2>/dev/null || chmod 600 "${tmp}"
+  chown --reference="${file}" "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${file}"
+}
+
+write_flag() {
+  local key="$1" value="$2"
+  set_env_value "${SC_ENV}" "${key}" "${value}"
+  set_env_value "$(app_env_path)" "${key}" "${value}"
+}
+
+flag_on() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+service_key() {
+  case "$1" in
+    ssh) echo "SERVICE_SSH_ENABLE" ;;
+    vmess) echo "SERVICE_VMESS_ENABLE" ;;
+    vless) echo "SERVICE_VLESS_ENABLE" ;;
+    trojan) echo "SERVICE_TROJAN_ENABLE" ;;
+    udp) echo "SERVICE_UDP_ENABLE" ;;
+    xhttp) echo "XRAY_XHTTP_ENABLE" ;;
+    *) return 1 ;;
+  esac
+}
+
+service_enabled() {
+  local key value
+  key="$(service_key "$1")" || return 1
+  value="$(env_get "${SC_ENV}" "${key}")"
+  if [[ -z "${value}" ]]; then
+    if [[ "$1" == "xhttp" ]]; then value="0"; else value="1"; fi
+  fi
+  flag_on "${value}"
+}
+
+listen_ports_of() {
+  local out
+  out="$(ss -H -lntp 2>/dev/null || true)"
+  awk -v proc="\"$1\"" 'index($0, proc) { a=$4; sub(/^.*:/, "", a); print a }' <<< "${out}"
+}
+
+tcp_listening() {
+  local out
+  out="$(ss -H -lnt 2>/dev/null || true)"
+  awk -v want="$1" '{ a=$4; sub(/^.*:/, "", a); if (a == want) f=1 } END { exit(f ? 0 : 1) }' <<< "${out}"
+}
+
+# stdin: satu port per baris. Hasil: "a,b,c" urut, unik, valid, tanpa port
+# yang dilindungi ($1, dipisah spasi).
+join_ports() {
+  sort -n | awk -v prot=" $1 " '
+    /^[0-9]+$/ && $1 >= 1 && $1 <= 65535 && index(prot, " " $1 " ") == 0 && !seen[$1]++ {
+      out = out (out == "" ? "" : ",") $1
+    }
+    END { print out }'
+}
+
+# DROPBEAR_PORT=22 atau salah konfigurasi lain tidak boleh mengunci admin
+# dari VPS, jadi port yang dipakai sshd selalu dikecualikan.
+dropbear_ports() {
+  local app_env main alt protected
+  app_env="$(app_env_path)"
+  main="$(env_get "${SC_ENV}" DROPBEAR_PORT)"
+  alt="$(env_get "${app_env}" DROPBEAR_ALT_PORT)"
+  protected="22 $(listen_ports_of sshd | tr '\n' ' ')"
+  {
+    printf '%s\n%s\n' "${main:-109}" "${alt:-143}"
+    listen_ports_of dropbear
+  } | join_ports "${protected}"
+}
+
+udp_ports() {
+  local f p found=""
+  for f in /etc/zivpn/config.json /root/udp/config.json; do
+    [[ -r "${f}" ]] || continue
+    p="$(sed -n 's/.*"listen"[[:space:]]*:[[:space:]]*"[^"]*:\([0-9][0-9]*\)".*/\1/p' "${f}" | head -n1)"
+    if [[ -n "${p}" ]]; then found+="${p}"$'\n'; fi
+  done
+  if [[ -z "${found}" ]]; then found="5667"$'\n'; fi
+  printf '%s' "${found}" | join_ports "53 67 68 123"
+}
+
+xray_rule() {
+  printf -- '-o lo -p tcp -d 127.0.0.1 -m multiport --dports %s -m comment --comment sc-svc-%s -j REJECT --reject-with tcp-reset' "$2" "$1"
+}
+
+# Nama komentar hanya [a-z0-9-] supaya iptables -S mencetaknya tanpa kutip.
+build_rules() {
+  local ports
+  RULES_OUT=()
+  RULES_IN=()
+  if ! service_enabled ssh; then
+    RULES_OUT+=("-o lo -p tcp -d 127.0.0.1 --dport ${SSHWS_PORT} -m comment --comment sc-svc-ssh -j REJECT --reject-with tcp-reset")
+    ports="$(dropbear_ports)"
+    if [[ -n "${ports}" ]]; then
+      RULES_IN+=("! -i lo -p tcp -m multiport --dports ${ports} -m comment --comment sc-svc-ssh -j REJECT --reject-with tcp-reset")
+    fi
+  fi
+  if ! service_enabled vmess; then RULES_OUT+=("$(xray_rule vmess "${VMESS_PORTS}")"); fi
+  if ! service_enabled vless; then RULES_OUT+=("$(xray_rule vless "${VLESS_PORTS}")"); fi
+  if ! service_enabled trojan; then RULES_OUT+=("$(xray_rule trojan "${TROJAN_PORTS}")"); fi
+  if ! service_enabled udp; then
+    ports="$(udp_ports)"
+    if [[ -n "${ports}" ]]; then
+      RULES_IN+=("! -i lo -p udp -m multiport --dports ${ports} -m comment --comment sc-svc-udp -j DROP")
+    fi
+  fi
+}
+
+remove_chain() {
+  local ipt="$1" parent="$2" chain="$3"
+  "${ipt}" -w 10 -S "${chain}" >/dev/null 2>&1 || return 0
+  while "${ipt}" -w 10 -D "${parent}" -j "${chain}" >/dev/null 2>&1; do :; done
+  "${ipt}" -w 10 -F "${chain}" >/dev/null 2>&1 || true
+  "${ipt}" -w 10 -X "${chain}" >/dev/null 2>&1 || true
+}
+
+# Rule lain (loop guard SSHWS, ACCEPT 80/443/109/143, ESTABLISHED) disisipkan
+# di puncak chain. Gerbang harus di atas semuanya supaya sesi yang sudah
+# tersambung juga terputus, jadi posisinya dicek tiap kali apply.
+ensure_jump_first() {
+  local ipt="$1" parent="$2" chain="$3" first
+  first="$("${ipt}" -w 10 -S "${parent}" 2>/dev/null | sed -n '2p' || true)"
+  [[ "${first}" == "-A ${parent} -j ${chain}" ]] && return 0
+  while "${ipt}" -w 10 -D "${parent}" -j "${chain}" >/dev/null 2>&1; do :; done
+  "${ipt}" -w 10 -I "${parent}" 1 -j "${chain}" || return 1
+}
+
+# sync_chain <iptables|ip6tables> <INPUT|OUTPUT> <chain> [spec...]
+# Chain dibangun ulang hanya kalau tanda tangan isinya berubah, jadi apply
+# berkala dari watchdog tidak membuka celah tanpa rule.
+sync_chain() {
+  local ipt="$1" parent="$2" chain="$3" sig current spec
+  shift 3
+  if (( $# == 0 )); then
+    remove_chain "${ipt}" "${parent}" "${chain}"
+    return 0
+  fi
+  sig="sc-svc-sig-$(printf '%s\n' "$@" | cksum | awk '{print $1}')"
+  current="$("${ipt}" -w 10 -S "${chain}" 2>/dev/null || true)"
+  if [[ "${current}" != *"${sig}"* ]]; then
+    if [[ -z "${current}" ]]; then
+      "${ipt}" -w 10 -N "${chain}" || return 1
+    fi
+    "${ipt}" -w 10 -F "${chain}" || return 1
+    for spec in "$@"; do
+      # shellcheck disable=SC2086
+      "${ipt}" -w 10 -A "${chain}" ${spec} || return 1
+    done
+    "${ipt}" -w 10 -A "${chain}" -m comment --comment "${sig}" -j RETURN || return 1
+  fi
+  ensure_jump_first "${ipt}" "${parent}" "${chain}" || return 1
+}
+
+cmd_apply() {
+  build_rules
+  if ! command -v iptables >/dev/null 2>&1; then
+    if (( ${#RULES_OUT[@]} + ${#RULES_IN[@]} > 0 )); then
+      echo "Gagal: iptables tidak tersedia; layanan yang OFF belum bisa ditutup." >&2
+      return 1
+    fi
+    return 0
+  fi
+  sync_chain iptables OUTPUT "${CHAIN_OUT}" ${RULES_OUT[@]+"${RULES_OUT[@]}"} || return 1
+  sync_chain iptables INPUT "${CHAIN_IN}" ${RULES_IN[@]+"${RULES_IN[@]}"} || return 1
+  # VPS dengan IPv6 mati di kernel tidak punya tabel ip6tables; lewati saja.
+  if command -v ip6tables >/dev/null 2>&1 && ip6tables -w 10 -S INPUT >/dev/null 2>&1; then
+    if ! sync_chain ip6tables INPUT "${CHAIN_IN}" ${RULES_IN[@]+"${RULES_IN[@]}"}; then
+      echo "Peringatan: rule IPv6 layanan belum terpasang." >&2
+    fi
+  fi
+  return 0
+}
+
+persist_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  fi
+}
+
+xray_bin() {
+  local bin
+  for bin in /usr/local/bin/xray /usr/bin/xray "$(command -v xray 2>/dev/null || true)"; do
+    if [[ -n "${bin}" && -x "${bin}" ]]; then
+      echo "${bin}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Xray menentukan format config dari ekstensi file, jadi file uji wajib
+# berakhiran .json (tanpa itu "run -test" selalu gagal).
+xray_supports_xhttp() {
+  local bin dir ok=1
+  bin="$(xray_bin)" || return 1
+  dir="$(mktemp -d /tmp/sc-xhttp-test.XXXXXX)"
+  printf '%s\n' '{"inbounds":[{"listen":"127.0.0.1","port":12002,"protocol":"vless","settings":{"clients":[{"id":"00000000-0000-4000-8000-000000000000"}],"decryption":"none"},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/xhvless","scMaxBufferedPosts":16}}}],"outbounds":[{"protocol":"freedom"}]}' > "${dir}/config.json"
+  if "${bin}" run -test -config "${dir}/config.json" >/dev/null 2>&1; then ok=0; fi
+  rm -rf "${dir}"
+  return "${ok}"
+}
+
+xhttp_in_config() {
+  [[ -r "${XRAY_CONF}" ]] && grep -qF '"vless-xhttp"' "${XRAY_CONF}"
+}
+
+# XHTTP mengubah daftar inbound dan Xray tidak punya reload. Restart API
+# membaca .env baru, lalu sinkronisasi saat start merender config dan
+# me-restart Xray sekali. Ditunggu sampai Xray benar-benar memuatnya.
+reload_xray_structure() {
+  local want="$1" i
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || return 1
+  for i in $(seq 1 45); do
+    sleep 1
+    systemctl is-active --quiet xray 2>/dev/null || continue
+    tcp_listening 10001 || continue
+    if [[ "${want}" == "1" ]]; then
+      if xhttp_in_config && tcp_listening 12002; then return 0; fi
+    else
+      if ! xhttp_in_config && ! tcp_listening 12002; then return 0; fi
+    fi
+  done
+  return 1
+}
+
+set_xhttp() {
+  local value="$1" previous="$2"
+  if [[ "${value}" == "${previous}" ]]; then
+    echo "XHTTP sudah $([[ "${value}" == "1" ]] && echo ON || echo OFF)."
+    return 0
+  fi
+  if [[ "${value}" == "1" ]] && ! xray_supports_xhttp; then
+    die "binary Xray belum mendukung XHTTP (xray run -test menolak config); update Xray dulu"
+  fi
+  write_flag XRAY_XHTTP_ENABLE "${value}"
+  if reload_xray_structure "${value}"; then
+    echo "XHTTP sekarang $([[ "${value}" == "1" ]] && echo ON || echo OFF)."
+    return 0
+  fi
+  write_flag XRAY_XHTTP_ENABLE "${previous}"
+  reload_xray_structure "${previous}" || true
+  die "Xray tidak sehat setelah XHTTP diubah; pengaturan dikembalikan ke semula"
+}
+
+cmd_set() {
+  local svc="${1:-}" want="${2:-}" key value previous
+  key="$(service_key "${svc}")" || die "layanan tidak dikenal: ${svc:-kosong} (pilih: ${SERVICES[*]})"
+  case "$(printf '%s' "${want}" | tr '[:upper:]' '[:lower:]')" in
+    on|1|enable) value="1" ;;
+    off|0|disable) value="0" ;;
+    *) die "status harus on atau off" ;;
+  esac
+  if service_enabled "${svc}"; then previous="1"; else previous="0"; fi
+  if [[ "${svc}" == "xhttp" ]]; then
+    set_xhttp "${value}" "${previous}"
+    return 0
+  fi
+  if [[ "${value}" == "0" ]] && ! command -v iptables >/dev/null 2>&1; then
+    die "iptables tidak tersedia, layanan tidak bisa ditutup"
+  fi
+  write_flag "${key}" "${value}"
+  if ! cmd_apply; then
+    write_flag "${key}" "${previous}"
+    cmd_apply || true
+    die "rule iptables gagal dipasang; status ${svc} dikembalikan"
+  fi
+  persist_rules
+  echo "Layanan ${svc} sekarang $([[ "${value}" == "1" ]] && echo ON || echo OFF)."
+}
+
+# Satu baris per layanan: "<nama> <ON|OFF> <detail>". Detail untuk layanan
+# OFF: TERPASANG/BELUM (rule benar-benar aktif); untuk xhttp: INBOUND/-.
+cmd_status() {
+  local svc state detail rules parent chain
+  rules=""
+  if command -v iptables >/dev/null 2>&1; then
+    rules="$(iptables -w 10 -S 2>/dev/null || true)"
+  fi
+  for svc in "${SERVICES[@]}"; do
+    if service_enabled "${svc}"; then state="ON"; else state="OFF"; fi
+    detail="-"
+    if [[ "${svc}" == "xhttp" ]]; then
+      if xhttp_in_config; then detail="INBOUND"; fi
+    elif [[ "${state}" == "OFF" ]]; then
+      if [[ "${svc}" == "udp" ]]; then parent="INPUT"; chain="${CHAIN_IN}"; else parent="OUTPUT"; chain="${CHAIN_OUT}"; fi
+      if [[ "${rules}" == *"sc-svc-${svc}"* && "${rules}" == *"-A ${parent} -j ${chain}"* ]]; then
+        detail="TERPASANG"
+      else
+        detail="BELUM"
+      fi
+    fi
+    printf '%s %s %s\n' "${svc}" "${state}" "${detail}"
+  done
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  apply) acquire_lock; cmd_apply ;;
+  set) acquire_lock; cmd_set "${2:-}" "${3:-}" ;;
+  *)
+    echo "Usage: sc-1forcr-service-gate {status|apply|set <ssh|vmess|vless|trojan|udp|xhttp> <on|off>}"
+    exit 1
+    ;;
+esac
+SERVICE_GATE_EOF
+  bash -n /usr/local/sbin/sc-1forcr-service-gate
+  chmod 700 /usr/local/sbin/sc-1forcr-service-gate
+}
+
+# Status ON/OFF layanan disimpan di env, gerbangnya di iptables. Dipanggil di
+# akhir install/update (setelah guard lain menyisipkan rule di puncak INPUT)
+# dan tiap siklus watchdog. Gagal di sini tidak memutus layanan, jadi hanya
+# dicatat; watchdog mencoba lagi.
+apply_service_gates() {
+  if [[ ! -x /usr/local/sbin/sc-1forcr-service-gate ]]; then
+    install_service_gate_manager
+  fi
+  if ! /usr/local/sbin/sc-1forcr-service-gate apply; then
+    log "PERINGATAN: status ON/OFF layanan belum bisa diterapkan; watchdog akan mencoba lagi."
+  fi
+  return 0
+}
+
 write_cli_menu() {
   local menu_runtime menu_runtime_tmp menu_wrapper_tmp update_cmd_tmp
   menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
 
   log "Menulis CLI menu..."
   install_xray_realip_manager
+  install_service_gate_manager
 
   cat > /etc/sc-1forcr.env <<EOF
 SCRIPT_VERSION=${SCRIPT_VERSION}
@@ -19140,6 +19860,12 @@ XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
+XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
+SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
+SERVICE_VMESS_ENABLE=${SERVICE_VMESS_ENABLE}
+SERVICE_VLESS_ENABLE=${SERVICE_VLESS_ENABLE}
+SERVICE_TROJAN_ENABLE=${SERVICE_TROJAN_ENABLE}
+SERVICE_UDP_ENABLE=${SERVICE_UDP_ENABLE}
 XRAY_LIVE_IP_TTL_SECONDS=${XRAY_LIVE_IP_TTL_SECONDS}
 XRAY_PATHS_VMESS=${XRAY_PATHS_VMESS}
 XRAY_PATHS_VLESS=${XRAY_PATHS_VLESS}
@@ -21162,7 +21888,7 @@ EOT_ZIVPN
       ;;
     vmess|vless|trojan)
       local title host user secret exp exp_time exp_text quota lim city isp domain sni tls none grpc any_port path_ws path_upgrade service_name
-      local linktls linknone linkgrpc linkuptls linkupntls
+      local linktls linknone linkgrpc linkuptls linkupntls linkxhttptls linkxhttpntls linkonering path_xhttp
       title="${type^^}"
       host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
       user="$(created_json_value "${raw}" '.data.username')"
@@ -21191,6 +21917,12 @@ EOT_ZIVPN
       linkgrpc="$(created_json_value "${raw}" '.data.link.grpc // .data.link.grpc_tls')"
       linkuptls="$(created_json_value "${raw}" '.data.link.uptls // .data.link.up_tls // .data.link.tls')"
       linkupntls="$(created_json_value "${raw}" '.data.link.upntls // .data.link.up_ntls // .data.link.none // .data.link.ntls')"
+      # Opsional: XHTTP hanya ada di VLESS saat inbound-nya aktif; OneRing untuk
+      # aplikasi 1FTunnel. Tidak ditampilkan kalau API tidak mengirimnya.
+      linkxhttptls="$(created_json_value "${raw}" '.data.link.xhttptls // .data.link.xhttp_tls' '')"
+      linkxhttpntls="$(created_json_value "${raw}" '.data.link.xhttpntls // .data.link.xhttp_ntls' '')"
+      linkonering="$(created_json_value "${raw}" '.data.link.onering' '')"
+      path_xhttp="$(created_json_value "${raw}" '.data.path.xhttp' '')"
       cat <<EOT_XRAY | ui_fx
 =============================
         ${title} ACCOUNT
@@ -21227,11 +21959,16 @@ SECURITY    : tls / none
 EOT_TROJAN_DETAIL
           ;;
       esac
-      cat <<EOT_XRAY_LINKS | ui_fx
+      cat <<EOT_XRAY_PATHS | ui_fx
 NETWORK     : ws, grpc, upgrade
 PATH WS     : ${path_ws}
 SERVICE     : ${service_name}
 PATH UPGRADE: ${path_upgrade}
+EOT_XRAY_PATHS
+      if [[ -n "${path_xhttp}" ]]; then
+        printf 'PATH XHTTP  : %s\n' "${path_xhttp}" | ui_fx
+      fi
+      cat <<EOT_XRAY_LINKS | ui_fx
 EXPIRED     : ${exp_text}
 QUOTA       : ${quota}
 IP LIMIT    : ${lim} pengguna
@@ -21253,6 +21990,23 @@ ${linkuptls}
 Up Non-TLS:
 ${linkupntls}
 EOT_XRAY_LINKS
+      if [[ -n "${linkxhttptls}" || -n "${linkxhttpntls}" ]]; then
+        cat <<EOT_XRAY_XHTTP | ui_fx
+
+XHTTP TLS:
+${linkxhttptls:--}
+
+XHTTP Non-TLS:
+${linkxhttpntls:--}
+EOT_XRAY_XHTTP
+      fi
+      if [[ -n "${linkonering}" ]]; then
+        cat <<EOT_XRAY_ONERING | ui_fx
+
+OneRing (1FTunnel):
+${linkonering}
+EOT_XRAY_ONERING
+      fi
       cat <<EOT_XRAY_FOOTER | ui_fx
 
 [ HOST INFORMATION ]
@@ -23976,7 +24730,7 @@ service_onoff() {
 }
 
 show_core_services_onoff() {
-  local udpcustom
+  local udpcustom svc state detail
   udpcustom="$(detect_udpcustom_service)"
   echo "Service status (ON/OFF):"
   echo "- ssh: $(service_onoff ssh)"
@@ -23988,6 +24742,15 @@ show_core_services_onoff() {
   echo "- sc-1forcr-sshws: $(service_onoff sc-1forcr-sshws)"
   echo "- ${ZIVPN_SERVICE}: $(service_onoff "${ZIVPN_SERVICE}")"
   echo "- ${udpcustom}: $(service_onoff "${udpcustom}")"
+  # Service systemd di atas bisa ON walau layanannya dimatikan admin.
+  if [[ -x "${SERVICE_GATE_BIN:-}" ]]; then
+    echo
+    echo "Layanan (menu ON/OFF LAYANAN):"
+    while read -r svc state detail; do
+      [[ -n "${svc}" ]] || continue
+      echo "- $(service_toggle_label "${svc}"): ${state}"
+    done < <("${SERVICE_GATE_BIN}" status 2>/dev/null || true)
+  fi
 }
 
 cleanup_zivpn_dnat_for_udphc() {
@@ -24483,8 +25246,161 @@ heal_sshws_xray_rules() {
     apply_sshws_loop_guard_rules
   fi
 
+  # Guard di atas menyisipkan rule ACCEPT di puncak INPUT; gerbang layanan
+  # yang OFF harus kembali ke atasnya.
+  if [[ -x "${SERVICE_GATE_BIN:-}" ]]; then
+    "${SERVICE_GATE_BIN}" apply || echo "Peringatan: status ON/OFF layanan belum bisa diterapkan ulang."
+  fi
+
   fw_persist_rules
   echo "Heal rule SSHWS+XRAY selesai."
+}
+
+# Menu ON/OFF LAYANAN. Layanan yang OFF ditolak di iptables oleh
+# sc-1forcr-service-gate; service systemd tetap jalan, jadi watchdog tidak
+# menyalakannya lagi dan protokol lain tidak ikut terputus.
+SERVICE_GATE_BIN="/usr/local/sbin/sc-1forcr-service-gate"
+SERVICE_TOGGLE_ORDER=(ssh vmess vless trojan udp xhttp)
+
+service_toggle_label() {
+  case "$1" in
+    ssh) echo "SSH WS/SSL/Dropbear" ;;
+    vmess) echo "VMess" ;;
+    vless) echo "VLESS" ;;
+    trojan) echo "Trojan" ;;
+    udp) echo "UDP ZIVPN/UDPHC" ;;
+    xhttp) echo "XHTTP VLESS" ;;
+  esac
+}
+
+# Satu baris panel: "N) Label ...... ON". OFF yang rule-nya belum terpasang
+# ditandai kuning supaya admin tahu layanan itu masih bisa diakses.
+service_toggle_item() {
+  local num="$1" svc="$2" state="$3" detail="$4" label color
+  label="$(service_toggle_label "${svc}")"
+  case "${state}" in
+    ON) color="${UI_OK}" ;;
+    *) color="${UI_BAD}" ;;
+  esac
+  if [[ "${state}" == "OFF" && "${detail}" == "BELUM" ]]; then
+    color="${UI_WARN}"
+    state="OFF*"
+  fi
+  printf '%s) %-20s %s%s%s' "${num}" "${label}" "${color}${UI_BOLD}" "${state}" "${UI_NC}"
+}
+
+service_toggle_explain() {
+  local svc="$1" want="$2" mem_mb
+  case "${svc}:${want}" in
+    ssh:off)
+      echo "Efek: SSH-WS, SSH SSL/CONNECT, dan Dropbear ditolak; sesi SSH aktif terputus."
+      echo "OpenSSH port 22 tetap terbuka untuk akses admin."
+      echo "Pembuatan akun SSH baru lewat API baru diblokir kalau UDP juga OFF (akun SSH dipakai login UDP)."
+      ;;
+    vmess:off|vless:off|trojan:off)
+      echo "Efek: sesi $(service_toggle_label "${svc}") aktif terputus dan akun baru ditolak API."
+      echo "Xray tidak direstart; protokol lain tetap jalan."
+      if [[ "${svc}" == "vless" ]]; then echo "XHTTP ikut tertutup karena memakai VLESS."; fi
+      ;;
+    udp:off)
+      echo "Efek: ZIVPN/UDP Custom berhenti menerima koneksi; sesi UDP aktif terputus."
+      ;;
+    xhttp:on|xhttp:off)
+      echo "Peringatan: Xray direstart sekali; semua sesi VMess/VLESS/Trojan reconnect."
+      echo "Kalau Xray gagal memuat config baru, pengaturan dikembalikan otomatis."
+      if [[ "${want}" == "on" ]]; then
+        mem_mb="$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null || echo 0)"
+        if [[ "${mem_mb:-0}" =~ ^[0-9]+$ ]] && (( mem_mb > 0 && mem_mb < 1800 )); then
+          echo "Peringatan: RAM VPS ${mem_mb} MB. XHTTP menambah pemakaian RAM Xray; disarankan untuk VPS 2 GB ke atas."
+        fi
+      fi
+      ;;
+    *:on)
+      echo "Efek: layanan dibuka lagi tanpa restart service."
+      ;;
+  esac
+}
+
+service_toggle_switch() {
+  local svc="$1" state="$2" want label confirm
+  label="$(service_toggle_label "${svc}")"
+  if [[ "${state}" == "ON" ]]; then want="off"; else want="on"; fi
+  echo "Layanan         : ${label}"
+  echo "Status sekarang : ${state}"
+  echo "Diubah menjadi  : ${want^^}"
+  echo
+  service_toggle_explain "${svc}" "${want}"
+  echo
+  prompt_input confirm "Lanjut ubah ${label} ke ${want^^}? [y/N]: " || return 0
+  if [[ ! "${confirm}" =~ ^[yY]$ ]]; then
+    echo "Dibatalkan."
+    return 0
+  fi
+  if [[ "${svc}" == "xhttp" ]]; then
+    echo "Menunggu Xray memuat config baru (maksimal sekitar 1 menit)..."
+  fi
+  if "${SERVICE_GATE_BIN}" set "${svc}" "${want}"; then
+    echo "Berhasil: ${label} sekarang ${want^^}."
+  else
+    echo "Gagal mengubah ${label}. Status lama dipertahankan."
+  fi
+  return 0
+}
+
+service_toggle_menu() {
+  local choice svc state detail n missing
+  local -A st=() dt=()
+  if [[ ! -x "${SERVICE_GATE_BIN}" ]]; then
+    echo "Gagal: ${SERVICE_GATE_BIN} belum terpasang. Jalankan update SC dulu."
+    return 0
+  fi
+  while true; do
+    st=(); dt=(); missing=0
+    while read -r svc state detail; do
+      [[ -n "${svc}" ]] || continue
+      st["${svc}"]="${state}"
+      dt["${svc}"]="${detail:--}"
+      if [[ "${state}" == "OFF" && "${detail}" == "BELUM" ]]; then missing=1; fi
+    done < <("${SERVICE_GATE_BIN}" status 2>/dev/null || true)
+    if [[ -z "${UI_MODE:-}" ]]; then ui_init; fi
+    clear
+    draw_menu_panel "ON/OFF LAYANAN" \
+      "$(service_toggle_item 1 ssh "${st[ssh]:-ON}" "${dt[ssh]:--}")" \
+      "$(service_toggle_item 2 vmess "${st[vmess]:-ON}" "${dt[vmess]:--}")" \
+      "$(service_toggle_item 3 vless "${st[vless]:-ON}" "${dt[vless]:--}")" \
+      "$(service_toggle_item 4 trojan "${st[trojan]:-ON}" "${dt[trojan]:--}")" \
+      "$(service_toggle_item 5 udp "${st[udp]:-ON}" "${dt[udp]:--}")" \
+      "$(service_toggle_item 6 xhttp "${st[xhttp]:-OFF}" "${dt[xhttp]:--}")" \
+      "7) Terapkan ulang (repair rule)" \
+      "0) Kembali"
+    if (( missing )); then
+      echo "Peringatan: layanan bertanda OFF* belum tertutup. Pilih 7 untuk memasang ulang rule."
+    fi
+    echo
+    if ! prompt_input choice "Pilih [0-7]: "; then
+      return 0
+    fi
+    clear
+    case "${choice}" in
+      1) service_toggle_switch ssh "${st[ssh]:-ON}" ;;
+      2) service_toggle_switch vmess "${st[vmess]:-ON}" ;;
+      3) service_toggle_switch vless "${st[vless]:-ON}" ;;
+      4) service_toggle_switch trojan "${st[trojan]:-ON}" ;;
+      5) service_toggle_switch udp "${st[udp]:-ON}" ;;
+      6) service_toggle_switch xhttp "${st[xhttp]:-OFF}" ;;
+      7)
+        if "${SERVICE_GATE_BIN}" apply; then
+          echo "Berhasil menerapkan ulang status ON/OFF layanan."
+        else
+          echo "Gagal menerapkan status ON/OFF layanan."
+        fi
+        ;;
+      0) return 0 ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    echo
+    menu_pause
+  done
 }
 
 service_menu() {
@@ -24837,6 +25753,71 @@ ${xray_proxy_realip_headers}
         proxy_buffering off;
     }
 
+    location /upvmess {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10004;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+${xray_proxy_realip_headers}
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
+    }
+
+    location /upvless {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10005;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+${xray_proxy_realip_headers}
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
+    }
+
+    location /uptrojan {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10006;
+        proxy_http_version 1.1;
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+${xray_proxy_realip_headers}
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
+    }
+
+    # XHTTP VLESS lewat HTTP/1.1: non-TLS port 80 dan TLS dengan ALPN http/1.1.
+    # Unduhan (GET panjang) dan unggahan (POST) harus mengalir tanpa buffer.
+    # Inbound hanya ada bila XRAY_XHTTP_ENABLE=1.
+    location /xhvless {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:12002;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+${xray_proxy_realip_headers}
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+    }
+
     location /vmess-grpc {
         access_log off;
         grpc_set_header Host \$host;
@@ -24960,6 +25941,16 @@ ${xray_grpc_realip_headers}
         grpc_read_timeout 3600s;
         grpc_send_timeout 3600s;
         grpc_pass grpc://127.0.0.1:11003;
+    }
+
+    # XHTTP VLESS (stream-up lewat H2). Inbound hanya ada bila XRAY_XHTTP_ENABLE=1.
+    location /xhvless {
+        access_log off;
+        grpc_set_header Host \$host;
+${xray_grpc_realip_headers}
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
+        grpc_pass grpc://127.0.0.1:12002;
     }
 
     location / {
@@ -25967,94 +26958,15 @@ draw_dashboard() {
   dashboard_collect
   dashboard_render
 }
-show_combined_online() {
-  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
-  mode="${1:-realtime}"
+
+# Pasangan "username ip" UDP Custom yang masih aktif dari journal: connected/
+# disconnected dipasangkan per src dan sesi lama kedaluwarsa (anti ghost
+# session). Dipakai layar SSH + UDP CUSTOM dan layar SEMUA AKUN ONLINE.
+collect_udphc_online_pairs() {
+  local mode="${1:-realtime}" out="$2" udpcustom udp_ttl
   udp_ttl="180"
   udpcustom="$(detect_udpcustom_service)"
-  hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
-  dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
-  dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
-  [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
-  [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
-
-  tmp_count="$(mktemp)"
-  tmp_status="$(mktemp)"
-  tmp_ssh_pid_ip="$(mktemp)"
-  tmp_pid_user="$(mktemp)"
-  tmp_ssh_pair="$(mktemp)"
-  tmp_ssh_count="$(mktemp)"
-  tmp_ssh_proc_count="$(mktemp)"
-  tmp_ssh_count_merged="$(mktemp)"
-  tmp_ssh_count_logs="$(mktemp)"
-  tmp_udp_pair="$(mktemp)"
-  tmp_udp_count="$(mktemp)"
-  tmp_db_ports="$(mktemp)"
-  tmp_db_recent="$(mktemp)"
-  tmp_db_recent_loose="$(mktemp)"
-  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_ssh_pair:-}" "${tmp_ssh_count:-}" "${tmp_ssh_proc_count:-}" "${tmp_ssh_count_merged:-}" "${tmp_ssh_count_logs:-}" "${tmp_udp_pair:-}" "${tmp_udp_count:-}" "${tmp_db_ports:-}" "${tmp_db_recent:-}" "${tmp_db_recent_loose:-}"' RETURN
-
-  # SSH realtime: map pid->user dan pid->remote_ip, lalu pisahkan dari pasangan user+ip UDPHC aktif.
-  : > "${tmp_ssh_pair}"
-  : > "${tmp_ssh_count}"
-  ss -Htnp state established 2>/dev/null | awk '
-    {
-      l=$3;
-      r=$4;
-      if (l !~ /:[0-9]+$/ || r !~ /:[0-9]+$/) { l=$4; r=$5; }
-      if (l ~ /:22$/ || l ~ /:'"${dropbear_main_port}"'$/ || l ~ /:'"${dropbear_alt_port}"'$/) {
-        ip=r;
-        gsub(/^\[/, "", ip);
-        gsub(/\]$/, "", ip);
-        sub(/:[0-9]+$/, "", ip);
-        if (ip == "") next;
-        s=$0;
-        while (match(s, /pid=[0-9]+/)) {
-          pid=substr(s, RSTART + 4, RLENGTH - 4);
-          if (pid ~ /^[0-9]+$/) print pid, ip;
-          s=substr(s, RSTART + RLENGTH);
-        }
-      }
-    }' | sort -u > "${tmp_ssh_pid_ip}" || true
-
-  if [[ -s "${tmp_ssh_pid_ip}" ]]; then
-    local pid_csv
-    pid_csv="$(awk '{print $1}' "${tmp_ssh_pid_ip}" | sort -u | paste -sd, -)"
-    ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
-      {
-        pid=$1;
-        $1="";
-        sub(/^[[:space:]]+/, "", $0);
-        u="";
-        if ($0 ~ /^sshd:/) {
-          u=$0;
-          sub(/^sshd:[[:space:]]*/, "", u);
-          sub(/[[:space:]].*$/, "", u);
-          sub(/@.*$/, "", u);
-          sub(/\[.*$/, "", u);
-        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
-          u=$0;
-          if (u !~ /\[[^]]+\]/) next;
-          sub(/^.*\[/, "", u);
-          sub(/\].*$/, "", u);
-        } else next;
-        u=tolower(u);
-        if (u !~ /^[a-z0-9._-]+$/) next;
-        if (u == "root" || u == "priv" || u == "net") next;
-        print pid, u;
-      }' > "${tmp_pid_user}" || true
-
-    awk '
-      NR==FNR { u[$1]=$2; next }
-      {
-        pid=$1; ip=$2; user=(pid in u ? u[pid] : "");
-        if (user != "" && ip != "") print user, ip;
-      }' "${tmp_pid_user}" "${tmp_ssh_pid_ip}" | sort -u > "${tmp_ssh_pair}" || true
-  fi
-
-  # UDP Custom: pair connected/disconnected by src, lalu expire sesi lama (anti ghost session).
-  : > "${tmp_udp_pair}"
-  : > "${tmp_udp_count}"
+  : > "${out}"
   if [[ "${mode}" == "history" ]]; then
     udp_ttl="43200"
     journalctl -u "${udpcustom}" -n "${UDPHC_LOG_LINES_HISTORY}" -o short-unix --no-pager 2>/dev/null
@@ -26165,7 +27077,95 @@ show_combined_online() {
         u=a[1]; ip=a[2];
         if (u != "" && ip != "") print u, ip;
       }
-    }' > "${tmp_udp_pair}" || true
+    }' > "${out}" || true
+}
+
+show_combined_online() {
+  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose dropbear_main_port dropbear_alt_port hc_auth_lookback_h
+  mode="${1:-realtime}"
+  hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
+  dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+  dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
+  [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
+
+  tmp_count="$(mktemp)"
+  tmp_status="$(mktemp)"
+  tmp_ssh_pid_ip="$(mktemp)"
+  tmp_pid_user="$(mktemp)"
+  tmp_ssh_pair="$(mktemp)"
+  tmp_ssh_count="$(mktemp)"
+  tmp_ssh_proc_count="$(mktemp)"
+  tmp_ssh_count_merged="$(mktemp)"
+  tmp_ssh_count_logs="$(mktemp)"
+  tmp_udp_pair="$(mktemp)"
+  tmp_udp_count="$(mktemp)"
+  tmp_db_ports="$(mktemp)"
+  tmp_db_recent="$(mktemp)"
+  tmp_db_recent_loose="$(mktemp)"
+  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_ssh_pair:-}" "${tmp_ssh_count:-}" "${tmp_ssh_proc_count:-}" "${tmp_ssh_count_merged:-}" "${tmp_ssh_count_logs:-}" "${tmp_udp_pair:-}" "${tmp_udp_count:-}" "${tmp_db_ports:-}" "${tmp_db_recent:-}" "${tmp_db_recent_loose:-}"' RETURN
+
+  # SSH realtime: map pid->user dan pid->remote_ip, lalu pisahkan dari pasangan user+ip UDPHC aktif.
+  : > "${tmp_ssh_pair}"
+  : > "${tmp_ssh_count}"
+  ss -Htnp state established 2>/dev/null | awk '
+    {
+      l=$3;
+      r=$4;
+      if (l !~ /:[0-9]+$/ || r !~ /:[0-9]+$/) { l=$4; r=$5; }
+      if (l ~ /:22$/ || l ~ /:'"${dropbear_main_port}"'$/ || l ~ /:'"${dropbear_alt_port}"'$/) {
+        ip=r;
+        gsub(/^\[/, "", ip);
+        gsub(/\]$/, "", ip);
+        sub(/:[0-9]+$/, "", ip);
+        if (ip == "") next;
+        s=$0;
+        while (match(s, /pid=[0-9]+/)) {
+          pid=substr(s, RSTART + 4, RLENGTH - 4);
+          if (pid ~ /^[0-9]+$/) print pid, ip;
+          s=substr(s, RSTART + RLENGTH);
+        }
+      }
+    }' | sort -u > "${tmp_ssh_pid_ip}" || true
+
+  if [[ -s "${tmp_ssh_pid_ip}" ]]; then
+    local pid_csv
+    pid_csv="$(awk '{print $1}' "${tmp_ssh_pid_ip}" | sort -u | paste -sd, -)"
+    ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
+      {
+        pid=$1;
+        $1="";
+        sub(/^[[:space:]]+/, "", $0);
+        u="";
+        if ($0 ~ /^sshd:/) {
+          u=$0;
+          sub(/^sshd:[[:space:]]*/, "", u);
+          sub(/[[:space:]].*$/, "", u);
+          sub(/@.*$/, "", u);
+          sub(/\[.*$/, "", u);
+        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+          u=$0;
+          if (u !~ /\[[^]]+\]/) next;
+          sub(/^.*\[/, "", u);
+          sub(/\].*$/, "", u);
+        } else next;
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/) next;
+        if (u == "root" || u == "priv" || u == "net") next;
+        print pid, u;
+      }' > "${tmp_pid_user}" || true
+
+    awk '
+      NR==FNR { u[$1]=$2; next }
+      {
+        pid=$1; ip=$2; user=(pid in u ? u[pid] : "");
+        if (user != "" && ip != "") print user, ip;
+      }' "${tmp_pid_user}" "${tmp_ssh_pid_ip}" | sort -u > "${tmp_ssh_pair}" || true
+  fi
+
+  # UDP Custom: pair connected/disconnected by src, lalu expire sesi lama (anti ghost session).
+  : > "${tmp_udp_count}"
+  collect_udphc_online_pairs "${mode}" "${tmp_udp_pair}"
 
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_udp_pair}" > "${tmp_udp_count}" || true
 
@@ -26507,7 +27507,12 @@ show_ssh_online_history() {
   show_combined_online "history"
 }
 
-show_ssh_only_online() {
+# Data monitor SSH, dipakai layar SSH dan layar SEMUA AKUN ONLINE supaya
+# angkanya selalu sama. Menulis "username|status|limit_ip|sesi|ip_aktif" ke $1
+# dan mengisi SSH_ONLINE_SOURCE_MODE.
+SSH_ONLINE_SOURCE_MODE=""
+collect_ssh_online_rows() {
+  local out="$1"
   local tmp_status tmp_ip_count tmp_verified_ip_count tmp_db_ports tmp_proc_count tmp_db_pids
   local dropbear_main_port dropbear_alt_port db_recent_log_max hc_auth_lookback_h source_mode ssh_tracker_ready
   tmp_status="$(mktemp)"
@@ -26752,17 +27757,11 @@ show_ssh_only_online() {
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
-  draw_menu_header "SSH USER LOGIN (${source_mode})"
+  SSH_ONLINE_SOURCE_MODE="${source_mode}"
+  : > "${out}"
   if [[ ! -s "${tmp_ip_count}" ]]; then
-    echo "Tidak ada user SSH yang sedang online."
-    echo
-    echo "Total User SSH : 0"
-    echo "Total Sesi SSH : 0"
-    return
+    return 0
   fi
-
-  printf "%-24s %-12s %-10s %-13s %-10s\n" "USERNAME" "STATUS" "LIMIT_IP" "SESI_AKTIF" "IP_AKTIF"
-  printf "%-24s %-12s %-10s %-13s %-10s\n" "------------------------" "------------" "----------" "-------------" "----------"
   awk '
     FILENAME==ARGV[1] {
       split($0,a,/\|/);
@@ -26789,14 +27788,41 @@ show_ssh_only_online() {
       else if (l > 0 && ipn > l) out="MULTI_LOGIN";
       else if (ipn > 0) out="AMAN";
       else out="ONLINE";
-      printf "%-24s %-12s %-10d %-13d %-10d\n", u, out, l, n, ipn;
-      total_user++; total_session+=n; total_ip+=ipn;
+      printf "%s|%s|%d|%d|%d\n", u, out, l, n, ipn;
       }
+    }' "${tmp_status}" "${tmp_ip_count}" "${tmp_verified_ip_count}" > "${out}"
+}
+
+show_ssh_only_online() {
+  local rows
+  rows="$(mktemp)"
+  collect_ssh_online_rows "${rows}"
+  # Dipasang setelah collector: trap RETURN milik collector menimpa trap yang
+  # dipasang sebelumnya, sehingga file ini tidak pernah dihapus.
+  trap 'rm -f "${rows:-}"' RETURN
+
+  draw_menu_header "SSH USER LOGIN (${SSH_ONLINE_SOURCE_MODE})"
+  if [[ ! -s "${rows}" ]]; then
+    echo "Tidak ada user SSH yang sedang online."
+    echo
+    echo "Total User SSH : 0"
+    echo "Total Sesi SSH : 0"
+    return
+  fi
+
+  printf "%-24s %-12s %-10s %-13s %-10s\n" "USERNAME" "STATUS" "LIMIT_IP" "SESI_AKTIF" "IP_AKTIF"
+  printf "%-24s %-12s %-10s %-13s %-10s\n" "------------------------" "------------" "----------" "-------------" "----------"
+  awk -F'|' '
+    {
+      printf "%-24s %-12s %-10d %-13d %-10d\n", $1, $2, $3, $4, $5;
+      total_user++; total_session+=$4; total_ip+=$5;
+    }
+    END {
       print "";
       printf "Total User SSH : %d\n", total_user + 0;
       printf "Total Sesi SSH : %d\n", total_session + 0;
       printf "Total IP Aktif : %d\n", total_ip + 0;
-    }' "${tmp_status}" "${tmp_ip_count}" "${tmp_verified_ip_count}"
+    }' "${rows}"
 }
 
 xray_log_snapshot() {
@@ -26976,13 +28002,117 @@ merge_xray_observations() {
 }
 
 show_xray_online_by_table() {
-  local table="$1" label="$2" mode="${3:-normal}"
-  local t_users t_seen t_tracker t_log protocol source_mode tracker_ready
+  local table="$1" label="$2" mode="${3:-normal}" rows rc=0
+  rows="$(mktemp)"
+  collect_xray_online_rows "${table}" "${label}" "${mode}" "${rows}" || rc=$?
+  # Dipasang setelah collector supaya tidak tertimpa trap RETURN miliknya.
+  trap 'rm -f "${rows:-}"' RETURN
+  if [[ "${rc}" == "2" ]]; then
+    draw_menu_header "${label} ONLINE"
+    echo "Tidak ada akun ${label} di DB."
+    return
+  fi
+
+  draw_menu_header "${label} USER LOGIN (${XRAY_ONLINE_SOURCE_MODE})"
+  if [[ "${XRAY_ONLINE_OBSERVED}" != "1" ]]; then
+    echo "Tidak ada sesi ${label} yang sedang aktif."
+    echo
+    echo "Total User ${label} : 0"
+    echo "Total Socket ${label} : 0"
+    echo "Total Jaringan Aktif/Estimasi ${label} : 0"
+    echo "Total IP Recent ${label} : 0"
+    return
+  fi
+
+  printf "%-20s %-10s %-8s %-11s %-12s %-10s %-10s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "MODE" "SOCKET_AKTIF" "NET_AKTIF" "IP_RECENT" "LAST_IP"
+  printf "%-20s %-10s %-8s %-11s %-12s %-10s %-10s %-22s\n" "--------------------" "----------" "--------" "-----------" "------------" "----------" "----------" "----------------------"
+  awk -F'|' '
+    {
+      printf "%-20s %-10s %-8d %-11s %-12d %-10d %-10d %-22s\n", $1, $2, $3, $4, $5, $6, $7, $8;
+      total_user++;
+      total_socket+=$5;
+      total_ip+=$6;
+      total_recent+=$7;
+    }
+    END {
+      print "";
+      printf "Total User : %d\n", total_user + 0;
+      printf "Total Socket Aktif : %d\n", total_socket + 0;
+      printf "Total Jaringan Aktif/Estimasi : %d\n", total_ip + 0;
+      printf "Total IP Recent : %d\n", total_recent + 0;
+    }' "${rows}"
+  echo
+  echo "Catatan: SOCKET_AKTIF bukan jumlah perangkat/orang."
+  echo "ONLINE berarti ada socket hidup atau autentikasi akun dalam ${xray_active_window_sec} detik terakhir."
+  echo "RECENT berarti akun terlihat di log, tetapi tidak ada bukti sesi hidup saat diperiksa."
+  echo "NET_AKTIF adalah estimasi jaringan overlap; IPv4/IPv6 dual-stack dan IP satu operator digabung."
+  echo "IP_RECENT adalah jumlah IP mentah dalam window aktif dan bukan jumlah perangkat."
+  echo "MODE LEGACY memakai satu credential bersama; jumlah perangkat tidak bisa dipastikan dari IP saja."
+}
+
+# Output mentah tracker Xray (semua protokol) ke $1. Baris pertama berisi
+# format (rows-v3/rows-v2) dan hasil pemanggilan (ok/failed). Baris dari
+# tracker yang gagal tetap disimpan, sama seperti dulu saat tracker dipanggil
+# langsung per protokol. Tidak menulis apa pun kalau tracker tidak terpasang.
+xray_live_rows_raw() {
+  local dst="$1" fmt="rows-v2" rows="" state="ok"
+  [[ -x /usr/local/sbin/sc-1forcr-xray-live ]] || return 1
+  if /usr/local/sbin/sc-1forcr-xray-live capabilities 2>/dev/null | grep -qx 'rows-v3'; then
+    fmt="rows-v3"
+  fi
+  rows="$(/usr/local/sbin/sc-1forcr-xray-live "${fmt}" 2>/dev/null)" || state="failed"
+  printf '%s %s\n%s\n' "${fmt}" "${state}" "${rows}" > "${dst}"
+  if [[ "${state}" == "ok" ]]; then return 0; fi
+  return 1
+}
+
+# Baris tracker satu protokol dari output xray_live_rows_raw, dalam format
+# yang dibaca merge_xray_observations. Return 0 hanya kalau tracker berhasil.
+xray_tracker_rows_for_protocol() {
+  local raw="$1" protocol="$2" dst="$3" fmt="" state=""
+  : > "${dst}"
+  [[ -s "${raw}" ]] || return 1
+  read -r fmt state < "${raw}" || true
+  if [[ "${fmt}" == "rows-v3" ]]; then
+    tail -n +2 "${raw}" | awk -F'|' -v proto="${protocol}" '
+      $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {
+        print $2 "|" $3 "|" $4 "|" $5 "|" ($6!="" ? $6 : "TIDAK_TERDETEKSI") "|" ($7!="" ? $7 : "PROXY_LOCAL");
+      }
+    ' > "${dst}"
+  else
+    tail -n +2 "${raw}" | awk -F'|' -v proto="${protocol}" '
+      $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
+        active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);
+        print $2 "|" $3 "|" active "|" $4 "|" ($5!="" ? $5 : "TIDAK_TERDETEKSI") "|" ($6!="" ? $6 : "PROXY_LOCAL");
+      }
+    ' > "${dst}"
+  fi
+  if [[ "${state}" == "ok" ]]; then return 0; fi
+  return 1
+}
+
+# Data monitor VMESS/VLESS/TROJAN, dipakai layar per protokol dan layar SEMUA
+# AKUN ONLINE. Menulis "username|status|limit_ip|mode|socket|net|ip_recent|last_ip"
+# ke $4, mengisi XRAY_ONLINE_SOURCE_MODE dan XRAY_ONLINE_OBSERVED (1 kalau
+# tracker/log melihat sesi). Return 2 kalau tabel akun kosong.
+# $5/$6 opsional: output xray_live_rows_raw dan xray_log_snapshot yang sudah
+# diambil pemanggil. Kalau diisi, collector tidak mengambil sendiri (file $5
+# yang tidak ada berarti tracker tidak tersedia), jadi layar SEMUA AKUN cukup
+# memanggil tracker dan membaca log sekali untuk tiga protokol.
+XRAY_ONLINE_SOURCE_MODE=""
+XRAY_ONLINE_OBSERVED="0"
+collect_xray_online_rows() {
+  local table="$1" label="$2" mode="${3:-normal}" out="$4" tracker_cache="${5:-}" log_cache="${6:-}"
+  local t_users t_seen t_tracker t_log t_raw protocol source_mode tracker_ready
   t_users="$(mktemp)"
   t_seen="$(mktemp)"
   t_tracker="$(mktemp)"
   t_log="$(mktemp)"
-  trap 'rm -f "${t_users:-}" "${t_seen:-}" "${t_tracker:-}" "${t_log:-}"' RETURN
+  t_raw="$(mktemp)"
+  trap 'rm -f "${t_users:-}" "${t_seen:-}" "${t_tracker:-}" "${t_log:-}" "${t_raw:-}"' RETURN
+  : > "${out}"
+  XRAY_ONLINE_SOURCE_MODE=""
+  XRAY_ONLINE_OBSERVED="0"
 
   case "${table}" in
     account_vmesses) protocol="vmess" ;;
@@ -27002,32 +28132,26 @@ show_xray_online_by_table() {
     FROM ${table} a ORDER BY LOWER(a.username);
   " > "${t_users}" 2>/dev/null || true
   if [[ ! -s "${t_users}" ]]; then
-    draw_menu_header "${label} ONLINE"
-    echo "Tidak ada akun ${label} di DB."
-    return
+    return 2
   fi
 
   source_mode="LOG_WINDOW_FALLBACK"
   tracker_ready="0"
-  if [[ -n "${protocol}" && -x /usr/local/sbin/sc-1forcr-xray-live ]]; then
-    if /usr/local/sbin/sc-1forcr-xray-live capabilities 2>/dev/null | grep -qx 'rows-v3'; then
-      if /usr/local/sbin/sc-1forcr-xray-live rows-v3 2>/dev/null | awk -F'|' -v proto="${protocol}" '
-        $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {
-          print $2 "|" $3 "|" $4 "|" $5 "|" ($6!="" ? $6 : "TIDAK_TERDETEKSI") "|" ($7!="" ? $7 : "PROXY_LOCAL");
-        }
-      ' > "${t_tracker}"; then
-        tracker_ready="1"
-      fi
-    elif /usr/local/sbin/sc-1forcr-xray-live rows-v2 2>/dev/null | awk -F'|' -v proto="${protocol}" '
-        $1==proto && $2 ~ /^[a-z0-9._-]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ {
-          active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);
-          print $2 "|" $3 "|" active "|" $4 "|" ($5!="" ? $5 : "TIDAK_TERDETEKSI") "|" ($6!="" ? $6 : "PROXY_LOCAL");
-        }
-      ' > "${t_tracker}"; then
-        tracker_ready="1"
+  if [[ -n "${protocol}" ]]; then
+    if [[ -n "${tracker_cache}" ]]; then
+      cp -f "${tracker_cache}" "${t_raw}" 2>/dev/null || : > "${t_raw}"
+    else
+      xray_live_rows_raw "${t_raw}" || true
+    fi
+    if xray_tracker_rows_for_protocol "${t_raw}" "${protocol}" "${t_tracker}"; then
+      tracker_ready="1"
     fi
   fi
-  xray_log_snapshot "${t_log}" "${mode}"
+  if [[ -n "${log_cache}" ]]; then
+    cp -f "${log_cache}" "${t_log}" 2>/dev/null || : > "${t_log}"
+  else
+    xray_log_snapshot "${t_log}" "${mode}"
+  fi
   merge_xray_observations "${t_tracker}" "${t_log}" "${t_seen}"
   if [[ -s "${t_tracker}" && -s "${t_log}" ]]; then
     source_mode="SOCKET+AUTH_LOG"
@@ -27038,20 +28162,12 @@ show_xray_online_by_table() {
   elif [[ "${tracker_ready}" == "1" ]]; then
     source_mode="REALTIME_SOCKET"
   fi
-
-  draw_menu_header "${label} USER LOGIN (${source_mode})"
+  XRAY_ONLINE_SOURCE_MODE="${source_mode}"
   if [[ ! -s "${t_seen}" ]]; then
-    echo "Tidak ada sesi ${label} yang sedang aktif."
-    echo
-    echo "Total User ${label} : 0"
-    echo "Total Socket ${label} : 0"
-    echo "Total Jaringan Aktif/Estimasi ${label} : 0"
-    echo "Total IP Recent ${label} : 0"
-    return
+    return 0
   fi
+  XRAY_ONLINE_OBSERVED="1"
 
-  printf "%-20s %-10s %-8s %-11s %-12s %-10s %-10s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "MODE" "SOCKET_AKTIF" "NET_AKTIF" "IP_RECENT" "LAST_IP"
-  printf "%-20s %-10s %-8s %-11s %-12s %-10s %-10s %-22s\n" "--------------------" "----------" "--------" "-----------" "------------" "----------" "----------" "----------------------"
   awk -F'|' '
     NR==FNR {
       db_status[$1]=$2;
@@ -27075,26 +28191,8 @@ show_xray_online_by_table() {
       else if (visibility ~ /RECENT/) out="RECENT";
       else out="OFFLINE";
       if (recent <= 0 || visibility=="PROXY_LOCAL" || lip=="" || lip=="-") lip="TIDAK_TERDETEKSI";
-      printf "%-20s %-10s %-8d %-11s %-12d %-10d %-10d %-22s\n", u, out, l, cm, sockets, ipc, recent, lip;
-      total_user++;
-      total_socket+=sockets;
-      total_ip+=ipc;
-      total_recent+=recent;
-    }
-    END {
-      print "";
-      printf "Total User : %d\n", total_user + 0;
-      printf "Total Socket Aktif : %d\n", total_socket + 0;
-      printf "Total Jaringan Aktif/Estimasi : %d\n", total_ip + 0;
-      printf "Total IP Recent : %d\n", total_recent + 0;
-    }' "${t_users}" "${t_seen}"
-  echo
-  echo "Catatan: SOCKET_AKTIF bukan jumlah perangkat/orang."
-  echo "ONLINE berarti ada socket hidup atau autentikasi akun dalam ${xray_active_window_sec} detik terakhir."
-  echo "RECENT berarti akun terlihat di log, tetapi tidak ada bukti sesi hidup saat diperiksa."
-  echo "NET_AKTIF adalah estimasi jaringan overlap; IPv4/IPv6 dual-stack dan IP satu operator digabung."
-  echo "IP_RECENT adalah jumlah IP mentah dalam window aktif dan bukan jumlah perangkat."
-  echo "MODE LEGACY memakai satu credential bersama; jumlah perangkat tidak bisa dipastikan dari IP saja."
+      printf "%s|%s|%d|%s|%d|%d|%d|%s\n", u, out, l, cm, sockets, ipc, recent, lip;
+    }' "${t_users}" "${t_seen}" > "${out}"
 }
 
 show_xray_online_realtime_by_table() {
@@ -27186,32 +28284,28 @@ refresh_zivpn_live_from_api_log_menu() {
     done
 }
 
-show_zivpn_online() {
-  local win handoff_grace has_live_table
+# Jendela aktif dan toleransi handoff monitor ZIVPN, dipakai layar ZIVPN dan
+# layar SEMUA AKUN ONLINE.
+ZIVPN_MONITOR_WIN="90"
+ZIVPN_MONITOR_GRACE="20"
+zivpn_online_windows() {
+  local win handoff_grace
   win="$(echo "${ZIVPN_ACTIVE_WINDOW_SECONDS:-90}" | tr -cd '0-9')"
   [[ -z "${win}" || "${win}" -lt 20 ]] && win="90"
   [[ "${win}" -gt 1800 ]] && win="1800"
   handoff_grace="$(echo "${ZIVPN_HANDOFF_GRACE_SECONDS:-90}" | tr -cd '0-9')"
   [[ -z "${handoff_grace}" || "${handoff_grace}" -lt 3 ]] && handoff_grace="20"
   [[ "${handoff_grace}" -gt 120 ]] && handoff_grace="120"
+  ZIVPN_MONITOR_WIN="${win}"
+  ZIVPN_MONITOR_GRACE="${handoff_grace}"
+}
 
-  draw_menu_header "ZIVPN ONLINE (LIVE DB)"
-  echo "Jendela aktif: ${win} detik"
-  echo "Toleransi handoff: ${handoff_grace} detik"
-  if [[ ! -f "${DB_PATH}" ]]; then
-    echo "DB tidak ditemukan: ${DB_PATH}"
-    return
-  fi
-
-  has_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
-  if [[ "${has_live_table}" != "1" ]]; then
-    echo "Tabel zivpn_live_sessions belum ada."
-    echo "Jalankan update script terbaru lalu restart: sc-1forcr-api dan sc-1forcr-iplimit.service"
-    return
-  fi
-  refresh_zivpn_live_from_api_log_menu
-
-  sqlite3 -header -column "${DB_PATH}" "
+# Query akun ZIVPN yang aktif: username, status, limit_ip, terhubung_ip,
+# last_seen, ip_list. Layar ZIVPN menampilkannya per kolom, layar SEMUA AKUN
+# membacanya sebagai baris "|".
+zivpn_online_sql() {
+  local win="$1" handoff_grace="$2"
+  printf '%s\n' "
     WITH active AS (
       SELECT LOWER(username) AS username, ip, last_seen
       FROM zivpn_live_sessions
@@ -27263,7 +28357,32 @@ show_zivpn_online() {
     JOIN account_sshs s ON LOWER(s.username) = n.username
     WHERE UPPER(TRIM(COALESCE(s.status,'')))='AKTIF'
     ORDER BY n.last_seen DESC, n.username ASC;
-  " || true
+  "
+}
+
+show_zivpn_online() {
+  local win handoff_grace has_live_table
+  zivpn_online_windows
+  win="${ZIVPN_MONITOR_WIN}"
+  handoff_grace="${ZIVPN_MONITOR_GRACE}"
+
+  draw_menu_header "ZIVPN ONLINE (LIVE DB)"
+  echo "Jendela aktif: ${win} detik"
+  echo "Toleransi handoff: ${handoff_grace} detik"
+  if [[ ! -f "${DB_PATH}" ]]; then
+    echo "DB tidak ditemukan: ${DB_PATH}"
+    return
+  fi
+
+  has_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
+  if [[ "${has_live_table}" != "1" ]]; then
+    echo "Tabel zivpn_live_sessions belum ada."
+    echo "Jalankan update script terbaru lalu restart: sc-1forcr-api dan sc-1forcr-iplimit.service"
+    return
+  fi
+  refresh_zivpn_live_from_api_log_menu
+
+  sqlite3 -header -column "${DB_PATH}" "$(zivpn_online_sql "${win}" "${handoff_grace}")" || true
 
   echo
   sqlite3 -noheader "${DB_PATH}" "
@@ -27293,6 +28412,121 @@ show_zivpn_online() {
 
 show_zivpn_online_realtime() {
   ui_monitor show_zivpn_online
+}
+
+# Semua akun yang sedang online dalam satu tabel. Datanya dari collector yang
+# sama dengan layar per layanan, jadi angkanya selalu cocok. Tracker dan log
+# Xray diambil sekali untuk tiga protokol supaya ringan di VPS 1 GB.
+show_all_online() {
+  local work rows ssh_mode xray_mode tracker_fmt tracker_state spec table label order rc has_live_table
+  work="$(mktemp -d)"
+  rows="${work}/rows"
+  : > "${rows}"
+
+  # Baris: urutan|layanan|username|status|limit_ip|sesi|ip_aktif
+  # Urutan: 1 SSH, 2 UDP Custom, 3 ZIVPN, 4 VMESS, 5 VLESS, 6 TROJAN.
+  collect_ssh_online_rows "${work}/ssh"
+  ssh_mode="${SSH_ONLINE_SOURCE_MODE:--}"
+  awk -F'|' '$1 != "" { print "1|SSH|" $1 "|" $2 "|" $3 "|" $4 "|" $5 }' "${work}/ssh" >> "${rows}"
+
+  # UDP Custom memakai status akun SSH, seperti layar SSH + UDP CUSTOM.
+  sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${work}/ssh-status" 2>/dev/null || true
+  collect_udphc_online_pairs "realtime" "${work}/udphc"
+  awk '
+    FILENAME==ARGV[1] {
+      split($0, a, /\|/);
+      st[a[1]]=a[2];
+      lim[a[1]]=(a[3] ~ /^[0-9]+$/ ? a[3] + 0 : 0);
+      next
+    }
+    $1 ~ /^[a-z0-9._-]+$/ && $2 != "" { cnt[$1]++ }
+    END {
+      for (u in cnt) {
+        s=(u in st ? st[u] : "AMAN");
+        out=((s == "LOCK" || s == "LOCK_TMP" || s == "LOCK_QUOTA") ? "KENA_LOCK" : "ONLINE");
+        printf "2|UDPHC|%s|%s|%d|%d|%d\n", u, out, (u in lim ? lim[u] : 0), cnt[u], cnt[u];
+      }
+    }' "${work}/ssh-status" "${work}/udphc" >> "${rows}"
+
+  has_live_table="0"
+  if [[ -f "${DB_PATH}" ]]; then
+    has_live_table="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='zivpn_live_sessions';" 2>/dev/null || echo 0)"
+  fi
+  if [[ "${has_live_table}" == "1" ]]; then
+    refresh_zivpn_live_from_api_log_menu
+    zivpn_online_windows
+    sqlite3 -noheader -separator '|' "${DB_PATH}" "$(zivpn_online_sql "${ZIVPN_MONITOR_WIN}" "${ZIVPN_MONITOR_GRACE}")" 2>/dev/null \
+      | awk -F'|' '$1 != "" { print "3|ZIVPN|" $1 "|" $2 "|" $3 "|-|" $4 }' >> "${rows}" || true
+  fi
+
+  xray_live_rows_raw "${work}/xray-raw" || true
+  xray_log_snapshot "${work}/xray-log" "realtime"
+  order=4
+  for spec in "account_vmesses|VMESS" "account_vlesses|VLESS" "account_trojans|TROJAN"; do
+    table="${spec%%|*}"
+    label="${spec#*|}"
+    rc=0
+    collect_xray_online_rows "${table}" "${label}" "realtime" "${work}/xray-rows" "${work}/xray-raw" "${work}/xray-log" || rc=$?
+    if [[ "${rc}" == "0" ]]; then
+      # OFFLINE = terlihat di tracker/log tapi tanpa sesi; bukan akun online.
+      awk -F'|' -v o="${order}" -v svc="${label}" '$1 != "" && $2 != "OFFLINE" { print o "|" svc "|" $1 "|" $2 "|" $3 "|" $5 "|" $6 }' \
+        "${work}/xray-rows" >> "${rows}"
+    fi
+    order=$(( order + 1 ))
+  done
+  tracker_fmt=""
+  tracker_state=""
+  if [[ -s "${work}/xray-raw" ]]; then
+    read -r tracker_fmt tracker_state < "${work}/xray-raw" || true
+  fi
+  xray_mode="LOG_WINDOW_FALLBACK"
+  if [[ "${tracker_state}" == "ok" && -s "${work}/xray-log" ]]; then
+    xray_mode="SOCKET+AUTH_LOG"
+  elif [[ "${tracker_state}" == "ok" ]]; then
+    xray_mode="REALTIME_SOCKET"
+  elif [[ -s "${work}/xray-log" ]]; then
+    xray_mode="AUTH_LOG_FALLBACK"
+  fi
+
+  # Dipasang setelah semua collector: trap RETURN milik collector menimpa trap
+  # yang dipasang lebih dulu.
+  trap 'rm -rf "${work:-}"' RETURN
+
+  draw_menu_header "SEMUA USER LOGIN"
+  echo "Sumber SSH  : ${ssh_mode}"
+  echo "Sumber Xray : ${xray_mode}"
+  echo
+  if [[ ! -s "${rows}" ]]; then
+    echo "Tidak ada akun yang sedang online."
+    echo
+    echo "Total Akun Online : 0"
+    return
+  fi
+
+  printf "%-20s %-8s %-12s %-9s %-7s %-8s\n" "USERNAME" "LAYANAN" "STATUS" "LIMIT_IP" "SESI" "IP_AKTIF"
+  printf "%-20s %-8s %-12s %-9s %-7s %-8s\n" "--------------------" "--------" "------------" "---------" "-------" "--------"
+  sort -t'|' -k1,1n -k3,3 "${rows}" | awk -F'|' '
+    {
+      printf "%-20s %-8s %-12s %-9s %-7s %-8s\n", $3, $2, $4, $5, $6, $7;
+      per_service[$2]++;
+      account=(($2 == "SSH" || $2 == "UDPHC" || $2 == "ZIVPN") ? "SSH" : $2) SUBSEP $3;
+      if (!(account in seen)) { seen[account]=1; accounts++; }
+    }
+    END {
+      print "";
+      printf "Total Akun Online : %d\n", accounts + 0;
+      printf "SSH               : %d\n", per_service["SSH"] + 0;
+      printf "UDP Custom        : %d\n", per_service["UDPHC"] + 0;
+      printf "ZIVPN             : %d\n", per_service["ZIVPN"] + 0;
+      printf "VMESS             : %d\n", per_service["VMESS"] + 0;
+      printf "VLESS             : %d\n", per_service["VLESS"] + 0;
+      printf "TROJAN            : %d\n", per_service["TROJAN"] + 0;
+    }'
+  echo
+  echo "Catatan: akun SSH yang dipakai di SSH, UDP Custom, dan ZIVPN dihitung satu akun."
+  echo "SESI adalah jumlah sesi/socket, bukan jumlah perangkat."
+  echo "IP_AKTIF VMESS/VLESS/TROJAN adalah estimasi jaringan; RECENT berarti hanya terlihat di log."
+  echo "Rincian tiap layanan ada di menu 1-6."
 }
 
 normalize_downloaded_script_file() {
@@ -27597,6 +28831,12 @@ update_script_from_repo() {
     XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}" \
     XRAY_VERSION="${XRAY_VERSION:-}" \
     XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}" \
+    XRAY_XHTTP_ENABLE="${XRAY_XHTTP_ENABLE:-0}" \
+    SERVICE_SSH_ENABLE="${SERVICE_SSH_ENABLE:-1}" \
+    SERVICE_VMESS_ENABLE="${SERVICE_VMESS_ENABLE:-1}" \
+    SERVICE_VLESS_ENABLE="${SERVICE_VLESS_ENABLE:-1}" \
+    SERVICE_TROJAN_ENABLE="${SERVICE_TROJAN_ENABLE:-1}" \
+    SERVICE_UDP_ENABLE="${SERVICE_UDP_ENABLE:-1}" \
     XRAY_LIVE_IP_TTL_SECONDS="${XRAY_LIVE_IP_TTL_SECONDS:-90}" \
     XRAY_PATHS_VMESS="${XRAY_PATHS_VMESS}" \
     XRAY_PATHS_VLESS="${XRAY_PATHS_VLESS}" \
@@ -28328,9 +29568,10 @@ monitor_online_menu() {
       "4) VLESS" \
       "5) TROJAN" \
       "6) ZIVPN" \
+      "7) SEMUA AKUN ONLINE" \
       "0) Kembali"
     echo
-    if ! prompt_input o "Pilih menu [0-6]: "; then
+    if ! prompt_input o "Pilih menu [0-7]: "; then
       return
     fi
     clear
@@ -28342,6 +29583,8 @@ monitor_online_menu() {
       4) show_xray_online_realtime_by_table "account_vlesses" "VLESS"; continue ;;
       5) show_xray_online_realtime_by_table "account_trojans" "TROJAN"; continue ;;
       6) show_zivpn_online_realtime; continue ;;
+      # Mengumpulkan semua layanan sekaligus, jadi mode live-nya dibuat lebih jarang.
+      7) UI_MONITOR_LIVE_SECONDS=10 ui_monitor show_all_online; continue ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -29102,7 +30345,7 @@ draw_main_options() {
   local -a items=(
     "01|MENU AKUN" "02|SERVICE MENU" "03|BACKUP/RESTORE"
     "04|CHANGE DOMAIN" "05|MONITOR USER LOCK" "06|MONITOR USER LOGIN"
-    "07|TOOLS MENU" " M|MENU UTAMA" " X|EXIT"
+    "07|TOOLS MENU" "08|ON/OFF LAYANAN" " M|MENU UTAMA" " X|EXIT"
   )
   local colw=24 per rows r c idx key label key_color line cell
   ui_layout
@@ -29188,15 +30431,15 @@ while true; do
 
   draw_main_options
   echo
-  printf -v menu_prompt ' %s◆%s %sSelect From Options%s %s[1-7, m, x]%s %s›%s ' \
+  printf -v menu_prompt ' %s◆%s %sSelect From Options%s %s[1-8, m, x]%s %s›%s ' \
     "${UI_ACC2}" "${UI_NC}" "${UI_VAL}" "${UI_NC}" "${UI_MUTED}" "${UI_NC}" "${UI_ACC}" "${UI_NC}"
   if ! prompt_input m "${menu_prompt}"; then
     SHOW_FULL_MENU=0
     continue
   fi
-  # Menu menampilkan nomor dua digit ([01]..[07]); keduanya diterima.
+  # Menu menampilkan nomor dua digit ([01]..[08]); keduanya diterima.
   m="${m//[[:space:]]/}"
-  if [[ "${m}" =~ ^0[1-7]$ ]]; then m="${m#0}"; fi
+  if [[ "${m}" =~ ^0[1-8]$ ]]; then m="${m#0}"; fi
   clear
   case "$m" in
     1) akun_menu || true ;;
@@ -29206,6 +30449,7 @@ while true; do
     5) ui_monitor monitor_temp_lock_menu || true; SHOW_FULL_MENU=0; continue ;;
     6) monitor_online_menu || true ;;
     7) tools_menu || true ;;
+    8) service_toggle_menu || true ;;
     m|M)
       SHOW_FULL_MENU=1
       continue
@@ -30165,7 +31409,8 @@ persist_pending_install_env() {
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
-    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_LIVE_IP_TTL_SECONDS
+    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_XHTTP_ENABLE XRAY_LIVE_IP_TTL_SECONDS
+    SERVICE_SSH_ENABLE SERVICE_VMESS_ENABLE SERVICE_VLESS_ENABLE SERVICE_TROJAN_ENABLE SERVICE_UDP_ENABLE
     XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
     NETWORK_COMPAT_ENABLE NETWORK_TCP_MSS DNS_GUARD_ENABLE DNS_GUARD_INTERVAL_MINUTES XRAY_OUTBOUND_DOMAIN_STRATEGY
     VMESS_BUG_PROFILE_ADDRESS VMESS_BUG_PROFILE_SNI VMESS_BUG_PROFILE_HOST VMESS_BUG_PROFILE_ALLOW_INSECURE
@@ -31367,6 +32612,7 @@ main() {
     enforce_single_udp_backend
     apply_tunnel_outbound_guard_rules
     restart_update_safe_services
+    apply_service_gates
     ensure_dns_resolver_if_needed
     if ! sync_xray_runtime_after_update; then
       log "Rekonsiliasi monitor Xray pasca-update gagal. Rollback otomatis akan dijalankan."
@@ -31463,6 +32709,7 @@ main() {
   run_install_step "36_sshws_guard" 98 "Terapkan guard SSHWS" apply_sshws_loop_guard_rules
   run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
   run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
+  run_install_step "38b_service_gate" 99 "Terapkan status ON/OFF layanan" apply_service_gates
   ensure_dns_resolver_if_needed
   run_install_step "39_preflight" 100 "Preflight akhir" post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. GASSS LANGSUNG TESTTT BANGGG."

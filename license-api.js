@@ -619,6 +619,32 @@ async function findRegistrationByServerKey(serverKey, { activeOnly = false } = {
   );
 }
 
+function bearerTokenValid(req) {
+  if (!LICENSE_API_TOKEN) return false;
+  const auth = String(req.headers.authorization || '').trim();
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : auth;
+  return safeEqualSecret(token, LICENSE_API_TOKEN);
+}
+
+// Setiap penolakan lisensi dicatat supaya VPS yang terkunci bisa dilacak dari
+// log pm2. Key hanya ditulis sebagai awalan hash. Kombinasi IP+alasan yang
+// sama dicatat maksimal sekali per 10 menit agar guard tiap 15 menit dan
+// menu yang dibuka berulang tidak membanjiri log.
+const LICENSE_REJECT_LOG_INTERVAL_MS = 10 * 60 * 1000;
+const licenseRejectLogSeen = new Map();
+
+function logLicenseRejection(req, code, serverKey = '', extra = '') {
+  const ip = cleanIp(getClientIp(req)) || '-';
+  const now = Date.now();
+  const mark = `${ip}|${code}`;
+  if (now - Number(licenseRejectLogSeen.get(mark) || 0) < LICENSE_REJECT_LOG_INTERVAL_MS) return;
+  if (licenseRejectLogSeen.size > 5000) licenseRejectLogSeen.clear();
+  licenseRejectLogSeen.set(mark, now);
+  const key = String(serverKey || '').trim();
+  const keyHash = key ? crypto.createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 8) : '-';
+  console.warn(`[license] tolak ip=${ip} alasan=${code} key_sha256=${keyHash}${extra ? ` ${extra}` : ''}`);
+}
+
 async function requireLicenseClient(req, res, next) {
   try {
     const serverKey = String(req.headers['x-sc-key'] || '').trim();
@@ -626,16 +652,39 @@ async function requireLicenseClient(req, res, next) {
       const reg = await findRegistrationByServerKey(serverKey, { activeOnly: false });
       if (reg) {
         if (!sourceIpMatchesRegistration(req, reg)) {
-          return res.status(403).json({ ok: false, allowed: false, status: 'blocked', message: 'source IP mismatch' });
+          logLicenseRejection(req, 'source-ip-mismatch', serverKey, `terdaftar=${cleanIp(reg.vps_ip) || '-'}`);
+          return res.status(403).json({
+            ok: false,
+            allowed: false,
+            status: 'blocked',
+            code: 'source-ip-mismatch',
+            message: 'source IP mismatch'
+          });
         }
         req.scLicenseRegistration = reg;
         req.scLicenseServerKey = serverKey;
         req.scLicenseAuth = 'vps-key';
         return next();
       }
+      // Key dikirim tapi tidak ada di sc_server_keys: hampir selalu key di
+      // database bot berbeda dengan key di VPS (misalnya setelah rotasi).
+      // Bearer legacy yang valid tetap boleh lewat untuk migrasi VPS lama.
+      if (!(LICENSE_ALLOW_LEGACY_BEARER && bearerTokenValid(req))) {
+        logLicenseRejection(req, 'server-key-unknown', serverKey);
+        return res.status(401).json({
+          ok: false,
+          allowed: false,
+          code: 'server-key-unknown',
+          message: 'key VPS tidak dikenal license API (key di bot berbeda dengan key di VPS)'
+        });
+      }
     }
     if (!LICENSE_ALLOW_LEGACY_BEARER) {
-      return res.status(401).json({ ok: false, message: 'per-VPS X-SC-Key required' });
+      logLicenseRejection(req, 'server-key-missing');
+      return res.status(401).json({ ok: false, code: 'server-key-missing', message: 'per-VPS X-SC-Key required' });
+    }
+    if (!serverKey && LICENSE_API_TOKEN && !bearerTokenValid(req)) {
+      logLicenseRejection(req, 'server-key-missing');
     }
     return requireBearer(req, res, () => {
       req.scLicenseAuth = 'legacy-bearer';
@@ -1293,6 +1342,7 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
           "UPDATE sc_registrations SET status = 'expired', updated_at = ? WHERE vps_ip = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?",
           [Date.now(), ip, Date.now()]
         ).catch(() => {});
+        logLicenseRejection(req, 'registration-expired', serverKey, `terdaftar=${ip || '-'}`);
         return res.status(403).json(attachSignedLease({
           ok: false,
           allowed: false,
@@ -1310,6 +1360,7 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
           scriptVersion
         }));
       }
+      logLicenseRejection(req, 'registration-not-active', serverKey, `ip_target=${ip || '-'}`);
       return res.status(403).json(attachSignedLease({
         ok: false,
         allowed: false,
@@ -1337,6 +1388,7 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
       ? { ok: true, reason: 'legacy-machine-id-unbound', machineIdHash: '' }
       : await bindMachineIdForRegistration(reg, serverKey, machineId);
     if (!machineBinding.ok) {
+      logLicenseRejection(req, machineBinding.reason || 'machine-binding-failed', serverKey, `terdaftar=${reg.vps_ip}`);
       return res.status(403).json(attachSignedLease({
         ok: false,
         allowed: false,

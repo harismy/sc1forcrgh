@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.75}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.76}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -13356,7 +13356,8 @@ function inspectSignedToken(token, expectedAudience = 'sc1forcr-runtime') {
 
     const status = String(payload.status || '').trim().toLowerCase();
     if (status !== 'active') {
-      return { allowed: false, signatureValid: true, reason: `license-${status || 'denied'}`, payload };
+      const detail = String(payload.reason || '').toLowerCase().replace(/[^a-z0-9._-]/g, '-').slice(0, 60);
+      return { allowed: false, signatureValid: true, reason: `license-${status || 'denied'}${detail ? `:${detail}` : ''}`, payload };
     }
     const registrationExpiresAt = Number(payload.registration_expires_at || 0);
     if (registrationExpiresAt > 0 && now >= registrationExpiresAt) {
@@ -13472,6 +13473,23 @@ function writeLegacyState(result, responseBody = {}) {
   ].join('\n'), 0o600);
 }
 
+// Jawaban license API tanpa lease. 401/403 berarti server menolak VPS ini
+// (misalnya key VPS tidak dikenal di bot), bukan gangguan jaringan.
+function licenseHttpError(statusCode, body) {
+  const status = Number(statusCode || 0);
+  const message = String(body?.message || '').trim();
+  let code = String(body?.code || '').trim().toLowerCase();
+  if (!/^[a-z0-9._-]{3,60}$/.test(code)) {
+    if (/source ip mismatch/i.test(message)) code = 'source-ip-mismatch';
+    else if (status === 401) code = 'server-key-unknown';
+    else code = `http-${status}`;
+  }
+  const rejected = status === 401 || status === 403;
+  const error = new Error(`${rejected ? 'api-rejected' : 'api-error'}:${code}`);
+  error.licenseRejected = rejected;
+  return error;
+}
+
 async function refreshLease({ force = false } = {}) {
   const current = checkLocalLease();
   if (!force && current.allowed && !current.refreshDue) return { ...current, refreshed: false };
@@ -13482,6 +13500,7 @@ async function refreshLease({ force = false } = {}) {
   const headers = { 'X-SC-Key': SERVER_KEY };
   if (LEGACY_BEARER) headers.Authorization = `Bearer ${LEGACY_BEARER}`;
   let lastError = new Error('license-endpoint-unreachable');
+  let rejection = null;
   for (const apiUrl of API_URLS) {
     try {
       const response = await requestJson(apiUrl, {
@@ -13494,6 +13513,11 @@ async function refreshLease({ force = false } = {}) {
         installPinnedPublicKey(body.license_public_key_b64, body.license_key_fingerprint);
       }
       const token = String(body.license_lease || '').trim();
+      if (!token) {
+        const error = licenseHttpError(response.statusCode, body);
+        if (error.licenseRejected) rejection = error;
+        throw error;
+      }
       const inspected = inspectSignedToken(token, 'sc1forcr-runtime');
       if (!inspected.signatureValid) throw new Error(inspected.reason || 'signed-lease-invalid');
       atomicWrite(LEASE_FILE, `${token}\n`, 0o600);
@@ -13507,9 +13531,17 @@ async function refreshLease({ force = false } = {}) {
       lastError = error;
     }
   }
+  const cause = rejection || lastError;
   const fallback = checkLocalLease();
-  if (fallback.allowed) return { ...fallback, refreshed: false, refreshError: lastError.message };
-  return { ...fallback, allowed: false, refreshed: false, reason: fallback.reason || `refresh-failed:${lastError.message}`, refreshError: lastError.message };
+  if (fallback.allowed) return { ...fallback, refreshed: false, refreshError: cause.message };
+  // Lease lama yang habis atau hilang hanya akibat; penyebabnya penolakan
+  // license API atau gagal refresh. Itu yang dicatat di lock supaya admin tahu
+  // langkah pulihnya. Vonis bertanda tangan (expired/blocked) tetap dipakai.
+  const signedVerdict = /^(license-|registration-expired$)/.test(String(fallback.reason || ''));
+  let reason = `refresh-failed:${cause.message}`;
+  if (rejection) reason = rejection.message;
+  else if (signedVerdict) reason = fallback.reason;
+  return { ...fallback, allowed: false, refreshed: false, reason, leaseReason: fallback.reason || '', refreshError: cause.message };
 }
 
 function readLockManagedByGuard() {
@@ -13584,6 +13616,7 @@ function saveGuardState(result) {
     mode: String(result?.mode || ''),
     refreshed: result?.refreshed === true,
     refresh_error: String(result?.refreshError || ''),
+    lease_reason: String(result?.leaseReason || ''),
     bound_ip: String(payload.bound_ip || ''),
     issued_at: Number(payload.issued_at || 0),
     lease_until: Number(payload.lease_until || 0),
@@ -26462,8 +26495,73 @@ EOF
   chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
 }
 
+# Isi layar kunci. Reason dari license guard adalah penyebab asli penolakan
+# lisensi (misalnya key VPS tidak dikenal), jadi tidak semua kunci berarti
+# SC expired. Tiap baris maksimal 60 kolom, selebar bingkai layar kunci.
+menu_lock_reason_text() {
+  local reason="${1:-}" managed_by="${2:-}"
+  printf 'Reason : %s\n\n' "${reason}"
+  case "${reason}" in
+    *server-key-unknown*)
+      printf '%s\n' \
+        "Status : Key VPS ini tidak dikenal server lisensi." \
+        "         Key di bot berbeda dengan key di VPS ini." \
+        "Aksi   : Kirim IP dan key VPS ke admin untuk menu" \
+        "         'Pulihkan Key VPS'. Lihat key VPS dengan:" \
+        "         grep SC_UPDATE_KEY /etc/sc-1forcr.env" \
+        "Akses terbuka otomatis setelah key dipulihkan."
+      ;;
+    *source-ip-mismatch*)
+      printf '%s\n' \
+        "Status : IP publik VPS tidak sama dengan IP terdaftar." \
+        "Aksi   : Ganti IP lewat menu 'Ganti IP VPS' di bot."
+      ;;
+    *machine-id*)
+      printf '%s\n' \
+        "Status : VPS terdeteksi di-reinstall (machine-id berubah)." \
+        "Aksi   : Minta admin 'Reset Binding VPS', lalu jalankan" \
+        "         installer terbaru lagi di VPS ini."
+      ;;
+    *registration-not-active*|license-rejected*)
+      printf '%s\n' \
+        "Status : IP VPS ini belum punya registrasi SC aktif." \
+        "Aksi   : Daftar atau perpanjang SC lewat bot resmi."
+      ;;
+    refresh-failed*|api-error*|lease-grace-expired|lease-format-invalid|signed-license-invalid)
+      printf '%s\n' \
+        "Status : VPS gagal memperbarui lisensi ke server bot." \
+        "Aksi   : Cek koneksi dan DNS VPS. Akses terbuka otomatis" \
+        "         setelah lisensi berhasil diperbarui (maks 15 menit)."
+      ;;
+    license-expired*|registration-expired)
+      printf '%s\n' \
+        "Status : SC expired." \
+        "Aksi   : Perpanjang SC lewat bot resmi. Akses terbuka" \
+        "         otomatis setelah perpanjang (maks 15 menit)."
+      ;;
+    migrate_ip_to_new_host)
+      printf '%s\n' \
+        "Status : SC sudah dipindah ke IP VPS baru." \
+        "Aksi   : Pakai VPS baru, atau hubungi admin."
+      ;;
+    *)
+      if [[ -n "${managed_by}" && "${managed_by}" != "control-plane" ]]; then
+        printf '%s\n' \
+          "Status : Lisensi VPS ditolak." \
+          "Aksi   : Hubungi admin dan sertakan reason di atas."
+      else
+        printf '%s\n' \
+          "Akses menu VPS dinonaktifkan admin." \
+          "Status : SC expired." \
+          "Aksi   : SC harus diperpanjang terlebih dahulu." \
+          "Hubungi admin untuk membuka akses kembali setelah perpanjang."
+      fi
+      ;;
+  esac
+}
+
 enforce_menu_license_access() {
-  local enabled ip_text status expires_raw expires_epoch now_epoch lock_file lock_reason meta_status meta_expires
+  local enabled ip_text status expires_raw expires_epoch now_epoch lock_file lock_reason lock_managed_by meta_status meta_expires
   lock_file="/etc/sc-1forcr-access.lock"
   ip_text="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip_text="${ip_text:-unknown}"
@@ -26520,19 +26618,16 @@ Setelah perpanjang berhasil, silakan ulangi install/update.
 ============================================================
 EOF
     else
-      cat <<EOF | ui_fx
-============================================================
-               SC 1FORCR NEXUS - AKSES DITOLAK            
-============================================================
-
-Akses menu VPS dinonaktifkan admin.
-Reason : ${lock_reason}
-
-Status : SC expired.
-Aksi   : SC harus diperpanjang terlebih dahulu.
-Hubungi admin untuk membuka akses kembali setelah perpanjang.
-============================================================
-EOF
+      lock_managed_by="$(sed -n 's/^managed_by=//p' "${lock_file}" | head -n1)"
+      {
+        printf '%s\n' \
+          "============================================================" \
+          "               SC 1FORCR NEXUS - AKSES DITOLAK" \
+          "============================================================" \
+          ""
+        menu_lock_reason_text "${lock_reason}" "${lock_managed_by}"
+        printf '%s\n' "============================================================"
+      } | ui_fx
     fi
     return 1
   fi

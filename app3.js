@@ -183,9 +183,12 @@ const MIGRATION_ROLLBACK_TTL_MS = Math.max(
   5 * 60 * 1000,
   Number(process.env.MIGRATION_ROLLBACK_TTL_MS || (2 * 60 * 60 * 1000)) || (2 * 60 * 60 * 1000)
 );
+// Unlock di Summary API V.1FSC.76+ menunggu refresh lisensi VPS (panggilan ke
+// license API + start service), jadi butuh lebih dari 10 detik. Jalannya di
+// latar belakang, tidak menahan handler Telegram.
 const SC_POST_REGISTRATION_UNLOCK_TIMEOUT_MS = Math.max(
   3000,
-  Number(process.env.SC_POST_REGISTRATION_UNLOCK_TIMEOUT_MS || 10000) || 10000
+  Number(process.env.SC_POST_REGISTRATION_UNLOCK_TIMEOUT_MS || 60000) || 60000
 );
 const SC_POST_REGISTRATION_NOTIFY_UNLOCK = /^(1|true|yes|on)$/i.test(
   String(process.env.SC_POST_REGISTRATION_NOTIFY_UNLOCK || '1').trim()
@@ -3548,7 +3551,7 @@ function adminMenu() {
     [Markup.button.callback('Semua SC Aktif', 'm_admin_active_sc_0'), Markup.button.callback('IP + KEY + ID', 'm_admin_list_ip_keys_0')],
     [Markup.button.callback('Hapus IP VPS', 'm_admin_remove_sc_ip')],
     [Markup.button.callback('Unlock Akses VPS', 'm_admin_unlock_sc_access'), Markup.button.callback('Info Detail IP VPS', 'm_admin_ip_info')],
-    [Markup.button.callback('Reset Binding VPS', 'm_admin_reset_machine_binding')],
+    [Markup.button.callback('Pulihkan Key VPS', 'm_admin_restore_vps_key'), Markup.button.callback('Reset Binding VPS', 'm_admin_reset_machine_binding')],
     [Markup.button.callback('Set Masa Aktif IP (Jam)', 'm_admin_set_sc_expiry_ip')],
 
     [Markup.button.callback('Tambah Domain', 'm_admin_add_domain'), Markup.button.callback('Daftar Domain', 'm_admin_list_domains')],
@@ -4355,6 +4358,96 @@ async function apiPost(host, key, endpoint, body = {}, timeoutMs = 120000) {
   });
   if (!res.data?.ok) throw new Error(res.data?.message || 'request gagal');
   return res.data;
+}
+
+// Key VPS dipakai dua pihak: Summary API VPS (x-sync-token) dan license API
+// (X-SC-Key saat VPS memperpanjang lease). Key yang salah di database bot
+// membuat VPS terkunci saat lease habis, jadi key ketikan pengguna dicek dulu
+// ke VPS dan hanya disimpan kalau VPS menerimanya.
+const SERVER_KEY_VERIFY_TIMEOUT_MS = 15000;
+
+async function verifyServerKeyOnHost(host, key, timeoutMs = SERVER_KEY_VERIFY_TIMEOUT_MS) {
+  const ip = normalizeHost(host);
+  const k = String(key || '').trim();
+  if (!isIpv4(ip) || k.length < 8) {
+    return { ok: false, reason: 'invalid', message: 'IP atau key tidak valid' };
+  }
+  try {
+    const res = await axios.get(`http://${ip}:8789/internal/account-summary`, {
+      timeout: Number(timeoutMs) || SERVER_KEY_VERIFY_TIMEOUT_MS,
+      headers: { 'x-sync-token': k },
+      validateStatus: () => true
+    });
+    const status = Number(res.status || 0);
+    if (status === 401 || status === 403) {
+      return { ok: false, reason: 'unauthorized', message: 'key ditolak VPS' };
+    }
+    if (status >= 200 && status < 300 && res.data?.ok) return { ok: true };
+    return { ok: false, reason: 'error', message: String(res.data?.message || `HTTP ${status}`) };
+  } catch (err) {
+    return { ok: false, reason: 'unreachable', message: parseErr(err) };
+  }
+}
+
+function serverKeyVerifyFailureText(host, check) {
+  if (check?.reason === 'unauthorized') {
+    return (
+      `Key ditolak VPS ${host}. Key TIDAK disimpan.\n\n` +
+      'Pastikan key sama persis dengan key di VPS. Cek di VPS dengan:\n' +
+      'grep SC_UPDATE_KEY /etc/sc-1forcr.env\n\n' +
+      'Kirim ulang key yang benar.'
+    );
+  }
+  if (check?.reason === 'invalid') return 'Key tidak valid. Minimal 8 karakter.';
+  return (
+    `VPS ${host} tidak bisa dihubungi untuk cek key (${check?.message || 'tanpa respons'}). Key TIDAK disimpan.\n\n` +
+    'Pastikan VPS menyala dan port 8789 terbuka, lalu kirim ulang key.'
+  );
+}
+
+// Log hanya memuat awal hash key, tidak pernah key aslinya.
+function serverKeyHashPrefix(key) {
+  const k = String(key || '').trim();
+  return k ? crypto.createHash('sha256').update(k, 'utf8').digest('hex').slice(0, 8) : '-';
+}
+
+// Reason dari license guard VPS (lihat refreshLease di installer) diterjemahkan
+// ke langkah pulih untuk admin.
+function licenseDenyHint(reasonInput) {
+  const reason = String(reasonInput || '').toLowerCase();
+  if (!reason) return '';
+  if (reason.includes('server-key-unknown')) {
+    return 'Key VPS tidak dikenal license API. Pakai "Pulihkan Key VPS" dengan key dari VPS (grep SC_UPDATE_KEY /etc/sc-1forcr.env).';
+  }
+  if (reason.includes('source-ip-mismatch')) {
+    return 'IP publik VPS berbeda dengan IP terdaftar. Ganti IP lewat menu "Ganti IP VPS".';
+  }
+  if (reason.includes('machine-id')) {
+    return 'Machine-id VPS berubah (VPS di-reinstall). Pakai "Reset Binding VPS", lalu jalankan installer lagi di VPS.';
+  }
+  if (reason.includes('expired') && !reason.includes('lease-grace-expired')) {
+    return 'Masa aktif SC sudah habis. Perpanjang dulu, lalu buka kunci lagi.';
+  }
+  if (reason.includes('not-active') || reason.includes('license-rejected')) {
+    return 'IP VPS tidak punya registrasi aktif di bot.';
+  }
+  if (reason.includes('refresh-failed') || reason.includes('api-error') || reason.includes('timeout') || reason.includes('lease-grace-expired')) {
+    return 'VPS tidak berhasil memperbarui lisensi. Cek koneksi/DNS VPS ke domain API bot.';
+  }
+  return '';
+}
+
+// Dipakai langkah bot yang meminta key: true berarti key sudah dicek dan
+// disimpan, false berarti pesan penolakan sudah dikirim dan langkah tetap
+// menunggu key berikutnya.
+async function acceptServerKeyFromUser(ctx, host, key) {
+  const check = await verifyServerKeyOnHost(host, key);
+  if (!check.ok) {
+    await ctx.reply(serverKeyVerifyFailureText(host, check));
+    return false;
+  }
+  await saveServerKeyForHost(ctx.from.id, host, key);
+  return true;
 }
 
 async function syncScRegistrationMetaToHost(host, key, meta = {}, timeoutMs = 30000) {
@@ -6091,6 +6184,23 @@ bot.action('m_admin_unlock_sc_access', async (ctx) => {
   );
 });
 
+bot.action('m_admin_restore_vps_key', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  userState.set(ctx.chat.id, { step: 'admin_restore_vps_key' });
+  return ctx.reply(
+    uiBox('PULIHKAN KEY VPS', [
+      'Untuk VPS yang terkunci karena key di bot tidak sama dengan key di VPS (reason lock: server-key-unknown).',
+      'Ambil key di VPS: grep SC_UPDATE_KEY /etc/sc-1forcr.env',
+      'Kirim dengan format: IP KEY_VPS',
+      '',
+      'Bot mengecek key ke VPS dulu. Key hanya disimpan kalau VPS menerimanya, lalu VPS diminta memperbarui lisensi dan membuka kunci.',
+      'Pesan berisi key dihapus dari chat setelah dibaca.',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
 bot.action('m_admin_reset_machine_binding', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
@@ -6098,8 +6208,9 @@ bot.action('m_admin_reset_machine_binding', async (ctx) => {
   return ctx.reply(
     uiBox('RESET BINDING LISENSI VPS', [
       'Gunakan hanya setelah VPS di-reinstall tetapi IP publik tetap sama.',
-      'Tindakan ini juga merotasi key unik VPS agar salinan key lama tidak dapat refresh lisensi.',
+      'Tindakan ini merotasi key unik VPS. VPS yang masih memakai key lama akan TERKUNCI saat lease habis (maks. 30 jam) sampai installer dijalankan ulang dengan key baru.',
       'Setelah reset, jalankan installer baru dari VPS tersebut untuk binding ulang.',
+      'VPS terkunci karena key di bot salah (reason server-key-unknown)? Jangan reset; pakai "Pulihkan Key VPS".',
       '',
       'Masukkan IP VPS target atau ketik "batal".'
     ])
@@ -8370,11 +8481,88 @@ bot.on('text', async (ctx) => {
         );
       } catch (unlockErr) {
         userState.delete(ctx.chat.id);
-        const extra = String(manualKey || '').trim().length >= 8
-          ? ''
-          : '\n\nJika key tersimpan sudah tidak cocok, ulangi dengan format: IP KEY_SERVER_BENAR.';
+        const status = Number(unlockErr?.response?.status || 0);
+        let extra = '';
+        if (status === 409) {
+          const hint = licenseDenyHint(unlockErr?.response?.data?.license_reason);
+          extra = hint ? `\n\n${hint}` : '';
+        } else if (String(manualKey || '').trim().length < 8) {
+          extra = '\n\nJika key tersimpan sudah tidak cocok, pakai menu "Pulihkan Key VPS" dengan key dari VPS.';
+        }
         return ctx.reply(`Gagal unlock akses SC VPS: ${parseErr(unlockErr)}${extra}`, adminMenu());
       }
+    }
+
+    if (state.step === 'admin_restore_vps_key') {
+      // Pesan admin memuat key rahasia: hapus dari chat sebelum apa pun.
+      await ctx.deleteMessage().catch(() => {});
+      if (!isAdmin(ctx.from.id)) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply('Akses ditolak. Hanya admin.');
+      }
+      const raw = String(text || '').trim();
+      const ip = extractIpv4(raw);
+      const key = ip ? (raw.replace(ip, ' ').replace(/^[\s:=,;-]+/, '').trim().split(/\s+/)[0] || '') : '';
+      if (!isIpv4(ip) || key.length < 8) {
+        return ctx.reply('Format tidak valid. Kirim: IP KEY_VPS (key minimal 8 karakter), atau ketik "batal".');
+      }
+      const detail = await adminGetScIpDetails(ip);
+      if (!detail || !detail.rows.length) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`IP ${ip} tidak ditemukan di database registrasi.`, adminMenu());
+      }
+      await ctx.reply(`Mengecek key ke VPS ${ip}...`);
+      const check = await verifyServerKeyOnHost(ip, key);
+      if (!check.ok) {
+        userState.delete(ctx.chat.id);
+        const why = check.reason === 'unauthorized'
+          ? 'VPS menolak key ini, jadi key ini bukan key VPS tersebut.'
+          : `VPS tidak bisa dihubungi di port 8789 (${check.message}).`;
+        return ctx.reply(
+          `Pulihkan key dibatalkan. Key TIDAK disimpan.\nIP: ${ip}\n${why}\n\n` +
+            'Ambil ulang key di VPS: grep SC_UPDATE_KEY /etc/sc-1forcr.env',
+          adminMenu()
+        );
+      }
+      const saved = await saveServerKeyForHostAllOwners(ip, key, ctx.from.id);
+      console.warn(
+        `[license-admin] server key restored ip=${ip} key_sha256=${serverKeyHashPrefix(key)} ` +
+          `owners=${saved.saved_for} actor=${ctx.from.id}`
+      );
+      userState.delete(ctx.chat.id);
+
+      // Summary API baru menjalankan refresh lisensi saat unlock dan menjawab
+      // 409 kalau license API masih menolak; versi lama hanya menghapus lock.
+      let unlockText = '';
+      try {
+        const resp = await unlockScAccessByHost(ip, key, ctx.from.id, 'admin_restore_vps_key', 60000);
+        if (resp?.license_refresh === 'ok') {
+          unlockText = 'Lisensi VPS berhasil diperbarui dan akses sudah dibuka.';
+        } else if (resp?.license_refresh === 'legacy') {
+          unlockText = 'VPS memakai lisensi mode lama; kunci akses sudah dibuka.';
+        } else {
+          unlockText =
+            'Kunci akses dihapus. Summary API VPS ini versi lama, jadi lisensinya diperbarui otomatis oleh guard dalam ±15 menit.\n' +
+            'Supaya langsung aktif, jalankan di VPS: sc-1forcr-license-guard refresh-enforce --force';
+        }
+      } catch (unlockErr) {
+        const data = unlockErr?.response?.data || {};
+        if (Number(unlockErr?.response?.status || 0) === 409) {
+          const reason = String(data.license_reason || '').trim();
+          const hint = licenseDenyHint(reason);
+          unlockText =
+            `License API masih menolak VPS ini${reason ? ` (reason: ${reason})` : ''}.` +
+            (hint ? `\n${hint}` : '');
+        } else {
+          unlockText =
+            `Gagal membuka kunci: ${parseErr(unlockErr)}\n` +
+            'Guard VPS akan mencoba lagi otomatis dalam ±15 menit.';
+        }
+      }
+      return ctx.reply(
+        `Key VPS dipulihkan.\nIP: ${ip}\nDisimpan untuk: ${saved.saved_for} owner\n\n${unlockText}`,
+        adminMenu()
+      );
     }
 
     if (state.step === 'admin_reset_machine_binding_ip') {
@@ -8394,7 +8582,8 @@ bot.on('text', async (ctx) => {
       userState.set(ctx.chat.id, state);
       return ctx.reply(
         `PERINGATAN: key VPS ${ip} akan dirotasi dan binding machine-id lama dihapus.\n` +
-        'VPS harus menjalankan installer terbaru lagi setelah reset.\n\n' +
+        'VPS yang masih jalan dengan key lama akan TERKUNCI saat lease habis, sampai installer terbaru dijalankan lagi di VPS itu.\n' +
+        'Kalau masalahnya hanya key di bot salah, batalkan dan pakai "Pulihkan Key VPS".\n\n' +
         `Ketik tepat: RESET ${ip}`
       );
     }
@@ -9308,8 +9497,8 @@ bot.on('text', async (ctx) => {
     if (state.step === 'delete_all_key') {
       const key = String(text || '').trim();
       if (key.length < 8) return ctx.reply('Key tidak valid.');
+      if (!(await acceptServerKeyFromUser(ctx, state.host, key))) return;
       state.key = key;
-      await saveServerKeyForHost(ctx.from.id, state.host, key);
       state.step = 'delete_all_choose_protocol';
       userState.set(ctx.chat.id, state);
       return ctx.reply(
@@ -9336,8 +9525,8 @@ bot.on('text', async (ctx) => {
     if (state.step === 'migrate_src_key') {
       const srcKey = String(text || '').trim();
       if (srcKey.length < 8) return ctx.reply('Key sumber tidak valid.');
+      if (!(await acceptServerKeyFromUser(ctx, state.srcHost, srcKey))) return;
       state.srcKey = srcKey;
-      await saveServerKeyForHost(ctx.from.id, state.srcHost, srcKey);
       state.step = 'migrate_dst_host';
       userState.set(ctx.chat.id, state);
       return ctx.reply('Masukkan IP VPS tujuan migrasi.');
@@ -9358,8 +9547,8 @@ bot.on('text', async (ctx) => {
     if (state.step === 'migrate_dst_key') {
       const dstKey = String(text || '').trim();
       if (dstKey.length < 8) return ctx.reply('Key tujuan tidak valid.');
+      if (!(await acceptServerKeyFromUser(ctx, state.dstHost, dstKey))) return;
       state.dstKey = dstKey;
-      await saveServerKeyForHost(ctx.from.id, state.dstHost, dstKey);
       state.step = 'migrate_choose_protocol';
       userState.set(ctx.chat.id, state);
       return ctx.reply(
@@ -9385,9 +9574,9 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.step === 'backup_key') {
-      const key = text;
+      const key = String(text || '').trim();
       if (key.length < 8) return ctx.reply('Key tidak valid.');
-      await saveServerKeyForHost(ctx.from.id, state.host, key);
+      if (!(await acceptServerKeyFromUser(ctx, state.host, key))) return;
 
       await ctx.reply('Membuat backup, tunggu...');
 
@@ -9474,9 +9663,10 @@ bot.on('text', async (ctx) => {
     }
 
     if (state.step === 'restore_key') {
-      if (text.length < 8) return ctx.reply('Key tidak valid.');
-      state.key = text;
-      await saveServerKeyForHost(ctx.from.id, state.host, text);
+      const key = String(text || '').trim();
+      if (key.length < 8) return ctx.reply('Key tidak valid.');
+      if (!(await acceptServerKeyFromUser(ctx, state.host, key))) return;
+      state.key = key;
       state.step = 'restore_wait_file';
       userState.set(ctx.chat.id, state);
       return ctx.reply('Upload file backup sebagai document (.json backup SC ini, atau .zip backup autoscript lain).');

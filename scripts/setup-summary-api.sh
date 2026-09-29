@@ -2280,6 +2280,36 @@ function setScMenuExecutable() {
   return changed;
 }
 
+const LICENSE_REQUIRED_MARKER = '/etc/sc-1forcr-license-required';
+const LICENSE_GUARD_BIN = '/usr/local/sbin/sc-1forcr-license-guard';
+const LICENSE_GUARD_UNLOCK_TIMEOUT_MS = 55000;
+
+// Unlock tanpa lease baru percuma: guard mengunci lagi di siklus berikutnya.
+// Guard dijalankan async supaya Summary API tetap melayani request lain selama
+// menunggu license API. Hasil: { ok, mode: 'ok'|'legacy'|'denied', reason }.
+function refreshSignedLicenseForUnlock() {
+  return new Promise((resolve) => {
+    try {
+      if (!fs.existsSync(LICENSE_REQUIRED_MARKER)) return resolve({ ok: true, mode: 'legacy', reason: '' });
+      if (!fs.existsSync(LICENSE_GUARD_BIN)) return resolve({ ok: false, mode: 'denied', reason: 'license-guard-missing' });
+      execFile(LICENSE_GUARD_BIN, ['refresh-enforce', '--force', '--json'], {
+        timeout: LICENSE_GUARD_UNLOCK_TIMEOUT_MS,
+        maxBuffer: 256 * 1024
+      }, (err, stdout) => {
+        let parsed = null;
+        const lastLine = String(stdout || '').trim().split('\n').pop() || '';
+        try { parsed = lastLine ? JSON.parse(lastLine) : null; } catch (_) {}
+        const fallbackReason = err ? (err.killed ? 'license-guard-timeout' : 'license-denied') : '';
+        const reason = String(parsed?.reason || fallbackReason).replace(/[^a-zA-Z0-9._:-]/g, '-').slice(0, 120);
+        if (!err && parsed?.allowed !== false) return resolve({ ok: true, mode: 'ok', reason });
+        return resolve({ ok: false, mode: 'denied', reason: reason || 'license-denied' });
+      });
+    } catch (err) {
+      resolve({ ok: false, mode: 'denied', reason: `license-guard-error:${String(err?.message || err).slice(0, 80)}` });
+    }
+  });
+}
+
 function applyScAccessLock(blockedInput, reasonInput, actorInput) {
   const blocked = blockedInput === true || /^(1|true|yes|on)$/i.test(String(blockedInput || '').trim());
   const reason = String(reasonInput || 'locked_by_admin').trim() || 'locked_by_admin';
@@ -2855,13 +2885,31 @@ app.post('/internal/sc-access-lock', (req, res) => {
   const blocked = req.body?.blocked;
   const reason = String(req.body?.reason || '').trim();
   const actor = String(req.body?.actor || '').trim();
-  return authorizeAndRun(req, res, (db) => {
+  const unlocking = !(blocked === true || /^(1|true|yes|on)$/i.test(String(blocked || '').trim()));
+  return authorizeAndRun(req, res, async (db) => {
     db.close();
+    let licenseRefresh = 'legacy';
+    if (unlocking) {
+      // VPS berlisensi bertanda tangan: perbarui lease dulu. Kalau license
+      // API masih menolak, lock dibiarkan (menghapusnya percuma karena guard
+      // mengunci lagi) dan alasannya dikirim balik ke bot.
+      const refresh = await refreshSignedLicenseForUnlock();
+      if (!refresh.ok) {
+        return res.status(409).json({
+          ok: false,
+          blocked: true,
+          license_refresh: 'denied',
+          license_reason: refresh.reason,
+          message: `lisensi VPS belum aktif (${refresh.reason}); unlock ditolak`
+        });
+      }
+      licenseRefresh = refresh.mode;
+    }
     const result = applyScAccessLock(blocked, reason, actor);
     if (!result.ok) {
       return res.status(Number(result.statusCode || 500)).json(result);
     }
-    return res.json(result);
+    return res.json(unlocking ? { ...result, license_refresh: licenseRefresh } : result);
   });
 });
 

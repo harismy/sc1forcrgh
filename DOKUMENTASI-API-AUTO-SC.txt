@@ -889,6 +889,35 @@ Body unlock:
 Fungsi:
 Mengunci atau membuka akses SC pada VPS.
 
+Unlock pada VPS berlisensi bertanda tangan menjalankan
+`sc-1forcr-license-guard refresh-enforce --force` dulu (maks 55 detik).
+
+Respon unlock sukses:
+{
+  "ok": true,
+  "blocked": false,
+  "license_refresh": "ok"
+}
+"license_refresh" bernilai "legacy" untuk VPS tanpa lisensi bertanda tangan.
+Summary API versi lama tidak mengirim field ini.
+
+Respon 409 kalau license API masih menolak VPS (lock tidak dihapus):
+{
+  "ok": false,
+  "blocked": true,
+  "license_refresh": "denied",
+  "license_reason": "api-rejected:server-key-unknown",
+  "message": "lisensi VPS belum aktif (...); unlock ditolak"
+}
+
+Reason lisensi yang umum:
+- api-rejected:server-key-unknown : key VPS tidak ada di database bot.
+  Pulihkan lewat menu admin "Pulihkan Key VPS".
+- api-rejected:source-ip-mismatch : IP publik VPS beda dengan IP terdaftar.
+- license-expired:registration-expired : masa aktif SC habis.
+- license-blocked:machine-id-mismatch : VPS di-reinstall, perlu Reset Binding.
+- refresh-failed:... : VPS gagal menghubungi license API.
+
 
 SC Expired Notify
 -----------------

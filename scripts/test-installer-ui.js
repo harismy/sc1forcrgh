@@ -267,28 +267,32 @@ try {
     assert(r.stdout.includes('203.0.113.10'));
   }
 
-  // 6. Animasi progres. /dev/tty diganti fd 4 (file), jadi semua yang digambar
-  //    proses animasi bisa diperiksa: kerangka layar, baris yang digambar
-  //    ulang, dan kursor yang selalu dikembalikan.
+  // 6. Animasi progres. /dev/tty diganti fd 4 (file), jadi semua yang dikirim
+  //    proses animasi ke terminal bisa diperiksa byte demi byte.
   const logFile = path.join(tmpDir, 'install.log');
   const screenFile = path.join(tmpDir, 'anim-screen.bin');
   const pidFile = path.join(tmpDir, 'anim.pid');
   const displayFns = extract(installer, 'show_install_progress() {', '\n# Ringkasan akhir install.')
     .replace(/\/var\/lib\/sc-1forcr\/install\.log/g, B(logFile));
   assert(displayFns.includes('install_display_start() {') && displayFns.includes(B(logFile)), 'fungsi tampilan progres tidak terambil');
-  const animPrelude = (cols) => `${FIXTURE}\n${promptBlock}\nshow_install_banner() { echo "BANNER-INSTALL"; }\n${displayFns}\n` +
-    `SC_ORIG_STDOUT_IS_TTY=1\nIUI_COLS=${cols}\n: > '${B(logFile)}'\nexec 4>'${B(screenFile)}'\n`;
-  // Kode kursor dibuat terbaca; satu "baris" = satu penggambaran.
+  // Layar digambar ulang penuh tiap 4 tick supaya test tidak perlu menunggu lama.
+  const animPrelude = (cols, rows = 40) => `${FIXTURE}\n${promptBlock}\nshow_install_banner() { echo "BANNER-INSTALL"; }\n${displayFns}\n` +
+    `SC_ORIG_STDOUT_IS_TTY=1\nIUI_COLS=${cols}\nIUI_ROWS=${rows}\nIUI_ANIM_REPAINT_TICKS=4\n: > '${B(logFile)}'\nexec 4>'${B(screenFile)}'\n`;
   const readScreen = () => fs.readFileSync(screenFile, 'utf8');
+  // Kode kursor dibuat terbaca: <ATn> = pindah ke baris n, <EL> = hapus sampai
+  // ujung baris, <ED> = hapus sampai ujung layar.
   const decode = (raw) => stripAnsi(raw
-    .replace(/\x1b\[(\d+)A/g, '<UP$1>').replace(/\x1b\[(\d+)B/g, '<DN$1>')
-    .replace(/\x1b\[\?25l/g, '<HIDE>').replace(/\x1b\[\?25h/g, '<SHOW>')
-    .replace(/\x1b\[H\x1b\[2J/g, '<CLEAR>'));
+    .replace(/\x1b\[H\x1b\[2J/g, '<CLEAR>')
+    .replace(/\x1b\[(\d+);1H/g, '<AT$1>').replace(/\x1b\[K/g, '<EL>').replace(/\x1b\[J/g, '<ED>')
+    .replace(/\x1b\[\?25l/g, '<HIDE>').replace(/\x1b\[\?25h/g, '<SHOW>'));
+  const paintsOf = (screen) => [...screen.matchAll(/<AT(\d+)>([^<]*)<EL>/g)].map((m) => ({ row: Number(m[1]), text: m[2] }));
+  const inner = (text) => text.replace(/^ │ /, '').replace(/ │$/, '').trim();
   const pidGone = (pid) => spawnSync(bash, ['-c', `kill -0 ${pid} 2>/dev/null`]).status !== 0;
   const waitGone = (pid) => {
     for (let i = 0; i < 40 && !pidGone(pid); i++) spawnSync(bash, ['-c', 'sleep 0.1']);
     return pidGone(pid);
   };
+  const WALL = 'haproxy[61442]: backend bk_sshws_tls has no server available!';
 
   for (const [term, cols] of [['xterm-256color', 80], ['linux', 44]]) {
     const r = run(`${animPrelude(cols)}
@@ -296,47 +300,81 @@ install_display_start
 echo "\${IUI_ANIM_PID}" > '${B(pidFile)}'
 echo "BARIS-RINCI-LANGKAH-SATU"
 show_install_progress 8 "Install paket dasar"
-sleep 1.5
 printf 'Setting up nginx-common (1.22.1-9) ...\\r\\n'
+sleep 1.5
+# Meteran unduhan curl: deretan angka yang ditulis ulang dengan \\r.
+printf '  %% Total    %% Received %% Xferd  Average Speed   Time    Time     Time  Current\\n'
+printf '  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0\\r'
+sleep 1.5
+# Siaran wall dari journald: ditulis langsung ke terminal, bukan oleh installer.
+printf '\\r\\n\\r\\nBroadcast message from systemd-journald@vps (Wed 2026-09-30 19:30:12 WIB):\\r\\n\\r\\n${WALL}\\r\\n\\r\\n' >&4
+show_install_progress 60 "Setup ZIVPN"
+sleep 2.5
+echo "unduh selesai"
 sleep 1.5
 show_install_progress 100 "Berhasil keinstall semua."
 install_display_finish
 false
-`, { TERM: term });
+`, { TERM: term, STY: '' });
     // Setelah install_display_finish trap dilepas: kegagalan berikutnya tidak
     // boleh memunculkan layar gagal.
     assert.strictEqual(r.status, 1, `animasi ${term}:\n${r.stdout}\n${r.stderr}`);
     const raw = readScreen();
     const screen = decode(raw);
     const bw = Math.min(78, Math.max(40, cols - 2));
-    assert(screen.startsWith('<CLEAR>'), 'animasi harus mulai dari layar bersih');
-    for (const text of ['S C   1 F O R C R   N E X U S', 'MEMASANG', '[ INSTALASI ]', 'Jangan tutup terminal ini.']) {
-      assert(screen.includes(text), `kerangka animasi harus memuat: ${text}`);
+    assert(screen.startsWith('<HIDE><CLEAR>'), 'animasi harus mulai dari layar bersih dengan kursor tersembunyi');
+
+    // Tidak ada gerak kursor relatif dan tidak ada newline dari animasi:
+    // semua baris digambar di posisi tetap, jadi tulisan dari luar tidak bisa
+    // menggeser kotak dan animasi sendiri tidak pernah menggulung layar.
+    assert(!/\x1b\[\d*[ABCDEF]/.test(raw), 'animasi tidak boleh memakai gerak kursor relatif');
+    const ownOutput = raw.split(/\r\n\r\nBroadcast message[^]*?available!\r\n\r\n/);
+    assert.strictEqual(ownOutput.length, 2, 'siaran wall tiruan tidak ditemukan di tangkapan layar');
+    assert(!ownOutput.join('').includes('\n'), 'animasi tidak boleh mengirim newline');
+
+    const paints = paintsOf(screen);
+    const topRow = (paints.find((p) => p.text.includes('[ INSTALASI ]')) || {}).row;
+    assert.strictEqual(topRow, 6, 'dengan terminal tinggi, kotak berada di bawah banner');
+    const row1 = topRow + 1;
+    const park = row1 + 5; // tiga baris isi, garis bawah, satu baris petunjuk
+    const isDynamic = (p) => p.row >= row1 && p.row <= row1 + 2;
+    for (const text of ['S C   1 F O R C R   N E X U S', 'MEMASANG', 'Jangan tutup terminal ini.']) {
+      assert(paints.some((p) => !isDynamic(p) && p.text.includes(text)), `kerangka animasi harus memuat: ${text}`);
     }
-    const [frame, live] = screen.split('<HIDE>');
-    assert(live !== undefined, 'kursor harus disembunyikan sebelum animasi jalan');
-    for (const line of frame.split('\n').filter((l) => isFrame(l) || isBanner(l))) {
-      assert.strictEqual(width(line), bw + 1, `kerangka animasi tidak lurus (${term}):\n${line}`);
+    assert(paints.every((p) => p.row >= 1 && p.row < park), 'tidak boleh menggambar di luar kerangka');
+    for (const p of paints.filter((q) => isDynamic(q) || isFrame(q.text) || isBanner(q.text))) {
+      assert.strictEqual(width(p.text), bw + 1, `baris animasi tidak lurus (${term}, baris ${p.row}):\n${p.text}`);
     }
-    // Proses animasi tidak boleh mengirim newline (layar akan tergulung dan
-    // posisi baris bergeser), dan setiap baris kembali ke posisi semula.
-    assert(!live.includes('\n'), 'animasi tidak boleh menggulung layar');
-    const draws = [...live.matchAll(/<UP(\d+)>\r([^\r<]*)<DN(\d+)>\r/g)];
-    assert(draws.length >= 6, `animasi harus menggambar beberapa kali (${term}): ${draws.length}`);
-    for (const [, up, row, down] of draws) {
-      assert.strictEqual(up, down, 'kursor harus kembali ke posisi semula');
-      assert(['5', '4', '3'].includes(up), `baris di luar kotak digambar: UP${up}`);
-      assert.strictEqual(width(row), bw + 1, `baris animasi tidak lurus (${term}):\n${row}`);
+    // Setiap baris isi diikuti parkir kursor di bawah kotak.
+    for (const m of screen.matchAll(/<AT(\d+)>[^<]*<EL><AT(\d+)>/g)) {
+      if (Number(m[1]) >= row1 && Number(m[1]) <= row1 + 2) assert.strictEqual(Number(m[2]), park, 'kursor harus diparkir di bawah kotak');
     }
-    const rowsAt = (n) => draws.filter((d) => d[1] === String(n)).map((d) => d[2]);
-    assert(rowsAt(5).some((l) => l.includes('Install paket dasar')), 'langkah yang sedang jalan harus tampil');
-    assert(rowsAt(5).every((l) => /\d\d:\d\d │$/.test(l)), 'waktu berjalan harus tampil di ujung baris');
-    assert(new Set(rowsAt(5).map((l) => l.slice(3, 4))).size >= 2, 'spinner harus berganti bentuk');
-    const percents = rowsAt(4).map((l) => Number((l.match(/(\d+)% │$/) || [])[1]));
-    assert(percents.length >= 2 && percents.every((p, i) => i === 0 || p >= percents[i - 1]), `bar harus naik: ${percents}`);
+
+    const at = (n) => paints.filter((p) => p.row === n).map((p) => p.text);
+    assert(at(row1).some((l) => l.includes('Install paket dasar')) && at(row1).some((l) => l.includes('Setup ZIVPN')), 'langkah yang sedang jalan harus tampil');
+    assert(at(row1).every((l) => /\d\d:\d\d │$/.test(l)), 'waktu berjalan harus tampil di ujung baris');
+    assert(new Set(at(row1).map((l) => l.slice(3, 4))).size >= 2, 'spinner harus berganti bentuk');
+    const percents = at(row1 + 1).map((l) => Number((l.match(/(\d+)% │$/) || [])[1]));
+    assert(percents.length >= 3 && percents.every((p, i) => i === 0 || p >= percents[i - 1]), `bar harus naik: ${percents}`);
     assert.strictEqual(percents[percents.length - 1], 100, 'bar harus penuh sebelum layar diganti');
-    assert(rowsAt(3).some((l) => l.includes('Setting up nginx-common (1.22.1-9) ...')), 'baris log terakhir harus tampil');
-    assert(rowsAt(3).every((l) => !/\[[=-]+\] +\d+%/.test(l)), 'baris progres installer tidak perlu diulang sebagai rincian');
+
+    const details = at(row1 + 2).map(inner);
+    const iNginx = details.indexOf('Setting up nginx-common (1.22.1-9) ...');
+    const iDone = details.indexOf('unduh selesai');
+    assert(iNginx >= 0 && iDone > iNginx, `baris log terakhir harus tampil: ${JSON.stringify(details)}`);
+    assert(details.every((d) => !d.includes('--:--:--') && !d.includes('% Total')), 'meteran unduhan curl tidak ditampilkan');
+    assert(details.every((d) => !/\[[=-]+\] +\d+%/.test(d)), 'baris progres installer tidak perlu diulang sebagai rincian');
+    assert(details.slice(iNginx + 1, iDone).includes(''), 'rincian langkah lama harus dikosongkan saat langkah berganti');
+
+    // Pulih sendiri: setelah siaran wall, seluruh kerangka digambar ulang di
+    // posisi yang sama dan sisa tulisan di bawah kotak dihapus.
+    const afterWall = screen.slice(screen.indexOf(WALL) + WALL.length);
+    assert(afterWall.includes(`<AT${park}><ED>`), 'tulisan dari luar harus dibersihkan oleh gambar ulang berikutnya');
+    const healed = paintsOf(afterWall);
+    assert(healed.some((p) => p.row === topRow && p.text.includes('[ INSTALASI ]')), 'garis atas kotak harus digambar ulang di baris yang sama');
+    assert(healed.some((p) => p.row === row1 && p.text.includes('Setup ZIVPN')), 'isi kotak tetap di baris yang sama setelah siaran wall');
+    assert(healed.every((p) => p.row < park), 'kotak tidak boleh ikut bergeser ke bawah');
+
     assert(screen.trimEnd().endsWith('<SHOW>'), 'kursor harus dimunculkan lagi');
     assert(!screen.includes('INSTALL GAGAL'));
     if (term === 'linux') assert(!/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(raw), 'konsol teks memakai spinner ASCII');
@@ -350,6 +388,23 @@ false
     assert(!fs.existsSync(path.join(tmpDir, 'install-anim.state')), 'file status animasi harus dibersihkan');
   }
 
+  // Terminal pendek: banner dibuang supaya kotaknya tetap muat. Di dalam GNU
+  // screen ada petunjuk untuk menyambung lagi dengan nama sesi yang sedang jalan.
+  {
+    const r = run(`${animPrelude(80, 9)}
+install_display_start
+show_install_progress 8 "Install paket dasar"
+sleep 1.2
+install_display_finish
+`, { TERM: 'xterm-256color', STY: '4242.1forcr-sc' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    const paints = paintsOf(decode(readScreen()));
+    assert.strictEqual((paints.find((p) => p.text.includes('[ INSTALASI ]')) || {}).row, 1, 'di terminal pendek kotak mulai dari baris pertama');
+    assert(!paints.some((p) => isBanner(p.text)), 'banner tidak digambar di terminal pendek');
+    assert(paints.some((p) => p.row === 7 && p.text.includes('Putus? Jalankan: screen -r 1forcr-sc')), 'petunjuk screen harus memakai nama sesi yang jalan');
+    assert(paints.every((p) => p.row <= 7), 'tidak boleh menggambar melewati tinggi terminal');
+  }
+
   // Install gagal di tengah jalan: animasi berhenti dan penyebabnya (ujung
   // log) ditampilkan, karena keluaran rinci tidak pernah sampai ke terminal.
   {
@@ -360,13 +415,16 @@ show_install_progress 2 "Validasi lisensi"
 sleep 0.8
 echo "Install ditolak: IP VPS belum terdaftar."
 exit 7
-`, { TERM: 'xterm-256color' });
+`, { TERM: 'xterm-256color', STY: '' });
     assert.strictEqual(r.status, 7, 'kode keluar asli harus dipertahankan');
     const screen = decode(readScreen()).replace(/\s+/g, ' ');
-    assert(screen.includes('INSTALL GAGAL (kode 7) di langkah: Validasi lisensi'), screen.slice(-600));
-    assert(screen.includes('Akhir log:') && screen.includes('Install ditolak: IP VPS belum terdaftar.'));
-    assert(screen.includes(`Log lengkap: ${B(logFile)}`));
-    assert(screen.lastIndexOf('<SHOW>') < screen.indexOf('INSTALL GAGAL'), 'kursor dimunculkan sebelum pesan gagal');
+    const report = screen.slice(screen.lastIndexOf('<CLEAR>'));
+    assert(screen.lastIndexOf('<CLEAR>') > screen.indexOf('[ INSTALASI ]'), 'layar dibersihkan sebelum laporan gagal');
+    assert(report.includes('INSTALL GAGAL (kode 7) di langkah: Validasi lisensi'), report.slice(0, 600));
+    assert(report.includes('Akhir log:') && report.includes('Install ditolak: IP VPS belum terdaftar.'));
+    assert(report.includes(`Log lengkap: ${B(logFile)}`));
+    assert(!report.includes('<AT'), 'animasi tidak boleh menggambar lagi setelah laporan gagal');
+    assert(screen.lastIndexOf('<SHOW>') < screen.lastIndexOf('<CLEAR>'), 'kursor dimunculkan sebelum laporan gagal');
     assert(waitGone(fs.readFileSync(pidFile, 'utf8').trim()), 'proses animasi harus berhenti saat install gagal');
   }
 
@@ -378,20 +436,21 @@ install_display_start
 echo "\${IUI_ANIM_PID}" > '${B(pidFile)}'
 sleep 0.8
 kill -9 $$
-`, { TERM: 'xterm-256color' });
+`, { TERM: 'xterm-256color', STY: '' });
     assert(waitGone(fs.readFileSync(pidFile, 'utf8').trim()), 'proses animasi tidak boleh tertinggal setelah installer mati');
     assert(decode(readScreen()).trimEnd().endsWith('<SHOW>'), 'kursor harus dikembalikan walau installer mati mendadak');
   }
 
-  // Tanpa terminal, log dimatikan, terminal bodoh, atau INSTALL_ANIMATION=0:
-  // tampilan lama (baris progres biasa di stdout), tanpa proses latar.
-  for (const setup of ['SC_ORIG_STDOUT_IS_TTY=0', 'INSTALL_ANIMATION=0', 'INSTALL_LOG_DISABLE=1', 'TERM=dumb']) {
+  // Tanpa terminal, log dimatikan, terminal bodoh, terminal terlalu pendek,
+  // atau INSTALL_ANIMATION=0: tampilan lama (baris progres biasa di stdout),
+  // tanpa proses latar.
+  for (const setup of ['SC_ORIG_STDOUT_IS_TTY=0', 'INSTALL_ANIMATION=0', 'INSTALL_LOG_DISABLE=1', 'TERM=dumb', 'IUI_ROWS=5']) {
     const r = run(`${animPrelude(80)}${setup}
 install_display_start
 show_install_progress 8 "Install paket dasar"
 echo "pid=[\${IUI_ANIM_PID}]"
 install_display_finish
-`, { TERM: 'xterm-256color' });
+`, { TERM: 'xterm-256color', STY: '' });
     assert.strictEqual(r.status, 0, r.stderr);
     assert(r.stdout.includes('BANNER-INSTALL') && /\] +8% \| Install paket dasar/.test(r.stdout), `progres biasa harus tampil (${setup})`);
     assert(r.stdout.includes('pid=[]'), `animasi tidak boleh jalan (${setup})`);
@@ -434,6 +493,13 @@ assert(extract(installer, 'show_install_progress() {', '\nINSTALL_LOG_START_BYTE
 assert(/\n    DOMAIN EMAIL [^\n]* INSTALL_ANIMATION\n/.test(extract(installer, 'persist_pending_install_env() {', '\ninstall_pending_resume_helper() {')),
   'INSTALL_ANIMATION harus ikut ke lanjut-install');
 assert(installer.includes('\nINSTALL_ANIMATION="${INSTALL_ANIMATION:-1}"\n'));
+
+// HAProxy tidak boleh mengirim log level emerg: journald dan rsyslog
+// menyiarkannya ke semua terminal yang login, termasuk layar install. Config
+// ditulis di dua tempat (installer dan script menu) dan keduanya harus sama.
+const haproxyLogLines = installer.match(/^ {4}log \/dev\/log local0.*$/gm) || [];
+assert.deepStrictEqual(haproxyLogLines, ['    log /dev/log local0 notice alert', '    log /dev/log local0 notice alert'],
+  'kedua konfigurasi HAProxy harus membatasi level log paling parah ke alert');
 
 // Token asli hanya ke terminal; salinan di log disamarkan.
 const showFnText = extract(installer, 'show_install_finished() {', '\nopen_menu_after_install() {');

@@ -74,6 +74,12 @@ Lock yang salah langsung merugikan pembeli, jadi aturannya condong menghindari f
 - Lock butuh dua pengecekan berturut-turut dengan sidik jari kelompok IP yang sama (`sampleSshDeviceLimit`, `sampleXrayIpLimit`). Tidak boleh ada jalur lock dari satu sampel.
 - Sesi SSH-WS hanya dihitung kalau klien masih mengirim data sejak pengecekan sebelumnya (kolom `ClientToSSH` di `sshws-quota.tsv`), supaya sesi lama yang mati setelah HP ganti IP tidak terbaca sebagai perangkat kedua.
 - Toleransi ZIVPN limit 1 (maksimal 2 IP dihitung 1) sengaja dipertahankan. Jangan diperketat tanpa data dari `iplimit_lock_history`.
+- **Untuk operator di `IPLIMIT_MERGE_ASNS`, IP-limit Xray menghitung jumlah IP, bukan kelompok subnet: setiap N IP adalah satu perangkat.** Ini dari kasus nyata: satu HP XL (limit 2) teramati sekaligus di `112.215.x`, `140.213.x`, dan `203.78.x`, lalu terkunci, sedangkan tiap HP XL tambahan membawa IP-nya sendiri. Default-nya XL Axiata termasuk Axis dengan N = 2 (2 IP = 1 perangkat, 4 IP = 2 perangkat). Operatornya, angka 2, dan cakupan "Xray saja" adalah keputusan pemilik; jangan diubah atau ditambah operator lain tanpa bukti dari `iplimit_lock_history`.
+  - Hanya VMess/VLESS/Trojan. SSH, ZIVPN, dan UDP Custom tetap per kelompok subnet, jadi hanya jalur Xray yang memanggil `countEffectiveDevices(..., true)` dan `ipGroupFingerprint(..., true)`.
+  - Format: ASN satu operator digabung `+`, `:N` di ujung adalah jumlah IP per perangkat, antar operator dipisah koma (`24203+17885+...:2,23693:3`). XL memakai beberapa ASN, jadi satu nomor saja tidak cukup. Tanpa `:N` seluruh operator dihitung satu perangkat. Kosong berarti fitur mati.
+  - Hitungan ini bisa lebih kecil **atau lebih besar** dari hitungan subnet (5 IP XL dalam satu `/16` adalah 3 perangkat), jadi pemilik IP dicari begitu jumlah IP mentah akun melewati limit (`primeOperatorGroups`), bukan menunggu hitungan subnetnya lewat.
+  - Sidik jari pelanggaran Xray memakai kunci operator, karena alamat XL berganti di tiap pengecekan; dengan sidik jari per subnet pelanggaran sungguhan tidak pernah terkonfirmasi dua siklus.
+  - Pemilik IP dicari lewat DNS (Team Cymru, resolver sistem lalu 8.8.8.8/1.1.1.1) dan disimpan 7 hari di tabel `ip_operator_cache`. Pencarian berhenti setelah tiga kegagalan per siklus. Kalau pencarian gagal, aturan subnet lama yang berlaku.
 - Test: `npm run test:iplimit-devices` dan `npm run test:xray-iplimit`.
 
 ### ON/OFF layanan (menu [08])
@@ -87,6 +93,8 @@ Lock yang salah langsung merugikan pembeli, jadi aturannya condong menghindari f
 - Port inbound Xray baru wajib ditambahkan ke `VMESS_PORTS`/`VLESS_PORTS`/`TROJAN_PORTS` di script ini, atau layanan itu tidak ikut tertutup. Test: `npm run test:service-gate`.
 
 Timeout HAProxy sengaja panjang (`timeout client/server 12h`) supaya tunnel WS tidak putus sendiri. Yang menjaga socket mati tidak menumpuk adalah `option clitcpka`/`srvtcpka` plus sysctl keepalive agresif (`tcp_keepalive_time=60`, `intvl=15`, `probes=4`). Ketiganya satu paket. Jangan hapus salah satu tanpa mengganti mekanisme penggantinya.
+
+Log HAProxy memakai `log /dev/log local0 notice alert`. Kata `alert` di ujung membatasi level paling parah: tanpa itu, "backend ... has no server available!" dikirim sebagai `emerg` dan disiarkan ke semua terminal yang sedang login, termasuk layar menu dan layar install. Pesan itu pasti muncul di setiap install baru, karena HAProxy dipasang sebelum layanan SSH-WS hidup. Konfigurasi ditulis di dua tempat (`setup_haproxy_tls_mux` dan salinannya di script menu); keduanya harus sama.
 
 ## Aturan systemd timer (penting, pernah jadi bug nyata)
 
@@ -194,6 +202,7 @@ Layar input domain di awal dan layar ringkasan di akhir install digambar mesin `
 - `show_install_finished` dipanggil setelah status pending dibersihkan dan dengan `|| true`: masalah tampilan tidak boleh membuat install yang sudah selesai dianggap terputus. Menu baru dibuka setelah Enter, karena menu langsung membersihkan layar.
 - Selama install penuh di terminal interaktif, progres ditampilkan sebagai animasi (`install_display_start` sampai `install_display_finish`): spinner, langkah yang sedang jalan, bar, waktu, dan baris log terakhir. Sejak animasi mulai, stdout/stderr installer **hanya** menuju `install.log`. Jalur update aman tidak memakainya. `INSTALL_ANIMATION=0`, tanpa terminal, `TERM=dumb`, atau `INSTALL_LOG_DISABLE=1` kembali ke baris progres biasa.
 - Yang menggambar adalah satu proses latar (`iui_anim_loop`) yang membaca file status `persen|pesan`; installer sendiri tidak pernah menulis ke terminal, jadi terminal yang macet tidak menahan install. Proses itu hanya menggambar ulang baris yang berubah, membaca log kira-kira sedetik sekali, tidak pernah mengirim newline (layar tidak boleh tergulung), dan berhenti sendiri kalau installer mati. Jangan tambahkan efek yang menggambar ulang bar di setiap tick; itu melipatgandakan data yang dikirim lewat SSH.
+- **Semua baris animasi digambar di posisi layar yang tetap** (`\033[baris;1H`), bukan "sekian baris di atas kursor", dan seluruh kerangka digambar ulang kira-kira 5 detik sekali sambil menghapus apa pun di bawah kotak. Ini pernah jadi bug nyata: terminal bisa ditulisi pihak lain kapan saja (journald dan rsyslog menyiarkan pesan level `emerg` ke semua terminal yang login), tulisan itu menggeser kursor, dan kotak tergambar ulang di tempat yang salah. Jangan kembali ke gerak kursor relatif.
 - Karena keluaran rinci tersembunyi, dua hal wajib dijaga: trap `install_display_on_exit` menampilkan ujung log saat install berhenti sebelum selesai, dan layar akhir menyebut jumlah peringatan yang tercatat di log. Langkah install baru tidak boleh meminta input lewat terminal selama animasi jalan.
 - Test: `npm run test:installer-ui` menggambar kedua layar di 6 lebar, 4 mode warna, dan 2 locale, menjalankan alur input domain dengan terminal tiruan, dan menjalankan animasi sungguhan (selesai normal, install gagal, installer mati mendadak).
 

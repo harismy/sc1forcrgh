@@ -5473,7 +5473,7 @@ async function buildInstallerQuickCopyText(options = {}) {
     ? `INSTALL_AUTH_TOKEN=${shellQuote(serverKey)} API_AUTH_TOKEN=${shellQuote(serverKey)} AUTH_TOKEN=${shellQuote(serverKey)} `
     : '';
   const urlArgs = installerUrls.map(shellQuote).join(' ');
-  const cmd = `rm -f /root/nexus-installer.sh; for u in ${urlArgs}; do if curl -4fsSL --connect-timeout 15 --retry 3 "$u" -o /root/nexus-installer.sh && head -n1 /root/nexus-installer.sh | grep -q '^#!'; then break; fi; rm -f /root/nexus-installer.sh; done; test -s /root/nexus-installer.sh && chmod +x /root/nexus-installer.sh && ${keyEnv}screen -S nexus-sc /root/nexus-installer.sh`;
+  const cmd = `rm -f /root/nexus-installer.sh; for u in ${urlArgs}; do if curl -4fsSL --connect-timeout 15 --retry 3 "$u" -o /root/nexus-installer.sh && head -n1 /root/nexus-installer.sh | grep -q '^#!'; then break; fi; rm -f /root/nexus-installer.sh; done; test -s /root/nexus-installer.sh && chmod +x /root/nexus-installer.sh && ${keyEnv}screen -S 1forcr-sc /root/nexus-installer.sh`;
   const line = '────────────────────────';
   if (isGeneral) {
     return {
@@ -5496,8 +5496,8 @@ async function buildInstallerQuickCopyText(options = {}) {
         `[3/3] <code>${escapeHtml(cmd)}</code>`,
         line,
         '<b>SESSION RECOVERY</b>',
-        '<code>screen -r nexus-sc</code>',
-        '<code>screen -d -r nexus-sc</code>'
+        '<code>screen -r 1forcr-sc</code>',
+        '<code>screen -d -r 1forcr-sc</code>'
       ].join('\n'),
       parse_mode: 'HTML'
     };
@@ -5534,9 +5534,9 @@ async function buildInstallerQuickCopyText(options = {}) {
       line,
       '<b>SESSION RECOVERY</b>',
       'Koneksi terputus? Login kembali lalu jalankan:',
-      '<code>screen -r nexus-sc</code>',
+      '<code>screen -r 1forcr-sc</code>',
       'Jika sesi masih attached:',
-      '<code>screen -d -r nexus-sc</code>',
+      '<code>screen -d -r 1forcr-sc</code>',
       '',
       '— 1FORCR NEXUS Installer —'
     ].join('\n'),

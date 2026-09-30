@@ -128,6 +128,9 @@ set -euo pipefail
 #   XRAY_RECENT_WINDOW_MINUTES=5                 (opsional, jendela menit log xray untuk kandidat multi-login)
 #   XRAY_ACTIVE_WINDOW_SECONDS=60                (opsional, jendela detik untuk kandidat IP aktif xray)
 #   XRAY_MIN_HITS_PER_IP=2                       (opsional, minimal hit/log per IP pada jendela aktif)
+#   IPLIMIT_MERGE_ASNS=24203+17885+24208+24518+139994+58496:2
+#                                                (IP-limit Xray: ASN satu operator digabung "+", ":N" = N IP dihitung
+#                                                 satu perangkat, antar operator dipisah koma; default XL/Axis, kosong=mati)
 #   XRAY_REAL_IP_ENABLE=0                        (canary: 1=teruskan IP asli HAProxy->Nginx->Xray)
 #   XRAY_XHTTP_ENABLE=0                          (opsional: 1=aktifkan inbound XHTTP VLESS di /xhvless)
 #   SERVICE_SSH_ENABLE=1                         (menu ON/OFF LAYANAN: 0=tolak SSH-WS/SSL/Dropbear; sshd 22 tetap buka)
@@ -193,7 +196,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.78}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.80}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -298,6 +301,12 @@ XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
 XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}"
+# Operator yang IP-nya dihitung per sekian alamat oleh IP-limit Xray, bukan per
+# kelompok subnet. Satu operator bisa punya beberapa nomor (ASN), digabung
+# dengan "+"; ":N" di ujung berarti N IP dihitung satu perangkat; antar
+# operator dipisah koma. Default: XL Axiata termasuk Axis, 2 IP = 1 perangkat.
+# Kosongkan untuk mematikan.
+IPLIMIT_MERGE_ASNS="${IPLIMIT_MERGE_ASNS-24203+17885+24208+24518+139994+58496:2}"
 XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}"
 XRAY_VERSION="${XRAY_VERSION:-}"
 XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
@@ -619,7 +628,9 @@ IUI_BW=0; IUI_IW=0; IUI_W=0
 IUI_GRAD=(); IUI_GRAD_BG=(); IUI_LINES=(); IUI_SVC=()
 IUI_PUBLIC_IP=""; IUI_DNS_STATE=""; IUI_DNS_IP=""; IUI_SSL=""
 IUI_ROW=""; IUI_CLIP=""; IUI_WARNINGS=0
-IUI_ANIM_PID=""; IUI_ANIM_LOG=""; IUI_ANIM_STATE=""; IUI_ANIM_UP=0
+IUI_ANIM_PID=""; IUI_ANIM_LOG=""; IUI_ANIM_STATE=""; IUI_ANIM_SIZE=""
+IUI_ANIM_ROW1=1; IUI_ANIM_PARK=1; IUI_ANIM_FRAME=(); IUI_ANIM_HINTS=()
+IUI_TTY_ROWS=0; IUI_TTY_COLS=0
 IUI_BAR_ON=(); IUI_BAR_OFF=""
 
 iui_tty_ok() {
@@ -695,7 +706,7 @@ iui_layout() {
   local -a sr=(0 41 150 255) sg=(229 121 70 64) sb=(255 255 255 170)
   local -a fg16=($'\033[96m' $'\033[94m' $'\033[95m') bg16=($'\033[106m' $'\033[104m' $'\033[105m')
   if [[ ! "${cols}" =~ ^[0-9]+$ ]]; then
-    size="$(stty size </dev/tty 2>/dev/null || true)"
+    size="$(stty size 2>/dev/null </dev/tty || true)"
     if [[ "${size}" =~ ^[0-9]+\ ([0-9]+)$ ]]; then cols="${BASH_REMATCH[1]}"; fi
   fi
   if [[ ! "${cols}" =~ ^[0-9]+$ || "${cols}" -lt 30 ]]; then cols=62; fi
@@ -1096,8 +1107,12 @@ iui_screen_finished() {
 # yang membaca file status; installer cukup menulis "persen|pesan" ke file itu
 # dan tidak pernah menulis ke terminal, jadi terminal yang macet (Ctrl+S,
 # koneksi lambat) tidak bisa menahan proses install.
-# Hemat resource untuk VPS 1 vCPU: hanya baris yang berubah yang digambar
-# ulang, dan log dibaca kira-kira sedetik sekali.
+# Hemat resource untuk VPS 1 vCPU: di tiap tick hanya baris yang berubah yang
+# digambar, log dibaca kira-kira sedetik sekali, dan seluruh layar digambar
+# ulang kira-kira 5 detik sekali.
+# Semua baris digambar di posisi layar yang tetap. Terminal bisa ditulisi pihak
+# lain kapan saja (journald menyiarkan pesan level emerg ke semua terminal),
+# dan tulisan itu tidak boleh menggeser kotak.
 
 iui_anim_supported() {
   [[ "${INSTALL_ANIMATION:-1}" != "0" ]] || return 1
@@ -1120,15 +1135,93 @@ iui_clip() {
   IUI_CLIP="${s}"
 }
 
-# Gambar ulang satu baris kotak yang letaknya $1 baris di atas kursor, lalu
-# kembalikan kursor. Tanpa newline, jadi layar tidak pernah tergulung.
-iui_anim_put() {
-  iui_row_build "$2"
-  printf '\033[%dA\r%s\033[%dB\r' "$1" "${IUI_ROW}" "$1"
+# Ukuran terminal -> IUI_TTY_ROWS IUI_TTY_COLS (0 kalau tidak diketahui).
+# IUI_ROWS dan IUI_COLS memaksa nilainya.
+iui_tty_size() {
+  local size=""
+  IUI_TTY_ROWS=0; IUI_TTY_COLS=0
+  size="$(stty size 2>/dev/null </dev/tty || true)"
+  if [[ "${size}" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
+    IUI_TTY_ROWS="${BASH_REMATCH[1]}"; IUI_TTY_COLS="${BASH_REMATCH[2]}"
+  fi
+  if [[ "${IUI_ROWS:-}" =~ ^[0-9]+$ ]]; then IUI_TTY_ROWS="${IUI_ROWS}"; fi
+  if [[ "${IUI_COLS:-}" =~ ^[0-9]+$ ]]; then IUI_TTY_COLS="${IUI_COLS}"; fi
 }
 
-# Baris log terakhir -> IUI_CLIP. Baris progres installer sendiri dilewati
-# karena isinya sudah tampil di kotak.
+# Susun kerangka layar untuk ukuran terminal saat ini:
+#   IUI_ANIM_FRAME[n] = isi baris layar ke-n yang statis (banner, garis, petunjuk)
+#   IUI_ANIM_ROW1     = baris layar untuk isi kotak pertama (tiga baris isi)
+#   IUI_ANIM_PARK     = baris tempat kursor diparkir, tepat di bawah petunjuk
+# Gagal (1) tanpa mengubah apa pun kalau terminal terlalu pendek untuk kotaknya.
+iui_anim_build() {
+  local i barw hint need r=1 line
+  local -a head=()
+  iui_tty_size
+  need=$(( 5 + ${#IUI_ANIM_HINTS[@]} + 1 ))
+  if (( IUI_TTY_ROWS > 0 && IUI_TTY_ROWS < need )); then return 1; fi
+  IUI_ANIM_SIZE="${IUI_TTY_ROWS}x${IUI_TTY_COLS}"
+  iui_layout
+  barw=$(( IUI_IW - 2 - 5 ))
+  IUI_BAR_ON=()
+  for ((i = 0; i < barw; i++)); do
+    if [[ "${IUI_MODE}" == "none" ]]; then
+      IUI_BAR_ON[i]="#"
+    else
+      IUI_BAR_ON[i]="${IUI_GRAD[i + 2]}█"
+    fi
+  done
+  if [[ "${IUI_MODE}" == "none" ]]; then IUI_BAR_OFF="-"; else IUI_BAR_OFF="░"; fi
+  # Banner hanya dipasang kalau tinggi terminal cukup untuk layar penuh.
+  if (( IUI_TTY_ROWS == 0 || IUI_TTY_ROWS >= need + 5 )); then
+    mapfile -t head < <(
+      printf '\n'
+      iui_banner "S C   1 F O R C R   N E X U S"
+      iui_center "${IUI_VAL}${IUI_BOLD}MEMASANG${IUI_NC}  ${IUI_ACC2}◆${IUI_NC}  ${IUI_ACC}${SCRIPT_VERSION}${IUI_NC}"
+    )
+  fi
+  IUI_ANIM_FRAME=()
+  for line in ${head[@]+"${head[@]}"}; do
+    IUI_ANIM_FRAME[r]="${line}"
+    r=$(( r + 1 ))
+  done
+  IUI_ANIM_FRAME[r]="$(iui_line '╭' '╮' "INSTALASI")"
+  IUI_ANIM_ROW1=$(( r + 1 ))
+  r=$(( r + 4 ))
+  IUI_ANIM_FRAME[r]="$(iui_line '╰' '╯')"
+  r=$(( r + 1 ))
+  for hint in "${IUI_ANIM_HINTS[@]}"; do
+    iui_clip "${hint}" "$(( IUI_BW - 2 ))"
+    IUI_ANIM_FRAME[r]="  ${IUI_MUTED}${IUI_CLIP}${IUI_NC}"
+    r=$(( r + 1 ))
+  done
+  IUI_ANIM_PARK="${r}"
+  return 0
+}
+
+# Gambar semua baris statis di posisi tetapnya, lalu hapus apa pun di bawah
+# kotak. Tiap baris diakhiri "hapus sampai ujung baris", jadi tulisan dari luar
+# (siaran wall, pesan kernel) tidak meninggalkan sisa.
+iui_anim_paint_frame() {
+  local r out=""
+  for r in "${!IUI_ANIM_FRAME[@]}"; do
+    out+=$'\033'"[${r};1H${IUI_ANIM_FRAME[r]}"$'\033[K'
+  done
+  out+=$'\033'"[${IUI_ANIM_PARK};1H"$'\033[J'
+  printf '%s' "${out}"
+}
+
+# Gambar satu baris isi kotak ($1 = 0, 1, atau 2) di posisi tetapnya, lalu
+# parkir kursor di bawah kotak. Posisi mutlak, bukan "sekian baris di atas
+# kursor": tulisan dari luar yang menggeser kursor tidak boleh ikut menggeser
+# kotak. Tanpa newline, jadi animasi sendiri tidak pernah menggulung layar.
+iui_anim_put() {
+  iui_row_build "$2"
+  printf '\033[%d;1H%s\033[K\033[%d;1H' "$(( IUI_ANIM_ROW1 + $1 ))" "${IUI_ROW}" "${IUI_ANIM_PARK}"
+}
+
+# Baris log terakhir -> IUI_CLIP. Gagal (1) kalau baris itu tidak layak
+# ditampilkan: baris progres installer sendiri (isinya sudah ada di kotak) dan
+# meteran unduhan curl (hanya deretan angka).
 iui_anim_log_tail() {
   local LC_ALL=C raw="" re=$'\033''\[[0-9;?]*[A-Za-z]'
   raw="$(tail -c 400 "${IUI_ANIM_LOG}" 2>/dev/null || true)"
@@ -1137,15 +1230,18 @@ iui_anim_log_tail() {
   raw="${raw##*$'\n'}"
   while [[ "${raw}" =~ ${re} ]]; do raw="${raw//"${BASH_REMATCH[0]}"/}"; done
   raw="${raw#\[autoscript-1FORCR-NEXUS\] }"
-  if [[ "${raw}" == "["[=-]*"% | "* ]]; then raw=""; fi
+  if [[ -z "${raw//[[:space:]]/}" || "${raw}" == "["[=-]*"% | "* ]]; then return 1; fi
+  if [[ "${raw}" == *"% Total"* || "${raw}" == *"Dload"* || "${raw}" =~ ^[[:space:]0-9.:kKMGTB%-]+$ ]]; then return 1; fi
   iui_clip "${raw}" "$(( IUI_IW - 2 ))"
+  return 0
 }
 
 # Proses latar animasi. Berhenti sendiri kalau installer mati, kalau terminal
 # hilang, atau kalau file status berisi "stop".
 iui_anim_loop() {
-  local tick=0 shown=0 target=0 msg="Menyiapkan instalasi" pct="" text="" drawn_pct=-1 drawn_detail=$'\001'
-  local start="${SECONDS}" el right left room fill i bar barw delta
+  local tick=0 shown=0 target=0 msg="Menyiapkan instalasi" pct="" text="" detail=""
+  local drawn_pct=-1 drawn_detail=$'\001' drawn_msg=""
+  local start="${SECONDS}" el right left room fill i bar barw delta every
   local -a frames=()
   set +e
   if [[ "${IUI_MODE}" == "truecolor" || "${IUI_MODE}" == "256" ]]; then
@@ -1153,7 +1249,9 @@ iui_anim_loop() {
   else
     frames=('|' '/' '-' '\')
   fi
-  barw=$(( IUI_IW - 2 - 5 ))
+  every="${IUI_ANIM_REPAINT_TICKS:-32}"
+  if [[ ! "${every}" =~ ^[1-9][0-9]*$ ]]; then every=32; fi
+  printf '\033[?25l\033[H\033[2J'
   while kill -0 "$$" 2>/dev/null; do
     pct=""; text=""
     IFS='|' read -r pct text < "${IUI_ANIM_STATE}"
@@ -1163,6 +1261,20 @@ iui_anim_loop() {
       if (( target > 100 )); then target=100; fi
       msg="${text}"
     fi
+
+    # Kira-kira tiap 5 detik seluruh layar digambar ulang di posisi tetap. Ini
+    # yang membuat tampilan pulih sendiri setelah ada tulisan dari luar atau
+    # layar tergulung, dan mengikuti ukuran terminal kalau berubah.
+    if (( tick % every == 0 )); then
+      iui_tty_size
+      if [[ "${IUI_TTY_ROWS}x${IUI_TTY_COLS}" != "${IUI_ANIM_SIZE}" ]]; then
+        if iui_anim_build; then printf '\033[H\033[2J'; fi
+      fi
+      iui_anim_paint_frame || break
+      drawn_pct=-1; drawn_detail=$'\001'
+    fi
+    barw=$(( IUI_IW - 2 - 5 ))
+
     # Bar mengejar target sedikit demi sedikit supaya naiknya halus. 100%
     # langsung penuh, karena layar ini segera diganti ringkasan akhir.
     if (( target >= 100 || shown > target )); then
@@ -1178,7 +1290,7 @@ iui_anim_loop() {
     room=$(( IUI_IW - 2 - 2 - 1 - ${#right} ))
     iui_clip "${msg}" "${room}"
     printf -v left '%-*s' "${room}" "${IUI_CLIP}"
-    iui_anim_put "${IUI_ANIM_UP}" "${IUI_ACC}${frames[tick % ${#frames[@]}]}${IUI_NC} ${IUI_VAL}${IUI_BOLD}${left}${IUI_NC} ${IUI_MUTED}${right}${IUI_NC}" || break
+    iui_anim_put 0 "${IUI_ACC}${frames[tick % ${#frames[@]}]}${IUI_NC} ${IUI_VAL}${IUI_BOLD}${left}${IUI_NC} ${IUI_MUTED}${right}${IUI_NC}" || break
 
     if (( shown != drawn_pct )); then
       fill=$(( shown * barw / 100 ))
@@ -1192,65 +1304,42 @@ iui_anim_loop() {
         fi
       done
       printf -v right '%3d%%' "${shown}"
-      iui_anim_put "$(( IUI_ANIM_UP - 1 ))" "${bar}${IUI_NC} ${IUI_VAL}${right}${IUI_NC}" || break
+      iui_anim_put 1 "${bar}${IUI_NC} ${IUI_VAL}${right}${IUI_NC}" || break
       drawn_pct="${shown}"
     fi
 
-    if (( tick % 6 == 0 )); then
-      iui_anim_log_tail
-      if [[ "${IUI_CLIP}" != "${drawn_detail}" ]]; then
-        drawn_detail="${IUI_CLIP}"
-        iui_anim_put "$(( IUI_ANIM_UP - 2 ))" "${IUI_MUTED}${drawn_detail}${IUI_NC}" || break
-      fi
+    # Rincian dari langkah sebelumnya tidak dibawa ke langkah berikutnya.
+    if [[ "${msg}" != "${drawn_msg}" ]]; then
+      drawn_msg="${msg}"
+      detail=""
+    fi
+    if (( tick % 6 == 0 )) && iui_anim_log_tail; then
+      detail="${IUI_CLIP}"
+    fi
+    if [[ "${detail}" != "${drawn_detail}" ]]; then
+      drawn_detail="${detail}"
+      iui_anim_put 2 "${IUI_MUTED}${detail}${IUI_NC}" || break
     fi
 
     tick=$(( tick + 1 ))
     sleep 0.15 2>/dev/null || sleep 1 || break
   done
-  printf '\033[?25h'
+  printf '\033[%d;1H\033[?25h' "${IUI_ANIM_PARK}"
 }
 
-# iui_anim_start FILE_LOG: gambar kerangka layar lalu jalankan proses animasi.
+# iui_anim_start FILE_LOG: siapkan kerangka layar lalu jalankan proses animasi.
 # Gagal (1) berarti animasi tidak jalan dan pemanggil memakai tampilan biasa.
 iui_anim_start() {
-  local log_file="$1" i barw hint
-  local -a hints=("Jangan tutup terminal ini.")
+  local log_file="$1"
+  IUI_ANIM_HINTS=("Jangan tutup terminal ini.")
   if [[ -n "${STY:-}" ]]; then
-    hints+=("Putus? Jalankan: screen -r ${STY#*.}")
+    IUI_ANIM_HINTS+=("Putus? Jalankan: screen -r ${STY#*.}")
   fi
   IUI_ANIM_LOG="${log_file}"
   IUI_ANIM_STATE="${log_file%/*}/install-anim.state"
   iui_init auto
-  iui_layout
-  barw=$(( IUI_IW - 2 - 5 ))
-  IUI_BAR_ON=()
-  for ((i = 0; i < barw; i++)); do
-    if [[ "${IUI_MODE}" == "none" ]]; then
-      IUI_BAR_ON[i]="#"
-    else
-      IUI_BAR_ON[i]="${IUI_GRAD[i + 2]}█"
-    fi
-  done
-  if [[ "${IUI_MODE}" == "none" ]]; then IUI_BAR_OFF="-"; else IUI_BAR_OFF="░"; fi
+  iui_anim_build || return 1
   : > "${IUI_ANIM_STATE}" || return 1
-  {
-    printf '\033[H\033[2J\n'
-    iui_banner "S C   1 F O R C R   N E X U S"
-    iui_center "${IUI_VAL}${IUI_BOLD}MEMASANG${IUI_NC}  ${IUI_ACC2}◆${IUI_NC}  ${IUI_ACC}${SCRIPT_VERSION}${IUI_NC}"
-    iui_line '╭' '╮' "INSTALASI"
-    iui_row ""
-    iui_row ""
-    iui_row ""
-    iui_line '╰' '╯'
-    for hint in "${hints[@]}"; do
-      iui_clip "${hint}" "$(( IUI_BW - 2 ))"
-      printf '  %s%s%s\n' "${IUI_MUTED}" "${IUI_CLIP}" "${IUI_NC}"
-    done
-    printf '\033[?25l'
-  } >/dev/tty || return 1
-  # Baris pertama kotak berada sekian baris di atas kursor: tiga baris isi,
-  # garis bawah, lalu baris petunjuk.
-  IUI_ANIM_UP=$(( 3 + 1 + ${#hints[@]} ))
   iui_anim_loop >/dev/tty 2>/dev/null &
   IUI_ANIM_PID="$!"
   # Dilepas dari daftar job supaya bash tidak mencetak "Terminated" ke log.
@@ -1285,13 +1374,15 @@ iui_anim_stop() {
 
 # Dipanggil dari trap EXIT saat installer berhenti sebelum selesai. Keluaran
 # rinci selama ini hanya masuk ke log, jadi ujung log diperlihatkan di sini.
+# Layar dibersihkan dulu: posisi kursor tidak bisa dipercaya kalau proses
+# animasi dihentikan paksa di tengah menggambar.
 iui_anim_abort() {
   local LC_ALL=C rc="${1:-1}" pct="" msg="" line re=$'\033''\[[0-9;?]*[A-Za-z]'
   if [[ -z "${IUI_ANIM_PID}" ]]; then return 0; fi
   IFS='|' read -r pct msg < "${IUI_ANIM_STATE}" 2>/dev/null || true
   iui_anim_stop
   {
-    printf '\n'
+    printf '\033[H\033[2J\n'
     if [[ "${rc}" != "0" ]]; then
       iui_say "${IUI_BAD}${IUI_BOLD}" "INSTALL GAGAL (kode ${rc}) di langkah: ${msg:-tidak diketahui}"
     else
@@ -4163,7 +4254,10 @@ setup_haproxy_tls_mux() {
 
   cat > /etc/haproxy/haproxy.cfg <<EOF
 global
-    log /dev/log local0 notice
+    # Level paling parah dibatasi ke alert. Tanpa itu, "backend ... has no server
+    # available!" dikirim sebagai emerg dan journald menyiarkannya ke semua
+    # terminal yang sedang login, termasuk layar menu dan layar install.
+    log /dev/log local0 notice alert
     daemon
     maxconn ${haproxy_maxconn}
     nbthread ${haproxy_nbthread}
@@ -5034,6 +5128,7 @@ XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
+IPLIMIT_MERGE_ASNS=${IPLIMIT_MERGE_ASNS}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
 XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
@@ -10080,6 +10175,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const net = require('net');
+const dns = require('dns');
 const crypto = require('crypto');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
@@ -10173,6 +10269,43 @@ const XRAY_PATH_VMESS = parseXrayPathList(process.env.XRAY_PATHS_VMESS, '/vmess'
 const XRAY_PATH_VLESS = parseXrayPathList(process.env.XRAY_PATHS_VLESS, '/vless')[0];
 const XRAY_PATH_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/trojan')[0];
 const XRAY_REAL_IP_ENABLE = /^(1|true|yes|on)$/i.test(String(process.env.XRAY_REAL_IP_ENABLE || '0').trim());
+// Operator yang terbukti mengeluarkan koneksi satu kartu lewat beberapa IP
+// sekaligus, sehingga kelompok subnet tidak bisa dipakai menghitung perangkat.
+// Kasus nyata: satu HP XL teramati di 112.215.x, 140.213.x, dan 203.78.x pada
+// saat yang sama. Untuk operator di daftar ini IP-limit Xray menghitung
+// jumlah IP, dan setiap N IP dianggap satu perangkat.
+// Format: ASN satu operator digabung "+" (XL memakai 24203, 17885, 24208,
+// 139994, 58496, dan 24518 milik Axis), ":N" di ujungnya adalah jumlah IP per
+// perangkat, dan antar operator dipisah koma. Tanpa ":N" seluruh operator
+// dihitung satu perangkat.
+// Hanya berlaku untuk VMess/VLESS/Trojan. SSH, ZIVPN, dan UDP Custom tetap
+// memakai kelompok subnet. Angka 2 untuk XL adalah keputusan pemilik; tambah
+// operator lain hanya dengan data dari iplimit_lock_history.
+const IPLIMIT_MERGE_ASNS_DEFAULT = '24203+17885+24208+24518+139994+58496:2';
+// ASN -> kunci operatornya ('as<ASN pertama di kelompok itu>').
+const IPLIMIT_MERGE_ASNS = new Map();
+// Kunci operator -> jumlah IP per perangkat (0 = seluruh operator satu perangkat).
+const IPLIMIT_MERGE_IPS_PER_DEVICE = new Map();
+for (const groupRaw of String(
+  process.env.IPLIMIT_MERGE_ASNS === undefined ? IPLIMIT_MERGE_ASNS_DEFAULT : process.env.IPLIMIT_MERGE_ASNS
+).split(/[\s,;]+/)) {
+  const [asnPart, perDevicePart = ''] = groupRaw.split(':');
+  const groupAsns = asnPart.split('+')
+    .map((v) => v.replace(/^as/i, '').trim())
+    .filter((v) => /^[0-9]{1,10}$/.test(v));
+  if (groupAsns.length === 0) continue;
+  const operatorKey = `as${groupAsns[0]}`;
+  for (const asn of groupAsns) {
+    if (!IPLIMIT_MERGE_ASNS.has(asn)) IPLIMIT_MERGE_ASNS.set(asn, operatorKey);
+  }
+  if (!IPLIMIT_MERGE_IPS_PER_DEVICE.has(operatorKey)) {
+    const perDevice = /^[0-9]{1,3}$/.test(perDevicePart.trim()) ? Math.min(64, Number(perDevicePart)) : 0;
+    IPLIMIT_MERGE_IPS_PER_DEVICE.set(operatorKey, perDevice);
+  }
+}
+const IP_OPERATOR_CACHE_SECONDS = 7 * 24 * 3600;
+const IP_OPERATOR_MAX_FAILURES = 3;
+const IP_OPERATOR_MAX_LOOKUPS_PER_CALL = 32;
 const XRAY_TRUSTED_PROXY_HEADER = 'X-SC-Real-IP-Proxy';
 function withXrayRealIp(streamSettings) {
   if (!XRAY_REAL_IP_ENABLE) return streamSettings;
@@ -11612,6 +11745,19 @@ function ipSubnetPrefix(ip, mask) {
   if (mask <= 16) return parts[0] + '.' + parts[1] + '.0.0/' + mask;
   return parts[0] + '.' + parts[1] + '.' + parts[2] + '.0/' + mask;
 }
+// IP -> kunci operator, untuk IP milik operator di IPLIMIT_MERGE_ASNS. Diisi
+// primeOperatorGroups() sebelum penghitungan Xray; kosong berarti aturan subnet.
+const mergedOperatorByIp = new Map();
+const operatorLookupDone = new Set();
+let operatorLookupFailures = 0;
+
+// Kelompok jaringan satu IP. Dengan useOperators (hanya jalur Xray), IP milik
+// operator di IPLIMIT_MERGE_ASNS masuk kelompok operatornya; selain itu subnet.
+function ipNetworkGroup(ip, mask, useOperators = false) {
+  const v = String(ip || '').trim().toLowerCase();
+  return (useOperators && mergedOperatorByIp.get(v)) || ipSubnetPrefix(v, mask);
+}
+
 function countIpGroups(ipSet, mask) {
   if (mask >= 32 || !ipSet || ipSet.size <= 1) return ipSet ? ipSet.size : 0;
   const groups = new Set();
@@ -11624,55 +11770,187 @@ function countIpGroups(ipSet, mask) {
 // Hitungan perangkat untuk semua protokol (Xray, SSH, SSH-WS, UDPHC, ZIVPN):
 // IP dalam subnet yang sama (pool CGNAT operator) dihitung satu, dan IPv4+IPv6
 // yang aktif bersamaan adalah satu perangkat dual-stack.
-function countEffectiveDevices(ipSet, mask) {
-  const ipv4Groups = new Set();
-  const ipv6Groups = new Set();
+// useOperators hanya dipakai jalur Xray: IP milik operator di IPLIMIT_MERGE_ASNS
+// dihitung per alamat (IPv6 per /64), dan setiap N alamat adalah satu perangkat.
+function countEffectiveDevices(ipSet, mask, useOperators = false) {
+  const families = [
+    { groups: new Set(), operators: new Map() },
+    { groups: new Set(), operators: new Map() }
+  ];
   for (const ipRaw of ipSet || []) {
     const ip = String(ipRaw || '').trim().toLowerCase();
     if (!ip) continue;
+    const isV6 = ip.includes(':');
+    const family = families[isV6 ? 1 : 0];
+    const operator = useOperators ? mergedOperatorByIp.get(ip) : '';
+    if (operator) {
+      if (!family.operators.has(operator)) family.operators.set(operator, new Set());
+      family.operators.get(operator).add(isV6 ? ipSubnetPrefix(ip, mask) : ip);
+      continue;
+    }
     const group = ipSubnetPrefix(ip, mask);
-    if (!group) continue;
-    if (ip.includes(':')) ipv6Groups.add(group);
-    else ipv4Groups.add(group);
+    if (group) family.groups.add(group);
   }
+  const familyCount = (family) => {
+    let count = family.groups.size;
+    for (const [operator, addresses] of family.operators) {
+      const perDevice = IPLIMIT_MERGE_IPS_PER_DEVICE.get(operator) || 0;
+      count += perDevice > 0 ? Math.ceil(addresses.size / perDevice) : 1;
+    }
+    return count;
+  };
+  const ipv4Count = familyCount(families[0]);
+  const ipv6Count = familyCount(families[1]);
   // IPv4 dan IPv6 pada koneksi yang sama adalah dual-stack, bukan dua device.
-  if (ipv4Groups.size > 0 && ipv6Groups.size > 0) {
-    return Math.max(ipv4Groups.size, ipv6Groups.size);
+  if (ipv4Count > 0 && ipv6Count > 0) {
+    return Math.max(ipv4Count, ipv6Count);
   }
-  return ipv4Groups.size + ipv6Groups.size;
+  return ipv4Count + ipv6Count;
 }
 
+// IP yang ditampilkan di notifikasi lock Xray: satu per kelompok subnet, dan
+// untuk operator di IPLIMIT_MERGE_ASNS satu per perangkat yang terhitung.
 function xrayRepresentativeIps(ipSet, mask) {
   const ipv4 = new Map();
   const ipv6 = new Map();
   for (const ipRaw of ipSet || []) {
     const ip = String(ipRaw || '').trim().toLowerCase();
     if (!ip) continue;
-    const group = ipSubnetPrefix(ip, mask);
+    const group = ipNetworkGroup(ip, mask, true);
     if (!group) continue;
     const target = ip.includes(':') ? ipv6 : ipv4;
-    if (!target.has(group)) target.set(group, ip);
+    if (!target.has(group)) target.set(group, []);
+    target.get(group).push(ip);
   }
-  let selected = ipv4;
-  if (ipv4.size === 0 || ipv6.size > ipv4.size) selected = ipv6;
-  return Array.from(selected.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([, ip]) => ip);
+  const expand = (family) => {
+    const out = [];
+    for (const [group, ips] of Array.from(family.entries()).sort(([a], [b]) => a.localeCompare(b))) {
+      const perDevice = IPLIMIT_MERGE_IPS_PER_DEVICE.get(group) || 0;
+      const shown = perDevice > 0 ? Math.ceil(new Set(ips).size / perDevice) : 1;
+      out.push(...Array.from(new Set(ips)).sort().slice(0, Math.max(1, shown)));
+    }
+    return out;
+  };
+  const shownV4 = expand(ipv4);
+  const shownV6 = expand(ipv6);
+  return (shownV4.length === 0 || shownV6.length > shownV4.length) ? shownV6 : shownV4;
 }
 
 // Sidik jari kelompok IP pelanggaran. Konfirmasi dua siklus hanya dihitung
 // kalau kelompoknya sama, jadi IP yang berganti-ganti tidak saling menguatkan.
-function ipGroupFingerprint(ipSet) {
+// Di jalur Xray (useOperators) IP operator di IPLIMIT_MERGE_ASNS memakai kunci
+// operatornya, karena alamatnya memang berganti-ganti di tiap pengecekan.
+function ipGroupFingerprint(ipSet, useOperators = false) {
   const groups = Array.from(new Set(
     Array.from(ipSet || [])
-      .map((ip) => ipSubnetPrefix(ip, XRAY_IP_GROUP_MASK))
+      .map((ip) => ipNetworkGroup(ip, XRAY_IP_GROUP_MASK, useOperators))
       .filter(Boolean)
   )).sort();
   return crypto.createHash('sha256').update(groups.join('|')).digest('hex').slice(0, 16);
 }
 
+// Nama DNS Team Cymru untuk mencari ASN sebuah IP (tanpa API key):
+//   1.2.3.4   -> 4.3.2.1.origin.asn.cymru.com
+//   IPv6      -> 32 nibble terbalik + .origin6.asn.cymru.com
+function operatorDnsName(ip) {
+  const v = String(ip || '').trim().toLowerCase();
+  if (net.isIP(v) === 4) return `${v.split('.').reverse().join('.')}.origin.asn.cymru.com`;
+  if (net.isIP(v) !== 6 || v.includes('.')) return '';
+  const halves = v.split('::');
+  if (halves.length > 2) return '';
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - left.length - right.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0)) return '';
+  const groups = [...left, ...Array(missing).fill('0'), ...right];
+  const nibbles = groups.map((part) => part.padStart(4, '0')).join('');
+  if (!/^[0-9a-f]{32}$/.test(nibbles)) return '';
+  return `${nibbles.split('').reverse().join('.')}.origin6.asn.cymru.com`;
+}
+
+// Jawaban TXT: "24203 | 112.215.211.0/24 | ID | apnic | 2009-02-19". Kolom
+// pertama bisa memuat lebih dari satu ASN.
+function parseOperatorAsns(text) {
+  return String(text || '').split('|')[0].trim().split(/\s+/).filter((v) => /^[0-9]{1,10}$/.test(v));
+}
+
+// Resolver sistem dulu; kalau gagal, resolver publik yang juga dipasang DNS
+// guard. Pencarian yang gagal berarti aturan lama dipakai, dan itu bisa berujung
+// salah kunci, jadi layak dicoba dua jalur.
+async function resolveOperatorTxt(name) {
+  let lastErr = null;
+  for (const servers of [null, ['8.8.8.8', '1.1.1.1']]) {
+    try {
+      const resolver = new dns.promises.Resolver({ timeout: 2500, tries: 2 });
+      if (servers) resolver.setServers(servers);
+      return await resolver.resolveTxt(name);
+    } catch (err) {
+      const code = String(err?.code || '');
+      if (code === 'ENOTFOUND' || code === 'ENODATA') throw err;
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+// ASN pemilik IP, dari cache database atau DNS. Array kosong berarti tidak
+// diketahui, dan pemanggil jatuh ke aturan subnet biasa.
+async function lookupIpOperatorAsns(ip, nowTs) {
+  const prefix = ipSubnetPrefix(ip, 24);
+  const cached = await get('SELECT asns, updated_at FROM ip_operator_cache WHERE prefix=?', [prefix]).catch(() => null);
+  const cachedAsns = cached ? String(cached.asns || '').split(',').filter(Boolean) : [];
+  if (cached && (nowTs - Number(cached.updated_at || 0)) < IP_OPERATOR_CACHE_SECONDS) return cachedAsns;
+  // DNS yang bermasalah tidak boleh menahan checker: setelah beberapa kali
+  // gagal, sisa pencarian di siklus ini dilewati.
+  if (operatorLookupFailures >= IP_OPERATOR_MAX_FAILURES) return cachedAsns;
+  const name = operatorDnsName(ip);
+  if (!name) return cachedAsns;
+  let asns = [];
+  try {
+    const records = await resolveOperatorTxt(name);
+    const found = new Set();
+    for (const record of records || []) {
+      for (const asn of parseOperatorAsns(Array.isArray(record) ? record.join('') : record)) found.add(asn);
+    }
+    asns = Array.from(found);
+  } catch (err) {
+    const code = String(err?.code || '');
+    // IP yang tidak ada di tabel routing bukan kegagalan; simpan sebagai kosong.
+    if (code !== 'ENOTFOUND' && code !== 'ENODATA') {
+      operatorLookupFailures += 1;
+      if (IPLIMIT_DEBUG) console.log(`[iplimit-debug][operator] lookup gagal ip=${ip} code=${code || err?.message || err}`);
+      return cachedAsns;
+    }
+  }
+  await run(
+    'INSERT OR REPLACE INTO ip_operator_cache(prefix, asns, updated_at) VALUES(?, ?, ?)',
+    [prefix, asns.join(','), nowTs]
+  ).catch(() => {});
+  return asns;
+}
+
+// Cari operator untuk IP-IP sebuah akun Xray dan catat yang operatornya ada di
+// IPLIMIT_MERGE_ASNS. Dipanggil hanya untuk akun yang jumlah IP-nya sudah
+// melewati limit, jadi akun yang tidak bermasalah tidak memicu pencarian.
+async function primeOperatorGroups(ipSet, nowTs = Math.floor(Date.now() / 1000)) {
+  if (IPLIMIT_MERGE_ASNS.size === 0) return;
+  const todo = [];
+  for (const ipRaw of ipSet || []) {
+    const ip = String(ipRaw || '').trim().toLowerCase();
+    if (!isUsableClientIp(ip) || operatorLookupDone.has(ip)) continue;
+    operatorLookupDone.add(ip);
+    todo.push(ip);
+    if (todo.length >= IP_OPERATOR_MAX_LOOKUPS_PER_CALL) break;
+  }
+  await Promise.all(todo.map(async (ip) => {
+    const asns = await lookupIpOperatorAsns(ip, nowTs).catch(() => []);
+    const merged = asns.map((asn) => IPLIMIT_MERGE_ASNS.get(asn)).find(Boolean);
+    if (merged) mergedOperatorByIp.set(ip, merged);
+  }));
+}
+
 function xrayViolationSignal(ipSet) {
-  return `xray-ip-${ipGroupFingerprint(ipSet)}`;
+  return `xray-ip-${ipGroupFingerprint(ipSet, true)}`;
 }
 
 function readXrayLiveSocketMap() {
@@ -12153,6 +12431,15 @@ async function ensureTables() {
     created_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`);
+  await run(`CREATE TABLE IF NOT EXISTS ip_operator_cache (
+    prefix TEXT PRIMARY KEY,
+    asns TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
+  )`);
+  await run(
+    'DELETE FROM ip_operator_cache WHERE updated_at < ?',
+    [Math.floor(Date.now() / 1000) - (30 * 24 * 3600)]
+  ).catch(() => {});
   await run(`CREATE TABLE IF NOT EXISTS iplimit_lock_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_type TEXT NOT NULL,
@@ -13575,9 +13862,15 @@ async function lockIfExceeded(nowTs) {
       const lim = Number(r.limitip || 0);
       const lockIpSet = xrayMap.has(userKey) ? xrayMap.get(userKey) : new Set();
       const cntRaw = lockIpSet.size;
+      // Operator di IPLIMIT_MERGE_ASNS (XL) dihitung per jumlah IP, bukan per
+      // subnet. Hitungannya bisa lebih kecil ATAU lebih besar dari hitungan
+      // subnet, jadi pemilik IP dicari begitu jumlah IP mentah melewati limit.
+      const cntSubnet = countEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK);
+      if (lim > 0 && cntRaw > lim) await primeOperatorGroups(lockIpSet, nowTs);
       // CGNAT tolerance: grup IP dalam subnet yang sama sebagai 1 device.
       // XRAY_IP_GROUP_MASK: 24 = /24 (moderate), 16 = /16 (aggressive), 32 = exact match.
-      const cntGrouped = countEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK);
+      const cntGrouped = countEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK, true);
+      if (IPLIMIT_DEBUG && cntGrouped !== cntSubnet) console.log(`[iplimit-debug][operator] ${item.type} user=${user} limit=${lim} ip=${cntRaw} subnet=${cntSubnet} perangkat=${cntGrouped}`);
       const cnt = cntGrouped;
       const liveSocketCount = Number(xrayLive.sockets.get(`${item.type}|${userKey}`) || 0);
       const hasSocketEvidence = xrayLive.available && liveSocketCount > 0;
@@ -20756,6 +21049,7 @@ XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
+IPLIMIT_MERGE_ASNS=${IPLIMIT_MERGE_ASNS}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
 XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
@@ -26916,7 +27210,10 @@ EONGINX
 
   cat > /etc/haproxy/haproxy.cfg <<EOHAP
 global
-    log /dev/log local0 notice
+    # Level paling parah dibatasi ke alert. Tanpa itu, "backend ... has no server
+    # available!" dikirim sebagai emerg dan journald menyiarkannya ke semua
+    # terminal yang sedang login, termasuk layar menu dan layar install.
+    log /dev/log local0 notice alert
     daemon
     maxconn ${haproxy_maxconn}
     nbthread ${haproxy_nbthread}
@@ -29787,6 +30084,7 @@ update_script_from_repo() {
     XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
     XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP}" \
     XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}" \
+    IPLIMIT_MERGE_ASNS="${IPLIMIT_MERGE_ASNS-24203+17885+24208+24518+139994+58496:2}" \
     XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}" \
     XRAY_VERSION="${XRAY_VERSION:-}" \
     XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}" \
@@ -32353,7 +32651,7 @@ show_install_finished() {
 open_menu_after_install() {
   # Pakai status tty ASLI yang direkam sebelum stdout dialihkan ke `tee` di
   # awal main() (exec > >(tee ...) membuat -t 1 selalu gagal walau sesi
-  # aslinya interaktif, mis. di dalam `screen -S nexus-sc ...`). Tanpa ini,
+  # aslinya interaktif, mis. di dalam `screen -S 1forcr-sc ...`). Tanpa ini,
   # menu tidak pernah kebuka otomatis dan screen langsung terminate begitu
   # main() selesai (user cuma lihat "[screen is terminating]").
   local stdin_tty="${SC_ORIG_STDIN_IS_TTY:-}" stdout_tty="${SC_ORIG_STDOUT_IS_TTY:-}" enter_key=""
@@ -32430,7 +32728,7 @@ persist_pending_install_env() {
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE
     EXPIRED_ACCOUNT_RETENTION_DAYS
     AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES
-    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_LOCK_HISTORY_RETENTION_DAYS IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
+    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_LOCK_HISTORY_RETENTION_DAYS IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG IPLIMIT_MERGE_ASNS
     SSHWS_TCP_KEEPALIVE_SECONDS SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX
@@ -33580,7 +33878,7 @@ main() {
   # Rekam status tty ASLI sebelum stdout/stderr dialihkan ke `tee` di bawah.
   # exec > >(tee ...) mengganti fd 1 dengan pipe, jadi -t 1 akan SELALU
   # gagal setelahnya walau sesi ini sebenarnya interaktif (mis. dijalankan
-  # via `screen -S nexus-sc ...`). Simpan hasil tes sekarang, dipakai lagi
+  # via `screen -S 1forcr-sc ...`). Simpan hasil tes sekarang, dipakai lagi
   # nanti oleh open_menu_after_install() dan guard re-run di bawah.
   [[ -t 0 ]] && SC_ORIG_STDIN_IS_TTY=1 || SC_ORIG_STDIN_IS_TTY=0
   [[ -t 1 ]] && SC_ORIG_STDOUT_IS_TTY=1 || SC_ORIG_STDOUT_IS_TTY=0

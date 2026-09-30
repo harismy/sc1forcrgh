@@ -33,6 +33,14 @@ globalThis.__devicePolicy = {
   parseXrayAllUserTraffic,
   queryAllXrayUserTraffic,
   readJournalOnce,
+  primeOperatorGroups,
+  operatorDnsName,
+  parseOperatorAsns,
+  xrayRepresentativeIps,
+  mergeAsns: () => Array.from(IPLIMIT_MERGE_ASNS.entries()).map(([asn, key]) => asn + '=' + key).sort(),
+  ipsPerDevice: () => Array.from(IPLIMIT_MERGE_IPS_PER_DEVICE.entries()).map(([key, n]) => key + '=' + n).sort(),
+  xrayViolationSignal,
+  cacheSeconds: IP_OPERATOR_CACHE_SECONDS,
   minGap: SSHWS_HARD_LIMIT_MIN_GAP_SECONDS
 };
 `;
@@ -56,8 +64,40 @@ const fakeFs = Object.assign(Object.create(fs), {
   }
 });
 
-// Tabel iplimit_violation_pending di memori, cukup untuk query yang dipakai sampler.
+// Tabel iplimit_violation_pending dan ip_operator_cache di memori, cukup untuk
+// query yang dipakai sampler dan pencarian operator. Keduanya bertahan antar
+// pemuatan checker, seperti database asli antar siklus timer.
 const pending = new Map();
+const operatorCache = new Map();
+
+// DNS tiruan untuk pencarian ASN (format jawaban Team Cymru). Test tidak pernah
+// menyentuh jaringan.
+const ASN_BY_PREFIX = {
+  // XL Axiata memakai beberapa ASN (data nyata dari tabel routing); blok yang
+  // lebih spesifik ditulis lebih dulu.
+  '112.215.10.': '17885', '140.213.200.': '139994',
+  '112.215.': '24203', '140.213.': '24203', '203.78.': '24203',
+  '114.125.': '23693', '182.1.': '23693',                       // Telkomsel
+  '114.4.': '4761'                                              // Indosat
+};
+function fakeDns({ fail = '', calls = [] } = {}) {
+  return {
+    promises: {
+      Resolver: class {
+        setServers() {}
+        async resolveTxt(name) {
+          calls.push(name);
+          if (fail) throw Object.assign(new Error(fail), { code: fail });
+          if (name.endsWith('.origin6.asn.cymru.com')) return [['24203 | 2001:448a::/32 | ID | apnic | 2005-01-01']];
+          const ip = name.replace('.origin.asn.cymru.com', '').split('.').reverse().join('.');
+          const hit = Object.keys(ASN_BY_PREFIX).find((prefix) => ip.startsWith(prefix));
+          if (!hit) throw Object.assign(new Error('ENOTFOUND'), { code: 'ENOTFOUND' });
+          return [[`${ASN_BY_PREFIX[hit]} | ${ip}/24 | ID | apnic | 2009-02-19`]];
+        }
+      }
+    }
+  };
+}
 class FakeDatabase {
   run(sql, params, cb) {
     const s = String(sql).replace(/\s+/g, ' ').trim();
@@ -77,11 +117,15 @@ class FakeDatabase {
     } else if (s.startsWith('INSERT OR REPLACE INTO iplimit_violation_pending')) {
       const [username, signal, firstSeen, lastSeen, hits, detected] = params;
       pending.set(`${username}|${signal}`, { username, signal, first_seen: firstSeen, last_seen: lastSeen, hits, detected });
+    } else if (s.startsWith('INSERT OR REPLACE INTO ip_operator_cache')) {
+      const [prefix, asns, updatedAt] = params;
+      operatorCache.set(prefix, { asns, updated_at: updatedAt });
     }
     cb.call({ changes: 1 }, null);
   }
   get(sql, params, cb) {
-    cb(null, pending.get(`${params[0]}|${params[1]}`));
+    if (String(sql).includes('FROM ip_operator_cache')) return cb(null, operatorCache.get(params[0]));
+    return cb(null, pending.get(`${params[0]}|${params[1]}`));
   }
   all(sql, params, cb) {
     cb(null, []);
@@ -89,15 +133,17 @@ class FakeDatabase {
 }
 
 // Setiap siklus timer adalah proses checker baru, jadi dimuat ulang per siklus.
-function loadChecker({ execFileSync } = {}) {
+function loadChecker({ execFileSync, env = {}, dns = null } = {}) {
   const context = vm.createContext({
     Buffer,
     console,
-    process: { env: {}, pid: 1 },
+    process: { env, pid: 1 },
     require(name) {
       if (name === 'sqlite3') return { verbose: () => ({ Database: FakeDatabase }) };
       if (name === 'fs') return fakeFs;
       if (name === 'child_process' && execFileSync) return { ...require('child_process'), execFileSync };
+      // Tanpa DNS tiruan, pencarian operator harus gagal, bukan ke jaringan.
+      if (name === 'dns') return dns || fakeDns({ fail: 'ECONNREFUSED' });
       return require(name);
     }
   });
@@ -168,6 +214,154 @@ function loadChecker({ execFileSync } = {}) {
 
   r = await sample('unlimited', ['114.125.1.1', '36.68.1.1', '182.2.1.1'], 3, 0, t0);
   assert.strictEqual(r.candidate, false, 'limit 0 means unlimited');
+
+  // --- Operator yang menyebar satu kartu ke banyak IP (khusus Xray) ----------
+  // Kasus nyata: satu HP XL (limit 2) teramati di tiga kelompok IP sekaligus
+  // dan terkunci. Untuk XL, IP-limit Xray menghitung jumlah IP: tiap 2 IP
+  // adalah satu perangkat (keputusan pemilik). SSH dan UDP tidak berubah.
+  {
+    // 112.215.10.1 terdaftar di AS17885, tiga lainnya di AS24203: tetap satu operator.
+    const XL = ['112.215.211.178', '112.215.10.1', '140.213.99.194', '203.78.124.54'];
+    const xray = (p, ips) => p.countEffectiveDevices(new Set(ips), 16, true);
+    const ssh = (p, ips) => p.countEffectiveDevices(new Set(ips), 16);
+    const calls = [];
+    let p = loadChecker({ dns: fakeDns({ calls }) });
+    assert.deepStrictEqual(Array.from(p.mergeAsns()),
+      ['139994=as24203', '17885=as24203', '24203=as24203', '24208=as24203', '24518=as24203', '58496=as24203'],
+      'default: semua ASN XL/Axis adalah satu operator');
+    assert.deepStrictEqual(Array.from(p.ipsPerDevice()), ['as24203=2'], 'default: 2 IP XL dihitung satu perangkat');
+    assert.strictEqual(xray(p, XL), 3, 'sebelum operatornya dikenali, aturan subnet melihat tiga jaringan');
+    await p.primeOperatorGroups(new Set(XL), t0);
+    assert.strictEqual(calls.length, 4);
+    assert.strictEqual(xray(p, XL), 2, '4 IP XL = 2 perangkat, jadi akun limit 2 tidak terkunci');
+    assert.strictEqual(ssh(p, XL), 3, 'SSH, ZIVPN, dan UDP tetap memakai kelompok subnet');
+    await p.primeOperatorGroups(new Set(XL), t0);
+    assert.strictEqual(calls.length, 4, 'IP yang sama tidak dicari dua kali dalam satu siklus');
+
+    // Jumlah IP menentukan jumlah perangkat, tidak peduli subnetnya.
+    const sameSubnet = ['112.215.211.1', '112.215.211.2', '112.215.211.3', '112.215.211.4', '112.215.211.5'];
+    await p.primeOperatorGroups(new Set(sameSubnet), t0);
+    assert.strictEqual(xray(p, sameSubnet.slice(0, 1)), 1);
+    assert.strictEqual(xray(p, sameSubnet.slice(0, 2)), 1, '2 IP = 1 perangkat');
+    assert.strictEqual(xray(p, sameSubnet.slice(0, 3)), 2);
+    assert.strictEqual(xray(p, sameSubnet.slice(0, 4)), 2, '4 IP = 2 perangkat');
+    assert.strictEqual(xray(p, sameSubnet), 3, '5 IP XL = 3 perangkat walau satu subnet: berbagi akun sesama XL terdeteksi');
+    assert.strictEqual(ssh(p, sameSubnet), 1);
+    assert.strictEqual(xray(p, [...XL, ...sameSubnet]), 5, '9 IP XL = 5 perangkat');
+
+    // Operator lain tidak berubah: tetap per kelompok subnet.
+    const telkomsel = ['114.125.10.1', '114.125.99.2', '182.1.100.1'];
+    await p.primeOperatorGroups(new Set(telkomsel), t0);
+    assert.strictEqual(xray(p, telkomsel), 2, 'Telkomsel tetap dihitung per kelompok subnet');
+    assert.strictEqual(xray(p, [...XL, ...telkomsel]), 4, 'XL 2 perangkat + Telkomsel 2 jaringan');
+    // IPv6 XL dihitung per /64 dan tetap dual-stack dengan IPv4-nya.
+    const dual = [...XL, '2001:448a:1050::5', '2001:448a:1050::9'];
+    await p.primeOperatorGroups(new Set(dual), t0);
+    assert.strictEqual(xray(p, dual), 2);
+
+    // Notifikasi menampilkan satu IP per perangkat yang terhitung.
+    assert.strictEqual(Array.from(p.xrayRepresentativeIps(new Set(XL), 16)).length, 2);
+    assert.strictEqual(Array.from(p.xrayRepresentativeIps(new Set([...XL, ...telkomsel]), 16)).length, 4);
+
+    // Alamat XL berganti di tiap pengecekan, jadi sidik jari Xray memakai kunci
+    // operatornya; kalau tidak, pelanggaran sungguhan tidak pernah terkonfirmasi.
+    const xlLater = ['112.215.211.9', '140.213.99.7', '203.78.124.1', '112.215.10.8', '112.215.211.77'];
+    await p.primeOperatorGroups(new Set(xlLater), t0);
+    assert.strictEqual(p.xrayViolationSignal(new Set([...XL, ...sameSubnet])), p.xrayViolationSignal(new Set(xlLater)));
+    assert.notStrictEqual(p.xrayViolationSignal(new Set(XL)), p.xrayViolationSignal(new Set([...XL, ...telkomsel])));
+    // Sampler SSH tidak mengenal operator: XL yang pindah kelompok subnet tetap
+    // mengulang konfirmasi, seperti sebelum aturan ini ada.
+    let s = await p.sampleSshDeviceLimit('ssh-xl', new Set(['112.215.1.1', '114.125.1.1', '114.4.1.1']), 3, 2, t0);
+    s = await p.sampleSshDeviceLimit('ssh-xl', new Set(['140.213.9.9', '114.125.2.2', '114.4.3.3']), 3, 2, t0 + p.minGap + 60);
+    assert.strictEqual(s.confirmed, false);
+
+    // Siklus berikutnya (proses baru): hasil diambil dari cache database,
+    // walau DNS sedang mati.
+    const offlineCalls = [];
+    p = loadChecker({ dns: fakeDns({ fail: 'ETIMEOUT', calls: offlineCalls }) });
+    await p.primeOperatorGroups(new Set(XL), t0 + 600);
+    assert.strictEqual(xray(p, XL), 2, 'cache harus dipakai antar siklus');
+    assert.strictEqual(offlineCalls.length, 0, 'IP yang masih ada di cache tidak memicu DNS');
+    // Cache kedaluwarsa dan DNS gagal: nilai lama tetap dipakai, bukan dibuang.
+    p = loadChecker({ dns: fakeDns({ fail: 'ETIMEOUT', calls: offlineCalls }) });
+    await p.primeOperatorGroups(new Set(XL), t0 + p.cacheSeconds + 600);
+    assert.strictEqual(xray(p, XL), 2, 'cache lama lebih baik daripada aturan yang salah saat DNS gagal');
+    assert(new Set(offlineCalls).size >= 1 && new Set(offlineCalls).size <= 4);
+
+    // Tanpa cache dan DNS gagal: aturan subnet tetap berlaku, dan setelah tiga
+    // kegagalan sisa pencarian dilewati supaya checker tidak tertahan.
+    operatorCache.clear();
+    const failedCalls = [];
+    p = loadChecker({ dns: fakeDns({ fail: 'ETIMEOUT', calls: failedCalls }) });
+    await p.primeOperatorGroups(new Set(XL), t0);
+    assert.strictEqual(xray(p, XL), 3, 'DNS gagal tidak boleh mengubah hitungan');
+    await p.primeOperatorGroups(new Set(['114.4.1.1', '114.4.2.2', '114.125.1.1', '182.1.1.1']), t0);
+    assert.strictEqual(new Set(failedCalls).size, 4, 'pencarian berhenti setelah beberapa kegagalan');
+    assert.strictEqual(failedCalls.length, 8, 'tiap IP dicoba lewat resolver sistem lalu resolver publik');
+    assert.strictEqual(operatorCache.size, 0, 'kegagalan DNS tidak boleh disimpan sebagai jawaban');
+
+    // IP yang tidak ada di tabel routing disimpan sebagai "tidak diketahui".
+    p = loadChecker({ dns: fakeDns() });
+    await p.primeOperatorGroups(new Set(['198.51.100.7']), t0);
+    assert.deepStrictEqual(operatorCache.get('198.51.100.0/24'), { asns: '', updated_at: t0 });
+
+    // Daftar operator dan angkanya bisa diubah atau dikosongkan lewat env.
+    const withEnv = async (value, ips) => {
+      operatorCache.clear();
+      const dnsCalls = [];
+      const checker = loadChecker({ env: { IPLIMIT_MERGE_ASNS: value }, dns: fakeDns({ calls: dnsCalls }) });
+      await checker.primeOperatorGroups(new Set(ips), t0);
+      return { checker, dnsCalls };
+    };
+    let e = await withEnv('', XL);
+    assert.strictEqual(xray(e.checker, XL), 3, 'daftar kosong mematikan aturan operator');
+    assert.strictEqual(e.dnsCalls.length, 0, 'daftar kosong tidak boleh memicu DNS');
+    e = await withEnv('24203+17885+139994:4', XL);
+    assert.strictEqual(xray(e.checker, XL), 1, ':4 berarti 4 IP = 1 perangkat');
+    e = await withEnv('24203+17885+139994', [...XL, ...sameSubnet]);
+    assert.deepStrictEqual(Array.from(e.checker.ipsPerDevice()), ['as24203=0']);
+    assert.strictEqual(xray(e.checker, [...XL, ...sameSubnet]), 1, 'tanpa ":N" seluruh operator satu perangkat');
+    e = await withEnv('AS24203+17885:2, 23693:3 bukan-angka', [...XL, ...telkomsel]);
+    assert.deepStrictEqual(Array.from(e.checker.mergeAsns()), ['17885=as24203', '23693=as23693', '24203=as24203'],
+      '"+" menggabung ASN satu operator, koma memisahkan operator');
+    assert.deepStrictEqual(Array.from(e.checker.ipsPerDevice()), ['as23693=3', 'as24203=2']);
+    assert.strictEqual(xray(e.checker, [...XL, ...telkomsel]), 3, 'XL 4 IP = 2, Telkomsel 3 IP dengan :3 = 1');
+    // ASN XL yang tidak dicantumkan kembali dihitung per subnet.
+    e = await withEnv('24203:2', XL);
+    assert.strictEqual(xray(e.checker, XL), 3, '3 IP AS24203 = 2 perangkat, ditambah 112.215.10.1 (AS17885) per subnet');
+
+    assert.strictEqual(p.operatorDnsName('112.215.211.178'), '178.211.215.112.origin.asn.cymru.com');
+    assert.strictEqual(p.operatorDnsName('2001:448a::5'),
+      '5.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.a.8.4.4.1.0.0.2.origin6.asn.cymru.com');
+    assert.strictEqual(p.operatorDnsName('bukan-ip'), '');
+    assert.deepStrictEqual(Array.from(p.parseOperatorAsns('24203 | 112.215.211.0/24 | ID | apnic | 2009-02-19')), ['24203']);
+    assert.deepStrictEqual(Array.from(p.parseOperatorAsns('23693 4761 | 10.0.0.0/8 | ID')), ['23693', '4761']);
+    operatorCache.clear();
+  }
+
+  // Aturan operator hanya dipasang di jalur Xray, dan pemilik IP dicari
+  // sebelum hitungan yang dipakai untuk keputusan lock.
+  {
+    const lockBlock = extract(checkerSource, 'async function lockIfExceeded(', '\n}\n');
+    const xrayStart = lockBlock.indexOf("{ type: 'vmess', table: 'account_vmesses' }");
+    assert(xrayStart > 0, 'awal jalur Xray tidak ditemukan');
+    const sshPart = lockBlock.slice(0, xrayStart);
+    const xrayPart = lockBlock.slice(xrayStart);
+    assert(!sshPart.includes('primeOperatorGroups') && !/countEffectiveDevices\([^)]*, true\)/.test(sshPart),
+      'jalur SSH/ZIVPN/UDP tidak boleh memakai aturan operator');
+    const iPrime = xrayPart.indexOf('if (lim > 0 && cntRaw > lim) await primeOperatorGroups(lockIpSet, nowTs);');
+    const iCount = xrayPart.indexOf('const cntGrouped = countEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK, true);');
+    assert(iPrime > 0 && iCount > iPrime, 'jalur Xray harus mengenali operator sebelum menghitung perangkat');
+    assert(checkerSource.includes('return `xray-ip-${ipGroupFingerprint(ipSet, true)}`;'));
+    assert(checkerSource.includes('const signal = `ssh-dev-${ipGroupFingerprint(evidenceIps)}`;'));
+    // Variabelnya harus sampai ke checker dan bertahan lintas update.
+    const XL_DEFAULT = '24203+17885+24208+24518+139994+58496:2';
+    assert(installer.includes(`\nIPLIMIT_MERGE_ASNS="\${IPLIMIT_MERGE_ASNS-${XL_DEFAULT}}"\n`));
+    assert(checkerSource.includes(`const IPLIMIT_MERGE_ASNS_DEFAULT = '${XL_DEFAULT}';`), 'default shell dan default checker harus sama');
+    assert.strictEqual((installer.match(/^IPLIMIT_MERGE_ASNS=\$\{IPLIMIT_MERGE_ASNS\}$/gm) || []).length, 2, 'harus ditulis ke .env aplikasi dan /etc/sc-1forcr.env');
+    assert(installer.includes(`    IPLIMIT_MERGE_ASNS="\${IPLIMIT_MERGE_ASNS-${XL_DEFAULT}}" \\\n`), 'harus diteruskan di jalur update');
+    assert(/IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG IPLIMIT_MERGE_ASNS\n/.test(installer), 'harus ikut ke lanjut-install');
+  }
 
   // --- Jalur lock SSH memakai sampler, bukan hitungan sesaat -----------------
   const sshBlock = extract(checkerSource, 'async function lockIfExceeded(', '\n}\n');

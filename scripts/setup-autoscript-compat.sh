@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.76}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.77}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -1610,8 +1610,156 @@ repair_dpkg_state() {
   wait_for_apt_locks || return 1
 }
 
+# >>> bullseye-security-repo
+# Blok ini ada di setup-autoscript-compat.sh dan setup-summary-api.sh, dan
+# isinya harus sama persis di keduanya.
+#
+# Debian 11 (bullseye) habis masa dukungnya 31 Agustus 2026. Beberapa hari
+# kemudian file .deb di repo keamanannya dihapus dari mirror, tapi indeksnya
+# dibiarkan ada. apt jadi meminta file yang sudah tidak ada ("404 Not Found"),
+# dan apt-get update tidak menolong karena indeksnya memang tidak berubah.
+# archive.debian.org belum memuat bullseye-security, jadi repo itu diarahkan
+# ke snapshot.debian.org pada titik terakhir sebelum filenya dihapus. Indeks
+# di snapshot itu sama persis dengan indeks terakhir di mirror, jadi versi
+# paket tidak berubah; yang berubah hanya tempat mengunduhnya.
+BULLSEYE_SECURITY_SNAPSHOT="${BULLSEYE_SECURITY_SNAPSHOT:-20260831T211327Z}"
+BULLSEYE_APT_DIR="${BULLSEYE_APT_DIR:-/etc/apt}"
+BULLSEYE_OS_RELEASE="${BULLSEYE_OS_RELEASE:-/etc/os-release}"
+BULLSEYE_SECURITY_REPO_OK=0
+
+is_debian_bullseye() {
+  local info
+  [[ -r "${BULLSEYE_OS_RELEASE}" ]] || return 1
+  # shellcheck disable=SC1090
+  info="$(. "${BULLSEYE_OS_RELEASE}" 2>/dev/null; printf '%s|%s|%s' "${ID:-}" "${VERSION_CODENAME:-}" "${VERSION_ID:-}")" || return 1
+  [[ "${info}" == "debian|bullseye|"* || "${info}" == "debian|"*"|11" ]]
+}
+
+# Cetak kode HTTP sebuah URL tanpa mengunduh isinya. Kosong/000 berarti tidak
+# ada jawaban, dan itu TIDAK dianggap 404.
+bullseye_http_code() {
+  local url="$1" code=""
+  if command -v curl >/dev/null 2>&1; then
+    code="$(curl -s -o /dev/null -I -L --connect-timeout 10 --max-time 25 -w '%{http_code}' "${url}" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    code="$(wget --spider -S -T 25 -t 1 "${url}" 2>&1 | awk '/^[[:space:]]*HTTP\//{c=$2} END{print c}' || true)"
+  fi
+  printf '%s' "${code}"
+}
+
+# Cetak "URI<TAB>komponen" untuk tiap baris "deb ... bullseye-security" yang
+# masih aktif dan belum menunjuk ke snapshot.
+bullseye_security_active_lines() {
+  local f
+  for f in "${BULLSEYE_APT_DIR}/sources.list" "${BULLSEYE_APT_DIR}"/sources.list.d/*.list; do
+    [[ -f "${f}" ]] || continue
+    awk '
+      $1 == "deb" {
+        i = 2
+        if ($i ~ /^\[/) { while (i <= NF && $i !~ /\]$/) i++; i++ }
+        if ($(i + 1) !~ /^bullseye-security\/?$/ || $i ~ /snapshot\.debian\.org/) next
+        comps = ""
+        for (j = i + 2; j <= NF && $j !~ /^#/; j++) comps = comps (comps == "" ? "" : " ") $j
+        print $i "\t" comps
+      }' "${f}" 2>/dev/null || true
+  done
+  return 0
+}
+
+# Berhasil (0) hanya kalau ada file paket yang memang akan diunduh dari repo
+# security dan mirror menjawab 404 untuk file itu. Mirror yang masih menyimpan
+# filenya (misalnya mirror milik provider) dibiarkan apa adanya.
+bullseye_security_pool_missing() {
+  local lines="$1" arg uris base uri code
+  local -a pkgs=()
+  shift
+  for arg in "$@"; do
+    case "${arg}" in
+      install|-*) ;;
+      *) pkgs+=("${arg}") ;;
+    esac
+  done
+  (( ${#pkgs[@]} > 0 )) || return 1
+  uris="$(DEBIAN_FRONTEND=noninteractive apt-get install --print-uris -y -qq "${pkgs[@]}" 2>/dev/null | awk -F"'" 'NF >= 3 { print $2 }' || true)"
+  [[ -n "${uris}" ]] || return 1
+  while IFS=$'\t' read -r base _; do
+    [[ -n "${base}" ]] || continue
+    uri="$(printf '%s\n' "${uris}" | grep -F -m1 "${base%/}/pool/" || true)"
+    [[ -n "${uri}" ]] || continue
+    code="$(bullseye_http_code "${uri}")"
+    if [[ "${code}" == "404" ]]; then
+      return 0
+    fi
+    if [[ "${code}" == "200" ]]; then
+      BULLSEYE_SECURITY_REPO_OK=1
+    fi
+  done <<< "${lines}"
+  return 1
+}
+
+bullseye_security_use_snapshot() {
+  local lines="$1" snapshot_url code comps f list_file
+  snapshot_url="http://snapshot.debian.org/archive/debian-security/${BULLSEYE_SECURITY_SNAPSHOT}"
+  # Jangan lepas repo lama kalau penggantinya tidak bisa dijangkau dari VPS ini.
+  code="$(bullseye_http_code "${snapshot_url}/dists/bullseye-security/InRelease")"
+  if [[ "${code}" != "200" ]]; then
+    log "PERINGATAN: snapshot.debian.org tidak terjangkau (HTTP ${code:-tanpa respons}). Sumber apt tidak diubah."
+    return 1
+  fi
+  comps="$(printf '%s\n' "${lines}" | awk -F'\t' '
+    { n = split($2, a, " "); for (k = 1; k <= n; k++) if (!(a[k] in seen)) { seen[a[k]] = 1; out = out (out == "" ? "" : " ") a[k] } }
+    END { print out }')"
+  [[ -n "${comps}" ]] || comps="main"
+  list_file="${BULLSEYE_APT_DIR}/sources.list.d/sc-1forcr-bullseye-security.list"
+  mkdir -p "${BULLSEYE_APT_DIR}/sources.list.d" || return 1
+  # Indeks snapshot sudah lewat Valid-Until, jadi pemeriksaan itu dimatikan
+  # khusus untuk baris ini. Tanda tangan GPG-nya tetap diperiksa apt.
+  {
+    printf '%s\n' "# Dibuat installer SC 1FORCR. Debian 11 sudah habis masa dukungnya dan file"
+    printf '%s\n' "# paket di repo security resminya sudah dihapus, jadi dipakai arsip snapshot."
+    printf 'deb [check-valid-until=no] %s bullseye-security %s\n' "${snapshot_url}" "${comps}"
+  } > "${list_file}" || return 1
+  # Baris lama dijadikan komentar, bukan dihapus, supaya bisa dikembalikan.
+  for f in "${BULLSEYE_APT_DIR}/sources.list" "${BULLSEYE_APT_DIR}"/sources.list.d/*.list; do
+    [[ -f "${f}" && "${f}" != "${list_file}" ]] || continue
+    sed -i -E '/snapshot\.debian\.org/!s/^[[:space:]]*deb(-src)?[[:space:]].*[[:space:]]bullseye-security\/?([[:space:]].*)?$/# sc-1forcr, repo ini sudah kosong: &/' "${f}" || return 1
+  done
+  log "Repo security Debian 11 dipindah ke ${snapshot_url}"
+  DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+  return 0
+}
+
+# Pemakaian:
+#   ensure_bullseye_security_repo probe install -y paket...
+#       pindah hanya kalau file paket yang akan diunduh terbukti 404.
+#   ensure_bullseye_security_repo force
+#       pindah tanpa memeriksa, dipakai setelah apt-get install sungguhan gagal.
+# Aman dipanggil berulang: setelah pindah tidak ada lagi baris aktif yang
+# perlu diurus, dan di luar Debian 11 fungsi ini langsung selesai.
+ensure_bullseye_security_repo() {
+  local mode="${1:-probe}" lines
+  if (( $# > 0 )); then
+    shift
+  fi
+  is_debian_bullseye || return 0
+  if [[ "${mode}" != "force" && "${BULLSEYE_SECURITY_REPO_OK}" == "1" ]]; then
+    return 0
+  fi
+  lines="$(bullseye_security_active_lines)"
+  [[ -n "${lines}" ]] || return 0
+  if [[ "${mode}" != "force" ]]; then
+    bullseye_security_pool_missing "${lines}" "$@" || return 0
+  fi
+  log "Debian 11 sudah habis masa dukungnya dan repo security-nya tidak lagi menyimpan file paket. Pindah ke arsip snapshot.debian.org..."
+  bullseye_security_use_snapshot "${lines}"
+}
+# <<< bullseye-security-repo
+
 apt_get_safe() {
   repair_dpkg_state || return 1
+  if [[ "${1:-}" == "install" ]]; then
+    ensure_bullseye_security_repo probe "$@" || true
+  fi
   DEBIAN_FRONTEND=noninteractive apt-get "$@"
 }
 
@@ -1651,9 +1799,11 @@ apt_refresh_lists_hard() {
 
 # Pasang paket dengan pemulihan otomatis kalau kegagalannya karena daftar basi.
 apt_install_with_refresh() {
+  ensure_bullseye_security_repo probe "$@" || true
   if DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1; then
     return 0
   fi
+  ensure_bullseye_security_repo force || true
   apt_refresh_lists_hard
   if DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1; then
     return 0
@@ -1712,6 +1862,9 @@ install_base_packages() {
     # Kegagalan berikutnya sering karena daftar paket apt basi: apt merujuk
     # versi .deb yang sudah dihapus dari mirror sehingga muncul 404 padahal
     # paketnya ada. Ambil ulang daftar paket lalu coba sekali lagi.
+    # Di Debian 11 mengambil ulang daftar tidak cukup, karena file paketnya
+    # memang sudah dihapus dari mirror; pindahkan dulu repo security-nya.
+    ensure_bullseye_security_repo force || true
     apt_refresh_lists_hard
     if ! apt_get_safe install -y "${base_pkgs[@]}"; then
       # Batch gagal sering kali cuma karena SATU nama paket tidak ada di rilis

@@ -4,7 +4,7 @@
   "private": true,
   "main": "app3.js",
   "scripts": {
-    "test": "npm run test:license && npm run test:xray-iplimit && npm run test:iplimit-devices && npm run test:xray-hot-add && npm run test:resource-guards && npm run test:xray-monitor && npm run test:online-notify && npm run test:menu-ui && npm run test:sc-renewal-payment && npm run test:dns-guard && npm run test:foreign-backup && npm run test:server-migration && npm run test:button-style && npm run test:telegram-notify && npm run test:service-gate && npm run test:online-monitor && npm run test:xray-links && npm run test:license-recovery && npm run test:update-compat && npm run test:cli-output",
+    "test": "npm run test:license && npm run test:xray-iplimit && npm run test:iplimit-devices && npm run test:xray-hot-add && npm run test:resource-guards && npm run test:xray-monitor && npm run test:online-notify && npm run test:menu-ui && npm run test:sc-renewal-payment && npm run test:dns-guard && npm run test:foreign-backup && npm run test:server-migration && npm run test:button-style && npm run test:telegram-notify && npm run test:service-gate && npm run test:online-monitor && npm run test:xray-links && npm run test:license-recovery && npm run test:bullseye-repo && npm run test:update-compat && npm run test:cli-output",
     "start": "node app3.js",
     "start:api": "node license-api.js",
     "start:expiry": "node app3.js --run-sc-expiry-scheduler",
@@ -27,6 +27,7 @@
     "test:online-monitor": "node scripts/test-online-monitor.js",
     "test:xray-links": "node scripts/test-xray-links.js",
     "test:license-recovery": "node scripts/test-license-recovery.js",
+    "test:bullseye-repo": "node scripts/test-bullseye-security-repo.js",
     "test:update-compat": "node scripts/test-update-compat.js",
     "test:cli-output": "node scripts/test-cli-account-output.js"
   },

@@ -118,6 +118,16 @@ Watchdog `/usr/local/sbin/sc-1forcr-postboot-health` memeriksa `ssh`, `dropbear`
 - **Naikkan `SCRIPT_VERSION`** setiap kali mengirim perbaikan, supaya jalur auto-update dan God Mode mengenali versi baru.
 - **`set -euo pipefail` aktif.** Perintah yang boleh gagal harus diakhiri `|| true`.
 
+### Debian 11 (bullseye) sudah habis masa dukungnya
+
+Debian 11 masih didukung installer, tapi repo keamanannya rusak di sisi Debian: file `.deb` `bullseye-security` dihapus dari mirror awal September 2026 sementara indeksnya dibiarkan. Akibatnya `apt-get install` berujung 404, dan `apt-get update` tidak menolong karena indeksnya memang tidak berubah.
+
+- `ensure_bullseye_security_repo` (blok bertanda `bullseye-security-repo`) memindahkan repo itu ke snapshot.debian.org `20260831T211327Z`. Indeks snapshot itu identik dengan indeks terakhir di mirror, jadi versi paket tidak berubah. Baris lama dijadikan komentar, dan sumber apt tidak disentuh kalau snapshot tidak terjangkau.
+- Blok itu ada di [scripts/setup-autoscript-compat.sh](scripts/setup-autoscript-compat.sh) **dan** [scripts/setup-summary-api.sh](scripts/setup-summary-api.sh), dan isinya harus identik.
+- Mode `probe` dipanggil `apt_get_safe` sebelum setiap `install`: pindah hanya kalau file yang akan diunduh terbukti 404, jadi mirror provider yang masih lengkap dibiarkan. Mode `force` dipakai setelah `apt-get install` sungguhan gagal. Pasang paket lewat `apt_get_safe`, jangan `apt-get install` langsung.
+- Perintah yang diketik pembeli sebelum installer jalan (langkah [2/3] di bot dan README) memakai `--no-upgrade` dan hanya memasang yang dibutuhkan untuk mengunduh installer. Tanpa itu apt ikut meng-upgrade paket dari repo security dan gagal 404 sebelum installer sempat memperbaiki repo. Jangan tambahkan `jq` atau `build-essential` ke sana; keduanya dipasang installer.
+- Test: `npm run test:bullseye-repo`.
+
 ### Wajib sebelum selesai
 
 ```bash

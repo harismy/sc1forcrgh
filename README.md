@@ -18,7 +18,7 @@ https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-summary-api.sh
 Jalankan sebagai `root` di VPS Debian/Ubuntu:
 
 ```bash
-apt-get update -y && apt-get install -y curl ca-certificates htop && TMP_SC=/tmp/setup-autoscript-compat.sh && curl -fsSL https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-autoscript-compat.sh -o "$TMP_SC" && chmod +x "$TMP_SC" && bash "$TMP_SC"
+apt-get update -y && apt-get install -y --no-upgrade curl ca-certificates htop && TMP_SC=/tmp/setup-autoscript-compat.sh && curl -fsSL https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-autoscript-compat.sh -o "$TMP_SC" && chmod +x "$TMP_SC" && bash "$TMP_SC"
 ```
 
 ## Install Summary API
@@ -26,7 +26,7 @@ apt-get update -y && apt-get install -y curl ca-certificates htop && TMP_SC=/tmp
 Jalankan jika hanya ingin memasang/update Summary API:
 
 ```bash
-apt-get update -y && apt-get install -y curl ca-certificates && TMP_SUMMARY=/tmp/setup-summary-api.sh && curl -fsSL https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-summary-api.sh -o "$TMP_SUMMARY" && chmod +x "$TMP_SUMMARY" && bash "$TMP_SUMMARY"
+apt-get update -y && apt-get install -y --no-upgrade curl ca-certificates && TMP_SUMMARY=/tmp/setup-summary-api.sh && curl -fsSL https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-summary-api.sh -o "$TMP_SUMMARY" && chmod +x "$TMP_SUMMARY" && bash "$TMP_SUMMARY"
 ```
 
 ## Install AutoSC + Summary API
@@ -34,7 +34,7 @@ apt-get update -y && apt-get install -y curl ca-certificates && TMP_SUMMARY=/tmp
 AutoSC default sudah bisa menjalankan instalasi Summary API jika fitur `AUTO_INSTALL_SUMMARY_API=1` aktif:
 
 ```bash
-apt-get update -y && apt-get install -y curl ca-certificates htop && TMP_SC=/tmp/setup-autoscript-compat.sh && curl -fsSL https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-autoscript-compat.sh -o "$TMP_SC" && chmod +x "$TMP_SC" && AUTO_INSTALL_SUMMARY_API=1 SUMMARY_API_SETUP_URL=https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-summary-api.sh bash "$TMP_SC"
+apt-get update -y && apt-get install -y --no-upgrade curl ca-certificates htop && TMP_SC=/tmp/setup-autoscript-compat.sh && curl -fsSL https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-autoscript-compat.sh -o "$TMP_SC" && chmod +x "$TMP_SC" && AUTO_INSTALL_SUMMARY_API=1 SUMMARY_API_SETUP_URL=https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-summary-api.sh bash "$TMP_SC"
 ```
 
 ## Update AutoSC

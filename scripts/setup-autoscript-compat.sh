@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.77}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.78}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -333,6 +333,8 @@ VMESS_BUG_PROFILE_SNI="${VMESS_BUG_PROFILE_SNI:-}"
 VMESS_BUG_PROFILE_HOST="${VMESS_BUG_PROFILE_HOST:-}"
 VMESS_BUG_PROFILE_ALLOW_INSECURE="${VMESS_BUG_PROFILE_ALLOW_INSECURE:-1}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
+# 0 = install tanpa animasi: keluaran rinci tampil di terminal seperti dulu.
+INSTALL_ANIMATION="${INSTALL_ANIMATION:-1}"
 
 # Migrasi default Xray lama. Kombinasi ini adalah nilai bawaan versi sebelum
 # V.1FSC.28; nilai custom lain tetap dipertahankan.
@@ -357,18 +359,8 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-if [[ -z "${DOMAIN}" ]]; then
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    read -r -p "Masukkan domain server: " DOMAIN </dev/tty || true
-  else
-    read -r -p "Masukkan domain server: " DOMAIN || true
-  fi
-fi
-
-if [[ -z "${DOMAIN}" ]]; then
-  echo "DOMAIN wajib diisi. Jalankan installer dari terminal interaktif atau isi env DOMAIN."
-  exit 1
-fi
+# Input domain ada di bawah, setelah sanitize_domain_host dan mesin tampilan
+# installer (blok installer-ui) didefinisikan.
 
 # EMAIL opsional: jika kosong/invalid, certbot dijalankan tanpa email
 # dengan --register-unsafely-without-email.
@@ -613,6 +605,725 @@ domain_covered_by_one_label_wildcard() {
   left="${host%.${base}}"
   [[ -n "${left}" && "${left}" != *.* ]]
 }
+
+# >>> installer-ui
+# Tampilan installer: layar input domain di awal dan layar ringkasan di akhir
+# install. Menu CLI punya mesin ui_* sendiri, tapi mesin itu hidup di dalam
+# script menu hasil generate dan belum ada saat installer jalan, jadi di sini
+# ada versi ringkas dengan palet dan bingkai yang sama. Fungsi layar menulis
+# ke stdout; pemanggil yang menentukan tujuannya (/dev/tty atau file log).
+IUI_MODE=""
+IUI_NC=""; IUI_BOLD=""; IUI_C=""
+IUI_LABEL=""; IUI_VAL=""; IUI_MUTED=""; IUI_OK=""; IUI_WARN=""; IUI_BAD=""; IUI_ACC=""; IUI_ACC2=""; IUI_INK=""
+IUI_BW=0; IUI_IW=0; IUI_W=0
+IUI_GRAD=(); IUI_GRAD_BG=(); IUI_LINES=(); IUI_SVC=()
+IUI_PUBLIC_IP=""; IUI_DNS_STATE=""; IUI_DNS_IP=""; IUI_SSL=""
+IUI_ROW=""; IUI_CLIP=""; IUI_WARNINGS=0
+IUI_ANIM_PID=""; IUI_ANIM_LOG=""; IUI_ANIM_STATE=""; IUI_ANIM_UP=0
+IUI_BAR_ON=(); IUI_BAR_OFF=""
+
+iui_tty_ok() {
+  { : >/dev/tty; } 2>/dev/null
+}
+
+# iui_color r g b [38=teks|48=latar] -> IUI_C (hanya mode truecolor dan 256).
+iui_color() {
+  local r="$1" g="$2" b="$3" layer="${4:-38}" lr lg lb
+  case "${IUI_MODE}" in
+    truecolor) printf -v IUI_C '\033[%d;2;%d;%d;%dm' "${layer}" "${r}" "${g}" "${b}" ;;
+    256)
+      lr=$(( r < 48 ? 0 : (r < 115 ? 1 : (r - 35) / 40) ))
+      lg=$(( g < 48 ? 0 : (g < 115 ? 1 : (g - 35) / 40) ))
+      lb=$(( b < 48 ? 0 : (b < 115 ? 1 : (b - 35) / 40) ))
+      printf -v IUI_C '\033[%d;5;%dm' "${layer}" "$(( 16 + 36 * lr + 6 * lg + lb ))" ;;
+    *) IUI_C="" ;;
+  esac
+}
+
+# iui_init [auto|truecolor|256|16|none]. Mode auto mengikuti aturan menu:
+# pilihan tersimpan di /etc/sc-1forcr/menu-color menang, konsol teks lama ke
+# 16 warna, GNU screen ke 256, sisanya truecolor.
+iui_init() {
+  local mode="${1:-auto}" forced=""
+  if [[ "${mode}" == "auto" ]]; then
+    if [[ -r /etc/sc-1forcr/menu-color ]]; then
+      forced="$(tr -cd 'a-z0-9' < /etc/sc-1forcr/menu-color 2>/dev/null || true)"
+    fi
+    case "${forced}" in
+      truecolor|256|16|none) mode="${forced}" ;;
+      *)
+        if [[ -n "${NO_COLOR:-}" ]]; then
+          mode="none"
+        else
+          case "${TERM:-}" in
+            ''|dumb|linux|vt100|vt102|vt220|ansi|cons25) mode="16" ;;
+            screen*) if [[ -n "${TMUX:-}" ]]; then mode="truecolor"; else mode="256"; fi ;;
+            *) mode="truecolor" ;;
+          esac
+        fi ;;
+    esac
+  fi
+  IUI_MODE="${mode}"
+  case "${IUI_MODE}" in
+    none)
+      IUI_NC=""; IUI_BOLD=""
+      IUI_LABEL=""; IUI_VAL=""; IUI_MUTED=""; IUI_OK=""; IUI_WARN=""; IUI_BAD=""; IUI_ACC=""; IUI_ACC2=""; IUI_INK="" ;;
+    16)
+      IUI_NC=$'\033[0m'; IUI_BOLD=$'\033[1m'
+      IUI_LABEL=$'\033[37m'; IUI_VAL=$'\033[97m'; IUI_MUTED=$'\033[90m'
+      IUI_OK=$'\033[92m'; IUI_WARN=$'\033[93m'; IUI_BAD=$'\033[91m'
+      IUI_ACC=$'\033[96m'; IUI_ACC2=$'\033[95m'; IUI_INK=$'\033[30m' ;;
+    *)
+      IUI_NC=$'\033[0m'; IUI_BOLD=$'\033[1m'
+      iui_color 128 146 178; IUI_LABEL="${IUI_C}"
+      iui_color 236 242 255; IUI_VAL="${IUI_C}"
+      iui_color 88 100 128; IUI_MUTED="${IUI_C}"
+      iui_color 0 230 118; IUI_OK="${IUI_C}"
+      iui_color 255 196 0; IUI_WARN="${IUI_C}"
+      iui_color 255 82 82; IUI_BAD="${IUI_C}"
+      iui_color 0 229 255; IUI_ACC="${IUI_C}"
+      iui_color 190 110 255; IUI_ACC2="${IUI_C}"
+      iui_color 12 14 32; IUI_INK="${IUI_C}" ;;
+  esac
+  return 0
+}
+
+# Lebar kotak mengikuti terminal (40-78 kolom) dan gradasi neon
+# cyan -> biru -> ungu -> magenta disiapkan per kolom. IUI_COLS memaksa lebar.
+iui_layout() {
+  local cols="${IUI_COLS:-}" size i pos seg f r g b
+  local -a sr=(0 41 150 255) sg=(229 121 70 64) sb=(255 255 255 170)
+  local -a fg16=($'\033[96m' $'\033[94m' $'\033[95m') bg16=($'\033[106m' $'\033[104m' $'\033[105m')
+  if [[ ! "${cols}" =~ ^[0-9]+$ ]]; then
+    size="$(stty size </dev/tty 2>/dev/null || true)"
+    if [[ "${size}" =~ ^[0-9]+\ ([0-9]+)$ ]]; then cols="${BASH_REMATCH[1]}"; fi
+  fi
+  if [[ ! "${cols}" =~ ^[0-9]+$ || "${cols}" -lt 30 ]]; then cols=62; fi
+  cols=$(( cols - 2 ))
+  if (( cols > 78 )); then cols=78; fi
+  if (( cols < 40 )); then cols=40; fi
+  if [[ -z "${IUI_MODE}" ]]; then iui_init auto; fi
+  IUI_BW="${cols}"
+  IUI_IW=$(( cols - 2 ))
+  IUI_GRAD=(); IUI_GRAD_BG=()
+  for ((i = 0; i < IUI_BW; i++)); do
+    case "${IUI_MODE}" in
+      none) IUI_GRAD[i]=""; IUI_GRAD_BG[i]="" ;;
+      16)
+        seg=$(( i * 3 / IUI_BW ))
+        IUI_GRAD[i]="${fg16[seg]}"; IUI_GRAD_BG[i]="${bg16[seg]}" ;;
+      *)
+        pos=$(( i * 1000 / (IUI_BW - 1) ))
+        seg=$(( pos * 3 / 1000 ))
+        if (( seg >= 3 )); then seg=2; fi
+        f=$(( pos * 3 - seg * 1000 ))
+        r=$(( sr[seg] + (sr[seg + 1] - sr[seg]) * f / 1000 ))
+        g=$(( sg[seg] + (sg[seg + 1] - sg[seg]) * f / 1000 ))
+        b=$(( sb[seg] + (sb[seg + 1] - sb[seg]) * f / 1000 ))
+        iui_color "${r}" "${g}" "${b}"; IUI_GRAD[i]="${IUI_C}"
+        iui_color "${r}" "${g}" "${b}" 48; IUI_GRAD_BG[i]="${IUI_C}" ;;
+    esac
+  done
+  return 0
+}
+
+# Lebar tampak -> IUI_W: kode warna dibuang, byte lanjutan UTF-8 tidak dihitung,
+# jadi tidak bergantung locale VPS.
+iui_width() {
+  local LC_ALL=C s="$1" re=$'\033''\[[0-9;]*m' cont
+  while [[ "${s}" =~ ${re} ]]; do s="${s//"${BASH_REMATCH[0]}"/}"; done
+  cont="${s//[^$'\x80'-$'\xbf']/}"
+  IUI_W=$(( ${#s} - ${#cont} ))
+}
+
+# Pecah teks polos per kata ke baris selebar maksimal $2 -> IUI_LINES. Kata
+# yang lebih panjang dari baris (domain, path) dipotong supaya bingkai utuh.
+iui_wrap() {
+  local LC_ALL=C text="$1" max="$2" word line=""
+  local -a words=()
+  IUI_LINES=()
+  if (( max < 8 )); then max=8; fi
+  text="${text//[^[:print:]]/}"
+  read -ra words <<< "${text}" || true
+  for word in ${words[@]+"${words[@]}"}; do
+    while (( ${#word} > max )); do
+      if [[ -n "${line}" ]]; then IUI_LINES+=("${line}"); line=""; fi
+      IUI_LINES+=("${word:0:max}")
+      word="${word:max}"
+    done
+    if [[ -z "${word}" ]]; then continue; fi
+    if [[ -z "${line}" ]]; then
+      line="${word}"
+    elif (( ${#line} + 1 + ${#word} <= max )); then
+      line+=" ${word}"
+    else
+      IUI_LINES+=("${line}")
+      line="${word}"
+    fi
+  done
+  if [[ -n "${line}" ]]; then IUI_LINES+=("${line}"); fi
+  if (( ${#IUI_LINES[@]} == 0 )); then IUI_LINES=(""); fi
+  return 0
+}
+
+# Garis bingkai: kiri kanan [judul]
+iui_line() {
+  local left="$1" right="$2" title="${3:-}" out col=1 i seg=""
+  if [[ -n "${title}" ]]; then
+    seg="[ ${title} ]"
+    if (( ${#seg} > IUI_BW - 4 )); then seg=""; fi
+  fi
+  out=" ${IUI_GRAD[0]}${left}"
+  while (( col < IUI_BW - 1 )); do
+    if [[ -n "${seg}" ]] && (( col == 2 )); then
+      for ((i = 0; i < ${#seg}; i++)); do
+        out+="${IUI_GRAD[col]}${IUI_BOLD}${seg:i:1}${IUI_NC}"
+        col=$(( col + 1 ))
+      done
+      continue
+    fi
+    out+="${IUI_GRAD[col]}─"
+    col=$(( col + 1 ))
+  done
+  out+="${IUI_GRAD[IUI_BW - 1]}${right}${IUI_NC}"
+  printf '%s\n' "${out}"
+}
+
+# Satu baris kotak tanpa newline -> IUI_ROW (dipakai juga oleh animasi).
+iui_row_build() {
+  local content="${1:-}" pad
+  iui_width "${content}"
+  pad=$(( IUI_IW - 2 - IUI_W ))
+  if (( pad < 0 )); then pad=0; fi
+  printf -v IUI_ROW ' %s│%s %s%*s %s│%s' "${IUI_GRAD[0]}" "${IUI_NC}" "${content}" "${pad}" '' "${IUI_GRAD[IUI_BW - 1]}" "${IUI_NC}"
+}
+
+iui_row() {
+  iui_row_build "${1:-}"
+  printf '%s\n' "${IUI_ROW}"
+}
+
+# Baris teks di dalam kotak, dilipat per kata: iui_text teks [warna]
+iui_text() {
+  local color="${2-${IUI_VAL}}" l
+  iui_wrap "$1" "$(( IUI_IW - 2 ))"
+  for l in "${IUI_LINES[@]}"; do
+    iui_row "${color}${l}${IUI_NC}"
+  done
+}
+
+# Label (maks 8 huruf) + nilai yang dilipat: iui_kv label nilai [warna nilai]
+iui_kv() {
+  local label="$1" color="${3-${IUI_VAL}}" key l first=1
+  iui_wrap "$2" "$(( IUI_IW - 2 - 11 ))"
+  for l in "${IUI_LINES[@]}"; do
+    if (( first )); then
+      printf -v key '%-8s' "${label}"
+      iui_row "${IUI_LABEL}${key}${IUI_NC} ${IUI_ACC}›${IUI_NC} ${color}${l}${IUI_NC}"
+      first=0
+    else
+      iui_row "           ${color}${l}${IUI_NC}"
+    fi
+  done
+}
+
+# Banner judul: latar gradasi penuh dengan tepi setengah blok atas-bawah.
+iui_banner() {
+  local text=" $1 " out=" " col start len ch top="" bottom=""
+  len=${#text}
+  start=$(( (IUI_BW - len) / 2 ))
+  if (( start < 0 )); then start=0; fi
+  for ((col = 0; col < IUI_BW; col++)); do
+    ch=" "
+    if [[ "${IUI_MODE}" == "none" ]]; then ch="="; fi
+    if (( col >= start && col < start + len )); then ch="${text:col-start:1}"; fi
+    out+="${IUI_GRAD_BG[col]}${IUI_INK}${IUI_BOLD}${ch}"
+    top+="${IUI_GRAD[col]}▄"
+    bottom+="${IUI_GRAD[col]}▀"
+  done
+  if [[ "${IUI_MODE}" != "none" ]]; then printf ' %s%s\n' "${top}" "${IUI_NC}"; fi
+  printf '%s%s\n' "${out}" "${IUI_NC}"
+  if [[ "${IUI_MODE}" != "none" ]]; then printf ' %s%s\n' "${bottom}" "${IUI_NC}"; fi
+}
+
+# Baris tanpa bingkai, di tengah kotak.
+iui_center() {
+  local content="$1" pad
+  iui_width "${content}"
+  pad=$(( (IUI_BW - IUI_W) / 2 ))
+  if (( pad < 0 )); then pad=0; fi
+  printf ' %*s%s\n' "${pad}" '' "${content}"
+}
+
+# Status layanan "NAMA|ON" atau "NAMA|OFF", disusun sebanyak yang muat per baris.
+iui_chips() {
+  local item name word color line="" used=0 w
+  for item in "$@"; do
+    name="${item%%|*}"
+    if [[ "${item#*|}" == "ON" ]]; then
+      color="${IUI_OK}"; word="aktif"
+    else
+      color="${IUI_BAD}"; word="mati"
+    fi
+    w=$(( ${#name} + 1 + ${#word} ))
+    if (( used > 0 && used + 3 + w > IUI_IW - 2 )); then
+      iui_row "${line}"
+      line=""; used=0
+    fi
+    if (( used > 0 )); then
+      line+="   "
+      used=$(( used + 3 ))
+    fi
+    line+="${IUI_LABEL}${name}${IUI_NC} ${color}${word}${IUI_NC}"
+    used=$(( used + w ))
+  done
+  if [[ -n "${line}" ]]; then iui_row "${line}"; fi
+  return 0
+}
+
+# Pesan di luar kotak, dilipat mengikuti lebar kotak: iui_say warna teks
+iui_say() {
+  local color="$1" l
+  iui_wrap "$2" "$(( IUI_BW - 2 ))"
+  for l in "${IUI_LINES[@]}"; do
+    printf '  %s%s%s\n' "${color}" "${l}" "${IUI_NC}"
+  done
+}
+
+# IP publik VPS -> IUI_PUBLIC_IP. Batas waktunya pendek karena dipanggil
+# sebelum layar pertama tampil; kosong berarti tidak terdeteksi.
+iui_detect_public_ip() {
+  local ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -4fsS --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    ip="$(wget -4qO- --timeout=5 --tries=1 https://api.ipify.org 2>/dev/null || true)"
+  fi
+  ip="${ip//[[:space:]]/}"
+  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    IUI_PUBLIC_IP="${ip}"
+  else
+    IUI_PUBLIC_IP=""
+  fi
+  return 0
+}
+
+# Bandingkan A record domain dengan IP publik VPS -> IUI_DNS_STATE:
+# match, mismatch, unresolved, atau unknown. Kalau IP publik tidak terdeteksi
+# (jaringan/resolver VPS bermasalah) hasilnya unknown, supaya tidak memberi
+# peringatan palsu sebelum installer sempat memperbaiki resolver.
+iui_domain_dns_status() {
+  local host="$1" ips=""
+  IUI_DNS_STATE="unknown"; IUI_DNS_IP=""
+  if [[ -z "${IUI_PUBLIC_IP}" ]] || ! command -v getent >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    ips="$(timeout 8 getent ahostsv4 "${host}" 2>/dev/null | awk '{ print $1 }' | sort -u || true)"
+  else
+    ips="$(getent ahostsv4 "${host}" 2>/dev/null | awk '{ print $1 }' | sort -u || true)"
+  fi
+  if [[ -z "${ips}" ]]; then
+    IUI_DNS_STATE="unresolved"
+    return 0
+  fi
+  if printf '%s\n' "${ips}" | grep -qxF "${IUI_PUBLIC_IP}"; then
+    IUI_DNS_STATE="match"
+    IUI_DNS_IP="${IUI_PUBLIC_IP}"
+  else
+    IUI_DNS_STATE="mismatch"
+    IUI_DNS_IP="$(printf '%s\n' "${ips}" | head -n 1)"
+  fi
+  return 0
+}
+
+iui_screen_welcome() {
+  local os ram_mb cores
+  os="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-}")" || os=""
+  ram_mb="$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo 2>/dev/null || true)"
+  cores="$(nproc 2>/dev/null || true)"
+  iui_layout
+  printf '\n'
+  iui_banner "S C   1 F O R C R   N E X U S"
+  iui_center "${IUI_VAL}${IUI_BOLD}INSTALLER${IUI_NC}  ${IUI_ACC2}◆${IUI_NC}  ${IUI_ACC}${SCRIPT_VERSION}${IUI_NC}"
+  iui_line '╭' '╮' "TENTANG SC"
+  # Teks dijaga pendek supaya di layar HP (40 kolom) tidak terlipat panjang.
+  iui_kv "SSH" "OpenSSH, Dropbear, WS/SSL"
+  iui_kv "XRAY" "VMess, VLESS, Trojan (WS, gRPC, HTTPUpgrade)"
+  iui_kv "UDP" "ZIVPN, UDP Custom, UDPGW"
+  iui_kv "PORT" "443 TLS, 80 non-TLS"
+  iui_kv "FITUR" "Limit IP/kuota, backup, update, pulih otomatis"
+  iui_line '├' '┤' "SERVER INI"
+  iui_kv "OS" "${os:-Linux}"
+  iui_kv "SPEK" "${cores:-?} vCPU, RAM ${ram_mb:-?} MB"
+  iui_kv "IP" "${IUI_PUBLIC_IP:-tidak terdeteksi}"
+  iui_line '├' '┤' "DOMAIN"
+  iui_text "Untuk sertifikat SSL dan link akun."
+  iui_text "Arahkan A record ke IP VPS ini dulu."
+  iui_text "Contoh: vpn.domainkamu.com" "${IUI_MUTED}"
+  iui_line '╰' '╯'
+}
+
+# Layar input domain. Mengisi DOMAIN dengan host yang formatnya valid; DOMAIN
+# tetap kosong kalau terminal ditutup atau input salah berulang kali.
+iui_prompt_domain() {
+  local input="" pending="" host="" answer="" tries=0
+  printf '\n  Menyiapkan installer SC 1FORCR NEXUS...\n' >/dev/tty
+  iui_detect_public_ip
+  iui_init auto
+  { printf '\033[H\033[2J'; iui_screen_welcome; } >/dev/tty
+  while true; do
+    if [[ -n "${pending}" ]]; then
+      input="${pending}"
+      pending=""
+    else
+      printf '  %sDomain%s %s›%s ' "${IUI_VAL}${IUI_BOLD}" "${IUI_NC}" "${IUI_ACC}" "${IUI_NC}" >/dev/tty
+      input=""
+      IFS= read -r input </dev/tty || return 0
+    fi
+    host="$(sanitize_domain_host "${input}")"
+    if ! certificate_dns_host_valid "${host}"; then
+      tries=$(( tries + 1 ))
+      if (( tries >= 5 )); then return 0; fi
+      iui_say "${IUI_BAD}" "Domain tidak valid. Tulis nama domainnya saja, contoh: vpn.domainkamu.com" >/dev/tty
+      continue
+    fi
+    iui_domain_dns_status "${host}"
+    case "${IUI_DNS_STATE}" in
+      match)
+        iui_say "${IUI_OK}" "Domain ${host} sudah mengarah ke IP VPS ini (${IUI_PUBLIC_IP})." >/dev/tty ;;
+      mismatch|unresolved)
+        {
+          if [[ "${IUI_DNS_STATE}" == "mismatch" ]]; then
+            iui_say "${IUI_WARN}" "Peringatan: ${host} mengarah ke ${IUI_DNS_IP}, bukan ke IP VPS ini (${IUI_PUBLIC_IP})."
+            iui_say "${IUI_MUTED}" "Ini wajar kalau domain memakai proxy Cloudflare. Kalau bukan, sertifikat SSL gagal dibuat dan port 443 memakai sertifikat sementara."
+          else
+            iui_say "${IUI_WARN}" "Peringatan: A record ${host} belum terbaca dari VPS ini."
+            iui_say "${IUI_MUTED}" "A record yang baru dibuat bisa butuh beberapa menit. Kalau domain belum diarahkan ke ${IUI_PUBLIC_IP}, sertifikat SSL gagal dibuat dan port 443 memakai sertifikat sementara."
+          fi
+          printf '  %sEnter = lanjut, atau ketik domain lain%s %s›%s ' "${IUI_VAL}${IUI_BOLD}" "${IUI_NC}" "${IUI_ACC}" "${IUI_NC}"
+        } >/dev/tty
+        answer=""
+        IFS= read -r answer </dev/tty || answer=""
+        answer="${answer//[[:space:]]/}"
+        case "${answer,,}" in
+          ''|y|ya|yes|lanjut) ;;
+          *)
+            pending="${answer}"
+            continue ;;
+        esac ;;
+    esac
+    DOMAIN="${host}"
+    return 0
+  done
+}
+
+# Status layanan dan sertifikat untuk layar akhir, diambil sekali lalu dipakai
+# untuk layar terminal dan salinan di log.
+iui_collect_finish_facts() {
+  local item cert_domain udp_name udp_unit
+  if [[ "${ACTIVE_UDP_BACKEND:-zivpn}" == "udpcustom" ]]; then
+    udp_name="UDP CUSTOM"; udp_unit="${UDPCUSTOM_SERVICE_NAME:-sc-1forcr-udpcustom}"
+  else
+    udp_name="ZIVPN"; udp_unit="${ZIVPN_SERVICE_NAME:-zivpn}"
+  fi
+  IUI_SVC=()
+  for item in "SSH|ssh" "DROPBEAR|dropbear" "SSH-WS|sc-1forcr-sshws" "XRAY|xray" \
+              "NGINX|nginx" "HAPROXY|haproxy" "API|sc-1forcr-api" "${udp_name}|${udp_unit}"; do
+    if systemctl is-active --quiet "${item#*|}" 2>/dev/null; then
+      IUI_SVC+=("${item%%|*}|ON")
+    else
+      IUI_SVC+=("${item%%|*}|OFF")
+    fi
+  done
+  cert_domain="$(tls_cert_domain)"
+  if [[ -s "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" && -s "/etc/letsencrypt/live/${cert_domain}/privkey.pem" ]]; then
+    IUI_SSL="letsencrypt"
+  else
+    IUI_SSL="sementara"
+  fi
+  if [[ -z "${IUI_PUBLIC_IP}" ]]; then iui_detect_public_ip; fi
+  return 0
+}
+
+# iui_screen_finished TOKEN: TOKEN adalah teks token yang ditampilkan (asli
+# untuk terminal, sudah disamarkan untuk salinan di log).
+iui_screen_finished() {
+  local token="$1" udp_text
+  if [[ "${ACTIVE_UDP_BACKEND:-zivpn}" == "udpcustom" ]]; then
+    udp_text="UDP Custom ${UDPCUSTOM_LISTEN_PORT:-5667}"
+  else
+    udp_text="ZIVPN ${ZIVPN_LISTEN_PORT:-5667} (${ZIVPN_DNAT_RANGE/:/-})"
+  fi
+  iui_layout
+  printf '\n'
+  iui_banner "S C   1 F O R C R   N E X U S"
+  iui_center "${IUI_OK}${IUI_BOLD}INSTALL SELESAI${IUI_NC}  ${IUI_ACC2}◆${IUI_NC}  ${IUI_ACC}${SCRIPT_VERSION}${IUI_NC}"
+  iui_line '╭' '╮' "SERVER"
+  iui_kv "DOMAIN" "${DOMAIN}"
+  iui_kv "IP" "${IUI_PUBLIC_IP:-tidak terdeteksi}"
+  if [[ "${IUI_SSL}" == "letsencrypt" ]]; then
+    iui_kv "SSL" "Aktif (Let's Encrypt)" "${IUI_OK}"
+  else
+    iui_kv "SSL" "Let's Encrypt gagal, 443 memakai sertifikat sementara. Cek A record domain." "${IUI_WARN}"
+  fi
+  iui_line '├' '┤' "LAYANAN"
+  iui_chips ${IUI_SVC[@]+"${IUI_SVC[@]}"}
+  iui_line '├' '┤' "PORT"
+  iui_kv "WEB" "443 TLS, 80 non-TLS"
+  iui_kv "SSH" "Dropbear ${DROPBEAR_PORT:-109} dan ${DROPBEAR_ALT_PORT:-143}"
+  iui_kv "UDP" "${udp_text}"
+  iui_line '├' '┤' "LANGKAH BERIKUTNYA"
+  iui_text "Ketik menu untuk membuka panel SC."
+  iui_text "Buat akun di menu [01] MENU AKUN."
+  iui_text "Log: /var/lib/sc-1forcr/install.log" "${IUI_MUTED}"
+  # Keluaran rinci tidak tampil selama animasi, jadi peringatan yang tercatat
+  # di log disebut di sini supaya tidak terlewat.
+  if (( IUI_WARNINGS > 0 )); then
+    iui_text "${IUI_WARNINGS} peringatan tercatat di log." "${IUI_WARN}"
+  fi
+  iui_line '╰' '╯'
+  # URL dan token di luar kotak supaya bisa disalin utuh walau layarnya sempit.
+  printf '  %sAPI Base %s %s›%s %s%s%s\n' "${IUI_LABEL}" "${IUI_NC}" "${IUI_ACC}" "${IUI_NC}" "${IUI_VAL}" "https://${DOMAIN}/vps" "${IUI_NC}"
+  printf '  %sAPI Token%s %s›%s %s%s%s\n' "${IUI_LABEL}" "${IUI_NC}" "${IUI_ACC}" "${IUI_NC}" "${IUI_VAL}${IUI_BOLD}" "${token}" "${IUI_NC}"
+  iui_say "${IUI_MUTED}" "Summary API memakai token yang sama (tabel servers, kolom key)."
+}
+
+# --- Animasi progres install -------------------------------------------------
+# Selama install, keluaran rinci (apt, certbot, build) hanya masuk ke log dan
+# terminal menampilkan satu kotak: spinner, langkah yang sedang jalan, bar
+# progres, dan baris log terakhir. Yang menggambar adalah satu proses latar
+# yang membaca file status; installer cukup menulis "persen|pesan" ke file itu
+# dan tidak pernah menulis ke terminal, jadi terminal yang macet (Ctrl+S,
+# koneksi lambat) tidak bisa menahan proses install.
+# Hemat resource untuk VPS 1 vCPU: hanya baris yang berubah yang digambar
+# ulang, dan log dibaca kira-kira sedetik sekali.
+
+iui_anim_supported() {
+  [[ "${INSTALL_ANIMATION:-1}" != "0" ]] || return 1
+  [[ "${INSTALL_LOG_DISABLE:-0}" != "1" ]] || return 1
+  [[ "${SC_ORIG_STDOUT_IS_TTY:-0}" == "1" ]] || return 1
+  case "${TERM:-}" in
+    ''|dumb) return 1 ;;
+  esac
+  iui_tty_ok
+}
+
+# Teks bebas -> IUI_CLIP: hanya ASCII tercetak, dipotong ke $2 kolom.
+iui_clip() {
+  local LC_ALL=C s="$1" max="$2"
+  s="${s//[^[:print:]]/}"
+  if (( max < 1 )); then max=1; fi
+  if (( ${#s} > max )); then
+    if (( max > 2 )); then s="${s:0:max-2}.."; else s="${s:0:max}"; fi
+  fi
+  IUI_CLIP="${s}"
+}
+
+# Gambar ulang satu baris kotak yang letaknya $1 baris di atas kursor, lalu
+# kembalikan kursor. Tanpa newline, jadi layar tidak pernah tergulung.
+iui_anim_put() {
+  iui_row_build "$2"
+  printf '\033[%dA\r%s\033[%dB\r' "$1" "${IUI_ROW}" "$1"
+}
+
+# Baris log terakhir -> IUI_CLIP. Baris progres installer sendiri dilewati
+# karena isinya sudah tampil di kotak.
+iui_anim_log_tail() {
+  local LC_ALL=C raw="" re=$'\033''\[[0-9;?]*[A-Za-z]'
+  raw="$(tail -c 400 "${IUI_ANIM_LOG}" 2>/dev/null || true)"
+  raw="${raw//$'\r'/$'\n'}"
+  while [[ "${raw}" == *$'\n' ]]; do raw="${raw%$'\n'}"; done
+  raw="${raw##*$'\n'}"
+  while [[ "${raw}" =~ ${re} ]]; do raw="${raw//"${BASH_REMATCH[0]}"/}"; done
+  raw="${raw#\[autoscript-1FORCR-NEXUS\] }"
+  if [[ "${raw}" == "["[=-]*"% | "* ]]; then raw=""; fi
+  iui_clip "${raw}" "$(( IUI_IW - 2 ))"
+}
+
+# Proses latar animasi. Berhenti sendiri kalau installer mati, kalau terminal
+# hilang, atau kalau file status berisi "stop".
+iui_anim_loop() {
+  local tick=0 shown=0 target=0 msg="Menyiapkan instalasi" pct="" text="" drawn_pct=-1 drawn_detail=$'\001'
+  local start="${SECONDS}" el right left room fill i bar barw delta
+  local -a frames=()
+  set +e
+  if [[ "${IUI_MODE}" == "truecolor" || "${IUI_MODE}" == "256" ]]; then
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  else
+    frames=('|' '/' '-' '\')
+  fi
+  barw=$(( IUI_IW - 2 - 5 ))
+  while kill -0 "$$" 2>/dev/null; do
+    pct=""; text=""
+    IFS='|' read -r pct text < "${IUI_ANIM_STATE}"
+    if [[ "${pct}" == "stop" ]]; then break; fi
+    if [[ "${pct}" =~ ^[0-9]+$ ]]; then
+      target="${pct}"
+      if (( target > 100 )); then target=100; fi
+      msg="${text}"
+    fi
+    # Bar mengejar target sedikit demi sedikit supaya naiknya halus. 100%
+    # langsung penuh, karena layar ini segera diganti ringkasan akhir.
+    if (( target >= 100 || shown > target )); then
+      shown="${target}"
+    elif (( shown < target )); then
+      delta=$(( (target - shown + 3) / 4 ))
+      if (( delta < 1 )); then delta=1; fi
+      shown=$(( shown + delta ))
+    fi
+
+    el=$(( SECONDS - start ))
+    printf -v right '%02d:%02d' "$(( el / 60 ))" "$(( el % 60 ))"
+    room=$(( IUI_IW - 2 - 2 - 1 - ${#right} ))
+    iui_clip "${msg}" "${room}"
+    printf -v left '%-*s' "${room}" "${IUI_CLIP}"
+    iui_anim_put "${IUI_ANIM_UP}" "${IUI_ACC}${frames[tick % ${#frames[@]}]}${IUI_NC} ${IUI_VAL}${IUI_BOLD}${left}${IUI_NC} ${IUI_MUTED}${right}${IUI_NC}" || break
+
+    if (( shown != drawn_pct )); then
+      fill=$(( shown * barw / 100 ))
+      bar=""
+      for ((i = 0; i < barw; i++)); do
+        if (( i < fill )); then
+          bar+="${IUI_BAR_ON[i]}"
+        else
+          if (( i == fill )); then bar+="${IUI_MUTED}"; fi
+          bar+="${IUI_BAR_OFF}"
+        fi
+      done
+      printf -v right '%3d%%' "${shown}"
+      iui_anim_put "$(( IUI_ANIM_UP - 1 ))" "${bar}${IUI_NC} ${IUI_VAL}${right}${IUI_NC}" || break
+      drawn_pct="${shown}"
+    fi
+
+    if (( tick % 6 == 0 )); then
+      iui_anim_log_tail
+      if [[ "${IUI_CLIP}" != "${drawn_detail}" ]]; then
+        drawn_detail="${IUI_CLIP}"
+        iui_anim_put "$(( IUI_ANIM_UP - 2 ))" "${IUI_MUTED}${drawn_detail}${IUI_NC}" || break
+      fi
+    fi
+
+    tick=$(( tick + 1 ))
+    sleep 0.15 2>/dev/null || sleep 1 || break
+  done
+  printf '\033[?25h'
+}
+
+# iui_anim_start FILE_LOG: gambar kerangka layar lalu jalankan proses animasi.
+# Gagal (1) berarti animasi tidak jalan dan pemanggil memakai tampilan biasa.
+iui_anim_start() {
+  local log_file="$1" i barw hint
+  local -a hints=("Jangan tutup terminal ini.")
+  if [[ -n "${STY:-}" ]]; then
+    hints+=("Putus? Jalankan: screen -r ${STY#*.}")
+  fi
+  IUI_ANIM_LOG="${log_file}"
+  IUI_ANIM_STATE="${log_file%/*}/install-anim.state"
+  iui_init auto
+  iui_layout
+  barw=$(( IUI_IW - 2 - 5 ))
+  IUI_BAR_ON=()
+  for ((i = 0; i < barw; i++)); do
+    if [[ "${IUI_MODE}" == "none" ]]; then
+      IUI_BAR_ON[i]="#"
+    else
+      IUI_BAR_ON[i]="${IUI_GRAD[i + 2]}█"
+    fi
+  done
+  if [[ "${IUI_MODE}" == "none" ]]; then IUI_BAR_OFF="-"; else IUI_BAR_OFF="░"; fi
+  : > "${IUI_ANIM_STATE}" || return 1
+  {
+    printf '\033[H\033[2J\n'
+    iui_banner "S C   1 F O R C R   N E X U S"
+    iui_center "${IUI_VAL}${IUI_BOLD}MEMASANG${IUI_NC}  ${IUI_ACC2}◆${IUI_NC}  ${IUI_ACC}${SCRIPT_VERSION}${IUI_NC}"
+    iui_line '╭' '╮' "INSTALASI"
+    iui_row ""
+    iui_row ""
+    iui_row ""
+    iui_line '╰' '╯'
+    for hint in "${hints[@]}"; do
+      iui_clip "${hint}" "$(( IUI_BW - 2 ))"
+      printf '  %s%s%s\n' "${IUI_MUTED}" "${IUI_CLIP}" "${IUI_NC}"
+    done
+    printf '\033[?25l'
+  } >/dev/tty || return 1
+  # Baris pertama kotak berada sekian baris di atas kursor: tiga baris isi,
+  # garis bawah, lalu baris petunjuk.
+  IUI_ANIM_UP=$(( 3 + 1 + ${#hints[@]} ))
+  iui_anim_loop >/dev/tty 2>/dev/null &
+  IUI_ANIM_PID="$!"
+  # Dilepas dari daftar job supaya bash tidak mencetak "Terminated" ke log.
+  disown "${IUI_ANIM_PID}" 2>/dev/null || true
+  return 0
+}
+
+iui_anim_update() {
+  local LC_ALL=C msg="${2:-}"
+  if [[ -z "${IUI_ANIM_PID}" ]]; then return 0; fi
+  msg="${msg//[^[:print:]]/}"
+  printf '%s|%s\n' "${1:-0}" "${msg}" > "${IUI_ANIM_STATE}" 2>/dev/null || true
+  return 0
+}
+
+# Minta proses animasi berhenti sendiri; kalau tidak menjawab (mis. tulisannya
+# tertahan terminal) baru dihentikan paksa. Kursor selalu dimunculkan lagi.
+iui_anim_stop() {
+  local pid="${IUI_ANIM_PID}" i
+  if [[ -z "${pid}" ]]; then return 0; fi
+  IUI_ANIM_PID=""
+  printf 'stop\n' > "${IUI_ANIM_STATE}" 2>/dev/null || true
+  for ((i = 0; i < 15; i++)); do
+    kill -0 "${pid}" 2>/dev/null || break
+    sleep 0.1 2>/dev/null || break
+  done
+  kill "${pid}" 2>/dev/null || true
+  rm -f "${IUI_ANIM_STATE}" 2>/dev/null || true
+  { printf '\033[?25h' >/dev/tty; } 2>/dev/null || true
+  return 0
+}
+
+# Dipanggil dari trap EXIT saat installer berhenti sebelum selesai. Keluaran
+# rinci selama ini hanya masuk ke log, jadi ujung log diperlihatkan di sini.
+iui_anim_abort() {
+  local LC_ALL=C rc="${1:-1}" pct="" msg="" line re=$'\033''\[[0-9;?]*[A-Za-z]'
+  if [[ -z "${IUI_ANIM_PID}" ]]; then return 0; fi
+  IFS='|' read -r pct msg < "${IUI_ANIM_STATE}" 2>/dev/null || true
+  iui_anim_stop
+  {
+    printf '\n'
+    if [[ "${rc}" != "0" ]]; then
+      iui_say "${IUI_BAD}${IUI_BOLD}" "INSTALL GAGAL (kode ${rc}) di langkah: ${msg:-tidak diketahui}"
+    else
+      iui_say "${IUI_WARN}${IUI_BOLD}" "Installer berhenti sebelum selesai di langkah: ${msg:-tidak diketahui}"
+    fi
+    iui_say "${IUI_MUTED}" "Akhir log:"
+    tail -n 40 "${IUI_ANIM_LOG}" 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n 15 | while IFS= read -r line; do
+      while [[ "${line}" =~ ${re} ]]; do line="${line//"${BASH_REMATCH[0]}"/}"; done
+      iui_clip "${line}" "$(( IUI_BW - 2 ))"
+      printf '  %s\n' "${IUI_CLIP}"
+    done
+    iui_say "${IUI_VAL}" "Log lengkap: ${IUI_ANIM_LOG}"
+    if [[ -x /usr/local/sbin/lanjut-install ]]; then
+      iui_say "${IUI_VAL}" "Setelah penyebabnya diperbaiki, jalankan: lanjut-install"
+    fi
+  } >/dev/tty 2>/dev/null || true
+  return 0
+}
+# <<< installer-ui
+
+if [[ -z "${DOMAIN}" ]]; then
+  if iui_tty_ok; then
+    iui_prompt_domain || true
+  else
+    read -r -p "Masukkan domain server: " DOMAIN || true
+  fi
+fi
+
+if [[ -z "${DOMAIN}" ]]; then
+  echo "DOMAIN wajib diisi. Jalankan installer dari terminal interaktif atau isi env DOMAIN."
+  exit 1
+fi
 
 DOMAIN="$(sanitize_domain_host "${DOMAIN}")"
 WILDCARD_BASE_DOMAIN="$(sanitize_domain_host "${WILDCARD_BASE_DOMAIN}")"
@@ -31574,6 +32285,69 @@ show_install_progress() {
   bar_empty="$(printf '%*s' "${empty}" '' | tr ' ' '-')"
 
   printf '[%s%s] %3d%% | %s\n' "${bar_filled}" "${bar_empty}" "${pct}" "${msg}"
+  iui_anim_update "${pct}" "${msg}"
+}
+
+INSTALL_LOG_START_BYTES=0
+
+# Mulai tampilan progres install. Di terminal interaktif: animasi, dan sejak
+# itu stdout/stderr hanya menuju log. Selain itu (tanpa terminal, log
+# dimatikan, atau INSTALL_ANIMATION=0): baris progres biasa seperti dulu.
+install_display_start() {
+  local log_file="/var/lib/sc-1forcr/install.log"
+  INSTALL_LOG_START_BYTES="$(wc -c < "${log_file}" 2>/dev/null | tr -cd '0-9' || true)"
+  INSTALL_LOG_START_BYTES="${INSTALL_LOG_START_BYTES:-0}"
+  if iui_anim_supported && iui_anim_start "${log_file}"; then
+    # Trap dipasang sebelum apa pun bisa gagal: tanpa itu, install yang gagal
+    # hanya meninggalkan layar animasi yang berhenti tanpa penjelasan.
+    trap install_display_on_exit EXIT
+    exec >>"${log_file}" 2>&1
+  fi
+  show_install_banner
+}
+
+install_display_finish() {
+  if [[ -n "${IUI_ANIM_PID}" ]]; then
+    # Beri waktu bar mencapai 100% sebelum layar diganti ringkasan akhir.
+    sleep 0.6 2>/dev/null || true
+    iui_anim_stop
+    trap - EXIT
+  fi
+  return 0
+}
+
+install_display_on_exit() {
+  local rc="$?"
+  trap - EXIT
+  iui_anim_abort "${rc}" || true
+  exit "${rc}"
+}
+
+# Ringkasan akhir install. Di terminal interaktif layar berwarna ditulis
+# langsung ke /dev/tty dan salinan polosnya (token disamarkan) ditambahkan ke
+# log, supaya log tidak berisi kode warna maupun token asli. Tanpa terminal,
+# ringkasan polos dicetak ke stdout seperti sebelumnya.
+show_install_finished() {
+  local log_file="/var/lib/sc-1forcr/install.log"
+  iui_collect_finish_facts
+  # Peringatan yang tercatat sejak install ini dimulai (bukan dari percobaan lama).
+  IUI_WARNINGS="$(tail -c "+$(( ${INSTALL_LOG_START_BYTES:-0} + 1 ))" "${log_file}" 2>/dev/null | grep -c 'PERINGATAN\|Peringatan' || true)"
+  if [[ ! "${IUI_WARNINGS}" =~ ^[0-9]+$ ]]; then IUI_WARNINGS=0; fi
+  if [[ "${SC_ORIG_STDOUT_IS_TTY:-0}" == "1" ]] && iui_tty_ok; then
+    # Keluaran sebelumnya lewat tee; beri jeda supaya tidak menyusul layar ini.
+    sleep 0.3 2>/dev/null || true
+    iui_init auto
+    { printf '\033[H\033[2J'; iui_screen_finished "${API_AUTH_TOKEN}"; } >/dev/tty
+    if [[ "${INSTALL_LOG_DISABLE:-0}" != "1" ]]; then
+      iui_init none
+      IUI_COLS=80 iui_screen_finished "$(mask_secret "${API_AUTH_TOKEN}")" >> "${log_file}" 2>/dev/null || true
+      iui_init auto
+    fi
+  else
+    iui_init none
+    IUI_COLS=80 iui_screen_finished "${API_AUTH_TOKEN}"
+  fi
+  return 0
 }
 
 open_menu_after_install() {
@@ -31582,12 +32356,16 @@ open_menu_after_install() {
   # aslinya interaktif, mis. di dalam `screen -S nexus-sc ...`). Tanpa ini,
   # menu tidak pernah kebuka otomatis dan screen langsung terminate begitu
   # main() selesai (user cuma lihat "[screen is terminating]").
-  local stdin_tty="${SC_ORIG_STDIN_IS_TTY:-}" stdout_tty="${SC_ORIG_STDOUT_IS_TTY:-}"
+  local stdin_tty="${SC_ORIG_STDIN_IS_TTY:-}" stdout_tty="${SC_ORIG_STDOUT_IS_TTY:-}" enter_key=""
   [[ -z "${stdin_tty}" ]] && { [[ -t 0 ]] && stdin_tty=1 || stdin_tty=0; }
   [[ -z "${stdout_tty}" ]] && { [[ -t 1 ]] && stdout_tty=1 || stdout_tty=0; }
   if [[ -x /usr/local/sbin/menu-sc-1forcr && "${stdin_tty}" == "1" && "${stdout_tty}" == "1" ]]; then
-    echo
-    echo "Membuka menu SC 1FORCR..."
+    # Menu langsung membersihkan layar, jadi ringkasan install ditahan dulu
+    # sampai pengguna selesai membacanya (dan menyalin token API).
+    if iui_tty_ok; then
+      printf '\n  %sTekan Enter untuk membuka menu SC 1FORCR...%s ' "${IUI_VAL}${IUI_BOLD}" "${IUI_NC}" >/dev/tty
+      IFS= read -r enter_key </dev/tty || true
+    fi
     /usr/local/sbin/menu-sc-1forcr </dev/tty >/dev/tty 2>&1 || true
   else
     echo
@@ -31626,7 +32404,7 @@ persist_pending_install_env() {
   local vars key
   mkdir -p /var/lib/sc-1forcr >/dev/null 2>&1 || true
   vars=(
-    DOMAIN EMAIL INSTALL_AUTH_TOKEN API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH
+    DOMAIN EMAIL INSTALL_AUTH_TOKEN API_AUTH_TOKEN AUTH_TOKEN API_PORT APP_DIR DB_PATH INSTALL_ANIMATION
     LICENSE_ENFORCE LICENSE_API_URL LICENSE_KEY SC_UPDATE_KEY
     LICENSE_LEASE_REQUIRED LICENSE_PUBLIC_KEY_B64 LICENSE_LEASE_REFRESH_MINUTES
     LICENSE_LEASE_FILE LICENSE_PUBLIC_KEY_FILE LICENSE_REQUIRED_MARKER
@@ -32903,7 +33681,7 @@ main() {
   install_pending_resume_helper
   install_pending_login_prompt
   set_pending_operation "install" "/usr/local/sbin/lanjut-install" "Install SC 1FORCR terputus sebelum selesai"
-  show_install_banner
+  install_display_start
   show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
 
   show_install_progress 1 "Cek DNS resolver"
@@ -32961,24 +33739,14 @@ main() {
   ensure_dns_resolver_if_needed
   run_install_step "39_preflight" 100 "Preflight akhir" post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. GASSS LANGSUNG TESTTT BANGGG."
-
-  cat <<EOF
-
-=========================================
-SELESAI - SC 1FORCR NEXUS TERPASANG
-=========================================
-Script Version : ${SCRIPT_VERSION}
-Domain         : ${DOMAIN}
-Email LE       : ${EMAIL:-without-email}
-API Token      : ${API_AUTH_TOKEN}
-API Base       : https://${DOMAIN}/vps
-Summary DB key : tabel servers kolom key = token di atas
-
-EOF
+  install_display_finish
 
   clear_pending_operation
   clear_install_resume_state
   rm -f "${PENDING_INSTALL_SCRIPT}" >/dev/null 2>&1 || true
+  # Setelah status pending dibersihkan, dan dengan '|| true': masalah tampilan
+  # tidak boleh membuat install yang sudah selesai dianggap terputus.
+  show_install_finished || true
   open_menu_after_install
 }
 

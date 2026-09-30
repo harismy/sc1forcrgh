@@ -183,6 +183,20 @@ Menu (`menu-sc-1forcr`, heredoc `MENU_SCRIPT_EOF`) memakai mesin tampilan `ui_*`
 - `trap ... RETURN` yang dipasang fungsi yang dipanggil **menimpa** trap RETURN pemanggilnya. Fungsi yang memanggil collector (yang punya trap sendiri) wajib memasang trap cleanup-nya **setelah** pemanggilan itu; kalau tidak, file temp-nya bocor tiap refresh.
 - Test: `npm run test:menu-ui` menggambar dashboard dan menu di 5 lebar layar, 4 mode warna, dan 2 locale, lalu memastikan semua bingkai lurus. Test yang sama memeriksa warna pesan `echo` (termasuk kasus yang tidak boleh salah warna, seperti "Cooldown gagal : 15 menit" dan "Jika ... gagal") dan bahwa echo tanpa terminal tetap polos.
 
+### Tampilan installer
+
+Layar input domain di awal dan layar ringkasan di akhir install digambar mesin `iui_*` (blok bertanda `installer-ui` di installer). Mesin `ui_*` milik menu hidup di dalam script menu hasil generate dan belum ada saat installer jalan, jadi `iui_*` adalah versi ringkasnya dengan palet, bingkai, lebar (40–78 kolom), dan aturan mode warna yang sama.
+
+- Blok itu harus berada setelah `certificate_dns_host_valid` dan sebelum `DOMAIN` disanitasi, karena input domain jalan di level atas script, sebelum `main()`.
+- Input domain divalidasi formatnya (salah = diminta ulang, bukan installer mati) lalu A record-nya dibandingkan dengan IP publik VPS. Hasilnya hanya peringatan dengan Enter untuk lanjut, tidak pernah memblokir: domain di balik proxy Cloudflare memang mengarah ke IP lain. Kalau IP publik tidak terdeteksi, pengecekan dilewati supaya resolver VPS yang rusak tidak memunculkan peringatan palsu.
+- Teks di dalam kotak lewat `iui_text`/`iui_kv`, yang melipat per kata. Jaga teks tetap pendek supaya di layar 40 kolom tidak terlipat panjang. URL API dan token dicetak di luar kotak supaya bisa disalin utuh.
+- Setelah `exec > >(tee ...)` di `main()`, stdout adalah pipe ke log. Layar berwarna ditulis langsung ke `/dev/tty`, dan salinan polos dengan token disamarkan ditambahkan ke `install.log`. Jangan cetak token asli lewat stdout di jalur interaktif.
+- `show_install_finished` dipanggil setelah status pending dibersihkan dan dengan `|| true`: masalah tampilan tidak boleh membuat install yang sudah selesai dianggap terputus. Menu baru dibuka setelah Enter, karena menu langsung membersihkan layar.
+- Selama install penuh di terminal interaktif, progres ditampilkan sebagai animasi (`install_display_start` sampai `install_display_finish`): spinner, langkah yang sedang jalan, bar, waktu, dan baris log terakhir. Sejak animasi mulai, stdout/stderr installer **hanya** menuju `install.log`. Jalur update aman tidak memakainya. `INSTALL_ANIMATION=0`, tanpa terminal, `TERM=dumb`, atau `INSTALL_LOG_DISABLE=1` kembali ke baris progres biasa.
+- Yang menggambar adalah satu proses latar (`iui_anim_loop`) yang membaca file status `persen|pesan`; installer sendiri tidak pernah menulis ke terminal, jadi terminal yang macet tidak menahan install. Proses itu hanya menggambar ulang baris yang berubah, membaca log kira-kira sedetik sekali, tidak pernah mengirim newline (layar tidak boleh tergulung), dan berhenti sendiri kalau installer mati. Jangan tambahkan efek yang menggambar ulang bar di setiap tick; itu melipatgandakan data yang dikirim lewat SSH.
+- Karena keluaran rinci tersembunyi, dua hal wajib dijaga: trap `install_display_on_exit` menampilkan ujung log saat install berhenti sebelum selesai, dan layar akhir menyebut jumlah peringatan yang tercatat di log. Langkah install baru tidak boleh meminta input lewat terminal selama animasi jalan.
+- Test: `npm run test:installer-ui` menggambar kedua layar di 6 lebar, 4 mode warna, dan 2 locale, menjalankan alur input domain dengan terminal tiruan, dan menjalankan animasi sungguhan (selesai normal, install gagal, installer mati mendadak).
+
 ## Bahasa
 
 Komentar, log, dan teks menu memakai bahasa Indonesia. Ikuti gaya yang sudah ada.

@@ -124,7 +124,10 @@ function assertLayout(text, title) {
   let [msg] = take();
   assertLayout(msg, 'AKUN SSH BARU');
   assert(msg.includes('Password : x7Kp29qa') && msg.includes('sg1.contoh.com:80@andi:x7Kp29qa'));
-  assert(msg.includes('Expired  : ') && /\(30 hari lagi\)/.test(msg), msg);
+  // notifyExpiry membulatkan ke menit lalu floor ke hari, jadi akun "30 hari"
+  // bisa terbaca 29-31 tergantung jam saat test jalan. Cukup pastikan sisa hari
+  // yang wajar muncul, bukan angka persis.
+  assert(msg.includes('Expired  : ') && /\((29|30|31) hari lagi\)/.test(msg), msg);
   assert(msg.includes('Quota    : Tanpa batas'), 'quota 0 berarti tanpa batas');
   assert(msg.includes('Pembeli  : ID 5566778899'));
   assert(!/1194|2200|8181|OVPN|OHP/.test(msg), 'port OVPN/OHP tidak dipasang SC ini, jangan tampil');

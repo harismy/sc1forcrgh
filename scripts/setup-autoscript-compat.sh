@@ -128,9 +128,6 @@ set -euo pipefail
 #   XRAY_RECENT_WINDOW_MINUTES=5                 (opsional, jendela menit log xray untuk kandidat multi-login)
 #   XRAY_ACTIVE_WINDOW_SECONDS=60                (opsional, jendela detik untuk kandidat IP aktif xray)
 #   XRAY_MIN_HITS_PER_IP=2                       (opsional, minimal hit/log per IP pada jendela aktif)
-#   IPLIMIT_MERGE_ASNS=24203+17885+24208+24518+139994+58496:2
-#                                                (IP-limit Xray: ASN satu operator digabung "+", ":N" = N IP dihitung
-#                                                 satu perangkat, antar operator dipisah koma; default XL/Axis, kosong=mati)
 #   XRAY_REAL_IP_ENABLE=0                        (canary: 1=teruskan IP asli HAProxy->Nginx->Xray)
 #   XRAY_XHTTP_ENABLE=0                          (opsional: 1=aktifkan inbound XHTTP VLESS di /xhvless)
 #   SERVICE_SSH_ENABLE=1                         (menu ON/OFF LAYANAN: 0=tolak SSH-WS/SSL/Dropbear; sshd 22 tetap buka)
@@ -196,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.81}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.82}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -301,12 +298,6 @@ XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-5}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-60}"
 XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}"
-# Operator yang IP-nya dihitung per sekian alamat oleh IP-limit Xray, bukan per
-# kelompok subnet. Satu operator bisa punya beberapa nomor (ASN), digabung
-# dengan "+"; ":N" di ujung berarti N IP dihitung satu perangkat; antar
-# operator dipisah koma. Default: XL Axiata termasuk Axis, 2 IP = 1 perangkat.
-# Kosongkan untuk mematikan.
-IPLIMIT_MERGE_ASNS="${IPLIMIT_MERGE_ASNS-24203+17885+24208+24518+139994+58496:2}"
 XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}"
 XRAY_VERSION="${XRAY_VERSION:-}"
 XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
@@ -5162,7 +5153,6 @@ XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
-IPLIMIT_MERGE_ASNS=${IPLIMIT_MERGE_ASNS}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
 XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
@@ -10209,7 +10199,6 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const net = require('net');
-const dns = require('dns');
 const crypto = require('crypto');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
@@ -10303,43 +10292,6 @@ const XRAY_PATH_VMESS = parseXrayPathList(process.env.XRAY_PATHS_VMESS, '/vmess'
 const XRAY_PATH_VLESS = parseXrayPathList(process.env.XRAY_PATHS_VLESS, '/vless')[0];
 const XRAY_PATH_TROJAN = parseXrayPathList(process.env.XRAY_PATHS_TROJAN, '/trojan')[0];
 const XRAY_REAL_IP_ENABLE = /^(1|true|yes|on)$/i.test(String(process.env.XRAY_REAL_IP_ENABLE || '0').trim());
-// Operator yang terbukti mengeluarkan koneksi satu kartu lewat beberapa IP
-// sekaligus, sehingga kelompok subnet tidak bisa dipakai menghitung perangkat.
-// Kasus nyata: satu HP XL teramati di 112.215.x, 140.213.x, dan 203.78.x pada
-// saat yang sama. Untuk operator di daftar ini IP-limit Xray menghitung
-// jumlah IP, dan setiap N IP dianggap satu perangkat.
-// Format: ASN satu operator digabung "+" (XL memakai 24203, 17885, 24208,
-// 139994, 58496, dan 24518 milik Axis), ":N" di ujungnya adalah jumlah IP per
-// perangkat, dan antar operator dipisah koma. Tanpa ":N" seluruh operator
-// dihitung satu perangkat.
-// Hanya berlaku untuk VMess/VLESS/Trojan. SSH, ZIVPN, dan UDP Custom tetap
-// memakai kelompok subnet. Angka 2 untuk XL adalah keputusan pemilik; tambah
-// operator lain hanya dengan data dari iplimit_lock_history.
-const IPLIMIT_MERGE_ASNS_DEFAULT = '24203+17885+24208+24518+139994+58496:2';
-// ASN -> kunci operatornya ('as<ASN pertama di kelompok itu>').
-const IPLIMIT_MERGE_ASNS = new Map();
-// Kunci operator -> jumlah IP per perangkat (0 = seluruh operator satu perangkat).
-const IPLIMIT_MERGE_IPS_PER_DEVICE = new Map();
-for (const groupRaw of String(
-  process.env.IPLIMIT_MERGE_ASNS === undefined ? IPLIMIT_MERGE_ASNS_DEFAULT : process.env.IPLIMIT_MERGE_ASNS
-).split(/[\s,;]+/)) {
-  const [asnPart, perDevicePart = ''] = groupRaw.split(':');
-  const groupAsns = asnPart.split('+')
-    .map((v) => v.replace(/^as/i, '').trim())
-    .filter((v) => /^[0-9]{1,10}$/.test(v));
-  if (groupAsns.length === 0) continue;
-  const operatorKey = `as${groupAsns[0]}`;
-  for (const asn of groupAsns) {
-    if (!IPLIMIT_MERGE_ASNS.has(asn)) IPLIMIT_MERGE_ASNS.set(asn, operatorKey);
-  }
-  if (!IPLIMIT_MERGE_IPS_PER_DEVICE.has(operatorKey)) {
-    const perDevice = /^[0-9]{1,3}$/.test(perDevicePart.trim()) ? Math.min(64, Number(perDevicePart)) : 0;
-    IPLIMIT_MERGE_IPS_PER_DEVICE.set(operatorKey, perDevice);
-  }
-}
-const IP_OPERATOR_CACHE_SECONDS = 7 * 24 * 3600;
-const IP_OPERATOR_MAX_FAILURES = 3;
-const IP_OPERATOR_MAX_LOOKUPS_PER_CALL = 32;
 const XRAY_TRUSTED_PROXY_HEADER = 'X-SC-Real-IP-Proxy';
 function withXrayRealIp(streamSettings) {
   if (!XRAY_REAL_IP_ENABLE) return streamSettings;
@@ -11779,19 +11731,6 @@ function ipSubnetPrefix(ip, mask) {
   if (mask <= 16) return parts[0] + '.' + parts[1] + '.0.0/' + mask;
   return parts[0] + '.' + parts[1] + '.' + parts[2] + '.0/' + mask;
 }
-// IP -> kunci operator, untuk IP milik operator di IPLIMIT_MERGE_ASNS. Diisi
-// primeOperatorGroups() sebelum penghitungan Xray; kosong berarti aturan subnet.
-const mergedOperatorByIp = new Map();
-const operatorLookupDone = new Set();
-let operatorLookupFailures = 0;
-
-// Kelompok jaringan satu IP. Dengan useOperators (hanya jalur Xray), IP milik
-// operator di IPLIMIT_MERGE_ASNS masuk kelompok operatornya; selain itu subnet.
-function ipNetworkGroup(ip, mask, useOperators = false) {
-  const v = String(ip || '').trim().toLowerCase();
-  return (useOperators && mergedOperatorByIp.get(v)) || ipSubnetPrefix(v, mask);
-}
-
 function countIpGroups(ipSet, mask) {
   if (mask >= 32 || !ipSet || ipSet.size <= 1) return ipSet ? ipSet.size : 0;
   const groups = new Set();
@@ -11804,187 +11743,56 @@ function countIpGroups(ipSet, mask) {
 // Hitungan perangkat untuk semua protokol (Xray, SSH, SSH-WS, UDPHC, ZIVPN):
 // IP dalam subnet yang sama (pool CGNAT operator) dihitung satu, dan IPv4+IPv6
 // yang aktif bersamaan adalah satu perangkat dual-stack.
-// useOperators hanya dipakai jalur Xray: IP milik operator di IPLIMIT_MERGE_ASNS
-// dihitung per alamat (IPv6 per /64), dan setiap N alamat adalah satu perangkat.
-function countEffectiveDevices(ipSet, mask, useOperators = false) {
-  const families = [
-    { groups: new Set(), operators: new Map() },
-    { groups: new Set(), operators: new Map() }
-  ];
+function countEffectiveDevices(ipSet, mask) {
+  const ipv4Groups = new Set();
+  const ipv6Groups = new Set();
   for (const ipRaw of ipSet || []) {
     const ip = String(ipRaw || '').trim().toLowerCase();
     if (!ip) continue;
-    const isV6 = ip.includes(':');
-    const family = families[isV6 ? 1 : 0];
-    const operator = useOperators ? mergedOperatorByIp.get(ip) : '';
-    if (operator) {
-      if (!family.operators.has(operator)) family.operators.set(operator, new Set());
-      family.operators.get(operator).add(isV6 ? ipSubnetPrefix(ip, mask) : ip);
-      continue;
-    }
     const group = ipSubnetPrefix(ip, mask);
-    if (group) family.groups.add(group);
+    if (!group) continue;
+    if (ip.includes(':')) ipv6Groups.add(group);
+    else ipv4Groups.add(group);
   }
-  const familyCount = (family) => {
-    let count = family.groups.size;
-    for (const [operator, addresses] of family.operators) {
-      const perDevice = IPLIMIT_MERGE_IPS_PER_DEVICE.get(operator) || 0;
-      count += perDevice > 0 ? Math.ceil(addresses.size / perDevice) : 1;
-    }
-    return count;
-  };
-  const ipv4Count = familyCount(families[0]);
-  const ipv6Count = familyCount(families[1]);
   // IPv4 dan IPv6 pada koneksi yang sama adalah dual-stack, bukan dua device.
-  if (ipv4Count > 0 && ipv6Count > 0) {
-    return Math.max(ipv4Count, ipv6Count);
+  if (ipv4Groups.size > 0 && ipv6Groups.size > 0) {
+    return Math.max(ipv4Groups.size, ipv6Groups.size);
   }
-  return ipv4Count + ipv6Count;
+  return ipv4Groups.size + ipv6Groups.size;
 }
 
-// IP yang ditampilkan di notifikasi lock Xray: satu per kelompok subnet, dan
-// untuk operator di IPLIMIT_MERGE_ASNS satu per perangkat yang terhitung.
+// IP yang ditampilkan di notifikasi lock Xray: satu per kelompok subnet.
 function xrayRepresentativeIps(ipSet, mask) {
   const ipv4 = new Map();
   const ipv6 = new Map();
   for (const ipRaw of ipSet || []) {
     const ip = String(ipRaw || '').trim().toLowerCase();
     if (!ip) continue;
-    const group = ipNetworkGroup(ip, mask, true);
+    const group = ipSubnetPrefix(ip, mask);
     if (!group) continue;
     const target = ip.includes(':') ? ipv6 : ipv4;
-    if (!target.has(group)) target.set(group, []);
-    target.get(group).push(ip);
+    if (!target.has(group)) target.set(group, ip);
   }
-  const expand = (family) => {
-    const out = [];
-    for (const [group, ips] of Array.from(family.entries()).sort(([a], [b]) => a.localeCompare(b))) {
-      const perDevice = IPLIMIT_MERGE_IPS_PER_DEVICE.get(group) || 0;
-      const shown = perDevice > 0 ? Math.ceil(new Set(ips).size / perDevice) : 1;
-      out.push(...Array.from(new Set(ips)).sort().slice(0, Math.max(1, shown)));
-    }
-    return out;
-  };
-  const shownV4 = expand(ipv4);
-  const shownV6 = expand(ipv6);
-  return (shownV4.length === 0 || shownV6.length > shownV4.length) ? shownV6 : shownV4;
+  let selected = ipv4;
+  if (ipv4.size === 0 || ipv6.size > ipv4.size) selected = ipv6;
+  return Array.from(selected.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, ip]) => ip);
 }
 
 // Sidik jari kelompok IP pelanggaran. Konfirmasi dua siklus hanya dihitung
 // kalau kelompoknya sama, jadi IP yang berganti-ganti tidak saling menguatkan.
-// Di jalur Xray (useOperators) IP operator di IPLIMIT_MERGE_ASNS memakai kunci
-// operatornya, karena alamatnya memang berganti-ganti di tiap pengecekan.
-function ipGroupFingerprint(ipSet, useOperators = false) {
+function ipGroupFingerprint(ipSet) {
   const groups = Array.from(new Set(
     Array.from(ipSet || [])
-      .map((ip) => ipNetworkGroup(ip, XRAY_IP_GROUP_MASK, useOperators))
+      .map((ip) => ipSubnetPrefix(ip, XRAY_IP_GROUP_MASK))
       .filter(Boolean)
   )).sort();
   return crypto.createHash('sha256').update(groups.join('|')).digest('hex').slice(0, 16);
 }
 
-// Nama DNS Team Cymru untuk mencari ASN sebuah IP (tanpa API key):
-//   1.2.3.4   -> 4.3.2.1.origin.asn.cymru.com
-//   IPv6      -> 32 nibble terbalik + .origin6.asn.cymru.com
-function operatorDnsName(ip) {
-  const v = String(ip || '').trim().toLowerCase();
-  if (net.isIP(v) === 4) return `${v.split('.').reverse().join('.')}.origin.asn.cymru.com`;
-  if (net.isIP(v) !== 6 || v.includes('.')) return '';
-  const halves = v.split('::');
-  if (halves.length > 2) return '';
-  const left = halves[0] ? halves[0].split(':') : [];
-  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
-  const missing = 8 - left.length - right.length;
-  if (missing < 0 || (halves.length === 1 && missing !== 0)) return '';
-  const groups = [...left, ...Array(missing).fill('0'), ...right];
-  const nibbles = groups.map((part) => part.padStart(4, '0')).join('');
-  if (!/^[0-9a-f]{32}$/.test(nibbles)) return '';
-  return `${nibbles.split('').reverse().join('.')}.origin6.asn.cymru.com`;
-}
-
-// Jawaban TXT: "24203 | 112.215.211.0/24 | ID | apnic | 2009-02-19". Kolom
-// pertama bisa memuat lebih dari satu ASN.
-function parseOperatorAsns(text) {
-  return String(text || '').split('|')[0].trim().split(/\s+/).filter((v) => /^[0-9]{1,10}$/.test(v));
-}
-
-// Resolver sistem dulu; kalau gagal, resolver publik yang juga dipasang DNS
-// guard. Pencarian yang gagal berarti aturan lama dipakai, dan itu bisa berujung
-// salah kunci, jadi layak dicoba dua jalur.
-async function resolveOperatorTxt(name) {
-  let lastErr = null;
-  for (const servers of [null, ['8.8.8.8', '1.1.1.1']]) {
-    try {
-      const resolver = new dns.promises.Resolver({ timeout: 2500, tries: 2 });
-      if (servers) resolver.setServers(servers);
-      return await resolver.resolveTxt(name);
-    } catch (err) {
-      const code = String(err?.code || '');
-      if (code === 'ENOTFOUND' || code === 'ENODATA') throw err;
-      lastErr = err;
-    }
-  }
-  throw lastErr;
-}
-
-// ASN pemilik IP, dari cache database atau DNS. Array kosong berarti tidak
-// diketahui, dan pemanggil jatuh ke aturan subnet biasa.
-async function lookupIpOperatorAsns(ip, nowTs) {
-  const prefix = ipSubnetPrefix(ip, 24);
-  const cached = await get('SELECT asns, updated_at FROM ip_operator_cache WHERE prefix=?', [prefix]).catch(() => null);
-  const cachedAsns = cached ? String(cached.asns || '').split(',').filter(Boolean) : [];
-  if (cached && (nowTs - Number(cached.updated_at || 0)) < IP_OPERATOR_CACHE_SECONDS) return cachedAsns;
-  // DNS yang bermasalah tidak boleh menahan checker: setelah beberapa kali
-  // gagal, sisa pencarian di siklus ini dilewati.
-  if (operatorLookupFailures >= IP_OPERATOR_MAX_FAILURES) return cachedAsns;
-  const name = operatorDnsName(ip);
-  if (!name) return cachedAsns;
-  let asns = [];
-  try {
-    const records = await resolveOperatorTxt(name);
-    const found = new Set();
-    for (const record of records || []) {
-      for (const asn of parseOperatorAsns(Array.isArray(record) ? record.join('') : record)) found.add(asn);
-    }
-    asns = Array.from(found);
-  } catch (err) {
-    const code = String(err?.code || '');
-    // IP yang tidak ada di tabel routing bukan kegagalan; simpan sebagai kosong.
-    if (code !== 'ENOTFOUND' && code !== 'ENODATA') {
-      operatorLookupFailures += 1;
-      if (IPLIMIT_DEBUG) console.log(`[iplimit-debug][operator] lookup gagal ip=${ip} code=${code || err?.message || err}`);
-      return cachedAsns;
-    }
-  }
-  await run(
-    'INSERT OR REPLACE INTO ip_operator_cache(prefix, asns, updated_at) VALUES(?, ?, ?)',
-    [prefix, asns.join(','), nowTs]
-  ).catch(() => {});
-  return asns;
-}
-
-// Cari operator untuk IP-IP sebuah akun Xray dan catat yang operatornya ada di
-// IPLIMIT_MERGE_ASNS. Dipanggil hanya untuk akun yang jumlah IP-nya sudah
-// melewati limit, jadi akun yang tidak bermasalah tidak memicu pencarian.
-async function primeOperatorGroups(ipSet, nowTs = Math.floor(Date.now() / 1000)) {
-  if (IPLIMIT_MERGE_ASNS.size === 0) return;
-  const todo = [];
-  for (const ipRaw of ipSet || []) {
-    const ip = String(ipRaw || '').trim().toLowerCase();
-    if (!isUsableClientIp(ip) || operatorLookupDone.has(ip)) continue;
-    operatorLookupDone.add(ip);
-    todo.push(ip);
-    if (todo.length >= IP_OPERATOR_MAX_LOOKUPS_PER_CALL) break;
-  }
-  await Promise.all(todo.map(async (ip) => {
-    const asns = await lookupIpOperatorAsns(ip, nowTs).catch(() => []);
-    const merged = asns.map((asn) => IPLIMIT_MERGE_ASNS.get(asn)).find(Boolean);
-    if (merged) mergedOperatorByIp.set(ip, merged);
-  }));
-}
-
 function xrayViolationSignal(ipSet) {
-  return `xray-ip-${ipGroupFingerprint(ipSet, true)}`;
+  return `xray-ip-${ipGroupFingerprint(ipSet)}`;
 }
 
 function readXrayLiveSocketMap() {
@@ -12465,15 +12273,6 @@ async function ensureTables() {
     created_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`);
-  await run(`CREATE TABLE IF NOT EXISTS ip_operator_cache (
-    prefix TEXT PRIMARY KEY,
-    asns TEXT NOT NULL DEFAULT '',
-    updated_at INTEGER NOT NULL
-  )`);
-  await run(
-    'DELETE FROM ip_operator_cache WHERE updated_at < ?',
-    [Math.floor(Date.now() / 1000) - (30 * 24 * 3600)]
-  ).catch(() => {});
   await run(`CREATE TABLE IF NOT EXISTS iplimit_lock_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_type TEXT NOT NULL,
@@ -13717,13 +13516,17 @@ async function lockIfExceeded(nowTs) {
     // Semua sumber wajib melewati limit di dua pengecekan berturut-turut dengan
     // kelompok IP yang sama, seperti Xray. Satu sampel sesaat (reconnect,
     // pindah jaringan) tidak cukup untuk mengunci akun pembeli.
+    // UDP (ZIVPN/UDP Custom) memberi toleransi limit x2 karena operator seluler
+    // memecah satu HP ke banyak IP/subnet: limit 1 aman sampai 2 jaringan, limit
+    // 2 sampai 4. SSH langsung dan SSH-WS tetap di limit (biasanya jaringan tetap).
+    const udpDeviceLimit = lim > 0 ? lim * 2 : 0;
     const deviceEvidenceIps = new Set();
-    for (const [count, ips] of [
-      [cntSshCombined, sshCombinedIpSet],
-      [cntUdphcIp, setUnionValues(sshUdphcIpMap)],
-      [cntZivpnEffective, zivpnIpSet]
+    for (const [count, ips, threshold] of [
+      [cntSshCombined, sshCombinedIpSet, lim],
+      [cntUdphcIp, setUnionValues(sshUdphcIpMap), udpDeviceLimit],
+      [cntZivpnEffective, zivpnIpSet, udpDeviceLimit]
     ]) {
-      if (lim > 0 && count > lim) for (const ip of ips) deviceEvidenceIps.add(ip);
+      if (threshold > 0 && count > threshold) for (const ip of ips) deviceEvidenceIps.add(ip);
     }
     const deviceSample = await sampleSshDeviceLimit(userKey, deviceEvidenceIps, cnt, lim, nowTs);
     // SSHWS menutupi IP asal dengan 127.0.0.1. Jumlah socket hanya menjadi
@@ -13896,16 +13699,13 @@ async function lockIfExceeded(nowTs) {
       const lim = Number(r.limitip || 0);
       const lockIpSet = xrayMap.has(userKey) ? xrayMap.get(userKey) : new Set();
       const cntRaw = lockIpSet.size;
-      // Operator di IPLIMIT_MERGE_ASNS (XL) dihitung per jumlah IP, bukan per
-      // subnet. Hitungannya bisa lebih kecil ATAU lebih besar dari hitungan
-      // subnet, jadi pemilik IP dicari begitu jumlah IP mentah melewati limit.
-      const cntSubnet = countEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK);
-      if (lim > 0 && cntRaw > lim) await primeOperatorGroups(lockIpSet, nowTs);
       // CGNAT tolerance: grup IP dalam subnet yang sama sebagai 1 device.
       // XRAY_IP_GROUP_MASK: 24 = /24 (moderate), 16 = /16 (aggressive), 32 = exact match.
-      const cntGrouped = countEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK, true);
-      if (IPLIMIT_DEBUG && cntGrouped !== cntSubnet) console.log(`[iplimit-debug][operator] ${item.type} user=${user} limit=${lim} ip=${cntRaw} subnet=${cntSubnet} perangkat=${cntGrouped}`);
+      const cntGrouped = countEffectiveDevices(lockIpSet, XRAY_IP_GROUP_MASK);
       const cnt = cntGrouped;
+      // Xray memberi toleransi limit x2 karena operator seluler memecah satu HP
+      // ke banyak subnet: limit 1 aman sampai 2 jaringan, limit 2 sampai 4.
+      const xrayDeviceLimit = lim > 0 ? lim * 2 : 0;
       const liveSocketCount = Number(xrayLive.sockets.get(`${item.type}|${userKey}`) || 0);
       const hasSocketEvidence = xrayLive.available && liveSocketCount > 0;
       // Parser log hanya mengembalikan IP yang overlap dalam window aktif.
@@ -13918,7 +13718,7 @@ async function lockIfExceeded(nowTs) {
         userKey,
         lockIpSet,
         cnt,
-        hasLiveEvidence ? lim : Number.MAX_SAFE_INTEGER,
+        hasLiveEvidence ? xrayDeviceLimit : Number.MAX_SAFE_INTEGER,
         nowTs
       );
       if (IPLIMIT_DEBUG) {
@@ -21083,7 +20883,6 @@ XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
-IPLIMIT_MERGE_ASNS=${IPLIMIT_MERGE_ASNS}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
 XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
@@ -30118,7 +29917,6 @@ update_script_from_repo() {
     XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
     XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP}" \
     XRAY_IP_GROUP_MASK="${XRAY_IP_GROUP_MASK:-16}" \
-    IPLIMIT_MERGE_ASNS="${IPLIMIT_MERGE_ASNS-24203+17885+24208+24518+139994+58496:2}" \
     XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}" \
     XRAY_VERSION="${XRAY_VERSION:-}" \
     XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}" \
@@ -32762,7 +32560,7 @@ persist_pending_install_env() {
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE
     EXPIRED_ACCOUNT_RETENTION_DAYS
     AUTO_PULL_UPDATE_ENABLE AUTO_PULL_UPDATE_INTERVAL_MINUTES AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES
-    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_LOCK_HISTORY_RETENTION_DAYS IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG IPLIMIT_MERGE_ASNS
+    IPLIMIT_CHECK_INTERVAL_MINUTES IPLIMIT_LOCK_MINUTES IPLIMIT_LOCK_HISTORY_RETENTION_DAYS IPLIMIT_AUTO_LOCK_ENABLE QUOTA_LOCK_ENABLE IPLIMIT_AUTO_TUNE IPLIMIT_DEBUG
     SSHWS_TCP_KEEPALIVE_SECONDS SSHWS_LOOP_GUARD_ENABLE SSHWS_LOOP_GUARD_PORTS SSHWS_LOOP_GUARD_NEW_ABOVE SSHWS_LOOP_GUARD_BURST SSHWS_LOOP_GUARD_CONNLIMIT_ABOVE
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX

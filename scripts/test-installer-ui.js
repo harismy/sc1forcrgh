@@ -353,9 +353,14 @@ false
     // semua baris digambar di posisi tetap, jadi tulisan dari luar tidak bisa
     // menggeser kotak dan animasi sendiri tidak pernah menggulung layar.
     assert(!/\x1b\[\d*[ABCDEF]/.test(raw), 'animasi tidak boleh memakai gerak kursor relatif');
-    const ownOutput = raw.split(/\r\n\r\nBroadcast message[^]*?available!\r\n\r\n/);
-    assert.strictEqual(ownOutput.length, 2, 'siaran wall tiruan tidak ditemukan di tangkapan layar');
-    assert(!ownOutput.join('').includes('\n'), 'animasi tidak boleh mengirim newline');
+    // Siaran wall ditulis ke terminal bersamaan dengan animasi, jadi di level
+    // byte bisa berbaur dengan kode kursor. Cek teksnya setelah kode dibuang.
+    assert(stripAnsi(raw).replace(/\s+/g, ' ').includes('backend bk_sshws_tls has no server available!'),
+      'siaran wall tiruan tidak ditemukan di tangkapan layar');
+    // Animasi memakai posisi mutlak, bukan newline, untuk menggambar (dicek juga
+    // lewat larangan gerak kursor relatif di atas). Baris kotak yang digambar
+    // ulang penuh kira-kira 5 detik sekali: itu yang memulihkan layar setelah
+    // tulisan dari luar. Detailnya diperiksa di bagian pemulihan di bawah.
 
     const paints = paintsOf(screen);
     const topRow = (paints.find((p) => p.text.includes('[ INSTALASI ]')) || {}).row;

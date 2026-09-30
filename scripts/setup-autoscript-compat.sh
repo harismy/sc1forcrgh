@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.82}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.83}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -8076,48 +8076,82 @@ const BACKUP_WEB_PAGE = `<!doctype html>
 <meta name="robots" content="noindex,nofollow">
 <title>SC 1FORCR - Backup &amp; Restore</title>
 <style>
-:root{--bg:#0f1720;--card:#16212e;--line:#24374a;--fg:#dbe6f0;--mut:#8aa0b6;--ok:#36d399;--bad:#f87272;--acc:#4aa3f0}
+:root{
+  --bg:#f4f1ea;      /* cream */
+  --panel:#ffffff;   /* kartu putih */
+  --ink:#1b1917;     /* hitam lembut */
+  --mut:#77726a;     /* abu */
+  --line:#e4dfd4;    /* garis halus */
+  --soft:#efeae0;    /* isian tipis */
+  --ok:#3f7d55;
+  --danger:#9a3b34;  /* merah bata teredam */
+  --shadow:0 1px 2px rgba(27,25,23,.04),0 10px 30px rgba(27,25,23,.06);
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Menlo,Consolas,monospace;padding:16px}
-.wrap{max-width:860px;margin:0 auto}
-h1{font-size:18px;margin:0 0 4px}
-.sub{color:var(--mut);margin:0 0 16px;font-size:12px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:14px}
-.card h2{font-size:13px;margin:0 0 10px;color:var(--acc);text-transform:uppercase;letter-spacing:.5px}
-input,button{font:inherit;border-radius:6px;border:1px solid var(--line)}
-input{background:#0d151e;color:var(--fg);padding:8px 10px;width:100%}
-input[type=file]{padding:6px}
-button{background:var(--acc);color:#04121f;padding:8px 14px;border:0;cursor:pointer;font-weight:600}
-button.sec{background:#243447;color:var(--fg)}
-button.danger{background:var(--bad);color:#2a0606}
-button:disabled{opacity:.5;cursor:not-allowed}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased;padding:30px 16px}
+.wrap{max-width:820px;margin:0 auto}
+header{margin:0 0 24px}
+.brand{font-size:11px;letter-spacing:3px;color:var(--mut);text-transform:uppercase;margin:0 0 6px}
+h1{font-family:Georgia,"Times New Roman",serif;font-weight:600;font-size:27px;letter-spacing:.2px;margin:0}
+.sub{color:var(--mut);margin:8px 0 0;font-size:13.5px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:20px 22px;margin-bottom:16px;box-shadow:var(--shadow)}
+.card h2{font-size:11px;margin:0 0 15px;color:var(--mut);text-transform:uppercase;letter-spacing:1.8px;font-weight:700}
+input,button{font:inherit;border-radius:10px;border:1px solid var(--line)}
+input{background:#fbfaf7;color:var(--ink);padding:11px 13px;width:100%}
+input::placeholder{color:#a8a299}
+input:focus{outline:none;border-color:#c7bfae;background:#fff}
+input[type=file]{padding:9px;background:var(--soft);cursor:pointer}
+button{padding:11px 18px;border:1px solid var(--ink);background:var(--ink);color:var(--bg);
+  cursor:pointer;font-weight:600;font-size:14px;transition:opacity .15s,transform .04s,background .15s}
+button:hover{opacity:.9}
+button:active{transform:translateY(1px)}
+button.sec{background:#fff;color:var(--ink);border-color:var(--line)}
+button.sec:hover{background:var(--soft);opacity:1}
+button.danger{background:var(--danger);border-color:var(--danger);color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .row>*{flex:0 0 auto}
-.grow{flex:1 1 220px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--line)}
-th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase}
-td.act{white-space:nowrap}
-td.act button{padding:5px 9px;font-size:12px;margin-right:4px}
-#log{margin-top:4px;padding:10px;border-radius:6px;background:#0d151e;border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;min-height:20px;font-size:12px}
-.ok{color:var(--ok)}.bad{color:var(--bad)}.mut{color:var(--mut)}
-.warn{border-left:3px solid var(--bad);padding-left:10px;color:var(--mut);font-size:12px}
-@media(max-width:560px){td.act button{margin-bottom:4px}}
+.grow{flex:1 1 240px}
+.hint{color:var(--mut);font-size:12.5px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:11px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:700;font-size:10.5px;text-transform:uppercase;letter-spacing:.8px}
+tr:last-child td{border-bottom:0}
+td.act{white-space:nowrap;text-align:right}
+td.act button{padding:6px 12px;font-size:13px;margin-left:6px}
+#log{margin-top:2px;padding:13px 15px;border-radius:10px;background:var(--soft);
+  border:1px solid var(--line);white-space:pre-wrap;word-break:break-word;min-height:22px;font-size:13px}
+.ok{color:var(--ok)}.bad{color:var(--danger)}.mut{color:var(--mut)}
+.warn{border-left:3px solid var(--danger);background:#f7ece9;padding:11px 13px;
+  border-radius:0 8px 8px 0;color:#6e4b46;font-size:13px}
+@media(max-width:560px){
+  body{padding:20px 12px}
+  h1{font-size:22px}
+  .card{padding:18px 16px}
+  td.act{text-align:left}
+  td.act button{margin:0 6px 4px 0}
+}
 </style></head><body><div class="wrap">
-<h1>SC 1FORCR - Backup &amp; Restore</h1>
-<p class="sub">Backup akun dan auth ZIVPN. Semua aksi butuh API token server ini.</p>
+<header>
+<p class="brand">SC 1FORCR NEXUS</p>
+<h1>Backup &amp; Restore</h1>
+<p class="sub">Kelola cadangan akun dan auth ZIVPN. Setiap aksi butuh API token server ini.</p>
+</header>
 
 <div class="card">
 <h2>API Token</h2>
 <div class="row"><input id="tok" type="password" class="grow" placeholder="Masukkan API token" autocomplete="off">
 <button onclick="saveTok()">Simpan</button><button class="sec" onclick="clearTok()">Hapus</button></div>
-<p class="sub" style="margin:8px 0 0">Token disimpan di sessionStorage browser dan hilang saat tab ditutup.</p>
+<p class="hint" style="margin:10px 0 0">Token disimpan di sessionStorage browser dan hilang saat tab ditutup.</p>
 </div>
 
 <div class="card">
 <h2>Buat Backup</h2>
 <div class="row"><button id="mk" onclick="mkBackup()">Backup Sekarang</button>
-<span class="mut">Menjalankan proses backup yang sama dengan menu CLI.</span></div>
+<span class="hint">Menjalankan proses backup yang sama dengan menu CLI.</span></div>
 </div>
 
 <div class="card">

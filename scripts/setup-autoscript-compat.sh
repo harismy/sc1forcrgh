@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
-# Target OS: Debian 10+ / Ubuntu 20+ (22.04 / 24.04 / 26.04 kompatibel)
+# Target OS: Debian 12+ / Ubuntu 20.04+ (22.04 / 24.04 / 26.04 kompatibel)
 #
 # Fitur:
 # - SSH
@@ -196,7 +196,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.80}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.81}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -1403,6 +1403,58 @@ iui_anim_abort() {
 }
 # <<< installer-ui
 
+# >>> os-support
+# OS yang diterima untuk install BARU: Debian 12 ke atas dan Ubuntu 20.04 ke
+# atas. Debian 10 sudah dicabut dari mirror utama dan Debian 11 habis masa
+# dukungnya 31 Agustus 2026, jadi keduanya tidak lagi diterima.
+# VPS yang sudah terpasang di OS lama tetap boleh update: lihat sc_is_installed.
+
+# SC sudah terpasang di VPS ini: sedang update, atau installer dijalankan ulang.
+sc_is_installed() {
+  if [[ "${UPDATE_SAFE_MODE:-0}" == "1" ]]; then return 0; fi
+  [[ -f /etc/sc-1forcr.env && -x /usr/local/sbin/menu-sc-1forcr ]]
+}
+
+# Cetak alasan OS ini tidak diterima untuk install baru; kosong kalau diterima.
+unsupported_os_reason() {
+  local id ver major
+  if [[ ! -f /etc/os-release ]]; then
+    echo "OS tidak dikenali (/etc/os-release tidak ditemukan)."
+    return 0
+  fi
+  id="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")" || id=""
+  ver="$(. /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-0}")" || ver="0"
+  major="${ver%%.*}"
+  if [[ ! "${major}" =~ ^[0-9]+$ ]]; then major=0; fi
+  case "${id}" in
+    debian)
+      if (( major < 12 )); then
+        echo "Debian ${ver} tidak didukung. Pakai Debian 12 atau 13."
+      fi
+      ;;
+    ubuntu)
+      if (( major < 20 )); then
+        echo "Ubuntu ${ver} tidak didukung. Minimal Ubuntu 20.04."
+      fi
+      ;;
+    *)
+      echo "OS ${id:-tidak dikenal} belum didukung. Pakai Debian 12 atau 13, atau Ubuntu 20.04 ke atas."
+      ;;
+  esac
+  return 0
+}
+
+# Install baru di OS yang tidak didukung ditolak di sini, sebelum pembeli
+# diminta mengisi domain dan sebelum lisensi divalidasi.
+if ! sc_is_installed; then
+  SC_OS_REJECT_REASON="$(unsupported_os_reason)"
+  if [[ -n "${SC_OS_REJECT_REASON}" ]]; then
+    echo "${SC_OS_REJECT_REASON}"
+    exit 1
+  fi
+fi
+# <<< os-support
+
 if [[ -z "${DOMAIN}" ]]; then
   if iui_tty_ok; then
     iui_prompt_domain || true
@@ -2115,37 +2167,19 @@ auto_tune_iplimit_vars
 auto_tune_resource_vars
 
 check_supported_os() {
-  local id ver major
-  if [[ ! -f /etc/os-release ]]; then
-    echo "OS tidak dikenali (/etc/os-release tidak ditemukan)."
-    exit 1
-  fi
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  id="${ID:-}"
-  ver="${VERSION_ID:-0}"
-  major="${ver%%.*}"
-
-  case "${id}" in
-    debian)
-      if [[ "${major}" -lt 10 ]]; then
-        echo "Debian ${ver} tidak didukung. Minimal Debian 10."
-        exit 1
-      fi
-      ;;
-    ubuntu)
-      if [[ "${major}" -lt 20 ]]; then
-        echo "Ubuntu ${ver} tidak didukung. Minimal Ubuntu 20.04."
-        exit 1
-      fi
-      ;;
-    *)
-      echo "OS ${id:-unknown} belum didukung script ini."
-      echo "Gunakan Debian 10+ atau Ubuntu 20+."
+  local reason pretty
+  reason="$(unsupported_os_reason)"
+  if [[ -n "${reason}" ]]; then
+    # Fungsi ini juga jalan di jalur update. VPS yang sudah terpasang di OS
+    # lama tidak boleh ikut ditolak, kalau tidak update-nya gagal selamanya.
+    if ! sc_is_installed; then
+      echo "${reason}"
       exit 1
-      ;;
-  esac
-  log "OS terdeteksi: ${PRETTY_NAME:-${id} ${ver}}"
+    fi
+    log "PERINGATAN: ${reason} SC yang sudah terpasang tetap dilanjutkan."
+  fi
+  pretty="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-}")" || pretty=""
+  log "OS terdeteksi: ${pretty:-tidak dikenal}"
 }
 
 ipv6_supported() {

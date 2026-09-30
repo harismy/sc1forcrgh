@@ -293,15 +293,38 @@ try {
     return pidGone(pid);
   };
   const WALL = 'haproxy[61442]: backend bk_sshws_tls has no server available!';
+  // Kecepatan tick animasi bergantung beban mesin, jadi skenario menunggu
+  // sampai tulisannya benar-benar muncul di layar, bukan tidur selama waktu
+  // tertentu lalu berharap animasi sudah sempat menggambar.
+  const WAIT_HELPERS = `
+wait_for() {
+  local i
+  for ((i = 0; i < 200; i++)); do
+    if grep -qF -- "$1" '${B(screenFile)}' 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  return 0
+}
+count_repaints() { grep -oF -- "$(printf '\\033[J')" '${B(screenFile)}' 2>/dev/null | wc -l; }
+wait_repaint() {
+  local base i
+  base="$(count_repaints)"
+  for ((i = 0; i < 200; i++)); do
+    if (( $(count_repaints) > base )); then return 0; fi
+    sleep 0.1
+  done
+  return 0
+}`;
 
   for (const [term, cols] of [['xterm-256color', 80], ['linux', 44]]) {
     const r = run(`${animPrelude(cols)}
+${WAIT_HELPERS}
 install_display_start
 echo "\${IUI_ANIM_PID}" > '${B(pidFile)}'
 echo "BARIS-RINCI-LANGKAH-SATU"
 show_install_progress 8 "Install paket dasar"
 printf 'Setting up nginx-common (1.22.1-9) ...\\r\\n'
-sleep 1.5
+wait_for 'Setting up nginx-common'
 # Meteran unduhan curl: deretan angka yang ditulis ulang dengan \\r.
 printf '  %% Total    %% Received %% Xferd  Average Speed   Time    Time     Time  Current\\n'
 printf '  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0\\r'
@@ -309,10 +332,12 @@ sleep 1.5
 # Siaran wall dari journald: ditulis langsung ke terminal, bukan oleh installer.
 printf '\\r\\n\\r\\nBroadcast message from systemd-journald@vps (Wed 2026-09-30 19:30:12 WIB):\\r\\n\\r\\n${WALL}\\r\\n\\r\\n' >&4
 show_install_progress 60 "Setup ZIVPN"
-sleep 2.5
+wait_for 'Setup ZIVPN'
+wait_repaint
 echo "unduh selesai"
-sleep 1.5
+wait_for 'unduh selesai'
 show_install_progress 100 "Berhasil keinstall semua."
+wait_for '100%'
 install_display_finish
 false
 `, { TERM: term, STY: '' });
@@ -392,9 +417,11 @@ false
   // screen ada petunjuk untuk menyambung lagi dengan nama sesi yang sedang jalan.
   {
     const r = run(`${animPrelude(80, 9)}
+${WAIT_HELPERS}
 install_display_start
 show_install_progress 8 "Install paket dasar"
-sleep 1.2
+wait_for 'Putus? Jalankan'
+wait_for 'Install paket dasar'
 install_display_finish
 `, { TERM: 'xterm-256color', STY: '4242.1forcr-sc' });
     assert.strictEqual(r.status, 0, r.stderr);
@@ -409,10 +436,11 @@ install_display_finish
   // log) ditampilkan, karena keluaran rinci tidak pernah sampai ke terminal.
   {
     const r = run(`${animPrelude(80)}
+${WAIT_HELPERS}
 install_display_start
 echo "\${IUI_ANIM_PID}" > '${B(pidFile)}'
 show_install_progress 2 "Validasi lisensi"
-sleep 0.8
+wait_for 'Validasi lisensi'
 echo "Install ditolak: IP VPS belum terdaftar."
 exit 7
 `, { TERM: 'xterm-256color', STY: '' });

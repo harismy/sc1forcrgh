@@ -126,14 +126,22 @@ Watchdog `/usr/local/sbin/sc-1forcr-postboot-health` memeriksa `ssh`, `dropbear`
 - **Naikkan `SCRIPT_VERSION`** setiap kali mengirim perbaikan, supaya jalur auto-update dan God Mode mengenali versi baru.
 - **`set -euo pipefail` aktif.** Perintah yang boleh gagal harus diakhiri `|| true`.
 
+### OS yang didukung
+
+Install **baru** hanya diterima di Debian 12 ke atas dan Ubuntu 20.04 ke atas (keputusan pemilik). Debian 10 sudah dicabut dari mirror utama dan Debian 11 habis masa dukungnya 31 Agustus 2026.
+
+- Batasnya ada di `unsupported_os_reason()` (blok bertanda `os-support`). Install baru di OS yang tidak didukung ditolak di level atas script, **sebelum** input domain dan validasi lisensi.
+- `check_supported_os` juga jalan di jalur update. VPS yang sudah terpasang (`sc_is_installed`: `UPDATE_SAFE_MODE=1`, atau `/etc/sc-1forcr.env` dan menu sudah ada) tidak boleh ditolak walau OS-nya lama; ia hanya mencatat peringatan. Kalau ikut ditolak, update VPS Debian 10/11 yang sudah ada gagal selamanya.
+- Teks bot (panduan install dan daftar fitur di app3.js) harus menyebut batas yang sama. Test: `npm run test:os-support`.
+
 ### Debian 11 (bullseye) sudah habis masa dukungnya
 
-Debian 11 masih didukung installer, tapi repo keamanannya rusak di sisi Debian: file `.deb` `bullseye-security` dihapus dari mirror awal September 2026 sementara indeksnya dibiarkan. Akibatnya `apt-get install` berujung 404, dan `apt-get update` tidak menolong karena indeksnya memang tidak berubah.
+Debian 11 tidak lagi diterima untuk install baru, tapi VPS Debian 11 yang sudah terpasang tetap di-update dan tetap butuh `apt`. Repo keamanannya rusak di sisi Debian: file `.deb` `bullseye-security` dihapus dari mirror awal September 2026 sementara indeksnya dibiarkan. Akibatnya `apt-get install` berujung 404, dan `apt-get update` tidak menolong karena indeksnya memang tidak berubah. Perbaikan di bawah ini dipertahankan untuk VPS lama itu.
 
 - `ensure_bullseye_security_repo` (blok bertanda `bullseye-security-repo`) memindahkan repo itu ke snapshot.debian.org `20260831T211327Z`. Indeks snapshot itu identik dengan indeks terakhir di mirror, jadi versi paket tidak berubah. Baris lama dijadikan komentar, dan sumber apt tidak disentuh kalau snapshot tidak terjangkau.
 - Blok itu ada di [scripts/setup-autoscript-compat.sh](scripts/setup-autoscript-compat.sh) **dan** [scripts/setup-summary-api.sh](scripts/setup-summary-api.sh), dan isinya harus identik.
 - Mode `probe` dipanggil `apt_get_safe` sebelum setiap `install`: pindah hanya kalau file yang akan diunduh terbukti 404, jadi mirror provider yang masih lengkap dibiarkan. Mode `force` dipakai setelah `apt-get install` sungguhan gagal. Pasang paket lewat `apt_get_safe`, jangan `apt-get install` langsung.
-- Perintah yang diketik pembeli sebelum installer jalan (langkah [2/3] di bot dan README) memakai `--no-upgrade` dan hanya memasang yang dibutuhkan untuk mengunduh installer. Tanpa itu apt ikut meng-upgrade paket dari repo security dan gagal 404 sebelum installer sempat memperbaiki repo. Jangan tambahkan `jq` atau `build-essential` ke sana; keduanya dipasang installer.
+- Perintah yang diketik pembeli sebelum installer jalan (langkah 2 di panduan install bot, dan README) memakai `--no-upgrade` dan hanya memasang yang dibutuhkan untuk mengunduh installer. Tanpa itu apt ikut meng-upgrade paket dari repo security dan gagal 404 sebelum installer sempat memperbaiki repo. Jangan tambahkan `jq` atau `build-essential` ke sana; keduanya dipasang installer.
 - Test: `npm run test:bullseye-repo`.
 
 ### Wajib sebelum selesai
@@ -162,6 +170,7 @@ Jangan buang waktu mengejar dua ini saat mengerjakan hal lain. Kalau memperbaiki
 
 ## Sisi bot
 
+- Pesan panduan install untuk pembeli (`buildInstallGuideLines` di app3.js) ditulis untuk pemula: syarat dulu, lalu satu langkah satu perintah yang berdiri sendiri di barisnya supaya bisa disalin utuh, dengan keterangan apa yang dilakukan. Link installer tidak ditampilkan di luar perintah langkah 3, karena pembeli mengira itu link yang harus dibuka. Pesan umum dan pesan per VPS memakai panduan yang sama. Test: `npm run test:install-guide`.
 - Campaign God Mode bersifat **pull**: VPS yang memanggil `/sc1forcr/god-update/check` secara berkala. Bot tidak punya akses SSH ke VPS dan tidak bisa mendorong perintah.
 - Karena itu campaign bisa menggantung kalau ada VPS yang tidak pernah lapor lagi. Penanganannya: auto-timeout saat tidak ada progres (`GOD_UPDATE_STALL_TIMEOUT_MINUTES`, default 180) plus tombol admin "Tuntaskan Sekarang".
 - **Key VPS di database bot harus sama dengan key di VPS.** License API mencari registrasi lewat `X-SC-Key` di `sc_server_keys`. Key yang salah di bot tidak langsung terasa, tapi saat lease habis (6 jam + grace 24 jam) VPS terkunci dengan reason `api-rejected:server-key-unknown`. Aturannya:

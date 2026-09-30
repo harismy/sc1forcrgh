@@ -547,11 +547,11 @@ async function ensureOrderKuotaAmountLockSchema() {
 
 async function seedDefaultSettings() {
   const now = Date.now();
-  const scFeaturesVersion = '2026-08-01.1';
+  const scFeaturesVersion = '2026-09-30.1';
   const defaultScFeaturesText = [
     'KOMPATIBILITAS & CORE',
-    '- Debian 11, 12, dan 13',
-    '- Ubuntu 22.04 dan 24.04',
+    '- Debian 12 dan 13',
+    '- Ubuntu 20.04, 22.04, dan 24.04',
     '- SSH / OpenSSH dan Dropbear',
     '- Nginx dan HAProxy TLS 443 mux',
     '- Xray Core',
@@ -5455,6 +5455,42 @@ function shellQuote(input) {
   return `'${String(input || '').replace(/'/g, `'\\''`)}'`;
 }
 
+// Panduan install untuk pembeli, ditulis untuk pemula: syaratnya dulu, lalu
+// satu langkah = satu perintah yang disalin utuh, dengan keterangan apa yang
+// dilakukan. Link installer tidak ditampilkan terpisah, karena pembeli mengira
+// itu link yang harus dibuka; link itu sudah ada di dalam perintah langkah 3.
+function buildInstallGuideLines(cmd, line) {
+  return [
+    '<b>SEBELUM MULAI</b>',
+    '• IP VPS sudah didaftarkan di bot ini. Tanpa itu installer menolak.',
+    '• VPS memakai Debian 12 ke atas atau Ubuntu 20.04 ke atas.',
+    '• Domain sudah diarahkan (A record) ke IP VPS.',
+    '',
+    '<b>CARA INSTALL</b>',
+    line,
+    'Login ke VPS sebagai <b>root</b> lewat aplikasi SSH. Jalankan perintah di bawah satu per satu: ketuk perintahnya untuk menyalin, tempel di terminal VPS, tekan Enter, dan tunggu selesai sebelum lanjut.',
+    '',
+    '<b>Langkah 1</b>: perbarui daftar paket',
+    '<code>apt update</code>',
+    '',
+    '<b>Langkah 2</b>: pasang alat yang dibutuhkan',
+    '<code>apt install --no-upgrade curl wget screen ca-certificates -y</code>',
+    '',
+    '<b>Langkah 3</b>: jalankan installer',
+    'Ini satu perintah panjang. Salin semuanya, jangan dipotong.',
+    `<code>${escapeHtml(cmd)}</code>`,
+    '',
+    '<b>Langkah 4</b>: isi domain',
+    'Installer akan meminta domain. Ketik domainnya, tekan Enter, lalu tunggu sampai muncul tulisan INSTALL SELESAI.',
+    line,
+    '<b>KALAU KONEKSI TERPUTUS</b>',
+    'Install tetap berjalan di VPS. Login lagi, lalu jalankan:',
+    '<code>screen -r 1forcr-sc</code>',
+    'Kalau ditolak karena sesinya masih terbuka di tempat lain, pakai:',
+    '<code>screen -d -r 1forcr-sc</code>'
+  ];
+}
+
 async function buildInstallerQuickCopyText(options = {}) {
   const domains = await listActiveApiDomains();
   const domain = domains[0] || '';
@@ -5466,7 +5502,6 @@ async function buildInstallerQuickCopyText(options = {}) {
     };
   }
   const installerUrls = domains.map((item) => `https://${item}/i`);
-  const installerUrl = installerUrls[0];
   const isGeneral = options?.general === true;
   const serverKey = String(options?.serverKey || '').trim();
   const keyEnv = !isGeneral && serverKey.length >= 8
@@ -5480,24 +5515,12 @@ async function buildInstallerQuickCopyText(options = {}) {
       ok: true,
       text: [
         '╭─〔 <b>1FORCR NEXUS</b> 〕',
-        '│ GLOBAL INSTALLER',
+        '│ PANDUAN INSTALL SC',
         '╰───────────────────────',
         '',
-        `Installer URL: ${escapeHtml(installerUrl)}`,
+        'Panduan ini berlaku untuk semua VPS yang sudah terdaftar. API key dipilih otomatis dari IP VPS yang menjalankan installer.',
         '',
-        'Link ini berlaku untuk semua VPS.',
-        'IP VPS wajib diregistrasikan terlebih dahulu.',
-        'API key akan dipilih otomatis berdasarkan IP VPS yang menjalankan installer.',
-        '',
-        '<b>INSTALLATION</b>',
-        line,
-        '[1/3] <code>apt update</code>',
-        '[2/3] <code>apt install --no-upgrade curl wget screen ca-certificates -y</code>',
-        `[3/3] <code>${escapeHtml(cmd)}</code>`,
-        line,
-        '<b>SESSION RECOVERY</b>',
-        '<code>screen -r 1forcr-sc</code>',
-        '<code>screen -d -r 1forcr-sc</code>'
+        ...buildInstallGuideLines(cmd, line)
       ].join('\n'),
       parse_mode: 'HTML'
     };
@@ -5522,21 +5545,7 @@ async function buildInstallerQuickCopyText(options = {}) {
       line,
       `Nexus API Key : ${escapeHtml(authText)}`,
       '',
-      '<b>SUPPORTED SYSTEM</b>',
-      '• Debian 11 atau versi terbaru',
-      '• Ubuntu 20.04 atau versi terbaru',
-      '',
-      '<b>INSTALLATION</b>',
-      line,
-      '[1/3] <code>apt update</code>',
-      '[2/3] <code>apt install --no-upgrade curl wget screen ca-certificates -y</code>',
-      `[3/3] <code>${escapeHtml(cmd)}</code>`,
-      line,
-      '<b>SESSION RECOVERY</b>',
-      'Koneksi terputus? Login kembali lalu jalankan:',
-      '<code>screen -r 1forcr-sc</code>',
-      'Jika sesi masih attached:',
-      '<code>screen -d -r 1forcr-sc</code>',
+      ...buildInstallGuideLines(cmd, line),
       '',
       '— 1FORCR NEXUS Installer —'
     ].join('\n'),

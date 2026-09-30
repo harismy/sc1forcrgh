@@ -318,11 +318,9 @@ assert(installer.includes('apt_install_with_refresh() {\n  ensure_bullseye_secur
 // Perintah yang diketik pembeli sebelum installer jalan tidak boleh memicu
 // upgrade paket (yang 404 di Debian 11) dan tidak memasang paket yang memang
 // dipasang installer.
-const botSteps = bot.match(/\[2\/3\] <code>[^<]*<\/code>/g) || [];
-assert.strictEqual(botSteps.length, 2, 'langkah [2/3] harus ada di dua pesan installer');
-for (const step of botSteps) {
-  assert.strictEqual(step, '[2/3] <code>apt install --no-upgrade curl wget screen ca-certificates -y</code>');
-}
+const botAptInstalls = bot.match(/<code>apt(?:-get)? install [^<]*<\/code>/g) || [];
+assert.deepStrictEqual(botAptInstalls, ['<code>apt install --no-upgrade curl wget screen ca-certificates -y</code>'],
+  'panduan install di bot hanya boleh punya satu perintah apt install, dengan --no-upgrade');
 const readmeInstalls = readme.match(/apt-get install [^&]*/g) || [];
 assert(readmeInstalls.length >= 3, 'perintah install di README tidak ditemukan');
 for (const cmd of readmeInstalls) {

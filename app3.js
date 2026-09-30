@@ -5459,6 +5459,13 @@ function shellQuote(input) {
 // satu langkah = satu perintah yang disalin utuh, dengan keterangan apa yang
 // dilakukan. Link installer tidak ditampilkan terpisah, karena pembeli mengira
 // itu link yang harus dibuka; link itu sudah ada di dalam perintah langkah 3.
+// Perintah ditampilkan sebagai blok kode Telegram (<pre>), bukan teks monospace
+// di dalam kalimat: bloknya tampil sebagai kotak dengan tombol salin, jadi
+// jelas mana yang harus disalin dan perintah panjang tersalin utuh.
+function installCommandBlock(command) {
+  return `<pre><code class="language-bash">${escapeHtml(command)}</code></pre>`;
+}
+
 function buildInstallGuideLines(cmd, line) {
   return [
     '<b>SEBELUM MULAI</b>',
@@ -5468,26 +5475,26 @@ function buildInstallGuideLines(cmd, line) {
     '',
     '<b>CARA INSTALL</b>',
     line,
-    'Login ke VPS sebagai <b>root</b> lewat aplikasi SSH. Jalankan perintah di bawah satu per satu: ketuk perintahnya untuk menyalin, tempel di terminal VPS, tekan Enter, dan tunggu selesai sebelum lanjut.',
+    'Login ke VPS sebagai <b>root</b> lewat aplikasi SSH. Jalankan perintah di bawah satu per satu: salin isi kotaknya, tempel di terminal VPS, tekan Enter, dan tunggu selesai sebelum lanjut.',
     '',
     '<b>Langkah 1</b>: perbarui daftar paket',
-    '<code>apt update</code>',
+    installCommandBlock('apt update'),
     '',
     '<b>Langkah 2</b>: pasang alat yang dibutuhkan',
-    '<code>apt install --no-upgrade curl wget screen ca-certificates -y</code>',
+    installCommandBlock('apt install --no-upgrade curl wget screen ca-certificates -y'),
     '',
     '<b>Langkah 3</b>: jalankan installer',
-    'Ini satu perintah panjang. Salin semuanya, jangan dipotong.',
-    `<code>${escapeHtml(cmd)}</code>`,
+    'Ini satu perintah panjang. Salin seluruh isi kotaknya, jangan dipotong.',
+    installCommandBlock(cmd),
     '',
     '<b>Langkah 4</b>: isi domain',
     'Installer akan meminta domain. Ketik domainnya, tekan Enter, lalu tunggu sampai muncul tulisan INSTALL SELESAI.',
     line,
     '<b>KALAU KONEKSI TERPUTUS</b>',
     'Install tetap berjalan di VPS. Login lagi, lalu jalankan:',
-    '<code>screen -r 1forcr-sc</code>',
+    installCommandBlock('screen -r 1forcr-sc'),
     'Kalau ditolak karena sesinya masih terbuka di tempat lain, pakai:',
-    '<code>screen -d -r 1forcr-sc</code>'
+    installCommandBlock('screen -d -r 1forcr-sc')
   ];
 }
 

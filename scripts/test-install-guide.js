@@ -29,7 +29,11 @@ async function build(domains, options) {
 
 const DOMAINS = ['installer.contoh.com', 'cadangan.contoh.net'];
 const unescape = (s) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
-const codeBlocks = (text) => (text.match(/<code>[^<]*<\/code>/g) || []).map((c) => unescape(c.slice(6, -7)));
+// Perintah harus berupa blok kode Telegram (<pre>): tampil sebagai kotak dengan
+// tombol salin. Teks monospace di dalam kalimat (<code> saja) tidak cukup jelas
+// untuk pemula.
+const BLOCK = /<pre><code class="language-bash">([^<]*)<\/code><\/pre>/g;
+const codeBlocks = (text) => [...text.matchAll(BLOCK)].map((m) => unescape(m[1]));
 
 function assertGuide(message, label) {
   assert.strictEqual(message.ok, true, label);
@@ -47,7 +51,7 @@ function assertGuide(message, label) {
     at = next;
   }
   for (const phrase of ['IP VPS sudah didaftarkan', 'Debian 12 ke atas atau Ubuntu 20.04 ke atas', 'Domain sudah diarahkan (A record)', 'sebagai <b>root</b>',
-    'ketuk perintahnya untuk menyalin', 'Salin semuanya, jangan dipotong.', 'INSTALL SELESAI']) {
+    'salin isi kotaknya', 'Salin seluruh isi kotaknya, jangan dipotong.', 'INSTALL SELESAI']) {
     assert(text.includes(phrase), `${label}: keterangan hilang: ${phrase}`);
   }
 
@@ -61,14 +65,16 @@ function assertGuide(message, label) {
   for (const domain of DOMAINS) assert(installCmd.includes(`'https://${domain}/i'`), `${label}: domain ${domain} tidak ada di perintah`);
   assert(installCmd.endsWith('screen -S 1forcr-sc /root/nexus-installer.sh'));
   assert.deepStrictEqual(codes.slice(3), ['screen -r 1forcr-sc', 'screen -d -r 1forcr-sc']);
-  // Setiap perintah berdiri di barisnya sendiri, tanpa awalan yang ikut tersalin.
-  for (const line of text.split('\n').filter((l) => l.includes('<code>'))) {
-    assert(/^<code>[^<]*<\/code>$/.test(line), `${label}: perintah harus sendirian di barisnya:\n${line}`);
+  // Setiap blok berdiri di barisnya sendiri, dan tidak ada perintah yang
+  // tertinggal sebagai teks monospace di luar blok.
+  for (const line of text.split('\n').filter((l) => l.includes('<pre>') || l.includes('<code'))) {
+    assert(/^<pre><code class="language-bash">[^<]*<\/code><\/pre>$/.test(line), `${label}: perintah harus berupa satu blok di barisnya sendiri:\n${line}`);
   }
+  assert.strictEqual((text.match(/<code/g) || []).length, 5, `${label}: semua perintah harus di dalam blok`);
 
   // Link installer hanya boleh ada di dalam perintah langkah 3. Di luar itu
   // pembeli mengira link tersebut harus dibuka.
-  const outsideCode = text.replace(/<code>[^<]*<\/code>/g, '');
+  const outsideCode = text.replace(BLOCK, '');
   assert(!/https?:\/\//.test(outsideCode), `${label}: ada link di luar perintah`);
   assert(!/Installer URL|\[\d\/\d\]|INSTALLATION|SESSION RECOVERY/.test(text), `${label}: format lama masih tersisa`);
   return { text, installCmd };

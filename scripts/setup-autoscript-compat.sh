@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.83}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.84}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -8026,7 +8026,9 @@ function backupFileFullPath(name) {
 function listBackupFiles() {
   try {
     return fs.readdirSync(BACKUP_DIR)
-      .filter((name) => backupFileSafeName(name))
+      // File sementara hasil unggahan restore (lama, sebelum ditaruh di /tmp)
+      // bukan backup asli; jangan tampilkan di daftar.
+      .filter((name) => backupFileSafeName(name) && !/^upload-/.test(name))
       .map((name) => {
         try {
           const st = fs.statSync(require('path').join(BACKUP_DIR, name));
@@ -8131,8 +8133,17 @@ td.act button{padding:6px 12px;font-size:13px;margin-left:6px}
   body{padding:20px 12px}
   h1{font-size:22px}
   .card{padding:18px 16px}
-  td.act{text-align:left}
-  td.act button{margin:0 6px 4px 0}
+  /* Tabel jadi kartu bertumpuk: kolom sempit di HP diganti label:nilai. */
+  table thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+  table,tbody,tr,td{display:block;width:100%}
+  tbody tr{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:12px;background:#fff}
+  tbody td{border:0;padding:5px 0;display:flex;justify-content:space-between;align-items:baseline;gap:14px;text-align:right}
+  tbody td::before{content:attr(data-label);color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.7px;font-weight:700;text-align:left;flex:0 0 auto}
+  tbody td.act{display:flex;justify-content:flex-start;gap:8px;padding-top:12px;margin-top:6px;border-top:1px solid var(--line)}
+  tbody td.act::before{display:none}
+  tbody td.act button{margin:0}
+  tbody td.msg{display:block;text-align:center;color:var(--mut);padding:8px 0}
+  tbody td.msg::before{display:none}
 }
 </style></head><body><div class="wrap">
 <header>
@@ -8158,7 +8169,7 @@ td.act button{padding:6px 12px;font-size:13px;margin-left:6px}
 <h2>Daftar Backup</h2>
 <div class="row" style="margin-bottom:10px"><button class="sec" onclick="loadList()">Muat Ulang</button></div>
 <table><thead><tr><th>File</th><th>Ukuran</th><th>Tanggal</th><th>Aksi</th></tr></thead>
-<tbody id="tb"><tr><td colspan="4" class="mut">Belum dimuat.</td></tr></tbody></table>
+<tbody id="tb"><tr><td colspan="4" class="msg">Belum dimuat.</td></tr></tbody></table>
 </div>
 
 <div class="card">
@@ -8188,8 +8199,8 @@ function loadList(){
   api('/vps/backup/list').then(function(r){return r.json()}).then(function(j){
     var d=unwrap(j);
     var rows=(d||[]);var tb=document.getElementById('tb');
-    if(!rows.length){tb.innerHTML='<tr><td colspan="4" class="mut">Belum ada file backup.</td></tr>';return say('Tidak ada file backup.')}
-    tb.innerHTML=rows.map(function(f){var n=esc(f.name);return '<tr><td>'+n+'</td><td>'+sz(f.size)+'</td><td>'+dt(f.mtime)+'</td><td class="act">'+
+    if(!rows.length){tb.innerHTML='<tr><td colspan="4" class="msg">Belum ada file backup.</td></tr>';return say('Tidak ada file backup.')}
+    tb.innerHTML=rows.map(function(f){var n=esc(f.name);return '<tr><td data-label="File">'+n+'</td><td data-label="Ukuran">'+sz(f.size)+'</td><td data-label="Tanggal">'+dt(f.mtime)+'</td><td class="act">'+
       '<button class="sec" onclick="dl(\\''+n+'\\')">Unduh</button>'+
       '<button class="danger" onclick="rs(\\''+n+'\\')">Restore</button></td></tr>'}).join('');
     say('Ada '+rows.length+' file backup.')
@@ -8299,8 +8310,9 @@ app.post('/vps/backup/restore', restoreBodyParser, async (req, res) => {
     } else if (typeof body === 'string' && body.trim()) {
       // Ditulis apa adanya tanpa JSON.parse supaya tidak boros RAM.
       // Skrip restore yang memvalidasi isinya dengan jq.
-      fs.mkdirSync(BACKUP_DIR, { recursive: true });
-      tempFile = require('path').join(BACKUP_DIR, `upload-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.json`);
+      // Ditaruh di /tmp, BUKAN di folder backup, supaya tidak muncul di daftar
+      // backup dan dibersihkan sendiri oleh sistem.
+      tempFile = require('path').join(require('os').tmpdir(), `sc1forcr-restore-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.json`);
       fs.writeFileSync(tempFile, body, { mode: 0o600 });
       target = tempFile;
     } else {
@@ -17526,16 +17538,30 @@ chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
 chmod 644 /etc/sc-1forcr/banner.html >/dev/null 2>&1 || true
 chmod 644 /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
 apply_restored_runtime_units
-systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
-systemctl restart xray >/dev/null 2>&1 || true
-# ZIVPN dan UDP Custom berbagi port; restart paksa keduanya menyalakan backend
-# yang sengaja mati lalu membuatnya gagal bind dan restart tanpa henti.
-systemctl try-restart "${ZIVPN_SERVICE:-zivpn}" >/dev/null 2>&1 || true
-systemctl try-restart "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}" >/dev/null 2>&1 || true
-systemctl restart sc-1forcr-sshws nginx >/dev/null 2>&1 || true
-systemctl restart haproxy >/dev/null 2>&1 || true
-systemctl restart ssh >/dev/null 2>&1 || true
-systemctl restart dropbear >/dev/null 2>&1 || true
+
+# Restart layanan inti dijalankan sebagai unit transient systemd yang tertunda,
+# BUKAN langsung di sini. Restore lewat web dilayani OLEH sc-1forcr-api melalui
+# nginx/haproxy; kalau direstart di tengah request, koneksi putus dan browser
+# menerima halaman error HTML (bukan JSON) -- persis gejala "Unexpected token '<'".
+# systemd-run menaruh restart di cgroup terpisah, jadi TIDAK ikut mati saat
+# sc-1forcr-api direstart (setsid saja tidak cukup: prosesnya masih di cgroup
+# API dan ikut dibunuh systemd). --on-active=2 memberi API waktu membalas 200
+# lebih dulu. Restore lewat menu CLI tetap benar (layanan tetap direstart).
+# ZIVPN/UDP Custom berbagi port; try-restart supaya backend yang sengaja mati
+# tidak dipaksa bind lalu crash-loop.
+_restore_zivpn_svc="${ZIVPN_SERVICE:-zivpn}"
+_restore_udp_svc="${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
+_restore_restart_cmd="systemctl restart sc-1forcr-api xray sc-1forcr-sshws nginx haproxy ssh dropbear >/dev/null 2>&1; systemctl try-restart ${_restore_zivpn_svc} ${_restore_udp_svc} >/dev/null 2>&1"
+if command -v systemd-run >/dev/null 2>&1; then
+  systemd-run --quiet --collect --on-active=2 \
+    --unit="sc-1forcr-restore-restart-$(date +%s)" \
+    /bin/bash -c "${_restore_restart_cmd}" >/dev/null 2>&1 || true
+else
+  # Fallback tanpa systemd-run: minimal API tetap direstart (systemctl hanya
+  # mengirim permintaan ke systemd/PID1, jadi selesai walau proses ini dibunuh).
+  setsid bash -c "sleep 2; ${_restore_restart_cmd}" >/dev/null 2>&1 </dev/null &
+  disown 2>/dev/null || true
+fi
 echo "Restore akun selesai dari: ${backup_file}"
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-restore-backup

@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.84}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.85}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -2730,10 +2730,35 @@ install_base_packages() {
   install_optional_pkg_if_available badvpn || true
 }
 
+# Unit systemd (sc-1forcr-api, iplimit, summary-api) dan license guard memanggil
+# /usr/bin/node secara langsung. Fallback binary resmi dan sebagian image VPS
+# menaruh node di /usr/local/bin, sehingga service gagal start dengan
+# "/usr/bin/node: No such file or directory" walau `node -v` jalan. Buat symlink
+# supaya kedua jalur sama. Aman dipanggil berulang.
+ensure_node_system_path() {
+  local node_bin tool tool_bin
+  node_bin="$(command -v node 2>/dev/null || true)"
+  [[ -n "${node_bin}" ]] || return 0
+  if [[ ! -x /usr/bin/node ]]; then
+    node_bin="$(readlink -f "${node_bin}" 2>/dev/null || printf '%s' "${node_bin}")"
+    [[ "${node_bin}" != "/usr/bin/node" ]] || return 0
+    ln -sfn "${node_bin}" /usr/bin/node
+    log "Node ada di ${node_bin}; symlink /usr/bin/node dibuat."
+  fi
+  for tool in npm npx; do
+    [[ -e "/usr/bin/${tool}" ]] && continue
+    tool_bin="$(command -v "${tool}" 2>/dev/null || true)"
+    [[ -n "${tool_bin}" && "${tool_bin}" != "/usr/bin/${tool}" ]] || continue
+    ln -sfn "${tool_bin}" "/usr/bin/${tool}" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
 install_node_if_missing() {
   local node_major node_arch node_ver node_url tmpdir
   if command -v node >/dev/null 2>&1; then
     log "Node sudah ada: $(node -v)"
+    ensure_node_system_path
     return
   fi
   log "Install Node.js (prioritas NodeSource 20, fallback 22/18)..."
@@ -2777,6 +2802,7 @@ install_node_if_missing() {
         hash -r
         if command -v node >/dev/null 2>&1; then
           log "Node terpasang dari binary resmi: $(node -v)"
+          ensure_node_system_path
           return
         fi
       else
@@ -2789,6 +2815,38 @@ install_node_if_missing() {
   exit 1
 }
 
+# Fallback kalau mirror Debian/Ubuntu tidak bisa diunduh (pernah terjadi:
+# koneksi VPS ke CDN deb.debian.org/Fastly putus di tengah install, sehingga
+# apt-get install golang-go gagal "Could not connect ... :443"). Pasang binary
+# resmi dari go.dev ke /usr/local/go. Hanya dipakai kalau apt gagal dua kali.
+install_go_official_binary() {
+  local go_arch go_ver tmpdir
+  case "$(uname -m)" in
+    x86_64) go_arch="amd64" ;;
+    aarch64|arm64) go_arch="arm64" ;;
+    *) return 1 ;;
+  esac
+  go_ver="$(curl -fsSL --connect-timeout 15 --max-time 30 "https://go.dev/VERSION?m=text" 2>/dev/null | head -n1 | tr -d '\r' || true)"
+  [[ "${go_ver}" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || go_ver="go1.22.12"
+  tmpdir="$(mktemp -d)"
+  log "Download Go ${go_ver} (${go_arch}) dari go.dev..."
+  if curl -fL --connect-timeout 15 --max-time 600 --retry 3 \
+      "https://go.dev/dl/${go_ver}.linux-${go_arch}.tar.gz" -o "${tmpdir}/go.tar.gz" \
+    && tar -xzf "${tmpdir}/go.tar.gz" -C "${tmpdir}" \
+    && [[ -x "${tmpdir}/go/bin/go" ]]; then
+    rm -rf /usr/local/go
+    mv "${tmpdir}/go" /usr/local/go
+    ln -sfn /usr/local/go/bin/go /usr/local/bin/go
+    ln -sfn /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+    rm -rf "${tmpdir}" >/dev/null 2>&1 || true
+    hash -r
+    command -v go >/dev/null 2>&1
+    return
+  fi
+  rm -rf "${tmpdir}" >/dev/null 2>&1 || true
+  return 1
+}
+
 install_go_if_missing() {
   if command -v go >/dev/null 2>&1; then
     log "Go sudah ada: $(go version)"
@@ -2796,8 +2854,23 @@ install_go_if_missing() {
   fi
   log "Install Go..."
   apt_update_tolerant
-  apt_get_safe install -y golang-go
-  log "Go installed: $(go version)"
+  if apt_get_safe install -y golang-go; then
+    log "Go installed: $(go version)"
+    return
+  fi
+  log "Install golang-go dari repo gagal (mirror tidak terjangkau?). Ambil ulang daftar paket lalu coba lagi..."
+  apt_refresh_lists_hard
+  if apt_get_safe install -y golang-go; then
+    log "Go installed: $(go version)"
+    return
+  fi
+  log "Repo distro masih gagal. Fallback: binary resmi Go dari go.dev..."
+  if install_go_official_binary; then
+    log "Go installed dari binary resmi: $(go version)"
+    return
+  fi
+  echo "Gagal install Go (repo distro dan binary resmi go.dev). Cek koneksi VPS ke deb.debian.org dan go.dev."
+  return 1
 }
 
 configure_xray_managed_runtime() {
@@ -33885,6 +33958,9 @@ main() {
   run_install_step "05_logrotate" 20 "Setup logrotate" setup_logrotate_optimizations
 
   run_install_step "06_node" 24 "Install Node.js" install_node_if_missing
+  # Tetap jalan walau step 06 di-skip (lanjut-install setelah node terpasang
+  # di /usr/local/bin oleh versi lama).
+  ensure_node_system_path
   run_install_step "07_go" 28 "Install Go" install_go_if_missing
   run_install_step "08_xray" 33 "Install Xray" install_xray
   run_install_step "09_banner_assets" 36 "Setup banner default" setup_default_banner_assets

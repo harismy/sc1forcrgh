@@ -202,9 +202,21 @@ apt_get_safe() {
   DEBIAN_FRONTEND=noninteractive apt-get "$@"
 }
 
+# Unit summary-api memanggil /usr/bin/node. Node dari binary resmi ada di
+# /usr/local/bin, jadi buat symlink supaya service tidak gagal start.
+ensure_node_system_path() {
+  local node_bin
+  [[ -x /usr/bin/node ]] && return 0
+  node_bin="$(command -v node 2>/dev/null || true)"
+  [[ -n "${node_bin}" ]] || return 0
+  ln -sfn "$(readlink -f "${node_bin}" 2>/dev/null || printf '%s' "${node_bin}")" /usr/bin/node
+  return 0
+}
+
 install_node_if_missing() {
   if command -v node >/dev/null 2>&1; then
     log "Node.js already installed: $(node -v)"
+    ensure_node_system_path
     return
   fi
 

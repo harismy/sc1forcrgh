@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.85}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.86}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -16783,9 +16783,50 @@ SC 1FORCR • ${DOMAIN:--}
 $(TZ=Asia/Jakarta date '+%d-%m-%Y %H:%M WIB')"
 
   tg_api="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-  if curl --http1.1 -fsS --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 90 -X POST "${tg_api}/sendDocument" \
-    -F "chat_id=${TELEGRAM_CHAT_ID}" \
-    -F "document=@${backup_json}" >/dev/null 2>>"${tg_err_log}"; then
+  tg_resp_file="$(mktemp)"
+  tg_curl_err="$(mktemp)"
+  # Upload dokumen. Sengaja tanpa curl -f: dengan -f, alasan penolakan dari
+  # Telegram (description, misalnya "Too Many Requests: retry after 30") ikut
+  # dibuang dan log hanya berisi kode HTTP. Batas waktu per percobaan 180 detik
+  # supaya jaringan VPS yang lambat masih sempat menyelesaikan upload.
+  tg_send_document() {
+    local code
+    code="$(curl --http1.1 -sS --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 180 \
+      -o "${tg_resp_file}" -w '%{http_code}' -X POST "${tg_api}/sendDocument" \
+      -F "chat_id=${TELEGRAM_CHAT_ID}" \
+      -F "document=@${backup_json}" 2>"${tg_curl_err}")" || true
+    printf '%s' "${code:-000}"
+  }
+  tg_doc_ok=0
+  tg_fail_reason=""
+  for tg_attempt in 1 2; do
+    : > "${tg_resp_file}"
+    tg_http_code="$(tg_send_document)"
+    if [[ "${tg_http_code}" == "200" ]] && jq -e '.ok == true' "${tg_resp_file}" >/dev/null 2>&1; then
+      tg_doc_ok=1
+      break
+    fi
+    if [[ "${tg_http_code}" == "000" ]]; then
+      # Tidak ada jawaban HTTP sama sekali: pakai pesan error curl (koneksi/timeout).
+      tg_fail_reason="koneksi gagal: $(grep -v '^[[:space:]]*$' "${tg_curl_err}" 2>/dev/null | tail -n1 || true)"
+    else
+      tg_fail_reason="Telegram HTTP ${tg_http_code}: $(jq -r '.description // empty' "${tg_resp_file}" 2>/dev/null || true)"
+    fi
+    # Kena rate limit dengan jeda pendek: tunggu sesuai permintaan Telegram lalu
+    # coba sekali lagi. Jeda panjang tidak ditunggu, langsung fallback teks.
+    tg_retry_after="$(jq -r '.parameters.retry_after // empty' "${tg_resp_file}" 2>/dev/null | tr -cd '0-9' || true)"
+    if [[ "${tg_attempt}" == "1" && "${tg_http_code}" == "429" && -n "${tg_retry_after}" ]] && (( tg_retry_after <= 60 )); then
+      sleep "$(( tg_retry_after + 1 ))"
+      continue
+    fi
+    break
+  done
+  tg_fail_reason="$(printf '%s' "${tg_fail_reason}" | tr -d '\r\n' | sed -e 's/[[:space:]]*$//' | cut -c1-160)"
+  if [[ "${tg_fail_reason}" == *":" ]]; then
+    tg_fail_reason="${tg_fail_reason%:}"
+  fi
+
+  if [[ "${tg_doc_ok}" == "1" ]]; then
     # Kirim ringkasan terpisah agar upload dokumen tetap kompatibel di jaringan yang sensitif multipart.
     curl --http1.1 -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
       -d "chat_id=${TELEGRAM_CHAT_ID}" \
@@ -16795,8 +16836,8 @@ ${caption_body}
 ${caption_footer}" >/dev/null 2>>"${tg_err_log}" || true
   else
     {
-      echo "[$(date '+%F %T')] sendDocument gagal untuk file: ${backup_json}"
-      tail -n 5 "${tg_err_log}" 2>/dev/null || true
+      echo "[$(date '+%F %T')] sendDocument gagal untuk file: ${backup_json} ($(du -h "${backup_json}" 2>/dev/null | cut -f1))"
+      echo "  alasan: ${tg_fail_reason:-tidak diketahui}"
     } >> "${tg_err_log}"
     # Fallback: minimal kirim notifikasi teks jika upload dokumen gagal.
     curl --http1.1 -fsS --retry 3 --retry-delay 1 --connect-timeout 10 --max-time 30 -X POST "${tg_api}/sendMessage" \
@@ -16805,9 +16846,11 @@ ${caption_footer}" >/dev/null 2>>"${tg_err_log}" || true
 ${notify_rule}
 ${caption_body}
 Lokasi   : ${backup_json}
+Alasan   : ${tg_fail_reason:-tidak diketahui}
 ${caption_footer}" >/dev/null 2>>"${tg_err_log}" || true
-    logger -t sc-1forcr "Auto-backup Telegram sendDocument gagal, fallback sendMessage dipakai."
+    logger -t sc-1forcr "Auto-backup Telegram sendDocument gagal (${tg_fail_reason:-tidak diketahui}), fallback sendMessage dipakai."
   fi
+  rm -f "${tg_resp_file}" "${tg_curl_err}" >/dev/null 2>&1 || true
 fi
 
 echo "Backup akun selesai: ${backup_json}"

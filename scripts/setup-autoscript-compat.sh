@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.86}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.87}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -898,6 +898,7 @@ iui_detect_public_ip() {
   local ip=""
   if command -v curl >/dev/null 2>&1; then
     ip="$(curl -4fsS --connect-timeout 3 --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+    [[ -n "${ip}" ]] || ip="$(curl -4fsS --connect-timeout 3 --max-time 5 https://ipv4.icanhazip.com 2>/dev/null || true)"
   elif command -v wget >/dev/null 2>&1; then
     ip="$(wget -4qO- --timeout=5 --tries=1 https://api.ipify.org 2>/dev/null || true)"
   fi
@@ -1614,22 +1615,52 @@ tls_cert_domain() {
   return 0
 }
 
-detect_public_ipv4() {
+# Daftar layanan cek IP. Lebih dari dua karena sebagian provider VPS tidak bisa
+# menjangkau CDN tertentu (pernah terjadi: api.ipify.org dan ifconfig.me timeout,
+# icanhazip.com jalan), dan install ditolak kalau IP publik tidak terdeteksi.
+PUBLIC_IPV4_CHECK_URLS=(
+  "https://api.ipify.org"
+  "https://ifconfig.me/ip"
+  "https://ipv4.icanhazip.com"
+  "https://checkip.amazonaws.com"
+  "https://ipinfo.io/ip"
+)
+
+# IPv4 global pertama di kartu jaringan, hanya kalau alamatnya publik (bukan
+# NAT/private), supaya VPS di balik NAT tidak terdaftar dengan IP internal.
+local_public_ipv4() {
   local ip
-  ip=""
-  if command -v curl >/dev/null 2>&1; then
-    ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
-    [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)"
-  elif command -v wget >/dev/null 2>&1; then
-    ip="$(wget -4qO- --timeout=10 https://api.ipify.org 2>/dev/null || true)"
-    [[ -z "${ip}" ]] && ip="$(wget -4qO- --timeout=10 https://ifconfig.me/ip 2>/dev/null || true)"
-  fi
-  ip="$(echo "${ip}" | tr -d '[:space:]')"
-  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  command -v ip >/dev/null 2>&1 || return 0
+  while read -r ip; do
+    ip="${ip%%/*}"
+    [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+    case "${ip}" in
+      10.*|127.*|0.*|169.254.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) continue ;;
+      100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) continue ;;
+    esac
     echo "${ip}"
     return 0
-  fi
-  echo ""
+  done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' || true)
+  return 0
+}
+
+detect_public_ipv4() {
+  local ip url
+  ip=""
+  for url in "${PUBLIC_IPV4_CHECK_URLS[@]}"; do
+    if command -v curl >/dev/null 2>&1; then
+      ip="$(curl -4fsS --connect-timeout 5 --max-time 10 "${url}" 2>/dev/null || true)"
+    elif command -v wget >/dev/null 2>&1; then
+      ip="$(wget -4qO- --timeout=10 --tries=1 "${url}" 2>/dev/null || true)"
+    fi
+    ip="$(echo "${ip}" | tr -d '[:space:]')"
+    if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      echo "${ip}"
+      return 0
+    fi
+  done
+  # Semua layanan luar gagal: pakai IP publik dari kartu jaringan VPS.
+  local_public_ipv4
   return 0
 }
 
@@ -19543,6 +19574,8 @@ detect_public_ipv4_pull() {
   fi
   ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
   [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ipv4.icanhazip.com 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://checkip.amazonaws.com 2>/dev/null || true)"
   ip="$(echo "${ip}" | tr -d '[:space:]')"
   if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "${ip}"
@@ -19775,6 +19808,8 @@ detect_public_ipv4_pull() {
   fi
   ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
   [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ipv4.icanhazip.com 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://checkip.amazonaws.com 2>/dev/null || true)"
   ip="$(echo "${ip}" | tr -d '[:space:]')"
   if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "${ip}"
@@ -19965,6 +20000,8 @@ detect_public_ipv4_god() {
   if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then echo "${ip}"; return 0; fi
   ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
   [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ipv4.icanhazip.com 2>/dev/null || true)"
+  [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://checkip.amazonaws.com 2>/dev/null || true)"
   ip="$(echo "${ip}" | tr -d '[:space:]')"
   [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && echo "${ip}" || echo ""
 }

@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.89}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.90}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -1739,44 +1739,68 @@ enforce_install_license() {
 
   log "Validasi lisensi ke server..."
   resp=""
+  resp_code=""
   license_candidates="${LICENSE_API_URLS:-},${LICENSE_API_URL:-}"
+  license_body_file="$(mktemp)"
   while IFS= read -r license_candidate; do
     license_candidate="$(echo "${license_candidate}" | xargs)"
     [[ "${license_candidate}" =~ ^https?://[^[:space:]]+$ ]] || continue
-    resp="$(
-      curl -4fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
-        -X POST "${license_candidate}" \
-        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
-        -H "Accept: application/json" \
-        --data-urlencode "license_key=${LICENSE_KEY}" \
-        --data-urlencode "ip=${vps_ip}" \
-        --data-urlencode "domain=${DOMAIN}" \
-        --data-urlencode "machine_id=${machine_id}" \
-        --data-urlencode "script_version=${SCRIPT_VERSION}" \
-        2>/dev/null ||
-      curl -fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
-        -X POST "${license_candidate}" \
-        -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
-        -H "X-SC-Key: ${SC_UPDATE_KEY}" \
-        -H "Accept: application/json" \
-        --data-urlencode "license_key=${LICENSE_KEY}" \
-        --data-urlencode "ip=${vps_ip}" \
-        --data-urlencode "domain=${DOMAIN}" \
-        --data-urlencode "machine_id=${machine_id}" \
-        --data-urlencode "script_version=${SCRIPT_VERSION}" \
-        2>/dev/null || true
-    )"
-    if [[ -n "${resp}" ]] && { ! command -v jq >/dev/null 2>&1 || echo "${resp}" | jq -e 'type == "object"' >/dev/null 2>&1; }; then
+    # Tanpa curl -f: penolakan (401/403) dijawab server dengan JSON berisi
+    # alasan (server-key-unknown, source-ip-mismatch, ...). Dengan -f jawaban
+    # itu dibuang dan installer salah melapor "server lisensi tidak merespon".
+    for license_ip_flag in -4 ""; do
+      : > "${license_body_file}"
+      resp_code="$(
+        curl ${license_ip_flag} -sS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
+          -o "${license_body_file}" -w '%{http_code}' \
+          -X POST "${license_candidate}" \
+          -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+          -H "X-SC-Key: ${SC_UPDATE_KEY}" \
+          -H "Accept: application/json" \
+          --data-urlencode "license_key=${LICENSE_KEY}" \
+          --data-urlencode "ip=${vps_ip}" \
+          --data-urlencode "domain=${DOMAIN}" \
+          --data-urlencode "machine_id=${machine_id}" \
+          --data-urlencode "script_version=${SCRIPT_VERSION}" \
+          2>/dev/null || true
+      )"
+      resp="$(cat "${license_body_file}" 2>/dev/null || true)"
+      # Jawaban sah = objek JSON (sukses maupun penolakan). Halaman HTML dari
+      # proxy/CDN (502 dan sejenisnya) dianggap tidak menjawab.
+      if [[ -n "${resp}" ]] && { { command -v jq >/dev/null 2>&1 && echo "${resp}" | jq -e 'type == "object"' >/dev/null 2>&1; } || \
+           { ! command -v jq >/dev/null 2>&1 && [[ "${resp}" =~ ^[[:space:]]*\{ ]]; }; }; then
+        break
+      fi
+      resp=""
+    done
+    if [[ -n "${resp}" ]]; then
       LICENSE_API_URL="${license_candidate}"
       break
     fi
-    resp=""
   done < <(printf '%s' "${license_candidates}" | tr ', ' '\n\n' | awk 'NF && !seen[$0]++')
+  rm -f "${license_body_file}" >/dev/null 2>&1 || true
   if [[ -z "${resp}" ]]; then
-    echo "Install ditolak: server lisensi tidak merespon."
+    echo "Install ditolak: server lisensi tidak merespon (HTTP ${resp_code:-000})."
     exit 1
   fi
+  license_code="$(echo "${resp}" | sed -nE 's/.*"code"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n1 || true)"
+  case "${license_code}" in
+    server-key-unknown)
+      echo "Install ditolak: key VPS di installer tidak dikenal server lisensi."
+      echo "Biasanya karena key sudah diganti (Reset Binding) atau install dilanjutkan dengan perintah lama."
+      echo "Ambil ulang perintah install dari bot lalu jalankan lagi; jangan pakai lanjut-install."
+      exit 1
+      ;;
+    source-ip-mismatch)
+      echo "Install ditolak: IP VPS yang menghubungi server lisensi (${vps_ip}) tidak sama dengan IP yang terdaftar di bot."
+      echo "Pastikan IP yang didaftarkan di bot adalah IP publik VPS ini."
+      exit 1
+      ;;
+    server-key-missing)
+      echo "Install ditolak: perintah install tidak membawa key VPS. Ambil ulang perintah install dari bot."
+      exit 1
+      ;;
+  esac
 
   ok="0"
   msg="License rejected"

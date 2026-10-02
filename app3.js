@@ -1882,6 +1882,20 @@ function shouldSendInstallerAfterRegistration(result) {
   return prevStatus !== 'active' && prevStatus !== 'expired';
 }
 
+// Pesan registrasi IP baru (berisi API key dan perintah install) disematkan di
+// chat pembeli supaya mudah dicari lagi saat install ulang. Tanpa notifikasi
+// tambahan; gagal pin tidak mengganggu registrasi.
+async function pinRegistrationMessage(chatId, sentMessage) {
+  const messageId = Number(sentMessage?.message_id || 0);
+  if (!chatId || !messageId) return false;
+  try {
+    await bot.telegram.pinChatMessage(chatId, messageId, { disable_notification: true });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function issueRandomServerKeyForHost(userId, host) {
   const uid = Number(userId || 0);
   const ip = normalizeHost(host);
@@ -8944,14 +8958,15 @@ bot.on('text', async (ctx) => {
           })
         : null;
       userState.delete(ctx.chat.id);
+      let registrationMessage = null;
       if (installerText?.ok) {
-        await ctx.reply(installerText.text, {
+        registrationMessage = await ctx.reply(installerText.text, {
           ...mainMenu(),
           parse_mode: installerText.parse_mode,
           disable_web_page_preview: true
         });
       } else {
-        await ctx.reply(
+        registrationMessage = await ctx.reply(
           `Registrasi SC Unlimited berhasil.\n` +
             `Nama Client: ${result.clientName || clientName}\n` +
             `IP: ${ip}\n` +
@@ -8963,6 +8978,9 @@ bot.on('text', async (ctx) => {
               : ''}`,
           mainMenu()
         );
+      }
+      if (sendInstaller) {
+        await pinRegistrationMessage(ctx.chat.id, registrationMessage);
       }
       schedulePostRegistrationHostSync({
         userId: ctx.from.id,
@@ -9127,14 +9145,15 @@ bot.on('text', async (ctx) => {
           })
         : null;
       userState.delete(ctx.chat.id);
+      let registrationMessage = null;
       if (installerText?.ok) {
-        await ctx.reply(installerText.text, {
+        registrationMessage = await ctx.reply(installerText.text, {
           ...mainMenu(),
           parse_mode: installerText.parse_mode,
           disable_web_page_preview: true
         });
       } else {
-        await ctx.reply(
+        registrationMessage = await ctx.reply(
           `Registrasi/perpanjang SC berhasil.\n` +
             `Nama Client: ${result.clientName || clientName}\n` +
             `IP: ${ip}\n` +
@@ -9147,6 +9166,9 @@ bot.on('text', async (ctx) => {
               : ''}`,
           mainMenu()
         );
+      }
+      if (sendInstaller) {
+        await pinRegistrationMessage(ctx.chat.id, registrationMessage);
       }
       schedulePostRegistrationHostSync({
         userId: ctx.from.id,

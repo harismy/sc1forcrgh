@@ -40,6 +40,7 @@ const api = heredoc('  cat > "${APP_DIR}/api.js" <<\'EOF\'');
 const ipl = heredoc('  cat > "${APP_DIR}/iplimit-checker.js" <<\'EOF\'');
 
 const sent = [];
+const sentEntities = [];
 const httpsStub = {
   request(_opts, onRes) {
     let body = '';
@@ -49,6 +50,8 @@ const httpsStub = {
       write(chunk) { body += chunk; },
       end() {
         sent.push(decodeURIComponent(/(?:^|&)text=([^&]*)/.exec(body)[1]));
+        const ent = /(?:^|&)entities=([^&]*)/.exec(body);
+        sentEntities.push(ent ? JSON.parse(decodeURIComponent(ent[1])) : []);
         onRes({ statusCode: 200, on: (ev, cb) => { if (ev === 'end') cb(); } });
       }
     };
@@ -94,7 +97,21 @@ function ymdPlus(days) {
 }
 
 function take() {
+  sentEntities.splice(0, sentEntities.length);
   return sent.splice(0, sent.length);
+}
+
+// Teks yang ditandai entity "code" (bisa disalin sekali sentuh di Telegram).
+function takeCopyable() {
+  const texts = sent.splice(0, sent.length);
+  const ents = sentEntities.splice(0, sentEntities.length);
+  return texts.map((text, i) => ({
+    text,
+    codes: (ents[i] || []).map((e) => {
+      assert.strictEqual(e.type, 'code');
+      return text.slice(e.offset, e.offset + e.length);
+    })
+  }));
 }
 
 const RULE = '━━━━━━━━━━━━━━━━━━━━━━';
@@ -121,8 +138,13 @@ function assertLayout(text, title) {
     hostname: 'sg1.contoh.com', username: 'andi', password: 'x7Kp29qa', exp: ymdPlus(30), limitip: '2', quota: '0',
     port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: '7300,7200' }
   }, owner);
-  let [msg] = take();
+  let [{ text: msg, codes }] = takeCopyable();
   assertLayout(msg, 'AKUN SSH BARU');
+  assert(!/[\u0001\u0002]/.test(msg), 'penanda salin tidak boleh ikut terkirim');
+  for (const want of ['andi', 'x7Kp29qa', 'sg1.contoh.com', 'sg1.contoh.com:80@andi:x7Kp29qa', 'sg1.contoh.com:443@andi:x7Kp29qa']) {
+    assert(codes.includes(want), `"${want}" harus bisa disalin sekali sentuh: ${JSON.stringify(codes)}`);
+  }
+  assert(codes.some((c) => c.startsWith('GET wss://')), 'payload WS bisa disalin');
   assert(msg.includes('Password : x7Kp29qa') && msg.includes('sg1.contoh.com:80@andi:x7Kp29qa'));
   // notifyExpiry membulatkan ke menit lalu floor ke hari, jadi akun "30 hari"
   // bisa terbaca 29-31 tergantung jam saat test jalan. Cukup pastikan sisa hari
@@ -137,8 +159,11 @@ function assertLayout(text, title) {
     port: { tls: '443', none: '80', grpc: '443' }, path: { ws: '/vmess', upgrade: '/upvmess' }, serviceName: 'vmess-grpc',
     link: { tls: link(443), none: link(80), grpc: link('grpc'), uptls: link(443), upntls: link(80) }
   }, {});
-  [msg] = take();
+  [{ text: msg, codes }] = takeCopyable();
   assertLayout(msg, 'AKUN VMESS BARU');
+  for (const want of [link(443), link(80), link('grpc'), 'uuid-1', 'budi']) {
+    assert(codes.includes(want), `"${want}" harus bisa disalin sekali sentuh`);
+  }
   assert.strictEqual(msg.split(link(443)).length - 1, 1, 'link upgrade yang sama dengan TLS tidak diulang');
   assert(msg.includes('Limit IP : Tanpa batas'));
   assert(!msg.includes('Pembeli'), 'akun tanpa pembeli tidak menampilkan baris Pembeli');
@@ -165,8 +190,9 @@ function assertLayout(text, title) {
   assert(msg.includes('XHTTP    : /xhvless'), 'path XHTTP tampil di bagian koneksi');
 
   await A.notifyAccountEvent('delete', 'trojan', { username: 'citra', password: 'rahasia-jangan-tampil', exp: ymdPlus(5) }, owner);
-  [msg] = take();
+  [{ text: msg, codes }] = takeCopyable();
   assertLayout(msg, 'AKUN DIHAPUS');
+  assert.strictEqual(codes.length, 0, 'notifikasi tanpa data salin tidak membawa entity');
   assert(!msg.includes('rahasia-jangan-tampil'), 'akun yang dihapus tidak boleh mengirim password');
 
   await A.notifyAccountEvent('renew', 'ssh/zivpn', {

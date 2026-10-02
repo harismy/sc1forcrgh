@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.87}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.88}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -5943,6 +5943,36 @@ app.post('/internal/zivpn-auth', async (req, res) => {
 const TELEGRAM_TEXT_LIMIT = 3800;
 const NOTIFY_RULE = '━━━━━━━━━━━━━━━━━━━━━━';
 const NOTIFY_SUBRULE = '──────────────────────';
+// Penanda bagian yang bisa disalin sekali sentuh (username, password, format
+// HTTP Custom, link). Saat dikirim, penanda dibuang dan diganti entity "code"
+// Telegram (offset UTF-16, sama dengan panjang string JS). Teks tetap polos,
+// jadi tidak perlu escape HTML dan tidak ada karakter yang bisa ditolak.
+const NOTIFY_CODE_OPEN = '\u0001';
+const NOTIFY_CODE_CLOSE = '\u0002';
+
+function notifyCode(value) {
+  const text = String(value ?? '').replace(/[\u0001\u0002]/g, '');
+  return text ? `${NOTIFY_CODE_OPEN}${text}${NOTIFY_CODE_CLOSE}` : '';
+}
+
+function telegramCodeEntities(markedText) {
+  const entities = [];
+  let text = '';
+  let openAt = -1;
+  for (const ch of String(markedText || '')) {
+    if (ch === NOTIFY_CODE_OPEN) {
+      openAt = text.length;
+    } else if (ch === NOTIFY_CODE_CLOSE) {
+      if (openAt >= 0 && text.length > openAt) entities.push({ type: 'code', offset: openAt, length: text.length - openAt });
+      openAt = -1;
+    } else {
+      text += ch;
+    }
+  }
+  // Penanda yang terpotong saat pesan dipecah: tutup di ujung bagian ini.
+  if (openAt >= 0 && text.length > openAt) entities.push({ type: 'code', offset: openAt, length: text.length - openAt });
+  return { text, entities };
+}
 
 function splitTelegramText(text, limit = TELEGRAM_TEXT_LIMIT) {
   const chunks = [];
@@ -5959,9 +5989,11 @@ function splitTelegramText(text, limit = TELEGRAM_TEXT_LIMIT) {
   return chunks;
 }
 
-function telegramSendText(text) {
+function telegramSendText(markedText) {
   return new Promise((resolve) => {
-    const payload = `chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&disable_web_page_preview=true&text=${encodeURIComponent(String(text))}`;
+    const { text, entities } = telegramCodeEntities(markedText);
+    const entityParam = entities.length ? `&entities=${encodeURIComponent(JSON.stringify(entities))}` : '';
+    const payload = `chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&disable_web_page_preview=true&text=${encodeURIComponent(String(text))}${entityParam}`;
     const req = https.request({
       hostname: 'api.telegram.org',
       path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -6011,6 +6043,13 @@ function notifyRow(label, value) {
   const text = value === null || value === undefined ? '' : notifyValue(String(value), '');
   if (!text || text === '-') return null;
   return `${String(label).padEnd(9, ' ')}: ${text}`;
+}
+
+// Sama dengan notifyRow, tapi nilainya bisa disalin sekali sentuh di Telegram.
+function notifyCopyRow(label, value) {
+  const text = value === null || value === undefined ? '' : notifyValue(String(value), '');
+  if (!text || text === '-') return null;
+  return `${String(label).padEnd(9, ' ')}: ${notifyCode(text)}`;
 }
 
 // Susunan semua notifikasi: judul, garis tebal, bagian-bagian yang dipisah
@@ -6243,8 +6282,8 @@ function formatSshCreateNotification(action, service, account = {}, owner = {}, 
   return notifyMessage(isTrialAction(action, username) ? 'AKUN TRIAL SSH' : 'AKUN SSH BARU', [
     {
       lines: [
-        notifyRow('Username', username),
-        notifyRow('Password', password),
+        notifyCopyRow('Username', username),
+        notifyCopyRow('Password', password),
         notifyRow('Expired', notifyExpiry(accountExpiryValue(account), true)),
         notifyRow('Limit IP', notifyLimitIp(account.limitip ?? account.iplimit)),
         notifyRow('Quota', notifyQuota(account.quota)),
@@ -6254,7 +6293,7 @@ function formatSshCreateNotification(action, service, account = {}, owner = {}, 
     {
       title: 'KONEKSI',
       lines: [
-        notifyRow('Host', host),
+        notifyCopyRow('Host', host),
         notifyRow('SSH WS', ntlsPort),
         notifyRow('SSH SSL', tlsPort),
         notifyRow('UDP Custom', udpCustom),
@@ -6265,13 +6304,13 @@ function formatSshCreateNotification(action, service, account = {}, owner = {}, 
     {
       title: 'FORMAT HTTP CUSTOM',
       lines: [
-        `${host}:${ntlsPort}@${username}:${password}`,
-        `${host}:${tlsPort}@${username}:${password}`
+        notifyCode(`${host}:${ntlsPort}@${username}:${password}`),
+        notifyCode(`${host}:${tlsPort}@${username}:${password}`)
       ]
     },
     {
       title: 'PAYLOAD WS',
-      lines: ['GET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]']
+      lines: [notifyCode('GET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]')]
     }
   ]);
 }
@@ -6294,7 +6333,7 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
   const pushLink = (label, value) => {
     if (!value) return;
     if (linkLines.length) linkLines.push('');
-    linkLines.push(`${label}:`, value);
+    linkLines.push(`${label}:`, notifyCode(value));
   };
   pushLink('TLS', links.tls);
   pushLink('Non-TLS', links.ntls);
@@ -6308,7 +6347,7 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
   return notifyMessage(isTrialAction(action, username) ? `AKUN TRIAL ${title}` : `AKUN ${title} BARU`, [
     {
       lines: [
-        notifyRow('Username', username),
+        notifyCopyRow('Username', username),
         notifyRow('Expired', notifyExpiry(accountExpiryValue(account), true)),
         notifyRow('Limit IP', notifyLimitIp(account.limitip ?? account.iplimit)),
         notifyRow('Quota', notifyQuota(account.quota)),
@@ -6318,12 +6357,12 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
     {
       title: 'KONEKSI',
       lines: [
-        notifyRow('Host', host),
-        sni && sni !== host ? notifyRow('SNI', sni) : null,
+        notifyCopyRow('Host', host),
+        sni && sni !== host ? notifyCopyRow('SNI', sni) : null,
         notifyRow('Port TLS', notifyPortValue(port, ['tls', 'any'], '443')),
         notifyRow('Non-TLS', notifyPortValue(port, ['none', 'ntls'], '80')),
         notifyRow('gRPC', notifyPortValue(port, ['grpc'], '443')),
-        notifyRow(serviceText === 'trojan' ? 'Password' : 'UUID', secret),
+        notifyCopyRow(serviceText === 'trojan' ? 'Password' : 'UUID', secret),
         notifyRow('Path WS', accountPathPart(account, 'ws', `/${serviceText}`)),
         notifyRow('Upgrade', accountPathPart(account, 'upgrade', `/up${serviceText}`)),
         links.xhttptls || links.xhttpntls ? notifyRow('XHTTP', accountPathPart(account, 'xhttp', '/xhvless')) : null,

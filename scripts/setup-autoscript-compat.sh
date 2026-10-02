@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.88}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.89}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -1391,6 +1391,14 @@ iui_anim_abort() {
       iui_say "${IUI_VAL}" "Setelah penyebabnya diperbaiki, jalankan: lanjut-install"
     fi
   } >/dev/tty 2>/dev/null || true
+  # Installer dijalankan lewat `screen -S 1forcr-sc` (panduan install bot).
+  # Begitu installer keluar, screen langsung menutup jendelanya dan layar
+  # gagal di atas hilang sebelum terbaca ("[screen is terminating]"). Tahan
+  # dulu sampai Enter; batas 10 menit supaya sesi tanpa orang tidak menggantung.
+  if [[ -n "${STY:-}${TMUX:-}" ]]; then
+    printf '\n  %sTekan Enter untuk menutup layar ini...%s ' "${IUI_VAL}${IUI_BOLD}" "${IUI_NC}" >/dev/tty 2>/dev/null || true
+    read -r -t 600 _ </dev/tty 2>/dev/null || true
+  fi
   return 0
 }
 # <<< installer-ui

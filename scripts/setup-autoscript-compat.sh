@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.91}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.92}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -3166,6 +3166,37 @@ dropbear_runtime_args() {
   printf -- '-K %s -I %s' "${keepalive}" "${idle}"
 }
 
+# Dropbear menolak start kalau file banner lebih dari 2000 byte ("Early exit:
+# Banner file too large, max is 2000 bytes"), lalu systemd menyerah setelah 5
+# percobaan dan port 109/143 mati. Ini pernah terjadi sungguhan setelah banner
+# HTML diganti dengan versi berwarna per huruf. OpenSSH tidak punya batas itu,
+# jadi hanya Dropbear yang diberi salinan yang dipadatkan (komentar HTML dibuang,
+# spasi/baris baru dirapatkan; tampilan HTML sama). Kalau masih kebesaran,
+# Dropbear jalan tanpa banner: koneksi lebih penting daripada banner.
+DROPBEAR_BANNER_MAX_BYTES=1990
+dropbear_safe_banner() {
+  local src="$1" compact="/etc/sc-1forcr/banner-dropbear.html" size orig
+  [[ -n "${src}" && -s "${src}" ]] || return 0
+  orig="$(wc -c < "${src}" 2>/dev/null | tr -cd '0-9' || true)"
+  if (( ${orig:-0} <= DROPBEAR_BANNER_MAX_BYTES )); then
+    printf '%s' "${src}"
+    return 0
+  fi
+  mkdir -p "$(dirname "${compact}")" >/dev/null 2>&1 || true
+  { tr -d '\r' < "${src}" | tr '\n\t' '  ' | sed -E 's/<!--([^-]|-[^-])*-->//g; s/ +/ /g; s/^ //; s/ $//'; } > "${compact}.tmp" 2>/dev/null || true
+  size="$(wc -c < "${compact}.tmp" 2>/dev/null | tr -cd '0-9' || true)"
+  if [[ -s "${compact}.tmp" ]] && (( ${size:-0} <= DROPBEAR_BANNER_MAX_BYTES )); then
+    mv -f "${compact}.tmp" "${compact}"
+    chmod 644 "${compact}" >/dev/null 2>&1 || true
+    echo "Catatan: banner ${orig} byte melebihi batas Dropbear 2000 byte; Dropbear memakai salinan padat ${size} byte." >&2
+    printf '%s' "${compact}"
+    return 0
+  fi
+  rm -f "${compact}.tmp" "${compact}" >/dev/null 2>&1 || true
+  echo "Peringatan: banner ${orig} byte melebihi batas Dropbear 2000 byte. Dropbear jalan tanpa banner (SSH port 22 tetap memakai banner). Perkecil banner supaya tampil di Dropbear." >&2
+  return 0
+}
+
 dropbear_fallback_urls() {
   local ver="$1"
   # Sumber utama kadang mati (HTTP 525). Fallback:
@@ -3200,6 +3231,8 @@ setup_dropbear() {
       echo "Banner ${banner_file}" >> /etc/ssh/sshd_config
     fi
   fi
+  # Dropbear punya batas ukuran banner sendiri; sshd tetap memakai file asli.
+  banner_file="$(dropbear_safe_banner "${banner_file}")"
 
   cat > /etc/default/dropbear <<EOF
 NO_START=0
@@ -3303,6 +3336,34 @@ EOF
   systemctl restart ssh >/dev/null 2>&1 || true
   systemctl enable dropbear >/dev/null 2>&1 || true
   systemctl restart dropbear >/dev/null 2>&1 || true
+}
+
+# VPS yang sudah terpasang dengan banner > 2000 byte: Dropbear terus gagal start.
+# Dipanggil di jalur update; hanya bertindak kalau override menunjuk banner yang
+# kebesaran, dan hanya me-restart Dropbear yang memang sedang tidak jalan.
+heal_dropbear_banner_override() {
+  local conf="/etc/systemd/system/dropbear.service.d/override.conf" cur safe size
+  [[ -f "${conf}" ]] || return 0
+  cur="$(sed -nE 's/^ExecStart=.* -b ([^ ]+).*/\1/p' "${conf}" | tail -n1)"
+  [[ -n "${cur}" && -f "${cur}" ]] || return 0
+  size="$(wc -c < "${cur}" 2>/dev/null | tr -cd '0-9' || true)"
+  (( ${size:-0} > DROPBEAR_BANNER_MAX_BYTES )) || return 0
+  safe="$(dropbear_safe_banner "${cur}" 2>/dev/null || true)"
+  if [[ -n "${safe}" ]]; then
+    sed -i "s| -b ${cur}| -b ${safe}|" "${conf}"
+  else
+    sed -i "s| -b ${cur}||" "${conf}"
+  fi
+  if [[ -f /etc/default/dropbear ]]; then
+    sed -i "s|^DROPBEAR_BANNER=.*|DROPBEAR_BANNER=\"${safe}\"|" /etc/default/dropbear
+  fi
+  log "Banner Dropbear ${size} byte melebihi batas 2000 byte; override Dropbear diperbaiki."
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if ! systemctl is-active --quiet dropbear; then
+    systemctl reset-failed dropbear >/dev/null 2>&1 || true
+    systemctl restart dropbear >/dev/null 2>&1 || true
+  fi
+  return 0
 }
 
 install_tunnel_hold_shell() {
@@ -21527,6 +21588,37 @@ dropbear_runtime_args() {
   printf -- '-K %s -I %s' "${keepalive}" "${idle}"
 }
 
+# Dropbear menolak start kalau file banner lebih dari 2000 byte ("Early exit:
+# Banner file too large, max is 2000 bytes"), lalu systemd menyerah setelah 5
+# percobaan dan port 109/143 mati. Ini pernah terjadi sungguhan setelah banner
+# HTML diganti dengan versi berwarna per huruf. OpenSSH tidak punya batas itu,
+# jadi hanya Dropbear yang diberi salinan yang dipadatkan (komentar HTML dibuang,
+# spasi/baris baru dirapatkan; tampilan HTML sama). Kalau masih kebesaran,
+# Dropbear jalan tanpa banner: koneksi lebih penting daripada banner.
+DROPBEAR_BANNER_MAX_BYTES=1990
+dropbear_safe_banner() {
+  local src="$1" compact="/etc/sc-1forcr/banner-dropbear.html" size orig
+  [[ -n "${src}" && -s "${src}" ]] || return 0
+  orig="$(wc -c < "${src}" 2>/dev/null | tr -cd '0-9' || true)"
+  if (( ${orig:-0} <= DROPBEAR_BANNER_MAX_BYTES )); then
+    printf '%s' "${src}"
+    return 0
+  fi
+  mkdir -p "$(dirname "${compact}")" >/dev/null 2>&1 || true
+  { tr -d '\r' < "${src}" | tr '\n\t' '  ' | sed -E 's/<!--([^-]|-[^-])*-->//g; s/ +/ /g; s/^ //; s/ $//'; } > "${compact}.tmp" 2>/dev/null || true
+  size="$(wc -c < "${compact}.tmp" 2>/dev/null | tr -cd '0-9' || true)"
+  if [[ -s "${compact}.tmp" ]] && (( ${size:-0} <= DROPBEAR_BANNER_MAX_BYTES )); then
+    mv -f "${compact}.tmp" "${compact}"
+    chmod 644 "${compact}" >/dev/null 2>&1 || true
+    echo "Catatan: banner ${orig} byte melebihi batas Dropbear 2000 byte; Dropbear memakai salinan padat ${size} byte." >&2
+    printf '%s' "${compact}"
+    return 0
+  fi
+  rm -f "${compact}.tmp" "${compact}" >/dev/null 2>&1 || true
+  echo "Peringatan: banner ${orig} byte melebihi batas Dropbear 2000 byte. Dropbear jalan tanpa banner (SSH port 22 tetap memakai banner). Perkecil banner supaya tampil di Dropbear." >&2
+  return 0
+}
+
 flag_enabled() {
   case "$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
     1|true|yes|on) return 0 ;;
@@ -30678,6 +30770,9 @@ apply_html_banner_config() {
     else
       echo "Banner ${banner_file}" >> /etc/ssh/sshd_config
     fi
+    # Dropbear punya batas ukuran banner sendiri; sshd tetap memakai file asli.
+    local sshd_banner_file="${banner_file}"
+    banner_file="$(dropbear_safe_banner "${banner_file}")"
     if [[ -f /etc/default/dropbear ]]; then
       if grep -q '^DROPBEAR_BANNER=' /etc/default/dropbear; then
         sed -i "s|^DROPBEAR_BANNER=.*|DROPBEAR_BANNER=\"${banner_file}\"|g" /etc/default/dropbear
@@ -30695,9 +30790,9 @@ Restart=on-failure
 LimitNOFILE=65536
 TasksMax=8192
 ExecStart=
-ExecStart=${dropbear_bin} -R -E -F ${dropbear_args} -p ${main_port} -p ${alt_port} -b ${banner_file}
+ExecStart=${dropbear_bin} -R -E -F ${dropbear_args} -p ${main_port} -p ${alt_port}${banner_file:+ -b ${banner_file}}
 EOF
-    echo "Banner aktif: ${banner_file}"
+    echo "Banner aktif: ${sshd_banner_file}"
   else
     if grep -qE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null; then
       sed -i "s|^[[:space:]]*Banner[[:space:]].*|Banner none|g" /etc/ssh/sshd_config
@@ -30759,6 +30854,7 @@ apply_dropbear_version_with_lock() {
   custom_bin="/usr/local/sbin/dropbear-${ver}"
   banner_file="/etc/sc-1forcr/banner.html"
   [[ -s "${banner_file}" ]] || banner_file=""
+  banner_file="$(dropbear_safe_banner "${banner_file}")"
   dropbear_args="$(dropbear_runtime_args)"
 
   mkdir -p "${src_dir}"
@@ -34082,6 +34178,7 @@ main() {
     enforce_single_udp_backend
     apply_tunnel_outbound_guard_rules
     restart_update_safe_services
+    heal_dropbear_banner_override || true
     apply_service_gates
     ensure_dns_resolver_if_needed
     if ! sync_xray_runtime_after_update; then

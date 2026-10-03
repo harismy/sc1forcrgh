@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.90}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.91}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -3930,6 +3930,35 @@ prepare_haproxy_pem() {
   return 0
 }
 
+# VPS bekas autoscript lain sering menyisakan config nginx (conf.d atau
+# sites-enabled) yang menunjuk sertifikat yang sudah dihapus. Satu file itu
+# membuat `nginx -t` gagal ("cannot load certificate") dan install SC berhenti
+# di langkah nginx. File seperti itu memang tidak bisa jalan, jadi dipindah ke
+# folder backup. Config milik SC dan file dengan sertifikat yang ada tidak disentuh.
+disable_broken_foreign_nginx_confs() {
+  local f cert bad backup_dir moved=0
+  backup_dir="/var/lib/sc-1forcr/backup/nginx/foreign-$(date +%s)"
+  for f in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*; do
+    [[ -e "${f}" ]] || continue
+    case "$(basename "${f}")" in sc-1forcr*) continue ;; esac
+    bad=""
+    while read -r cert; do
+      cert="${cert%;}"
+      cert="${cert//\"/}"
+      cert="${cert//\'/}"
+      [[ -n "${cert}" && "${cert}" != *'$'* && "${cert}" == /* ]] || continue
+      if [[ ! -e "${cert}" ]]; then bad="${cert}"; break; fi
+    done < <(awk '$1 ~ /^ssl_(certificate|certificate_key|trusted_certificate)$/ {print $2}' "${f}" 2>/dev/null || true)
+    [[ -n "${bad}" ]] || continue
+    mkdir -p "${backup_dir}"
+    if mv -f "${f}" "${backup_dir}/" 2>/dev/null; then
+      log "Config nginx sisa script lain dinonaktifkan: ${f} (sertifikat ${bad} tidak ada). Salinan: ${backup_dir}"
+      moved=$(( moved + 1 ))
+    fi
+  done
+  return 0
+}
+
 setup_nginx_and_cert() {
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
@@ -4345,6 +4374,7 @@ EOF
   fi
   ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
   rm -f /etc/nginx/sites-enabled/default
+  disable_broken_foreign_nginx_confs
   tune_nginx_capacity
   if nginx -t; then
     systemctl enable nginx

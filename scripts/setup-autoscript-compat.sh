@@ -130,6 +130,9 @@ set -euo pipefail
 #   XRAY_MIN_HITS_PER_IP=2                       (opsional, minimal hit/log per IP pada jendela aktif)
 #   XRAY_REAL_IP_ENABLE=0                        (canary: 1=teruskan IP asli HAProxy->Nginx->Xray)
 #   XRAY_XHTTP_ENABLE=0                          (opsional: 1=aktifkan inbound XHTTP VLESS di /xhvless)
+#   XRAY_MULTIPATH_ENABLE=1                      (path WS bebas untuk VMess/VLESS/Trojan; 0=hanya path standar)
+#   EXTRA_TLS_PORTS=8443,2053,2083,2087,2096     (port TLS tambahan -> 443; off=mati, port yang dipakai program lain dilewati)
+#   EXTRA_NTLS_PORTS=8080,8880,2052,2082,2086,2095 (port NTLS tambahan -> 80; off=mati)
 #   SERVICE_SSH_ENABLE=1                         (menu ON/OFF LAYANAN: 0=tolak SSH-WS/SSL/Dropbear; sshd 22 tetap buka)
 #   SERVICE_VMESS_ENABLE=1                       (0=tolak trafik VMess tanpa restart Xray)
 #   SERVICE_VLESS_ENABLE=1                       (0=tolak trafik VLESS termasuk XHTTP)
@@ -193,7 +196,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.94}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.95}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -302,6 +305,9 @@ XRAY_MIRROR_BASE="${XRAY_MIRROR_BASE:-}"
 XRAY_VERSION="${XRAY_VERSION:-}"
 XRAY_REAL_IP_ENABLE="${XRAY_REAL_IP_ENABLE:-0}"
 XRAY_XHTTP_ENABLE="${XRAY_XHTTP_ENABLE:-0}"
+XRAY_MULTIPATH_ENABLE="${XRAY_MULTIPATH_ENABLE:-1}"
+EXTRA_TLS_PORTS="${EXTRA_TLS_PORTS:-8443,2053,2083,2087,2096}"
+EXTRA_NTLS_PORTS="${EXTRA_NTLS_PORTS:-8080,8880,2052,2082,2086,2095}"
 SERVICE_SSH_ENABLE="${SERVICE_SSH_ENABLE:-1}"
 SERVICE_VMESS_ENABLE="${SERVICE_VMESS_ENABLE:-1}"
 SERVICE_VLESS_ENABLE="${SERVICE_VLESS_ENABLE:-1}"
@@ -4042,8 +4048,15 @@ map \$sc_sshws_real_ip \$sc_sshws_limit_key {
     "" \$binary_remote_addr;
     default \$sc_sshws_real_ip;
 }
-limit_req_zone \$sc_sshws_limit_key zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
-limit_conn_zone \$sc_sshws_limit_key zone=sc_sshws_conn:10m;
+# Klien WebSocket asli (Sec-WebSocket-Key) adalah Xray multi path yang
+# membuka satu koneksi per aplikasi. Kunci kosong = tidak dihitung, sama
+# seperti location /vmess, /vless, dan /trojan yang tidak dibatasi.
+map \$http_sec_websocket_key \$sc_sshws_limit_scope {
+    "" \$sc_sshws_limit_key;
+    default "";
+}
+limit_req_zone \$sc_sshws_limit_scope zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
+limit_conn_zone \$sc_sshws_limit_scope zone=sc_sshws_conn:10m;
 
 EOF_LIMIT
 )
@@ -5382,6 +5395,9 @@ XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
 XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
+XRAY_MULTIPATH_ENABLE=${XRAY_MULTIPATH_ENABLE}
+EXTRA_TLS_PORTS=${EXTRA_TLS_PORTS}
+EXTRA_NTLS_PORTS=${EXTRA_NTLS_PORTS}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
 SERVICE_VMESS_ENABLE=${SERVICE_VMESS_ENABLE}
 SERVICE_VLESS_ENABLE=${SERVICE_VLESS_ENABLE}
@@ -6417,8 +6433,8 @@ function formatSshCreateNotification(action, service, account = {}, owner = {}, 
       title: 'KONEKSI',
       lines: [
         notifyCopyRow('Host', host),
-        notifyRow('SSH WS', ntlsPort),
-        notifyRow('SSH SSL', tlsPort),
+        notifyRow('SSH WS', notifyPortValue(port, ['none_all'], ntlsPort)),
+        notifyRow('SSH SSL', notifyPortValue(port, ['tls_all'], tlsPort)),
         notifyRow('UDP Custom', udpCustom),
         notifyRow('UDPGW', udpgw),
         notifyRow('Lokasi', notifyLocation(account, location))
@@ -6482,11 +6498,11 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
       lines: [
         notifyCopyRow('Host', host),
         sni && sni !== host ? notifyCopyRow('SNI', sni) : null,
-        notifyRow('Port TLS', notifyPortValue(port, ['tls', 'any'], '443')),
-        notifyRow('Non-TLS', notifyPortValue(port, ['none', 'ntls'], '80')),
+        notifyRow('Port TLS', notifyPortValue(port, ['tls_all', 'tls', 'any'], '443')),
+        notifyRow('Non-TLS', notifyPortValue(port, ['none_all', 'none', 'ntls'], '80')),
         notifyRow('gRPC', notifyPortValue(port, ['grpc'], '443')),
         notifyCopyRow(serviceText === 'trojan' ? 'Password' : 'UUID', secret),
-        notifyRow('Path WS', accountPathPart(account, 'ws', `/${serviceText}`)),
+        notifyRow('Path WS', `${accountPathPart(account, 'ws', `/${serviceText}`)}${account.path?.any ? ' atau path bebas' : ''}`),
         notifyRow('Upgrade', accountPathPart(account, 'upgrade', `/up${serviceText}`)),
         links.xhttptls || links.xhttpntls ? notifyRow('XHTTP', accountPathPart(account, 'xhttp', '/xhvless')) : null,
         notifyRow('Service', notifyValue(account.serviceName || `${serviceText}-grpc`)),
@@ -7438,6 +7454,53 @@ const XRAY_XHTTP_PATH_VLESS = '/xhvless';
 // Dibaca sama seperti di buildXrayRuntimeConfig: inbound XHTTP hanya ada kalau
 // XRAY_XHTTP_ENABLE=1, jadi link XHTTP juga hanya dibuat saat itu.
 const XRAY_XHTTP_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.XRAY_XHTTP_ENABLE || '').trim());
+// Path WS bebas (mux SSH-WS mengenali VMess/VLESS/Trojan dari frame pertama).
+const XRAY_MULTIPATH_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.XRAY_MULTIPATH_ENABLE || '1').trim());
+// Mux menulis penanda ini saat jalan. Update aman tidak me-restart mux, jadi
+// path bebas baru diiklankan setelah mux versi baru benar-benar aktif.
+const SSHWS_MULTIPATH_MARKER = '/run/sc-1forcr/sshws-multipath';
+let multipathCache = { at: 0, active: false };
+function xrayMultipathActive() {
+  if (!XRAY_MULTIPATH_ENABLED) return false;
+  const now = Date.now();
+  if (now - multipathCache.at >= 30000) {
+    multipathCache = { at: now, active: fs.existsSync(SSHWS_MULTIPATH_MARKER) };
+  }
+  return multipathCache.active;
+}
+
+// Port TLS/NTLS tambahan dari sc-1forcr-extra-ports (dialihkan ke 443/80),
+// dibaca dari file state dan di-cache 30 detik. Kunci tls/none tetap satu
+// port (443/80) supaya bot lain yang membacanya tidak berubah; daftar lengkap
+// ada di tls_all/none_all.
+const EXTRA_PORTS_STATE_FILE = '/var/lib/sc-1forcr/extra-ports.state';
+let extraPortsCache = { at: 0, tls: [], ntls: [] };
+function extraPortsState() {
+  const now = Date.now();
+  if (now - extraPortsCache.at < 30000) return extraPortsCache;
+  const next = { at: now, tls: [], ntls: [] };
+  try {
+    for (const line of fs.readFileSync(EXTRA_PORTS_STATE_FILE, 'utf8').split(/\r?\n/)) {
+      const m = line.match(/^(TLS_ACTIVE|NTLS_ACTIVE)=(.*)$/);
+      if (!m) continue;
+      const ports = m[2].split(',').map((p) => p.trim()).filter((p) => /^\d{1,5}$/.test(p));
+      if (m[1] === 'TLS_ACTIVE') next.tls = ports;
+      else next.ntls = ports;
+    }
+  } catch (_) {}
+  extraPortsCache = next;
+  return next;
+}
+function publicPorts(extra = {}) {
+  const state = extraPortsState();
+  return {
+    tls: '443',
+    none: '80',
+    tls_all: ['443', ...state.tls].join(', '),
+    none_all: ['80', ...state.ntls].join(', '),
+    ...extra
+  };
+}
 
 // HTTPUpgrade: TLS lewat 443, non-TLS lewat 80 (nginx /up<protokol>).
 function vmessUpgradeLink(host, id, tls, username = '') {
@@ -8641,7 +8704,7 @@ function sshPayload(username, password, expDate, limitip, location = null, quota
     time: nowTime(),
     city: sanitizeInfoText(location?.city || '-'),
     isp: sanitizeInfoText(location?.isp || '-'),
-    port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: udpgwPorts.join(',') },
+    port: publicPorts({ ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: udpgwPorts.join(',') }),
     ws_path: '/ssh-ws',
     ws_alt_path: '/ws',
     udpgw: {
@@ -9001,7 +9064,7 @@ app.delete('/vps/deletesshvpn/:username', async (req, res) => {
         limitip: row.limitip ?? 0,
         city: location.city,
         isp: location.isp,
-        port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: (SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200']).join(',') },
+        port: publicPorts({ ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: (SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200']).join(',') }),
         ws_path: '/ssh-ws',
         udpgw: { ports: SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'] }
       }, {
@@ -9222,8 +9285,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
-      port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: XRAY_UPGRADE_PATH.vmess, aliases: XRAY_PATHS_VMESS },
+      port: publicPorts({ any: '443', grpc: '443' }),
+      path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: XRAY_UPGRADE_PATH.vmess, aliases: XRAY_PATHS_VMESS, any: xrayMultipathActive() },
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
@@ -9250,9 +9313,9 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
-      port: { tls: '443', none: '80', any: '443', grpc: '443' },
+      port: publicPorts({ any: '443', grpc: '443' }),
       path: {
-        ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: XRAY_UPGRADE_PATH.vless, aliases: XRAY_PATHS_VLESS,
+        ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: XRAY_UPGRADE_PATH.vless, aliases: XRAY_PATHS_VLESS, any: xrayMultipathActive(),
         ...(XRAY_XHTTP_ENABLED ? { xhttp: XRAY_XHTTP_PATH_VLESS } : {})
       },
       serviceName: 'vless-grpc',
@@ -9284,8 +9347,8 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
-      port: { tls: '443', none: '80', any: '443', grpc: '443' },
-      path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: XRAY_UPGRADE_PATH.trojan, aliases: XRAY_PATHS_TROJAN },
+      port: publicPorts({ any: '443', grpc: '443' }),
+      path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: XRAY_UPGRADE_PATH.trojan, aliases: XRAY_PATHS_TROJAN, any: xrayMultipathActive() },
       serviceName: 'trojan-grpc',
       limitip: String(limitip),
       iplimit: String(limitip),
@@ -9476,7 +9539,7 @@ async function delXray(table, username, req = null) {
       iplimit: row.limitip ?? 0,
       city: location.city,
       isp: location.isp,
-      port: { tls: '443', none: '80', any: '443', grpc: '443' },
+      port: publicPorts({ any: '443', grpc: '443' }),
       path: { ws: meta.path },
       serviceName: meta.serviceName
     }, owner);
@@ -9981,6 +10044,11 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -10317,6 +10385,377 @@ func stripBufferedHttpJunk(reader *bufio.Reader) {
 	}
 }
 
+// ── Multi path Xray WS ──────────────────────────────────────────────────────
+// Klien VMess/VLESS/Trojan WS dengan path bebas (/bebas, /worryfree, ...)
+// masuk ke mux ini lewat nginx "location /". Klien WebSocket asli selalu
+// mengirim Sec-WebSocket-Key, sedangkan payload SSH-WS (HTTP Custom dan
+// sejenisnya) umumnya tidak. Untuk klien WebSocket asli, mux menjawab 101
+// sendiri, membaca frame pertama, mengenali protokolnya, lalu meneruskan
+// koneksi ke inbound Xray dengan path standarnya. Data "SSH-..." setelah jabat
+// tangan tetap diteruskan ke SSH seperti biasa.
+
+type xrayRoute struct {
+	name string
+	port int
+	path string
+}
+
+var (
+	multipathEnabled  = true
+	xrayRealIPEnabled = false
+	xrayHost          = "127.0.0.1"
+	xrayRoutes        = map[string]xrayRoute{}
+	firstFrameWait    = 3 * time.Second
+	xrayConfigPaths   = []string{"/usr/local/etc/xray/config.json", "/etc/xray/config.json"}
+
+	vlessMu        sync.Mutex
+	vlessIDs       map[[16]byte]bool
+	vlessCheckedAt time.Time
+	vlessFileStamp string
+)
+
+func envBool(key string, fallback bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return fallback
+}
+
+func initMultipath() {
+	multipathEnabled = envBool("XRAY_MULTIPATH_ENABLE", true)
+	xrayRealIPEnabled = envBool("XRAY_REAL_IP_ENABLE", false)
+	xrayHost = envOr("XRAY_WS_HOST", "127.0.0.1")
+	xrayRoutes = map[string]xrayRoute{
+		"vmess":  {name: "vmess", port: envInt("XRAY_WS_VMESS_PORT", 10001), path: envOr("XRAY_WS_VMESS_PATH", "/vmess")},
+		"vless":  {name: "vless", port: envInt("XRAY_WS_VLESS_PORT", 10002), path: envOr("XRAY_WS_VLESS_PATH", "/vless")},
+		"trojan": {name: "trojan", port: envInt("XRAY_WS_TROJAN_PORT", 10003), path: envOr("XRAY_WS_TROJAN_PATH", "/trojan")},
+	}
+	if p := strings.TrimSpace(os.Getenv("XRAY_CONFIG_PATH")); p != "" {
+		xrayConfigPaths = []string{p}
+	}
+}
+
+// Penanda untuk api.js dan menu: path bebas hanya diiklankan kalau mux yang
+// sedang jalan memang mendukungnya. Update aman tidak me-restart mux, jadi
+// binary baru baru aktif setelah restart atau reboot.
+func markMultipathRuntime() {
+	path := envOr("SSHWS_MULTIPATH_MARKER", "/run/sc-1forcr/sshws-multipath")
+	if !multipathEnabled {
+		_ = os.Remove(path)
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = ioutil.WriteFile(path, []byte("1\n"), 0644)
+}
+
+// Nilai header asli (huruf besar-kecil dipertahankan; Sec-WebSocket-Key peka huruf).
+func headerValue(raw []byte, name string) string {
+	target := strings.ToLower(strings.TrimSpace(name))
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 && strings.ToLower(strings.TrimSpace(parts[0])) == target {
+			return strings.TrimSpace(parts[1])
+		}
+	}
+	return ""
+}
+
+func wsAcceptKey(key string) string {
+	h := sha1.New()
+	_, _ = io.WriteString(h, key+"258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// Early data Xray/V2Ray (?ed=...) dibawa di Sec-WebSocket-Protocol, sama
+// dengan cara Xray membacanya.
+func decodeEarlyData(protocol string) []byte {
+	v := strings.TrimSpace(protocol)
+	if v == "" {
+		return nil
+	}
+	v = strings.NewReplacer("+", "-", "/", "_", "=", "").Replace(v)
+	data, err := base64.RawURLEncoding.DecodeString(v)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// Payload frame WS pertama dari klien (sudah di-unmask), paling banyak max
+// byte, tanpa memakan data dari reader. isFrame=false kalau data pertama
+// bukan frame klien WebSocket (misalnya SSH mentah).
+func peekFirstFrame(reader *bufio.Reader, max int) ([]byte, bool) {
+	head, err := reader.Peek(2)
+	if err != nil || len(head) < 2 {
+		return nil, false
+	}
+	opcode := head[0] & 0x0f
+	if head[0]&0x70 != 0 || head[1]&0x80 == 0 || (opcode != 0x0 && opcode != 0x1 && opcode != 0x2) {
+		return nil, false
+	}
+	length := uint64(head[1] & 0x7f)
+	hdr := 2
+	switch length {
+	case 126:
+		ext, err := reader.Peek(4)
+		if err != nil {
+			return nil, true
+		}
+		length = uint64(binary.BigEndian.Uint16(ext[2:4]))
+		hdr = 4
+	case 127:
+		ext, err := reader.Peek(10)
+		if err != nil {
+			return nil, true
+		}
+		length = binary.BigEndian.Uint64(ext[2:10])
+		hdr = 10
+	}
+	hdr += 4
+	want := max
+	if length < uint64(want) {
+		want = int(length)
+	}
+	buf, _ := reader.Peek(hdr + want)
+	if len(buf) <= hdr {
+		return nil, true
+	}
+	mask := buf[hdr-4 : hdr]
+	payload := buf[hdr:]
+	out := make([]byte, len(payload))
+	for i := range payload {
+		out[i] = payload[i] ^ mask[i%4]
+	}
+	return out, true
+}
+
+func isHexByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// UUID dari id klien Xray: UUID biasa, atau string 1-30 karakter yang Xray
+// petakan ke UUIDv5 dengan namespace nol.
+func parseXrayID(id string) ([16]byte, bool) {
+	var out [16]byte
+	text := strings.TrimSpace(id)
+	if l := len(text); l < 32 || l > 36 {
+		if l == 0 || l > 30 {
+			return out, false
+		}
+		h := sha1.New()
+		h.Write(out[:])
+		h.Write([]byte(text))
+		sum := h.Sum(nil)
+		copy(out[:], sum[:16])
+		out[6] = (out[6] & 0x0f) | (5 << 4)
+		out[8] = (out[8] & (0xff >> 2)) | (0x02 << 6)
+		return out, true
+	}
+	clean := strings.Replace(text, "-", "", -1)
+	if len(clean) != 32 {
+		return out, false
+	}
+	raw, err := hex.DecodeString(clean)
+	if err != nil {
+		return out, false
+	}
+	copy(out[:], raw)
+	return out, true
+}
+
+// Daftar UUID VLESS dari config Xray, dibaca ulang kalau file berubah (dicek
+// paling sering tiap 5 detik). nil = tidak bisa dibaca.
+func currentVlessIDs() map[[16]byte]bool {
+	vlessMu.Lock()
+	defer vlessMu.Unlock()
+	if time.Since(vlessCheckedAt) < 5*time.Second {
+		return vlessIDs
+	}
+	vlessCheckedAt = time.Now()
+	for _, path := range xrayConfigPaths {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		stamp := fmt.Sprintf("%s|%d|%d", path, info.Size(), info.ModTime().UnixNano())
+		if stamp == vlessFileStamp {
+			return vlessIDs
+		}
+		data, err := ioutil.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var cfg struct {
+			Inbounds []struct {
+				Protocol string `json:"protocol"`
+				Settings struct {
+					Clients []struct {
+						ID string `json:"id"`
+					} `json:"clients"`
+				} `json:"settings"`
+			} `json:"inbounds"`
+		}
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			continue
+		}
+		ids := map[[16]byte]bool{}
+		for _, inbound := range cfg.Inbounds {
+			if strings.ToLower(inbound.Protocol) != "vless" {
+				continue
+			}
+			for _, c := range inbound.Settings.Clients {
+				if id, ok := parseXrayID(c.ID); ok {
+					ids[id] = true
+				}
+			}
+		}
+		vlessIDs = ids
+		vlessFileStamp = stamp
+		return vlessIDs
+	}
+	vlessIDs = nil
+	vlessFileStamp = ""
+	return nil
+}
+
+// Protokol dari awal payload: Trojan = 56 hex + CRLF; VLESS = versi 0 lalu
+// UUID yang terdaftar (atau versi 0 saja kalau config tidak terbaca); selain
+// itu VMess, yang header AEAD-nya memang tampak acak.
+func classifyXrayPayload(p []byte) string {
+	if len(p) >= 58 && p[56] == '\r' && p[57] == '\n' {
+		hexOK := true
+		for i := 0; i < 56; i++ {
+			if !isHexByte(p[i]) {
+				hexOK = false
+				break
+			}
+		}
+		if hexOK {
+			return "trojan"
+		}
+	}
+	if len(p) >= 17 && p[0] == 0 {
+		ids := currentVlessIDs()
+		if ids == nil {
+			return "vless"
+		}
+		var id [16]byte
+		copy(id[:], p[1:17])
+		if ids[id] {
+			return "vless"
+		}
+	}
+	return "vmess"
+}
+
+// Header untuk inbound Xray: baris request diganti path standar, header
+// internal tidak ikut, dan IP asli dikirim seperti nginx bila real IP aktif.
+func buildXrayRequest(rawHeader []byte, route xrayRoute, clientIP string) []byte {
+	var b bytes.Buffer
+	b.WriteString("GET " + route.path + " HTTP/1.1\r\n")
+	lines := strings.Split(string(rawHeader), "\r\n")
+	for _, line := range lines[1:] {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(strings.SplitN(line, ":", 2)[0]))
+		switch name {
+		case "x-sc-sshws-ip", "x-sc-real-ip-proxy":
+			continue
+		case "x-forwarded-for":
+			if xrayRealIPEnabled {
+				continue
+			}
+		}
+		b.WriteString(line + "\r\n")
+	}
+	if xrayRealIPEnabled && clientIP != "" {
+		b.WriteString("X-Forwarded-For: " + clientIP + "\r\n")
+		b.WriteString("X-SC-Real-IP-Proxy: 1\r\n")
+	}
+	b.WriteString("\r\n")
+	return b.Bytes()
+}
+
+func connectSSHAfterUpgrade(client net.Conn, reader *bufio.Reader, clientIP, sshHost string, sshPort, keepAliveSeconds int) {
+	stripBufferedHttpJunk(reader)
+	sshUp, err := dialTCP(sshHost, sshPort, keepAliveSeconds)
+	if err != nil {
+		return
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+		_ = sshUp.Close()
+		return
+	}
+	tunnelBoth(client, sshUp, registerQuotaSession(sshUp, clientIP))
+}
+
+func handleRealWebSocket(client net.Conn, reader *bufio.Reader, rawHeader []byte, wsKey, clientIP, sshHost string, sshPort, keepAliveSeconds int) {
+	protocol := headerValue(rawHeader, "sec-websocket-protocol")
+	early := decodeEarlyData(protocol)
+	resp := "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: " + wsAcceptKey(wsKey) + "\r\n"
+	if len(early) > 0 {
+		resp += "Sec-WebSocket-Protocol: " + protocol + "\r\n"
+	}
+	if err := writeAll(client, []byte(resp+"\r\n")); err != nil {
+		return
+	}
+
+	kind := ""
+	if len(early) > 0 {
+		kind = classifyXrayPayload(early)
+	} else {
+		_ = client.SetReadDeadline(time.Now().Add(firstFrameWait))
+		if head, err := reader.Peek(4); err == nil && string(head) == "SSH-" {
+			connectSSHAfterUpgrade(client, reader, clientIP, sshHost, sshPort, keepAliveSeconds)
+			return
+		}
+		payload, isFrame := peekFirstFrame(reader, 64)
+		if !isFrame || (len(payload) >= 4 && string(payload[:4]) == "SSH-") {
+			// Bukan frame WebSocket (atau klien menunggu banner server):
+			// perlakukan sama seperti SSH-WS biasa.
+			connectSSHAfterUpgrade(client, reader, clientIP, sshHost, sshPort, keepAliveSeconds)
+			return
+		}
+		kind = classifyXrayPayload(payload)
+	}
+
+	route, ok := xrayRoutes[kind]
+	if !ok {
+		return
+	}
+	up, err := dialTCP(xrayHost, route.port, keepAliveSeconds)
+	if err != nil {
+		return
+	}
+	if err := writeAll(up, buildXrayRequest(rawHeader, route, clientIP)); err != nil {
+		_ = up.Close()
+		return
+	}
+	upReader := bufio.NewReaderSize(up, 4096)
+	_ = up.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, status, _, err := readHttpHeader(upReader, 16*1024)
+	if err != nil || !strings.Contains(status, " 101") {
+		_ = up.Close()
+		return
+	}
+	_ = up.SetReadDeadline(time.Time{})
+	_ = client.SetReadDeadline(time.Time{})
+	if err := flushReaderBufferedTo(upReader, client); err != nil {
+		_ = up.Close()
+		return
+	}
+	if err := flushReaderBufferedTo(reader, up); err != nil {
+		_ = up.Close()
+		return
+	}
+	tunnelBoth(client, up, nil)
+}
+
 func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int, readerBufferSize int, keepAliveSeconds int) {
 	defer client.Close()
 	tuneTCP(client, keepAliveSeconds)
@@ -10370,6 +10809,12 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			}
 
 			if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+				if multipathEnabled {
+					if wsKey := headerValue(rawHeader, "sec-websocket-key"); wsKey != "" {
+						handleRealWebSocket(client, reader, rawHeader, wsKey, clientIP, sshHost, sshPort, keepAliveSeconds)
+						return
+					}
+				}
 				sshUp, err := dialTCP(sshHost, sshPort, keepAliveSeconds)
 				if err != nil {
 					return
@@ -10469,13 +10914,17 @@ func main() {
 		keepAliveSeconds = 3600
 	}
 
+	initMultipath()
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err == nil {
+		markMultipathRuntime()
+	}
 	if err != nil {
 		fmt.Printf("listen error: %v\n", err)
 		os.Exit(1)
 	}
 	startQuotaFlusher()
-	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d, buffer=%dKB, keepalive=%ds\n", port, sshHost, sshPort, httpHost, httpPort, readerBufferKB, keepAliveSeconds)
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d, buffer=%dKB, keepalive=%ds, multipath=%v\n", port, sshHost, sshPort, httpHost, httpPort, readerBufferKB, keepAliveSeconds, multipathEnabled)
 
 	for {
 		conn, err := ln.Accept()
@@ -16364,6 +16813,13 @@ if [[ -x /usr/local/sbin/sc-1forcr-service-gate ]]; then
     log_health "GAGAL menerapkan status ON/OFF layanan"
 fi
 
+# Port TLS/NTLS tambahan: pasang ulang aturan REDIRECT kalau hilang, dan lepas
+# port yang belakangan dipakai program lain. Tidak menulis apa pun kalau sama.
+if [[ -x /usr/local/sbin/sc-1forcr-extra-ports ]]; then
+  /usr/local/sbin/sc-1forcr-extra-ports apply >/dev/null 2>&1 || \
+    log_health "GAGAL menerapkan port TLS/NTLS tambahan"
+fi
+
 # Dependensi diperiksa lebih dulu. Unit yang sudah aktif dan listen tidak disentuh.
 repair_unit_if_needed ssh.service || true
 repair_unit_if_needed dropbear.service || true
@@ -16797,6 +17253,9 @@ SETTINGS_KEYS = [
     "XRAY_MIN_HITS_PER_IP",
     "XRAY_REAL_IP_ENABLE",
     "XRAY_XHTTP_ENABLE",
+    "XRAY_MULTIPATH_ENABLE",
+    "EXTRA_TLS_PORTS",
+    "EXTRA_NTLS_PORTS",
     "SERVICE_SSH_ENABLE",
     "SERVICE_VMESS_ENABLE",
     "SERVICE_VLESS_ENABLE",
@@ -17664,6 +18123,9 @@ SETTINGS_KEYS = [
     "XRAY_MIN_HITS_PER_IP",
     "XRAY_REAL_IP_ENABLE",
     "XRAY_XHTTP_ENABLE",
+    "XRAY_MULTIPATH_ENABLE",
+    "EXTRA_TLS_PORTS",
+    "EXTRA_NTLS_PORTS",
     "SERVICE_SSH_ENABLE",
     "SERVICE_VMESS_ENABLE",
     "SERVICE_VLESS_ENABLE",
@@ -21141,6 +21603,294 @@ apply_service_gates() {
   return 0
 }
 
+# Port TLS/NTLS tambahan selain 443/80. Koneksi dari luar ke port tambahan
+# dialihkan kernel (iptables nat REDIRECT) ke 443 (HAProxy TLS) atau 80 (nginx
+# NTLS), jadi tidak ada service baru dan config HAProxy/nginx tidak berubah.
+# Semua aturan path, multi path, real IP, limit, dan ON/OFF layanan otomatis
+# sama dengan port 443/80.
+install_extra_ports_manager() {
+  mkdir -p /usr/local/sbin /var/lib/sc-1forcr
+  cat > /usr/local/sbin/sc-1forcr-extra-ports <<'EXTRA_PORTS_EOF'
+#!/usr/bin/env bash
+# sc-1forcr-extra-ports {apply|status|clear}
+#
+# - apply  : pasang/rapikan aturan REDIRECT sesuai EXTRA_TLS_PORTS dan
+#            EXTRA_NTLS_PORTS. Dipanggil install/update, menu, dan tiap siklus
+#            watchdog. Aturan hanya ditulis ulang kalau berbeda.
+# - status : cetak hasil apply terakhir (port aktif dan port yang dilewati).
+# - clear  : lepas semua aturan (dipakai uninstall).
+#
+# Port yang sedang dipakai program lain di alamat publik dilewati, supaya
+# panel atau web milik pemilik VPS tidak ikut terambil. Listener 127.0.0.1
+# (misalnya mux SSH-WS di 127.0.0.1:2082) tidak bentrok, karena REDIRECT di
+# PREROUTING hanya berlaku untuk paket yang datang dari luar.
+set -uo pipefail
+
+ENV_FILE="${SC_ENV_FILE:-/etc/sc-1forcr.env}"
+CHAIN="SC1FORCR_PORTS"
+STATE_FILE="${EXTRA_PORTS_STATE_FILE:-/var/lib/sc-1forcr/extra-ports.state}"
+LOCK_FILE="${EXTRA_PORTS_LOCK_FILE:-/run/sc-1forcr-extra-ports.lock}"
+DEFAULT_TLS="8443,2053,2083,2087,2096"
+DEFAULT_NTLS="8080,8880,2052,2082,2086,2095"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}" >/dev/null 2>&1 || true
+  set +a
+fi
+
+# "off"/"0"/"none" = mati; kosong = daftar bawaan.
+port_list() {
+  local raw="$1" fallback="$2" p out="" seen=","
+  case "$(echo "${raw}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    off|0|none|no|false) return 0 ;;
+    "") raw="${fallback}" ;;
+  esac
+  for p in $(echo "${raw}" | tr ',;' '  '); do
+    p="$(echo "${p}" | tr -cd '0-9')"
+    [[ -n "${p}" ]] || continue
+    p=$((10#${p}))
+    (( p >= 1 && p <= 65535 )) || continue
+    [[ "${seen}" == *",${p},"* ]] && continue
+    seen+="${p},"
+    out+="${out:+ }${p}"
+  done
+  printf '%s' "${out}"
+}
+
+# Port publik milik SC sendiri dan port sshd tidak pernah dialihkan.
+reserved_ports() {
+  printf '%s\n' 22 80 443 "${DROPBEAR_PORT:-109}" "${DROPBEAR_ALT_PORT:-143}" 109 143
+  awk '$1 ~ /^LISTEN/ && /"sshd"/ { a=$4; sub(/.*:/, "", a); print a }' <<< "${LISTEN_DUMP}"
+}
+
+# Listener publik per port -> "port nama_proses". Loopback dilewati.
+public_listeners() {
+  awk '
+    $1 !~ /^LISTEN/ { next }
+    {
+      addr=$4; port=addr; sub(/.*:/, "", port);
+      host=substr(addr, 1, length(addr) - length(port) - 1);
+      gsub(/^\[|\]$/, "", host); sub(/%.*/, "", host);
+      if (host ~ /^127\./ || host == "::1" || host == "::ffff:127.0.0.1") next;
+      name="-";
+      if (match($0, /\(\("[^"]+"/)) name=substr($0, RSTART + 3, RLENGTH - 4);
+      print port, name;
+    }' <<< "${LISTEN_DUMP}"
+}
+
+# Ada listener IPv6 (atau dual-stack) di port target? Dipakai untuk memutuskan
+# apakah aturan ip6tables berguna (HAProxy 443 saat ini hanya IPv4).
+has_v6_listener() {
+  local target="$1"
+  awk -v t="${target}" '
+    $1 ~ /^LISTEN/ { a=$4; p=a; sub(/.*:/, "", p); if (p == t && (a ~ /^\[/ || a ~ /^\*:/)) f=1 }
+    END { exit !f }' <<< "${LISTEN_DUMP}"
+}
+
+desired_pairs() {
+  local kind ports p target name
+  local -A reserved=() busy=() taken=()
+  for p in $(reserved_ports); do [[ "${p}" =~ ^[0-9]+$ ]] && reserved["${p}"]=1; done
+  while read -r p name; do
+    [[ "${p}" =~ ^[0-9]+$ ]] || continue
+    [[ -n "${busy[${p}]:-}" ]] || busy["${p}"]="${name}"
+  done < <(public_listeners)
+  ACTIVE_TLS=""; ACTIVE_NTLS=""; SKIPPED=""; PAIRS=""
+  for kind in tls ntls; do
+    if [[ "${kind}" == "tls" ]]; then
+      ports="$(port_list "${EXTRA_TLS_PORTS:-}" "${DEFAULT_TLS}")"; target=443
+    else
+      ports="$(port_list "${EXTRA_NTLS_PORTS:-}" "${DEFAULT_NTLS}")"; target=80
+    fi
+    for p in ${ports}; do
+      if [[ -n "${reserved[${p}]:-}" ]]; then
+        SKIPPED+="${SKIPPED:+,}${p}:port-sc"; continue
+      fi
+      if [[ -n "${taken[${p}]:-}" ]]; then
+        SKIPPED+="${SKIPPED:+,}${p}:ganda"; continue
+      fi
+      if [[ -n "${busy[${p}]:-}" ]]; then
+        SKIPPED+="${SKIPPED:+,}${p}:${busy[${p}]}"; continue
+      fi
+      taken["${p}"]=1
+      PAIRS+="${p}>${target} "
+      if [[ "${kind}" == "tls" ]]; then ACTIVE_TLS+="${ACTIVE_TLS:+,}${p}"; else ACTIVE_NTLS+="${ACTIVE_NTLS:+,}${p}"; fi
+    done
+  done
+}
+
+# Pasangan "port>target" yang terpasang di chain, urut sama dengan input.
+current_pairs() {
+  local tool="$1"
+  "${tool}" -w 10 -t nat -S "${CHAIN}" 2>/dev/null | awk '
+    $1 == "-A" {
+      d=""; t="";
+      for (i = 1; i <= NF; i++) {
+        if ($i == "--dport") d=$(i + 1);
+        if ($i == "--to-ports") t=$(i + 1);
+      }
+      if (d != "" && t != "") printf "%s>%s ", d, t;
+    }'
+}
+
+remove_jumps() {
+  local tool="$1"
+  while "${tool}" -w 10 -t nat -D PREROUTING -p tcp -m addrtype --dst-type LOCAL -j "${CHAIN}" >/dev/null 2>&1; do :; done
+  while "${tool}" -w 10 -t nat -D PREROUTING -p tcp -j "${CHAIN}" >/dev/null 2>&1; do :; done
+}
+
+clear_tool() {
+  local tool="$1"
+  command -v "${tool}" >/dev/null 2>&1 || return 0
+  remove_jumps "${tool}"
+  "${tool}" -w 10 -t nat -F "${CHAIN}" >/dev/null 2>&1 || true
+  "${tool}" -w 10 -t nat -X "${CHAIN}" >/dev/null 2>&1 || true
+}
+
+# Hanya paket yang tujuannya alamat VPS ini (dst-type LOCAL) yang dialihkan.
+# Trafik yang diteruskan VPS (docker, VPN milik pemilik) ke port yang sama di
+# server lain tidak boleh ikut berbelok ke HAProxy/nginx.
+ensure_jump() {
+  local tool="$1"
+  if "${tool}" -w 10 -t nat -C PREROUTING -p tcp -m addrtype --dst-type LOCAL -j "${CHAIN}" >/dev/null 2>&1; then
+    return 1
+  fi
+  if "${tool}" -w 10 -t nat -I PREROUTING 1 -p tcp -m addrtype --dst-type LOCAL -j "${CHAIN}" >/dev/null 2>&1; then
+    while "${tool}" -w 10 -t nat -D PREROUTING -p tcp -j "${CHAIN}" >/dev/null 2>&1; do :; done
+    return 0
+  fi
+  # Modul addrtype tidak ada: alihkan tanpa filter tujuan.
+  if "${tool}" -w 10 -t nat -C PREROUTING -p tcp -j "${CHAIN}" >/dev/null 2>&1; then
+    return 1
+  fi
+  "${tool}" -w 10 -t nat -I PREROUTING 1 -p tcp -j "${CHAIN}" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Kembalikan 0 kalau ada perubahan.
+apply_tool() {
+  local tool="$1" pairs="$2" pair changed=1
+  command -v "${tool}" >/dev/null 2>&1 || return 1
+  "${tool}" -w 10 -t nat -S PREROUTING >/dev/null 2>&1 || return 1
+  if [[ -z "${pairs// /}" ]]; then
+    if "${tool}" -w 10 -t nat -S "${CHAIN}" >/dev/null 2>&1; then
+      clear_tool "${tool}"
+      return 0
+    fi
+    return 1
+  fi
+  "${tool}" -w 10 -t nat -S "${CHAIN}" >/dev/null 2>&1 || "${tool}" -w 10 -t nat -N "${CHAIN}" >/dev/null 2>&1 || true
+  if [[ "$(current_pairs "${tool}")" != "${pairs}" ]]; then
+    "${tool}" -w 10 -t nat -F "${CHAIN}" >/dev/null 2>&1 || return 1
+    for pair in ${pairs}; do
+      "${tool}" -w 10 -t nat -A "${CHAIN}" -p tcp --dport "${pair%%>*}" -j REDIRECT --to-ports "${pair##*>}" >/dev/null 2>&1 || true
+    done
+    changed=0
+  fi
+  if ensure_jump "${tool}"; then changed=0; fi
+  return "${changed}"
+}
+
+write_state() {
+  local tmp body
+  body="TLS_ACTIVE=${ACTIVE_TLS}
+NTLS_ACTIVE=${ACTIVE_NTLS}
+SKIPPED=${SKIPPED}
+IPV6_TARGETS=${V6_TARGETS}"
+  if [[ -f "${STATE_FILE}" && "$(cat "${STATE_FILE}" 2>/dev/null)" == "${body}" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "${STATE_FILE}")" >/dev/null 2>&1 || true
+  tmp="${STATE_FILE}.tmp.$$"
+  printf '%s\n' "${body}" > "${tmp}" && chmod 644 "${tmp}" && mv -f "${tmp}" "${STATE_FILE}"
+}
+
+persist_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_apply() {
+  local changed=1 v6_pairs="" pair target
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "iptables tidak tersedia."
+    return 1
+  fi
+  LISTEN_DUMP="$(ss -Htlnp 2>/dev/null || true)"
+  desired_pairs
+  if apply_tool iptables "${PAIRS}"; then changed=0; fi
+  # IPv6 hanya untuk target yang memang listen di IPv6 (nginx [::]:80 kalau
+  # VPS punya IPv6; HAProxy 443 saat ini IPv4 saja).
+  V6_TARGETS=""
+  for target in 443 80; do
+    has_v6_listener "${target}" || continue
+    V6_TARGETS+="${V6_TARGETS:+,}${target}"
+    for pair in ${PAIRS}; do
+      if [[ "${pair##*>}" == "${target}" ]]; then v6_pairs+="${pair} "; fi
+    done
+  done
+  if apply_tool ip6tables "${v6_pairs}"; then changed=0; fi
+  write_state
+  if (( changed == 0 )); then persist_rules; fi
+  return 0
+}
+
+cmd_status() {
+  local key value
+  if [[ ! -f "${STATE_FILE}" ]]; then
+    echo "Belum pernah diterapkan."
+    return 0
+  fi
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      TLS_ACTIVE) echo "TLS tambahan  : ${value:--}" ;;
+      NTLS_ACTIVE) echo "NTLS tambahan : ${value:--}" ;;
+      SKIPPED) echo "Dilewati      : ${value:--}" ;;
+    esac
+  done < "${STATE_FILE}"
+}
+
+{ exec 9>"${LOCK_FILE}"; } 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+  flock -w 20 9 >/dev/null 2>&1 || { echo "Port tambahan sedang diproses."; exit 1; }
+fi
+
+case "${1:-status}" in
+  apply) cmd_apply ;;
+  status) cmd_status ;;
+  clear)
+    clear_tool iptables
+    clear_tool ip6tables
+    rm -f "${STATE_FILE}" >/dev/null 2>&1 || true
+    persist_rules
+    ;;
+  *)
+    echo "Usage: sc-1forcr-extra-ports {apply|status|clear}"
+    exit 1
+    ;;
+esac
+EXTRA_PORTS_EOF
+  bash -n /usr/local/sbin/sc-1forcr-extra-ports
+  chmod 700 /usr/local/sbin/sc-1forcr-extra-ports
+}
+
+# Gagal di sini tidak memutus port 443/80, jadi hanya dicatat; watchdog
+# menerapkan ulang tiap siklus.
+apply_extra_ports() {
+  if [[ ! -x /usr/local/sbin/sc-1forcr-extra-ports ]]; then
+    install_extra_ports_manager
+  fi
+  if ! /usr/local/sbin/sc-1forcr-extra-ports apply >/dev/null 2>&1; then
+    log "PERINGATAN: port TLS/NTLS tambahan belum bisa diterapkan; watchdog akan mencoba lagi."
+  else
+    log "Port tambahan: $(/usr/local/sbin/sc-1forcr-extra-ports status 2>/dev/null | tr '\n' ';')"
+  fi
+  return 0
+}
+
 write_cli_menu() {
   local menu_runtime menu_runtime_tmp menu_wrapper_tmp update_cmd_tmp
   menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
@@ -21148,6 +21898,7 @@ write_cli_menu() {
   log "Menulis CLI menu..."
   install_xray_realip_manager
   install_service_gate_manager
+  install_extra_ports_manager
 
   cat > /etc/sc-1forcr.env <<EOF
 SCRIPT_VERSION=${SCRIPT_VERSION}
@@ -21262,6 +22013,9 @@ XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 XRAY_IP_GROUP_MASK=${XRAY_IP_GROUP_MASK}
 XRAY_REAL_IP_ENABLE=${XRAY_REAL_IP_ENABLE}
 XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
+XRAY_MULTIPATH_ENABLE=${XRAY_MULTIPATH_ENABLE}
+EXTRA_TLS_PORTS=${EXTRA_TLS_PORTS}
+EXTRA_NTLS_PORTS=${EXTRA_NTLS_PORTS}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
 SERVICE_VMESS_ENABLE=${SERVICE_VMESS_ENABLE}
 SERVICE_VLESS_ENABLE=${SERVICE_VLESS_ENABLE}
@@ -23222,7 +23976,7 @@ print_created_account() {
 
   case "${type}" in
     ssh)
-      local host user pass exp exp_time lim city isp tls ntls dns ovpn_tcp ovpn_udp ssh_ohp udp_custom
+      local host user pass exp exp_time lim city isp tls ntls tls_list ntls_list dns ovpn_tcp ovpn_udp ssh_ohp udp_custom
       host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
       user="$(created_json_value "${raw}" '.data.username')"
       pass="$(created_json_value "${raw}" '.data.password // .data.secret')"
@@ -23233,6 +23987,8 @@ print_created_account() {
       isp="$(created_json_value "${raw}" '.data.isp // .data.location.isp')"
       tls="$(created_json_value "${raw}" '.data.port.tls // .data.port.ssl // .data.port.any' '443')"
       ntls="$(created_json_value "${raw}" '.data.port.none // .data.port.ntls // .data.port.ws' '80')"
+      tls_list="$(created_json_value "${raw}" '.data.port.tls_all' "${tls}")"
+      ntls_list="$(created_json_value "${raw}" '.data.port.none_all' "${ntls}")"
       dns="$(created_json_value "${raw}" '.data.port.dns // .data.port.dnsslow // .data.port.dnslow')"
       ovpn_tcp="$(created_json_value "${raw}" '.data.port.ovpntcp // .data.port.ovpn_tcp' '1194')"
       ovpn_udp="$(created_json_value "${raw}" '.data.port.ovpnudp // .data.port.ovpn_udp' '2200')"
@@ -23262,8 +24018,8 @@ IP Limit    : ${lim}
 
 [ PORTS ]
 ------------------------------
-TLS         : ${tls}
-Non-TLS     : ${ntls}
+TLS         : ${tls_list}
+Non-TLS     : ${ntls_list}
 OVPN TCP    : ${ovpn_tcp}
 OVPN UDP    : ${ovpn_udp}
 SSH OHP     : ${ssh_ohp}
@@ -23337,11 +24093,14 @@ EOT_ZIVPN
       isp="$(created_json_value "${raw}" '.data.isp // .data.location.isp')"
       domain="$(created_json_value "${raw}" '.data.domain // .data.hostname // .data.host')"
       sni="$(created_json_value "${raw}" '.data.sni // .data.server_name // .data.hostname // .data.host')"
-      tls="$(created_json_value "${raw}" '.data.port.tls // .data.port.any' '443')"
-      none="$(created_json_value "${raw}" '.data.port.none // .data.port.ntls' '80')"
+      tls="$(created_json_value "${raw}" '.data.port.tls_all // .data.port.tls // .data.port.any' '443')"
+      none="$(created_json_value "${raw}" '.data.port.none_all // .data.port.none // .data.port.ntls' '80')"
       grpc="$(created_json_value "${raw}" '.data.port.grpc' '443')"
       any_port="$(created_json_value "${raw}" '.data.port.any // .data.port.tls' '443')"
       path_ws="$(created_json_value "${raw}" ".data.path.ws // .data.path.stn // .data.ws_path" "/${type}")"
+      if [[ "$(created_json_value "${raw}" '.data.path.any' 'false')" == "true" ]]; then
+        path_ws="${path_ws} atau path bebas"
+      fi
       path_upgrade="$(created_json_value "${raw}" ".data.path.upgrade // .data.upgrade_path" "/up${type}")"
       service_name="$(created_json_value "${raw}" '.data.serviceName // .data.service_name' "${type}-grpc")"
       linktls="$(created_json_value "${raw}" '.data.link.tls // .data.link.ws_tls')"
@@ -26069,9 +26828,10 @@ tools_menu() {
       "15) Diagnosa/Repair Routing Jaringan" \
       "16) Setting Web Dokumentasi API" \
       "17) Tema Warna Menu" \
+      "18) Port TLS/NTLS Tambahan" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-17]: "; then
+    if ! prompt_input tm "Pilih menu [0-18]: "; then
       return
     fi
     clear
@@ -26093,6 +26853,7 @@ tools_menu() {
       15) network_compatibility_menu || true ;;
       16) set_api_docs_config_menu || true ;;
       17) set_menu_color_menu || true ;;
+      18) set_extra_ports_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -26103,6 +26864,72 @@ tools_menu() {
 
 # Deteksi otomatis tidak bisa tahu kemampuan aplikasi SSH di HP/PC, jadi
 # pemilik VPS bisa memaksa mode warna. Truecolor memberi gradasi paling halus.
+# Port TLS/NTLS tambahan dialihkan kernel ke 443/80 oleh sc-1forcr-extra-ports.
+# Port yang sedang dipakai program lain otomatis dilewati.
+extra_ports_clean_input() {
+  local raw="$1"
+  case "$(echo "${raw}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+    off|0|none) printf 'off'; return 0 ;;
+  esac
+  echo "${raw}" | tr ' ;' ',,' | tr -cd '0-9,' | sed 's/,,*/,/g; s/^,//; s/,$//'
+}
+
+set_extra_ports_menu() {
+  local bin="/usr/local/sbin/sc-1forcr-extra-ports" tls_in ntls_in value changed=0
+  if [[ ! -x "${bin}" ]]; then
+    echo "Gagal: ${bin} belum terpasang. Jalankan update SC dulu."
+    return 0
+  fi
+  draw_menu_header "PORT TLS/NTLS TAMBAHAN"
+  "${bin}" apply >/dev/null 2>&1 || true
+  "${bin}" status | ui_fx
+  if [[ "$(menu_bool_01 "${XRAY_MULTIPATH_ENABLE:-1}")" != "1" ]]; then
+    menu_kv "Multi path WS" "NONAKTIF (hanya path standar)"
+  elif [[ -f /run/sc-1forcr/sshws-multipath ]]; then
+    menu_kv "Multi path WS" "AKTIF (SSH/VMess/VLESS/Trojan path bebas)"
+  else
+    menu_kv "Multi path WS" "menunggu restart SSH-WS (aktif setelah reboot)"
+  fi
+  echo
+  echo "Port TLS dialihkan ke 443, port NTLS ke 80. Isi daftar dipisah koma,"
+  echo "ketik off untuk mematikan, atau Enter untuk tetap."
+  echo "Catatan: buka juga port ini di firewall panel provider kalau ada."
+  echo
+  prompt_input tls_in "Port TLS  [${EXTRA_TLS_PORTS:-8443,2053,2083,2087,2096}]: " || return 0
+  prompt_input ntls_in "Port NTLS [${EXTRA_NTLS_PORTS:-8080,8880,2052,2082,2086,2095}]: " || return 0
+  if [[ -n "${tls_in// /}" ]]; then
+    value="$(extra_ports_clean_input "${tls_in}")"
+    if [[ -z "${value}" ]]; then
+      echo "Input port TLS tidak valid, daftar lama dipakai."
+    else
+      EXTRA_TLS_PORTS="${value}"
+      update_sc_env_var EXTRA_TLS_PORTS "${EXTRA_TLS_PORTS}"
+      changed=1
+    fi
+  fi
+  if [[ -n "${ntls_in// /}" ]]; then
+    value="$(extra_ports_clean_input "${ntls_in}")"
+    if [[ -z "${value}" ]]; then
+      echo "Input port NTLS tidak valid, daftar lama dipakai."
+    else
+      EXTRA_NTLS_PORTS="${value}"
+      update_sc_env_var EXTRA_NTLS_PORTS "${EXTRA_NTLS_PORTS}"
+      changed=1
+    fi
+  fi
+  if (( changed == 0 )); then
+    return 0
+  fi
+  echo
+  if "${bin}" apply >/dev/null 2>&1; then
+    echo "Berhasil menerapkan port tambahan:"
+  else
+    echo "Gagal menerapkan port tambahan. Watchdog akan mencoba lagi."
+  fi
+  "${bin}" status | ui_fx
+  return 0
+}
+
 set_menu_color_menu() {
   local current="" detected choice mode=""
   if [[ -r "${MENU_COLOR_FILE}" ]]; then
@@ -27017,8 +27844,15 @@ map \$sc_sshws_real_ip \$sc_sshws_limit_key {
     "" \$binary_remote_addr;
     default \$sc_sshws_real_ip;
 }
-limit_req_zone \$sc_sshws_limit_key zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
-limit_conn_zone \$sc_sshws_limit_key zone=sc_sshws_conn:10m;
+# Klien WebSocket asli (Sec-WebSocket-Key) adalah Xray multi path yang
+# membuka satu koneksi per aplikasi. Kunci kosong = tidak dihitung, sama
+# seperti location /vmess, /vless, dan /trojan yang tidak dibatasi.
+map \$http_sec_websocket_key \$sc_sshws_limit_scope {
+    "" \$sc_sshws_limit_key;
+    default "";
+}
+limit_req_zone \$sc_sshws_limit_scope zone=sc_sshws_req:10m rate=${SSHWS_NGINX_LIMIT_RATE};
+limit_conn_zone \$sc_sshws_limit_scope zone=sc_sshws_conn:10m;
 
 EOF_LIMIT
 )
@@ -32383,6 +33217,7 @@ systemctl stop sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
 systemctl disable --now sc-1forcr-udpgw-alias.service sc-1forcr-udpgw-drain.timer >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-udpgw-alias clear >/dev/null 2>&1 || true
+/usr/local/sbin/sc-1forcr-extra-ports clear >/dev/null 2>&1 || true
 if command -v netfilter-persistent >/dev/null 2>&1; then
   netfilter-persistent save >/dev/null 2>&1 || true
 elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
@@ -32444,6 +33279,7 @@ rm -f /usr/local/sbin/sc-1forcr-udpgw-drain
 rm -f /usr/local/sbin/sc-1forcr-capacity-tune
 rm -f /usr/local/sbin/sc-1forcr-dns-guard
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
+rm -f /usr/local/sbin/sc-1forcr-extra-ports
 rm -f /etc/profile.d/sc-1forcr-auto-menu.sh
 
 echo "Uninstall SC 1FORCR selesai."
@@ -33272,7 +34108,7 @@ persist_pending_install_env() {
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
-    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_XHTTP_ENABLE XRAY_LIVE_IP_TTL_SECONDS
+    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_XHTTP_ENABLE XRAY_MULTIPATH_ENABLE EXTRA_TLS_PORTS EXTRA_NTLS_PORTS XRAY_LIVE_IP_TTL_SECONDS
     SERVICE_SSH_ENABLE SERVICE_VMESS_ENABLE SERVICE_VLESS_ENABLE SERVICE_TROJAN_ENABLE SERVICE_UDP_ENABLE
     XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
     NETWORK_COMPAT_ENABLE NETWORK_TCP_MSS DNS_GUARD_ENABLE DNS_GUARD_INTERVAL_MINUTES XRAY_OUTBOUND_DOMAIN_STRATEGY
@@ -34477,6 +35313,7 @@ main() {
     restart_update_safe_services
     heal_dropbear_banner_override || true
     apply_service_gates
+    apply_extra_ports
     ensure_dns_resolver_if_needed
     if ! sync_xray_runtime_after_update; then
       log "Rekonsiliasi monitor Xray pasca-update gagal. Rollback otomatis akan dijalankan."
@@ -34577,6 +35414,7 @@ main() {
   run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
   run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
   run_install_step "38b_service_gate" 99 "Terapkan status ON/OFF layanan" apply_service_gates
+  run_install_step "38c_extra_ports" 99 "Terapkan port TLS/NTLS tambahan" apply_extra_ports
   ensure_dns_resolver_if_needed
   run_install_step "39_preflight" 100 "Preflight akhir" post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. GASSS LANGSUNG TESTTT BANGGG."

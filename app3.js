@@ -547,7 +547,7 @@ async function ensureOrderKuotaAmountLockSchema() {
 
 async function seedDefaultSettings() {
   const now = Date.now();
-  const scFeaturesVersion = '2026-09-30.1';
+  const scFeaturesVersion = '2026-10-06.1';
   const defaultScFeaturesText = [
     'KOMPATIBILITAS & CORE',
     '- Debian 12 dan 13',
@@ -572,8 +572,9 @@ async function seedDefaultSettings() {
     '- Akun reguler berbasis tanggal dan jam',
     '',
     'PORT & PATH DEFAULT',
-    '- HTTP / non-TLS: 80',
-    '- TLS / SSL mux: 443',
+    '- HTTP / non-TLS: 80, plus 8080, 8880, 2052, 2082, 2086, 2095',
+    '- TLS / SSL mux: 443, plus 8443, 2053, 2083, 2087, 2096',
+    '- Port tambahan bisa diatur dari menu; port yang dipakai program lain otomatis dilewati',
     '- OpenSSH: 22',
     '- Dropbear: 109 dan 143',
     '- SSHWS backend internal: 2082',
@@ -581,6 +582,7 @@ async function seedDefaultSettings() {
     '- VMess WS: /vmess',
     '- VLESS WS: /vless',
     '- Trojan WS: /trojan',
+    '- Multi path: SSH, VMess, VLESS, dan Trojan WS tetap konek dengan path bebas (mis. /worryfree)',
     '- Xray gRPC: /vmess-grpc, /vless-grpc, /trojan-grpc',
     '- ZIVPN / UDPHC listen default: 5667',
     '- ZIVPN DNAT default: 6000-19999 dan UDP 553',

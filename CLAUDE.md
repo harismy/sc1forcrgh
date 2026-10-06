@@ -90,6 +90,29 @@ Lock yang salah langsung merugikan pembeli, jadi aturannya condong menghindari f
 - API menolak akun baru (503) untuk layanan yang OFF. Akun SSH baru hanya ditolak kalau SSH **dan** UDP OFF, karena akun SSH juga dipakai login ZIVPN/UDP Custom.
 - Port inbound Xray baru wajib ditambahkan ke `VMESS_PORTS`/`VLESS_PORTS`/`TROJAN_PORTS` di script ini, atau layanan itu tidak ikut tertutup. Test: `npm run test:service-gate`.
 
+### Port TLS/NTLS tambahan
+
+`/usr/local/sbin/sc-1forcr-extra-ports` (heredoc `EXTRA_PORTS_EOF`) membuka port selain 443/80 dengan mengalihkannya di kernel: chain nat `SC1FORCR_PORTS` berisi `REDIRECT` ke 443 (TLS, HAProxy) atau 80 (NTLS, nginx). Tidak ada service atau listener baru, jadi path, multi path, real IP, limit, dan ON/OFF layanan otomatis sama dengan 443/80.
+
+- Daftar port ada di `EXTRA_TLS_PORTS` (default `8443,2053,2083,2087,2096`) dan `EXTRA_NTLS_PORTS` (default `8080,8880,2052,2082,2086,2095`). `off` mematikan. Bisa diubah di menu Tools > Port TLS/NTLS Tambahan.
+- Port publik SC (22, 80, 443, Dropbear), port sshd, dan port yang sedang dipakai program lain di alamat publik (`ss -tlnp`) dilewati dan dicatat di `SKIPPED`. Listener 127.0.0.1 (mux SSH-WS di 2082, nginx 8080 mode real IP) **tidak** bentrok, karena REDIRECT di PREROUTING hanya berlaku untuk paket dari luar. Jangan ganti cara ini dengan `listen`/`bind` publik di nginx/HAProxy: port 2082 dan 8080 akan bentrok dengan listener loopback itu.
+- Jump ke chain memakai `-m addrtype --dst-type LOCAL`, supaya trafik yang diteruskan VPS (docker, VPN milik pemilik) tidak ikut berbelok. IPv6 hanya dipasang untuk target yang memang listen di IPv6 (HAProxy 443 saat ini IPv4 saja).
+- `apply` dipanggil di akhir install/update, dari menu, dan tiap siklus watchdog. Aturan dan `netfilter-persistent save` hanya ditulis kalau berbeda, jadi siklus watchdog tanpa perubahan tidak menyentuh iptables.
+- Hasilnya ditulis ke `/var/lib/sc-1forcr/extra-ports.state`. api.js membacanya untuk `port.tls_all`/`port.none_all`. Kunci `port.tls`/`port.none` tetap satu port (443/80), karena bot jualan lain membacanya sebagai satu angka. Test: `npm run test:extra-ports`.
+
+### Multi path WS (path bebas)
+
+SSH-WS sudah menerima path apa saja lewat nginx `location /` ke mux 2082. Untuk VMess/VLESS/Trojan WS dengan path bebas, mux Go (`handleRealWebSocket` di `ssh_mux.go`) yang memilih inbound:
+
+- Hanya klien WebSocket asli (mengirim `Sec-WebSocket-Key`) yang masuk jalur ini. Payload SSH-WS tanpa key tetap memakai jalur lama.
+- Mux menjawab 101 sendiri (dengan `Sec-WebSocket-Accept`), lalu membaca frame pertama tanpa memakannya. Trojan = 56 hex + CRLF. VLESS = byte versi 0 + UUID yang terdaftar di config Xray (dibaca ulang kalau file berubah); kalau config tidak terbaca, versi 0 saja sudah cukup. Selain itu VMess. Early data (`Sec-WebSocket-Protocol`) diklasifikasi langsung dari header.
+- Data `SSH-` setelah 101, data yang bukan frame klien, atau klien yang diam 3 detik (menunggu banner server) diteruskan ke SSH seperti biasa.
+- Koneksi diteruskan langsung ke inbound Xray (10001–10003) dengan path standar, bukan lewat nginx, supaya tidak ada putaran nginx ↔ mux. `X-Forwarded-For` diperlakukan sama dengan location nginx (diganti IP asli + `X-SC-Real-IP-Proxy` saat `XRAY_REAL_IP_ENABLE=1`), dan header internal `X-SC-SSHWS-IP` tidak pernah diteruskan. Tracker IP-limit Xray dan service gate tetap bekerja karena koneksi masuk ke port inbound yang sama.
+- Klien WebSocket asli dikecualikan dari limit SSH-WS nginx (`$sc_sshws_limit_scope` kosong), sama seperti `/vmess` yang tidak dibatasi. Kalau tidak, satu HP Xray tanpa mux bisa kena 429.
+- Path yang diawali `/vmess`, `/vless`, `/trojan`, `/yourbug`, `/up*`, `/xhvless`, `/vps/`, `/docs` tetap milik location nginx-nya. gRPC, HTTPUpgrade, dan XHTTP tidak ikut multi path.
+- Update aman tidak me-restart mux (supaya SSH-WS tidak putus), jadi binary baru aktif setelah restart `sc-1forcr-sshws` atau reboot. Mux menulis `/run/sc-1forcr/sshws-multipath` saat start. api.js (`xrayMultipathActive`, yang mengisi `path.any` dan "atau path bebas" di detail akun) dan menu hanya menyebut path bebas kalau penanda itu ada.
+- Go di VPS berasal dari paket distro (Ubuntu 20.04 = Go 1.13). Kode mux tidak boleh memakai API Go 1.14 ke atas; `npm run test:mux-multipath` memeriksanya, dan menjalankan uji perilaku `scripts/go/ssh_mux_multipath_test.go` kalau `GO_BIN` atau `go` tersedia. `XRAY_MULTIPATH_ENABLE=0` mematikan jalur ini (perlu restart `sc-1forcr-sshws`).
+
 Timeout HAProxy sengaja panjang (`timeout client/server 12h`) supaya tunnel WS tidak putus sendiri. Yang menjaga socket mati tidak menumpuk adalah `option clitcpka`/`srvtcpka` plus sysctl keepalive agresif (`tcp_keepalive_time=60`, `intvl=15`, `probes=4`). Ketiganya satu paket. Jangan hapus salah satu tanpa mengganti mekanisme penggantinya.
 
 Log HAProxy memakai `log /dev/log local0 notice alert`. Kata `alert` di ujung membatasi level paling parah: tanpa itu, "backend ... has no server available!" dikirim sebagai `emerg` dan disiarkan ke semua terminal yang sedang login, termasuk layar menu dan layar install. Pesan itu pasti muncul di setiap install baru, karena HAProxy dipasang sebelum layanan SSH-WS hidup. Konfigurasi ditulis di dua tempat (`setup_haproxy_tls_mux` dan salinannya di script menu); keduanya harus sama.

@@ -144,7 +144,7 @@ df() { return 127; }
 hostname() { return 127; }
 clear() { :; }
 DB_PATH=/tidak/ada.db; ZIVPN_SERVICE=zivpn; DOMAIN=vpn.example.com; SCRIPT_VERSION=V.1FSC.0
-DASH_PROC_DIR=/tidak/ada
+DASH_PROC_DIR=/tidak/ada; RESOURCE_CAPACITY_STATE_FILE=/tidak/ada
 `;
   const colorFile = path.join(tmpDir, 'color-256');
   fs.writeFileSync(colorFile, '256\n');
@@ -446,16 +446,17 @@ esac
       fs.writeFileSync(sh, `set -euo pipefail\n${engine}\n${dashboard}\n${fixture}\n` +
         `MENU_COLOR_FILE='${toBashPath(cf)}'\nMENU_COLS=${cols}\nUI_MODE=''\n` +
         `dashboard_render > '${toBashPath(outFile)}'\n` +
-        'echo "${UI_ROWS} ${D_ROW_CPU} ${D_ROW_RAM} ${D_ROW_UPTIME} ${D_ROW_TIME}"\n' +
-        'dashboard_live_sample() { :; }\n' +
+        'echo "${UI_ROWS} ${D_ROW_CPU} ${D_ROW_RAM} ${D_ROW_UPTIME} ${D_ROW_TIME} ${D_ROW_CAP} ${D_ROW_ANALYZER}"\n' +
+        'dashboard_live_sample() { :; }\ndashboard_cap_read() { :; }\n' +
         `{ DASH_LIVE_ON=1; dashboard_live_tick; printf '|'; dashboard_live_tick; printf '|'; ` +
-        `D_CPU_PCT=91; D_LOAD1=3.10; dashboard_live_tick; } > '${toBashPath(tickFile)}'\n` +
+        `D_CPU_PCT=91; D_LOAD1=3.10; dashboard_live_tick; printf '|'; ` +
+        `D_LIVE_ONLINE=55; dashboard_live_tick; } > '${toBashPath(tickFile)}'\n` +
         `dashboard_render > '${toBashPath(fullFile)}'\n` +
         'if dashboard_live_allowed; then echo LIVE_ALLOWED; else echo LIVE_BLOCKED; fi\n' +
         `UI_ROWS=0; draw_main_options > '${toBashPath(outFile)}.menu'; echo "MENU_ROWS \${UI_ROWS}"\n`);
       const r = spawnSync(bash, [toBashPath(sh)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8' } });
       assert.strictEqual(r.status, 0, `live render failed mode=${mode} cols=${cols}:\n${r.stderr}`);
-      const [rows, rowCpu, rowRam, rowUp, rowTime] = r.stdout.trim().split('\n')[0].split(/\s+/).map(Number);
+      const [rows, rowCpu, rowRam, rowUp, rowTime, rowCap, rowAnalyzer] = r.stdout.trim().split('\n')[0].split(/\s+/).map(Number);
       const screen = fs.readFileSync(outFile, 'utf8').split('\n');
       assert.strictEqual(screen.length - 1, rows, `UI_ROWS must equal the printed lines mode=${mode} cols=${cols}`);
       const at = (n) => stripAnsi(screen[n - 1] || '');
@@ -463,10 +464,15 @@ esac
       assert(/│ RAM +›/.test(at(rowRam)), `D_ROW_RAM points to the wrong line mode=${mode} cols=${cols}: ${at(rowRam)}`);
       assert(/│ UPTIME +›/.test(at(rowUp)), `D_ROW_UPTIME points to the wrong line mode=${mode} cols=${cols}: ${at(rowUp)}`);
       assert(/│ TIME +›/.test(at(rowTime)), `D_ROW_TIME points to the wrong line mode=${mode} cols=${cols}: ${at(rowTime)}`);
+      assert(/│ CAPACITY +›/.test(at(rowCap)), `D_ROW_CAP points to the wrong line mode=${mode} cols=${cols}: ${at(rowCap)}`);
+      assert(/│ ANALYZER +›/.test(at(rowAnalyzer)), `D_ROW_ANALYZER points to the wrong line mode=${mode} cols=${cols}: ${at(rowAnalyzer)}`);
       assert(at(rowCpu).includes('█') && at(rowCpu).includes('37%'), 'CPU row must show a usage bar like RAM');
 
-      const [t1, t2, t3] = fs.readFileSync(tickFile, 'utf8').split('|');
-      for (const t of [t1, t3]) {
+      const [t1, t2, t3, t4] = fs.readFileSync(tickFile, 'utf8').split('|');
+      assert(t4.includes(`${ESC}[${rowAnalyzer};1H`) && !t4.includes(`${ESC}[${rowCap};1H`) && !t4.includes(`${ESC}[${rowCpu};1H`),
+        'a new analyzer result redraws only the ANALYZER row');
+      assert(stripAnsi(t4).includes('online 55'), 'ANALYZER row must show the new online count');
+      for (const t of [t1, t3, t4]) {
         assert(t.startsWith(`${ESC}7`) && t.endsWith(`${ESC}8`), 'live tick must save and restore the cursor');
         assert(!t.includes('\n'), 'live tick must never print a newline (the screen must not scroll)');
       }
@@ -513,6 +519,23 @@ esac
   const procLines = proc.stdout.trim().split('\n');
   assert.deepStrictEqual(procLines, ['A 488 1953 25 512 1024 0.50 [1d 1h 1m] []', 'B 24', 'C 24', 'D 25', 'T ok'],
     `unexpected /proc sample:\n${proc.stdout}`);
+
+  // Hasil capacity analyzer dibaca tanpa proses baru, umur datanya tampil
+  // ("7m lalu"), dan file state yang belum ada tetap WAIT.
+  const capFile = path.join(tmpDir, 'capacity.env');
+  const capSh = path.join(tmpDir, 'cap.sh');
+  fs.writeFileSync(capSh, `set -euo pipefail\n${engine}\n${collect}\n${dashboard}\n` +
+    `printf -v now '%(%s)T' -1\n` +
+    `printf 'CAPACITY_UPDATED_AT=x\\nCAPACITY_UPDATED_EPOCH=%s\\nAVG_RAM_USED_PERCENT=16.3\\nAVG_CPU_USED_PERCENT=56.8\\nACTIVE_USER_ESTIMATE=38\\nCAPACITY_ACTIVE_USER_TARGET=160\\nRECOMMENDED_ADD_BATCH=5\\nCAPACITY_STATUS=OK\\n' "$(( now - 420 ))" > '${toBashPath(capFile)}'\n` +
+    `RESOURCE_CAPACITY_STATE_FILE='${toBashPath(capFile)}'; D_CAP_EST=30\n` +
+    'dashboard_cap_read; dashboard_cap_age\n' +
+    'echo "${D_LIVE_STATUS}|${D_LIVE_ONLINE}|${D_LIVE_RAM}|${D_LIVE_CPU}|${D_CAP_TEXT}|${DASH_CAP_AGE}"\n' +
+    'RESOURCE_CAPACITY_STATE_FILE=/tidak/ada; dashboard_cap_read; dashboard_cap_age\n' +
+    'echo "${D_LIVE_STATUS}|${D_LIVE_ONLINE}|${D_CAP_TEXT}|${DASH_CAP_AGE}"\n');
+  const capOut = spawnSync(bash, [toBashPath(capSh)], { encoding: 'utf8' });
+  assert.strictEqual(capOut.status, 0, `dashboard_cap_read failed:\n${capOut.stderr}`);
+  assert.deepStrictEqual(capOut.stdout.trim().split('\n'), ['OK|38|16.3|56.8|~160 user +5|7m lalu', 'WAIT|0|~30 user|'],
+    `unexpected capacity state:\n${capOut.stdout}`);
 
   // Prompt live: read -t yang habis waktunya menjalankan satu siklus live,
   // pilihan yang diketik tetap diterima, perubahan ukuran terminal

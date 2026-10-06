@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.93}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.94}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -15443,6 +15443,8 @@ mkdir -p "$(dirname "${state_file}")"
 tmp_state="$(mktemp)"
 {
   printf 'CAPACITY_UPDATED_AT=%s\n' "$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
+  # Dipakai dashboard menu untuk menampilkan umur data ("7m lalu").
+  printf 'CAPACITY_UPDATED_EPOCH=%s\n' "$(date +%s)"
   printf 'RESOURCE_TARGET_PERCENT=%s\n' "${target}"
   printf 'RAM_TOTAL_MIB=%s\n' "${mem_total_mib}"
   printf 'RAM_USED_MIB=%s\n' "${mem_used_mib}"
@@ -28327,11 +28329,47 @@ dashboard_live_sample() {
   return 0
 }
 
+# Hasil capacity analyzer (timer 15 menit): status, online, rata-rata RAM/CPU,
+# dan target kapasitas. Jumlah online sengaja tidak dihitung di menu, karena
+# butuh membaca socket, journal, dan log Xray yang berat di VPS kecil. File
+# state dibaca dengan builtin bash saat dashboard dibuka dan diulang dashboard
+# live tiap DASH_CAP_REREAD_SECONDS, jadi hasil analyzer baru langsung tampil.
+dashboard_cap_read() {
+  local file="${RESOURCE_CAPACITY_STATE_FILE:-/var/lib/sc-1forcr/capacity.env}" k v
+  local status="" active="" cap="" add="" ram="" cpu="" epoch=""
+  if [[ -r "${file}" ]]; then
+    while IFS='=' read -r k v; do
+      case "${k}" in
+        CAPACITY_STATUS) status="${v}" ;;
+        ACTIVE_USER_ESTIMATE) active="${v}" ;;
+        CAPACITY_ACTIVE_USER_TARGET) cap="${v}" ;;
+        RECOMMENDED_ADD_BATCH) add="${v}" ;;
+        AVG_RAM_USED_PERCENT) ram="${v}" ;;
+        AVG_CPU_USED_PERCENT) cpu="${v}" ;;
+        CAPACITY_UPDATED_EPOCH) epoch="${v}" ;;
+      esac
+    done < "${file}"
+  fi
+  D_LIVE_STATUS="${status:-WAIT}"
+  D_LIVE_ONLINE="${active:-0}"
+  D_LIVE_RAM="${ram:--}"
+  D_LIVE_CPU="${cpu:--}"
+  D_CAP_EPOCH=""
+  if [[ "${epoch}" =~ ^[0-9]+$ ]]; then D_CAP_EPOCH="${epoch}"; fi
+  D_CAP_TEXT="~${D_CAP_EST:-?} user"
+  if [[ "${D_LIVE_STATUS}" != "WAIT" && "${cap}" =~ ^[0-9]+$ ]]; then
+    D_CAP_TEXT="~${cap} user"
+    if [[ "${add}" =~ ^[0-9]+$ ]] && (( add > 0 )); then D_CAP_TEXT+=" +${add}"; fi
+  fi
+  DASH_CAP_READ_AT="${SECONDS}"
+  return 0
+}
+
 dashboard_collect() {
   local udpcustom active_where counts
   local license_client_name license_status license_expires_raw
   local sc_meta_status sc_meta_client sc_meta_expires
-  local cap_ram_gb cap_cores cap_tier cap_est live_status live_active live_cap live_add live_ram live_cpu
+  local cap_ram_gb cap_cores cap_tier cap_est
 
   D_OS="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
   D_KERNEL="$(uname -r 2>/dev/null || echo '-')"
@@ -28395,22 +28433,9 @@ dashboard_collect() {
   IFS='|' read -r cap_ram_gb cap_cores cap_tier cap_est <<< "$(get_server_capacity_profile)"
   D_CORES="${cap_cores:-1}"
   D_SPEC="${cap_ram_gb:-?}GB / ${cap_cores:-?} vCPU / tier ${cap_tier:-?}"
+  D_CAP_EST="${cap_est:-?}"
   ensure_capacity_state_once
-  live_status="$(read_capacity_state_value CAPACITY_STATUS)"
-  live_active="$(read_capacity_state_value ACTIVE_USER_ESTIMATE)"
-  live_cap="$(read_capacity_state_value CAPACITY_ACTIVE_USER_TARGET)"
-  live_add="$(read_capacity_state_value RECOMMENDED_ADD_BATCH)"
-  live_ram="$(read_capacity_state_value AVG_RAM_USED_PERCENT)"
-  live_cpu="$(read_capacity_state_value AVG_CPU_USED_PERCENT)"
-  D_LIVE_STATUS="${live_status:-WAIT}"
-  D_LIVE_ONLINE="${live_active:-0}"
-  D_LIVE_RAM="${live_ram:--}"
-  D_LIVE_CPU="${live_cpu:--}"
-  D_CAP_TEXT="~${cap_est} user"
-  if [[ "${D_LIVE_STATUS}" != "WAIT" && "${live_cap:-}" =~ ^[0-9]+$ ]]; then
-    D_CAP_TEXT="~${live_cap} user"
-    if [[ "${live_add:-}" =~ ^[0-9]+$ ]] && (( live_add > 0 )); then D_CAP_TEXT="${D_CAP_TEXT} +${live_add}"; fi
-  fi
+  dashboard_cap_read
   D_CAP_MODE="AUTO"
   if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" != "1" ]]; then D_CAP_MODE="MANUAL"; fi
   dashboard_live_sample
@@ -28459,20 +28484,56 @@ dashboard_row_time() {
   ui_kv "TIME" "${UI_VAL}${UI_OUT}${UI_NC}${mark}"
 }
 
+dashboard_row_cap() {
+  ui_kv_parts "CAPACITY" "${UI_ACC}${D_CAP_MODE}${UI_NC}" "${UI_VAL}${D_CAP_TEXT}${UI_NC}"
+}
+
+# Umur hasil analyzer -> DASH_CAP_AGE ("7m lalu"), supaya jelas baris ini
+# hasil pemeriksaan berkala, bukan angka realtime.
+dashboard_cap_age() {
+  local now=0 age
+  DASH_CAP_AGE=""
+  [[ "${D_CAP_EPOCH:-}" =~ ^[0-9]+$ ]] || return 0
+  printf -v now '%(%s)T' -1 2>/dev/null || return 0
+  age=$(( now - D_CAP_EPOCH ))
+  if (( age < 0 )); then age=0; fi
+  if (( age < 60 )); then DASH_CAP_AGE="baru saja"
+  elif (( age < 3600 )); then DASH_CAP_AGE="$(( age / 60 ))m lalu"
+  else DASH_CAP_AGE="$(( age / 3600 ))j lalu"; fi
+  return 0
+}
+
+dashboard_row_analyzer() {
+  local color="${UI_OK}"
+  case "${D_LIVE_STATUS}" in
+    WAIT|WATCH) color="${UI_WARN}" ;;
+    FULL|CRITICAL) color="${UI_BAD}" ;;
+  esac
+  dashboard_cap_age
+  ui_kv_parts "ANALYZER" "${color}${D_LIVE_STATUS}${UI_NC}" "${UI_MUTED}online${UI_NC} ${UI_VAL}${D_LIVE_ONLINE}${UI_NC}" \
+    "${UI_MUTED}ram${UI_NC} ${UI_VAL}${D_LIVE_RAM}%${UI_NC}" "${UI_MUTED}cpu${UI_NC} ${UI_VAL}${D_LIVE_CPU}%${UI_NC}" \
+    "${UI_MUTED}${DASH_CAP_AGE}${UI_NC}"
+}
+
 # Sidik nilai satu baris live -> DASH_K. Baris digambar ulang hanya kalau
 # sidiknya berubah, supaya data yang dikirim lewat SSH tetap kecil.
+DASH_LIVE_ROWS=(cpu ram uptime time cap analyzer)
 dashboard_live_key() {
   case "$1" in
     cpu) DASH_K="${D_CPU_PCT:-}|${D_LOAD1}|${D_LOAD5}|${D_LOAD15}" ;;
     ram) DASH_K="${D_RAM_PCT}|${D_RAM_USED:-}|${D_RAM_TOTAL:-}" ;;
     uptime) DASH_K="${D_UPTIME}|${D_SWAP_USED:-}|${D_SWAP_TOTAL:-}" ;;
     time) DASH_K="${D_TIME}|${DASH_LIVE_ON}" ;;
+    cap) DASH_K="${D_CAP_MODE}|${D_CAP_TEXT}" ;;
+    analyzer)
+      dashboard_cap_age
+      DASH_K="${D_LIVE_STATUS}|${D_LIVE_ONLINE}|${D_LIVE_RAM}|${D_LIVE_CPU}|${DASH_CAP_AGE}" ;;
   esac
 }
 
 dashboard_live_remember() {
   local name
-  for name in cpu ram uptime time; do
+  for name in "${DASH_LIVE_ROWS[@]}"; do
     dashboard_live_key "${name}"
     DASH_KEYS[${name}]="${DASH_K}"
   done
@@ -28485,8 +28546,9 @@ dashboard_live_remember() {
 dashboard_live_tick() {
   local esc=$'\033' out="" name row
   dashboard_live_sample
+  if (( SECONDS - DASH_CAP_READ_AT >= DASH_CAP_REREAD_SECONDS )); then dashboard_cap_read; fi
   UI_ROW_SINK="buf"
-  for name in cpu ram uptime time; do
+  for name in "${DASH_LIVE_ROWS[@]}"; do
     dashboard_live_key "${name}"
     if [[ "${DASH_K}" == "${DASH_KEYS[${name}]:-}" ]]; then continue; fi
     DASH_KEYS[${name}]="${DASH_K}"
@@ -28553,7 +28615,7 @@ menu_read_choice_live() {
 }
 
 dashboard_render() {
-  local valw bar_len exp_color days sub cap_color health_color live_color zivpn_standby=0 udphc_standby=0
+  local valw bar_len exp_color days sub health_color zivpn_standby=0 udphc_standby=0
   local -a svc=() acc=()
   ui_layout
   valw=$(( UI_IW - 2 - 11 ))
@@ -28622,17 +28684,11 @@ dashboard_render() {
   dashboard_svc "UDPHC" "${D_SVC_UDPHC}" "${udphc_standby}"; svc+=("${UI_OUT}")
   health_color="${UI_WARN}"
   if [[ "${D_HEALTH}" == "GOOD" ]]; then health_color="${UI_OK}"; fi
-  live_color="${UI_OK}"
-  case "${D_LIVE_STATUS}" in
-    WAIT|WATCH) live_color="${UI_WARN}" ;;
-    FULL|CRITICAL) live_color="${UI_BAD}" ;;
-  esac
-  cap_color="${UI_ACC}"
   ui_line_top "SERVICES"
   ui_flow 3 "${svc[@]}"
   ui_kv_parts "HEALTH" "${health_color}${UI_BOLD}${D_HEALTH}${UI_NC}" "${UI_MUTED}spec${UI_NC} ${UI_VAL}${D_SPEC}${UI_NC}"
-  ui_kv_parts "CAPACITY" "${cap_color}${D_CAP_MODE}${UI_NC}" "${UI_VAL}${D_CAP_TEXT}${UI_NC}"
-  ui_kv_parts "LIVE" "${live_color}${D_LIVE_STATUS}${UI_NC}" "${UI_MUTED}online${UI_NC} ${UI_VAL}${D_LIVE_ONLINE}${UI_NC}" "${UI_MUTED}ram${UI_NC} ${UI_VAL}${D_LIVE_RAM}%${UI_NC}" "${UI_MUTED}cpu${UI_NC} ${UI_VAL}${D_LIVE_CPU}%${UI_NC}"
+  D_ROW_CAP=$(( UI_ROWS + 1 )); dashboard_row_cap
+  D_ROW_ANALYZER=$(( UI_ROWS + 1 )); dashboard_row_analyzer
   ui_line_sep "ACCOUNTS"
   acc+=("${UI_MUTED}SSH${UI_NC} ${UI_ACC}${UI_BOLD}${D_ACC_SSH}${UI_NC}")
   acc+=("${UI_MUTED}VMESS${UI_NC} ${UI_ACC}${UI_BOLD}${D_ACC_VMESS}${UI_NC}")
@@ -31327,6 +31383,9 @@ DASHBOARD_LIVE_IDLE_MINUTES="${DASHBOARD_LIVE_IDLE_MINUTES:-10}"
 DASH_LIVE_ON=0
 DASH_WINCH=0
 DASH_K=""
+DASH_CAP_AGE=""
+DASH_CAP_REREAD_SECONDS=30
+DASH_CAP_READ_AT=0
 declare -A DASH_KEYS=()
 # Titik gradasi neon: cyan -> biru -> ungu -> magenta.
 UI_SR=(0 41 150 255)

@@ -193,7 +193,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.92}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.93}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -28253,28 +28253,93 @@ dashboard_net_info() {
   return 0
 }
 
+# RAM, swap, CPU, load, uptime, dan jam dibaca dari /proc dengan builtin bash,
+# tanpa proses baru, jadi murah dipanggil berulang oleh dashboard live.
+# CPU% adalah selisih /proc/stat sejak sampel sebelumnya, dikurangi pemakaian
+# CPU menu ini sendiri beserta anak prosesnya (sqlite3, jq, curl saat
+# mengumpulkan data), supaya angkanya tidak ikut naik karena menu dibuka.
+# DASH_PROC_DIR hanya untuk test.
+DASH_CPU_TOTAL=0
+DASH_CPU_BUSY=0
+dashboard_live_sample() {
+  local proc="${DASH_PROC_DIR:-/proc}" key val rest mt="" mf=0 ma="" bf=0 ca=0 st=0 sf=0 used up="" self=""
+  local cpu u n s i w q sq stl total busy self_ticks=0 d_total d_busy days hours mins
+  local -a f=()
+  if [[ -r "${proc}/meminfo" ]]; then
+    while read -r key val rest; do
+      case "${key}" in
+        MemTotal:) mt="${val}" ;;
+        MemFree:) mf="${val}" ;;
+        MemAvailable:) ma="${val}" ;;
+        Buffers:) bf="${val}" ;;
+        Cached:) ca="${val}" ;;
+        SwapTotal:) st="${val}" ;;
+        SwapFree:) sf="${val}"; break ;;
+      esac
+    done < "${proc}/meminfo"
+  fi
+  if [[ "${mt}" =~ ^[0-9]+$ && "${mf}${bf}${ca}${st}${sf}" =~ ^[0-9]+$ ]] && (( mt > 0 )); then
+    # MemAvailable sama dengan dasar kolom "used" pada free versi baru.
+    if [[ "${ma}" =~ ^[0-9]+$ ]]; then used=$(( mt - ma )); else used=$(( mt - mf - bf - ca )); fi
+    if (( used < 0 )); then used=0; fi
+    D_RAM_TOTAL=$(( mt / 1024 )); D_RAM_USED=$(( used / 1024 )); D_RAM_PCT=$(( used * 100 / mt ))
+    D_SWAP_TOTAL=$(( st / 1024 )); D_SWAP_USED=$(( (st - sf) / 1024 ))
+  fi
+
+  if [[ -r "${proc}/stat" ]] && read -r cpu u n s i w q sq stl rest < "${proc}/stat" \
+     && [[ "${cpu}" == "cpu" && "${u}${n}${s}${i}" =~ ^[0-9]+$ ]]; then
+    [[ "${w:-0}${q:-0}${sq:-0}${stl:-0}" =~ ^[0-9]+$ ]] || { w=0; q=0; sq=0; stl=0; }
+    total=$(( u + n + s + i + ${w:-0} + ${q:-0} + ${sq:-0} + ${stl:-0} ))
+    busy=$(( total - i - ${w:-0} ))
+    # Field 14-17 /proc/PID/stat: utime stime cutime cstime (setelah "(nama) ").
+    if [[ -r "${proc}/$$/stat" ]] && read -r self < "${proc}/$$/stat"; then
+      self="${self##*) }"
+      # Sengaja tanpa here-string: bash 5.0 (Ubuntu 20.04) membuat file
+      # sementara untuk <<<. Isinya hanya angka dan satu huruf status.
+      f=(${self})
+      if [[ "${f[11]:-}${f[12]:-}${f[13]:-}${f[14]:-}" =~ ^[0-9]+$ ]]; then
+        self_ticks=$(( f[11] + f[12] + f[13] + f[14] ))
+      fi
+    fi
+    busy=$(( busy - self_ticks ))
+    if (( DASH_CPU_TOTAL > 0 && total > DASH_CPU_TOTAL )); then
+      d_total=$(( total - DASH_CPU_TOTAL ))
+      d_busy=$(( busy - DASH_CPU_BUSY ))
+      if (( d_busy < 0 )); then d_busy=0; fi
+      if (( d_busy > d_total )); then d_busy="${d_total}"; fi
+      D_CPU_PCT=$(( (d_busy * 100 + d_total / 2) / d_total ))
+    fi
+    DASH_CPU_TOTAL="${total}"
+    DASH_CPU_BUSY="${busy}"
+  fi
+
+  if [[ -r "${proc}/loadavg" ]]; then
+    read -r D_LOAD1 D_LOAD5 D_LOAD15 rest < "${proc}/loadavg" || true
+  fi
+  if [[ -r "${proc}/uptime" ]] && read -r up rest < "${proc}/uptime"; then
+    up="${up%%.*}"
+    if [[ "${up}" =~ ^[0-9]+$ ]]; then
+      days=$(( up / 86400 )); hours=$(( (up % 86400) / 3600 )); mins=$(( (up % 3600) / 60 ))
+      if (( days > 0 )); then D_UPTIME="${days}d ${hours}h ${mins}m"; else D_UPTIME="${hours}h ${mins}m"; fi
+    fi
+  fi
+  printf -v D_TIME '%(%d %b %Y  %H:%M %Z)T' -1 2>/dev/null || true
+  return 0
+}
+
 dashboard_collect() {
-  local uptime_s days hours mins udpcustom active_where counts load_rest=""
+  local udpcustom active_where counts
   local license_client_name license_status license_expires_raw
   local sc_meta_status sc_meta_client sc_meta_expires
   local cap_ram_gb cap_cores cap_tier cap_est live_status live_active live_cap live_add live_ram live_cpu
 
   D_OS="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
   D_KERNEL="$(uname -r 2>/dev/null || echo '-')"
-  read -r D_RAM_USED D_RAM_TOTAL D_SWAP_USED D_SWAP_TOTAL <<< "$(free -m 2>/dev/null | awk '/^Mem:/ {mu=$3; mt=$2} /^Swap:/ {su=$3; st=$2} END {printf "%d %d %d %d\n", mu, mt, su, st}' || true)"
-  D_RAM_PCT=0
-  if [[ "${D_RAM_TOTAL:-}" =~ ^[0-9]+$ && "${D_RAM_USED:-}" =~ ^[0-9]+$ ]] && (( D_RAM_TOTAL > 0 )); then
-    D_RAM_PCT=$(( D_RAM_USED * 100 / D_RAM_TOTAL ))
-  fi
+  D_RAM_USED=""; D_RAM_TOTAL=""; D_RAM_PCT=0; D_SWAP_USED=""; D_SWAP_TOTAL=""; D_CPU_PCT=""
+  D_LOAD1="-"; D_LOAD5="-"; D_LOAD15="-"; D_UPTIME="-"; D_TIME="-"
+  # Sampel pertama jadi titik awal CPU%; sampel kedua di akhir fungsi ini.
+  dashboard_live_sample
   read -r D_DISK_USED D_DISK_TOTAL D_DISK_PCT <<< "$(df -P -BG / 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/%/,"",$5); print $3, $2, $5}' || true)"
-  D_LOAD1="-"; D_LOAD5="-"; D_LOAD15="-"
-  read -r D_LOAD1 D_LOAD5 D_LOAD15 load_rest 2>/dev/null < /proc/loadavg || true
-
-  uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
-  if [[ ! "${uptime_s}" =~ ^[0-9]+$ ]]; then uptime_s=0; fi
-  days=$(( uptime_s / 86400 )); hours=$(( (uptime_s % 86400) / 3600 )); mins=$(( (uptime_s % 3600) / 60 ))
-  if (( days > 0 )); then D_UPTIME="${days}d ${hours}h ${mins}m"; else D_UPTIME="${hours}h ${mins}m"; fi
-  D_TIME="$(date '+%d %b %Y  %H:%M %Z' 2>/dev/null || echo '-')"
 
   dashboard_net_info
   refresh_license_cache_guard
@@ -28348,6 +28413,7 @@ dashboard_collect() {
   fi
   D_CAP_MODE="AUTO"
   if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" != "1" ]]; then D_CAP_MODE="MANUAL"; fi
+  dashboard_live_sample
   return 0
 }
 
@@ -28361,6 +28427,131 @@ dashboard_svc() {
   UI_OUT="${dot}${UI_NC} ${UI_VAL}${label}${UI_NC}"
 }
 
+# Baris yang ikut diperbarui dashboard live. Dipakai dashboard_render dan
+# dashboard_live_tick, jadi tampilan awal dan hasil pembaruan selalu sama.
+dashboard_row_cpu() {
+  local txt="-"
+  if [[ "${D_CPU_PCT:-}" =~ ^[0-9]+$ ]]; then txt="${D_CPU_PCT}%"; fi
+  ui_bar "${D_CPU_PCT:-0}" "${D_BAR_LEN}"
+  ui_kv_parts "CPU" "${UI_OUT} ${UI_VAL}${txt}${UI_NC}" "${UI_MUTED}load${UI_NC} ${UI_VAL}${D_LOAD1} ${D_LOAD5} ${D_LOAD15}${UI_NC}"
+}
+
+dashboard_row_ram() {
+  ui_bar "${D_RAM_PCT}" "${D_BAR_LEN}"
+  ui_kv_parts "RAM" "${UI_OUT} ${UI_VAL}${D_RAM_PCT}%${UI_NC}" "${UI_MUTED}${D_RAM_USED:-?}M/${D_RAM_TOTAL:-?}M${UI_NC}"
+}
+
+dashboard_row_uptime() {
+  ui_kv_parts "UPTIME" "${UI_VAL}${D_UPTIME}${UI_NC}" "${UI_MUTED}swap${UI_NC} ${UI_VAL}${D_SWAP_USED:-0}M/${D_SWAP_TOTAL:-0}M${UI_NC}"
+}
+
+# Penanda live: "● live", atau titik saja kalau layar HP terlalu sempit.
+dashboard_row_time() {
+  local room=$(( UI_IW - 2 - 11 )) mark=""
+  ui_fit "${D_TIME}" "${room}"
+  if [[ "${DASH_LIVE_ON}" == "1" ]]; then
+    if (( ${#UI_OUT} + 8 <= room )); then
+      mark="  ${UI_OK}●${UI_NC} ${UI_MUTED}live${UI_NC}"
+    elif (( ${#UI_OUT} + 3 <= room )); then
+      mark="  ${UI_OK}●${UI_NC}"
+    fi
+  fi
+  ui_kv "TIME" "${UI_VAL}${UI_OUT}${UI_NC}${mark}"
+}
+
+# Sidik nilai satu baris live -> DASH_K. Baris digambar ulang hanya kalau
+# sidiknya berubah, supaya data yang dikirim lewat SSH tetap kecil.
+dashboard_live_key() {
+  case "$1" in
+    cpu) DASH_K="${D_CPU_PCT:-}|${D_LOAD1}|${D_LOAD5}|${D_LOAD15}" ;;
+    ram) DASH_K="${D_RAM_PCT}|${D_RAM_USED:-}|${D_RAM_TOTAL:-}" ;;
+    uptime) DASH_K="${D_UPTIME}|${D_SWAP_USED:-}|${D_SWAP_TOTAL:-}" ;;
+    time) DASH_K="${D_TIME}|${DASH_LIVE_ON}" ;;
+  esac
+}
+
+dashboard_live_remember() {
+  local name
+  for name in cpu ram uptime time; do
+    dashboard_live_key "${name}"
+    DASH_KEYS[${name}]="${DASH_K}"
+  done
+}
+
+# Satu siklus live: ambil sampel /proc, gambar ulang baris yang berubah di
+# posisi tetapnya, semuanya dalam satu kali tulis. Posisi kursor disimpan
+# (ESC 7) dan dikembalikan (ESC 8), jadi angka yang sedang diketik di prompt
+# tetap di tempatnya.
+dashboard_live_tick() {
+  local esc=$'\033' out="" name row
+  dashboard_live_sample
+  UI_ROW_SINK="buf"
+  for name in cpu ram uptime time; do
+    dashboard_live_key "${name}"
+    if [[ "${DASH_K}" == "${DASH_KEYS[${name}]:-}" ]]; then continue; fi
+    DASH_KEYS[${name}]="${DASH_K}"
+    row="D_ROW_${name^^}"
+    UI_BUF=""
+    "dashboard_row_${name}"
+    out+="${esc}[${!row};1H${UI_BUF}${esc}[K"
+  done
+  UI_ROW_SINK=""
+  if [[ -n "${out}" ]]; then printf '%s' "${esc}7${out}${esc}8"; fi
+  return 0
+}
+
+# Live hanya kalau posisi baris pasti: seluruh layar (dashboard, menu, prompt)
+# muat di terminal tanpa tergulung dan tidak ada baris yang terlipat. Tema
+# none dan terminal dumb tetap polos tanpa kode kursor.
+dashboard_live_allowed() {
+  [[ "${DASHBOARD_LIVE_SECONDS}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "${DASHBOARD_LIVE_IDLE_MINUTES}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${UI_MODE}" != "none" ]] || return 1
+  case "${TERM:-}" in ''|dumb) return 1 ;; esac
+  [[ -t 1 ]] || return 1
+  (( ${D_ROW_CPU:-0} > 0 )) || return 1
+  ui_tty_size
+  (( UI_TTY_ROWS > 0 && UI_ROWS + 1 <= UI_TTY_ROWS )) || return 1
+  (( UI_TTY_COLS >= UI_BW + 1 )) || return 1
+  return 0
+}
+
+# Prompt menu utama sambil menjalankan dashboard live. Teks yang sedang
+# diketik aman: terminal (mode kanonik) menahan satu baris sampai Enter, jadi
+# read -t yang habis waktunya tidak memakan apa pun. Live berhenti kalau
+# ukuran terminal berubah (posisi baris tidak pasti lagi) dan setelah
+# DASHBOARD_LIVE_IDLE_MINUTES tanpa input, supaya sesi SSH yang ditinggal
+# tidak terus mengirim data. MENU_INPUT_TTY hanya untuk test.
+menu_read_choice_live() {
+  local var_name="$1" prompt="$2" tty="${MENU_INPUT_TTY:-/dev/tty}" rc=0 idle_until
+  idle_until=$(( SECONDS + DASHBOARD_LIVE_IDLE_MINUTES * 60 ))
+  DASH_WINCH=0
+  DASH_LIVE_ON=1
+  printf '%s' "${prompt}"
+  trap 'DASH_WINCH=1' WINCH
+  while true; do
+    rc=0
+    read -r -t "${DASHBOARD_LIVE_SECONDS}" "${var_name}" < "${tty}" || rc=$?
+    if (( rc <= 128 )); then break; fi
+    if (( DASH_WINCH == 1 || SECONDS >= idle_until )); then
+      trap - WINCH
+      DASH_LIVE_ON=0
+      if (( DASH_WINCH == 0 )); then dashboard_live_tick; fi
+      rc=0
+      read -r "${var_name}" < "${tty}" || rc=$?
+      break
+    fi
+    dashboard_live_tick
+  done
+  trap - WINCH
+  DASH_LIVE_ON=0
+  if (( rc != 0 )); then
+    cancelled
+    return 130
+  fi
+  return 0
+}
+
 dashboard_render() {
   local valw bar_len exp_color days sub cap_color health_color live_color zivpn_standby=0 udphc_standby=0
   local -a svc=() acc=()
@@ -28369,9 +28560,11 @@ dashboard_render() {
   bar_len=$(( valw - 20 ))
   if (( bar_len > 20 )); then bar_len=20; fi
   if (( bar_len < 6 )); then bar_len=6; fi
+  D_BAR_LEN="${bar_len}"
 
   clear
   printf '\n'
+  UI_ROWS=1
   ui_banner "S C   1 F O R C R   N E X U S"
 
   exp_color="${UI_OK}"
@@ -28391,17 +28584,19 @@ dashboard_render() {
   ui_width "${sub}"
   ui_pad "$(( (UI_BW - UI_W) / 2 ))"
   printf ' %s%s\n' "${UI_TMP}" "${sub}"
+  UI_ROWS=$(( UI_ROWS + 1 ))
 
   ui_line_top "SERVER"
   ui_kv_text "OS" "${D_OS}"
   ui_kv_text "KERNEL" "${D_KERNEL}"
-  ui_kv_parts "CPU" "${UI_VAL}${D_CORES} vCPU${UI_NC}" "${UI_MUTED}load${UI_NC} ${UI_VAL}${D_LOAD1} ${D_LOAD5} ${D_LOAD15}${UI_NC}"
-  ui_bar "${D_RAM_PCT}" "${bar_len}"
-  ui_kv_parts "RAM" "${UI_OUT} ${UI_VAL}${D_RAM_PCT}%${UI_NC}" "${UI_MUTED}${D_RAM_USED:-?}M/${D_RAM_TOTAL:-?}M${UI_NC}"
+  # Jumlah vCPU sudah tampil di baris HEALTH (spec), jadi baris CPU memuat
+  # bar pemakaian seperti RAM.
+  D_ROW_CPU=$(( UI_ROWS + 1 )); dashboard_row_cpu
+  D_ROW_RAM=$(( UI_ROWS + 1 )); dashboard_row_ram
   ui_bar "${D_DISK_PCT:-0}" "${bar_len}"
   ui_kv_parts "DISK" "${UI_OUT} ${UI_VAL}${D_DISK_PCT:-0}%${UI_NC}" "${UI_MUTED}${D_DISK_USED:-?}G/${D_DISK_TOTAL:-?}G${UI_NC}"
-  ui_kv_parts "UPTIME" "${UI_VAL}${D_UPTIME}${UI_NC}" "${UI_MUTED}swap${UI_NC} ${UI_VAL}${D_SWAP_USED:-0}M/${D_SWAP_TOTAL:-0}M${UI_NC}"
-  ui_kv_text "TIME" "${D_TIME}"
+  D_ROW_UPTIME=$(( UI_ROWS + 1 )); dashboard_row_uptime
+  D_ROW_TIME=$(( UI_ROWS + 1 )); dashboard_row_time
   ui_line_sep "NETWORK"
   ui_fit "${D_CITY}" 16
   ui_kv_parts "IP" "${UI_VAL}${D_IP}${UI_NC}" "${UI_MUTED}${UI_OUT}${UI_NC}"
@@ -28446,6 +28641,7 @@ dashboard_render() {
   acc+=("${UI_MUTED}TOTAL${UI_NC} ${UI_ACC2}${UI_BOLD}$(( D_ACC_SSH + D_ACC_VMESS + D_ACC_VLESS + D_ACC_TROJAN ))${UI_NC}")
   ui_flow 3 "${acc[@]}"
   ui_line_bot
+  dashboard_live_remember
   return 0
 }
 
@@ -31118,6 +31314,20 @@ UI_TMP=""
 UI_GRAD=()
 UI_GRAD_BG=()
 UI_GRAD_KEY=""
+# Jumlah baris yang sudah dicetak mesin tampilan sejak layar dibersihkan.
+# Dashboard live memakainya untuk tahu posisi baris dan apakah layar muat.
+UI_ROWS=0
+# UI_ROW_SINK=buf: ui_row menulis ke UI_BUF, tidak ke layar.
+UI_ROW_SINK=""
+UI_BUF=""
+# Dashboard live: baris CPU/RAM/UPTIME/TIME diperbarui tiap N detik selama
+# menu utama menunggu pilihan. 0 = mati (contoh: DASHBOARD_LIVE_SECONDS=0 menu).
+DASHBOARD_LIVE_SECONDS="${DASHBOARD_LIVE_SECONDS:-2}"
+DASHBOARD_LIVE_IDLE_MINUTES="${DASHBOARD_LIVE_IDLE_MINUTES:-10}"
+DASH_LIVE_ON=0
+DASH_WINCH=0
+DASH_K=""
+declare -A DASH_KEYS=()
 # Titik gradasi neon: cyan -> biru -> ungu -> magenta.
 UI_SR=(0 41 150 255)
 UI_SG=(229 121 70 64)
@@ -31307,16 +31517,23 @@ ui_line() {
   done
   out+="${UI_GRAD[UI_BW - 1]}${right}${UI_NC}"
   printf '%s\n' "${out}"
+  UI_ROWS=$(( UI_ROWS + 1 ))
 }
 ui_line_top() { ui_line '╭' '╮' "${1:-}" "${2:-left}"; }
 ui_line_sep() { ui_line '├' '┤' "${1:-}" "${2:-left}"; }
 ui_line_bot() { ui_line '╰' '╯'; }
 
 ui_row() {
-  local content="$1"
+  local content="$1" line
   ui_width "${content}"
   ui_pad "$(( UI_IW - 2 - UI_W ))"
-  printf ' %s│%s %s%s %s│%s\n' "${UI_GRAD[0]}" "${UI_NC}" "${content}" "${UI_TMP}" "${UI_GRAD[UI_BW - 1]}" "${UI_NC}"
+  printf -v line ' %s│%s %s%s %s│%s' "${UI_GRAD[0]}" "${UI_NC}" "${content}" "${UI_TMP}" "${UI_GRAD[UI_BW - 1]}" "${UI_NC}"
+  if [[ "${UI_ROW_SINK:-}" == "buf" ]]; then
+    UI_BUF+="${line}"
+    return 0
+  fi
+  printf '%s\n' "${line}"
+  UI_ROWS=$(( UI_ROWS + 1 ))
 }
 
 ui_center() {
@@ -31327,6 +31544,7 @@ ui_center() {
   right=$(( UI_IW - 2 - UI_W - left ))
   if (( right < 0 )); then right=0; fi
   printf ' %s│%s %*s%s%*s %s│%s\n' "${UI_GRAD[0]}" "${UI_NC}" "${left}" '' "${content}" "${right}" '' "${UI_GRAD[UI_BW - 1]}" "${UI_NC}"
+  UI_ROWS=$(( UI_ROWS + 1 ))
 }
 
 # Teks ASCII diwarnai mengikuti gradasi mulai kolom start -> UI_OUT.
@@ -31355,30 +31573,40 @@ ui_banner() {
     top+="${UI_GRAD[col]}▄"
     bottom+="${UI_GRAD[col]}▀"
   done
-  if [[ "${UI_MODE}" != "none" ]]; then printf ' %s%s\n' "${top}" "${UI_NC}"; fi
+  if [[ "${UI_MODE}" != "none" ]]; then printf ' %s%s\n' "${top}" "${UI_NC}"; UI_ROWS=$(( UI_ROWS + 1 )); fi
   printf '%s%s\n' "${out}" "${UI_NC}"
-  if [[ "${UI_MODE}" != "none" ]]; then printf ' %s%s\n' "${bottom}" "${UI_NC}"; fi
+  UI_ROWS=$(( UI_ROWS + 1 ))
+  if [[ "${UI_MODE}" != "none" ]]; then printf ' %s%s\n' "${bottom}" "${UI_NC}"; UI_ROWS=$(( UI_ROWS + 1 )); fi
 }
 
-# Bar pemakaian: hijau -> kuning -> merah sepanjang bar -> UI_OUT.
+# Bar pemakaian: hijau -> kuning -> merah sepanjang bar -> UI_OUT. Hasilnya
+# disimpan per mode/panjang/isi, karena dashboard live menggambar bar yang
+# sama berulang kali.
+declare -A UI_BAR_CACHE=()
 ui_bar() {
-  local pct="$1" len="$2" fill i pos r g out=""
+  local pct="$1" len="$2" fill i pos r g out="" key
   if [[ ! "${pct}" =~ ^[0-9]+$ ]]; then pct=0; fi
   if (( pct > 100 )); then pct=100; fi
   if (( len < 1 )); then len=1; fi
   fill=$(( (pct * len + 50) / 100 ))
   if (( pct > 0 && fill == 0 )); then fill=1; fi
-  for ((i=0; i<len; i++)); do
-    if (( i < fill )); then
-      pos=$(( i * 1000 / (len > 1 ? len - 1 : 1) ))
-      if (( pos < 500 )); then r=$(( pos * 255 / 500 )); g=230; else r=255; g=$(( 230 - (pos - 500) * 170 / 500 )); fi
-      ui_color_to UI_TMP "${r}" "${g}" 90
-      out+="${UI_TMP}█"
-    else
-      out+="${UI_MUTED}░"
-    fi
+  key="${UI_MODE}:${len}:${fill}"
+  if [[ -n "${UI_BAR_CACHE[${key}]:-}" ]]; then
+    UI_OUT="${UI_BAR_CACHE[${key}]}"
+    return 0
+  fi
+  for ((i=0; i<fill; i++)); do
+    pos=$(( i * 1000 / (len > 1 ? len - 1 : 1) ))
+    if (( pos < 500 )); then r=$(( pos * 255 / 500 )); g=230; else r=255; g=$(( 230 - (pos - 500) * 170 / 500 )); fi
+    ui_color_to UI_TMP "${r}" "${g}" 90
+    out+="${UI_TMP}█"
   done
+  if (( fill < len )); then
+    out+="${UI_MUTED}"
+    for ((i=fill; i<len; i++)); do out+="░"; done
+  fi
   UI_OUT="${out}${UI_NC}"
+  UI_BAR_CACHE[${key}]="${UI_OUT}"
 }
 
 # Label rata kiri + nilai berwarna. Ruang nilai = UI_IW - 2 - 11.
@@ -31923,16 +32151,26 @@ while true; do
     continue
   fi
   clear
+  UI_ROWS=0
+  D_ROW_CPU=0
   if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
     draw_dashboard
     echo
+    UI_ROWS=$(( UI_ROWS + 1 ))
   fi
 
   draw_main_options
   echo
+  UI_ROWS=$(( UI_ROWS + 1 ))
   printf -v menu_prompt ' %s◆%s %sSelect From Options%s %s[1-8, m, x]%s %s›%s ' \
     "${UI_ACC2}" "${UI_NC}" "${UI_VAL}" "${UI_NC}" "${UI_MUTED}" "${UI_NC}" "${UI_ACC}" "${UI_NC}"
-  if ! prompt_input m "${menu_prompt}"; then
+  menu_rc=0
+  if [[ "${SHOW_FULL_MENU}" == "1" ]] && dashboard_live_allowed; then
+    menu_read_choice_live m "${menu_prompt}" || menu_rc=$?
+  else
+    prompt_input m "${menu_prompt}" || menu_rc=$?
+  fi
+  if (( menu_rc != 0 )); then
     SHOW_FULL_MENU=0
     continue
   fi

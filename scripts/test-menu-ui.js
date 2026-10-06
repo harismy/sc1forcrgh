@@ -42,7 +42,7 @@ const fixture = `
 clear() { :; }
 D_CLIENT='DEMO CLIENT'; D_VERSION='V.1FSC.67'; D_EXPIRY='262d 1h 28m'
 D_OS='Debian GNU/Linux 12 (bookworm)'; D_KERNEL='6.1.0-42-cloud-amd64'
-D_CORES=2; D_LOAD1=0.35; D_LOAD5=0.40; D_LOAD15=0.41
+D_CORES=2; D_CPU_PCT=37; D_LOAD1=0.35; D_LOAD5=0.40; D_LOAD15=0.41
 D_RAM_USED=794; D_RAM_TOTAL=1979; D_RAM_PCT=40; D_SWAP_USED=83; D_SWAP_TOTAL=1023
 D_DISK_USED=8; D_DISK_TOTAL=40; D_DISK_PCT=22; D_UPTIME='21h 22m'; D_TIME='26 Sep 2026  15:10 CST'
 D_IP='203.0.113.10'; D_CITY='Jakarta'; D_ISP='AS64500 Contoh Penyedia Internet Nusantara Sangat Panjang Namanya'
@@ -144,6 +144,7 @@ df() { return 127; }
 hostname() { return 127; }
 clear() { :; }
 DB_PATH=/tidak/ada.db; ZIVPN_SERVICE=zivpn; DOMAIN=vpn.example.com; SCRIPT_VERSION=V.1FSC.0
+DASH_PROC_DIR=/tidak/ada
 `;
   const colorFile = path.join(tmpDir, 'color-256');
   fs.writeFileSync(colorFile, '256\n');
@@ -427,6 +428,135 @@ esac
   assert(flowOut.includes('Gagal mengubah Trojan. Status lama dipertahankan.'), 'failed toggle must be reported');
   assert(flowOut.includes('Peringatan: layanan bertanda OFF* belum tertutup'), 'OFF without an active rule must be flagged');
   assert(flowOut.includes('Pilihan tidak valid.'), 'invalid choice must be rejected');
+
+  // Dashboard live. Posisi baris yang dicatat dashboard_render harus tepat
+  // menunjuk baris CPU/RAM/UPTIME/TIME, dan UI_ROWS sama dengan jumlah baris
+  // yang tercetak; kalau meleset, pembaruan live menimpa baris lain. Satu
+  // siklus live hanya menggambar baris yang berubah, tanpa newline, di antara
+  // simpan/kembalikan kursor, dan barisnya identik dengan render penuh.
+  const ESC = '\x1b';
+  for (const mode of ['truecolor', 'none']) {
+    for (const cols of [44, 80]) {
+      const cf = path.join(tmpDir, `live-${mode}`);
+      fs.writeFileSync(cf, `${mode}\n`);
+      const outFile = path.join(tmpDir, 'live-render.txt');
+      const tickFile = path.join(tmpDir, 'live-tick.txt');
+      const fullFile = path.join(tmpDir, 'live-full.txt');
+      const sh = path.join(tmpDir, 'live.sh');
+      fs.writeFileSync(sh, `set -euo pipefail\n${engine}\n${dashboard}\n${fixture}\n` +
+        `MENU_COLOR_FILE='${toBashPath(cf)}'\nMENU_COLS=${cols}\nUI_MODE=''\n` +
+        `dashboard_render > '${toBashPath(outFile)}'\n` +
+        'echo "${UI_ROWS} ${D_ROW_CPU} ${D_ROW_RAM} ${D_ROW_UPTIME} ${D_ROW_TIME}"\n' +
+        'dashboard_live_sample() { :; }\n' +
+        `{ DASH_LIVE_ON=1; dashboard_live_tick; printf '|'; dashboard_live_tick; printf '|'; ` +
+        `D_CPU_PCT=91; D_LOAD1=3.10; dashboard_live_tick; } > '${toBashPath(tickFile)}'\n` +
+        `dashboard_render > '${toBashPath(fullFile)}'\n` +
+        'if dashboard_live_allowed; then echo LIVE_ALLOWED; else echo LIVE_BLOCKED; fi\n' +
+        `UI_ROWS=0; draw_main_options > '${toBashPath(outFile)}.menu'; echo "MENU_ROWS \${UI_ROWS}"\n`);
+      const r = spawnSync(bash, [toBashPath(sh)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C.UTF-8', LANG: 'C.UTF-8' } });
+      assert.strictEqual(r.status, 0, `live render failed mode=${mode} cols=${cols}:\n${r.stderr}`);
+      const [rows, rowCpu, rowRam, rowUp, rowTime] = r.stdout.trim().split('\n')[0].split(/\s+/).map(Number);
+      const screen = fs.readFileSync(outFile, 'utf8').split('\n');
+      assert.strictEqual(screen.length - 1, rows, `UI_ROWS must equal the printed lines mode=${mode} cols=${cols}`);
+      const at = (n) => stripAnsi(screen[n - 1] || '');
+      assert(/│ CPU +›/.test(at(rowCpu)), `D_ROW_CPU points to the wrong line mode=${mode} cols=${cols}: ${at(rowCpu)}`);
+      assert(/│ RAM +›/.test(at(rowRam)), `D_ROW_RAM points to the wrong line mode=${mode} cols=${cols}: ${at(rowRam)}`);
+      assert(/│ UPTIME +›/.test(at(rowUp)), `D_ROW_UPTIME points to the wrong line mode=${mode} cols=${cols}: ${at(rowUp)}`);
+      assert(/│ TIME +›/.test(at(rowTime)), `D_ROW_TIME points to the wrong line mode=${mode} cols=${cols}: ${at(rowTime)}`);
+      assert(at(rowCpu).includes('█') && at(rowCpu).includes('37%'), 'CPU row must show a usage bar like RAM');
+
+      const [t1, t2, t3] = fs.readFileSync(tickFile, 'utf8').split('|');
+      for (const t of [t1, t3]) {
+        assert(t.startsWith(`${ESC}7`) && t.endsWith(`${ESC}8`), 'live tick must save and restore the cursor');
+        assert(!t.includes('\n'), 'live tick must never print a newline (the screen must not scroll)');
+      }
+      assert(t1.includes(`${ESC}[${rowTime};1H`) && !t1.includes(`${ESC}[${rowCpu};1H`), 'first tick only redraws the TIME row');
+      assert(stripAnsi(t1).includes(cols >= 80 ? '● live' : '●'), 'TIME row must show the live marker while live');
+      assert.strictEqual(t2, '', 'a tick without changes must not send anything');
+      assert(t3.includes(`${ESC}[${rowCpu};1H`) && !t3.includes(`${ESC}[${rowRam};1H`), 'only changed rows are redrawn');
+      const cpuMove = `${ESC}[${rowCpu};1H`;
+      const seg = t3.slice(t3.indexOf(cpuMove) + cpuMove.length, t3.indexOf(`${ESC}[K`, t3.indexOf(cpuMove)));
+      const full = fs.readFileSync(fullFile, 'utf8').split('\n');
+      assert.strictEqual(seg, full[rowCpu - 1], `live CPU row must match a full render mode=${mode} cols=${cols}`);
+      assert(stripAnsi(seg).includes('91%'), 'live CPU row must show the new value');
+      if (cols >= 80) assert(stripAnsi(seg).includes('3.10'), 'live CPU row must show the new load on wide screens');
+      assert(r.stdout.includes('LIVE_BLOCKED'), 'live must stay off when stdout is not a terminal');
+      const menuRowsPrinted = fs.readFileSync(`${outFile}.menu`, 'utf8').split('\n').length - 1;
+      assert(r.stdout.includes(`MENU_ROWS ${menuRowsPrinted}\n`), `UI_ROWS must count the main menu lines mode=${mode} cols=${cols}`);
+    }
+  }
+
+  // Pembacaan /proc: RAM memakai MemAvailable, CPU% dari selisih /proc/stat
+  // dikurangi CPU menu sendiri (utime+stime+cutime+cstime), sampel tanpa
+  // kemajuan tidak mengubah angka, dan /proc yang tidak terbaca tidak membuat
+  // menu mati di bawah set -euo pipefail.
+  const procDir = path.join(tmpDir, 'proc');
+  const procSh = path.join(tmpDir, 'proc.sh');
+  fs.writeFileSync(procSh, `set -euo pipefail\n${collect}\n` +
+    `P='${toBashPath(procDir)}'\nmkdir -p "$P/$$"\nDASH_PROC_DIR="$P"\n` +
+    `printf 'MemTotal: 2000000 kB\\nMemFree: 300000 kB\\nMemAvailable: 1500000 kB\\nBuffers: 1000 kB\\nCached: 2000 kB\\nSwapCached: 0 kB\\nSwapTotal: 1048576 kB\\nSwapFree: 524288 kB\\n' > "$P/meminfo"\n` +
+    `printf 'cpu  100 0 100 800 0 0 0 0 0 0\\n' > "$P/stat"\n` +
+    `printf '1234 (menu (x)) S 1 1 1 0 -1 0 0 0 0 0 10 10 0 0 20 0\\n' > "$P/$$/stat"\n` +
+    `printf '0.50 0.40 0.30 1/100 999\\n' > "$P/loadavg"\n` +
+    `printf '90061.5 1000.0\\n' > "$P/uptime"\n` +
+    'D_CPU_PCT=""; D_TIME="-"\n' +
+    'dashboard_live_sample\n' +
+    'echo "A ${D_RAM_USED} ${D_RAM_TOTAL} ${D_RAM_PCT} ${D_SWAP_USED} ${D_SWAP_TOTAL} ${D_LOAD1} [${D_UPTIME}] [${D_CPU_PCT}]"\n' +
+    `printf 'cpu  300 0 200 1300 100 0 0 0 0 0\\n' > "$P/stat"\n` +
+    `printf '1234 (menu (x)) S 1 1 1 0 -1 0 0 0 0 0 30 20 50 0 20 0\\n' > "$P/$$/stat"\n` +
+    'dashboard_live_sample\necho "B ${D_CPU_PCT}"\n' +
+    'dashboard_live_sample\necho "C ${D_CPU_PCT}"\n' +
+    'DASH_PROC_DIR=/tidak/ada; dashboard_live_sample; echo "D ${D_RAM_PCT}"\n' +
+    'if [[ "${D_TIME}" != "-" && -n "${D_TIME}" ]]; then echo "T ok"; fi\n');
+  const proc = spawnSync(bash, [toBashPath(procSh)], { encoding: 'utf8' });
+  assert.strictEqual(proc.status, 0, `dashboard_live_sample failed:\n${proc.stderr}`);
+  const procLines = proc.stdout.trim().split('\n');
+  assert.deepStrictEqual(procLines, ['A 488 1953 25 512 1024 0.50 [1d 1h 1m] []', 'B 24', 'C 24', 'D 25', 'T ok'],
+    `unexpected /proc sample:\n${proc.stdout}`);
+
+  // Prompt live: read -t yang habis waktunya menjalankan satu siklus live,
+  // pilihan yang diketik tetap diterima, perubahan ukuran terminal
+  // menghentikan live tanpa menggambar apa pun, idle menghentikan live sambil
+  // menghapus penanda, dan EOF tetap batal seperti prompt_input.
+  const liveLoop = extract(menuRuntime, 'menu_read_choice_live() {', '\n}\n') + '\n}\n';
+  const loopSh = path.join(tmpDir, 'loop.sh');
+  const loopCase = (actions, idle) => `
+DASHBOARD_LIVE_SECONDS=2; DASHBOARD_LIVE_IDLE_MINUTES=${idle}; DASH_LIVE_ON=0; DASH_WINCH=0
+ACTIONS=(${actions}); READ_LOG=""; TICKS=""; m=""; rc=0
+menu_read_choice_live m 'PROMPT> ' || rc=$?
+echo "RESULT m=\${m} rc=\${rc} reads=\${READ_LOG} ticks=\${TICKS} live=\${DASH_LIVE_ON} trap=[$(trap -p WINCH)]"
+`;
+  fs.writeFileSync(loopSh, `set -euo pipefail\n${liveLoop}\n` +
+    'cancelled() { echo "Dibatalkan."; }\n' +
+    'dashboard_live_tick() { TICKS+="${DASH_LIVE_ON}"; }\n' +
+    'read() {\n' +
+    '  local last="${!#}" act="${ACTIONS[0]}"\n' +
+    '  ACTIONS=("${ACTIONS[@]:1}")\n' +
+    '  case " $* " in *" -t "*) READ_LOG+="t" ;; *) READ_LOG+="b" ;; esac\n' +
+    '  case "${act}" in\n' +
+    '    timeout) return 142 ;;\n' +
+    '    winch) DASH_WINCH=1; return 142 ;;\n' +
+    '    eof) return 1 ;;\n' +
+    '    value:*) printf -v "${last}" \'%s\' "${act#value:}"; return 0 ;;\n' +
+    '  esac\n' +
+    '}\n' +
+    'MENU_INPUT_TTY=/dev/null\n' +
+    loopCase('timeout timeout value:3', 10) +
+    loopCase('winch value:5', 10) +
+    loopCase('timeout value:7', 0) +
+    loopCase('eof', 10));
+  const loop = spawnSync(bash, [toBashPath(loopSh)], { encoding: 'utf8' });
+  assert.strictEqual(loop.status, 0, `menu_read_choice_live failed:\n${loop.stderr}`);
+  const results = loop.stdout.split('\n').filter((l) => l.includes('RESULT')).map((l) => l.slice(l.indexOf('RESULT')));
+  assert.deepStrictEqual(results, [
+    'RESULT m=3 rc=0 reads=ttt ticks=11 live=0 trap=[]',
+    'RESULT m=5 rc=0 reads=tb ticks= live=0 trap=[]',
+    'RESULT m=7 rc=0 reads=tb ticks=0 live=0 trap=[]',
+    'RESULT m= rc=130 reads=t ticks= live=0 trap=[]'
+  ], `unexpected live prompt flow:\n${loop.stdout}`);
+  assert(loop.stdout.includes('PROMPT> '), 'the prompt must be printed once before waiting');
+  assert(loop.stdout.includes('Dibatalkan.'), 'EOF must be reported as cancelled like prompt_input');
+  assert(/dashboard_live_allowed; then\n\s+menu_read_choice_live m /.test(mainLoop), 'main menu must use the live prompt only when allowed');
 
   console.log('menu ui tests passed');
 } finally {

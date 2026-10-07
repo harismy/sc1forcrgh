@@ -1,0 +1,229 @@
+{
+  "note": "Salinan identik ada di BotVPN test/fixtures/sc1forcr-account-messages.json dan repo SC scripts/fixtures/account-message-parity.json. Teks expected = output menu print_created_account = pesan BotVPN setelah * dan ` dibuang dan baris footer toko dihapus.",
+  "cases": [
+    {
+      "name": "ssh-create-zivpn",
+      "type": "ssh",
+      "mode": "create",
+      "data": {
+        "hostname": "id1.example.com",
+        "username": "budi",
+        "password": "rahasia1",
+        "exp": "2026-11-06 14:05:09",
+        "time": "14:05:09",
+        "city": "Jakarta",
+        "isp": "PT Contoh Net",
+        "port": {
+          "tls": "443",
+          "none": "80",
+          "tls_all": "443, 8443, 2053",
+          "none_all": "80, 8080, 8880",
+          "ovpntcp": "1194",
+          "ovpnudp": "2200",
+          "sshohp": "8181",
+          "udpgw": "7300,7200"
+        },
+        "ws_path": "/ssh-ws",
+        "ws_alt_path": "/ws",
+        "udpgw": {
+          "mode": "badvpn",
+          "ports": [
+            "7300",
+            "7200"
+          ],
+          "notes": "Untuk VC/telp/game di SSH/SSHWS, set badvpn/udpgw ke salah satu port ini."
+        },
+        "limitip": "2",
+        "quota": "0"
+      },
+      "expected": "=============================\n SSH ACCOUNT CREATED\n=============================\n\n[ SSH PREMIUM DETAILS ]\n-----------------------------\nSSH WS      : id1.example.com:80@budi:rahasia1\nSSH SSL     : id1.example.com:443@budi:rahasia1\n\n[ HOST INFORMATION ]\n-----------------------------\nHostname    : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\nUsername    : budi\nPassword    : rahasia1\nExpiry Date : 2026-11-06 14:05:09\nExpiry Time : 14:05:09\nQuota       : Unlimited\nIP Limit    : 2\n\n[ PORTS ]\n------------------------------\nTLS         : 443, 8443, 2053\nNon-TLS     : 80, 8080, 8880\nUDPGW       : 7300,7200\n\n[ PAYLOAD WS ]\n------------------------------\nGET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]\n\n[ PAYLOAD ENHANCED + SPLIT ]\n------------------------------\nPATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]\n------------------------------\nTerima kasih telah menggunakan layanan kami."
+    },
+    {
+      "name": "ssh-trial-udpcustom",
+      "type": "ssh",
+      "mode": "trial",
+      "data": {
+        "hostname": "id1.example.com",
+        "username": "trial0421",
+        "password": "trial0421",
+        "exp": "2026-10-07 15:05:09",
+        "time": "14:05:09",
+        "city": "Jakarta",
+        "isp": "PT Contoh Net",
+        "port": {
+          "tls": "443",
+          "none": "80",
+          "tls_all": "443",
+          "none_all": "80",
+          "ovpntcp": "1194",
+          "ovpnudp": "2200",
+          "sshohp": "8181",
+          "udpgw": "7300,7200",
+          "udpcustom": "5667"
+        },
+        "ws_path": "/ssh-ws",
+        "ws_alt_path": "/ws",
+        "udpgw": {
+          "mode": "badvpn",
+          "ports": [
+            "7300",
+            "7200"
+          ],
+          "notes": "Untuk VC/telp/game di SSH/SSHWS, set badvpn/udpgw ke salah satu port ini."
+        },
+        "limitip": "1",
+        "quota": "10"
+      },
+      "expected": "=============================\n TRIAL SSH ACCOUNT\n=============================\n\n[ SSH PREMIUM DETAILS ]\n-----------------------------\nSSH WS      : id1.example.com:80@trial0421:trial0421\nSSH SSL     : id1.example.com:443@trial0421:trial0421\n\n[ HOST INFORMATION ]\n-----------------------------\nHostname    : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\nUsername    : trial0421\nPassword    : trial0421\nExpiry Date : 2026-10-07 15:05:09\nExpiry Time : 15:05:09\nQuota       : 10 GB\nIP Limit    : 1\n\n[ PORTS ]\n------------------------------\nTLS         : 443\nNon-TLS     : 80\nUDPGW       : 7300,7200\nUDP Custom  : 5667\n\n[ PAYLOAD WS ]\n------------------------------\nGET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]\n\n[ PAYLOAD ENHANCED + SPLIT ]\n------------------------------\nPATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]\n------------------------------\nTerima kasih telah menggunakan layanan kami."
+    },
+    {
+      "name": "vmess-create-multipath",
+      "type": "vmess",
+      "mode": "create",
+      "data": {
+        "hostname": "id1.example.com",
+        "username": "citra",
+        "uuid": "f5029bdf-8cf4-426a-ae59-b58c429fbcdc",
+        "expired": "2026-11-06 14:05:09",
+        "exp": "2026-11-06 14:05:09",
+        "time": "14:05:09",
+        "wildcard_hosts": [],
+        "front_hosts": [],
+        "city": "Jakarta",
+        "isp": "PT Contoh Net",
+        "port": {
+          "tls": "443",
+          "none": "80",
+          "tls_all": "443, 8443, 2053",
+          "none_all": "80, 8080, 8880",
+          "any": "443",
+          "grpc": "443"
+        },
+        "path": {
+          "ws": "/vmess",
+          "stn": "/vmess",
+          "multi": "/yourbug",
+          "upgrade": "/upvmess",
+          "aliases": [
+            "/vmess"
+          ],
+          "any": true
+        },
+        "serviceName": "vmess-grpc",
+        "limitip": "1",
+        "iplimit": "1",
+        "quota": "50",
+        "link": {
+          "tls": "vmess://ws-tls",
+          "none": "vmess://ws-ntls",
+          "grpc": "vmess://grpc",
+          "uptls": "vmess://up-tls",
+          "upntls": "vmess://up-ntls",
+          "onering": "vmess://onering"
+        },
+        "bug_profile": null
+      },
+      "expected": "=============================\n        VMESS ACCOUNT\n=============================\n\n[ VMESS DETAILS ]\n-----------------------------\nREMARKS     : citra\nHOST        : id1.example.com\nPORT TLS    : 443, 8443, 2053\nPORT NTLS   : 80, 8080, 8880\nPORT GRPC   : 443\nPORT ANY    : 443\nUUID        : f5029bdf-8cf4-426a-ae59-b58c429fbcdc\nALTER ID    : 0\nSECURITY    : auto\nNETWORK     : ws, grpc, upgrade\nPATH WS     : /vmess atau path bebas\nSERVICE     : vmess-grpc\nPATH UPGRADE: /upvmess\nEXPIRED     : 2026-11-06 14:05:09\nQUOTA       : 50 GB\nIP LIMIT    : 1 pengguna\n\n[ VMESS URL ]\n-----------------------------\nTLS:\nvmess://ws-tls\n\nNon-TLS:\nvmess://ws-ntls\n\ngRPC:\nvmess://grpc\n\nUp TLS:\nvmess://up-tls\n\nUp Non-TLS:\nvmess://up-ntls\n\nOneRing (1FTunnel):\nvmess://onering\n\n[ HOST INFORMATION ]\n-----------------------------\nDomain      : id1.example.com\nSNI         : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\n\n[ PORTS ]\n-----------------------------\nWS TLS      : 443, 8443, 2053\nWS NTLS     : 80, 8080, 8880\nGRPC TLS    : 443\nANY PORT    : 443\n-----------------------------\nTerima kasih telah menggunakan layanan kami."
+    },
+    {
+      "name": "vless-trial-xhttp",
+      "type": "vless",
+      "mode": "trial",
+      "data": {
+        "hostname": "id1.example.com",
+        "username": "trial7788",
+        "uuid": "0b6f5a52-5d3c-4a8e-9f4e-3c2d1b0a9f8e",
+        "expired": "2026-10-07 15:05:09",
+        "exp": "2026-10-07 15:05:09",
+        "time": "14:05:09",
+        "wildcard_hosts": [],
+        "front_hosts": [],
+        "city": "Jakarta",
+        "isp": "PT Contoh Net",
+        "port": {
+          "tls": "443",
+          "none": "80",
+          "tls_all": "443",
+          "none_all": "80",
+          "any": "443",
+          "grpc": "443"
+        },
+        "path": {
+          "ws": "/vless",
+          "stn": "/vless",
+          "multi": "/yourbug/vless",
+          "upgrade": "/upvless",
+          "aliases": [
+            "/vless"
+          ],
+          "any": false,
+          "xhttp": "/xhvless"
+        },
+        "serviceName": "vless-grpc",
+        "limitip": "0",
+        "iplimit": "0",
+        "quota": "0",
+        "link": {
+          "tls": "vless://ws-tls",
+          "none": "vless://ws-ntls",
+          "grpc": "vless://grpc",
+          "uptls": "vless://up-tls",
+          "upntls": "vless://up-ntls",
+          "xhttptls": "vless://xh-tls",
+          "xhttpntls": "vless://xh-ntls",
+          "onering": "vless://onering"
+        }
+      },
+      "expected": "=============================\n    TRIAL VLESS ACCOUNT\n=============================\n\n[ VLESS DETAILS ]\n-----------------------------\nREMARKS     : trial7788\nHOST        : id1.example.com\nPORT TLS    : 443\nPORT NTLS   : 80\nPORT GRPC   : 443\nPORT ANY    : 443\nUUID        : 0b6f5a52-5d3c-4a8e-9f4e-3c2d1b0a9f8e\nENCRYPTION  : none\nSECURITY    : tls / none\nNETWORK     : ws, grpc, upgrade, xhttp\nPATH WS     : /vless\nSERVICE     : vless-grpc\nPATH UPGRADE: /upvless\nPATH XHTTP  : /xhvless\nEXPIRED     : 2026-10-07 15:05:09\nQUOTA       : Unlimited\nIP LIMIT    : Unlimited\n\n[ VLESS URL ]\n-----------------------------\nTLS:\nvless://ws-tls\n\nNon-TLS:\nvless://ws-ntls\n\ngRPC:\nvless://grpc\n\nUp TLS:\nvless://up-tls\n\nUp Non-TLS:\nvless://up-ntls\n\nXHTTP TLS:\nvless://xh-tls\n\nXHTTP Non-TLS:\nvless://xh-ntls\n\nOneRing (1FTunnel):\nvless://onering\n\n[ HOST INFORMATION ]\n-----------------------------\nDomain      : id1.example.com\nSNI         : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\n\n[ PORTS ]\n-----------------------------\nWS TLS      : 443\nWS NTLS     : 80\nGRPC TLS    : 443\nANY PORT    : 443\n-----------------------------\nTerima kasih telah menggunakan layanan kami."
+    },
+    {
+      "name": "trojan-create",
+      "type": "trojan",
+      "mode": "create",
+      "data": {
+        "hostname": "id1.example.com",
+        "username": "dewi",
+        "password": "9a1c3e5f-7b2d-4f6a-8c0e-1d3f5a7b9c2e",
+        "uuid": "9a1c3e5f-7b2d-4f6a-8c0e-1d3f5a7b9c2e",
+        "expired": "2026-11-06 14:05:09",
+        "exp": "2026-11-06 14:05:09",
+        "time": "14:05:09",
+        "wildcard_hosts": [],
+        "front_hosts": [],
+        "city": "Jakarta",
+        "isp": "PT Contoh Net",
+        "port": {
+          "tls": "443",
+          "none": "80",
+          "tls_all": "443, 8443",
+          "none_all": "80, 8080",
+          "any": "443",
+          "grpc": "443"
+        },
+        "path": {
+          "ws": "/trojan",
+          "stn": "/trojan",
+          "multi": "/yourbug/trojan",
+          "upgrade": "/uptrojan",
+          "aliases": [
+            "/trojan"
+          ],
+          "any": true
+        },
+        "serviceName": "trojan-grpc",
+        "limitip": "2",
+        "iplimit": "2",
+        "quota": "100",
+        "link": {
+          "tls": "trojan://ws-tls",
+          "none": "trojan://ws-ntls",
+          "grpc": "trojan://grpc",
+          "uptls": "trojan://up-tls",
+          "upntls": "trojan://up-ntls",
+          "onering": "trojan://onering"
+        }
+      },
+      "expected": "=============================\n        TROJAN ACCOUNT\n=============================\n\n[ TROJAN DETAILS ]\n-----------------------------\nREMARKS     : dewi\nHOST        : id1.example.com\nPORT TLS    : 443, 8443\nPORT NTLS   : 80, 8080\nPORT GRPC   : 443\nPORT ANY    : 443\nPASSWORD    : 9a1c3e5f-7b2d-4f6a-8c0e-1d3f5a7b9c2e\nSECURITY    : tls / none\nNETWORK     : ws, grpc, upgrade\nPATH WS     : /trojan atau path bebas\nSERVICE     : trojan-grpc\nPATH UPGRADE: /uptrojan\nEXPIRED     : 2026-11-06 14:05:09\nQUOTA       : 100 GB\nIP LIMIT    : 2 pengguna\n\n[ TROJAN URL ]\n-----------------------------\nTLS:\ntrojan://ws-tls\n\nNon-TLS:\ntrojan://ws-ntls\n\ngRPC:\ntrojan://grpc\n\nUp TLS:\ntrojan://up-tls\n\nUp Non-TLS:\ntrojan://up-ntls\n\nOneRing (1FTunnel):\ntrojan://onering\n\n[ HOST INFORMATION ]\n-----------------------------\nDomain      : id1.example.com\nSNI         : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\n\n[ PORTS ]\n-----------------------------\nWS TLS      : 443, 8443\nWS NTLS     : 80, 8080\nGRPC TLS    : 443\nANY PORT    : 443\n-----------------------------\nTerima kasih telah menggunakan layanan kami."
+    }
+  ]
+}

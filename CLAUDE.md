@@ -252,6 +252,15 @@ Menu (`menu-sc-1forcr`, heredoc `MENU_SCRIPT_EOF`) memakai mesin tampilan `ui_*`
 - `trap ... RETURN` yang dipasang fungsi yang dipanggil **menimpa** trap RETURN pemanggilnya. Fungsi yang memanggil collector (yang punya trap sendiri) wajib memasang trap cleanup-nya **setelah** pemanggilan itu; kalau tidak, file temp-nya bocor tiap refresh.
 - Test: `npm run test:menu-ui` menggambar dashboard dan menu di 5 lebar layar, 4 mode warna, dan 2 locale, lalu memastikan semua bingkai lurus. Test yang sama memeriksa warna pesan `echo` (termasuk kasus yang tidak boleh salah warna, seperti "Cooldown gagal : 15 menit" dan "Jika ... gagal") dan bahwa echo tanpa terminal tetap polos.
 
+### Detail akun: menu = BotVPN
+
+Detail akun SSH dan Xray (buat dan trial) di menu (`print_created_account`) harus sama persis dengan pesan bot penjualan BotVPN (`modules/accountMessages.js` di repo BotVPN). Bot hanya menambah tanda Markdown (`*`, `` ` ``) dan baris footer toko.
+
+- Teks yang diharapkan ada di [scripts/fixtures/account-message-parity.json](scripts/fixtures/account-message-parity.json), dengan salinan identik di BotVPN `test/fixtures/sc1forcr-account-messages.json`. Kalau tampilan diubah, jalankan `node scripts/test-account-message-parity.js --update`, salin fixture ke BotVPN, dan samakan formatter bot. Test: `npm run test:account-parity` di sini dan `test/accountMessages.test.js` di BotVPN.
+- Hanya tampilkan layanan yang dipasang SC. OpenVPN, SSH OHP, SlowDNS, dan web config port 81 tidak ada. API tetap mengirim kunci `ovpntcp`/`ovpnudp`/`sshohp`, karena bot lain membacanya tanpa nilai cadangan. BotVPN mengenali server SC dari respons (`isSc1forcrPayload`) lalu menyembunyikannya; server script lain tetap mendapat baris lama.
+- `port.udpcustom` hanya dikirim saat backend UDP Custom aktif (`udpcustomPublicPort`). Backend dibaca dari `.env` API, karena menu menggantinya tanpa restart API.
+- Parser `app.js` BotVPN membaca ulang pesan akun (`extractAccountLinksFromMessage`, `getCreateMessageField`) untuk menyimpan link dan membuat config otomatis. Urutan link TLS, Non-TLS, gRPC, Up TLS, Up Non-TLS harus tetap, dan label lain di pesan bot harus tetap tebal.
+
 ### Tampilan installer
 
 Layar input domain di awal dan layar ringkasan di akhir install digambar mesin `iui_*` (blok bertanda `installer-ui` di installer). Mesin `ui_*` milik menu hidup di dalam script menu hasil generate dan belum ada saat installer jalan, jadi `iui_*` adalah versi ringkasnya dengan palet, bingkai, lebar (40–78 kolom), dan aturan mode warna yang sama.

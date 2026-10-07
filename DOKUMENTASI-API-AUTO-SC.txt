@@ -213,16 +213,25 @@ Response data utama:
   "port": {
     "tls": "443",
     "none": "80",
+    "tls_all": "443, 8443, 2053, 2083, 2087, 2096",
+    "none_all": "80, 8080, 8880, 2052, 2082, 2086, 2095",
     "ovpntcp": "1194",
     "ovpnudp": "2200",
     "sshohp": "8181",
-    "udpgw": "7300,7200"
+    "udpgw": "7300,7200",
+    "udpcustom": "5667"
   },
   "ws_path": "/ssh-ws",
   "ws_alt_path": "/ws",
   "limitip": "1",
   "quota": "100"
 }
+
+Catatan port:
+- tls_all / none_all : semua port TLS/non-TLS aktif (443/80 plus port tambahan).
+- udpcustom          : hanya ada kalau backend UDP Custom aktif.
+- ovpntcp, ovpnudp, sshohp : hanya untuk kompatibilitas bot lama. SC tidak
+  memasang OpenVPN maupun OHP, jadi jangan ditampilkan ke pembeli.
 
 
 Buat Trial SSH

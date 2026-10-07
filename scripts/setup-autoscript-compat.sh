@@ -199,7 +199,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.96}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.97}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -8713,8 +8713,25 @@ app.get('/vps/my-accounts', async (req, res) => {
   }
 });
 
+// Port UDP Custom hanya dikirim saat backend UDP Custom aktif. ZIVPN memakai
+// port yang sama, jadi saat backend ZIVPN layanan UDP Custom memang mati.
+function udpcustomPublicPort() {
+  const backend = String(readServiceToggles().ACTIVE_UDP_BACKEND || process.env.ACTIVE_UDP_BACKEND || 'zivpn').trim().toLowerCase();
+  if (!['udpcustom', 'udp-custom', 'udphc'].includes(backend)) return '';
+  try {
+    const listen = String(JSON.parse(fs.readFileSync(UDPCUSTOM_CONFIG, 'utf8'))?.listen || '');
+    const match = listen.match(/:(\d{1,5})$/);
+    if (match) return match[1];
+  } catch (_) {}
+  return String(Number(process.env.UDPCUSTOM_LISTEN_PORT) || 5667);
+}
+
+// ovpntcp/ovpnudp/sshohp tetap dikirim supaya bot lain yang membacanya tanpa
+// nilai cadangan tidak menampilkan "undefined", walau SC tidak memasang
+// OpenVPN maupun OHP. Menu dan BotVPN tidak menampilkannya.
 function sshPayload(username, password, expDate, limitip, location = null, quota = 0) {
   const udpgwPorts = SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'];
+  const udpcustomPort = udpcustomPublicPort();
   return {
     hostname: DOMAIN,
     username,
@@ -8723,7 +8740,10 @@ function sshPayload(username, password, expDate, limitip, location = null, quota
     time: nowTime(),
     city: sanitizeInfoText(location?.city || '-'),
     isp: sanitizeInfoText(location?.isp || '-'),
-    port: publicPorts({ ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: udpgwPorts.join(',') }),
+    port: publicPorts({
+      ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: udpgwPorts.join(','),
+      ...(udpcustomPort ? { udpcustom: udpcustomPort } : {})
+    }),
     ws_path: '/ssh-ws',
     ws_alt_path: '/ws',
     udpgw: {
@@ -8875,7 +8895,8 @@ function validateSshUsername(usernameRaw) {
 // Layanan yang dimatikan lewat menu ON/OFF LAYANAN (sc-1forcr-service-gate).
 // Trafiknya sudah ditolak di iptables; di sini akun baru ikut ditolak supaya
 // pembeli tidak membayar layanan yang mati. Dibaca ulang dari .env (cache per
-// mtime/ukuran), jadi mengubah status tidak perlu restart API.
+// mtime/ukuran), jadi mengubah status tidak perlu restart API. Backend UDP
+// aktif ikut dibaca dari sini karena menu menggantinya tanpa restart API.
 const SERVICE_TOGGLE_ENV_PATH = `${__dirname}/.env`;
 let serviceToggleCache = { stamp: '', values: {} };
 function readServiceToggles() {
@@ -8885,7 +8906,7 @@ function readServiceToggles() {
     if (stamp !== serviceToggleCache.stamp) {
       const values = {};
       for (const line of fs.readFileSync(SERVICE_TOGGLE_ENV_PATH, 'utf8').split('\n')) {
-        const match = line.match(/^(SERVICE_[A-Z]+_ENABLE)=(.*)$/);
+        const match = line.match(/^(SERVICE_[A-Z]+_ENABLE|ACTIVE_UDP_BACKEND)=(.*)$/);
         if (match) values[match[1]] = match[2].replace(/["'\r]/g, '').trim();
       }
       serviceToggleCache = { stamp, values };
@@ -24548,17 +24569,45 @@ created_expiry_time() {
   fi
 }
 
+# Teks detail akun di sini harus sama dengan pesan akun BotVPN
+# (modules/accountMessages.js). Fixture bersama di
+# scripts/fixtures/account-message-parity.json dijaga test:account-parity.
 created_quota_text() {
   local quota="$1"
   if [[ "${quota}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    printf '%s GB' "${quota}"
+    if [[ "${quota}" =~ ^0+([.]0+)?$ ]]; then
+      printf 'Unlimited'
+    else
+      printf '%s GB' "${quota}"
+    fi
   else
     printf '%s' "${quota:--}"
   fi
 }
 
+# Limit IP 0 berarti tidak dibatasi. Argumen kedua ditempel hanya ke angka.
+created_limit_text() {
+  local limit="$1" suffix="${2:-}"
+  if [[ "${limit}" =~ ^0+$ ]]; then
+    printf 'Unlimited'
+  else
+    printf '%s%s' "${limit:--}" "${suffix}"
+  fi
+}
+
+# Expired Xray: tanggal API sudah memuat jam, jadi jam terpisah hanya ditempel
+# kalau tanggalnya belum memuat jam.
+created_expired_text() {
+  local expired="$1" time_value="$2"
+  if [[ "${expired}" =~ [0-9]{2}:[0-9]{2}:[0-9]{2} || "${expired}" == *" - "* || -z "${time_value}" ]]; then
+    printf '%s' "${expired}"
+  else
+    printf '%s - %s' "${expired}" "${time_value}"
+  fi
+}
+
 print_created_account() {
-  local type="$1" raw="$2"
+  local type="$1" raw="$2" mode="${3:-create}"
   local code err_msg
   code="$(echo "${raw}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
   if [[ "${code}" != "200" ]]; then
@@ -24569,34 +24618,35 @@ print_created_account() {
 
   case "${type}" in
     ssh)
-      local host user pass exp exp_time lim city isp tls ntls tls_list ntls_list dns ovpn_tcp ovpn_udp ssh_ohp udp_custom
+      # OpenVPN, SSH OHP, dan SlowDNS tidak dipasang SC, jadi tidak ditampilkan
+      # walau API masih mengirim kunci ovpntcp/ovpnudp/sshohp untuk bot lama.
+      local title host user pass exp exp_time quota lim city isp tls ntls tls_list ntls_list udpgw udp_custom
+      title="SSH ACCOUNT CREATED"
+      [[ "${mode}" == "trial" ]] && title="TRIAL SSH ACCOUNT"
       host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
       user="$(created_json_value "${raw}" '.data.username')"
       pass="$(created_json_value "${raw}" '.data.password // .data.secret')"
       exp="$(created_json_value "${raw}" '.data.exp // .data.expired // .data.date_exp')"
       exp_time="$(created_expiry_time "${exp}" "$(created_json_value "${raw}" '.data.time')")"
-      lim="$(created_json_value "${raw}" '.data.limitip // .data.iplimit' '0')"
+      quota="$(created_quota_text "$(created_json_value "${raw}" '.data.quota // .data.kuota // .data.quota_gb' '0')")"
+      lim="$(created_limit_text "$(created_json_value "${raw}" '.data.limitip // .data.iplimit' '0')")"
       city="$(created_json_value "${raw}" '.data.city // .data.location.city')"
       isp="$(created_json_value "${raw}" '.data.isp // .data.location.isp')"
       tls="$(created_json_value "${raw}" '.data.port.tls // .data.port.ssl // .data.port.any' '443')"
       ntls="$(created_json_value "${raw}" '.data.port.none // .data.port.ntls // .data.port.ws' '80')"
       tls_list="$(created_json_value "${raw}" '.data.port.tls_all' "${tls}")"
       ntls_list="$(created_json_value "${raw}" '.data.port.none_all' "${ntls}")"
-      dns="$(created_json_value "${raw}" '.data.port.dns // .data.port.dnsslow // .data.port.dnslow')"
-      ovpn_tcp="$(created_json_value "${raw}" '.data.port.ovpntcp // .data.port.ovpn_tcp' '1194')"
-      ovpn_udp="$(created_json_value "${raw}" '.data.port.ovpnudp // .data.port.ovpn_udp' '2200')"
-      ssh_ohp="$(created_json_value "${raw}" '.data.port.sshohp // .data.port.ssh_ohp' '8181')"
-      udp_custom="$(created_json_value "${raw}" '.data.port.udpcustom // .data.port.udp_custom // .data.port.udphc // .data.udpcustom_port // .data.udp_custom_port')"
+      udpgw="$(created_json_value "${raw}" '.data.port.udpgw' '')"
+      udp_custom="$(created_json_value "${raw}" '.data.port.udpcustom // .data.port.udp_custom // .data.port.udphc' '')"
       cat <<EOT_SSH | ui_fx
 =============================
- SSH ACCOUNT CREATED
+ ${title}
 =============================
 
 [ SSH PREMIUM DETAILS ]
 -----------------------------
 SSH WS      : ${host}:${ntls}@${user}:${pass}
 SSH SSL     : ${host}:${tls}@${user}:${pass}
-DNS SELOW   : ${host}:${dns}@${user}:${pass}
 
 [ HOST INFORMATION ]
 -----------------------------
@@ -24607,16 +24657,21 @@ Username    : ${user}
 Password    : ${pass}
 Expiry Date : ${exp}
 Expiry Time : ${exp_time}
+Quota       : ${quota}
 IP Limit    : ${lim}
 
 [ PORTS ]
 ------------------------------
 TLS         : ${tls_list}
 Non-TLS     : ${ntls_list}
-OVPN TCP    : ${ovpn_tcp}
-OVPN UDP    : ${ovpn_udp}
-SSH OHP     : ${ssh_ohp}
-UDP Custom  : ${udp_custom}
+EOT_SSH
+      if [[ -n "${udpgw}" ]]; then
+        printf 'UDPGW       : %s\n' "${udpgw}" | ui_fx
+      fi
+      if [[ -n "${udp_custom}" ]]; then
+        printf 'UDP Custom  : %s\n' "${udp_custom}" | ui_fx
+      fi
+      cat <<EOT_SSH_PAYLOAD | ui_fx
 
 [ PAYLOAD WS ]
 ------------------------------
@@ -24624,11 +24679,10 @@ GET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[c
 
 [ PAYLOAD ENHANCED + SPLIT ]
 ------------------------------
-PATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection:
-Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]
+PATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]
 ------------------------------
 Terima kasih telah menggunakan layanan kami.
-EOT_SSH
+EOT_SSH_PAYLOAD
       ;;
     zivpn)
       local host user exp exp_time lim city isp udp_port backend
@@ -24668,20 +24722,18 @@ Terima kasih telah menggunakan layanan kami.
 EOT_ZIVPN
       ;;
     vmess|vless|trojan)
-      local title host user secret exp exp_time exp_text quota lim city isp domain sni tls none grpc any_port path_ws path_upgrade service_name
+      local title heading host user secret exp exp_text quota lim city isp domain sni tls none grpc any_port path_ws path_upgrade service_name network
       local linktls linknone linkgrpc linkuptls linkupntls linkxhttptls linkxhttpntls linkonering path_xhttp
       title="${type^^}"
+      heading="        ${title} ACCOUNT"
+      [[ "${mode}" == "trial" ]] && heading="    TRIAL ${title} ACCOUNT"
       host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
       user="$(created_json_value "${raw}" '.data.username')"
       secret="$(created_json_value "${raw}" '.data.uuid // .data.password // .data.secret // .data.id')"
       exp="$(created_json_value "${raw}" '.data.exp // .data.expired // .data.date_exp')"
-      exp_time="$(created_expiry_time "${exp}" "$(created_json_value "${raw}" '.data.time')")"
-      exp_text="${exp}"
-      if [[ "${exp}" != *" - "* && "${exp_time}" != "-" ]]; then
-        exp_text="${exp} - ${exp_time}"
-      fi
+      exp_text="$(created_expired_text "${exp}" "$(created_json_value "${raw}" '.data.time' '')")"
       quota="$(created_quota_text "$(created_json_value "${raw}" '.data.quota // .data.kuota // .data.quota_gb' '0')")"
-      lim="$(created_json_value "${raw}" '.data.limitip // .data.iplimit' '0')"
+      lim="$(created_limit_text "$(created_json_value "${raw}" '.data.limitip // .data.iplimit' '0')" ' pengguna')"
       city="$(created_json_value "${raw}" '.data.city // .data.location.city')"
       isp="$(created_json_value "${raw}" '.data.isp // .data.location.isp')"
       domain="$(created_json_value "${raw}" '.data.domain // .data.hostname // .data.host')"
@@ -24707,9 +24759,13 @@ EOT_ZIVPN
       linkxhttpntls="$(created_json_value "${raw}" '.data.link.xhttpntls // .data.link.xhttp_ntls' '')"
       linkonering="$(created_json_value "${raw}" '.data.link.onering' '')"
       path_xhttp="$(created_json_value "${raw}" '.data.path.xhttp' '')"
+      network="ws, grpc, upgrade"
+      if [[ -n "${linkxhttptls}" || -n "${linkxhttpntls}" ]]; then
+        network="${network}, xhttp"
+      fi
       cat <<EOT_XRAY | ui_fx
 =============================
-        ${title} ACCOUNT
+${heading}
 =============================
 
 [ ${title} DETAILS ]
@@ -24744,7 +24800,7 @@ EOT_TROJAN_DETAIL
           ;;
       esac
       cat <<EOT_XRAY_PATHS | ui_fx
-NETWORK     : ws, grpc, upgrade
+NETWORK     : ${network}
 PATH WS     : ${path_ws}
 SERVICE     : ${service_name}
 PATH UPGRADE: ${path_upgrade}
@@ -24755,7 +24811,7 @@ EOT_XRAY_PATHS
       cat <<EOT_XRAY_LINKS | ui_fx
 EXPIRED     : ${exp_text}
 QUOTA       : ${quota}
-IP LIMIT    : ${lim} pengguna
+IP LIMIT    : ${lim}
 
 [ ${title} URL ]
 -----------------------------
@@ -24774,15 +24830,11 @@ ${linkuptls}
 Up Non-TLS:
 ${linkupntls}
 EOT_XRAY_LINKS
-      if [[ -n "${linkxhttptls}" || -n "${linkxhttpntls}" ]]; then
-        cat <<EOT_XRAY_XHTTP | ui_fx
-
-XHTTP TLS:
-${linkxhttptls:--}
-
-XHTTP Non-TLS:
-${linkxhttpntls:--}
-EOT_XRAY_XHTTP
+      if [[ -n "${linkxhttptls}" ]]; then
+        printf '\nXHTTP TLS:\n%s\n' "${linkxhttptls}" | ui_fx
+      fi
+      if [[ -n "${linkxhttpntls}" ]]; then
+        printf '\nXHTTP Non-TLS:\n%s\n' "${linkxhttpntls}" | ui_fx
       fi
       if [[ -n "${linkonering}" ]]; then
         cat <<EOT_XRAY_ONERING | ui_fx
@@ -24919,7 +24971,7 @@ create_trial_account() {
       resp="$(api_call "POST" "${ep}" "$(jq -nc --arg u "${username}" --argjson e 1 --arg l "${limitip}" --arg q "0" '{username:$u,expired:$e,limitip:$l,kuota:$q}')")"
     fi
 
-    print_created_account "${type}" "${resp}"
+    print_created_account "${type}" "${resp}" trial
     code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
     if [[ "${code}" == "200" ]]; then
       schedule_trial_delete_1h "${type}" "${username}"

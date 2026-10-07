@@ -133,6 +133,9 @@ set -euo pipefail
 #   XRAY_MULTIPATH_ENABLE=1                      (path WS bebas untuk VMess/VLESS/Trojan; 0=hanya path standar)
 #   EXTRA_TLS_PORTS=8443,2053,2083,2087,2096     (port TLS tambahan -> 443; off=mati, port yang dipakai program lain dilewati)
 #   EXTRA_NTLS_PORTS=8080,8880,2052,2082,2086,2095 (port NTLS tambahan -> 80; off=mati)
+#   TUNNEL_LOCAL_GUARD_ENABLE=1                  (akun VPN tidak bisa menjangkau layanan lokal VPS, jaringan privat, dan metadata provider)
+#   SSH_BRUTE_GUARD_ENABLE=1                     (batas koneksi baru ke sshd per IP: 15/menit, burst 30)
+#   SSHD_HARDEN_ENABLE=1                         (sshd: forwarding hanya lokal, tanpa X11/tun, LoginGraceTime 30)
 #   SERVICE_SSH_ENABLE=1                         (menu ON/OFF LAYANAN: 0=tolak SSH-WS/SSL/Dropbear; sshd 22 tetap buka)
 #   SERVICE_VMESS_ENABLE=1                       (0=tolak trafik VMess tanpa restart Xray)
 #   SERVICE_VLESS_ENABLE=1                       (0=tolak trafik VLESS termasuk XHTTP)
@@ -196,7 +199,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.95}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.96}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -308,6 +311,9 @@ XRAY_XHTTP_ENABLE="${XRAY_XHTTP_ENABLE:-0}"
 XRAY_MULTIPATH_ENABLE="${XRAY_MULTIPATH_ENABLE:-1}"
 EXTRA_TLS_PORTS="${EXTRA_TLS_PORTS:-8443,2053,2083,2087,2096}"
 EXTRA_NTLS_PORTS="${EXTRA_NTLS_PORTS:-8080,8880,2052,2082,2086,2095}"
+TUNNEL_LOCAL_GUARD_ENABLE="${TUNNEL_LOCAL_GUARD_ENABLE:-1}"
+SSH_BRUTE_GUARD_ENABLE="${SSH_BRUTE_GUARD_ENABLE:-1}"
+SSHD_HARDEN_ENABLE="${SSHD_HARDEN_ENABLE:-1}"
 SERVICE_SSH_ENABLE="${SERVICE_SSH_ENABLE:-1}"
 SERVICE_VMESS_ENABLE="${SERVICE_VMESS_ENABLE:-1}"
 SERVICE_VLESS_ENABLE="${SERVICE_VLESS_ENABLE:-1}"
@@ -3169,7 +3175,8 @@ dropbear_runtime_args() {
   idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
   [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
   [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="300"
-  printf -- '-K %s -I %s' "${keepalive}" "${idle}"
+  # -w: tolak login root (admin lewat sshd); -k: tolak remote port forwarding.
+  printf -- '-w -k -K %s -I %s' "${keepalive}" "${idle}"
 }
 
 # Dropbear menolak start kalau file banner lebih dari 2000 byte ("Early exit:
@@ -5398,6 +5405,9 @@ XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
 XRAY_MULTIPATH_ENABLE=${XRAY_MULTIPATH_ENABLE}
 EXTRA_TLS_PORTS=${EXTRA_TLS_PORTS}
 EXTRA_NTLS_PORTS=${EXTRA_NTLS_PORTS}
+TUNNEL_LOCAL_GUARD_ENABLE=${TUNNEL_LOCAL_GUARD_ENABLE}
+SSH_BRUTE_GUARD_ENABLE=${SSH_BRUTE_GUARD_ENABLE}
+SSHD_HARDEN_ENABLE=${SSHD_HARDEN_ENABLE}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
 SERVICE_VMESS_ENABLE=${SERVICE_VMESS_ENABLE}
 SERVICE_VLESS_ENABLE=${SERVICE_VLESS_ENABLE}
@@ -7081,18 +7091,27 @@ function ensureTunnelShellAllowed() {
   return shell;
 }
 
+// Grup utama akun SSH. Pembatas trafik tunnel (sc-1forcr-tunnel-guard)
+// mengenali koneksi forwarding akun lewat grup ini. Kalau grup gagal dibuat,
+// akun tetap dibuat tanpa grup; watchdog memindahkannya nanti.
+const TUNNEL_GROUP = 'sc-1forcr-tunnel';
+function ensureTunnelGroup() {
+  return safeExec('getent', ['group', TUNNEL_GROUP]) || safeExec('groupadd', ['-r', '-f', TUNNEL_GROUP]);
+}
+
 function ensureLinuxUser(username, password, expDate) {
   username = validateSshUsername(username);
   password = validateSshPassword(password);
   const shell = ensureTunnelShellAllowed();
+  const groupArgs = ensureTunnelGroup() ? ['-g', TUNNEL_GROUP] : [];
   const exists = safeExec('id', ['-u', username]);
-  if (!exists && !safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', shell, username])) {
+  if (!exists && !safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', shell, ...groupArgs, username])) {
     throw new Error(`gagal membuat Linux user ${username}`);
   }
   if (!safeExec('chpasswd', [], `${username}:${password}\n`)) {
     throw new Error(`gagal mengubah password Linux user ${username}`);
   }
-  if (!safeExec('usermod', ['-d', `/home/${username}`, '-s', shell, username])) {
+  if (!safeExec('usermod', ['-d', `/home/${username}`, '-s', shell, ...groupArgs, username])) {
     throw new Error(`gagal mengamankan shell Linux user ${username}`);
   }
   const linuxExpDate = ymdFromDateExp(expDate);
@@ -16805,6 +16824,14 @@ if command -v iptables >/dev/null 2>&1; then
     iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || true
 fi
 
+# Pembatas trafik tunnel (layanan lokal/privat/metadata dan port penyalahgunaan)
+# dan batas brute force sshd: dipasang ulang kalau hilang. Dijalankan sebelum
+# gerbang ON/OFF supaya gerbang tetap menjadi aturan pertama.
+if [[ -x /usr/local/sbin/sc-1forcr-tunnel-guard ]]; then
+  /usr/local/sbin/sc-1forcr-tunnel-guard apply >/dev/null 2>&1 || \
+    log_health "GAGAL menerapkan pembatas trafik tunnel"
+fi
+
 # Layanan yang dimatikan lewat menu ON/OFF LAYANAN: gerbang iptables-nya
 # dipasang ulang kalau hilang (reboot tanpa netfilter-persistent) atau
 # tergeser dari puncak chain oleh rule ACCEPT di atas. Semua ON = no-op.
@@ -17256,6 +17283,9 @@ SETTINGS_KEYS = [
     "XRAY_MULTIPATH_ENABLE",
     "EXTRA_TLS_PORTS",
     "EXTRA_NTLS_PORTS",
+    "TUNNEL_LOCAL_GUARD_ENABLE",
+    "SSH_BRUTE_GUARD_ENABLE",
+    "SSHD_HARDEN_ENABLE",
     "SERVICE_SSH_ENABLE",
     "SERVICE_VMESS_ENABLE",
     "SERVICE_VLESS_ENABLE",
@@ -18126,6 +18156,9 @@ SETTINGS_KEYS = [
     "XRAY_MULTIPATH_ENABLE",
     "EXTRA_TLS_PORTS",
     "EXTRA_NTLS_PORTS",
+    "TUNNEL_LOCAL_GUARD_ENABLE",
+    "SSH_BRUTE_GUARD_ENABLE",
+    "SSHD_HARDEN_ENABLE",
     "SERVICE_SSH_ENABLE",
     "SERVICE_VMESS_ENABLE",
     "SERVICE_VLESS_ENABLE",
@@ -21877,6 +21910,561 @@ EXTRA_PORTS_EOF
   chmod 700 /usr/local/sbin/sc-1forcr-extra-ports
 }
 
+# ── Keamanan trafik tunnel ──────────────────────────────────────────────────
+# Dropbear versi lama tidak menurunkan hak akses setelah login, jadi koneksi
+# forwarding pengguna SSH-WS/Dropbear dibuka oleh proses root. ZIVPN dan UDP
+# Custom juga jalan sebagai root. Aturan iptables per-UID (! --uid-owner 0)
+# tidak berlaku untuk mereka, termasuk penjaga API Xray 10085. Ketiganya diberi
+# Group= khusus (user tetap root, akses file tidak berubah) supaya soketnya
+# bisa dikenali lewat -m owner --gid-owner. Akun SSH memakai grup yang sama
+# sebagai grup utama. Group= berlaku saat service itu restart berikutnya;
+# update aman sengaja tidak me-restart supaya pengguna tidak putus.
+TUNNEL_GROUP_NAME="sc-1forcr-tunnel"
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+install_tunnel_group_dropins() {
+  local unit dir file changed=0 content
+  if ! getent group "${TUNNEL_GROUP_NAME}" >/dev/null 2>&1; then
+    if ! groupadd -r "${TUNNEL_GROUP_NAME}" >/dev/null 2>&1; then
+      log "PERINGATAN: grup ${TUNNEL_GROUP_NAME} gagal dibuat; pembatas trafik Dropbear/UDP dilewati."
+      return 0
+    fi
+  fi
+  content="[Service]
+Group=${TUNNEL_GROUP_NAME}"
+  for unit in dropbear "${ZIVPN_SERVICE_NAME:-zivpn}" "${UDPCUSTOM_SERVICE_NAME:-sc-1forcr-udpcustom}"; do
+    dir="${SYSTEMD_UNIT_DIR}/${unit}.service.d"
+    file="${dir}/40-sc-1forcr-tunnel-group.conf"
+    if [[ -f "${file}" && "$(cat "${file}" 2>/dev/null)" == "${content}" ]]; then
+      continue
+    fi
+    mkdir -p "${dir}"
+    printf '%s\n' "${content}" > "${file}"
+    changed=1
+  done
+  if (( changed )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    log "Grup ${TUNNEL_GROUP_NAME} dipasang untuk Dropbear/ZIVPN/UDP Custom (aktif saat service restart berikutnya)."
+  fi
+  return 0
+}
+
+# Dropbear: tolak login root (-w; admin tetap lewat sshd port 22) dan remote
+# port forwarding (-k; aplikasi tunnel hanya memakai forwarding lokal). VPS
+# lama punya override tanpa flag ini. Flag disisipkan tanpa me-restart
+# Dropbear yang sedang jalan, jadi berlaku saat Dropbear restart berikutnya.
+ensure_dropbear_hardening_flags() {
+  local conf="${SYSTEMD_UNIT_DIR}/dropbear.service.d/override.conf" defaults="${DROPBEAR_DEFAULTS_FILE:-/etc/default/dropbear}" changed=0
+  if [[ -f "${conf}" ]] && grep -qE '^ExecStart=.*dropbear' "${conf}"; then
+    if ! grep -qE '^ExecStart=.*dropbear.* -w( |$)' "${conf}" || ! grep -qE '^ExecStart=.*dropbear.* -k( |$)' "${conf}"; then
+      sed -i -E '/^ExecStart=.*dropbear/{ s/ -w( |$)/\1/g; s/ -k( |$)/\1/g; s/ -F( |$)/ -F -w -k\1/; }' "${conf}"
+      changed=1
+    fi
+  fi
+  if [[ -f "${defaults}" ]] && ! grep -qE '^DROPBEAR_EXTRA_ARGS=.*(^|[" ])-w( |")' "${defaults}"; then
+    sed -i -E 's/^DROPBEAR_EXTRA_ARGS="/DROPBEAR_EXTRA_ARGS="-w -k /' "${defaults}"
+  fi
+  if (( changed )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if ! systemctl is-active --quiet dropbear; then
+      systemctl restart dropbear >/dev/null 2>&1 || true
+    fi
+    log "Dropbear: login root dan remote forwarding ditolak (aktif saat Dropbear restart berikutnya)."
+  fi
+  return 0
+}
+
+# sshd: forwarding hanya lokal (-L/-D; -R dipakai untuk menduduki port lokal
+# saat service restart lalu menyadap token API), tanpa forwarding socket
+# unix, X11, dan tun, plus batas waktu login. PasswordAuthentication dan
+# PermitRootLogin sengaja tidak disentuh supaya pemilik VPS tidak terkunci.
+# Divalidasi sshd -t sebelum reload; reload tidak memutus sesi yang ada.
+SSHD_CONFIG_FILE="${SSHD_CONFIG_FILE:-/etc/ssh/sshd_config}"
+SSHD_CONFIG_DIR="${SSHD_CONFIG_DIR:-/etc/ssh/sshd_config.d}"
+sshd_hardening_body() {
+  cat <<'SSHD_HARDEN_EOF'
+# Dikelola SC 1FORCR. Matikan dengan SSHD_HARDEN_ENABLE=0 di /etc/sc-1forcr.env.
+LoginGraceTime 30
+AllowTcpForwarding local
+AllowStreamLocalForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+SSHD_HARDEN_EOF
+}
+
+sshd_reload_if_active() {
+  local unit
+  for unit in ssh sshd; do
+    if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+      systemctl reload "${unit}" >/dev/null 2>&1 || true
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Sisipkan atau buang blok bertanda di awal sshd_config (dipakai kalau
+# sshd_config tidak memuat Include sshd_config.d). Nilai pertama yang menang
+# di sshd, jadi blok harus di paling atas.
+sshd_top_block() {
+  local mode="$1" file="${SSHD_CONFIG_FILE}" tmp
+  tmp="$(mktemp)"
+  awk '/^# >>> sc-1forcr hardening >>>$/{skip=1} !skip{print} /^# <<< sc-1forcr hardening <<<$/{skip=0}' "${file}" > "${tmp}.rest"
+  if [[ "${mode}" == "add" ]]; then
+    { echo "# >>> sc-1forcr hardening >>>"; sshd_hardening_body; echo "# <<< sc-1forcr hardening <<<"; cat "${tmp}.rest"; } > "${tmp}"
+  else
+    cat "${tmp}.rest" > "${tmp}"
+  fi
+  rm -f "${tmp}.rest"
+  if cmp -s "${tmp}" "${file}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  cat "${tmp}" > "${file}"
+  rm -f "${tmp}"
+  return 0
+}
+
+apply_sshd_hardening() {
+  local main="${SSHD_CONFIG_FILE}" dropin="${SSHD_CONFIG_DIR}/00-sc-1forcr.conf" backup changed=0 body
+  command -v sshd >/dev/null 2>&1 || return 0
+  [[ -f "${main}" ]] || return 0
+  # sshd -t gagal tanpa direktori privsep. Dengan socket activation (Ubuntu
+  # 24.04) direktori ini baru dibuat saat ada koneksi pertama.
+  mkdir -p -m 0755 /run/sshd >/dev/null 2>&1 || true
+  backup="$(mktemp)"
+  cp -a "${main}" "${backup}"
+  if [[ -f "${dropin}" ]]; then cp -a "${dropin}" "${backup}.dropin"; fi
+
+  if ! flag_enabled "${SSHD_HARDEN_ENABLE:-1}"; then
+    if [[ -f "${dropin}" ]]; then rm -f "${dropin}"; changed=1; fi
+    if sshd_top_block remove; then changed=1; fi
+  else
+    body="$(sshd_hardening_body)"
+    if grep -qiE '^[[:space:]]*Include[[:space:]]+[^#]*sshd_config\.d/\*\.conf' "${main}"; then
+      if [[ ! -f "${dropin}" || "$(cat "${dropin}")" != "${body}" ]]; then
+        mkdir -p "${SSHD_CONFIG_DIR}"
+        printf '%s\n' "${body}" > "${dropin}"
+        chmod 644 "${dropin}"
+        changed=1
+      fi
+      # Include ada tapi bisa saja berada setelah baris yang menimpa nilai
+      # kita (nilai pertama menang). Kalau belum efektif, pakai blok di atas.
+      if sshd -t >/dev/null 2>&1 && sshd -T 2>/dev/null | grep -qi '^allowtcpforwarding '; then
+        if ! sshd -T 2>/dev/null | grep -qi '^allowtcpforwarding local$'; then
+          if sshd_top_block add; then changed=1; fi
+        fi
+      fi
+    else
+      if sshd_top_block add; then changed=1; fi
+    fi
+  fi
+
+  if (( changed )); then
+    if ! sshd -t >/dev/null 2>&1; then
+      cat "${backup}" > "${main}"
+      if [[ -f "${backup}.dropin" ]]; then cp -a "${backup}.dropin" "${dropin}"; else rm -f "${dropin}"; fi
+      rm -f "${backup}" "${backup}.dropin"
+      log "PERINGATAN: config sshd hasil hardening tidak valid (sshd -t); config lama dipulihkan, sshd tidak di-reload."
+      return 0
+    fi
+    sshd_reload_if_active
+    log "Hardening sshd diterapkan: forwarding hanya lokal, tanpa X11/tun/socket unix, LoginGraceTime 30."
+  fi
+  rm -f "${backup}" "${backup}.dropin"
+  return 0
+}
+
+install_tunnel_guard_manager() {
+  mkdir -p /usr/local/sbin /var/lib/sc-1forcr
+  cat > /usr/local/sbin/sc-1forcr-tunnel-guard <<'TUNNEL_GUARD_EOF'
+#!/usr/bin/env bash
+# sc-1forcr-tunnel-guard {apply|status|clear}
+#
+# Membatasi koneksi yang dibuka atas nama pengguna VPN, supaya akun VPN tidak
+# bisa dipakai menyerang VPS ini atau server lain:
+# - Ke alamat VPS sendiri (127.0.0.1 dan IP publik): hanya DNS, 80/443, API
+#   (auth ZIVPN), dan UDPGW. sshd, Dropbear, API Xray 10085, mux 2082, dan
+#   listener nginx internal tidak bisa dijangkau lewat tunnel.
+# - Ke jaringan privat dan metadata provider (169.254.0.0/16, 10/8,
+#   172.16/12, 192.168/16, 100.64/10, fc00::/7, fe80::/10): hanya DNS.
+# - Port penyalahgunaan (SMTP/RDP/VNC/SMB, plus SSH kalau blokir SSH keluar
+#   aktif) juga ditolak untuk proses root pembawa trafik pengguna.
+# Pemilik trafik dikenali dari grup sc-1forcr-tunnel (akun SSH, Dropbear,
+# ZIVPN, UDP Custom) dan UID nobody (Xray). Hanya paket NEW yang diperiksa.
+#
+# Juga membatasi koneksi baru ke sshd per IP (brute force password root).
+# apply dipanggil install/update dan tiap siklus watchdog; iptables hanya
+# ditulis ulang kalau aturan yang diinginkan berubah atau hilang.
+set -uo pipefail
+
+ENV_FILE="${SC_ENV_FILE:-/etc/sc-1forcr.env}"
+GROUP="sc-1forcr-tunnel"
+STATE_FILE="${TUNNEL_GUARD_STATE_FILE:-/var/lib/sc-1forcr/tunnel-guard.state}"
+LOCK_FILE="${TUNNEL_GUARD_LOCK_FILE:-/run/sc-1forcr-tunnel-guard.lock}"
+OUT_CHAIN="SC1FORCR_TUN_OUT"
+LOCAL_CHAIN="SC1FORCR_TUN_LOCAL"
+PRIV_CHAIN="SC1FORCR_TUN_PRIV"
+SSH_CHAIN="SC1FORCR_SSH_GUARD"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}" >/dev/null 2>&1 || true
+  set +a
+fi
+TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
+
+# Tanpa proses baru (dipanggil berkali-kali tiap siklus watchdog).
+flag_on() {
+  local v="${1:-}"
+  v="${v,,}"
+  case "${v//[[:space:]]/}" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# Daftar port bersih, tanpa duplikat, dipisah koma.
+csv_ports() {
+  local p out="" seen="," all="$*"
+  all="${all//[,;]/ }"
+  for p in ${all}; do
+    p="${p//[!0-9]/}"
+    [[ -n "${p}" ]] || continue
+    p=$((10#${p}))
+    (( p >= 1 && p <= 65535 )) || continue
+    [[ "${seen}" == *",${p},"* ]] && continue
+    seen+="${p},"
+    out+="${out:+,}${p}"
+  done
+  printf '%s' "${out}"
+}
+
+# multiport menerima paling banyak 15 port per aturan.
+port_chunks() {
+  local csv="$1" p chunk="" n=0
+  for p in ${csv//,/ }; do
+    chunk+="${chunk:+,}${p}"
+    n=$((n + 1))
+    if (( n == 15 )); then printf '%s\n' "${chunk}"; chunk=""; n=0; fi
+  done
+  [[ -n "${chunk}" ]] && printf '%s\n' "${chunk}"
+  return 0
+}
+
+ensure_group() {
+  local line
+  line="$(getent group "${GROUP}" 2>/dev/null || true)"
+  if [[ -z "${line}" ]]; then
+    groupadd -r "${GROUP}" >/dev/null 2>&1 || return 1
+    line="$(getent group "${GROUP}" 2>/dev/null || true)"
+  fi
+  line="$(echo "${line}" | cut -d: -f3)"
+  [[ "${line}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${line}"
+}
+
+# Akun SSH (dikenali dari shell tunnel) yang grup utamanya belum grup tunnel.
+reconcile_users() {
+  local gid="$1" user fixed=0
+  while IFS= read -r user; do
+    [[ -n "${user}" && "${user}" != "root" ]] || continue
+    if usermod -g "${GROUP}" "${user}" >/dev/null 2>&1; then fixed=$((fixed + 1)); fi
+  done < <(getent passwd 2>/dev/null | awk -F: -v sh="${TUNNEL_SHELL}" -v g="${gid}" '$7 == sh && $4 != g { print $1 }')
+  USERS_FIXED="${fixed}"
+}
+
+# Port sshd yang dibatasi: listener sshd publik dan Port di config sshd.
+# Port milik SC (80/443/Dropbear) tidak pernah ikut.
+sshd_ports() {
+  local ports reserved=",80,443,109,143,${DROPBEAR_PORT:-109},${DROPBEAR_ALT_PORT:-143}," p out=""
+  ports="$( { ss -Htlnp 2>/dev/null | awk '/"sshd"/ { a=$4; sub(/.*:/, "", a); print a }'; sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }'; } | sort -u | tr '\n' ',')"
+  for p in ${ports//,/ }; do
+    [[ "${p}" =~ ^[0-9]+$ ]] || continue
+    [[ "${reserved}" == *",${p},"* ]] && continue
+    out+="${out:+,}${p}"
+  done
+  printf '%s' "$(csv_ports "${out:-22}")"
+}
+
+# Aturan yang diinginkan per keluarga alamat -> array global.
+build_rules() {
+  local fam="$1" chunk cidr
+  LOCAL_RULES=(); PRIV_RULES=(); OUT_RULES=(); OUT_JUMPS=(); SSH_RULES=(); SSH_JUMPS=()
+  if flag_on "${TUNNEL_LOCAL_GUARD_ENABLE:-1}"; then
+    LOCAL_RULES+=("-p udp --dport 53 -j RETURN")
+    while IFS= read -r chunk; do
+      [[ -n "${chunk}" ]] && LOCAL_RULES+=("-p tcp -m multiport --dports ${chunk} -j RETURN")
+    done < <(port_chunks "${LOCAL_ALLOW}")
+    LOCAL_RULES+=("-p tcp -j REJECT --reject-with tcp-reset" "-j REJECT")
+    PRIV_RULES=("-p udp --dport 53 -j RETURN" "-p tcp --dport 53 -j RETURN" "-p tcp -j REJECT --reject-with tcp-reset" "-j REJECT")
+    OUT_RULES+=("-m addrtype --dst-type LOCAL -j ${LOCAL_CHAIN}")
+    if [[ "${fam}" == "4" ]]; then
+      for cidr in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+        OUT_RULES+=("-d ${cidr} -j ${PRIV_CHAIN}")
+      done
+    else
+      for cidr in fe80::/10 fc00::/7; do
+        OUT_RULES+=("-d ${cidr} -j ${PRIV_CHAIN}")
+      done
+    fi
+  fi
+  if flag_on "${TUNNEL_ABUSE_GUARD_ENABLE:-1}" && [[ -n "${ABUSE_PORTS}" ]]; then
+    while IFS= read -r chunk; do
+      [[ -n "${chunk}" ]] && OUT_RULES+=("-p tcp -m multiport --dports ${chunk} -j REJECT --reject-with tcp-reset")
+    done < <(port_chunks "${ABUSE_PORTS}")
+  fi
+  if flag_on "${SSH_TUNNEL_BLOCK_OUTBOUND_SSH:-0}" && [[ -n "${SSH_OUT_PORTS}" ]]; then
+    while IFS= read -r chunk; do
+      [[ -n "${chunk}" ]] && OUT_RULES+=("-p tcp -m multiport --dports ${chunk} -j REJECT --reject-with tcp-reset")
+    done < <(port_chunks "${SSH_OUT_PORTS}")
+  fi
+  if (( ${#OUT_RULES[@]} > 0 )); then
+    [[ -n "${TUN_GID}" ]] && OUT_JUMPS+=("-m conntrack --ctstate NEW -m owner --gid-owner ${TUN_GID} -j ${OUT_CHAIN}")
+    [[ -n "${NOBODY_UID}" ]] && OUT_JUMPS+=("-m conntrack --ctstate NEW -m owner --uid-owner ${NOBODY_UID} -j ${OUT_CHAIN}")
+  fi
+  if flag_on "${SSH_BRUTE_GUARD_ENABLE:-1}" && [[ -n "${SSHD_PORTS}" ]]; then
+    local mask=32
+    [[ "${fam}" == "6" ]] && mask=64
+    while IFS= read -r chunk; do
+      [[ -n "${chunk}" ]] && SSH_RULES+=("-p tcp -m multiport --dports ${chunk} -m hashlimit --hashlimit-name sc_sshd${fam} --hashlimit-mode srcip --hashlimit-srcmask ${mask} --hashlimit-above 15/minute --hashlimit-burst 30 -j DROP")
+    done < <(port_chunks "${SSHD_PORTS}")
+    SSH_JUMPS+=("! -i lo -p tcp -m conntrack --ctstate NEW -j ${SSH_CHAIN}")
+  fi
+}
+
+rule_count() {
+  "$1" -w 10 -S "$2" 2>/dev/null | grep -c '^-A' || true
+}
+
+# Chain sesuai harapan: kalau 0 aturan, chain tidak boleh ada; selain itu
+# chain ada dengan jumlah aturan yang sama.
+chain_matches() {
+  local tool="$1" chain="$2" expected="$3"
+  if (( expected == 0 )); then
+    ! "${tool}" -w 10 -S "${chain}" >/dev/null 2>&1
+    return
+  fi
+  "${tool}" -w 10 -S "${chain}" >/dev/null 2>&1 || return 1
+  [[ "$(rule_count "${tool}" "${chain}")" == "${expected}" ]]
+}
+
+# Lepas semua jump parent -> chain. Kembalikan 0 kalau ada yang dilepas.
+remove_jump() {
+  local tool="$1" parent="$2" chain="$3" spec removed=1
+  while IFS= read -r spec; do
+    [[ -n "${spec}" ]] || continue
+    # shellcheck disable=SC2086
+    if "${tool}" -w 10 -D ${spec#-A } >/dev/null 2>&1; then removed=0; fi
+  done < <("${tool}" -w 10 -S "${parent}" 2>/dev/null | grep -E -- "-j ${chain}( |$)" || true)
+  return "${removed}"
+}
+
+# Kembalikan 0 kalau chain memang ada lalu dibuang.
+drop_chain() {
+  local tool="$1" chain="$2"
+  "${tool}" -w 10 -S "${chain}" >/dev/null 2>&1 || return 1
+  "${tool}" -w 10 -F "${chain}" >/dev/null 2>&1 || true
+  "${tool}" -w 10 -X "${chain}" >/dev/null 2>&1 || true
+  return 0
+}
+
+create_chain() {
+  local tool="$1" chain="$2" rule
+  shift 2
+  (( $# > 0 )) || return 0
+  "${tool}" -w 10 -N "${chain}" >/dev/null 2>&1 || "${tool}" -w 10 -F "${chain}" >/dev/null 2>&1 || return 1
+  for rule in "$@"; do
+    # shellcheck disable=SC2086
+    "${tool}" -w 10 -A "${chain}" ${rule} >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
+# Pasang jump yang belum ada di posisi teratas. Kembalikan 0 kalau ada yang dipasang.
+ensure_jumps() {
+  local tool="$1" parent="$2" spec added=1
+  shift 2
+  for spec in "$@"; do
+    # shellcheck disable=SC2086
+    if ! "${tool}" -w 10 -C "${parent}" ${spec} >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      "${tool}" -w 10 -I "${parent}" 1 ${spec} >/dev/null 2>&1 && added=0
+    fi
+  done
+  return "${added}"
+}
+
+# Satu keluarga alamat. Urutan aman: jump dilepas sebelum chain dibuang, chain
+# OUT (yang merujuk LOCAL/PRIV) dibuang sebelum LOCAL/PRIV, dan chain dibuat
+# sebelum jump dipasang. Kembalikan 0 kalau ada perubahan.
+apply_family() {
+  local tool="$1" fam="$2" force="$3" changed=1 want_out=0 want_ssh=0 rebuild_out=0 rebuild_ssh=0
+  command -v "${tool}" >/dev/null 2>&1 || return 1
+  "${tool}" -w 10 -S OUTPUT >/dev/null 2>&1 || return 1
+  build_rules "${fam}"
+  (( ${#OUT_JUMPS[@]} > 0 )) && want_out=1
+  (( ${#SSH_JUMPS[@]} > 0 )) && want_ssh=1
+  if (( want_out )); then
+    if [[ "${force}" == "1" ]] \
+       || ! chain_matches "${tool}" "${OUT_CHAIN}" "${#OUT_RULES[@]}" \
+       || ! chain_matches "${tool}" "${LOCAL_CHAIN}" "${#LOCAL_RULES[@]}" \
+       || ! chain_matches "${tool}" "${PRIV_CHAIN}" "${#PRIV_RULES[@]}"; then
+      rebuild_out=1
+    fi
+  fi
+  if (( want_ssh )); then
+    if [[ "${force}" == "1" ]] || ! chain_matches "${tool}" "${SSH_CHAIN}" "${#SSH_RULES[@]}"; then
+      rebuild_ssh=1
+    fi
+  fi
+
+  if (( ! want_out || rebuild_out )); then
+    if remove_jump "${tool}" OUTPUT "${OUT_CHAIN}"; then changed=0; fi
+    if drop_chain "${tool}" "${OUT_CHAIN}"; then changed=0; fi
+    if drop_chain "${tool}" "${LOCAL_CHAIN}"; then changed=0; fi
+    if drop_chain "${tool}" "${PRIV_CHAIN}"; then changed=0; fi
+  fi
+  if (( ! want_ssh || rebuild_ssh )); then
+    if remove_jump "${tool}" INPUT "${SSH_CHAIN}"; then changed=0; fi
+    if drop_chain "${tool}" "${SSH_CHAIN}"; then changed=0; fi
+  fi
+  if (( rebuild_out )); then
+    create_chain "${tool}" "${LOCAL_CHAIN}" "${LOCAL_RULES[@]}" || true
+    create_chain "${tool}" "${PRIV_CHAIN}" "${PRIV_RULES[@]}" || true
+    create_chain "${tool}" "${OUT_CHAIN}" "${OUT_RULES[@]}" || true
+    changed=0
+  fi
+  if (( rebuild_ssh )); then
+    create_chain "${tool}" "${SSH_CHAIN}" "${SSH_RULES[@]}" || true
+    changed=0
+  fi
+  if (( want_out )) && ensure_jumps "${tool}" OUTPUT "${OUT_JUMPS[@]}"; then changed=0; fi
+  if (( want_ssh )) && ensure_jumps "${tool}" INPUT "${SSH_JUMPS[@]}"; then changed=0; fi
+  return "${changed}"
+}
+
+load_inputs() {
+  TUN_GID="$(ensure_group || true)"
+  USERS_FIXED=0
+  [[ -n "${TUN_GID}" ]] && reconcile_users "${TUN_GID}"
+  NOBODY_UID="$(getent passwd nobody 2>/dev/null | cut -d: -f3 || true)"
+  [[ "${NOBODY_UID}" =~ ^[0-9]+$ ]] || NOBODY_UID=""
+  LOCAL_ALLOW="$(csv_ports 53 80 443 "${API_PORT:-8088}" "${SSHWS_UDPGW_PORTS:-7300,7200}")"
+  ABUSE_PORTS="$(csv_ports "${TUNNEL_ABUSE_BLOCK_TCP_PORTS:-3389,5900,5901,5902,445,135,139,25,465,587}")"
+  SSH_OUT_PORTS="$(csv_ports "${SSH_TUNNEL_BLOCK_OUTBOUND_PORTS:-22,2222}")"
+  SSHD_PORTS="$(sshd_ports)"
+}
+
+signature() {
+  local fam
+  {
+    echo "gid=${TUN_GID} nobody=${NOBODY_UID}"
+    for fam in 4 6; do
+      build_rules "${fam}"
+      printf '%s\n' "fam=${fam}" "${LOCAL_RULES[@]}" "${PRIV_RULES[@]}" "${OUT_RULES[@]}" "${OUT_JUMPS[@]}" "${SSH_RULES[@]}" "${SSH_JUMPS[@]}"
+    done
+  } | cksum | awk '{ print $1 "-" $2 }'
+}
+
+state_value() {
+  [[ -f "${STATE_FILE}" ]] || return 0
+  awk -F= -v k="$1" '$1 == k { print substr($0, index($0, "=") + 1); exit }' "${STATE_FILE}" 2>/dev/null || true
+}
+
+write_state() {
+  local body tmp
+  body="SIG=${SIG}
+TUNNEL_GID=${TUN_GID}
+LOCAL_GUARD=$(flag_on "${TUNNEL_LOCAL_GUARD_ENABLE:-1}" && echo 1 || echo 0)
+SSH_BRUTE_GUARD=$(flag_on "${SSH_BRUTE_GUARD_ENABLE:-1}" && echo 1 || echo 0)
+SSHD_PORTS=${SSHD_PORTS}
+LOCAL_ALLOW=${LOCAL_ALLOW}"
+  if [[ -f "${STATE_FILE}" && "$(cat "${STATE_FILE}" 2>/dev/null)" == "${body}" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "${STATE_FILE}")" >/dev/null 2>&1 || true
+  tmp="${STATE_FILE}.tmp.$$"
+  printf '%s\n' "${body}" > "${tmp}" && chmod 644 "${tmp}" && mv -f "${tmp}" "${STATE_FILE}"
+}
+
+persist_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_apply() {
+  local force=0 changed=1
+  if ! command -v iptables >/dev/null 2>&1; then
+    echo "iptables tidak tersedia."
+    return 1
+  fi
+  load_inputs
+  SIG="$(signature)"
+  [[ "$(state_value SIG)" == "${SIG}" ]] || force=1
+  if apply_family iptables 4 "${force}"; then changed=0; fi
+  if apply_family ip6tables 6 "${force}"; then changed=0; fi
+  write_state
+  if (( changed == 0 )); then persist_rules; fi
+  if (( USERS_FIXED > 0 )); then echo "Akun SSH dipindah ke grup ${GROUP}: ${USERS_FIXED}"; fi
+  return 0
+}
+
+cmd_status() {
+  echo "Pembatas lokal/privat : $( [[ "$(state_value LOCAL_GUARD)" == "1" ]] && echo AKTIF || echo NONAKTIF )"
+  echo "Batas brute force sshd: $( [[ "$(state_value SSH_BRUTE_GUARD)" == "1" ]] && echo "AKTIF (port $(state_value SSHD_PORTS))" || echo NONAKTIF )"
+  echo "Port lokal diizinkan  : $(state_value LOCAL_ALLOW)"
+}
+
+cmd_clear() {
+  local tool
+  for tool in iptables ip6tables; do
+    command -v "${tool}" >/dev/null 2>&1 || continue
+    "${tool}" -w 10 -S OUTPUT >/dev/null 2>&1 || continue
+    remove_jump "${tool}" OUTPUT "${OUT_CHAIN}"
+    remove_jump "${tool}" INPUT "${SSH_CHAIN}"
+    drop_chain "${tool}" "${OUT_CHAIN}"
+    drop_chain "${tool}" "${LOCAL_CHAIN}"
+    drop_chain "${tool}" "${PRIV_CHAIN}"
+    drop_chain "${tool}" "${SSH_CHAIN}"
+  done
+  rm -f "${STATE_FILE}" >/dev/null 2>&1 || true
+  persist_rules
+}
+
+{ exec 9>"${LOCK_FILE}"; } 2>/dev/null || true
+if command -v flock >/dev/null 2>&1; then
+  flock -w 20 9 >/dev/null 2>&1 || { echo "Pembatas tunnel sedang diproses."; exit 1; }
+fi
+
+case "${1:-status}" in
+  apply) cmd_apply ;;
+  status) cmd_status ;;
+  clear) cmd_clear ;;
+  *)
+    echo "Usage: sc-1forcr-tunnel-guard {apply|status|clear}"
+    exit 1
+    ;;
+esac
+TUNNEL_GUARD_EOF
+  bash -n /usr/local/sbin/sc-1forcr-tunnel-guard
+  chmod 700 /usr/local/sbin/sc-1forcr-tunnel-guard
+}
+
+# Dipanggil di akhir install/update, sebelum apply_service_gates (gerbang
+# ON/OFF harus tetap jadi aturan pertama). Kegagalan tidak memutus layanan,
+# jadi hanya dicatat; watchdog menerapkan ulang pembatas iptables tiap siklus.
+apply_tunnel_security() {
+  install_tunnel_guard_manager
+  apply_sshd_hardening || true
+  if ! /usr/local/sbin/sc-1forcr-tunnel-guard apply >/dev/null 2>&1; then
+    log "PERINGATAN: pembatas trafik tunnel belum bisa diterapkan; watchdog akan mencoba lagi."
+  fi
+  return 0
+}
+
 # Gagal di sini tidak memutus port 443/80, jadi hanya dicatat; watchdog
 # menerapkan ulang tiap siklus.
 apply_extra_ports() {
@@ -21899,6 +22487,7 @@ write_cli_menu() {
   install_xray_realip_manager
   install_service_gate_manager
   install_extra_ports_manager
+  install_tunnel_guard_manager
 
   cat > /etc/sc-1forcr.env <<EOF
 SCRIPT_VERSION=${SCRIPT_VERSION}
@@ -22016,6 +22605,9 @@ XRAY_XHTTP_ENABLE=${XRAY_XHTTP_ENABLE}
 XRAY_MULTIPATH_ENABLE=${XRAY_MULTIPATH_ENABLE}
 EXTRA_TLS_PORTS=${EXTRA_TLS_PORTS}
 EXTRA_NTLS_PORTS=${EXTRA_NTLS_PORTS}
+TUNNEL_LOCAL_GUARD_ENABLE=${TUNNEL_LOCAL_GUARD_ENABLE}
+SSH_BRUTE_GUARD_ENABLE=${SSH_BRUTE_GUARD_ENABLE}
+SSHD_HARDEN_ENABLE=${SSHD_HARDEN_ENABLE}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
 SERVICE_VMESS_ENABLE=${SERVICE_VMESS_ENABLE}
 SERVICE_VLESS_ENABLE=${SERVICE_VLESS_ENABLE}
@@ -22341,7 +22933,8 @@ dropbear_runtime_args() {
   idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
   [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
   [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="300"
-  printf -- '-K %s -I %s' "${keepalive}" "${idle}"
+  # -w: tolak login root (admin lewat sshd); -k: tolak remote port forwarding.
+  printf -- '-w -k -K %s -I %s' "${keepalive}" "${idle}"
 }
 
 # Dropbear menolak start kalau file banner lebih dari 2000 byte ("Early exit:
@@ -33218,6 +33811,10 @@ systemctl disable sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
 systemctl disable --now sc-1forcr-udpgw-alias.service sc-1forcr-udpgw-drain.timer >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-udpgw-alias clear >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-extra-ports clear >/dev/null 2>&1 || true
+/usr/local/sbin/sc-1forcr-tunnel-guard clear >/dev/null 2>&1 || true
+rm -f /etc/ssh/sshd_config.d/00-sc-1forcr.conf
+rm -f /etc/systemd/system/dropbear.service.d/40-sc-1forcr-tunnel-group.conf /etc/systemd/system/zivpn.service.d/40-sc-1forcr-tunnel-group.conf /etc/systemd/system/sc-1forcr-udpcustom.service.d/40-sc-1forcr-tunnel-group.conf
+systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
 if command -v netfilter-persistent >/dev/null 2>&1; then
   netfilter-persistent save >/dev/null 2>&1 || true
 elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
@@ -33280,6 +33877,7 @@ rm -f /usr/local/sbin/sc-1forcr-capacity-tune
 rm -f /usr/local/sbin/sc-1forcr-dns-guard
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 rm -f /usr/local/sbin/sc-1forcr-extra-ports
+rm -f /usr/local/sbin/sc-1forcr-tunnel-guard
 rm -f /etc/profile.d/sc-1forcr-auto-menu.sh
 
 echo "Uninstall SC 1FORCR selesai."
@@ -33836,7 +34434,8 @@ keepalive="$(echo "${DROPBEAR_KEEPALIVE_SECONDS:-30}" | tr -cd '0-9')"
 idle="$(echo "${DROPBEAR_IDLE_TIMEOUT_SECONDS:-300}" | tr -cd '0-9')"
 [[ -z "${keepalive}" || "${keepalive}" -gt 3600 ]] && keepalive="30"
 [[ -z "${idle}" || "${idle}" -gt 86400 ]] && idle="300"
-printf -- '-K %s -I %s' "${keepalive}" "${idle}"
+# -w: tolak login root (admin lewat sshd); -k: tolak remote port forwarding.
+printf -- '-w -k -K %s -I %s' "${keepalive}" "${idle}"
 EOF
   chmod 755 /usr/local/sbin/dropbear_runtime_args >/dev/null 2>&1 || true
   ln -sf /usr/local/sbin/dropbear_runtime_args /usr/local/bin/dropbear_runtime_args >/dev/null 2>&1 || true
@@ -34108,7 +34707,7 @@ persist_pending_install_env() {
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
-    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_XHTTP_ENABLE XRAY_MULTIPATH_ENABLE EXTRA_TLS_PORTS EXTRA_NTLS_PORTS XRAY_LIVE_IP_TTL_SECONDS
+    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_XHTTP_ENABLE XRAY_MULTIPATH_ENABLE EXTRA_TLS_PORTS EXTRA_NTLS_PORTS TUNNEL_LOCAL_GUARD_ENABLE SSH_BRUTE_GUARD_ENABLE SSHD_HARDEN_ENABLE XRAY_LIVE_IP_TTL_SECONDS
     SERVICE_SSH_ENABLE SERVICE_VMESS_ENABLE SERVICE_VLESS_ENABLE SERVICE_TROJAN_ENABLE SERVICE_UDP_ENABLE
     XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
     NETWORK_COMPAT_ENABLE NETWORK_TCP_MSS DNS_GUARD_ENABLE DNS_GUARD_INTERVAL_MINUTES XRAY_OUTBOUND_DOMAIN_STRATEGY
@@ -35310,6 +35909,9 @@ main() {
     sync_zivpn_auth_token_with_api_runtime
     enforce_single_udp_backend
     apply_tunnel_outbound_guard_rules
+    install_tunnel_group_dropins
+    ensure_dropbear_hardening_flags
+    apply_tunnel_security
     restart_update_safe_services
     heal_dropbear_banner_override || true
     apply_service_gates
@@ -35376,6 +35978,7 @@ main() {
   run_install_step "07_go" 28 "Install Go" install_go_if_missing
   run_install_step "08_xray" 33 "Install Xray" install_xray
   run_install_step "09_banner_assets" 36 "Setup banner default" setup_default_banner_assets
+  run_install_step "09b_tunnel_group" 38 "Siapkan grup trafik tunnel" install_tunnel_group_dropins
   run_install_step "10_dropbear" 40 "Setup Dropbear" setup_dropbear
   run_install_step "11_database" 44 "Inisialisasi database" init_db
   run_install_step "12_harden_shells" 47 "Harden shell akun tunnel" harden_ssh_tunnel_shells
@@ -35412,6 +36015,7 @@ main() {
   sync_zivpn_auth_token_with_api_runtime
   run_install_step "36_sshws_guard" 98 "Terapkan guard SSHWS" apply_sshws_loop_guard_rules
   run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
+  run_install_step "37b_tunnel_security" 99 "Terapkan keamanan sshd dan trafik tunnel" apply_tunnel_security
   run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
   run_install_step "38b_service_gate" 99 "Terapkan status ON/OFF layanan" apply_service_gates
   run_install_step "38c_extra_ports" 99 "Terapkan port TLS/NTLS tambahan" apply_extra_ports

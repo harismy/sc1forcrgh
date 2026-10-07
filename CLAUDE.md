@@ -63,7 +63,7 @@ Xray tidak punya reload, jadi restart memutus **semua** pengguna vmess/vless/tro
 
 - Akun baru, trial, dan perpanjangan akun expired ditambahkan tanpa restart lewat `HandlerService` (`xray api adu`), lihat `writeXrayConfigAndReload()` di api.js. Penghapusan, pergantian kredensial, dan lock/unlock tetap restart, karena hanya restart yang memutus sesi lama user yang dicabut.
 - `buildXrayRuntimeConfig()` ada di api.js **dan** iplimit-checker.js, dan isinya harus identik termasuk tag inbound. Config yang strukturnya berbeda selalu jatuh ke restart. `npm run test:xray-hot-add` menjaga ini.
-- `HandlerService` bisa membuat akun, jadi hanya aktif kalau rule iptables "hanya root ke 127.0.0.1:10085" dari `apply_tunnel_outbound_guard_rules()` terpasang dan Xray tidak jalan sebagai root. Jangan hapus rule itu.
+- `HandlerService` bisa membuat akun, jadi hanya aktif kalau rule iptables "hanya root ke 127.0.0.1:10085" dari `apply_tunnel_outbound_guard_rules()` terpasang dan Xray tidak jalan sebagai root. Jangan hapus rule itu. Rule itu tidak menahan Dropbear, ZIVPN, dan UDP Custom, karena forwarding mereka dibuka proses root. Yang menahan mereka adalah pembatas trafik tunnel (lihat "Keamanan trafik tunnel dan sshd").
 - Link akun (`createXray` di api.js): WS, gRPC, HTTPUpgrade (`uptls`/`upntls`, path `/up<protokol>`), OneRing untuk aplikasi 1FTunnel (WS TLS dengan SNI `onering:<domain>:<domain>`), dan XHTTP VLESS (`xhttptls`/`xhttpntls`) hanya saat `XRAY_XHTTP_ENABLE=1`. Path link wajib sama dengan inbound di `buildXrayRuntimeConfig()` dan location nginx (`/xhvless` ada di blok 80/8083 lewat HTTP/1.1 dan di blok 8081 lewat h2). `npm run test:xray-links` menjaga ini.
 
 ### IP-limit (auto lock multi-login)
@@ -89,6 +89,32 @@ Lock yang salah langsung merugikan pembeli, jadi aturannya condong menghindari f
 - Port sshd tidak pernah ikut ditutup (akses admin). Menutup VMess/VLESS/Trojan tidak me-restart Xray. XHTTP satu-satunya yang me-restart Xray (lewat restart API), dan status lamanya dipulihkan kalau Xray tidak memuat inbound baru.
 - API menolak akun baru (503) untuk layanan yang OFF. Akun SSH baru hanya ditolak kalau SSH **dan** UDP OFF, karena akun SSH juga dipakai login ZIVPN/UDP Custom.
 - Port inbound Xray baru wajib ditambahkan ke `VMESS_PORTS`/`VLESS_PORTS`/`TROJAN_PORTS` di script ini, atau layanan itu tidak ikut tertutup. Test: `npm run test:service-gate`.
+
+### Keamanan trafik tunnel dan sshd
+
+Akun VPN tidak boleh bisa dipakai menyerang VPS ini atau server lain.
+
+- **Dropbear 2019.78 (default) tidak menurunkan hak akses setelah login**, jadi koneksi forwarding pengguna SSH-WS/Dropbear dibuka proses root. ZIVPN dan UDP Custom juga jalan sebagai root. Akibatnya semua rule `! --uid-owner 0` (port penyalahgunaan, penjaga 10085) **tidak berlaku** untuk mereka.
+- Solusinya grup `sc-1forcr-tunnel`:
+  - Dropbear, ZIVPN, dan UDP Custom mendapat `Group=sc-1forcr-tunnel` lewat drop-in `40-sc-1forcr-tunnel-group.conf`. User tetap root, jadi akses file tidak berubah.
+  - Akun SSH memakai grup itu sebagai grup utama: `useradd -g` di api.js, dan akun lama dipindah otomatis oleh pembatas (akun dikenali dari shell tunnel).
+  - Xray dikenali lewat UID `nobody`.
+  - Group= baru aktif saat service itu restart berikutnya. Update aman sengaja tidak me-restart, supaya pengguna tidak putus.
+- `/usr/local/sbin/sc-1forcr-tunnel-guard` (heredoc `TUNNEL_GUARD_EOF`) memeriksa paket NEW milik grup/UID itu:
+  - Ke alamat VPS sendiri (`addrtype LOCAL`): hanya DNS, 80/443, `API_PORT` (dipakai auth ZIVPN), dan port UDPGW. sshd, Dropbear, 10085, mux 2082, dan nginx internal ditolak.
+  - Ke 169.254.0.0/16, 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7, dan fe80::/10: hanya DNS. Ini termasuk metadata provider.
+  - Port penyalahgunaan (`TUNNEL_ABUSE_BLOCK_TCP_PORTS`), plus port SSH kalau `SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1`.
+  - Koneksi baru ke sshd dibatasi per IP: 15/menit, burst 30, per /64 untuk IPv6. Port milik SC dan Dropbear tidak pernah ikut.
+  - Dipanggil install/update dan tiap siklus watchdog, sebelum gerbang ON/OFF. iptables hanya ditulis ulang kalau aturan berubah atau hilang. Script ini **tidak boleh** memanggil systemctl.
+  - Bisa dimatikan lewat `TUNNEL_LOCAL_GUARD_ENABLE` dan `SSH_BRUTE_GUARD_ENABLE`.
+- Kalau menambah layanan lokal yang **memang** perlu dijangkau dari tunnel, tambahkan port-nya ke `LOCAL_ALLOW` di script itu. Kalau tidak, pengguna VPN tidak bisa memakainya.
+- Dropbear jalan dengan `-w` (root hanya lewat sshd) dan `-k` (tanpa remote forwarding) di ketiga salinan `dropbear_runtime_args`. VPS lama disisipi flag ini oleh `ensure_dropbear_hardening_flags`, tanpa me-restart Dropbear yang sedang jalan.
+- sshd (`apply_sshd_hardening`):
+  - Isinya `AllowTcpForwarding local`, `AllowStreamLocalForwarding no`, `GatewayPorts no`, `PermitTunnel no`, `X11Forwarding no`, dan `LoginGraceTime 30`.
+  - Ditulis sebagai drop-in `00-sc-1forcr.conf`. Kalau tidak efektif, dipakai blok bertanda di baris teratas sshd_config.
+  - Divalidasi `sshd -t`, dipulihkan kalau gagal, lalu `reload` (bukan restart).
+  - **`PermitRootLogin` dan `PasswordAuthentication` sengaja tidak disentuh**, supaya pemilik VPS tidak terkunci.
+- Test: `npm run test:tunnel-security`.
 
 ### Port TLS/NTLS tambahan
 

@@ -162,7 +162,7 @@ const baseEnv = {
   TUNNEL_GUARD_STATE_FILE: toBashPath(stateFile),
   TUNNEL_GUARD_LOCK_FILE: toBashPath(path.join(tmp, 'lock'))
 };
-for (const k of ['TUNNEL_LOCAL_GUARD_ENABLE', 'SSH_BRUTE_GUARD_ENABLE', 'TUNNEL_ABUSE_GUARD_ENABLE', 'TUNNEL_ABUSE_BLOCK_TCP_PORTS',
+for (const k of ['TUNNEL_LOCAL_GUARD_ENABLE', 'TUNNEL_ADMIN_SSH_ALLOW', 'SSH_BRUTE_GUARD_ENABLE', 'TUNNEL_ABUSE_GUARD_ENABLE', 'TUNNEL_ABUSE_BLOCK_TCP_PORTS',
   'SSH_TUNNEL_BLOCK_OUTBOUND_SSH', 'SSH_TUNNEL_BLOCK_OUTBOUND_PORTS', 'API_PORT', 'SSHWS_UDPGW_PORTS', 'SSH_TUNNEL_SHELL']) delete baseEnv[k];
 const guard = (cmd) => {
   for (const f of ['writes', 'persist', 'sys']) fs.rmSync(path.join(tmp, f), { force: true });
@@ -212,9 +212,12 @@ try {
   assert.deepStrictEqual(chain(4, 'SC1FORCR_TUN_LOCAL'), [
     '-p udp --dport 53 -j RETURN',
     '-p tcp -m multiport --dports 53,80,443,8088,7300,7200 -j RETURN',
+    '-p tcp -m multiport --dports 22,2222 -m hashlimit --hashlimit-name sc_tunssh4 --hashlimit-above 4/minute --hashlimit-burst 8 -j REJECT --reject-with tcp-reset',
+    '-p tcp -m multiport --dports 22,2222 -j RETURN',
     '-p tcp -j REJECT --reject-with tcp-reset',
     '-j REJECT'
-  ], 'only DNS, 80/443, the API (ZIVPN auth) and UDPGW stay reachable on the VPS itself');
+  ], 'only DNS, 80/443, the API (ZIVPN auth), UDPGW and rate-limited sshd (owner logging in through their own VPN) stay reachable');
+  assert(!chain(4, 'SC1FORCR_TUN_LOCAL').some((r) => /--dports [^ ]*\b(109|143|10085|2082)\b/.test(r)), 'Dropbear, Xray API and mux stay closed to tunnels');
   assert.deepStrictEqual(chain(4, 'SC1FORCR_TUN_PRIV'), [
     '-p udp --dport 53 -j RETURN', '-p tcp --dport 53 -j RETURN', '-p tcp -j REJECT --reject-with tcp-reset', '-j REJECT'
   ], 'private networks and metadata: DNS only');
@@ -252,6 +255,12 @@ try {
   guard('apply');
   assert(chain(4, 'SC1FORCR_TUN_LOCAL').includes('-p tcp -m multiport --dports 53,80,443,9090,7300 -j RETURN'), 'API/UDPGW port changes are applied');
 
+  // Pemilik bisa menolak SSH lewat VPN sama sekali.
+  write(envFile, 'TUNNEL_ADMIN_SSH_ALLOW=0\n');
+  guard('apply');
+  assert(!chain(4, 'SC1FORCR_TUN_LOCAL').some((r) => r.includes('22,2222')), 'TUNNEL_ADMIN_SSH_ALLOW=0 closes sshd to tunnels again');
+  assert(guard('status').includes('SSH admin lewat VPN   : DITOLAK'));
+
   // Hanya penjaga port penyalahgunaan yang aktif.
   write(envFile, 'TUNNEL_LOCAL_GUARD_ENABLE=0\n');
   guard('apply');
@@ -282,6 +291,7 @@ try {
   guard('apply');
   const status = guard('status');
   assert(status.includes('Pembatas lokal/privat : AKTIF') && status.includes('AKTIF (port 22,2222)'), `status:\n${status}`);
+  assert(status.includes('SSH admin lewat VPN   : DIIZINKAN (port 22,2222, 4/menit)'), `status:\n${status}`);
   guard('clear');
   assert.deepStrictEqual(rules(4), []);
   assert.deepStrictEqual(chains(4), []);
@@ -403,7 +413,7 @@ try {
   const watchdog = between(installer, "cat > /usr/local/sbin/sc-1forcr-postboot-health <<'POSTBOOT_HEALTH_EOF'\n", '\nPOSTBOOT_HEALTH_EOF\n');
   assert(watchdog.indexOf('sc-1forcr-tunnel-guard apply') > 0 && watchdog.indexOf('sc-1forcr-tunnel-guard apply') < watchdog.indexOf('sc-1forcr-service-gate apply'),
     'watchdog re-applies the guard before the service gate');
-  for (const key of ['TUNNEL_LOCAL_GUARD_ENABLE', 'SSH_BRUTE_GUARD_ENABLE', 'SSHD_HARDEN_ENABLE']) {
+  for (const key of ['TUNNEL_LOCAL_GUARD_ENABLE', 'TUNNEL_ADMIN_SSH_ALLOW', 'SSH_BRUTE_GUARD_ENABLE', 'SSHD_HARDEN_ENABLE']) {
     assert.strictEqual(installer.split(`${key}=\${${key}}\n`).length - 1, 2, `${key} must be in both env dumps`);
     assert.strictEqual(installer.split(`    "${key}",\n`).length - 1, 2, `${key} must be in both backup setting lists`);
     assert(new RegExp(`vars=\\([\\s\\S]*\\b${key}\\b[\\s\\S]*?\\n  \\)`).test(installer), `${key} must survive a pending install`);

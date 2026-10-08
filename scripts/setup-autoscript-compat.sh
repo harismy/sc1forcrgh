@@ -134,6 +134,7 @@ set -euo pipefail
 #   EXTRA_TLS_PORTS=8443,2053,2083,2087,2096     (port TLS tambahan -> 443; off=mati, port yang dipakai program lain dilewati)
 #   EXTRA_NTLS_PORTS=8080,8880,2052,2082,2086,2095 (port NTLS tambahan -> 80; off=mati)
 #   TUNNEL_LOCAL_GUARD_ENABLE=1                  (akun VPN tidak bisa menjangkau layanan lokal VPS, jaringan privat, dan metadata provider)
+#   TUNNEL_ADMIN_SSH_ALLOW=1                     (pemilik VPS tetap bisa SSH ke VPS ini sambil konek VPN lewat VPS yang sama; dibatasi 4 koneksi/menit; 0=tolak)
 #   SSH_BRUTE_GUARD_ENABLE=1                     (batas koneksi baru ke sshd per IP: 15/menit, burst 30)
 #   SSHD_HARDEN_ENABLE=1                         (sshd: forwarding hanya lokal, tanpa X11/tun, LoginGraceTime 30)
 #   SERVICE_SSH_ENABLE=1                         (menu ON/OFF LAYANAN: 0=tolak SSH-WS/SSL/Dropbear; sshd 22 tetap buka)
@@ -199,7 +200,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.97}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.98}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -312,6 +313,7 @@ XRAY_MULTIPATH_ENABLE="${XRAY_MULTIPATH_ENABLE:-1}"
 EXTRA_TLS_PORTS="${EXTRA_TLS_PORTS:-8443,2053,2083,2087,2096}"
 EXTRA_NTLS_PORTS="${EXTRA_NTLS_PORTS:-8080,8880,2052,2082,2086,2095}"
 TUNNEL_LOCAL_GUARD_ENABLE="${TUNNEL_LOCAL_GUARD_ENABLE:-1}"
+TUNNEL_ADMIN_SSH_ALLOW="${TUNNEL_ADMIN_SSH_ALLOW:-1}"
 SSH_BRUTE_GUARD_ENABLE="${SSH_BRUTE_GUARD_ENABLE:-1}"
 SSHD_HARDEN_ENABLE="${SSHD_HARDEN_ENABLE:-1}"
 SERVICE_SSH_ENABLE="${SERVICE_SSH_ENABLE:-1}"
@@ -5406,6 +5408,7 @@ XRAY_MULTIPATH_ENABLE=${XRAY_MULTIPATH_ENABLE}
 EXTRA_TLS_PORTS=${EXTRA_TLS_PORTS}
 EXTRA_NTLS_PORTS=${EXTRA_NTLS_PORTS}
 TUNNEL_LOCAL_GUARD_ENABLE=${TUNNEL_LOCAL_GUARD_ENABLE}
+TUNNEL_ADMIN_SSH_ALLOW=${TUNNEL_ADMIN_SSH_ALLOW}
 SSH_BRUTE_GUARD_ENABLE=${SSH_BRUTE_GUARD_ENABLE}
 SSHD_HARDEN_ENABLE=${SSHD_HARDEN_ENABLE}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
@@ -17305,6 +17308,7 @@ SETTINGS_KEYS = [
     "EXTRA_TLS_PORTS",
     "EXTRA_NTLS_PORTS",
     "TUNNEL_LOCAL_GUARD_ENABLE",
+    "TUNNEL_ADMIN_SSH_ALLOW",
     "SSH_BRUTE_GUARD_ENABLE",
     "SSHD_HARDEN_ENABLE",
     "SERVICE_SSH_ENABLE",
@@ -18178,6 +18182,7 @@ SETTINGS_KEYS = [
     "EXTRA_TLS_PORTS",
     "EXTRA_NTLS_PORTS",
     "TUNNEL_LOCAL_GUARD_ENABLE",
+    "TUNNEL_ADMIN_SSH_ALLOW",
     "SSH_BRUTE_GUARD_ENABLE",
     "SSHD_HARDEN_ENABLE",
     "SERVICE_SSH_ENABLE",
@@ -22105,8 +22110,10 @@ install_tunnel_guard_manager() {
 # Membatasi koneksi yang dibuka atas nama pengguna VPN, supaya akun VPN tidak
 # bisa dipakai menyerang VPS ini atau server lain:
 # - Ke alamat VPS sendiri (127.0.0.1 dan IP publik): hanya DNS, 80/443, API
-#   (auth ZIVPN), dan UDPGW. sshd, Dropbear, API Xray 10085, mux 2082, dan
-#   listener nginx internal tidak bisa dijangkau lewat tunnel.
+#   (auth ZIVPN), UDPGW, dan sshd dengan batas 4 koneksi baru/menit untuk
+#   semua akun VPN sekaligus (pemilik VPS sering SSH ke VPS sambil konek VPN
+#   lewat VPS yang sama). Dropbear, API Xray 10085, mux 2082, dan listener
+#   nginx internal tidak bisa dijangkau lewat tunnel.
 # - Ke jaringan privat dan metadata provider (169.254.0.0/16, 10/8,
 #   172.16/12, 192.168/16, 100.64/10, fc00::/7, fe80::/10): hanya DNS.
 # - Port penyalahgunaan (SMTP/RDP/VNC/SMB, plus SSH kalau blokir SSH keluar
@@ -22218,6 +22225,16 @@ build_rules() {
     while IFS= read -r chunk; do
       [[ -n "${chunk}" ]] && LOCAL_RULES+=("-p tcp -m multiport --dports ${chunk} -j RETURN")
     done < <(port_chunks "${LOCAL_ALLOW}")
+    # SSH ke VPS ini dari dalam VPN-nya sendiri: koneksi keluar lewat Xray atau
+    # Dropbear, jadi masuk ke sini, bukan ke batas brute force per IP di INPUT
+    # (yang melewati lo). Satu ember bersama untuk semua akun VPN, 4/menit.
+    if flag_on "${TUNNEL_ADMIN_SSH_ALLOW:-1}" && [[ -n "${SSHD_PORTS}" ]]; then
+      while IFS= read -r chunk; do
+        [[ -n "${chunk}" ]] || continue
+        LOCAL_RULES+=("-p tcp -m multiport --dports ${chunk} -m hashlimit --hashlimit-name sc_tunssh${fam} --hashlimit-above 4/minute --hashlimit-burst 8 -j REJECT --reject-with tcp-reset")
+        LOCAL_RULES+=("-p tcp -m multiport --dports ${chunk} -j RETURN")
+      done < <(port_chunks "${SSHD_PORTS}")
+    fi
     LOCAL_RULES+=("-p tcp -j REJECT --reject-with tcp-reset" "-j REJECT")
     PRIV_RULES=("-p udp --dport 53 -j RETURN" "-p tcp --dport 53 -j RETURN" "-p tcp -j REJECT --reject-with tcp-reset" "-j REJECT")
     OUT_RULES+=("-m addrtype --dst-type LOCAL -j ${LOCAL_CHAIN}")
@@ -22399,6 +22416,7 @@ write_state() {
   body="SIG=${SIG}
 TUNNEL_GID=${TUN_GID}
 LOCAL_GUARD=$(flag_on "${TUNNEL_LOCAL_GUARD_ENABLE:-1}" && echo 1 || echo 0)
+ADMIN_SSH=$(flag_on "${TUNNEL_ADMIN_SSH_ALLOW:-1}" && echo 1 || echo 0)
 SSH_BRUTE_GUARD=$(flag_on "${SSH_BRUTE_GUARD_ENABLE:-1}" && echo 1 || echo 0)
 SSHD_PORTS=${SSHD_PORTS}
 LOCAL_ALLOW=${LOCAL_ALLOW}"
@@ -22437,6 +22455,7 @@ cmd_status() {
   echo "Pembatas lokal/privat : $( [[ "$(state_value LOCAL_GUARD)" == "1" ]] && echo AKTIF || echo NONAKTIF )"
   echo "Batas brute force sshd: $( [[ "$(state_value SSH_BRUTE_GUARD)" == "1" ]] && echo "AKTIF (port $(state_value SSHD_PORTS))" || echo NONAKTIF )"
   echo "Port lokal diizinkan  : $(state_value LOCAL_ALLOW)"
+  echo "SSH admin lewat VPN   : $( [[ "$(state_value ADMIN_SSH)" == "1" ]] && echo "DIIZINKAN (port $(state_value SSHD_PORTS), 4/menit)" || echo DITOLAK )"
 }
 
 cmd_clear() {
@@ -22627,6 +22646,7 @@ XRAY_MULTIPATH_ENABLE=${XRAY_MULTIPATH_ENABLE}
 EXTRA_TLS_PORTS=${EXTRA_TLS_PORTS}
 EXTRA_NTLS_PORTS=${EXTRA_NTLS_PORTS}
 TUNNEL_LOCAL_GUARD_ENABLE=${TUNNEL_LOCAL_GUARD_ENABLE}
+TUNNEL_ADMIN_SSH_ALLOW=${TUNNEL_ADMIN_SSH_ALLOW}
 SSH_BRUTE_GUARD_ENABLE=${SSH_BRUTE_GUARD_ENABLE}
 SSHD_HARDEN_ENABLE=${SSHD_HARDEN_ENABLE}
 SERVICE_SSH_ENABLE=${SERVICE_SSH_ENABLE}
@@ -34759,7 +34779,7 @@ persist_pending_install_env() {
     SSHWS_NGINX_LIMIT_ENABLE SSHWS_NGINX_LIMIT_RATE SSHWS_NGINX_LIMIT_BURST SSHWS_NGINX_LIMIT_CONN
     NGINX_WORKER_CONNECTIONS NGINX_WORKER_RLIMIT_NOFILE NGINX_SERVICE_LIMIT_NOFILE SC_API_MEMORY_MAX SSHWS_SERVICE_MEMORY_MAX
     DROPBEAR_LOG_MAX_LINES DROPBEAR_RECENT_LOG_MAX_LINES UDPHC_LOG_LINES_HISTORY UDPHC_LOG_LINES_REALTIME UDPHC_LOG_LINES_CHECKER
-    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_XHTTP_ENABLE XRAY_MULTIPATH_ENABLE EXTRA_TLS_PORTS EXTRA_NTLS_PORTS TUNNEL_LOCAL_GUARD_ENABLE SSH_BRUTE_GUARD_ENABLE SSHD_HARDEN_ENABLE XRAY_LIVE_IP_TTL_SECONDS
+    XRAY_BLOCK_TCP_PORTS XRAY_RECENT_WINDOW_MINUTES XRAY_ACTIVE_WINDOW_SECONDS XRAY_MIN_HITS_PER_IP XRAY_REAL_IP_ENABLE XRAY_XHTTP_ENABLE XRAY_MULTIPATH_ENABLE EXTRA_TLS_PORTS EXTRA_NTLS_PORTS TUNNEL_LOCAL_GUARD_ENABLE TUNNEL_ADMIN_SSH_ALLOW SSH_BRUTE_GUARD_ENABLE SSHD_HARDEN_ENABLE XRAY_LIVE_IP_TTL_SECONDS
     SERVICE_SSH_ENABLE SERVICE_VMESS_ENABLE SERVICE_VLESS_ENABLE SERVICE_TROJAN_ENABLE SERVICE_UDP_ENABLE
     XRAY_PATHS_VMESS XRAY_PATHS_VLESS XRAY_PATHS_TROJAN
     NETWORK_COMPAT_ENABLE NETWORK_TCP_MSS DNS_GUARD_ENABLE DNS_GUARD_INTERVAL_MINUTES XRAY_OUTBOUND_DOMAIN_STRATEGY

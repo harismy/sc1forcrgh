@@ -101,12 +101,13 @@ Akun VPN tidak boleh bisa dipakai menyerang VPS ini atau server lain.
   - Xray dikenali lewat UID `nobody`.
   - Group= baru aktif saat service itu restart berikutnya. Update aman sengaja tidak me-restart, supaya pengguna tidak putus.
 - `/usr/local/sbin/sc-1forcr-tunnel-guard` (heredoc `TUNNEL_GUARD_EOF`) memeriksa paket NEW milik grup/UID itu:
-  - Ke alamat VPS sendiri (`addrtype LOCAL`): hanya DNS, 80/443, `API_PORT` (dipakai auth ZIVPN), dan port UDPGW. sshd, Dropbear, 10085, mux 2082, dan nginx internal ditolak.
+  - Ke alamat VPS sendiri (`addrtype LOCAL`): hanya DNS, 80/443, `API_PORT` (dipakai auth ZIVPN), port UDPGW, dan sshd dengan batas 4 koneksi baru/menit untuk semua akun VPN sekaligus. Dropbear, 10085, mux 2082, dan nginx internal ditolak.
+  - sshd sengaja dibuka (`TUNNEL_ADMIN_SSH_ALLOW`, default 1). Pernah jadi keluhan nyata: setelah V.1FSC.96 pemilik VPS tidak bisa SSH ke VPS-nya sambil konek VPN (SSH maupun Xray) lewat VPS yang sama, karena koneksi itu keluar dari Xray/Dropbear lalu masuk lewat `lo`, jadi kena pembatas ini dan tidak pernah melewati batas brute force per IP di INPUT. Batas 4/menit itu yang menggantikan batas per IP untuk jalur ini; jangan dibuka tanpa batas.
   - Ke 169.254.0.0/16, 10/8, 172.16/12, 192.168/16, 100.64/10, fc00::/7, dan fe80::/10: hanya DNS. Ini termasuk metadata provider.
   - Port penyalahgunaan (`TUNNEL_ABUSE_BLOCK_TCP_PORTS`), plus port SSH kalau `SSH_TUNNEL_BLOCK_OUTBOUND_SSH=1`.
   - Koneksi baru ke sshd dibatasi per IP: 15/menit, burst 30, per /64 untuk IPv6. Port milik SC dan Dropbear tidak pernah ikut.
   - Dipanggil install/update dan tiap siklus watchdog, sebelum gerbang ON/OFF. iptables hanya ditulis ulang kalau aturan berubah atau hilang. Script ini **tidak boleh** memanggil systemctl.
-  - Bisa dimatikan lewat `TUNNEL_LOCAL_GUARD_ENABLE` dan `SSH_BRUTE_GUARD_ENABLE`.
+  - Bisa dimatikan lewat `TUNNEL_LOCAL_GUARD_ENABLE` dan `SSH_BRUTE_GUARD_ENABLE`. `TUNNEL_ADMIN_SSH_ALLOW=0` menutup lagi sshd untuk trafik tunnel.
 - Kalau menambah layanan lokal yang **memang** perlu dijangkau dari tunnel, tambahkan port-nya ke `LOCAL_ALLOW` di script itu. Kalau tidak, pengguna VPN tidak bisa memakainya.
 - Dropbear jalan dengan `-w` (root hanya lewat sshd) dan `-k` (tanpa remote forwarding) di ketiga salinan `dropbear_runtime_args`. VPS lama disisipi flag ini oleh `ensure_dropbear_hardening_flags`, tanpa me-restart Dropbear yang sedang jalan.
 - sshd (`apply_sshd_hardening`):

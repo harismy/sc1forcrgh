@@ -426,3 +426,73 @@ func TestUnmaskedFrameIsNotXray(t *testing.T) {
 		t.Fatalf("data bukan frame klien harus tetap ke SSH, dapat %s", hit.name)
 	}
 }
+
+// Payload injector dengan [split]: teks HTTP palsu setelah 101 harus dibuang
+// sebelum identitas SSH, apa pun penutupnya dan kapan pun datangnya. Dulu
+// penutup selain "\r\n\r\n" membuat mux memakan identitas SSH klien.
+func splitJunkCase(t *testing.T, request string, late string) {
+	defer setup(t)()
+	h := newHarness(t, "101")
+	defer h.close()
+	c, r, resp := h.open(t, request)
+	defer c.Close()
+	// Request GET biasa sebelum upgrade dijawab 200 dulu, baru 101.
+	for strings.HasPrefix(resp, "HTTP/1.1 200") {
+		var next bytes.Buffer
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatalf("respons 101 tidak datang setelah 200: %v", err)
+			}
+			next.WriteString(line)
+			if line == "\r\n" {
+				break
+			}
+		}
+		resp = next.String()
+	}
+	if !strings.HasPrefix(resp, "HTTP/1.1 101") {
+		t.Fatalf("payload harus dijawab 101:\n%s", resp)
+	}
+	if late != "" {
+		time.Sleep(80 * time.Millisecond)
+		_, _ = c.Write([]byte(late))
+	}
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	line, err := r.ReadString('\n')
+	if err != nil || line != "SSH-2.0-fake\r\n" {
+		t.Fatalf("banner SSH harus sampai ke klien tanpa menunggu: %q %v", line, err)
+	}
+	_, _ = c.Write([]byte("SSH-2.0-client\r\n"))
+	hit := h.wait(t)
+	if hit.name != "ssh" || !strings.HasPrefix(string(hit.data), "SSH-2.0-client") {
+		t.Fatalf("SSH harus menerima identitas klien utuh tanpa teks HTTP: %s %q", hit.name, hit.data)
+	}
+}
+
+const splitUpgrade = "PATCH / HTTP/1.1\r\nHost: bug.com\r\nUpgrade: websocket\r\n\r\n"
+
+func TestSplitJunkCRLFLF(t *testing.T) {
+	splitJunkCase(t, splitUpgrade+"HTTP/enhanced 200 OK\r\n\n", "")
+}
+
+func TestSplitJunkLiteralBackslashN(t *testing.T) {
+	splitJunkCase(t, splitUpgrade+"HTTP/enhanced 200 OK\r\n\\n", "")
+}
+
+func TestSplitJunkCRLFCRLF(t *testing.T) {
+	splitJunkCase(t, splitUpgrade+"HTTP/ 200 OK\r\n\r\n", "")
+}
+
+func TestSplitJunkArrivesLate(t *testing.T) {
+	splitJunkCase(t, splitUpgrade, "HTTP/enhanced 200 OK\r\n\n")
+}
+
+func TestSplitJunkAfterKeepAliveRequest(t *testing.T) {
+	splitJunkCase(t, "GET / HTTP/1.1\r\nHost: event.ruangguru.com\r\nConnection: Keep-Alive\r\n\r\n"+
+		splitUpgrade+"HTTP/enhanced 200 OK\r\n\n", "")
+}
+
+func TestSplitJunkWithWebSocketKey(t *testing.T) {
+	splitJunkCase(t, wsRequest("/", "")+"HTTP/enhanced 200 OK\r\n\n", "")
+}

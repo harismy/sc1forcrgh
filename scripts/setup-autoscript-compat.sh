@@ -200,7 +200,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.98}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.99}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -10410,22 +10410,87 @@ func looksHttpLike(first string) bool {
 	return true
 }
 
-func stripBufferedHttpJunk(reader *bufio.Reader) {
-	for i := 0; i < 2 && reader.Buffered() > 0; i++ {
-		n := reader.Buffered()
-		if n > 24 {
-			n = 24
-		}
-		peek, err := reader.Peek(n)
-		if err != nil {
-			return
-		}
-		p := strings.ToLower(strings.TrimSpace(string(peek)))
-		if !(strings.HasPrefix(p, "http/") || looksHttpLike(p)) {
-			return
-		}
-		_, _, _, _ = readHttpHeader(reader, 8192)
+// Payload injector dengan [split] sering mengirim teks HTTP palsu setelah
+// 101, misalnya "HTTP/enhanced 200 OK\r\n\n" atau "HTTP/ 200 OK\r\n\r\n",
+// sebelum identitas SSH klien. Dulu teks itu dibuang dengan membaca sampai
+// "\r\n\r\n"; penutup lain (\r\n\n, "\n" literal) membuat mux ikut memakan
+// identitas SSH klien dan koneksi macet setelah 101. Penyaring ini membuang
+// semua byte sebelum "SSH-" selama awalnya tampak seperti teks HTTP, tanpa
+// pernah menunggu penutup tertentu dan apa pun waktu kedatangannya. Data lain
+// (SSH mentah, biner) langsung diteruskan apa adanya.
+const maxSSHJunkBytes = 16 * 1024
+
+var sshIdentPrefix = []byte("SSH-")
+
+func looksLikeHTTPJunk(b []byte) bool {
+	s := strings.ToLower(strings.TrimLeft(string(b), " \t\r\n"))
+	if s == "" {
+		return true
 	}
+	if len(s) > 64 {
+		s = s[:64]
+	}
+	if strings.HasPrefix(s, "http/") || strings.HasPrefix("http/", s) {
+		return true
+	}
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return looksHttpLike(strings.TrimSpace(s[:i]))
+	}
+	return false
+}
+
+type sshJunkSkipConn struct {
+	net.Conn
+	pend []byte
+	err  error
+	done bool
+}
+
+func (c *sshJunkSkipConn) Read(p []byte) (int, error) {
+	for !c.done {
+		if len(c.pend) > 0 {
+			if idx := bytes.Index(c.pend, sshIdentPrefix); idx >= 0 {
+				c.pend = c.pend[idx:]
+				c.done = true
+				break
+			}
+			if !looksLikeHTTPJunk(c.pend) || len(c.pend) > maxSSHJunkBytes {
+				c.done = true
+				break
+			}
+		}
+		buf := make([]byte, 2048)
+		n, err := c.Conn.Read(buf)
+		c.pend = append(c.pend, buf[:n]...)
+		if err != nil {
+			c.done = true
+			c.err = err
+		}
+	}
+	if len(c.pend) > 0 {
+		n := copy(p, c.pend)
+		c.pend = c.pend[n:]
+		return n, nil
+	}
+	if c.err != nil {
+		err := c.err
+		c.err = nil
+		return 0, err
+	}
+	return c.Conn.Read(p)
+}
+
+// Sisi klien tunnel SSH setelah 101: data yang sudah ada di buffer reader ikut
+// lewat penyaring yang sama dengan data berikutnya.
+func sshClientSide(client net.Conn, reader *bufio.Reader) net.Conn {
+	c := &sshJunkSkipConn{Conn: client}
+	if n := reader.Buffered(); n > 0 {
+		c.pend = make([]byte, n)
+		if _, err := io.ReadFull(reader, c.pend); err != nil {
+			c.pend = nil
+		}
+	}
+	return c
 }
 
 // ── Multi path Xray WS ──────────────────────────────────────────────────────
@@ -10724,17 +10789,12 @@ func buildXrayRequest(rawHeader []byte, route xrayRoute, clientIP string) []byte
 }
 
 func connectSSHAfterUpgrade(client net.Conn, reader *bufio.Reader, clientIP, sshHost string, sshPort, keepAliveSeconds int) {
-	stripBufferedHttpJunk(reader)
 	sshUp, err := dialTCP(sshHost, sshPort, keepAliveSeconds)
 	if err != nil {
 		return
 	}
 	_ = client.SetReadDeadline(time.Time{})
-	if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-		_ = sshUp.Close()
-		return
-	}
-	tunnelBoth(client, sshUp, registerQuotaSession(sshUp, clientIP))
+	tunnelBoth(sshClientSide(client, reader), sshUp, registerQuotaSession(sshUp, clientIP))
 }
 
 func handleRealWebSocket(client net.Conn, reader *bufio.Reader, rawHeader []byte, wsKey, clientIP, sshHost string, sshPort, keepAliveSeconds int) {
@@ -10863,13 +10923,8 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 					return
 				}
 				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
-			stripBufferedHttpJunk(reader)
-			_ = client.SetReadDeadline(time.Time{})
-			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-				_ = sshUp.Close()
-				return
-			}
-				tunnelBoth(client, sshUp, registerQuotaSession(sshUp, clientIP))
+				_ = client.SetReadDeadline(time.Time{})
+				tunnelBoth(sshClientSide(client, reader), sshUp, registerQuotaSession(sshUp, clientIP))
 				return
 			}
 
@@ -10881,13 +10936,8 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 					return
 				}
 				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
-				stripBufferedHttpJunk(reader)
 				_ = client.SetReadDeadline(time.Time{})
-				if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-					_ = sshUp.Close()
-					return
-				}
-				tunnelBoth(client, sshUp, registerQuotaSession(sshUp, clientIP))
+				tunnelBoth(sshClientSide(client, reader), sshUp, registerQuotaSession(sshUp, clientIP))
 				return
 			}
 

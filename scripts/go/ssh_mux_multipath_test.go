@@ -496,3 +496,21 @@ func TestSplitJunkAfterKeepAliveRequest(t *testing.T) {
 func TestSplitJunkWithWebSocketKey(t *testing.T) {
 	splitJunkCase(t, wsRequest("/", "")+"HTTP/enhanced 200 OK\r\n\n", "")
 }
+
+// Port 80 (dan port NTLS tambahan): nginx "location /" selalu menambahkan
+// Upgrade: websocket ke request pertama, jadi request pancingan bug-host sudah
+// dijawab 101, lalu request PATCH berikutnya, teks [split], dan SSH datang
+// sebagai data di dalam tunnel.
+const nginxFirst = "GET / HTTP/1.1\r\nHost: event.ruangguru.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-SC-SSHWS-IP: 203.0.113.9\r\n\r\n"
+
+func TestPort80SplitCRLFLF(t *testing.T) {
+	splitJunkCase(t, nginxFirst+splitUpgrade+"HTTP/enhanced 200 OK\r\n\n", "")
+}
+
+func TestPort80SplitCRLFCRLF(t *testing.T) {
+	splitJunkCase(t, nginxFirst+"PATCH / HTTP/1.0\r\nHost: id1.example.com\r\nUpgrade: websocket\r\n\r\n"+"HTTP/ 200 OK\r\n\r\n", "")
+}
+
+func TestPort80SplitArrivesLate(t *testing.T) {
+	splitJunkCase(t, nginxFirst, splitUpgrade+"HTTP/enhanced 200 OK\r\n\n")
+}

@@ -200,7 +200,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.99}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.100}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -10389,12 +10389,20 @@ func readHttpHeader(reader *bufio.Reader, maxHeaderBytes int) ([]byte, string, s
 		if raw.Len() > maxHeaderBytes {
 			return nil, "", "", fmt.Errorf("header too large")
 		}
-		if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
+		// Sebagian klien menutup header dengan LF saja ("\n\n"), bukan
+		// "\r\n\r\n". Keduanya diterima; "\r\n\r\n" tidak ikut cocok ke
+		// cabang "\n\n" karena dua byte terakhirnya "\r\n".
+		b := raw.Bytes()
+		if bytes.HasSuffix(b, []byte("\r\n\r\n")) || bytes.HasSuffix(b, []byte("\n\n")) {
 			break
 		}
 	}
 	rawStr := raw.String()
-	first := strings.ToLower(strings.TrimSpace(strings.SplitN(rawStr, "\r\n", 2)[0]))
+	firstLine := rawStr
+	if i := strings.IndexByte(firstLine, '\n'); i >= 0 {
+		firstLine = firstLine[:i]
+	}
+	first := strings.ToLower(strings.TrimSpace(firstLine))
 	header := strings.ToLower(rawStr)
 	return raw.Bytes(), first, header, nil
 }
@@ -10410,58 +10418,138 @@ func looksHttpLike(first string) bool {
 	return true
 }
 
-// Payload injector dengan [split] sering mengirim teks HTTP palsu setelah
-// 101, misalnya "HTTP/enhanced 200 OK\r\n\n" atau "HTTP/ 200 OK\r\n\r\n",
-// sebelum identitas SSH klien. Dulu teks itu dibuang dengan membaca sampai
-// "\r\n\r\n"; penutup lain (\r\n\n, "\n" literal) membuat mux ikut memakan
-// identitas SSH klien dan koneksi macet setelah 101. Penyaring ini membuang
-// semua byte sebelum "SSH-" selama awalnya tampak seperti teks HTTP, tanpa
-// pernah menunggu penutup tertentu dan apa pun waktu kedatangannya. Data lain
-// (SSH mentah, biner) langsung diteruskan apa adanya.
+// Payload injector dengan [split] sering menyuntik teks HTTP palsu setelah
+// 101 (misalnya "HTTP/enhanced 200 OK\r\n\n", "HTTP/ 200 OK\r\n\r\n", request
+// PATCH/GET kedua, atau potongan kecil seperti "\n" literal dan awalan method
+// "PAT") sebelum identitas SSH klien. Penutupnya bermacam-macam dan bisa
+// datang terpotong di batas paket, jadi penyaring ini tidak pernah menunggu
+// penutup tertentu: ia menahan semua byte selama masih berupa teks ASCII yang
+// bisa dicetak sampai identitas SSH muncul, lalu membuang semua yang
+// mendahuluinya. Byte biner pertama (atau melewati batas) menandakan ini bukan
+// teks sampah, jadi sisanya diteruskan apa adanya; SSH mentah dan protokol
+// non-teks tidak terganggu.
 const maxSSHJunkBytes = 16 * 1024
 
-var sshIdentPrefix = []byte("SSH-")
+var (
+	sshIdentPrefix = []byte("SSH-")
+	sshIdent20     = []byte("SSH-2.0")
+	sshIdent1x     = []byte("SSH-1.")
+)
 
-func looksLikeHTTPJunk(b []byte) bool {
-	s := strings.ToLower(strings.TrimLeft(string(b), " \t\r\n"))
-	if s == "" {
-		return true
+// sshIdentIndex mencari awal identitas SSH klien di dalam b. "SSH-2.0" dan
+// "SSH-1." dianggap identitas di mana pun ia muncul, termasuk kalau tergabung
+// tanpa newline dengan sampah di depannya (misalnya "...OK\r\n\\nSSH-2.0").
+// "SSH-" polos hanya diterima di awal buffer atau tepat setelah newline,
+// supaya teks sampah seperti "User-Agent: SSH-Tunnel" tidak salah dipotong.
+// Mengembalikan -1 kalau identitas belum ada.
+func sshIdentIndex(b []byte) int {
+	best := -1
+	if i := bytes.Index(b, sshIdent20); i >= 0 {
+		best = i
 	}
-	if len(s) > 64 {
-		s = s[:64]
+	if i := bytes.Index(b, sshIdent1x); i >= 0 && (best < 0 || i < best) {
+		best = i
 	}
-	if strings.HasPrefix(s, "http/") || strings.HasPrefix("http/", s) {
-		return true
+	off := 0
+	for off < len(b) {
+		i := bytes.Index(b[off:], sshIdentPrefix)
+		if i < 0 {
+			break
+		}
+		pos := off + i
+		if pos == 0 || b[pos-1] == '\n' {
+			if best < 0 || pos < best {
+				best = pos
+			}
+			break
+		}
+		off = pos + 1
 	}
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return looksHttpLike(strings.TrimSpace(s[:i]))
+	return best
+}
+
+// isTextJunk benar selama semua byte adalah teks ASCII yang bisa dicetak atau
+// spasi/tab/CR/LF. Teks seperti itu ditahan sampai identitas SSH muncul; byte
+// biner pertama menandakan ini bukan sampah HTTP sehingga diteruskan apa adanya.
+func isTextJunk(b []byte) bool {
+	for _, ch := range b {
+		if ch == '\t' || ch == '\r' || ch == '\n' {
+			continue
+		}
+		if ch < 0x20 || ch > 0x7e {
+			return false
+		}
 	}
-	return false
+	return true
+}
+
+var lastSSHWSAnomalyLog int64
+
+// logSSHWSAnomaly mencatat kejanggalan jalur SSH-WS dengan batas frekuensi
+// global (maksimal sekali tiap 30 detik) supaya journald VPS kecil tidak
+// kebanjiran. Cuplikan byte selalu lewat escapeSnippet supaya karakter kontrol
+// tidak merusak terminal yang membaca journal.
+func logSSHWSAnomaly(format string, args ...interface{}) {
+	now := time.Now().UnixNano()
+	prev := atomic.LoadInt64(&lastSSHWSAnomalyLog)
+	if prev != 0 && now-prev < int64(30*time.Second) {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&lastSSHWSAnomalyLog, prev, now) {
+		return
+	}
+	// journald sudah menambahkan timestamp, jadi cukup tulis ke stderr tanpa
+	// prefix waktu sendiri. Memakai fmt/os yang sudah diimpor (tanpa paket log).
+	fmt.Fprintf(os.Stderr, "[sshws] "+format+"\n", args...)
+}
+
+func escapeSnippet(b []byte, max int) string {
+	if len(b) > max {
+		b = b[:max]
+	}
+	var sb strings.Builder
+	for _, ch := range b {
+		if ch >= 0x20 && ch <= 0x7e {
+			sb.WriteByte(ch)
+		} else {
+			fmt.Fprintf(&sb, "\\x%02x", ch)
+		}
+	}
+	return sb.String()
 }
 
 type sshJunkSkipConn struct {
 	net.Conn
-	pend []byte
-	err  error
-	done bool
+	pend     []byte
+	clientIP string
+	err      error
+	done     bool
 }
 
 func (c *sshJunkSkipConn) Read(p []byte) (int, error) {
 	for !c.done {
 		if len(c.pend) > 0 {
-			if idx := bytes.Index(c.pend, sshIdentPrefix); idx >= 0 {
+			if idx := sshIdentIndex(c.pend); idx >= 0 {
 				c.pend = c.pend[idx:]
 				c.done = true
 				break
 			}
-			if !looksLikeHTTPJunk(c.pend) || len(c.pend) > maxSSHJunkBytes {
+			if !isTextJunk(c.pend) {
+				c.done = true
+				break
+			}
+			if len(c.pend) > maxSSHJunkBytes {
+				logSSHWSAnomaly("identitas SSH tidak muncul setelah %d byte dari %s; cuplikan: %s",
+					len(c.pend), c.clientIP, escapeSnippet(c.pend, 48))
 				c.done = true
 				break
 			}
 		}
 		buf := make([]byte, 2048)
 		n, err := c.Conn.Read(buf)
-		c.pend = append(c.pend, buf[:n]...)
+		if n > 0 {
+			c.pend = append(c.pend, buf[:n]...)
+		}
 		if err != nil {
 			c.done = true
 			c.err = err
@@ -10482,8 +10570,8 @@ func (c *sshJunkSkipConn) Read(p []byte) (int, error) {
 
 // Sisi klien tunnel SSH setelah 101: data yang sudah ada di buffer reader ikut
 // lewat penyaring yang sama dengan data berikutnya.
-func sshClientSide(client net.Conn, reader *bufio.Reader) net.Conn {
-	c := &sshJunkSkipConn{Conn: client}
+func sshClientSide(client net.Conn, reader *bufio.Reader, clientIP string) net.Conn {
+	c := &sshJunkSkipConn{Conn: client, clientIP: clientIP}
 	if n := reader.Buffered(); n > 0 {
 		c.pend = make([]byte, n)
 		if _, err := io.ReadFull(reader, c.pend); err != nil {
@@ -10794,7 +10882,7 @@ func connectSSHAfterUpgrade(client net.Conn, reader *bufio.Reader, clientIP, ssh
 		return
 	}
 	_ = client.SetReadDeadline(time.Time{})
-	tunnelBoth(sshClientSide(client, reader), sshUp, registerQuotaSession(sshUp, clientIP))
+	tunnelBoth(sshClientSide(client, reader, clientIP), sshUp, registerQuotaSession(sshUp, clientIP))
 }
 
 func handleRealWebSocket(client net.Conn, reader *bufio.Reader, rawHeader []byte, wsKey, clientIP, sshHost string, sshPort, keepAliveSeconds int) {
@@ -10908,6 +10996,27 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 	    if strings.HasPrefix(first, "connect ") {
 				_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 				afterConnect = true
+				// Setelah CONNECT, klien SSH-over-CONNECT biasa langsung
+				// mengirim identitas SSH atau diam menunggu banner server.
+				// readHttpHeader akan menunggu penutup header selamanya untuk
+				// kedua kasus itu sehingga koneksi macet sampai deadline. Jadi
+				// intip dulu dengan deadline pendek: identitas SSH atau klien
+				// yang diam diarahkan langsung ke tunnel SSH, selain itu lanjut
+				// parse request HTTP berikutnya di loop (jalur injektor [split]).
+				_ = client.SetReadDeadline(time.Now().Add(firstFrameWait))
+				peekConnect, perr := reader.Peek(4)
+				if perr != nil {
+					if ne, ok := perr.(net.Error); ok && ne.Timeout() {
+						connectSSHAfterUpgrade(client, reader, clientIP, sshHost, sshPort, keepAliveSeconds)
+						return
+					}
+					return
+				}
+				if string(peekConnect) == "SSH-" {
+					connectSSHAfterUpgrade(client, reader, clientIP, sshHost, sshPort, keepAliveSeconds)
+					return
+				}
+				_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
 				continue
 			}
 
@@ -10924,7 +11033,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 				}
 				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
 				_ = client.SetReadDeadline(time.Time{})
-				tunnelBoth(sshClientSide(client, reader), sshUp, registerQuotaSession(sshUp, clientIP))
+				tunnelBoth(sshClientSide(client, reader, clientIP), sshUp, registerQuotaSession(sshUp, clientIP))
 				return
 			}
 
@@ -10937,7 +11046,7 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 				}
 				_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
 				_ = client.SetReadDeadline(time.Time{})
-				tunnelBoth(sshClientSide(client, reader), sshUp, registerQuotaSession(sshUp, clientIP))
+				tunnelBoth(sshClientSide(client, reader, clientIP), sshUp, registerQuotaSession(sshUp, clientIP))
 				return
 			}
 

@@ -514,3 +514,209 @@ func TestPort80SplitCRLFCRLF(t *testing.T) {
 func TestPort80SplitArrivesLate(t *testing.T) {
 	splitJunkCase(t, nginxFirst, splitUpgrade+"HTTP/enhanced 200 OK\r\n\n")
 }
+
+// ── Celah yang masih tersisa di V.1FSC.99 ───────────────────────────────────
+// Penyaring .99 memakai bytes.Index("SSH-") + looksLikeHTTPJunk. Itu menyerah
+// menyaring begitu potongan pertama tidak tampak seperti HTTP (padahal identitas
+// belum datang), dan memotong di "SSH-" pertama walau itu bagian teks sampah.
+// Tes di bawah ini gagal di .99 dan lolos di penyaring teks .100.
+
+// sshFragmentCase meniru klien yang mengirim sampah lalu identitas SSH dalam
+// beberapa paket terpisah (TCP tersegmentasi). Banner server harus tetap sampai
+// tanpa menunggu, dan SSH harus menerima identitas klien utuh tanpa byte sampah
+// di depannya. Fragmen terakhir selalu identitas penuh supaya fakeSSH membacanya
+// sebagai satu potongan.
+func sshFragmentCase(t *testing.T, request string, frags []string) {
+	defer setup(t)()
+	h := newHarness(t, "101")
+	defer h.close()
+	c, r, resp := h.open(t, request)
+	defer c.Close()
+	for strings.HasPrefix(resp, "HTTP/1.1 200") {
+		var next bytes.Buffer
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				t.Fatalf("respons 101 tidak datang setelah 200: %v", err)
+			}
+			next.WriteString(line)
+			if line == "\r\n" {
+				break
+			}
+		}
+		resp = next.String()
+	}
+	if !strings.HasPrefix(resp, "HTTP/1.1 101") {
+		t.Fatalf("payload harus dijawab 101:\n%s", resp)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if line, err := r.ReadString('\n'); err != nil || line != "SSH-2.0-fake\r\n" {
+		t.Fatalf("banner SSH harus sampai tanpa menunggu: %q %v", line, err)
+	}
+	for _, f := range frags {
+		if _, err := c.Write([]byte(f)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	hit := h.wait(t)
+	if hit.name != "ssh" || !strings.HasPrefix(string(hit.data), "SSH-2.0-client") {
+		t.Fatalf("SSH harus menerima identitas klien utuh: %s %q", hit.name, hit.data)
+	}
+}
+
+// Potongan sampah kecil yang bukan teks HTTP ("\n" literal) datang sendirian
+// sebelum identitas. Mux .99 menyerah menyaring lalu menempelkannya ke identitas
+// SSH sehingga Dropbear menolak baris itu.
+func TestFragmentLiteralBackslashNThenIdent(t *testing.T) {
+	sshFragmentCase(t, nginxFirst, []string{"\\n", "SSH-2.0-client\r\n"})
+}
+
+// Awalan method HTTP yang terpotong ("PAT") datang lebih dulu; penyaring harus
+// menahannya sebagai teks sampai identitas muncul, bukan langsung meneruskannya.
+func TestFragmentPartialMethodThenIdent(t *testing.T) {
+	sshFragmentCase(t, nginxFirst, []string{"PAT", "CH / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n", "SSH-2.0-client\r\n"})
+}
+
+// Teks sampah memuat token mirip identitas ("User-Agent: SSH-Client/..") sebelum
+// identitas asli. Mux .99 memotong di "SSH-" pertama sehingga Dropbear menerima
+// baris sampah sebagai identitas; .100 hanya menerima "SSH-2.0"/"SSH-1." atau
+// "SSH-" di awal baris.
+func TestSplitJunkFakeSSHToken(t *testing.T) {
+	splitJunkCase(t, splitUpgrade+"User-Agent: SSH-Client/9.9\r\n\r\n", "")
+}
+
+func TestPort80FakeSSHToken(t *testing.T) {
+	splitJunkCase(t, nginxFirst+"User-Agent: SSH-Client/9.9\r\n\r\n", "")
+}
+
+// [split] ganda dengan request lengkap di dalamnya (jalur port 80). Gagal di
+// .98 (penutup "\r\n\n"), lolos sejak .99.
+func TestPort80DoubleSplit(t *testing.T) {
+	splitJunkCase(t, nginxFirst+splitUpgrade+splitUpgrade+"HTTP/enhanced 200 OK\r\n\n", "")
+}
+
+// ── SSH-over-CONNECT ────────────────────────────────────────────────────────
+// Setelah 200 Connection Established, klien bisa langsung mengirim identitas SSH
+// atau diam menunggu banner server. Mux .99 kembali ke readHttpHeader yang
+// menunggu penutup header selamanya, jadi koneksi macet sampai deadline dan
+// banner tidak pernah sampai. .100 mengintip dulu dengan deadline pendek.
+
+func TestConnectThenRawSSH(t *testing.T) {
+	defer setup(t)()
+	h := newHarness(t, "101")
+	defer h.close()
+	c, r, resp := h.open(t, "CONNECT host:22 HTTP/1.1\r\nHost: host:22\r\n\r\n")
+	defer c.Close()
+	if !strings.HasPrefix(resp, "HTTP/1.1 200") {
+		t.Fatalf("CONNECT harus dijawab 200:\n%s", resp)
+	}
+	_, _ = c.Write([]byte("SSH-2.0-client\r\n"))
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if line, err := r.ReadString('\n'); err != nil || line != "SSH-2.0-fake\r\n" {
+		t.Fatalf("banner SSH harus sampai setelah CONNECT: %q %v", line, err)
+	}
+	if hit := h.wait(t); hit.name != "ssh" || !strings.HasPrefix(string(hit.data), "SSH-2.0-client") {
+		t.Fatalf("SSH harus menerima identitas utuh setelah CONNECT")
+	}
+}
+
+func TestConnectThenSilentSSH(t *testing.T) {
+	defer setup(t)()
+	h := newHarness(t, "101")
+	defer h.close()
+	c, r, resp := h.open(t, "CONNECT host:22 HTTP/1.1\r\nHost: host:22\r\n\r\n")
+	defer c.Close()
+	if !strings.HasPrefix(resp, "HTTP/1.1 200") {
+		t.Fatalf("CONNECT harus dijawab 200:\n%s", resp)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if line, err := r.ReadString('\n'); err != nil || line != "SSH-2.0-fake\r\n" {
+		t.Fatalf("banner SSH harus sampai walau klien diam: %q %v", line, err)
+	}
+	_, _ = c.Write([]byte("SSH-2.0-client\r\n"))
+	if hit := h.wait(t); hit.name != "ssh" {
+		t.Fatalf("seharusnya SSH, dapat %s", hit.name)
+	}
+}
+
+// Setelah CONNECT, request HTTP Upgrade [split] yang menyusul tetap dilayani 101
+// lalu SSH (perilaku lama tidak boleh rusak oleh intip baru).
+func TestConnectThenUpgradeStillSSH(t *testing.T) {
+	defer setup(t)()
+	h := newHarness(t, "101")
+	defer h.close()
+	c, r, resp := h.open(t, "CONNECT host:22 HTTP/1.1\r\nHost: host:22\r\n\r\n")
+	defer c.Close()
+	if !strings.HasPrefix(resp, "HTTP/1.1 200") {
+		t.Fatalf("CONNECT harus dijawab 200:\n%s", resp)
+	}
+	_, _ = c.Write([]byte(splitUpgrade))
+	var up bytes.Buffer
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.Fatalf("101 setelah upgrade pasca-CONNECT tidak datang: %v (%q)", err, up.String())
+		}
+		up.WriteString(line)
+		if line == "\r\n" {
+			break
+		}
+	}
+	if !strings.HasPrefix(up.String(), "HTTP/1.1 101") {
+		t.Fatalf("upgrade setelah CONNECT harus 101:\n%s", up.String())
+	}
+	if line, err := r.ReadString('\n'); err != nil || line != "SSH-2.0-fake\r\n" {
+		t.Fatalf("banner SSH harus sampai: %q %v", line, err)
+	}
+	_, _ = c.Write([]byte("SSH-2.0-client\r\n"))
+	if hit := h.wait(t); hit.name != "ssh" {
+		t.Fatalf("seharusnya SSH, dapat %s", hit.name)
+	}
+}
+
+// Header yang ditutup LF saja ("\n\n") di jalur mux langsung (443/CONNECT atau
+// HAProxy send-proxy). Mux .99 hanya berhenti di "\r\n\r\n" sehingga
+// readHttpHeader macet; .100 menerima "\n\n" juga.
+func TestBareLFHeaderUpgrade(t *testing.T) {
+	defer setup(t)()
+	h := newHarness(t, "101")
+	defer h.close()
+	c, r, resp := h.open(t, "PATCH / HTTP/1.1\nHost: bug.com\nUpgrade: websocket\nConnection: Upgrade\n\n")
+	defer c.Close()
+	if !strings.HasPrefix(resp, "HTTP/1.1 101") {
+		t.Fatalf("header LF-saja harus tetap di-upgrade:\n%s", resp)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if line, err := r.ReadString('\n'); err != nil || line != "SSH-2.0-fake\r\n" {
+		t.Fatalf("banner harus sampai: %q %v", line, err)
+	}
+	_, _ = c.Write([]byte("SSH-2.0-client\r\n"))
+	if hit := h.wait(t); hit.name != "ssh" || !strings.HasPrefix(string(hit.data), "SSH-2.0-client") {
+		t.Fatalf("SSH harus menerima identitas utuh")
+	}
+}
+
+// Unit sshIdentIndex: "SSH-2.0"/"SSH-1." di mana saja, "SSH-" polos hanya di
+// awal atau setelah newline; token di tengah baris tidak dipotong.
+func TestSSHIdentIndex(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"SSH-2.0-x", 0},
+		{"junk\r\nSSH-2.0-x", 6},
+		{"\\nSSH-2.0-x", 2},
+		{"User-Agent: SSH-Client\r\n", -1},
+		{"User-Agent: SSH-Client\r\nSSH-2.0-x", 24},
+		{"\nSSH-foo", 1},
+		{"SSH-foo", 0},
+		{"no identity here", -1},
+	}
+	for _, tc := range cases {
+		if got := sshIdentIndex([]byte(tc.in)); got != tc.want {
+			t.Fatalf("sshIdentIndex(%q) = %d, mau %d", tc.in, got, tc.want)
+		}
+	}
+}

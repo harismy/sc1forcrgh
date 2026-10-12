@@ -58,6 +58,9 @@ const requires = [...source.matchAll(/require\('([^']+)'\)/g)].map((m) => m[1]);
 assert.deepStrictEqual([...new Set(requires)].sort(), ['crypto', 'fs', 'http', 'https', 'path', 'sqlite3'],
   'bot-panel.js hanya boleh memakai modul bawaan Node dan sqlite3 milik api.js');
 assert(!/log\([^)]*CONFIG\.(token|localToken)/.test(source), 'token tidak boleh ditulis ke log');
+// Bot jualan terpisah dari bot notifikasi: token dan chat notif tidak dibaca.
+assert(!/envStr\('TELEGRAM_|process\.env\.TELEGRAM_|ENV\.TELEGRAM_/.test(source), 'bot jualan tidak boleh memakai TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID milik bot notif');
+assert(/envStr\('BOT_PANEL_TOKEN'\)/.test(source), 'bot jualan memakai BOT_PANEL_TOKEN');
 
 // ── Muat modul dengan env tiruan ────────────────────────────────────────────
 
@@ -65,7 +68,8 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bot-panel-test-'));
 const dbPath = path.join(tmp, 'state', 'bot-panel.db');
 Object.assign(process.env, {
   BOT_PANEL_ENABLE: '1',
-  TELEGRAM_BOT_TOKEN: '123456:TESTTOKEN',
+  BOT_PANEL_TOKEN: '654321:JUALANTOKEN',
+  TELEGRAM_BOT_TOKEN: '123456:NOTIFTOKEN',
   TELEGRAM_CHAT_ID: '-1009999',
   BOT_PANEL_ADMIN_IDS: '1001',
   BOT_PANEL_DB: dbPath,
@@ -488,6 +492,11 @@ async function saldo(id) {
   assert(/bukan database SQLite/.test(texts(calls)), 'file bukan sqlite ditolak');
   assert.strictEqual(await saldo(BUYER), 15000, 'database tetap utuh setelah restore ditolak');
 
+  // Semua kabar toko lewat bot jualan ke chat pribadi admin, tidak pernah ke chat notif.
+  assert.strictEqual(bot.CONFIG.token, '654321:JUALANTOKEN');
+  assert(!tgCalls.some((c) => String(c.payload && c.payload.chat_id) === '-1009999'), 'bot jualan tidak boleh mengirim ke chat bot notif');
+  assert(tgCalls.some((c) => c.method === 'sendMessage' && c.payload.chat_id === '1001' && /TOP UP MASUK/.test(c.payload.text)), 'kabar top up dikirim ke admin');
+
   await bot.closeStore();
 
   // ── Integrasi installer ─────────────────────────────────────────────────
@@ -501,17 +510,20 @@ async function saldo(id) {
     }
     assert(/^BOT_PANEL_ENABLE="\$\{BOT_PANEL_ENABLE:-0\}"$/m.test(installer), 'Bot Panel mati secara default');
     const appEnv = installer.slice(installer.indexOf('cat > "${APP_DIR}/.env" <<EOF'), installer.indexOf('chmod 600 "${APP_DIR}/.env"'));
-    for (const key of ['BOT_PANEL_ENABLE', 'BOT_PANEL_ADMIN_IDS']) {
+    for (const key of ['BOT_PANEL_ENABLE', 'BOT_PANEL_TOKEN', 'BOT_PANEL_ADMIN_IDS']) {
       const line = `\n${key}=\${${key}}\n`;
       assert(appEnv.includes(line), `${key} wajib ada di .env aplikasi`);
       assert(installer.split(line).length - 1 >= 2, `${key} wajib ada di .env aplikasi dan dump /etc/sc-1forcr.env`);
     }
     const persist = installer.slice(installer.indexOf('persist_pending_install_env() {'), installer.indexOf('persist_pending_install_env() {') + 6000);
-    assert(/BOT_PANEL_ENABLE BOT_PANEL_ADMIN_IDS/.test(persist), 'variabel Bot Panel wajib ikut persist_pending_install_env');
+    assert(/BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS/.test(persist), 'variabel Bot Panel wajib ikut persist_pending_install_env');
     assert((installer.match(/^\s+install_bot_panel \|\| true$/gm) || []).length >= 2, 'install_bot_panel dipanggil di jalur install penuh dan update aman');
     assert(/set_bot_panel_menu \|\| true/.test(installer), 'menu Tools punya Mode Bot Panel');
-    assert(/systemctl restart sc-1forcr-botpanel/.test(installer.slice(installer.indexOf('set_telegram_notif_config() {'), installer.indexOf('set_account_event_webhook_config() {'))),
-      'ganti token bot harus me-restart Bot Panel yang aktif');
+    assert(/"\$\{BOT_PANEL_ENABLE\}" == "1" && -n "\$\{BOT_PANEL_TOKEN:-\}"/.test(installer), 'service hanya jalan kalau token bot jualan ada');
+    const notifMenu = installer.slice(installer.indexOf('set_telegram_notif_config() {'), installer.indexOf('\n}\n', installer.indexOf('set_telegram_notif_config() {')));
+    assert(!/botpanel|BOT_PANEL/.test(notifMenu), 'setting bot notif tidak boleh menyentuh Bot Panel (bot terpisah)');
+    const tokenMenu = installer.slice(installer.indexOf('set_bot_panel_token() {'), installer.indexOf('\n}\n', installer.indexOf('set_bot_panel_token() {')));
+    assert(tokenMenu.length > 50 && /== "\$\{TELEGRAM_BOT_TOKEN:-\}"/.test(tokenMenu), 'token bot jualan wajib ditolak kalau sama dengan token bot notif');
   }
 
   fs.rmSync(tmp, { recursive: true, force: true });

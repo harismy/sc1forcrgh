@@ -84,8 +84,9 @@ set -euo pipefail
 #   SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES=15   (opsional, jeda minimal restart ulang unit yang sama oleh watchdog)
 #   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
 #   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
-#   BOT_PANEL_ENABLE=0                          (opsional, 1=bot Telegram jualan akun aktif; 0=bot hanya kirim notif)
-#   BOT_PANEL_ADMIN_IDS=                        (opsional, ID Telegram admin Bot Panel, pisah koma; default TELEGRAM_CHAT_ID pribadi)
+#   BOT_PANEL_ENABLE=0                          (opsional, 1=bot Telegram jualan akun aktif)
+#   BOT_PANEL_TOKEN=                            (opsional, token bot jualan; terpisah dari TELEGRAM_BOT_TOKEN notif)
+#   BOT_PANEL_ADMIN_IDS=                        (opsional, ID Telegram admin bot jualan, pisah koma)
 #   BOT_PANEL_MEMORY_MAX=128M                   (opsional, batas RAM service Bot Panel)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
@@ -254,10 +255,11 @@ DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
-# Mode Bot Panel: bot Telegram yang sama dipakai untuk jualan akun (buat,
-# trial, perpanjang, top up, multi server). Mati secara default; saat mati,
-# bot hanya menerima notifikasi dari api.js seperti biasa.
+# Mode Bot Panel: bot Telegram jualan akun (buat, trial, perpanjang, top up,
+# multi server) dengan token sendiri. Terpisah dari bot notifikasi di atas,
+# yang tetap mengirim notif seperti biasa. Mati secara default.
 BOT_PANEL_ENABLE="${BOT_PANEL_ENABLE:-0}"
+BOT_PANEL_TOKEN="${BOT_PANEL_TOKEN:-}"
 BOT_PANEL_ADMIN_IDS="${BOT_PANEL_ADMIN_IDS:-}"
 BOT_PANEL_MEMORY_MAX="${BOT_PANEL_MEMORY_MAX:-128M}"
 BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}"
@@ -5455,6 +5457,7 @@ TUNNEL_ABUSE_BLOCK_TCP_PORTS=${TUNNEL_ABUSE_BLOCK_TCP_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_PANEL_ENABLE=${BOT_PANEL_ENABLE}
+BOT_PANEL_TOKEN=${BOT_PANEL_TOKEN}
 BOT_PANEL_ADMIN_IDS=${BOT_PANEL_ADMIN_IDS}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
 BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
@@ -22690,10 +22693,11 @@ apply_extra_ports() {
 }
 
 # ── Mode Bot Panel ──────────────────────────────────────────────────────────
-# Bot Telegram jualan akun yang memakai token bot notifikasi yang sama. File
-# dan unit selalu ditulis (supaya menu bisa menyalakannya tanpa update), tapi
-# service hanya jalan saat BOT_PANEL_ENABLE=1; saat mati tidak ada proses
-# tambahan sama sekali. Service memakai DynamicUser: bot menerima input dari
+# Bot Telegram jualan akun dengan token sendiri (BOT_PANEL_TOKEN), terpisah
+# dari bot notifikasi (TELEGRAM_BOT_TOKEN) yang tidak disentuh sama sekali.
+# File dan unit selalu ditulis (supaya menu bisa menyalakannya tanpa update),
+# tapi service hanya jalan saat BOT_PANEL_ENABLE=1 dan token bot jualan ada;
+# saat mati tidak ada proses tambahan sama sekali. Service memakai DynamicUser: bot menerima input dari
 # publik, jadi tidak dijalankan sebagai root, dan database saldo di
 # /var/lib/sc-1forcr-botpanel hanya bisa dibaca user dinamis itu dan root.
 # Gagal di sini tidak boleh menggagalkan install atau memicu rollback update.
@@ -22707,8 +22711,13 @@ install_bot_panel() {
 // -------------------
 // Bot Telegram jualan akun (buat, trial, perpanjang) untuk server ini dan
 // server SC 1FORCR lain yang didaftarkan admin lewat domain + token API.
-// Hanya jalan saat BOT_PANEL_ENABLE=1 (service sc-1forcr-botpanel). Saat mati,
-// token bot yang sama tetap dipakai api.js untuk notifikasi saja.
+// Hanya jalan saat BOT_PANEL_ENABLE=1 (service sc-1forcr-botpanel).
+//
+// Bot jualan terpisah dari bot notifikasi: bot ini hanya memakai
+// BOT_PANEL_TOKEN dan BOT_PANEL_ADMIN_IDS. TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+// tetap milik notifikasi api.js, backup, dan notif online, dan tidak dibaca di
+// sini. Kabar toko (top up masuk, penjualan, pesanan bermasalah) dikirim bot
+// ini ke chat pribadi admin.
 //
 // Hemat resource (target VPS 1 GB / 1 vCPU):
 // - Tanpa dependensi baru: hanya modul bawaan Node dan sqlite3 milik api.js.
@@ -22740,19 +22749,13 @@ function parseIdList(raw) {
 
 const CONFIG = {
   enabled: envStr('BOT_PANEL_ENABLE', '0') === '1',
-  token: envStr('TELEGRAM_BOT_TOKEN'),
-  notifyChat: envStr('TELEGRAM_CHAT_ID'),
+  token: envStr('BOT_PANEL_TOKEN'),
   dbPath: envStr('BOT_PANEL_DB', '/var/lib/sc-1forcr-botpanel/bot-panel.db'),
   domain: envStr('DOMAIN').toLowerCase(),
   localPort: Number(envStr('PORT', '0')) || 0,
   localToken: envStr('API_AUTH_TOKEN') || envStr('AUTH_TOKEN'),
-  adminIds: []
+  adminIds: parseIdList(envStr('BOT_PANEL_ADMIN_IDS'))
 };
-CONFIG.adminIds = (() => {
-  const list = parseIdList(envStr('BOT_PANEL_ADMIN_IDS'));
-  if (list.length) return list;
-  return /^\d{4,20}$/.test(CONFIG.notifyChat) ? [CONFIG.notifyChat] : [];
-})();
 
 const DEFAULT_GOPAY_BASE = 'https://api-gopay.sawargipay.cloud';
 const DEFAULT_SHOPEE_BASE = 'https://v1-gateway.autogopay.site';
@@ -23292,9 +23295,10 @@ async function sendAccountMessage(chatId, text, markup) {
   }
 }
 
+// Kabar toko dikirim bot jualan ke chat pribadi tiap admin, bukan ke chat
+// bot notifikasi.
 async function notifyAdmins(text) {
-  const targets = CONFIG.notifyChat ? [CONFIG.notifyChat] : CONFIG.adminIds;
-  for (const target of targets) {
+  for (const target of CONFIG.adminIds) {
     await sendHtml(target, text).catch((err) => log('notif admin gagal:', err.message));
   }
 }
@@ -24703,7 +24707,8 @@ async function sendBackup(targets, reason) {
         .catch((err) => log('kirim backup gagal:', err.message));
     }
   } finally {
-    fs.unlink(file, () => {});
+    // Hapus sinkron: salinan berisi saldo tidak boleh tertinggal di disk.
+    try { fs.unlinkSync(file); } catch (_err) { /* sudah tidak ada */ }
   }
 }
 
@@ -25115,8 +25120,8 @@ async function handleConflict(err) {
     await notifyAdmins([
       '<b>BOT PANEL BENTROK</b>',
       LINE,
-      `Bot Panel di ${escapeHtml(CONFIG.domain || 'VPS ini')} tidak bisa membaca pesan karena token bot ini juga dipakai bot lain (VPS lain dengan Mode Bot Panel aktif, atau aplikasi lain).`,
-      'Satu token bot hanya boleh dipakai satu Bot Panel. Matikan Mode Bot Panel di VPS lain; server lain cukup didaftarkan lewat Menu Admin > Kelola Server.'
+      `Bot Panel di ${escapeHtml(CONFIG.domain || 'VPS ini')} tidak bisa membaca pesan karena token bot jualan ini juga dipakai program lain (VPS lain dengan Mode Bot Panel aktif, atau bot/aplikasi lain).`,
+      'Satu token bot jualan hanya boleh dipakai satu Bot Panel. Matikan Mode Bot Panel di VPS lain atau ganti token; server lain cukup didaftarkan lewat Menu Admin > Kelola Server.'
     ].join('\n'));
   }
   await sleep(60000);
@@ -25141,7 +25146,7 @@ async function pollLoop() {
         continue;
       }
       if (err.code === 401 || err.code === 404) {
-        log('token bot ditolak Telegram; cek TELEGRAM_BOT_TOKEN. Bot Panel berhenti.');
+        log('token bot jualan ditolak Telegram; cek BOT_PANEL_TOKEN. Bot Panel berhenti.');
         process.exit(0);
       }
       log('getUpdates gagal:', err.message);
@@ -25171,7 +25176,7 @@ async function main() {
     process.exit(0);
   }
   if (!CONFIG.token) {
-    log('TELEGRAM_BOT_TOKEN kosong; isi lewat menu Tools > Setting BOT Telegram.');
+    log('BOT_PANEL_TOKEN kosong; isi lewat menu Tools > Mode Bot Panel > Set Token Bot Jualan.');
     process.exit(0);
   }
   process.umask(0o077);
@@ -25183,7 +25188,7 @@ async function main() {
     botUsername = String(me.username || '');
   } catch (err) {
     if (err.code === 401 || err.code === 404) {
-      log('token bot ditolak Telegram; Bot Panel berhenti.');
+      log('token bot jualan ditolak Telegram; Bot Panel berhenti.');
       process.exit(0);
     }
     log('getMe gagal (lanjut):', err.message);
@@ -25308,7 +25313,7 @@ EOF
 # aktif supaya kode baru langsung dipakai; ini tidak menyentuh layanan tunnel.
 apply_bot_panel_state() {
   BOT_PANEL_ENABLE="$(normalize_bool_01 "${BOT_PANEL_ENABLE:-0}")"
-  if [[ "${BOT_PANEL_ENABLE}" == "1" && -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  if [[ "${BOT_PANEL_ENABLE}" == "1" && -n "${BOT_PANEL_TOKEN:-}" ]]; then
     systemctl enable sc-1forcr-botpanel.service >/dev/null 2>&1 || true
     if ! systemctl restart sc-1forcr-botpanel.service >/dev/null 2>&1; then
       log "PERINGATAN: Bot Panel gagal start. Cek: journalctl -u sc-1forcr-botpanel -n 50"
@@ -25398,6 +25403,7 @@ SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES=${SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 BOT_PANEL_ENABLE=${BOT_PANEL_ENABLE}
+BOT_PANEL_TOKEN=${BOT_PANEL_TOKEN}
 BOT_PANEL_ADMIN_IDS=${BOT_PANEL_ADMIN_IDS}
 BOT_PANEL_MEMORY_MAX=${BOT_PANEL_MEMORY_MAX}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -34911,6 +34917,7 @@ update_script_from_repo() {
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
     BOT_PANEL_ENABLE="${BOT_PANEL_ENABLE:-0}" \
+    BOT_PANEL_TOKEN="${BOT_PANEL_TOKEN:-}" \
     BOT_PANEL_ADMIN_IDS="${BOT_PANEL_ADMIN_IDS:-}" \
     BOT_PANEL_MEMORY_MAX="${BOT_PANEL_MEMORY_MAX:-128M}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
@@ -35147,9 +35154,6 @@ set_telegram_notif_config() {
     update_app_env_var "TELEGRAM_CHAT_ID" "${TELEGRAM_CHAT_ID}"
   fi
   systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
-  if [[ "$(normalize_bool_01 "${BOT_PANEL_ENABLE:-0}")" == "1" ]]; then
-    systemctl restart sc-1forcr-botpanel >/dev/null 2>&1 || true
-  fi
   reset_online_notify_retry
   systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
@@ -35172,20 +35176,55 @@ set_telegram_notif_config() {
   fi
 }
 
-# Mode Bot Panel: token bot notifikasi yang sama dipakai untuk bot jualan akun
-# (service sc-1forcr-botpanel). Mati = bot hanya menerima notifikasi api.js.
+# Mode Bot Panel: bot jualan akun (service sc-1forcr-botpanel) dengan token
+# sendiri (BOT_PANEL_TOKEN). Bot notifikasi (TELEGRAM_BOT_TOKEN) terpisah dan
+# tetap mengirim notif seperti biasa, apa pun status Bot Panel.
 bot_panel_enabled() {
   [[ "$(normalize_bool_01 "${BOT_PANEL_ENABLE:-0}")" == "1" ]]
 }
 
 bot_panel_admin_ids_text() {
-  if [[ -n "${BOT_PANEL_ADMIN_IDS:-}" ]]; then
-    printf '%s' "${BOT_PANEL_ADMIN_IDS}"
-  elif [[ "${TELEGRAM_CHAT_ID:-}" =~ ^[0-9]{4,20}$ ]]; then
-    printf '%s (dari Chat ID notif)' "${TELEGRAM_CHAT_ID}"
-  else
-    printf '%s' "-"
+  printf '%s' "${BOT_PANEL_ADMIN_IDS:--}"
+}
+
+# Token bot jualan dicek ke Telegram (getMe) sebelum disimpan. Token yang sama
+# dengan bot notif ditolak supaya kedua bot benar-benar terpisah.
+set_bot_panel_token() {
+  local token resp name
+  echo "Token Bot Jualan : $(mask_secret "${BOT_PANEL_TOKEN:-}")"
+  echo "Buat bot baru di @BotFather khusus untuk jualan, lalu tempel tokennya di sini."
+  echo "Kosongkan untuk mempertahankan, ketik 'batal' untuk kembali."
+  if ! prompt_input token "Token Bot Jualan: "; then
+    return 1
   fi
+  [[ "${token,,}" == "batal" ]] && return 1
+  [[ -z "${token}" ]] && return 0
+  token="$(printf '%s' "${token}" | tr -d '[:space:]')"
+  if [[ ! "${token}" =~ ^[0-9]{5,15}:[A-Za-z0-9_-]{30,64}$ ]]; then
+    echo "Format token tidak valid. Contoh: 123456789:AAH...(dari @BotFather)."
+    return 1
+  fi
+  if [[ "${token}" == "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    echo "Gagal: token ini sama dengan bot notif. Bot jualan wajib memakai bot lain."
+    return 1
+  fi
+  resp="$(curl -sS --connect-timeout 10 --max-time 20 "https://api.telegram.org/bot${token}/getMe" 2>/dev/null || true)"
+  if [[ "${resp}" == *'"ok":false'* ]]; then
+    echo "Gagal: token ditolak Telegram. Cek lagi token dari @BotFather."
+    return 1
+  fi
+  name="$(printf '%s' "${resp}" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')"
+  if [[ -z "${name}" ]]; then
+    echo "Peringatan: Telegram tidak bisa dihubungi untuk mengecek token; token tetap disimpan."
+  fi
+  BOT_PANEL_TOKEN="${token}"
+  update_sc_env_var "BOT_PANEL_TOKEN" "${BOT_PANEL_TOKEN}"
+  update_app_env_var "BOT_PANEL_TOKEN" "${BOT_PANEL_TOKEN}"
+  if bot_panel_enabled; then
+    systemctl restart sc-1forcr-botpanel.service >/dev/null 2>&1 || true
+  fi
+  echo "Berhasil: token bot jualan tersimpan${name:+ (@${name})}."
+  return 0
 }
 
 # Perkiraan dampak dari pengukuran service: proses Node + sqlite3 sekitar
@@ -35209,14 +35248,23 @@ bot_panel_resource_note() {
 }
 
 set_bot_panel_admin_ids() {
-  local ids clean
+  local ids clean suggest=""
+  if [[ -z "${BOT_PANEL_ADMIN_IDS:-}" && "${TELEGRAM_CHAT_ID:-}" =~ ^[0-9]{4,20}$ ]]; then
+    suggest="${TELEGRAM_CHAT_ID}"
+  fi
   echo "ID admin sekarang : $(bot_panel_admin_ids_text)"
-  echo "Cek ID Telegram Anda lewat @userinfobot (atau kirim /id ke bot saat Bot Panel aktif)."
-  echo "Pisahkan beberapa ID dengan koma. Kosongkan untuk mempertahankan, ketik 'batal' untuk kembali."
+  echo "Cek ID Telegram Anda lewat @userinfobot (atau kirim /id ke bot jualan saat aktif)."
+  echo "Pisahkan beberapa ID dengan koma. Ketik 'batal' untuk kembali."
+  if [[ -n "${suggest}" ]]; then
+    echo "Kosongkan untuk memakai ID ${suggest} (Chat ID bot notif)."
+  else
+    echo "Kosongkan untuk mempertahankan."
+  fi
   if ! prompt_input ids "ID admin Bot Panel: "; then
     return 1
   fi
   [[ "${ids,,}" == "batal" ]] && return 1
+  [[ -z "${ids}" ]] && ids="${suggest}"
   [[ -z "${ids}" ]] && return 0
   clean="$(echo "${ids}" | tr ' ;' ',,' | tr -cd '0-9,' | sed 's/,,*/,/g; s/^,//; s/,$//')"
   if [[ -z "${clean}" ]]; then
@@ -35247,12 +35295,13 @@ toggle_bot_panel() {
     echo "Gagal: Bot Panel belum terpasang di VPS ini. Jalankan Update SC dulu."
     return 1
   fi
-  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
-    echo "Gagal: Bot Token belum diisi. Isi dulu di menu Setting BOT Telegram."
-    return 1
+  if [[ -z "${BOT_PANEL_TOKEN:-}" ]]; then
+    echo "Peringatan: token bot jualan belum diisi. Bot jualan memakai bot terpisah dari bot notif."
+    set_bot_panel_token || return 1
+    [[ -n "${BOT_PANEL_TOKEN:-}" ]] || return 1
   fi
-  if [[ -z "${BOT_PANEL_ADMIN_IDS:-}" && ! "${TELEGRAM_CHAT_ID:-}" =~ ^[0-9]{4,20}$ ]]; then
-    echo "Peringatan: ID admin Bot Panel belum ada (Chat ID notif berupa grup)."
+  if [[ -z "${BOT_PANEL_ADMIN_IDS:-}" ]]; then
+    echo "Peringatan: ID admin bot jualan belum diisi."
     set_bot_panel_admin_ids || return 1
     [[ -n "${BOT_PANEL_ADMIN_IDS:-}" ]] || return 1
   fi
@@ -35272,7 +35321,7 @@ toggle_bot_panel() {
   systemctl restart sc-1forcr-botpanel.service >/dev/null 2>&1 || true
   sleep 3
   if systemctl is-active --quiet sc-1forcr-botpanel.service; then
-    echo "Berhasil: Bot Panel aktif. Kirim /start ke bot Anda, lalu buka Menu Admin untuk"
+    echo "Berhasil: Bot Panel aktif. Kirim /start ke bot jualan, lalu buka Menu Admin untuk"
     echo "mengisi harga server ini, payment gateway, dan menambah server lain."
   else
     echo "Gagal: Bot Panel tidak berjalan. Cek log:"
@@ -35287,32 +35336,37 @@ set_bot_panel_menu() {
   state="NONAKTIF (bot hanya kirim notifikasi)"
   bot_panel_enabled && state="AKTIF (bot jualan akun)"
   draw_menu_header "MODE BOT PANEL (JUALAN AKUN)"
-  echo "Status          : ${state}"
-  echo "Service         : $(systemctl is-active sc-1forcr-botpanel.service 2>/dev/null || echo inactive)"
-  echo "Bot Token       : $(mask_secret "${TELEGRAM_BOT_TOKEN:-}")"
-  echo "Admin Bot Panel : $(bot_panel_admin_ids_text)"
+  echo "Status           : ${state}"
+  echo "Service          : $(systemctl is-active sc-1forcr-botpanel.service 2>/dev/null || echo inactive)"
+  echo "Token Bot Jualan : $(mask_secret "${BOT_PANEL_TOKEN:-}")"
+  echo "Admin Bot Jualan : $(bot_panel_admin_ids_text)"
+  echo "Bot Notif        : $(mask_secret "${TELEGRAM_BOT_TOKEN:-}") (terpisah, tetap kirim notif)"
   bot_panel_resource_note
   echo
-  echo "Saat aktif, /start di bot menampilkan info toko dan saldo, menu buat, trial,"
-  echo "perpanjang akun, dan top up QRIS GoPay/ShopeePay (AutoGoPay). Menu Admin di bot"
-  echo "dipakai menambah server SC lain (domain + Auth Token), mengatur harga, dan saldo."
-  echo "Satu token bot hanya untuk satu Bot Panel; VPS lain cukup didaftarkan di bot."
+  echo "Bot jualan memakai bot Telegram sendiri. Saat aktif, /start di bot jualan"
+  echo "menampilkan info toko dan saldo, menu buat, trial, perpanjang akun, dan top up"
+  echo "QRIS GoPay/ShopeePay (AutoGoPay). Menu Admin di bot dipakai menambah server SC"
+  echo "lain (domain + Auth Token), mengatur harga, dan saldo. Kabar toko (top up,"
+  echo "penjualan) dikirim bot jualan ke admin; notif server tetap lewat bot notif."
+  echo "Satu token bot jualan hanya untuk satu Bot Panel; VPS lain cukup didaftarkan."
   echo
   if bot_panel_enabled; then
     echo "1) Nonaktifkan Bot Panel"
   else
     echo "1) Aktifkan Bot Panel"
   fi
-  echo "2) Set ID Admin Bot Panel"
-  echo "3) Lihat Log Bot Panel"
+  echo "2) Set Token Bot Jualan"
+  echo "3) Set ID Admin Bot Jualan"
+  echo "4) Lihat Log Bot Panel"
   echo "0) Kembali"
-  if ! prompt_input choice "Pilih [0-3]: "; then
+  if ! prompt_input choice "Pilih [0-4]: "; then
     return 0
   fi
   case "${choice}" in
     1) toggle_bot_panel || true ;;
-    2) set_bot_panel_admin_ids || true ;;
-    3) journalctl -u sc-1forcr-botpanel.service -n 40 --no-pager -o cat 2>/dev/null || echo "Log Bot Panel belum tersedia." ;;
+    2) set_bot_panel_token || true ;;
+    3) set_bot_panel_admin_ids || true ;;
+    4) journalctl -u sc-1forcr-botpanel.service -n 40 --no-pager -o cat 2>/dev/null || echo "Log Bot Panel belum tersedia." ;;
     *) return 0 ;;
   esac
   return 0
@@ -37730,7 +37784,7 @@ persist_pending_install_env() {
     DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION DROPBEAR_KEEPALIVE_SECONDS DROPBEAR_IDLE_TIMEOUT_SECONDS
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
-    BOT_PANEL_ENABLE BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
+    BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE

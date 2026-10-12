@@ -84,6 +84,9 @@ set -euo pipefail
 #   SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES=15   (opsional, jeda minimal restart ulang unit yang sama oleh watchdog)
 #   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
 #   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
+#   BOT_PANEL_ENABLE=0                          (opsional, 1=bot Telegram jualan akun aktif; 0=bot hanya kirim notif)
+#   BOT_PANEL_ADMIN_IDS=                        (opsional, ID Telegram admin Bot Panel, pisah koma; default TELEGRAM_CHAT_ID pribadi)
+#   BOT_PANEL_MEMORY_MAX=128M                   (opsional, batas RAM service Bot Panel)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
@@ -200,7 +203,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.100}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.101}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -251,6 +254,12 @@ DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+# Mode Bot Panel: bot Telegram yang sama dipakai untuk jualan akun (buat,
+# trial, perpanjang, top up, multi server). Mati secara default; saat mati,
+# bot hanya menerima notifikasi dari api.js seperti biasa.
+BOT_PANEL_ENABLE="${BOT_PANEL_ENABLE:-0}"
+BOT_PANEL_ADMIN_IDS="${BOT_PANEL_ADMIN_IDS:-}"
+BOT_PANEL_MEMORY_MAX="${BOT_PANEL_MEMORY_MAX:-128M}"
 BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}"
 BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
@@ -5445,6 +5454,8 @@ TUNNEL_ABUSE_GUARD_ENABLE=${TUNNEL_ABUSE_GUARD_ENABLE}
 TUNNEL_ABUSE_BLOCK_TCP_PORTS=${TUNNEL_ABUSE_BLOCK_TCP_PORTS}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+BOT_PANEL_ENABLE=${BOT_PANEL_ENABLE}
+BOT_PANEL_ADMIN_IDS=${BOT_PANEL_ADMIN_IDS}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
 BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 AUTO_REBOOT_ENABLE=${AUTO_REBOOT_ENABLE}
@@ -22678,6 +22689,2636 @@ apply_extra_ports() {
   return 0
 }
 
+# ── Mode Bot Panel ──────────────────────────────────────────────────────────
+# Bot Telegram jualan akun yang memakai token bot notifikasi yang sama. File
+# dan unit selalu ditulis (supaya menu bisa menyalakannya tanpa update), tapi
+# service hanya jalan saat BOT_PANEL_ENABLE=1; saat mati tidak ada proses
+# tambahan sama sekali. Service memakai DynamicUser: bot menerima input dari
+# publik, jadi tidak dijalankan sebagai root, dan database saldo di
+# /var/lib/sc-1forcr-botpanel hanya bisa dibaca user dinamis itu dan root.
+# Gagal di sini tidak boleh menggagalkan install atau memicu rollback update.
+install_bot_panel() {
+  log "Menulis Bot Panel..."
+  mkdir -p "${APP_DIR}" || return 0
+  cat > "${APP_DIR}/bot-panel.js" <<'BOT_PANEL_EOF'
+'use strict';
+
+// Bot Panel SC 1FORCR
+// -------------------
+// Bot Telegram jualan akun (buat, trial, perpanjang) untuk server ini dan
+// server SC 1FORCR lain yang didaftarkan admin lewat domain + token API.
+// Hanya jalan saat BOT_PANEL_ENABLE=1 (service sc-1forcr-botpanel). Saat mati,
+// token bot yang sama tetap dipakai api.js untuk notifikasi saja.
+//
+// Hemat resource (target VPS 1 GB / 1 vCPU):
+// - Tanpa dependensi baru: hanya modul bawaan Node dan sqlite3 milik api.js.
+// - Long polling getUpdates 50 detik: saat sepi hanya satu request per 50 detik.
+// - Pengecekan pembayaran hanya berjalan selama ada top up yang menunggu.
+// - QRIS dikirim sebagai URL gambar dari gateway; server ini tidak membuat gambar.
+//
+// Uang pembeli: saldo hanya berubah di dalam tx() lewat applyBalance(), dan
+// tidak ada panggilan jaringan di dalam transaksi. Pembelian memotong saldo
+// dulu, lalu memanggil API server; gagal yang pasti = saldo dikembalikan,
+// hasil yang tidak pasti (timeout) = pesanan ditandai "review" untuk admin.
+
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
+const https = require('https');
+const crypto = require('crypto');
+
+const ENV = process.env;
+
+function envStr(key, fallback = '') {
+  const value = ENV[key];
+  return String(value === undefined || value === null ? fallback : value).trim();
+}
+
+function parseIdList(raw) {
+  return [...new Set(String(raw || '').split(/[\s,;]+/).map((s) => s.trim()).filter((s) => /^\d{4,20}$/.test(s)))];
+}
+
+const CONFIG = {
+  enabled: envStr('BOT_PANEL_ENABLE', '0') === '1',
+  token: envStr('TELEGRAM_BOT_TOKEN'),
+  notifyChat: envStr('TELEGRAM_CHAT_ID'),
+  dbPath: envStr('BOT_PANEL_DB', '/var/lib/sc-1forcr-botpanel/bot-panel.db'),
+  domain: envStr('DOMAIN').toLowerCase(),
+  localPort: Number(envStr('PORT', '0')) || 0,
+  localToken: envStr('API_AUTH_TOKEN') || envStr('AUTH_TOKEN'),
+  adminIds: []
+};
+CONFIG.adminIds = (() => {
+  const list = parseIdList(envStr('BOT_PANEL_ADMIN_IDS'));
+  if (list.length) return list;
+  return /^\d{4,20}$/.test(CONFIG.notifyChat) ? [CONFIG.notifyChat] : [];
+})();
+
+const DEFAULT_GOPAY_BASE = 'https://api-gopay.sawargipay.cloud';
+const DEFAULT_SHOPEE_BASE = 'https://v1-gateway.autogopay.site';
+const LINE = '------------------------------';
+const DURATIONS = [1, 3, 7, 15, 30, 60, 90];
+const TOPUP_PRESETS = [10000, 20000, 50000, 100000];
+const PENDING_TTL_MS = 10 * 60 * 1000;
+const DEPOSIT_CHECK_MS = 10 * 1000;
+const DEPOSIT_GRACE_MS = 30 * 60 * 1000;
+
+const PROTOCOLS = {
+  ssh: { label: 'SSH / UDP', create: '/vps/sshvpn', trial: '/vps/trialsshvpn', renew: 'renewsshvpn' },
+  vmess: { label: 'VMess', create: '/vps/vmessall', trial: '/vps/trialvmessall', renew: 'renewvmess' },
+  vless: { label: 'VLESS', create: '/vps/vlessall', trial: '/vps/trialvlessall', renew: 'renewvless' },
+  trojan: { label: 'Trojan', create: '/vps/trojanall', trial: '/vps/trialtrojanall', renew: 'renewtrojan' }
+};
+
+// ── Utilitas ────────────────────────────────────────────────────────────────
+
+const now = () => Date.now();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function log(...args) {
+  console.log('[bot-panel]', ...args);
+}
+
+class UserError extends Error {}
+
+function rupiah(value) {
+  const n = Math.trunc(Number(value) || 0);
+  const digits = String(Math.abs(n)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  return `${n < 0 ? '-' : ''}Rp ${digits}`;
+}
+
+function wib(ms = now()) {
+  return new Date(Number(ms) + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+}
+
+function wibDayStart(ms = now()) {
+  return Date.parse(`${wib(ms).slice(0, 10)}T00:00:00+07:00`);
+}
+
+function escapeHtml(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function maskSecret(value) {
+  const text = String(value || '');
+  if (!text) return '-';
+  if (text.length <= 8) return '****';
+  return `${text.slice(0, 4)}****${text.slice(-4)}`;
+}
+
+function toInt(raw) {
+  const text = String(raw === undefined || raw === null ? '' : raw).replace(/[.,\s]/g, '').replace(/^rp/i, '');
+  return /^-?\d{1,12}$/.test(text) ? Number(text) : NaN;
+}
+
+function normalizeDomain(raw) {
+  const text = String(raw || '').trim().toLowerCase()
+    .replace(/^https?:\/\//, '').replace(/[/?#].*$/, '').replace(/:\d+$/, '').replace(/\.$/, '');
+  return /^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(text) ? text : '';
+}
+
+function normalizeBaseUrl(raw, suffixes = []) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  try {
+    const url = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    let pathname = url.pathname.replace(/\/+$/, '');
+    const lower = pathname.toLowerCase();
+    const suffix = suffixes.find((item) => lower.endsWith(item));
+    if (suffix) pathname = pathname.slice(0, -suffix.length).replace(/\/+$/, '');
+    return `${url.protocol}//${url.host}${pathname}`;
+  } catch (_err) {
+    return '';
+  }
+}
+
+function joinUrl(base, endpoint) {
+  return `${String(base).replace(/\/+$/, '')}/${String(endpoint).replace(/^\/+/, '')}`;
+}
+
+function parseExpiry(text, fallbackMs) {
+  const match = String(text || '').match(/(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2}(?::\d{2})?))?/);
+  if (!match) return fallbackMs;
+  const ms = Date.parse(`${match[1]}T${match[2] ? (match[2].length === 5 ? `${match[2]}:00` : match[2]) : '23:59:59'}+07:00`);
+  return Number.isFinite(ms) ? ms : fallbackMs;
+}
+
+function createMutex() {
+  let tail = Promise.resolve();
+  return (fn) => {
+    const result = tail.then(fn, fn);
+    tail = result.then(() => {}, () => {});
+    return result;
+  };
+}
+
+// Bagian yang bisa diganti test: database, Telegram, dan HTTP keluar.
+const deps = {
+  openDatabase(file) {
+    const sqlite3 = require('sqlite3');
+    return new Promise((resolve, reject) => {
+      const handle = new sqlite3.Database(file, (err) => (err ? reject(err) : resolve(handle)));
+    });
+  },
+  tgRequest: null,
+  httpJson: null,
+  downloadTelegramFile: null,
+  sendDocument: null
+};
+
+// ── Database ────────────────────────────────────────────────────────────────
+
+let db = null;
+let restoring = false;
+
+function dbCall(method, sql, params) {
+  return new Promise((resolve, reject) => {
+    if (!db) return reject(new Error('database belum siap'));
+    if (method === 'run') {
+      db.run(sql, params, function onRun(err) {
+        if (err) reject(err);
+        else resolve({ changes: this.changes, lastID: this.lastID });
+      });
+      return undefined;
+    }
+    db[method](sql, params, (err, out) => (err ? reject(err) : resolve(out)));
+    return undefined;
+  });
+}
+
+const run = (sql, params = []) => dbCall('run', sql, params);
+const get = (sql, params = []) => dbCall('get', sql, params);
+const all = (sql, params = []) => dbCall('all', sql, params);
+const exec = (sql) => new Promise((resolve, reject) => db.exec(sql, (err) => (err ? reject(err) : resolve())));
+
+// Satu koneksi SQLite: semua penulisan antre di satu kunci. Di dalam tx(),
+// pakai run() langsung (bukan write()) dan jangan memanggil jaringan.
+const writeLock = createMutex();
+const write = (sql, params = []) => writeLock(() => run(sql, params));
+
+function tx(fn) {
+  return writeLock(async () => {
+    await run('BEGIN IMMEDIATE');
+    try {
+      const out = await fn();
+      await run('COMMIT');
+      return out;
+    } catch (err) {
+      await run('ROLLBACK').catch(() => {});
+      throw err;
+    }
+  });
+}
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY, username TEXT, name TEXT,
+  saldo INTEGER NOT NULL DEFAULT 0, banned INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER, last_seen INTEGER
+);
+CREATE TABLE IF NOT EXISTS servers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, domain TEXT NOT NULL UNIQUE,
+  token TEXT NOT NULL DEFAULT '', local INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1,
+  price_day INTEGER NOT NULL DEFAULT 0, quota_gb INTEGER NOT NULL DEFAULT 0,
+  limit_ip INTEGER NOT NULL DEFAULT 2, max_accounts INTEGER NOT NULL DEFAULT 0, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, server_id INTEGER NOT NULL,
+  protocol TEXT NOT NULL, username TEXT NOT NULL, expired TEXT, expired_at INTEGER,
+  trial INTEGER NOT NULL DEFAULT 0, created_at INTEGER,
+  UNIQUE(server_id, protocol, username)
+);
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, server_id INTEGER NOT NULL,
+  kind TEXT NOT NULL, protocol TEXT NOT NULL, username TEXT NOT NULL, days INTEGER NOT NULL,
+  amount INTEGER NOT NULL, status TEXT NOT NULL, note TEXT, created_at INTEGER, updated_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS deposits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ref TEXT UNIQUE, user_id INTEGER NOT NULL,
+  amount INTEGER NOT NULL, gateway TEXT NOT NULL, provider_tx TEXT, chat_id INTEGER,
+  message_id INTEGER, status TEXT NOT NULL, created_at INTEGER, expires_at INTEGER, paid_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, delta INTEGER NOT NULL,
+  balance INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT, note TEXT, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
+CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
+CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+`;
+
+const SETTING_DEFAULTS = {
+  store_name: '',
+  info_text: 'Akun SSH, VMess, VLESS, dan Trojan aktif otomatis setelah dibeli.',
+  contact: '',
+  trial_enable: '1',
+  trial_per_day: '1',
+  gopay_enable: '0',
+  gopay_key: '',
+  gopay_base: DEFAULT_GOPAY_BASE,
+  shopee_enable: '0',
+  shopee_key: '',
+  shopee_base: DEFAULT_SHOPEE_BASE,
+  topup_min: '10000',
+  topup_max: '1000000',
+  qr_minutes: '15',
+  backup_daily: '1',
+  last_backup_date: ''
+};
+
+const settings = new Map();
+let botUsername = '';
+
+function setting(key) {
+  if (settings.has(key)) return settings.get(key);
+  return Object.prototype.hasOwnProperty.call(SETTING_DEFAULTS, key) ? SETTING_DEFAULTS[key] : '';
+}
+
+async function setSetting(key, value) {
+  await write('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', [key, String(value)]);
+  settings.set(key, String(value));
+}
+
+async function loadSettings() {
+  settings.clear();
+  for (const row of await all('SELECT key, value FROM settings')) settings.set(row.key, row.value);
+}
+
+async function openStore(file = CONFIG.dbPath) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  db = await deps.openDatabase(file);
+  await exec('PRAGMA busy_timeout = 5000;');
+  await exec(SCHEMA);
+  await loadSettings();
+  await ensureLocalServer();
+}
+
+function closeStore() {
+  return new Promise((resolve) => {
+    if (!db) return resolve();
+    const handle = db;
+    db = null;
+    handle.close(() => resolve());
+    return undefined;
+  });
+}
+
+// Server ini selalu terdaftar. Ia baru tampil ke pembeli setelah admin
+// mengisi harga, supaya akun tidak pernah terjual gratis karena lupa diatur.
+async function ensureLocalServer() {
+  const local = await get('SELECT * FROM servers WHERE local = 1 LIMIT 1');
+  const domain = CONFIG.domain || 'server-lokal';
+  if (!local) {
+    await write(
+      'INSERT OR IGNORE INTO servers (name, domain, token, local, enabled, price_day, quota_gb, limit_ip, max_accounts, created_at) VALUES (?, ?, ?, 1, 1, 0, 0, 2, 0, ?)',
+      ['Server Utama', domain, '', now()]
+    );
+  } else if (CONFIG.domain && local.domain !== domain) {
+    await write('UPDATE servers SET domain = ? WHERE id = ?', [domain, local.id]);
+  }
+}
+
+function storeName() {
+  const raw = setting('store_name') || botUsername || 'SC_1FORCR';
+  return String(raw).replace(/^@+/, '').trim() || 'SC_1FORCR';
+}
+
+function isAdmin(userId) {
+  return CONFIG.adminIds.includes(String(userId));
+}
+
+// Wajib dipanggil di dalam tx(). Saldo tidak pernah boleh minus.
+async function applyBalance(userId, delta, kind, ref, note) {
+  const user = await get('SELECT saldo FROM users WHERE id = ?', [userId]);
+  if (!user) throw new UserError('Pengguna tidak ditemukan.');
+  const next = Number(user.saldo) + Number(delta);
+  if (next < 0) throw new UserError('Saldo tidak cukup.');
+  await run('UPDATE users SET saldo = ? WHERE id = ?', [next, userId]);
+  await run(
+    'INSERT INTO ledger (user_id, delta, balance, kind, ref, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [userId, Number(delta), next, kind, ref || '', note || '', now()]
+  );
+  return next;
+}
+
+async function touchUser(from) {
+  const id = Number(from.id);
+  const username = String(from.username || '').slice(0, 64);
+  const name = [from.first_name, from.last_name].filter(Boolean).join(' ').slice(0, 64);
+  const user = await get('SELECT * FROM users WHERE id = ?', [id]);
+  if (!user) {
+    await write(
+      'INSERT OR IGNORE INTO users (id, username, name, saldo, banned, created_at, last_seen) VALUES (?, ?, ?, 0, 0, ?, ?)',
+      [id, username, name, now(), now()]
+    );
+    return get('SELECT * FROM users WHERE id = ?', [id]);
+  }
+  if (user.username !== username || user.name !== name || now() - Number(user.last_seen || 0) > 6 * 3600 * 1000) {
+    await write('UPDATE users SET username = ?, name = ?, last_seen = ? WHERE id = ?', [username, name, now(), id]);
+  }
+  return user;
+}
+
+// ── Telegram ────────────────────────────────────────────────────────────────
+
+const tgAgent = new https.Agent({ keepAlive: true, maxSockets: 6 });
+
+function readBody(res, limit) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    res.on('data', (chunk) => {
+      size += chunk.length;
+      if (size <= limit) chunks.push(chunk);
+    });
+    res.on('end', () => resolve(Buffer.concat(chunks)));
+    res.on('error', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+function tgError(data, statusCode) {
+  const err = new Error((data && data.description) || `HTTP ${statusCode}`);
+  err.code = (data && data.error_code) || statusCode;
+  err.retryAfter = data && data.parameters && data.parameters.retry_after;
+  return err;
+}
+
+deps.tgRequest = function tgRequest(method, payload, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const body = Buffer.from(JSON.stringify(payload || {}));
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${CONFIG.token}/${method}`,
+      method: 'POST',
+      agent: tgAgent,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': body.length }
+    }, async (res) => {
+      const raw = await readBody(res, 4 * 1024 * 1024);
+      let data = null;
+      try { data = JSON.parse(raw.toString('utf8')); } catch (_err) { data = null; }
+      if (data && data.ok) resolve(data.result);
+      else reject(tgError(data, res.statusCode));
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
+};
+
+deps.sendDocument = function sendDocument(chatId, filePath, fileName, caption) {
+  return new Promise((resolve, reject) => {
+    const boundary = `----scbotpanel${crypto.randomBytes(8).toString('hex')}`;
+    const field = (name, value) => Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`);
+    const body = Buffer.concat([
+      field('chat_id', String(chatId)),
+      field('caption', caption || ''),
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      fs.readFileSync(filePath),
+      Buffer.from(`\r\n--${boundary}--\r\n`)
+    ]);
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${CONFIG.token}/sendDocument`,
+      method: 'POST',
+      agent: tgAgent,
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length }
+    }, async (res) => {
+      const raw = await readBody(res, 1024 * 1024);
+      let data = null;
+      try { data = JSON.parse(raw.toString('utf8')); } catch (_err) { data = null; }
+      if (data && data.ok) resolve(data.result);
+      else reject(tgError(data, res.statusCode));
+    });
+    req.setTimeout(60000, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end(body);
+  });
+};
+
+deps.downloadTelegramFile = function downloadTelegramFile(filePath, target, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const req = https.get({
+      hostname: 'api.telegram.org',
+      path: `/file/bot${CONFIG.token}/${filePath}`,
+      agent: tgAgent
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`unduh file gagal (HTTP ${res.statusCode})`));
+        return;
+      }
+      let size = 0;
+      const out = fs.createWriteStream(target, { mode: 0o600 });
+      res.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > maxBytes) req.destroy(new Error('file terlalu besar'));
+      });
+      res.pipe(out);
+      out.on('finish', () => resolve(size));
+      out.on('error', reject);
+    });
+    req.setTimeout(60000, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+  });
+};
+
+async function tg(method, payload, { timeoutMs = 25000, retries = 1 } = {}) {
+  try {
+    return await deps.tgRequest(method, payload, timeoutMs);
+  } catch (err) {
+    if (err.code === 429 && retries > 0) {
+      await sleep(Math.min(30, Number(err.retryAfter) || 3) * 1000);
+      return tg(method, payload, { timeoutMs, retries: retries - 1 });
+    }
+    throw err;
+  }
+}
+
+// Skema warna tombol sama dengan bot lisensi: tanpa warna untuk navigasi,
+// merah untuk menghapus/mematikan, hijau untuk konfirmasi dan pembayaran,
+// biru untuk sisanya. Menu utama memberi warna per baris.
+function inferStyle(text) {
+  const t = String(text || '').trim().toLowerCase();
+  if (/^(kembali|batal|menu utama|sebelumnya|berikutnya)$/.test(t)) return '';
+  if (/^(hapus|nonaktifkan|blokir$|kurangi|refund|batalkan|ya, hapus)/.test(t)) return 'danger';
+  if (/^(ya, |bayar|cek status)/.test(t)) return 'success';
+  return 'primary';
+}
+
+function btn(text, data, style) {
+  const button = { text, callback_data: data };
+  const resolved = style === undefined ? inferStyle(text) : style;
+  if (['primary', 'success', 'danger'].includes(resolved)) button.style = resolved;
+  return button;
+}
+
+function kb(rows) {
+  return { inline_keyboard: rows.filter((row) => Array.isArray(row) && row.length) };
+}
+
+function pairs(buttons) {
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  return rows;
+}
+
+const backRow = (data = 'h', text = 'Kembali') => [btn(text, data, '')];
+
+function makeCtx(update) {
+  const cb = update.callback_query || null;
+  const msg = update.message || (cb && cb.message) || null;
+  return {
+    update,
+    cb,
+    msg: update.message || null,
+    from: (update.message && update.message.from) || (cb && cb.from) || null,
+    chatId: msg && msg.chat ? msg.chat.id : null,
+    chatType: msg && msg.chat ? msg.chat.type : '',
+    messageId: cb && cb.message ? cb.message.message_id : null,
+    cbIsMedia: Boolean(cb && cb.message && !cb.message.text),
+    answered: false,
+    user: null,
+    admin: false
+  };
+}
+
+async function answer(ctx, text = '', alert = false) {
+  if (!ctx.cb || ctx.answered) return;
+  ctx.answered = true;
+  await tg('answerCallbackQuery', { callback_query_id: ctx.cb.id, text: text || undefined, show_alert: alert || undefined }).catch(() => {});
+}
+
+function splitText(text, limit = 3800) {
+  const parts = [];
+  let current = '';
+  for (const line of String(text).split('\n')) {
+    if (current && current.length + line.length + 1 > limit) {
+      parts.push(current);
+      current = '';
+    }
+    current = current ? `${current}\n${line}` : line;
+  }
+  if (current) parts.push(current);
+  return parts.length ? parts : [''];
+}
+
+function sendHtml(chatId, text, markup) {
+  return tg('sendMessage', {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    ...(markup ? { reply_markup: markup } : {})
+  });
+}
+
+const reply = (ctx, text, markup) => sendHtml(ctx.chatId, text, markup);
+
+async function show(ctx, text, markup) {
+  if (ctx.cb && ctx.messageId && !ctx.cbIsMedia) {
+    try {
+      return await tg('editMessageText', {
+        chat_id: ctx.chatId,
+        message_id: ctx.messageId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: markup || kb([])
+      });
+    } catch (err) {
+      if (/not modified/i.test(err.message)) return null;
+    }
+  }
+  return reply(ctx, text, markup);
+}
+
+// Pesan akun memakai Markdown lama seperti BotVPN. Kalau Telegram menolak
+// entity (misalnya nama toko aneh), kirim ulang sebagai teks polos.
+async function sendAccountMessage(chatId, text, markup) {
+  const parts = splitText(text);
+  for (let i = 0; i < parts.length; i += 1) {
+    const last = i === parts.length - 1;
+    const payload = { chat_id: chatId, text: parts[i], disable_web_page_preview: true, ...(last && markup ? { reply_markup: markup } : {}) };
+    try {
+      await tg('sendMessage', { ...payload, parse_mode: 'Markdown' });
+    } catch (err) {
+      if (err.code !== 400) throw err;
+      await tg('sendMessage', { ...payload, text: parts[i].replace(/[*`]/g, '') });
+    }
+  }
+}
+
+async function notifyAdmins(text) {
+  const targets = CONFIG.notifyChat ? [CONFIG.notifyChat] : CONFIG.adminIds;
+  for (const target of targets) {
+    await sendHtml(target, text).catch((err) => log('notif admin gagal:', err.message));
+  }
+}
+
+// ── Format detail akun (sama dengan menu CLI dan BotVPN) ───────────────────
+// Setelah tanda * dan ` dibuang dan baris footer toko dihapus, isi pesan
+// harus sama dengan print_created_account di menu. Fixture bersama:
+// scripts/fixtures/account-message-parity.json (dicek test-bot-panel.js).
+
+const SSH_PAYLOAD_WS = 'GET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]';
+const SSH_PAYLOAD_SPLIT = 'PATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]';
+const THANKS = '*Terima kasih telah menggunakan layanan kami.*';
+
+function pick(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === false) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+function row(label, value) {
+  return `*${label}*${' '.repeat(Math.max(0, 12 - label.length))}: \`${value}\``;
+}
+
+function quotaText(value) {
+  const text = pick(value) || '0';
+  if (!/^\d+(\.\d+)?$/.test(text)) return text;
+  return /^0+(\.0+)?$/.test(text) ? 'Unlimited' : `${text} GB`;
+}
+
+function limitText(value, suffix = '') {
+  const text = pick(value) || '0';
+  return /^0+$/.test(text) ? 'Unlimited' : `${text}${suffix}`;
+}
+
+function expiryTime(expired, fallback) {
+  const match = String(expired || '').match(/(\d{2}:\d{2}:\d{2})/);
+  return match ? match[1] : (pick(fallback) || '-');
+}
+
+function expiredText(expired, time) {
+  const exp = pick(expired) || '-';
+  const clock = pick(time);
+  if (/\d{2}:\d{2}:\d{2}/.test(exp) || exp.includes(' - ') || !clock) return exp;
+  return `${exp} - ${clock}`;
+}
+
+function locationOf(s) {
+  const location = s && s.location;
+  return {
+    city: pick(s && s.city, location && location.city, s && s.CITY, s && s.kota, typeof location === 'string' ? location : '') || '-',
+    isp: pick(s && s.isp, location && location.isp, s && s.ISP, s && s.org, s && s.organization) || '-'
+  };
+}
+
+function isSc1forcrPayload(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (payload.udpgw && typeof payload.udpgw === 'object' && payload.udpgw.mode === 'badvpn') return true;
+  if (payload.ws_path === '/ssh-ws' && payload.ws_alt_path === '/ws') return true;
+  return Array.isArray(payload.wildcard_hosts) && Array.isArray(payload.front_hosts);
+}
+
+function sshDnsSelowLines(payload) {
+  if (isSc1forcrPayload(payload)) return [];
+  return [`*DNS SELOW*    : \`${payload && payload.hostname}:5300@${payload && payload.username}:${payload && payload.password}\``];
+}
+
+function sshLegacyPortLines(payload) {
+  if (isSc1forcrPayload(payload)) return [];
+  const port = (payload && payload.port) || {};
+  return [
+    `*OVPN TCP*     : \`${port.ovpntcp}\``,
+    `*OVPN UDP*     : \`${port.ovpnudp}\``,
+    `*SSH OHP*      : \`${port.sshohp}\``
+  ];
+}
+
+function downloadConfigLines(payload, fileName) {
+  if (isSc1forcrPayload(payload)) return [];
+  return ['', '*[ DOWNLOAD CONFIG ]*', '-----------------------------', `http://${payload && payload.hostname}:81/${fileName}`, ''];
+}
+
+function storeFooter(year = new Date().getFullYear(), copyright = false) {
+  // Tanda hak cipta ditulis lewat kode karakter supaya source tetap ASCII.
+  return `${copyright ? `${String.fromCharCode(0xa9)} ` : ''}Telegram Bots ${storeName()} - ${year}`;
+}
+
+function closing(trial) {
+  return [`*${storeFooter(undefined, trial)}*`, THANKS];
+}
+
+const XRAY_LINK_FIELDS = [
+  { label: 'TLS', keys: ['tls'] },
+  { label: 'Non-TLS', keys: ['none'] },
+  { label: 'gRPC', keys: ['grpc'] },
+  { label: 'Up TLS', keys: ['uptls', 'upgrade_tls', 'upgrade'] },
+  { label: 'Up Non-TLS', keys: ['upntls', 'upgrade_none', 'upgrade_ntls'] },
+  { label: 'XHTTP TLS', keys: ['xhttptls'], optional: true },
+  { label: 'XHTTP Non-TLS', keys: ['xhttpntls'], optional: true },
+  { label: 'OneRing (1FTunnel)', keys: ['onering'], optional: true }
+];
+
+function pickXrayLink(links, keys) {
+  for (const key of keys) {
+    const value = String((links && links[key]) === undefined || (links && links[key]) === null ? '' : links[key]).trim();
+    if (value) return value;
+  }
+  return '';
+}
+
+function buildXrayLinkLines(links) {
+  return XRAY_LINK_FIELDS
+    .map(({ label, keys, optional }) => {
+      const value = pickXrayLink(links, keys);
+      if (!value && optional) return null;
+      return `${label}:\n\`${value || '-'}\``;
+    })
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function xrayNetworkText(links) {
+  return pickXrayLink(links, ['xhttptls', 'xhttpntls']) ? 'ws, grpc, upgrade, xhttp' : 'ws, grpc, upgrade';
+}
+
+function formatSshAccountMessage(s, { trial = false, quota, limitip } = {}) {
+  const port = (s && s.port) || {};
+  const host = pick(s && s.hostname, s && s.host) || '-';
+  const user = pick(s && s.username) || '-';
+  const pass = pick(s && s.password, s && s.secret) || '-';
+  const exp = pick(s && s.exp, s && s.expired, s && s.date_exp) || '-';
+  const tls = pick(port.tls, port.ssl, port.any) || '443';
+  const ntls = pick(port.none, port.ntls, port.ws) || '80';
+  const udpgw = pick(port.udpgw);
+  const udpCustom = pick(port.udpcustom, port.udpCustom, port.udp_custom, port.udphc);
+  const { city, isp } = locationOf(s);
+
+  const lines = [
+    '=============================',
+    ` *${trial ? 'TRIAL SSH ACCOUNT' : 'SSH ACCOUNT CREATED'}*`,
+    '=============================',
+    '',
+    '*[ SSH PREMIUM DETAILS ]*',
+    '-----------------------------',
+    row('SSH WS', `${host}:${ntls}@${user}:${pass}`),
+    row('SSH SSL', `${host}:${tls}@${user}:${pass}`),
+    ...sshDnsSelowLines(s),
+    '',
+    '*[ HOST INFORMATION ]*',
+    '-----------------------------',
+    row('Hostname', host),
+    row('City', city),
+    row('ISP', isp),
+    row('Username', user),
+    row('Password', pass),
+    row('Expiry Date', exp),
+    row('Expiry Time', expiryTime(exp, s && s.time)),
+    row('Quota', quotaText(pick(s && s.quota, s && s.kuota, s && s.quota_gb, quota))),
+    row('IP Limit', limitText(pick(s && s.limitip, s && s.iplimit, limitip))),
+    '',
+    '*[ PORTS ]*',
+    '------------------------------',
+    row('TLS', pick(port.tls_all) || tls),
+    row('Non-TLS', pick(port.none_all) || ntls),
+    ...sshLegacyPortLines(s),
+    udpgw ? row('UDPGW', udpgw) : null,
+    udpCustom ? row('UDP Custom', udpCustom) : null,
+    '',
+    '*[ PAYLOAD WS ]*',
+    '------------------------------',
+    `\`${SSH_PAYLOAD_WS}\``,
+    '',
+    '*[ PAYLOAD ENHANCED + SPLIT ]*',
+    '------------------------------',
+    `\`${SSH_PAYLOAD_SPLIT}\``,
+    ...(trial ? downloadConfigLines(s, 'myvpn-config.zip') : []),
+    '------------------------------',
+    ...closing(trial)
+  ];
+  return `\n${lines.filter((line) => line !== null).join('\n')}\n`;
+}
+
+const XRAY_CREDENTIAL_ROWS = {
+  vmess: (secret) => [row('UUID', secret), row('ALTER ID', '0'), row('SECURITY', 'auto')],
+  vless: (secret) => [row('UUID', secret), row('ENCRYPTION', 'none'), row('SECURITY', 'tls / none')],
+  trojan: (secret) => [row('PASSWORD', secret), row('SECURITY', 'tls / none')]
+};
+
+function formatXrayAccountMessage(protocol, s, { trial = false, username, quota, limitip } = {}) {
+  const type = String(protocol || '').toLowerCase();
+  const title = type.toUpperCase();
+  const port = (s && s.port) || {};
+  const pathInfo = s && s.path && typeof s.path === 'object' ? s.path : {};
+  const links = s && s.link && typeof s.link === 'object' ? s.link : {};
+  const host = pick(s && s.hostname, s && s.host) || '-';
+  const secret = pick(s && s.uuid, s && s.password, s && s.secret, s && s.id) || '-';
+  const tls = pick(port.tls_all, port.tls, port.any) || '443';
+  const none = pick(port.none_all, port.none, port.ntls) || '80';
+  const grpc = pick(port.grpc) || '443';
+  const anyPort = pick(port.any, port.tls) || '443';
+  const pathWsBase = pick(pathInfo.ws, pathInfo.stn, s && s.ws_path, typeof (s && s.path) === 'string' ? s.path : '') || `/${type}`;
+  const pathWs = pathInfo.any === true || pathInfo.any === 'true' ? `${pathWsBase} atau path bebas` : pathWsBase;
+  const pathXhttp = pick(pathInfo.xhttp);
+  const { city, isp } = locationOf(s);
+
+  const lines = [
+    '=============================',
+    trial ? `    *TRIAL ${title} ACCOUNT*` : `        *${title} ACCOUNT*`,
+    '=============================',
+    '',
+    `*[ ${title} DETAILS ]*`,
+    '-----------------------------',
+    row('REMARKS', pick(s && s.username, s && s.remark, s && s.remarks, username) || '-'),
+    row('HOST', host),
+    row('PORT TLS', tls),
+    row('PORT NTLS', none),
+    row('PORT GRPC', grpc),
+    row('PORT ANY', anyPort),
+    ...(XRAY_CREDENTIAL_ROWS[type] || XRAY_CREDENTIAL_ROWS.vmess)(secret),
+    row('NETWORK', xrayNetworkText(links)),
+    row('PATH WS', pathWs),
+    row('SERVICE', pick(s && s.serviceName, s && s.service_name) || `${type}-grpc`),
+    row('PATH UPGRADE', pick(pathInfo.upgrade, pathInfo.up, pathInfo.upws, s && s.upgrade_path) || `/up${type}`),
+    pathXhttp ? row('PATH XHTTP', pathXhttp) : null,
+    row('EXPIRED', expiredText(pick(s && s.exp, s && s.expired, s && s.date_exp), s && s.time)),
+    row('QUOTA', quotaText(pick(s && s.quota, s && s.kuota, s && s.quota_gb, quota))),
+    row('IP LIMIT', limitText(pick(s && s.limitip, s && s.iplimit, limitip), ' pengguna')),
+    '',
+    `*[ ${title} URL ]*`,
+    '-----------------------------',
+    buildXrayLinkLines(links),
+    '',
+    '*[ HOST INFORMATION ]*',
+    '-----------------------------',
+    row('Domain', pick(s && s.domain, s && s.hostname, s && s.host) || '-'),
+    row('SNI', pick(s && s.sni, s && s.server_name, s && s.hostname, s && s.host) || '-'),
+    row('City', city),
+    row('ISP', isp),
+    '',
+    '*[ PORTS ]*',
+    '-----------------------------',
+    row('WS TLS', tls),
+    row('WS NTLS', none),
+    row('GRPC TLS', grpc),
+    row('ANY PORT', anyPort),
+    ...(trial ? downloadConfigLines(s, `${type}-config.zip`) : []),
+    '-----------------------------',
+    ...closing(trial)
+  ];
+  return `\n${lines.filter((line) => line !== null).join('\n')}\n`;
+}
+
+function formatAccountMessage(protocol, data, options) {
+  return protocol === 'ssh' ? formatSshAccountMessage(data, options) : formatXrayAccountMessage(protocol, data, options);
+}
+
+// ── HTTP keluar: API server SC dan payment gateway ──────────────────────────
+
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
+
+deps.httpJson = function httpJson({ url, method = 'GET', headers = {}, body, timeoutMs = 30000 }) {
+  return new Promise((resolve, reject) => {
+    let target;
+    try { target = new URL(url); } catch (err) { reject(err); return; }
+    const isHttps = target.protocol === 'https:';
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
+    const req = (isHttps ? https : http).request({
+      hostname: target.hostname,
+      port: target.port || (isHttps ? 443 : 80),
+      path: `${target.pathname}${target.search}`,
+      method,
+      agent: isHttps ? httpsAgent : undefined,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'sc-1forcr-botpanel',
+        ...headers,
+        ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': payload.length } : {})
+      }
+    }, async (res) => {
+      const raw = await readBody(res, 2 * 1024 * 1024);
+      let json = null;
+      try { json = JSON.parse(raw.toString('utf8')); } catch (_err) { json = null; }
+      resolve({ status: res.statusCode, json });
+    });
+    req.setTimeout(timeoutMs, () => {
+      const err = new Error('timeout');
+      err.timeout = true;
+      req.destroy(err);
+    });
+    req.on('error', (err) => {
+      // Timeout atau koneksi putus setelah request terkirim berarti hasilnya
+      // tidak pasti. Gagal sambung (ECONNREFUSED, DNS, sertifikat) pasti gagal.
+      if (err.timeout || ['ECONNRESET', 'EPIPE'].includes(err.code) || /socket hang up/i.test(err.message)) err.uncertain = true;
+      reject(err);
+    });
+    if (payload) req.write(payload);
+    req.end();
+  });
+};
+
+function serverBase(server) {
+  return Number(server.local) === 1 ? `http://127.0.0.1:${CONFIG.localPort}` : `https://${server.domain}`;
+}
+
+function serverToken(server) {
+  return Number(server.local) === 1 ? CONFIG.localToken : server.token;
+}
+
+async function scApi(server, method, apiPath, body, timeoutMs = 60000) {
+  const { status, json } = await deps.httpJson({
+    url: `${serverBase(server)}${apiPath}`,
+    method,
+    headers: { Authorization: serverToken(server) },
+    body,
+    timeoutMs
+  });
+  const meta = (json && json.meta) || {};
+  if (status >= 200 && status < 300 && Number(meta.code || 200) === 200 && json && json.data !== undefined) return json.data;
+  const err = new Error(String(meta.message || (json && json.message) || `HTTP ${status}`).slice(0, 300));
+  err.status = status;
+  // 502/504 dari nginx atau 5xx tanpa jawaban JSON API: api.js mungkin sudah
+  // memproses request sebelum putus, jadi hasilnya tidak pasti.
+  if (status === 502 || status === 504 || (status >= 500 && !(json && json.meta))) err.uncertain = true;
+  throw err;
+}
+
+async function probeServer(domain, token) {
+  let health;
+  try {
+    health = await deps.httpJson({ url: `https://${domain}/vps/health`, timeoutMs: 15000 });
+  } catch (err) {
+    throw new UserError(`Domain tidak bisa dihubungi lewat HTTPS (${err.message}).`);
+  }
+  if (health.status !== 200 || !(health.json && health.json.data && health.json.data.ok)) {
+    throw new UserError(`Domain menjawab HTTP ${health.status}, bukan API SC 1FORCR.`);
+  }
+  const cap = await deps.httpJson({ url: `https://${domain}/vps/capacity`, headers: { Authorization: token }, timeoutMs: 15000 })
+    .catch((err) => { throw new UserError(`Cek token gagal (${err.message}).`); });
+  if (cap.status === 401) throw new UserError('Token ditolak server (401). Pastikan token = Auth Token di menu Informasi Key Script server itu.');
+  if (cap.status === 403 || cap.status === 423) {
+    throw new UserError(`Server menolak: ${String((cap.json && (cap.json.message || (cap.json.meta && cap.json.meta.message))) || `HTTP ${cap.status}`).slice(0, 200)}`);
+  }
+  const data = (cap.json && cap.json.data) || {};
+  return { capacity: data.capacity_status || '-', canAdd: data.can_add_users };
+}
+
+// ── Payment gateway AutoGoPay (GoPay & ShopeePay) ──────────────────────────
+
+const GATEWAYS = {
+  gopay: {
+    label: 'GoPay',
+    base: () => normalizeBaseUrl(setting('gopay_base'), ['/qris/generate', '/qris/status', '/transactions']) || DEFAULT_GOPAY_BASE,
+    key: () => setting('gopay_key')
+  },
+  shopee: {
+    label: 'ShopeePay',
+    base: () => normalizeBaseUrl(setting('shopee_base'), ['/shopeepay/qris/create', '/shopeepay/qris/status', '/shopeepay/transactions', '/shopeepay/status']) || DEFAULT_SHOPEE_BASE,
+    key: () => setting('shopee_key') || setting('gopay_key')
+  }
+};
+
+function enabledGateways() {
+  return Object.keys(GATEWAYS).filter((gw) => setting(`${gw}_enable`) === '1' && GATEWAYS[gw].key());
+}
+
+function extractQrisString(body) {
+  const candidates = [body && body.data && body.data.qr_string, body && body.data && body.data.qris_string, body && body.data && body.data.qris, body && body.qr_string];
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim().startsWith('000201')) return value.trim();
+  }
+  return '';
+}
+
+async function createQris(gateway, amount) {
+  const gw = GATEWAYS[gateway];
+  if (!gw || !gw.key()) throw new UserError('Metode pembayaran ini belum diatur admin.');
+  const endpoint = gateway === 'gopay' ? 'qris/generate' : 'shopeepay/qris/create';
+  const { status, json } = await deps.httpJson({
+    url: joinUrl(gw.base(), endpoint),
+    method: 'POST',
+    headers: { Authorization: `Bearer ${gw.key()}` },
+    body: { amount: Number(amount) },
+    timeoutMs: 20000
+  });
+  const data = (json && json.data) || {};
+  const providerTx = gateway === 'gopay' ? data.transaction_id : data.order_sn;
+  if (!json || !json.success || !providerTx || !data.qr_url) {
+    throw new Error(`${gw.label} gagal membuat QRIS (HTTP ${status}): ${String((json && (json.message || json.error)) || '').slice(0, 160)}`);
+  }
+  return { providerTx: String(providerTx), qrUrl: String(data.qr_url), qrString: extractQrisString(json) };
+}
+
+async function checkQris(gateway, providerTx) {
+  const gw = GATEWAYS[gateway];
+  if (gateway === 'gopay') {
+    const { json } = await deps.httpJson({
+      url: joinUrl(gw.base(), 'qris/status'),
+      method: 'POST',
+      headers: { Authorization: `Bearer ${gw.key()}` },
+      body: { transaction_id: providerTx },
+      timeoutMs: 15000
+    });
+    const status = String((json && json.data && json.data.transaction_status) || '').toLowerCase();
+    return {
+      settled: ['settlement', 'paid', 'success', 'capture'].includes(status),
+      failed: ['expire', 'expired', 'cancel', 'cancelled', 'deny', 'failure', 'failed'].includes(status),
+      status
+    };
+  }
+  const { json } = await deps.httpJson({
+    url: `${joinUrl(gw.base(), 'shopeepay/qris/status')}?order_sn=${encodeURIComponent(providerTx)}`,
+    method: 'GET',
+    headers: { Authorization: `Bearer ${gw.key()}` },
+    timeoutMs: 15000
+  });
+  const data = (json && json.data) || {};
+  const status = String(data.status || '').toLowerCase();
+  const settled = data.paid === true || Number(data.order_status) === 1 || ['success', 'settlement', 'paid'].includes(status);
+  return { settled, failed: !settled && ['expired', 'expire', 'cancelled', 'cancel', 'failed'].includes(status), status };
+}
+
+async function testGateway(gateway) {
+  const gw = GATEWAYS[gateway];
+  if (!gw.key()) return `${gw.label}: key belum diisi`;
+  const endpoint = gateway === 'gopay' ? 'transactions' : 'shopeepay/status';
+  try {
+    const { status } = await deps.httpJson({ url: joinUrl(gw.base(), endpoint), headers: { Authorization: `Bearer ${gw.key()}` }, timeoutMs: 15000 });
+    if (status === 401 || status === 403) return `${gw.label}: key ditolak (HTTP ${status})`;
+    return `${gw.label}: terhubung (HTTP ${status})`;
+  } catch (err) {
+    return `${gw.label}: gagal terhubung (${err.message})`;
+  }
+}
+
+// ── Top up ──────────────────────────────────────────────────────────────────
+
+const depositLastCheck = new Map();
+let pollTimer = null;
+let pollRunning = false;
+
+async function settleDeposit(dep) {
+  const balance = await tx(async () => {
+    const res = await run("UPDATE deposits SET status = 'paid', paid_at = ? WHERE id = ? AND status = 'pending'", [now(), dep.id]);
+    if (res.changes !== 1) return null;
+    return applyBalance(dep.user_id, dep.amount, 'topup', dep.ref, `Top up ${GATEWAYS[dep.gateway] ? GATEWAYS[dep.gateway].label : dep.gateway}`);
+  });
+  if (balance === null) return false;
+  depositLastCheck.delete(dep.id);
+  if (dep.message_id) tg('deleteMessage', { chat_id: dep.chat_id, message_id: dep.message_id }).catch(() => {});
+  await sendHtml(dep.chat_id, [
+    '<b>TOP UP BERHASIL</b>',
+    LINE,
+    `Nominal : ${rupiah(dep.amount)}`,
+    `Saldo   : <b>${rupiah(balance)}</b>`,
+    `ID      : <code>${escapeHtml(dep.ref)}</code>`
+  ].join('\n'), kb([backRow('h', 'Menu Utama')])).catch(() => {});
+  await notifyAdmins([
+    '<b>TOP UP MASUK</b>',
+    LINE,
+    `Pengguna : <code>${dep.user_id}</code>`,
+    `Nominal  : ${rupiah(dep.amount)}`,
+    `Metode   : ${escapeHtml(GATEWAYS[dep.gateway] ? GATEWAYS[dep.gateway].label : dep.gateway)}`,
+    `ID       : <code>${escapeHtml(dep.ref)}</code>`
+  ].join('\n'));
+  return true;
+}
+
+// Menutup top up yang kedaluwarsa atau dibatalkan. Selalu cek status terakhir
+// dulu supaya pembayaran di detik terakhir tidak hilang. Kalau gateway tidak
+// bisa dihubungi, pembatalan ditolak dan top up kedaluwarsa tetap ditunggu
+// sampai masa tenggang habis.
+async function closeDeposit(dep, finalStatus) {
+  let checked = false;
+  try {
+    const st = await checkQris(dep.gateway, dep.provider_tx);
+    checked = true;
+    if (st.settled) return settleDeposit(dep);
+  } catch (err) {
+    log(`cek akhir top up ${dep.ref} gagal:`, err.message);
+  }
+  if (!checked && finalStatus === 'cancelled') {
+    throw new UserError('Status pembayaran belum bisa dicek. Coba batalkan lagi sebentar.');
+  }
+  if (!checked && finalStatus === 'expired' && now() < Number(dep.expires_at) + DEPOSIT_GRACE_MS) return false;
+  const res = await write("UPDATE deposits SET status = ? WHERE id = ? AND status = 'pending'", [finalStatus, dep.id]);
+  if (res.changes === 1) {
+    depositLastCheck.delete(dep.id);
+    if (dep.message_id) tg('deleteMessage', { chat_id: dep.chat_id, message_id: dep.message_id }).catch(() => {});
+    const note = finalStatus === 'cancelled' ? 'dibatalkan' : 'kedaluwarsa';
+    await sendHtml(dep.chat_id, `Top up <code>${escapeHtml(dep.ref)}</code> ${note}. Saldo tidak berubah.`, kb([backRow('h', 'Menu Utama')])).catch(() => {});
+  }
+  return false;
+}
+
+async function checkDeposit(dep) {
+  depositLastCheck.set(dep.id, now());
+  if (now() > Number(dep.expires_at)) return closeDeposit(dep, 'expired');
+  const st = await checkQris(dep.gateway, dep.provider_tx);
+  if (st.settled) return settleDeposit(dep);
+  if (st.failed) return closeDeposit(dep, 'expired');
+  return false;
+}
+
+async function pollDeposits() {
+  const rows = await all("SELECT * FROM deposits WHERE status = 'pending' ORDER BY id LIMIT 50");
+  for (const dep of rows) {
+    if (now() - (depositLastCheck.get(dep.id) || 0) < DEPOSIT_CHECK_MS - 500) continue;
+    await checkDeposit(dep).catch((err) => log(`cek top up ${dep.ref} gagal:`, err.message));
+  }
+  const left = await get("SELECT COUNT(*) AS n FROM deposits WHERE status = 'pending'");
+  return Number(left.n) > 0;
+}
+
+// Timer hanya hidup selama ada top up yang menunggu.
+function schedulePoll(delay = DEPOSIT_CHECK_MS) {
+  if (pollTimer || pollRunning) return;
+  pollTimer = setTimeout(async () => {
+    pollTimer = null;
+    pollRunning = true;
+    let more = false;
+    try {
+      more = await pollDeposits();
+    } catch (err) {
+      log('poll top up gagal:', err.message);
+      more = true;
+    } finally {
+      pollRunning = false;
+    }
+    if (more) schedulePoll();
+  }, delay);
+  if (pollTimer.unref) pollTimer.unref();
+}
+
+async function startTopup(ctx, amount, gateway) {
+  const uid = Number(ctx.from.id);
+  const min = Number(setting('topup_min')) || 10000;
+  const max = Number(setting('topup_max')) || 1000000;
+  if (!Number.isFinite(amount) || amount < min || amount > max) {
+    throw new UserError(`Nominal top up harus antara ${rupiah(min)} dan ${rupiah(max)}.`);
+  }
+  if (!enabledGateways().includes(gateway)) throw new UserError('Metode pembayaran ini sedang tidak aktif.');
+  const open = await get("SELECT ref FROM deposits WHERE user_id = ? AND status = 'pending' LIMIT 1", [uid]);
+  if (open) throw new UserError(`Masih ada top up yang menunggu pembayaran (${open.ref}). Bayar atau batalkan dulu.`);
+
+  const qr = await createQris(gateway, amount);
+  const minutes = Math.max(5, Math.min(60, Number(setting('qr_minutes')) || 15));
+  const ref = `TU${now().toString(36).toUpperCase()}${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+  const expiresAt = now() + minutes * 60 * 1000;
+  const ins = await write(
+    "INSERT INTO deposits (ref, user_id, amount, gateway, provider_tx, chat_id, status, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+    [ref, uid, amount, gateway, qr.providerTx, ctx.chatId, now(), expiresAt]
+  );
+  const caption = [
+    '<b>TOP UP SALDO</b>',
+    LINE,
+    `Nominal : <b>${rupiah(amount)}</b>`,
+    `Metode  : ${GATEWAYS[gateway].label} (QRIS)`,
+    `Berlaku : sampai ${wib(expiresAt).slice(11, 16)} WIB`,
+    `ID      : <code>${ref}</code>`,
+    LINE,
+    'Scan QRIS ini dan bayar tepat sesuai nominal.',
+    'Saldo masuk otomatis setelah pembayaran terbaca.'
+  ].join('\n');
+  const markup = kb([[btn('Cek Status', `tu:c:${ins.lastID}`), btn('Batalkan', `tu:x:${ins.lastID}`)]]);
+  let sent = null;
+  try {
+    sent = await tg('sendPhoto', { chat_id: ctx.chatId, photo: qr.qrUrl, caption, parse_mode: 'HTML', reply_markup: markup });
+  } catch (err) {
+    log('kirim gambar QRIS gagal, kirim link:', err.message);
+    sent = await sendHtml(ctx.chatId, `${caption}\n\nGambar QRIS: ${escapeHtml(qr.qrUrl)}`, markup).catch(() => null);
+  }
+  if (sent && sent.message_id) await write('UPDATE deposits SET message_id = ? WHERE id = ?', [sent.message_id, ins.lastID]);
+  schedulePoll();
+}
+
+// ── Server ──────────────────────────────────────────────────────────────────
+
+const getServer = (id) => get('SELECT * FROM servers WHERE id = ?', [Number(id)]);
+
+async function sellableServers(admin) {
+  return admin
+    ? all('SELECT * FROM servers WHERE enabled = 1 ORDER BY local DESC, id')
+    : all('SELECT * FROM servers WHERE enabled = 1 AND price_day > 0 ORDER BY local DESC, id');
+}
+
+async function activeCount(serverId) {
+  const row = await get('SELECT COUNT(*) AS n FROM accounts WHERE server_id = ? AND trial = 0 AND expired_at > ?', [serverId, now()]);
+  return Number(row.n) || 0;
+}
+
+function serverUsable(server, admin) {
+  if (!server || Number(server.enabled) !== 1) return false;
+  return admin || Number(server.price_day) > 0;
+}
+
+// ── Pesanan: buat dan perpanjang ────────────────────────────────────────────
+
+function isUncertain(err) {
+  return Boolean(err && err.uncertain);
+}
+
+async function placeOrder(ctx, { kind, server, protocol, username, password, days, accountId }) {
+  const uid = Number(ctx.from.id);
+  const amount = ctx.admin ? 0 : Number(server.price_day) * Number(days);
+  if (!ctx.admin && amount <= 0) throw new UserError('Server ini belum punya harga.');
+  if (kind === 'create' && Number(server.max_accounts) > 0 && (await activeCount(server.id)) >= Number(server.max_accounts)) {
+    throw new UserError('Slot server ini sudah penuh. Pilih server lain.');
+  }
+
+  const orderId = await tx(async () => {
+    const ins = await run(
+      "INSERT INTO orders (user_id, server_id, kind, protocol, username, days, amount, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)",
+      [uid, server.id, kind, protocol, username, days, amount, now(), now()]
+    );
+    if (amount > 0) {
+      await applyBalance(uid, -amount, kind === 'create' ? 'buy' : 'renew', `order:${ins.lastID}`, `${kind === 'create' ? 'Beli' : 'Perpanjang'} ${PROTOCOLS[protocol].label} ${username} ${days} hari`);
+    }
+    return ins.lastID;
+  });
+
+  const owner = { telegram_user_id: uid, telegram_chat_id: Number(ctx.chatId) };
+  const limits = { kuota: Number(server.quota_gb) || 0, limitip: Number(server.limit_ip) || 0 };
+  let data;
+  try {
+    if (kind === 'create') {
+      data = await scApi(server, 'POST', PROTOCOLS[protocol].create, {
+        username,
+        ...(protocol === 'ssh' ? { password } : {}),
+        expired: days,
+        ...limits,
+        ...owner
+      });
+    } else {
+      data = await scApi(server, 'POST', `/vps/${PROTOCOLS[protocol].renew}/${encodeURIComponent(username)}/${days}`, { ...limits, ...owner });
+    }
+  } catch (err) {
+    if (isUncertain(err)) {
+      await write("UPDATE orders SET status = 'review', note = ?, updated_at = ? WHERE id = ?", [`timeout: ${err.message}`, now(), orderId]);
+      await notifyAdmins([
+        '<b>PESANAN PERLU DICEK</b>',
+        LINE,
+        `Order    : #${orderId} (${kind === 'create' ? 'buat' : 'perpanjang'})`,
+        `Pengguna : <code>${uid}</code>`,
+        `Server   : ${escapeHtml(server.name)}`,
+        `Akun     : ${escapeHtml(PROTOCOLS[protocol].label)} ${escapeHtml(username)} (${days} hari)`,
+        `Nominal  : ${rupiah(amount)}`,
+        'Server tidak menjawab tepat waktu. Cek akunnya, lalu pilih Refund atau Selesai di Menu Admin > Pesanan Bermasalah.'
+      ].join('\n'));
+      throw new UserError('Server tidak menjawab tepat waktu. Pesanan Anda diteruskan ke admin untuk dicek; saldo tidak hilang.');
+    }
+    await refundOrder(orderId, `gagal: ${err.message}`);
+    throw new UserError(`Gagal: ${err.message}. Saldo sudah dikembalikan.`);
+  }
+
+  const expiredRaw = pick(data && data.exp, data && data.expired, data && data.date_exp);
+  const expiredAt = parseExpiry(expiredRaw, now() + Number(days) * 86400000);
+  const finalUser = String((data && data.username) || username);
+  await tx(async () => {
+    await run("UPDATE orders SET status = 'done', updated_at = ? WHERE id = ?", [now(), orderId]);
+    if (kind === 'create') {
+      await run(
+        'INSERT INTO accounts (user_id, server_id, protocol, username, expired, expired_at, trial, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?) ON CONFLICT(server_id, protocol, username) DO UPDATE SET user_id = excluded.user_id, expired = excluded.expired, expired_at = excluded.expired_at, trial = 0',
+        [uid, server.id, protocol, finalUser, expiredRaw, expiredAt, now()]
+      );
+    } else {
+      await run('UPDATE accounts SET expired = ?, expired_at = ? WHERE id = ?', [expiredRaw, expiredAt, accountId]);
+    }
+  });
+  if (amount > 0) {
+    await notifyAdmins([
+      `<b>${kind === 'create' ? 'PENJUALAN AKUN' : 'PERPANJANGAN AKUN'}</b>`,
+      LINE,
+      `Pengguna : <code>${uid}</code>`,
+      `Server   : ${escapeHtml(server.name)}`,
+      `Akun     : ${escapeHtml(PROTOCOLS[protocol].label)} ${escapeHtml(finalUser)} (${days} hari)`,
+      `Nominal  : ${rupiah(amount)}`
+    ].join('\n'));
+  }
+  return { data, amount, expiredRaw, username: finalUser };
+}
+
+async function refundOrder(orderId, note) {
+  return tx(async () => {
+    const order = await get('SELECT * FROM orders WHERE id = ?', [orderId]);
+    if (!order || !['processing', 'review'].includes(order.status)) return null;
+    await run("UPDATE orders SET status = 'refunded', note = ?, updated_at = ? WHERE id = ?", [String(note || '').slice(0, 300), now(), orderId]);
+    if (Number(order.amount) > 0) {
+      return applyBalance(order.user_id, Number(order.amount), 'refund', `order:${orderId}`, 'Pengembalian saldo pesanan gagal');
+    }
+    return 0;
+  });
+}
+
+// Pesanan yang masih "processing" saat proses mulai berarti bot mati di
+// tengah jalan. Hasilnya tidak pasti, jadi diserahkan ke admin.
+async function recoverInterruptedOrders() {
+  const rows = await all("SELECT * FROM orders WHERE status = 'processing'");
+  if (!rows.length) return;
+  await write("UPDATE orders SET status = 'review', note = 'bot berhenti di tengah pesanan', updated_at = ? WHERE status = 'processing'", [now()]);
+  await notifyAdmins(`<b>PESANAN PERLU DICEK</b>\n${LINE}\n${rows.length} pesanan terputus karena bot restart. Buka Menu Admin > Pesanan Bermasalah.`);
+}
+
+// ── Tampilan pengguna ───────────────────────────────────────────────────────
+
+const pending = new Map();
+
+function setPending(uid, step, data = {}) {
+  pending.set(Number(uid), { step, data, at: now() });
+}
+
+function takePending(uid) {
+  const item = pending.get(Number(uid));
+  if (!item) return null;
+  if (now() - item.at > PENDING_TTL_MS) {
+    pending.delete(Number(uid));
+    return null;
+  }
+  return item;
+}
+
+const clearPending = (uid) => pending.delete(Number(uid));
+
+function homeKeyboard(admin) {
+  return kb([
+    [btn('Buat Akun', 'b', 'success'), btn('Trial Gratis', 't', 'success')],
+    [btn('Perpanjang Akun', 'r', 'success'), btn('Akun Saya', 'acc', 'success')],
+    [btn('Top Up Saldo', 'tu', 'success'), btn('Riwayat Saldo', 'hist', 'success')],
+    [btn('Server dan Harga', 'srv', 'primary')],
+    admin ? [btn('Menu Admin', 'a', 'primary')] : null
+  ]);
+}
+
+async function showHome(ctx) {
+  clearPending(ctx.from.id);
+  const uid = Number(ctx.from.id);
+  const user = await get('SELECT * FROM users WHERE id = ?', [uid]);
+  const stats = await get(
+    `SELECT (SELECT COUNT(*) FROM servers WHERE enabled = 1 AND price_day > 0) AS servers,
+            (SELECT COUNT(*) FROM users) AS users,
+            (SELECT COUNT(*) FROM accounts WHERE trial = 0 AND expired_at > ?) AS accounts,
+            (SELECT COUNT(*) FROM accounts WHERE trial = 0 AND expired_at > ? AND user_id = ?) AS mine`,
+    [now(), now(), uid]
+  );
+  const trialOn = setting('trial_enable') === '1';
+  const lines = [
+    `<b>${escapeHtml(storeName())}</b>`,
+    LINE,
+    `ID Telegram : <code>${uid}</code>`,
+    `Nama        : ${escapeHtml(user && user.name ? user.name : '-')}`,
+    `Saldo       : <b>${rupiah(user ? user.saldo : 0)}</b>`,
+    LINE,
+    `Server aktif : ${stats.servers}`,
+    `Pengguna bot : ${stats.users}`,
+    `Akun aktif   : ${stats.accounts} (milik Anda ${stats.mine})`,
+    `Trial gratis : ${trialOn ? `${Math.max(1, Number(setting('trial_per_day')) || 1)}x per hari` : 'tidak tersedia'}`,
+    LINE
+  ];
+  const info = setting('info_text');
+  if (info) lines.push(escapeHtml(info));
+  if (setting('contact')) lines.push(`Kontak admin: ${escapeHtml(setting('contact'))}`);
+  return show(ctx, lines.join('\n'), homeKeyboard(ctx.admin));
+}
+
+async function showServerList(ctx) {
+  const servers = await sellableServers(false);
+  const lines = ['<b>DAFTAR SERVER DAN HARGA</b>', LINE];
+  if (!servers.length) lines.push('Belum ada server yang dijual.');
+  for (const [i, s] of servers.entries()) {
+    const used = await activeCount(s.id);
+    lines.push(`${i + 1}. <b>${escapeHtml(s.name)}</b>`);
+    lines.push(`   Harga    : ${rupiah(s.price_day)} / hari (${rupiah(s.price_day * 30)} / 30 hari)`);
+    lines.push(`   Quota    : ${Number(s.quota_gb) > 0 ? `${s.quota_gb} GB` : 'Unlimited'} | Limit IP: ${Number(s.limit_ip) > 0 ? s.limit_ip : 'Unlimited'}`);
+    lines.push(`   Slot     : ${Number(s.max_accounts) > 0 ? `${used}/${s.max_accounts}` : `${used} terpakai`}`);
+  }
+  lines.push(LINE, 'Layanan: SSH/UDP (ZIVPN, UDP Custom), VMess, VLESS, Trojan.');
+  return show(ctx, lines.join('\n'), kb([backRow()]));
+}
+
+async function chooseServer(ctx, mode) {
+  if (mode === 't' && setting('trial_enable') !== '1' && !ctx.admin) {
+    return show(ctx, 'Trial gratis sedang tidak tersedia.', kb([backRow()]));
+  }
+  const servers = await sellableServers(ctx.admin);
+  if (!servers.length) return show(ctx, 'Belum ada server yang tersedia. Hubungi admin.', kb([backRow()]));
+  const title = mode === 'b' ? 'BUAT AKUN' : 'TRIAL GRATIS';
+  const buttons = servers.map((s) => btn(
+    mode === 'b' ? `${s.name} - ${Number(s.price_day) > 0 ? `${rupiah(s.price_day)}/hari` : 'harga belum diisi'}` : s.name,
+    `${mode}:s:${s.id}`
+  ));
+  return show(ctx, `<b>${title}</b>\n${LINE}\nPilih server:`, kb([...buttons.map((b) => [b]), backRow()]));
+}
+
+async function chooseProtocol(ctx, mode, serverId) {
+  const server = await getServer(serverId);
+  if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server tidak tersedia.', kb([backRow(mode)]));
+  const buttons = Object.keys(PROTOCOLS).map((p) => btn(PROTOCOLS[p].label, `${mode}:p:${server.id}:${p}`));
+  const lines = [`<b>${mode === 'b' ? 'BUAT AKUN' : 'TRIAL GRATIS'}</b>`, LINE, `Server : ${escapeHtml(server.name)}`];
+  if (mode === 'b') lines.push(`Harga  : ${ctx.admin ? 'gratis (admin)' : `${rupiah(server.price_day)} / hari`}`);
+  else lines.push('Masa aktif trial: 60 menit.');
+  lines.push(LINE, 'Pilih layanan:');
+  return show(ctx, lines.join('\n'), kb([...pairs(buttons), backRow(mode)]));
+}
+
+const USERNAME_RE = /^[a-z][a-z0-9]{2,15}$/;
+const PASSWORD_RE = /^[A-Za-z0-9]{4,20}$/;
+
+async function askUsername(ctx, serverId, protocol) {
+  const server = await getServer(serverId);
+  if (!serverUsable(server, ctx.admin) || !PROTOCOLS[protocol]) return show(ctx, 'Pilihan tidak valid.', kb([backRow('b')]));
+  setPending(ctx.from.id, 'buy_user', { serverId: server.id, protocol });
+  return show(ctx, [
+    `<b>BUAT AKUN ${escapeHtml(PROTOCOLS[protocol].label.toUpperCase())}</b>`,
+    LINE,
+    `Server : ${escapeHtml(server.name)}`,
+    LINE,
+    'Kirim username akun:',
+    '- 3 sampai 16 karakter',
+    '- huruf kecil dan angka, diawali huruf',
+    '',
+    'Ketik /batal untuk membatalkan.'
+  ].join('\n'), kb([backRow('b', 'Batal')]));
+}
+
+function durationKeyboard(prefix, server, admin, extra = '') {
+  const buttons = DURATIONS.map((d) => btn(
+    admin ? `${d} hari` : `${d} hari - ${rupiah(Number(server.price_day) * d)}`,
+    `${prefix}${extra}${d}`
+  ));
+  return pairs(buttons);
+}
+
+async function askDuration(ctx, order) {
+  const server = await getServer(order.serverId);
+  setPending(ctx.from.id, 'buy_days', order);
+  const lines = [
+    `<b>BUAT AKUN ${escapeHtml(PROTOCOLS[order.protocol].label.toUpperCase())}</b>`,
+    LINE,
+    `Server   : ${escapeHtml(server.name)}`,
+    `Username : <code>${escapeHtml(order.username)}</code>`
+  ];
+  if (order.protocol === 'ssh') lines.push(`Password : <code>${escapeHtml(order.password)}</code>`);
+  lines.push(LINE, 'Pilih masa aktif:');
+  return reply(ctx, lines.join('\n'), kb([...durationKeyboard('b:d:', server, ctx.admin), backRow('h', 'Batal')]));
+}
+
+// Pesan "sedang diproses" menggantikan menu; kalau langkah berikutnya gagal,
+// galatnya dikirim sebagai pesan (bukan notifikasi kecil yang mudah terlewat).
+function progress(ctx, text) {
+  ctx.progress = true;
+  return show(ctx, text, kb([]));
+}
+
+async function confirmBuy(ctx, days) {
+  if (!DURATIONS.includes(days)) return show(ctx, 'Pilihan masa aktif tidak valid.', kb([backRow()]));
+  const item = takePending(ctx.from.id);
+  if (!item || item.step !== 'buy_days') return show(ctx, 'Sesi pembelian sudah habis. Ulangi dari Buat Akun.', kb([backRow()]));
+  const order = { ...item.data, days };
+  const server = await getServer(order.serverId);
+  if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server tidak tersedia.', kb([backRow()]));
+  const user = await get('SELECT saldo FROM users WHERE id = ?', [Number(ctx.from.id)]);
+  const amount = ctx.admin ? 0 : Number(server.price_day) * days;
+  setPending(ctx.from.id, 'buy_confirm', order);
+  const lines = [
+    '<b>KONFIRMASI PEMBELIAN</b>',
+    LINE,
+    `Server   : ${escapeHtml(server.name)}`,
+    `Layanan  : ${escapeHtml(PROTOCOLS[order.protocol].label)}`,
+    `Username : <code>${escapeHtml(order.username)}</code>`,
+    `Durasi   : ${days} hari`,
+    `Quota    : ${Number(server.quota_gb) > 0 ? `${server.quota_gb} GB` : 'Unlimited'}`,
+    `Limit IP : ${Number(server.limit_ip) > 0 ? server.limit_ip : 'Unlimited'}`,
+    `Harga    : ${ctx.admin ? 'gratis (admin)' : rupiah(amount)}`
+  ];
+  if (!ctx.admin) {
+    lines.push(`Saldo    : ${rupiah(user.saldo)} -> ${rupiah(user.saldo - amount)}`);
+    if (user.saldo < amount) {
+      clearPending(ctx.from.id);
+      lines.push(LINE, `Saldo kurang ${rupiah(amount - user.saldo)}. Silakan top up dulu.`);
+      return show(ctx, lines.join('\n'), kb([[btn('Top Up Saldo', 'tu')], backRow()]));
+    }
+  }
+  return show(ctx, lines.join('\n'), kb([[btn('Ya, Buat Akun', 'b:y'), btn('Batal', 'h', '')]]));
+}
+
+async function executeBuy(ctx) {
+  const item = takePending(ctx.from.id);
+  clearPending(ctx.from.id);
+  if (!item || item.step !== 'buy_confirm') return show(ctx, 'Sesi pembelian sudah habis. Ulangi dari Buat Akun.', kb([backRow()]));
+  const order = item.data;
+  const server = await getServer(order.serverId);
+  if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server tidak tersedia.', kb([backRow()]));
+  await progress(ctx, `Membuat akun <code>${escapeHtml(order.username)}</code> di ${escapeHtml(server.name)}...`);
+  const result = await placeOrder(ctx, { kind: 'create', server, protocol: order.protocol, username: order.username, password: order.password, days: order.days });
+  await sendAccountMessage(ctx.chatId, formatAccountMessage(order.protocol, result.data, { username: result.username, quota: server.quota_gb, limitip: server.limit_ip }), kb([backRow('h', 'Menu Utama')]));
+  await show(ctx, `Akun <code>${escapeHtml(result.username)}</code> berhasil dibuat.${result.amount > 0 ? ` Saldo terpotong ${rupiah(result.amount)}.` : ''}`, kb([]));
+}
+
+async function executeTrial(ctx, serverId, protocol) {
+  if (setting('trial_enable') !== '1' && !ctx.admin) return show(ctx, 'Trial gratis sedang tidak tersedia.', kb([backRow()]));
+  const server = await getServer(serverId);
+  if (!serverUsable(server, ctx.admin) || !PROTOCOLS[protocol]) return show(ctx, 'Server tidak tersedia.', kb([backRow('t')]));
+  const uid = Number(ctx.from.id);
+  if (!ctx.admin) {
+    const limit = Math.max(1, Number(setting('trial_per_day')) || 1);
+    const used = await get('SELECT COUNT(*) AS n FROM accounts WHERE user_id = ? AND trial = 1 AND created_at >= ?', [uid, wibDayStart()]);
+    if (Number(used.n) >= limit) return show(ctx, `Jatah trial hari ini sudah habis (${limit}x per hari). Coba lagi besok.`, kb([backRow()]));
+  }
+  await progress(ctx, `Membuat akun trial ${escapeHtml(PROTOCOLS[protocol].label)} di ${escapeHtml(server.name)}...`);
+  let data;
+  try {
+    data = await scApi(server, 'POST', PROTOCOLS[protocol].trial, { username: '', limitip: 1, telegram_user_id: uid, telegram_chat_id: Number(ctx.chatId) });
+  } catch (err) {
+    throw new UserError(`Gagal membuat trial: ${err.message}`);
+  }
+  const username = String((data && data.username) || '');
+  const expiredRaw = pick(data && data.exp, data && data.expired);
+  if (username) {
+    await write(
+      'INSERT INTO accounts (user_id, server_id, protocol, username, expired, expired_at, trial, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?) ON CONFLICT(server_id, protocol, username) DO UPDATE SET user_id = excluded.user_id, expired = excluded.expired, expired_at = excluded.expired_at, trial = 1, created_at = excluded.created_at',
+      [uid, server.id, protocol, username, expiredRaw, parseExpiry(expiredRaw, now() + 3600000), now()]
+    );
+  }
+  await sendAccountMessage(ctx.chatId, formatAccountMessage(protocol, data, { trial: true, username, limitip: 1 }), kb([backRow('h', 'Menu Utama')]));
+  await show(ctx, 'Akun trial berhasil dibuat.', kb([]));
+}
+
+async function myAccounts(uid, renewOnly) {
+  const since = now() - 30 * 86400000;
+  return all(
+    `SELECT a.*, s.name AS server_name, s.enabled AS server_enabled, s.price_day AS price_day FROM accounts a
+       JOIN servers s ON s.id = a.server_id
+      WHERE a.user_id = ? ${renewOnly ? 'AND a.trial = 0 AND a.expired_at > ?' : 'AND a.expired_at > ?'}
+      ORDER BY a.expired_at DESC LIMIT 20`,
+    [uid, renewOnly ? since : now() - 7 * 86400000]
+  );
+}
+
+function accountStatus(acc) {
+  if (Number(acc.trial) === 1) return Number(acc.expired_at) > now() ? 'TRIAL' : 'TRIAL HABIS';
+  return Number(acc.expired_at) > now() ? 'AKTIF' : 'EXPIRED';
+}
+
+async function showMyAccounts(ctx) {
+  const rows = await myAccounts(Number(ctx.from.id), false);
+  const lines = ['<b>AKUN SAYA</b>', LINE];
+  if (!rows.length) lines.push('Belum ada akun.');
+  for (const acc of rows) {
+    lines.push(`<b>${escapeHtml(PROTOCOLS[acc.protocol] ? PROTOCOLS[acc.protocol].label : acc.protocol)}</b> <code>${escapeHtml(acc.username)}</code> - ${accountStatus(acc)}`);
+    lines.push(`   ${escapeHtml(acc.server_name)} | exp ${escapeHtml(acc.expired || wib(acc.expired_at))}`);
+  }
+  return show(ctx, lines.join('\n'), kb([[btn('Perpanjang Akun', 'r')], backRow()]));
+}
+
+async function chooseRenewAccount(ctx) {
+  const rows = await myAccounts(Number(ctx.from.id), true);
+  if (!rows.length) return show(ctx, 'Belum ada akun yang bisa diperpanjang.', kb([[btn('Buat Akun', 'b')], backRow()]));
+  const buttons = rows.map((acc) => btn(`${PROTOCOLS[acc.protocol] ? PROTOCOLS[acc.protocol].label : acc.protocol} ${acc.username} (${acc.server_name})`, `r:a:${acc.id}`));
+  return show(ctx, `<b>PERPANJANG AKUN</b>\n${LINE}\nPilih akun:`, kb([...buttons.map((b) => [b]), backRow()]));
+}
+
+async function ownedAccount(ctx, accountId) {
+  const acc = await get('SELECT * FROM accounts WHERE id = ?', [Number(accountId)]);
+  if (!acc || (Number(acc.user_id) !== Number(ctx.from.id) && !ctx.admin) || Number(acc.trial) === 1) return null;
+  return acc;
+}
+
+async function chooseRenewDays(ctx, accountId) {
+  const acc = await ownedAccount(ctx, accountId);
+  if (!acc) return show(ctx, 'Akun tidak ditemukan.', kb([backRow('r')]));
+  const server = await getServer(acc.server_id);
+  if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server akun ini sedang tidak menerima perpanjangan.', kb([backRow('r')]));
+  return show(ctx, [
+    '<b>PERPANJANG AKUN</b>',
+    LINE,
+    `Akun   : ${escapeHtml(PROTOCOLS[acc.protocol].label)} <code>${escapeHtml(acc.username)}</code>`,
+    `Server : ${escapeHtml(server.name)}`,
+    `Exp    : ${escapeHtml(acc.expired || wib(acc.expired_at))}`,
+    LINE,
+    'Pilih tambahan masa aktif:'
+  ].join('\n'), kb([...durationKeyboard('r:d:', server, ctx.admin, `${acc.id}:`), backRow('r')]));
+}
+
+async function confirmRenew(ctx, accountId, days) {
+  const acc = await ownedAccount(ctx, accountId);
+  if (!acc) return show(ctx, 'Akun tidak ditemukan.', kb([backRow('r')]));
+  const server = await getServer(acc.server_id);
+  if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server akun ini sedang tidak menerima perpanjangan.', kb([backRow('r')]));
+  const user = await get('SELECT saldo FROM users WHERE id = ?', [Number(ctx.from.id)]);
+  const amount = ctx.admin ? 0 : Number(server.price_day) * days;
+  const lines = [
+    '<b>KONFIRMASI PERPANJANGAN</b>',
+    LINE,
+    `Akun   : ${escapeHtml(PROTOCOLS[acc.protocol].label)} <code>${escapeHtml(acc.username)}</code>`,
+    `Server : ${escapeHtml(server.name)}`,
+    `Tambah : ${days} hari`,
+    `Harga  : ${ctx.admin ? 'gratis (admin)' : rupiah(amount)}`
+  ];
+  if (!ctx.admin) {
+    lines.push(`Saldo  : ${rupiah(user.saldo)} -> ${rupiah(user.saldo - amount)}`);
+    if (user.saldo < amount) {
+      lines.push(LINE, `Saldo kurang ${rupiah(amount - user.saldo)}. Silakan top up dulu.`);
+      return show(ctx, lines.join('\n'), kb([[btn('Top Up Saldo', 'tu')], backRow('r')]));
+    }
+  }
+  // Tombol konfirmasi hanya berlaku sekali: klik ganda tidak memotong saldo dua kali.
+  setPending(ctx.from.id, 'renew_confirm', { accountId: acc.id, days });
+  return show(ctx, lines.join('\n'), kb([[btn('Ya, Perpanjang', `r:y:${acc.id}:${days}`), btn('Batal', 'r', '')]]));
+}
+
+async function executeRenew(ctx, accountId, days) {
+  const item = takePending(ctx.from.id);
+  clearPending(ctx.from.id);
+  if (!item || item.step !== 'renew_confirm' || Number(item.data.accountId) !== Number(accountId) || Number(item.data.days) !== Number(days)) {
+    return show(ctx, 'Sesi perpanjangan sudah habis. Ulangi dari Perpanjang Akun.', kb([backRow('r')]));
+  }
+  const acc = await ownedAccount(ctx, accountId);
+  if (!acc) return show(ctx, 'Akun tidak ditemukan.', kb([backRow('r')]));
+  const server = await getServer(acc.server_id);
+  if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server akun ini sedang tidak menerima perpanjangan.', kb([backRow('r')]));
+  await progress(ctx, `Memperpanjang <code>${escapeHtml(acc.username)}</code>...`);
+  const result = await placeOrder(ctx, { kind: 'renew', server, protocol: acc.protocol, username: acc.username, days, accountId: acc.id });
+  await show(ctx, [
+    '<b>PERPANJANGAN BERHASIL</b>',
+    LINE,
+    `Akun      : ${escapeHtml(PROTOCOLS[acc.protocol].label)} <code>${escapeHtml(acc.username)}</code>`,
+    `Server    : ${escapeHtml(server.name)}`,
+    `Expired   : ${escapeHtml(result.expiredRaw || '-')}`,
+    `Terpotong : ${rupiah(result.amount)}`
+  ].join('\n'), kb([backRow('h', 'Menu Utama')]));
+}
+
+async function showTopup(ctx) {
+  const gateways = enabledGateways();
+  if (!gateways.length) {
+    const contact = setting('contact');
+    return show(ctx, `<b>TOP UP SALDO</b>\n${LINE}\nTop up otomatis belum aktif.${contact ? ` Hubungi admin: ${escapeHtml(contact)}` : ' Hubungi admin.'}`, kb([backRow()]));
+  }
+  const min = Number(setting('topup_min')) || 10000;
+  const max = Number(setting('topup_max')) || 1000000;
+  const presets = TOPUP_PRESETS.filter((n) => n >= min && n <= max);
+  const buttons = presets.map((n) => btn(rupiah(n), `tu:a:${n}`));
+  return show(ctx, [
+    '<b>TOP UP SALDO</b>',
+    LINE,
+    `Metode  : ${gateways.map((gw) => GATEWAYS[gw].label).join(', ')} (QRIS)`,
+    `Minimal : ${rupiah(min)}`,
+    `Maksimal: ${rupiah(max)}`,
+    LINE,
+    'Pilih nominal:'
+  ].join('\n'), kb([...pairs(buttons), [btn('Nominal Lain', 'tu:o')], backRow()]));
+}
+
+async function chooseGateway(ctx, amount) {
+  const gateways = enabledGateways();
+  if (!gateways.length) return showTopup(ctx);
+  const min = Number(setting('topup_min')) || 10000;
+  const max = Number(setting('topup_max')) || 1000000;
+  if (!Number.isFinite(amount) || amount < min || amount > max) {
+    throw new UserError(`Nominal top up harus antara ${rupiah(min)} dan ${rupiah(max)}.`);
+  }
+  if (gateways.length === 1) return startTopup(ctx, amount, gateways[0]);
+  return show(ctx, `<b>TOP UP ${rupiah(amount)}</b>\n${LINE}\nPilih metode pembayaran:`,
+    kb([gateways.map((gw) => btn(`Bayar ${GATEWAYS[gw].label}`, `tu:g:${gw}:${amount}`)), backRow('tu')]));
+}
+
+async function showHistory(ctx) {
+  const rows = await all('SELECT * FROM ledger WHERE user_id = ? ORDER BY id DESC LIMIT 15', [Number(ctx.from.id)]);
+  const labels = { topup: 'Top up', buy: 'Beli akun', renew: 'Perpanjang', refund: 'Refund', admin: 'Admin' };
+  const lines = ['<b>RIWAYAT SALDO</b>', LINE];
+  if (!rows.length) lines.push('Belum ada transaksi.');
+  for (const r of rows) {
+    lines.push(`${wib(r.created_at).slice(0, 16)} ${labels[r.kind] || r.kind} ${r.delta > 0 ? '+' : ''}${rupiah(r.delta)}`);
+    if (r.note) lines.push(`   ${escapeHtml(r.note)}`);
+  }
+  return show(ctx, lines.join('\n'), kb([backRow()]));
+}
+
+// ── Menu admin ──────────────────────────────────────────────────────────────
+
+async function showAdmin(ctx) {
+  clearPending(ctx.from.id);
+  const day = wibDayStart();
+  const s = await get(
+    `SELECT (SELECT COUNT(*) FROM users) AS users,
+            (SELECT COALESCE(SUM(saldo), 0) FROM users) AS saldo,
+            (SELECT COUNT(*) FROM servers) AS servers,
+            (SELECT COUNT(*) FROM servers WHERE enabled = 1 AND price_day > 0) AS live,
+            (SELECT COALESCE(SUM(delta), 0) FROM ledger WHERE kind = 'topup' AND created_at >= ?) AS topup,
+            (SELECT COUNT(*) FROM ledger WHERE kind = 'topup' AND created_at >= ?) AS topup_n,
+            (SELECT COALESCE(-SUM(delta), 0) FROM ledger WHERE kind IN ('buy', 'renew', 'refund') AND created_at >= ?) AS sales,
+            (SELECT COUNT(*) FROM orders WHERE status = 'done' AND created_at >= ?) AS sales_n,
+            (SELECT COUNT(*) FROM orders WHERE status = 'review') AS review`,
+    [day, day, day, day]
+  );
+  const text = [
+    '<b>MENU ADMIN</b>',
+    LINE,
+    `Pengguna       : ${s.users}`,
+    `Saldo beredar  : ${rupiah(s.saldo)}`,
+    `Server         : ${s.servers} (dijual ${s.live})`,
+    `Top up hari ini: ${rupiah(s.topup)} (${s.topup_n}x)`,
+    `Jual hari ini  : ${rupiah(s.sales)} (${s.sales_n} pesanan)`,
+    `Perlu dicek    : ${s.review} pesanan`,
+    LINE,
+    `Payment        : ${enabledGateways().map((gw) => GATEWAYS[gw].label).join(', ') || 'belum aktif'}`
+  ].join('\n');
+  return show(ctx, text, kb([
+    [btn('Kelola Server', 'a:sv'), btn('Kelola Pengguna', 'a:u')],
+    [btn('Payment Gateway', 'a:pg'), btn('Pengaturan Bot', 'a:cfg')],
+    [btn(`Pesanan Bermasalah (${s.review})`, 'a:or'), btn('Backup Database', 'a:bk')],
+    backRow('h', 'Menu Utama')
+  ]));
+}
+
+async function showAdminServers(ctx) {
+  clearPending(ctx.from.id);
+  const servers = await all('SELECT * FROM servers ORDER BY local DESC, id');
+  const lines = ['<b>KELOLA SERVER</b>', LINE];
+  for (const s of servers) {
+    const state = Number(s.enabled) !== 1 ? 'NONAKTIF' : (Number(s.price_day) > 0 ? 'DIJUAL' : 'HARGA KOSONG');
+    lines.push(`#${s.id} <b>${escapeHtml(s.name)}</b>${Number(s.local) === 1 ? ' (server ini)' : ''} - ${state}`);
+    lines.push(`   ${escapeHtml(s.domain)} | ${rupiah(s.price_day)}/hari`);
+  }
+  lines.push(LINE, 'Server baru didaftarkan dengan domain + Auth Token SC-nya (menu Tools > Informasi Key Script di VPS itu).');
+  const buttons = servers.map((s) => btn(`#${s.id} ${s.name}`, `a:sv:${s.id}`));
+  return show(ctx, lines.join('\n'), kb([...pairs(buttons), [btn('Tambah Server', 'a:sva')], backRow('a')]));
+}
+
+async function showAdminServer(ctx, id) {
+  clearPending(ctx.from.id);
+  const s = await getServer(id);
+  if (!s) return show(ctx, 'Server tidak ditemukan.', kb([backRow('a:sv')]));
+  const used = await activeCount(s.id);
+  const local = Number(s.local) === 1;
+  const text = [
+    `<b>SERVER #${s.id}</b>${local ? ' (server ini)' : ''}`,
+    LINE,
+    `Nama      : ${escapeHtml(s.name)}`,
+    `Domain    : ${escapeHtml(s.domain)}`,
+    `Token     : ${local ? 'otomatis (lokal)' : escapeHtml(maskSecret(s.token))}`,
+    `Harga     : ${rupiah(s.price_day)} / hari`,
+    `Quota     : ${Number(s.quota_gb) > 0 ? `${s.quota_gb} GB` : 'Unlimited'}`,
+    `Limit IP  : ${Number(s.limit_ip) > 0 ? s.limit_ip : 'Unlimited'}`,
+    `Maks akun : ${Number(s.max_accounts) > 0 ? `${s.max_accounts} (terpakai ${used})` : `tanpa batas (terpakai ${used})`}`,
+    `Status    : ${Number(s.enabled) === 1 ? 'AKTIF' : 'NONAKTIF'}${Number(s.price_day) > 0 ? '' : ' (tidak tampil ke pembeli sampai harga diisi)'}`
+  ].join('\n');
+  return show(ctx, text, kb([
+    [btn('Ubah Harga', `a:se:${s.id}:price_day`), btn('Ubah Quota', `a:se:${s.id}:quota_gb`)],
+    [btn('Ubah Limit IP', `a:se:${s.id}:limit_ip`), btn('Ubah Maks Akun', `a:se:${s.id}:max_accounts`)],
+    [btn('Ubah Nama', `a:se:${s.id}:name`), local ? null : btn('Ganti Token', `a:se:${s.id}:token`)].filter(Boolean),
+    [btn('Cek Koneksi', `a:sc:${s.id}`), btn(Number(s.enabled) === 1 ? 'Nonaktifkan' : 'Aktifkan', `a:so:${s.id}`)],
+    local ? null : [btn('Hapus Server', `a:sd:${s.id}`)],
+    backRow('a:sv')
+  ]));
+}
+
+const SERVER_FIELDS = {
+  name: { label: 'nama server (maks 32 karakter)' },
+  price_day: { label: 'harga per hari dalam rupiah (contoh 1000). Isi 0 untuk berhenti menjual', min: 0, max: 10000000 },
+  quota_gb: { label: 'quota per akun dalam GB (0 = unlimited)', min: 0, max: 100000 },
+  limit_ip: { label: 'limit IP per akun (0 = unlimited)', min: 0, max: 100 },
+  max_accounts: { label: 'maksimal akun aktif di server ini (0 = tanpa batas)', min: 0, max: 100000 },
+  token: { label: 'Auth Token baru server ini' }
+};
+
+async function saveServerField(ctx, id, field, raw) {
+  const s = await getServer(id);
+  if (!s || !SERVER_FIELDS[field]) throw new UserError('Server tidak ditemukan.');
+  const text = String(raw || '').trim();
+  if (field === 'name') {
+    if (!text || text.length > 32) throw new UserError('Nama harus 1-32 karakter.');
+    await write('UPDATE servers SET name = ? WHERE id = ?', [text, s.id]);
+  } else if (field === 'token') {
+    if (Number(s.local) === 1) throw new UserError('Token server ini dibaca otomatis.');
+    if (!/^[A-Za-z0-9._-]{8,200}$/.test(text)) throw new UserError('Format token tidak valid.');
+    await probeServer(s.domain, text);
+    await write('UPDATE servers SET token = ? WHERE id = ?', [text, s.id]);
+  } else {
+    const value = toInt(text);
+    const spec = SERVER_FIELDS[field];
+    if (!Number.isFinite(value) || value < spec.min || value > spec.max) throw new UserError(`Masukkan angka ${spec.min}-${spec.max}.`);
+    await write(`UPDATE servers SET ${field} = ? WHERE id = ?`, [value, s.id]);
+  }
+}
+
+async function addServerStep(ctx, step, data, text) {
+  if (step === 'name') {
+    const name = String(text || '').trim();
+    if (!name || name.length > 32) throw new UserError('Nama harus 1-32 karakter.');
+    setPending(ctx.from.id, 'a_add', { step: 'domain', name });
+    return reply(ctx, 'Kirim <b>domain</b> server itu (contoh: sg1.domainku.com).', kb([backRow('a:sv', 'Batal')]));
+  }
+  if (step === 'domain') {
+    const domain = normalizeDomain(text);
+    if (!domain) throw new UserError('Domain tidak valid. Kirim domain saja, tanpa https:// dan tanpa path.');
+    if (await get('SELECT id FROM servers WHERE domain = ?', [domain])) throw new UserError('Domain ini sudah terdaftar.');
+    setPending(ctx.from.id, 'a_add', { ...data, step: 'token', domain });
+    return reply(ctx, 'Kirim <b>Auth Token</b> server itu (menu Tools > Informasi Key Script di VPS itu).\nPesan token akan dihapus setelah dibaca.', kb([backRow('a:sv', 'Batal')]));
+  }
+  if (step === 'token') {
+    const token = String(text || '').trim();
+    if (ctx.msg) tg('deleteMessage', { chat_id: ctx.chatId, message_id: ctx.msg.message_id }).catch(() => {});
+    if (!/^[A-Za-z0-9._-]{8,200}$/.test(token)) throw new UserError('Format token tidak valid.');
+    await reply(ctx, `Mengecek ${escapeHtml(data.domain)}...`);
+    const probe = await probeServer(data.domain, token);
+    setPending(ctx.from.id, 'a_add', { ...data, step: 'price', token });
+    return reply(ctx, `Server terhubung (kapasitas: ${escapeHtml(probe.capacity)}).\nKirim <b>harga per hari</b> dalam rupiah (contoh 1000).`, kb([backRow('a:sv', 'Batal')]));
+  }
+  if (step === 'price') {
+    const price = toInt(text);
+    if (!Number.isFinite(price) || price < 0 || price > 10000000) throw new UserError('Masukkan angka 0-10000000.');
+    const ins = await write(
+      'INSERT INTO servers (name, domain, token, local, enabled, price_day, quota_gb, limit_ip, max_accounts, created_at) VALUES (?, ?, ?, 0, 1, ?, 0, 2, 0, ?)',
+      [data.name, data.domain, data.token, price, now()]
+    );
+    clearPending(ctx.from.id);
+    await reply(ctx, `Server <b>${escapeHtml(data.name)}</b> ditambahkan. Atur quota dan limit IP di halaman server.`);
+    return showAdminServer({ ...ctx, cb: null }, ins.lastID);
+  }
+  return null;
+}
+
+async function showAdminUsers(ctx) {
+  clearPending(ctx.from.id);
+  const recent = await all('SELECT * FROM users ORDER BY created_at DESC LIMIT 8');
+  const lines = ['<b>KELOLA PENGGUNA</b>', LINE, 'Pengguna terbaru:'];
+  for (const u of recent) lines.push(`<code>${u.id}</code> ${escapeHtml(u.name || '-')} ${u.username ? `@${escapeHtml(u.username)}` : ''} - ${rupiah(u.saldo)}${Number(u.banned) ? ' (DIBLOKIR)' : ''}`);
+  return show(ctx, lines.join('\n'), kb([[btn('Cari Pengguna', 'a:uf')], backRow('a')]));
+}
+
+async function showAdminUser(ctx, id) {
+  clearPending(ctx.from.id);
+  const u = await get('SELECT * FROM users WHERE id = ?', [Number(id)]);
+  if (!u) return show(ctx, 'Pengguna tidak ditemukan. Pengguna harus pernah /start bot ini.', kb([backRow('a:u')]));
+  const acc = await get('SELECT COUNT(*) AS n FROM accounts WHERE user_id = ? AND trial = 0 AND expired_at > ?', [u.id, now()]);
+  const spent = await get("SELECT COALESCE(-SUM(delta), 0) AS n FROM ledger WHERE user_id = ? AND kind IN ('buy', 'renew', 'refund')", [u.id]);
+  return show(ctx, [
+    '<b>DETAIL PENGGUNA</b>',
+    LINE,
+    `ID        : <code>${u.id}</code>`,
+    `Nama      : ${escapeHtml(u.name || '-')} ${u.username ? `@${escapeHtml(u.username)}` : ''}`,
+    `Saldo     : <b>${rupiah(u.saldo)}</b>`,
+    `Akun aktif: ${acc.n}`,
+    `Belanja   : ${rupiah(spent.n)}`,
+    `Bergabung : ${wib(u.created_at).slice(0, 16)} WIB`,
+    `Status    : ${Number(u.banned) ? 'DIBLOKIR' : 'normal'}`
+  ].join('\n'), kb([
+    [btn('Tambah Saldo', `a:ua:${u.id}:+`), btn('Kurangi Saldo', `a:ua:${u.id}:-`)],
+    [btn(Number(u.banned) ? 'Buka Blokir' : 'Blokir', `a:ub:${u.id}`)],
+    backRow('a:u')
+  ]));
+}
+
+async function adjustSaldo(ctx, userId, sign, raw) {
+  const amount = toInt(raw);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 100000000) throw new UserError('Masukkan nominal lebih dari 0.');
+  const delta = sign === '-' ? -amount : amount;
+  const balance = await tx(() => applyBalance(Number(userId), delta, 'admin', `admin:${ctx.from.id}`, `${delta > 0 ? 'Ditambah' : 'Dikurangi'} admin`));
+  clearPending(ctx.from.id);
+  await sendHtml(Number(userId), `Saldo Anda ${delta > 0 ? 'ditambah' : 'dikurangi'} admin ${rupiah(amount)}.\nSaldo sekarang: <b>${rupiah(balance)}</b>`).catch(() => {});
+  await reply(ctx, `Saldo pengguna <code>${userId}</code> sekarang ${rupiah(balance)}.`);
+  return showAdminUser({ ...ctx, cb: null }, userId);
+}
+
+async function showAdminPayment(ctx) {
+  clearPending(ctx.from.id);
+  const line = (gw) => {
+    const on = setting(`${gw}_enable`) === '1';
+    const own = setting(`${gw}_key`);
+    const key = own ? maskSecret(own) : (gw === 'shopee' && setting('gopay_key') ? 'memakai key GoPay' : 'belum diisi');
+    return `${GATEWAYS[gw].label.padEnd(9)} : ${on ? 'AKTIF' : 'NONAKTIF'} | key ${escapeHtml(key)}`;
+  };
+  const text = [
+    '<b>PAYMENT GATEWAY (AutoGoPay)</b>',
+    LINE,
+    line('gopay'),
+    `URL GoPay : ${escapeHtml(GATEWAYS.gopay.base())}`,
+    line('shopee'),
+    `URL Shopee: ${escapeHtml(GATEWAYS.shopee.base())}`,
+    LINE,
+    `Top up    : ${rupiah(setting('topup_min'))} - ${rupiah(setting('topup_max'))}`,
+    `Masa QRIS : ${setting('qr_minutes')} menit`,
+    LINE,
+    'Key diambil dari dashboard AutoGoPay. Pesan berisi key dihapus setelah dibaca.'
+  ].join('\n');
+  return show(ctx, text, kb([
+    [btn(setting('gopay_enable') === '1' ? 'Nonaktifkan GoPay' : 'Aktifkan GoPay', 'a:pt:gopay'), btn('Set Key GoPay', 'a:pe:gopay_key')],
+    [btn(setting('shopee_enable') === '1' ? 'Nonaktifkan ShopeePay' : 'Aktifkan ShopeePay', 'a:pt:shopee'), btn('Set Key ShopeePay', 'a:pe:shopee_key')],
+    [btn('Set URL GoPay', 'a:pe:gopay_base'), btn('Set URL ShopeePay', 'a:pe:shopee_base')],
+    [btn('Minimal Top Up', 'a:pe:topup_min'), btn('Maksimal Top Up', 'a:pe:topup_max')],
+    [btn('Masa Aktif QRIS', 'a:pe:qr_minutes'), btn('Tes Koneksi', 'a:px')],
+    backRow('a')
+  ]));
+}
+
+const PAYMENT_FIELDS = {
+  gopay_key: { label: 'API key GoPay', secret: true },
+  shopee_key: { label: 'API key ShopeePay (kirim - untuk memakai key GoPay)', secret: true },
+  gopay_base: { label: 'URL dasar GoPay (kirim - untuk default)' },
+  shopee_base: { label: 'URL dasar ShopeePay (kirim - untuk default)' },
+  topup_min: { label: 'minimal top up (rupiah)', min: 1000, max: 10000000 },
+  topup_max: { label: 'maksimal top up (rupiah)', min: 10000, max: 100000000 },
+  qr_minutes: { label: 'masa aktif QRIS dalam menit (5-60)', min: 5, max: 60 }
+};
+
+async function savePaymentField(ctx, field, raw) {
+  const spec = PAYMENT_FIELDS[field];
+  const text = String(raw || '').trim();
+  if (spec.secret && ctx.msg) tg('deleteMessage', { chat_id: ctx.chatId, message_id: ctx.msg.message_id }).catch(() => {});
+  if (field === 'gopay_key' || field === 'shopee_key') {
+    if (field === 'shopee_key' && text === '-') return setSetting(field, '');
+    if (!/^[A-Za-z0-9._:-]{8,300}$/.test(text)) throw new UserError('Format key tidak valid.');
+    return setSetting(field, text);
+  }
+  if (field === 'gopay_base' || field === 'shopee_base') {
+    if (text === '-') return setSetting(field, field === 'gopay_base' ? DEFAULT_GOPAY_BASE : DEFAULT_SHOPEE_BASE);
+    const url = normalizeBaseUrl(text);
+    if (!url || !url.startsWith('https://')) throw new UserError('URL harus diawali https://');
+    return setSetting(field, url);
+  }
+  const value = toInt(text);
+  if (!Number.isFinite(value) || value < spec.min || value > spec.max) throw new UserError(`Masukkan angka ${spec.min}-${spec.max}.`);
+  if (field === 'topup_min' && value > Number(setting('topup_max'))) throw new UserError('Minimal tidak boleh melebihi maksimal.');
+  if (field === 'topup_max' && value < Number(setting('topup_min'))) throw new UserError('Maksimal tidak boleh di bawah minimal.');
+  return setSetting(field, String(value));
+}
+
+async function showAdminSettings(ctx) {
+  clearPending(ctx.from.id);
+  const text = [
+    '<b>PENGATURAN BOT</b>',
+    LINE,
+    `Nama toko   : ${escapeHtml(storeName())}`,
+    `Kontak admin: ${escapeHtml(setting('contact') || '-')}`,
+    `Trial       : ${setting('trial_enable') === '1' ? `AKTIF, ${setting('trial_per_day')}x per hari per pengguna` : 'NONAKTIF'}`,
+    `Backup harian ke admin: ${setting('backup_daily') === '1' ? 'AKTIF' : 'NONAKTIF'}`,
+    LINE,
+    'Teks info /start:',
+    escapeHtml(setting('info_text') || '-')
+  ].join('\n');
+  return show(ctx, text, kb([
+    [btn('Nama Toko', 'a:te:store_name'), btn('Kontak Admin', 'a:te:contact')],
+    [btn('Teks Info /start', 'a:te:info_text'), btn('Trial per Hari', 'a:te:trial_per_day')],
+    [btn(setting('trial_enable') === '1' ? 'Nonaktifkan Trial' : 'Aktifkan Trial', 'a:tt:trial_enable'),
+      btn(setting('backup_daily') === '1' ? 'Nonaktifkan Backup Harian' : 'Aktifkan Backup Harian', 'a:tt:backup_daily')],
+    backRow('a')
+  ]));
+}
+
+const TEXT_FIELDS = {
+  store_name: { label: 'nama toko (maks 32 karakter, kirim - untuk memakai username bot)', max: 32 },
+  contact: { label: 'kontak admin, misalnya @username (kirim - untuk mengosongkan)', max: 64 },
+  info_text: { label: 'teks info yang tampil di /start (maks 500 karakter, kirim - untuk mengosongkan)', max: 500 },
+  trial_per_day: { label: 'jatah trial per pengguna per hari (1-10)', min: 1, max: 10 }
+};
+
+async function saveTextField(ctx, field, raw) {
+  const spec = TEXT_FIELDS[field];
+  const text = String(raw || '').trim();
+  if (field === 'trial_per_day') {
+    const value = toInt(text);
+    if (!Number.isFinite(value) || value < spec.min || value > spec.max) throw new UserError('Masukkan angka 1-10.');
+    return setSetting(field, String(value));
+  }
+  if (text === '-') return setSetting(field, '');
+  if (!text || text.length > spec.max) throw new UserError(`Maksimal ${spec.max} karakter.`);
+  return setSetting(field, text);
+}
+
+async function showReviewOrders(ctx) {
+  const rows = await all("SELECT o.*, s.name AS server_name FROM orders o LEFT JOIN servers s ON s.id = o.server_id WHERE o.status = 'review' ORDER BY o.id LIMIT 10");
+  const lines = ['<b>PESANAN BERMASALAH</b>', LINE];
+  if (!rows.length) lines.push('Tidak ada pesanan yang perlu dicek.');
+  const buttons = [];
+  for (const o of rows) {
+    lines.push(`#${o.id} ${o.kind === 'create' ? 'buat' : 'perpanjang'} ${escapeHtml(PROTOCOLS[o.protocol] ? PROTOCOLS[o.protocol].label : o.protocol)} <code>${escapeHtml(o.username)}</code> ${o.days} hari`);
+    lines.push(`   ${escapeHtml(o.server_name || '-')} | pengguna <code>${o.user_id}</code> | ${rupiah(o.amount)}`);
+    lines.push(`   ${escapeHtml(String(o.note || '').slice(0, 120))}`);
+    buttons.push([btn(`Refund #${o.id}`, `a:or:r:${o.id}`), btn(`Selesai #${o.id}`, `a:or:d:${o.id}`)]);
+  }
+  lines.push(LINE, 'Refund = saldo dikembalikan. Selesai = akun ternyata sudah jadi di server.');
+  return show(ctx, lines.join('\n'), kb([...buttons, backRow('a')]));
+}
+
+// ── Backup dan restore database ─────────────────────────────────────────────
+
+function stateDir() {
+  return path.dirname(CONFIG.dbPath);
+}
+
+async function makeBackupFile() {
+  const file = path.join(stateDir(), `bot-panel-backup-${now()}.db`);
+  await writeLock(() => run(`VACUUM INTO '${file.replace(/'/g, "''")}'`));
+  return file;
+}
+
+async function sendBackup(targets, reason) {
+  const file = await makeBackupFile();
+  try {
+    const stamp = wib().replace(/[: ]/g, '-');
+    for (const target of targets) {
+      await deps.sendDocument(target, file, `bot-panel-${CONFIG.domain || 'vps'}-${stamp}.db`,
+        `Backup database Bot Panel (${reason}) ${wib()} WIB. Restore: kirim file ini ke bot dengan caption /restore`)
+        .catch((err) => log('kirim backup gagal:', err.message));
+    }
+  } finally {
+    fs.unlink(file, () => {});
+  }
+}
+
+const SQLITE_HEADER = 'SQLite format 3\u0000';
+
+async function restoreDatabase(ctx, doc) {
+  if (!doc || Number(doc.file_size || 0) > 20 * 1024 * 1024) throw new UserError('File backup tidak valid atau lebih dari 20 MB.');
+  const info = await tg('getFile', { file_id: doc.file_id });
+  const tmp = path.join(stateDir(), `restore-${now()}.db`);
+  await deps.downloadTelegramFile(info.file_path, tmp, 20 * 1024 * 1024);
+  try {
+    const head = Buffer.alloc(16);
+    const fd = fs.openSync(tmp, 'r');
+    fs.readSync(fd, head, 0, 16, 0);
+    fs.closeSync(fd);
+    if (head.toString('binary') !== SQLITE_HEADER) throw new UserError('File bukan database SQLite.');
+    const probe = await deps.openDatabase(tmp);
+    const check = await new Promise((resolve, reject) => probe.all(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'servers', 'ledger', 'settings')", [],
+      (err, rows) => (err ? reject(err) : resolve(rows))
+    ));
+    await new Promise((resolve) => probe.close(() => resolve()));
+    if (check.length !== 4) throw new UserError('File bukan backup Bot Panel.');
+  } catch (err) {
+    fs.unlink(tmp, () => {});
+    throw err instanceof UserError ? err : new UserError(`File backup rusak: ${err.message}`);
+  }
+
+  restoring = true;
+  try {
+    await writeLock(async () => {
+      await closeStore();
+      const keep = `${CONFIG.dbPath}.sebelum-restore-${now()}`;
+      if (fs.existsSync(CONFIG.dbPath)) fs.renameSync(CONFIG.dbPath, keep);
+      fs.renameSync(tmp, CONFIG.dbPath);
+      fs.chmodSync(CONFIG.dbPath, 0o600);
+      const olds = fs.readdirSync(stateDir()).filter((f) => f.startsWith(`${path.basename(CONFIG.dbPath)}.sebelum-restore-`)).sort();
+      for (const f of olds.slice(0, Math.max(0, olds.length - 3))) fs.unlink(path.join(stateDir(), f), () => {});
+    });
+    await openStore();
+  } finally {
+    restoring = false;
+  }
+  pending.clear();
+  depositLastCheck.clear();
+  schedulePoll(1000);
+}
+
+// ── Routing ─────────────────────────────────────────────────────────────────
+
+// Callback lanjutan sebuah alur memakai input yang tersimpan; callback lain
+// membuang input setengah jadi supaya teks berikutnya tidak salah ditafsirkan.
+const CONTINUATION_CALLBACK = /^(b:rp|b:d:|b:y$|r:y:)/;
+
+async function handleCallback(ctx) {
+  const data = String(ctx.cb.data || '');
+  const parts = data.split(':');
+  const uid = Number(ctx.from.id);
+  if (!CONTINUATION_CALLBACK.test(data)) clearPending(uid);
+
+  if (data === 'h') return showHome(ctx);
+  if (data === 'srv') return showServerList(ctx);
+  if (data === 'acc') return showMyAccounts(ctx);
+  if (data === 'hist') return showHistory(ctx);
+
+  if (parts[0] === 'b' || parts[0] === 't') {
+    const mode = parts[0];
+    if (parts.length === 1) return chooseServer(ctx, mode);
+    if (parts[1] === 's') return chooseProtocol(ctx, mode, parts[2]);
+    if (parts[1] === 'p' && mode === 'b') return askUsername(ctx, parts[2], parts[3]);
+    if (parts[1] === 'p' && mode === 't') return executeTrial(ctx, parts[2], parts[3]);
+    if (parts[1] === 'rp') {
+      const item = takePending(uid);
+      if (!item || item.step !== 'buy_pass') return show(ctx, 'Sesi pembelian sudah habis.', kb([backRow()]));
+      return askDuration(ctx, { ...item.data, password: crypto.randomBytes(6).toString('hex').slice(0, 8) });
+    }
+    if (parts[1] === 'd') return confirmBuy(ctx, Number(parts[2]));
+    if (parts[1] === 'y') return executeBuy(ctx);
+  }
+
+  if (parts[0] === 'r') {
+    if (parts.length === 1) return chooseRenewAccount(ctx);
+    const days = Number(parts[3]);
+    if ((parts[1] === 'd' || parts[1] === 'y') && !DURATIONS.includes(days)) return showHome(ctx);
+    if (parts[1] === 'a') return chooseRenewDays(ctx, parts[2]);
+    if (parts[1] === 'd') return confirmRenew(ctx, parts[2], days);
+    if (parts[1] === 'y') return executeRenew(ctx, parts[2], days);
+  }
+
+  if (parts[0] === 'tu') {
+    if (parts.length === 1) return showTopup(ctx);
+    if (parts[1] === 'a') return chooseGateway(ctx, Number(parts[2]));
+    if (parts[1] === 'o') {
+      setPending(uid, 'tu_amount');
+      return show(ctx, `Kirim nominal top up dalam rupiah (${rupiah(setting('topup_min'))} - ${rupiah(setting('topup_max'))}).\nKetik /batal untuk membatalkan.`, kb([backRow('tu', 'Batal')]));
+    }
+    if (parts[1] === 'g') return startTopup(ctx, Number(parts[3]), parts[2]);
+    if (parts[1] === 'c' || parts[1] === 'x') {
+      const dep = await get('SELECT * FROM deposits WHERE id = ? AND user_id = ?', [Number(parts[2]), uid]);
+      if (!dep || dep.status !== 'pending') return answer(ctx, 'Top up ini sudah selesai atau tidak ditemukan.', true);
+      if (parts[1] === 'x') {
+        await answer(ctx, 'Membatalkan...');
+        return closeDeposit(dep, 'cancelled');
+      }
+      if (now() - (depositLastCheck.get(dep.id) || 0) < 5000) return answer(ctx, 'Tunggu beberapa detik lalu cek lagi.');
+      const paid = await checkDeposit(dep).catch(() => false);
+      return answer(ctx, paid ? 'Pembayaran diterima.' : 'Pembayaran belum terbaca. Saldo masuk otomatis setelah dibayar.', !paid);
+    }
+  }
+
+  if (parts[0] === 'a') {
+    if (!ctx.admin) return answer(ctx, 'Menu ini khusus admin.', true);
+    return handleAdminCallback(ctx, data, parts);
+  }
+  return showHome(ctx);
+}
+
+async function handleAdminCallback(ctx, data, parts) {
+  const uid = Number(ctx.from.id);
+  const prompt = (text, back) => show(ctx, `${text}\nKetik /batal untuk membatalkan.`, kb([backRow(back, 'Batal')]));
+  switch (parts[1]) {
+    case undefined: return showAdmin(ctx);
+    case 'sv': return parts[2] ? showAdminServer(ctx, parts[2]) : showAdminServers(ctx);
+    case 'sva':
+      setPending(uid, 'a_add', { step: 'name' });
+      return prompt('<b>TAMBAH SERVER</b>\nKirim nama server (contoh: SG Premium).', 'a:sv');
+    case 'se': {
+      const [, , id, field] = parts;
+      if (!SERVER_FIELDS[field]) return showAdminServers(ctx);
+      setPending(uid, 'a_server', { id: Number(id), field });
+      return prompt(`Kirim ${SERVER_FIELDS[field].label}.`, `a:sv:${id}`);
+    }
+    case 'sc': {
+      const s = await getServer(parts[2]);
+      if (!s) return showAdminServers(ctx);
+      await answer(ctx, 'Mengecek...');
+      let note;
+      try {
+        if (Number(s.local) === 1) {
+          const cap = await scApi(s, 'GET', '/vps/capacity', undefined, 15000);
+          note = `Terhubung. Kapasitas: ${cap.capacity_status || '-'}`;
+        } else {
+          const probe = await probeServer(s.domain, s.token);
+          note = `Terhubung. Kapasitas: ${probe.capacity}`;
+        }
+      } catch (err) {
+        note = `Gagal: ${err.message}`;
+      }
+      await reply(ctx, `Server <b>${escapeHtml(s.name)}</b>: ${escapeHtml(note)}`);
+      return showAdminServer({ ...ctx, cb: null }, s.id);
+    }
+    case 'so': {
+      const s = await getServer(parts[2]);
+      if (!s) return showAdminServers(ctx);
+      await write('UPDATE servers SET enabled = ? WHERE id = ?', [Number(s.enabled) === 1 ? 0 : 1, s.id]);
+      return showAdminServer(ctx, s.id);
+    }
+    case 'sd': {
+      const s = await getServer(parts[2]);
+      if (!s || Number(s.local) === 1) return showAdminServers(ctx);
+      return show(ctx, `Hapus server <b>${escapeHtml(s.name)}</b> dari bot?\nAkun yang sudah dibuat di server itu tidak dihapus, tapi pembeli tidak bisa memperpanjangnya lewat bot.`,
+        kb([[btn('Ya, Hapus Server', `a:sy:${s.id}`, 'danger'), btn('Batal', `a:sv:${s.id}`, '')]]));
+    }
+    case 'sy': {
+      const s = await getServer(parts[2]);
+      if (s && Number(s.local) !== 1) await write('DELETE FROM servers WHERE id = ?', [s.id]);
+      return showAdminServers(ctx);
+    }
+    case 'u': return parts[2] ? showAdminUser(ctx, parts[2]) : showAdminUsers(ctx);
+    case 'uf':
+      setPending(uid, 'a_user_find');
+      return prompt('Kirim ID Telegram pengguna.', 'a:u');
+    case 'ua': {
+      const target = await get('SELECT id FROM users WHERE id = ?', [Number(parts[2])]);
+      if (!target) return showAdminUsers(ctx);
+      setPending(uid, 'a_saldo', { id: target.id, sign: parts[3] === '-' ? '-' : '+' });
+      return prompt(`Kirim nominal yang akan ${parts[3] === '-' ? 'dikurangi dari' : 'ditambahkan ke'} saldo <code>${target.id}</code>.`, `a:u:${target.id}`);
+    }
+    case 'ub': {
+      const target = await get('SELECT * FROM users WHERE id = ?', [Number(parts[2])]);
+      if (!target) return showAdminUsers(ctx);
+      if (isAdmin(target.id)) return answer(ctx, 'Admin tidak bisa diblokir.', true);
+      await write('UPDATE users SET banned = ? WHERE id = ?', [Number(target.banned) ? 0 : 1, target.id]);
+      return showAdminUser(ctx, target.id);
+    }
+    case 'pg': return showAdminPayment(ctx);
+    case 'pt': {
+      const gw = parts[2];
+      if (!GATEWAYS[gw]) return showAdminPayment(ctx);
+      const turningOn = setting(`${gw}_enable`) !== '1';
+      if (turningOn && !GATEWAYS[gw].key()) return answer(ctx, `Isi key ${GATEWAYS[gw].label} dulu.`, true);
+      await setSetting(`${gw}_enable`, turningOn ? '1' : '0');
+      return showAdminPayment(ctx);
+    }
+    case 'pe': {
+      const field = parts[2];
+      if (!PAYMENT_FIELDS[field]) return showAdminPayment(ctx);
+      setPending(uid, 'a_payment', { field });
+      return prompt(`Kirim ${PAYMENT_FIELDS[field].label}.`, 'a:pg');
+    }
+    case 'px': {
+      await answer(ctx, 'Mengetes...');
+      const lines = await Promise.all(Object.keys(GATEWAYS).map(testGateway));
+      await reply(ctx, escapeHtml(lines.join('\n')));
+      return showAdminPayment({ ...ctx, cb: null });
+    }
+    case 'cfg': return showAdminSettings(ctx);
+    case 'te': {
+      const field = parts[2];
+      if (!TEXT_FIELDS[field]) return showAdminSettings(ctx);
+      setPending(uid, 'a_text', { field });
+      return prompt(`Kirim ${TEXT_FIELDS[field].label}.`, 'a:cfg');
+    }
+    case 'tt': {
+      const field = parts[2];
+      if (!['trial_enable', 'backup_daily'].includes(field)) return showAdminSettings(ctx);
+      await setSetting(field, setting(field) === '1' ? '0' : '1');
+      return showAdminSettings(ctx);
+    }
+    case 'or': {
+      if (parts[2] === 'r' || parts[2] === 'd') {
+        const orderId = Number(parts[3]);
+        const order = await get('SELECT * FROM orders WHERE id = ?', [orderId]);
+        if (!order || order.status !== 'review') return showReviewOrders(ctx);
+        if (parts[2] === 'r') {
+          const balance = await refundOrder(orderId, `refund oleh admin ${uid}`);
+          if (balance !== null) {
+            await sendHtml(order.user_id, `Pesanan #${orderId} dibatalkan admin. Saldo ${rupiah(order.amount)} dikembalikan.`).catch(() => {});
+          }
+        } else {
+          await write("UPDATE orders SET status = 'done', note = ?, updated_at = ? WHERE id = ? AND status = 'review'", [`ditandai selesai oleh admin ${uid}`, now(), orderId]);
+          if (order.kind === 'create') {
+            await write(
+              'INSERT OR IGNORE INTO accounts (user_id, server_id, protocol, username, expired, expired_at, trial, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
+              [order.user_id, order.server_id, order.protocol, order.username, '', Number(order.created_at) + Number(order.days) * 86400000, now()]
+            );
+          }
+        }
+        return showReviewOrders(ctx);
+      }
+      return showReviewOrders(ctx);
+    }
+    case 'bk':
+      await answer(ctx, 'Menyiapkan backup...');
+      await sendBackup([uid], 'manual');
+      return null;
+    default:
+      return showAdmin(ctx);
+  }
+}
+
+async function handleText(ctx) {
+  const uid = Number(ctx.from.id);
+  const text = String(ctx.msg.text || '').trim();
+  const command = text.startsWith('/') ? text.split(/\s+/)[0].split('@')[0].toLowerCase() : '';
+
+  if (command === '/start' || command === '/menu') return showHome(ctx);
+  if (command === '/batal') {
+    clearPending(uid);
+    return showHome(ctx);
+  }
+  if (command === '/saldo') {
+    const user = await get('SELECT saldo FROM users WHERE id = ?', [uid]);
+    return reply(ctx, `Saldo Anda: <b>${rupiah(user ? user.saldo : 0)}</b>`, kb([[btn('Top Up Saldo', 'tu')], backRow('h', 'Menu Utama')]));
+  }
+  if (command === '/id') return reply(ctx, `ID Telegram Anda: <code>${uid}</code>`);
+  if (command === '/admin') return ctx.admin ? showAdmin(ctx) : showHome(ctx);
+
+  const item = takePending(uid);
+  if (!item) return showHome(ctx);
+
+  switch (item.step) {
+    case 'buy_user': {
+      const username = text.toLowerCase();
+      if (!USERNAME_RE.test(username)) throw new UserError('Username tidak valid. Gunakan 3-16 huruf kecil/angka, diawali huruf.');
+      const order = { ...item.data, username };
+      if (order.protocol === 'ssh') {
+        setPending(uid, 'buy_pass', order);
+        return reply(ctx, 'Kirim password akun SSH (4-20 huruf/angka), atau pakai password acak.', kb([[btn('Password Acak', 'b:rp')], backRow('h', 'Batal')]));
+      }
+      return askDuration(ctx, order);
+    }
+    case 'buy_pass':
+      if (!PASSWORD_RE.test(text)) throw new UserError('Password harus 4-20 huruf/angka tanpa spasi.');
+      return askDuration(ctx, { ...item.data, password: text });
+    case 'tu_amount': {
+      clearPending(uid);
+      const amount = toInt(text);
+      if (!Number.isFinite(amount)) throw new UserError('Kirim angka saja, contoh 25000.');
+      return chooseGateway(ctx, amount);
+    }
+    case 'a_add':
+      if (!ctx.admin) return showHome(ctx);
+      return addServerStep(ctx, item.data.step, item.data, text);
+    case 'a_server':
+      if (!ctx.admin) return showHome(ctx);
+      if (item.data.field === 'token') tg('deleteMessage', { chat_id: ctx.chatId, message_id: ctx.msg.message_id }).catch(() => {});
+      await saveServerField(ctx, item.data.id, item.data.field, text);
+      clearPending(uid);
+      await reply(ctx, 'Tersimpan.');
+      return showAdminServer({ ...ctx, cb: null }, item.data.id);
+    case 'a_user_find': {
+      if (!ctx.admin) return showHome(ctx);
+      const id = toInt(text.replace(/^@/, ''));
+      if (!Number.isFinite(id)) throw new UserError('Kirim ID Telegram berupa angka.');
+      return showAdminUser({ ...ctx, cb: null }, id);
+    }
+    case 'a_saldo':
+      if (!ctx.admin) return showHome(ctx);
+      return adjustSaldo(ctx, item.data.id, item.data.sign, text);
+    case 'a_payment':
+      if (!ctx.admin) return showHome(ctx);
+      await savePaymentField(ctx, item.data.field, text);
+      clearPending(uid);
+      await reply(ctx, 'Tersimpan.');
+      return showAdminPayment({ ...ctx, cb: null });
+    case 'a_text':
+      if (!ctx.admin) return showHome(ctx);
+      await saveTextField(ctx, item.data.field, text);
+      clearPending(uid);
+      await reply(ctx, 'Tersimpan.');
+      return showAdminSettings({ ...ctx, cb: null });
+    default:
+      return showHome(ctx);
+  }
+}
+
+async function handleUpdate(update) {
+  const ctx = makeCtx(update);
+  if (!ctx.from || !ctx.chatId) return;
+  // Bot yang sama bisa ada di grup notifikasi; menu hanya dilayani di chat pribadi.
+  if (ctx.chatType !== 'private') {
+    await answer(ctx);
+    return;
+  }
+  if (restoring) {
+    if (ctx.cb) await answer(ctx, 'Database sedang dipulihkan, coba lagi sebentar.', true);
+    else await reply(ctx, 'Database sedang dipulihkan, coba lagi sebentar.').catch(() => {});
+    return;
+  }
+  try {
+    ctx.user = await touchUser(ctx.from);
+    ctx.admin = isAdmin(ctx.from.id);
+    if (Number(ctx.user && ctx.user.banned) === 1 && !ctx.admin) {
+      if (ctx.cb) await answer(ctx, 'Akun Anda diblokir admin.', true);
+      else await reply(ctx, 'Akun Anda diblokir admin.');
+      return;
+    }
+    if (ctx.cb) {
+      await handleCallback(ctx);
+    } else if (ctx.msg && ctx.msg.document && /^\/restore\b/i.test(String(ctx.msg.caption || '').trim())) {
+      if (!ctx.admin) return;
+      await reply(ctx, 'Memulihkan database dari file...');
+      await restoreDatabase(ctx, ctx.msg.document);
+      await reply(ctx, 'Database Bot Panel berhasil dipulihkan. Database lama disimpan sebagai cadangan di VPS.');
+    } else if (ctx.msg && typeof ctx.msg.text === 'string') {
+      await handleText(ctx);
+    }
+  } catch (err) {
+    const message = err instanceof UserError ? err.message : 'Terjadi kesalahan, coba lagi.';
+    if (!(err instanceof UserError)) log('error menangani update:', err && err.stack ? err.stack : err);
+    if (ctx.cb && !ctx.answered && !ctx.progress) await answer(ctx, message.slice(0, 190), true);
+    else await reply(ctx, escapeHtml(message), kb([backRow('h', 'Menu Utama')])).catch(() => {});
+  } finally {
+    await answer(ctx);
+  }
+}
+
+// Update tiap pengguna diproses berurutan (klik ganda tidak membuat pesanan
+// ganda), tapi pengguna lain tidak ikut menunggu.
+const chains = new Map();
+
+function dispatch(update) {
+  const from = (update.message && update.message.from) || (update.callback_query && update.callback_query.from);
+  if (!from) return Promise.resolve();
+  const key = Number(from.id);
+  const entry = chains.get(key) || { tail: Promise.resolve(), size: 0 };
+  if (entry.size >= 5) return entry.tail;
+  entry.size += 1;
+  entry.tail = entry.tail
+    .then(() => handleUpdate(update))
+    .catch((err) => log('dispatch error:', err && err.message))
+    .finally(() => {
+      entry.size -= 1;
+      if (entry.size === 0) chains.delete(key);
+    });
+  chains.set(key, entry);
+  return entry.tail;
+}
+
+// ── Polling dan pengawas ────────────────────────────────────────────────────
+
+let stopping = false;
+let lastPollOk = now();
+let lastConflictNotice = 0;
+let webhookCleared = false;
+
+async function handleConflict(err) {
+  lastPollOk = now();
+  if (/webhook/i.test(err.message) && !webhookCleared) {
+    webhookCleared = true;
+    log('webhook aktif di token ini; dihapus supaya getUpdates bisa dipakai');
+    await tg('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
+    return;
+  }
+  log('token bot sedang dipakai instance lain (409); tunggu 60 detik');
+  if (now() - lastConflictNotice > 6 * 3600 * 1000) {
+    lastConflictNotice = now();
+    await notifyAdmins([
+      '<b>BOT PANEL BENTROK</b>',
+      LINE,
+      `Bot Panel di ${escapeHtml(CONFIG.domain || 'VPS ini')} tidak bisa membaca pesan karena token bot ini juga dipakai bot lain (VPS lain dengan Mode Bot Panel aktif, atau aplikasi lain).`,
+      'Satu token bot hanya boleh dipakai satu Bot Panel. Matikan Mode Bot Panel di VPS lain; server lain cukup didaftarkan lewat Menu Admin > Kelola Server.'
+    ].join('\n'));
+  }
+  await sleep(60000);
+}
+
+async function pollLoop() {
+  let offset = 0;
+  let backoff = 1000;
+  while (!stopping) {
+    try {
+      const updates = await tg('getUpdates', { offset, timeout: 50, allowed_updates: ['message', 'callback_query'] }, { timeoutMs: 65000, retries: 0 });
+      lastPollOk = now();
+      backoff = 1000;
+      for (const update of updates) {
+        offset = Math.max(offset, Number(update.update_id) + 1);
+        dispatch(update);
+      }
+    } catch (err) {
+      if (stopping) break;
+      if (err.code === 409) {
+        await handleConflict(err);
+        continue;
+      }
+      if (err.code === 401 || err.code === 404) {
+        log('token bot ditolak Telegram; cek TELEGRAM_BOT_TOKEN. Bot Panel berhenti.');
+        process.exit(0);
+      }
+      log('getUpdates gagal:', err.message);
+      await sleep(backoff);
+      backoff = Math.min(backoff * 2, 60000);
+    }
+  }
+}
+
+async function maintenance() {
+  for (const [uid, item] of pending) if (now() - item.at > PENDING_TTL_MS) pending.delete(uid);
+  await write('DELETE FROM accounts WHERE expired_at < ?', [now() - 60 * 86400000]).catch(() => {});
+  await write("DELETE FROM deposits WHERE status <> 'pending' AND created_at < ?", [now() - 90 * 86400000]).catch(() => {});
+  const today = wib().slice(0, 10);
+  const hour = Number(wib().slice(11, 13));
+  if (setting('backup_daily') === '1' && hour >= 1 && setting('last_backup_date') !== today && CONFIG.adminIds.length) {
+    await setSetting('last_backup_date', today);
+    await sendBackup(CONFIG.adminIds, 'harian').catch((err) => log('backup harian gagal:', err.message));
+  }
+  const left = await get("SELECT COUNT(*) AS n FROM deposits WHERE status = 'pending'");
+  if (Number(left.n) > 0) schedulePoll(1000);
+}
+
+async function main() {
+  if (!CONFIG.enabled) {
+    log('BOT_PANEL_ENABLE bukan 1; Bot Panel tidak dijalankan.');
+    process.exit(0);
+  }
+  if (!CONFIG.token) {
+    log('TELEGRAM_BOT_TOKEN kosong; isi lewat menu Tools > Setting BOT Telegram.');
+    process.exit(0);
+  }
+  process.umask(0o077);
+  if (!CONFIG.adminIds.length) log('Peringatan: admin belum diatur (BOT_PANEL_ADMIN_IDS). Menu admin tidak bisa dibuka.');
+
+  await openStore();
+  try {
+    const me = await tg('getMe', {});
+    botUsername = String(me.username || '');
+  } catch (err) {
+    if (err.code === 401 || err.code === 404) {
+      log('token bot ditolak Telegram; Bot Panel berhenti.');
+      process.exit(0);
+    }
+    log('getMe gagal (lanjut):', err.message);
+  }
+  await tg('setMyCommands', {
+    commands: [
+      { command: 'start', description: 'Menu utama' },
+      { command: 'saldo', description: 'Cek saldo' },
+      { command: 'batal', description: 'Batalkan input' }
+    ]
+  }).catch(() => {});
+  await recoverInterruptedOrders();
+  schedulePoll(3000);
+
+  const maintenanceTimer = setInterval(() => maintenance().catch((err) => log('maintenance gagal:', err.message)), 10 * 60 * 1000);
+  const watchdogTimer = setInterval(() => {
+    if (now() - lastPollOk > 15 * 60 * 1000) {
+      log('polling Telegram macet lebih dari 15 menit; keluar supaya systemd memulai ulang.');
+      process.exit(1);
+    }
+  }, 60 * 1000);
+
+  const shutdown = () => {
+    stopping = true;
+    clearInterval(maintenanceTimer);
+    clearInterval(watchdogTimer);
+    closeStore().then(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
+  log(`jalan untuk @${botUsername || '?'} (admin: ${CONFIG.adminIds.length})`);
+  await pollLoop();
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    log('fatal:', err && err.stack ? err.stack : err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  CONFIG,
+  deps,
+  openStore,
+  closeStore,
+  run,
+  get,
+  all,
+  tx,
+  write,
+  setting,
+  setSetting,
+  applyBalance,
+  touchUser,
+  handleUpdate,
+  dispatch,
+  placeOrder,
+  refundOrder,
+  settleDeposit,
+  closeDeposit,
+  pollDeposits,
+  createQris,
+  checkQris,
+  probeServer,
+  scApi,
+  formatSshAccountMessage,
+  formatXrayAccountMessage,
+  storeFooter,
+  normalizeDomain,
+  normalizeBaseUrl,
+  parseExpiry,
+  rupiah,
+  inferStyle,
+  homeKeyboard,
+  recoverInterruptedOrders,
+  UserError,
+  _state: { pending, chains, depositLastCheck }
+};
+BOT_PANEL_EOF
+  chmod 644 "${APP_DIR}/bot-panel.js" >/dev/null 2>&1 || true
+
+  BOT_PANEL_MEMORY_MAX="$(sanitize_memory_max_value "${BOT_PANEL_MEMORY_MAX:-128M}" "128M")"
+  cat > /etc/systemd/system/sc-1forcr-botpanel.service <<EOF
+[Unit]
+Description=SC 1FORCR Bot Panel (bot Telegram jualan akun)
+After=network-online.target sc-1forcr-api.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+Environment=NODE_ENV=production
+Environment=UV_THREADPOOL_SIZE=2
+Environment=BOT_PANEL_DB=/var/lib/sc-1forcr-botpanel/bot-panel.db
+ExecStart=/usr/bin/node --max-old-space-size=64 ${APP_DIR}/bot-panel.js
+Restart=on-failure
+RestartSec=10
+DynamicUser=yes
+StateDirectory=sc-1forcr-botpanel
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+TasksMax=64
+MemoryMax=${BOT_PANEL_MEMORY_MAX}
+Nice=5
+CPUQuota=40%
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  apply_bot_panel_state
+  return 0
+}
+
+# Menyalakan atau mematikan service sesuai BOT_PANEL_ENABLE. Restart saat
+# aktif supaya kode baru langsung dipakai; ini tidak menyentuh layanan tunnel.
+apply_bot_panel_state() {
+  BOT_PANEL_ENABLE="$(normalize_bool_01 "${BOT_PANEL_ENABLE:-0}")"
+  if [[ "${BOT_PANEL_ENABLE}" == "1" && -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    systemctl enable sc-1forcr-botpanel.service >/dev/null 2>&1 || true
+    if ! systemctl restart sc-1forcr-botpanel.service >/dev/null 2>&1; then
+      log "PERINGATAN: Bot Panel gagal start. Cek: journalctl -u sc-1forcr-botpanel -n 50"
+    fi
+  else
+    systemctl disable --now sc-1forcr-botpanel.service >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 write_cli_menu() {
   local menu_runtime menu_runtime_tmp menu_wrapper_tmp update_cmd_tmp
   menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
@@ -22756,6 +25397,9 @@ SERVICE_HEALTH_INTERVAL_MINUTES=${SERVICE_HEALTH_INTERVAL_MINUTES}
 SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES=${SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+BOT_PANEL_ENABLE=${BOT_PANEL_ENABLE}
+BOT_PANEL_ADMIN_IDS=${BOT_PANEL_ADMIN_IDS}
+BOT_PANEL_MEMORY_MAX=${BOT_PANEL_MEMORY_MAX}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
 BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
@@ -27653,9 +30297,10 @@ tools_menu() {
       "16) Setting Web Dokumentasi API" \
       "17) Tema Warna Menu" \
       "18) Port TLS/NTLS Tambahan" \
+      "19) Mode Bot Panel (Jualan Akun)" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-18]: "; then
+    if ! prompt_input tm "Pilih menu [0-19]: "; then
       return
     fi
     clear
@@ -27678,6 +30323,7 @@ tools_menu() {
       16) set_api_docs_config_menu || true ;;
       17) set_menu_color_menu || true ;;
       18) set_extra_ports_menu || true ;;
+      19) set_bot_panel_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -32264,6 +34910,9 @@ update_script_from_repo() {
     SSHWS_SERVICE_MEMORY_MAX="${SSHWS_SERVICE_MEMORY_MAX:-auto}" \
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
+    BOT_PANEL_ENABLE="${BOT_PANEL_ENABLE:-0}" \
+    BOT_PANEL_ADMIN_IDS="${BOT_PANEL_ADMIN_IDS:-}" \
+    BOT_PANEL_MEMORY_MAX="${BOT_PANEL_MEMORY_MAX:-128M}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}" \
     AUTO_INSTALL_SUMMARY_API="0" \
@@ -32498,6 +35147,9 @@ set_telegram_notif_config() {
     update_app_env_var "TELEGRAM_CHAT_ID" "${TELEGRAM_CHAT_ID}"
   fi
   systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+  if [[ "$(normalize_bool_01 "${BOT_PANEL_ENABLE:-0}")" == "1" ]]; then
+    systemctl restart sc-1forcr-botpanel >/dev/null 2>&1 || true
+  fi
   reset_online_notify_retry
   systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
   systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
@@ -32518,6 +35170,152 @@ set_telegram_notif_config() {
       fi
     fi
   fi
+}
+
+# Mode Bot Panel: token bot notifikasi yang sama dipakai untuk bot jualan akun
+# (service sc-1forcr-botpanel). Mati = bot hanya menerima notifikasi api.js.
+bot_panel_enabled() {
+  [[ "$(normalize_bool_01 "${BOT_PANEL_ENABLE:-0}")" == "1" ]]
+}
+
+bot_panel_admin_ids_text() {
+  if [[ -n "${BOT_PANEL_ADMIN_IDS:-}" ]]; then
+    printf '%s' "${BOT_PANEL_ADMIN_IDS}"
+  elif [[ "${TELEGRAM_CHAT_ID:-}" =~ ^[0-9]{4,20}$ ]]; then
+    printf '%s (dari Chat ID notif)' "${TELEGRAM_CHAT_ID}"
+  else
+    printf '%s' "-"
+  fi
+}
+
+# Perkiraan dampak dari pengukuran service: proses Node + sqlite3 sekitar
+# 40-60 MB RAM, CPU hampir 0% saat sepi (long polling 1 request per 50 detik).
+bot_panel_is_small_vps() {
+  local ram_kb cores
+  ram_kb="$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  cores="$(nproc 2>/dev/null || echo 1)"
+  (( ${ram_kb:-0} < 1800000 || ${cores:-1} < 2 ))
+}
+
+bot_panel_resource_note() {
+  local ram_kb
+  ram_kb="$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  echo "Spesifikasi VPS : RAM $(( ${ram_kb:-0} / 1024 )) MiB, $(nproc 2>/dev/null || echo 1) vCPU"
+  echo "Pemakaian bot   : sekitar 40-60 MB RAM (batas ${BOT_PANEL_MEMORY_MAX:-128M}), CPU hampir 0% saat sepi"
+  if bot_panel_is_small_vps; then
+    echo "Peringatan: VPS 1 GB / 1 vCPU cukup untuk toko kecil (puluhan pembeli aktif)."
+    echo "Untuk pembeli ramai (ratusan pengguna bot aktif) atau banyak server, disarankan 2 GB / 2 vCPU."
+  fi
+}
+
+set_bot_panel_admin_ids() {
+  local ids clean
+  echo "ID admin sekarang : $(bot_panel_admin_ids_text)"
+  echo "Cek ID Telegram Anda lewat @userinfobot (atau kirim /id ke bot saat Bot Panel aktif)."
+  echo "Pisahkan beberapa ID dengan koma. Kosongkan untuk mempertahankan, ketik 'batal' untuk kembali."
+  if ! prompt_input ids "ID admin Bot Panel: "; then
+    return 1
+  fi
+  [[ "${ids,,}" == "batal" ]] && return 1
+  [[ -z "${ids}" ]] && return 0
+  clean="$(echo "${ids}" | tr ' ;' ',,' | tr -cd '0-9,' | sed 's/,,*/,/g; s/^,//; s/,$//')"
+  if [[ -z "${clean}" ]]; then
+    echo "ID admin tidak valid."
+    return 1
+  fi
+  BOT_PANEL_ADMIN_IDS="${clean}"
+  update_sc_env_var "BOT_PANEL_ADMIN_IDS" "${BOT_PANEL_ADMIN_IDS}"
+  update_app_env_var "BOT_PANEL_ADMIN_IDS" "${BOT_PANEL_ADMIN_IDS}"
+  if bot_panel_enabled; then
+    systemctl restart sc-1forcr-botpanel.service >/dev/null 2>&1 || true
+  fi
+  echo "Berhasil: ID admin Bot Panel = ${BOT_PANEL_ADMIN_IDS}"
+  return 0
+}
+
+toggle_bot_panel() {
+  local ans
+  if bot_panel_enabled; then
+    BOT_PANEL_ENABLE="0"
+    update_sc_env_var "BOT_PANEL_ENABLE" "0"
+    update_app_env_var "BOT_PANEL_ENABLE" "0"
+    systemctl disable --now sc-1forcr-botpanel.service >/dev/null 2>&1 || true
+    echo "Berhasil: Bot Panel dinonaktifkan. Bot kembali hanya mengirim notifikasi."
+    return 0
+  fi
+  if [[ ! -f /etc/systemd/system/sc-1forcr-botpanel.service || ! -f "${APP_DIR:-/opt/sc-1forcr}/bot-panel.js" ]]; then
+    echo "Gagal: Bot Panel belum terpasang di VPS ini. Jalankan Update SC dulu."
+    return 1
+  fi
+  if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    echo "Gagal: Bot Token belum diisi. Isi dulu di menu Setting BOT Telegram."
+    return 1
+  fi
+  if [[ -z "${BOT_PANEL_ADMIN_IDS:-}" && ! "${TELEGRAM_CHAT_ID:-}" =~ ^[0-9]{4,20}$ ]]; then
+    echo "Peringatan: ID admin Bot Panel belum ada (Chat ID notif berupa grup)."
+    set_bot_panel_admin_ids || return 1
+    [[ -n "${BOT_PANEL_ADMIN_IDS:-}" ]] || return 1
+  fi
+  if bot_panel_is_small_vps; then
+    if ! prompt_input ans "VPS ini kecil. Tetap aktifkan Bot Panel? [y/N]: "; then
+      return 1
+    fi
+    if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
+      echo "Dibatalkan."
+      return 0
+    fi
+  fi
+  BOT_PANEL_ENABLE="1"
+  update_sc_env_var "BOT_PANEL_ENABLE" "1"
+  update_app_env_var "BOT_PANEL_ENABLE" "1"
+  systemctl enable --no-reload sc-1forcr-botpanel.service >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-botpanel.service >/dev/null 2>&1 || true
+  sleep 3
+  if systemctl is-active --quiet sc-1forcr-botpanel.service; then
+    echo "Berhasil: Bot Panel aktif. Kirim /start ke bot Anda, lalu buka Menu Admin untuk"
+    echo "mengisi harga server ini, payment gateway, dan menambah server lain."
+  else
+    echo "Gagal: Bot Panel tidak berjalan. Cek log:"
+    journalctl -u sc-1forcr-botpanel.service -n 20 --no-pager -o cat 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+set_bot_panel_menu() {
+  local choice state
+  state="NONAKTIF (bot hanya kirim notifikasi)"
+  bot_panel_enabled && state="AKTIF (bot jualan akun)"
+  draw_menu_header "MODE BOT PANEL (JUALAN AKUN)"
+  echo "Status          : ${state}"
+  echo "Service         : $(systemctl is-active sc-1forcr-botpanel.service 2>/dev/null || echo inactive)"
+  echo "Bot Token       : $(mask_secret "${TELEGRAM_BOT_TOKEN:-}")"
+  echo "Admin Bot Panel : $(bot_panel_admin_ids_text)"
+  bot_panel_resource_note
+  echo
+  echo "Saat aktif, /start di bot menampilkan info toko dan saldo, menu buat, trial,"
+  echo "perpanjang akun, dan top up QRIS GoPay/ShopeePay (AutoGoPay). Menu Admin di bot"
+  echo "dipakai menambah server SC lain (domain + Auth Token), mengatur harga, dan saldo."
+  echo "Satu token bot hanya untuk satu Bot Panel; VPS lain cukup didaftarkan di bot."
+  echo
+  if bot_panel_enabled; then
+    echo "1) Nonaktifkan Bot Panel"
+  else
+    echo "1) Aktifkan Bot Panel"
+  fi
+  echo "2) Set ID Admin Bot Panel"
+  echo "3) Lihat Log Bot Panel"
+  echo "0) Kembali"
+  if ! prompt_input choice "Pilih [0-3]: "; then
+    return 0
+  fi
+  case "${choice}" in
+    1) toggle_bot_panel || true ;;
+    2) set_bot_panel_admin_ids || true ;;
+    3) journalctl -u sc-1forcr-botpanel.service -n 40 --no-pager -o cat 2>/dev/null || echo "Log Bot Panel belum tersedia." ;;
+    *) return 0 ;;
+  esac
+  return 0
 }
 
 set_account_event_webhook_config() {
@@ -34040,6 +36838,9 @@ systemctl disable sc-1forcr-udpgw@7300.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udpgw@7200.service >/dev/null 2>&1 || true
 systemctl disable --now sc-1forcr-udpgw-alias.service sc-1forcr-udpgw-drain.timer >/dev/null 2>&1 || true
+# Database Bot Panel (saldo pembeli) sengaja tidak dihapus: install ulang
+# memakainya lagi. Lokasinya /var/lib/private/sc-1forcr-botpanel.
+systemctl disable --now sc-1forcr-botpanel.service >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-udpgw-alias clear >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-extra-ports clear >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-tunnel-guard clear >/dev/null 2>&1 || true
@@ -34052,6 +36853,7 @@ elif command -v iptables-save >/dev/null 2>&1 && [[ -d /etc/iptables ]]; then
   iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
 fi
 rm -f /etc/systemd/system/sc-1forcr-api.service
+rm -f /etc/systemd/system/sc-1forcr-botpanel.service
 rm -f /etc/systemd/system/sc-1forcr-sshws.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
@@ -34928,6 +37730,7 @@ persist_pending_install_env() {
     DROPBEAR_PORT DROPBEAR_ALT_PORT DROPBEAR_VERSION DROPBEAR_KEEPALIVE_SECONDS DROPBEAR_IDLE_TIMEOUT_SECONDS
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
+    BOT_PANEL_ENABLE BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE
@@ -36147,6 +38950,7 @@ main() {
     heal_dropbear_banner_override || true
     apply_service_gates
     apply_extra_ports
+    install_bot_panel || true
     ensure_dns_resolver_if_needed
     if ! sync_xray_runtime_after_update; then
       log "Rekonsiliasi monitor Xray pasca-update gagal. Rollback otomatis akan dijalankan."
@@ -36250,6 +39054,8 @@ main() {
   run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
   run_install_step "38b_service_gate" 99 "Terapkan status ON/OFF layanan" apply_service_gates
   run_install_step "38c_extra_ports" 99 "Terapkan port TLS/NTLS tambahan" apply_extra_ports
+  # Opsional dan mati secara default; masalah Bot Panel tidak boleh membuat install gagal.
+  install_bot_panel || true
   ensure_dns_resolver_if_needed
   run_install_step "39_preflight" 100 "Preflight akhir" post_install_preflight
   show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. GASSS LANGSUNG TESTTT BANGGG."

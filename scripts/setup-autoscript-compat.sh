@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.101}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.102}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -22282,15 +22282,18 @@ install_tunnel_guard_manager() {
 #
 # Membatasi koneksi yang dibuka atas nama pengguna VPN, supaya akun VPN tidak
 # bisa dipakai menyerang VPS ini atau server lain:
-# - Ke alamat VPS sendiri (127.0.0.1 dan IP publik): hanya DNS, 80/443, API
-#   (auth ZIVPN), UDPGW, dan sshd dengan batas 4 koneksi baru/menit untuk
-#   semua akun VPN sekaligus (pemilik VPS sering SSH ke VPS sambil konek VPN
-#   lewat VPS yang sama). Dropbear, API Xray 10085, mux 2082, dan listener
-#   nginx internal tidak bisa dijangkau lewat tunnel.
-# - Ke jaringan privat dan metadata provider (169.254.0.0/16, 10/8,
-#   172.16/12, 192.168/16, 100.64/10, fc00::/7, fe80::/10): hanya DNS.
+# Mode longgar (keputusan pemilik): akun VPN bebas nge-ping dan konek ke mana
+# saja supaya segala jenis tunneling/bug dan "calculating ping" lancar. Yang
+# tetap ditutup cuma yang fatal dan tak dipakai tunneling:
+# - Ke alamat VPS sendiri (127.0.0.1 dan IP publik): semua lolos, KECUALI API
+#   Xray 10085 (bikin akun gratis). sshd tetap dibatasi 4 koneksi baru/menit
+#   untuk semua akun VPN sekaligus (pemilik VPS sering SSH ke VPS sambil konek
+#   VPN lewat VPS yang sama). ICMP echo (ping) lolos.
+# - Ke metadata provider 169.254.169.254: ditolak (pencurian kredensial VPS).
+#   Jaringan privat lain (10/8, 172.16/12, 192.168/16, ...) dibiarkan lolos.
 # - Port penyalahgunaan (SMTP/RDP/VNC/SMB, plus SSH kalau blokir SSH keluar
-#   aktif) juga ditolak untuk proses root pembawa trafik pengguna.
+#   aktif) tetap ditolak untuk menjaga reputasi IP; tidak memengaruhi tunneling
+#   kuota. Bisa dimatikan dengan TUNNEL_ABUSE_GUARD_ENABLE=0.
 # Pemilik trafik dikenali dari grup sc-1forcr-tunnel (akun SSH, Dropbear,
 # ZIVPN, UDP Custom) dan UID nobody (Xray). Hanya paket NEW yang diperiksa.
 #
@@ -22393,32 +22396,39 @@ sshd_ports() {
 build_rules() {
   local fam="$1" chunk cidr
   LOCAL_RULES=(); PRIV_RULES=(); OUT_RULES=(); OUT_JUMPS=(); SSH_RULES=(); SSH_JUMPS=()
+  # Mode longgar (keputusan pemilik): akun VPN boleh nge-ping dan konek ke mana
+  # saja -- ke VPS ini maupun ke luar -- supaya segala jenis tunneling/bug
+  # (termasuk host bug WC) dan "calculating ping" lancar. Yang tetap ditutup
+  # cuma dua hal yang tidak pernah dipakai tunneling tapi fatal kalau dibuka:
+  # Xray API 10085 (bikin akun Xray gratis) dan metadata cloud 169.254.169.254
+  # (pencurian kredensial VPS). ICMP echo (ping) selalu lolos. sshd ke VPS ini
+  # tetap dibatasi 4/menit untuk semua akun VPN sekaligus (pengganti batas
+  # per-IP di jalur lo, lihat V.1FSC.98).
   if flag_on "${TUNNEL_LOCAL_GUARD_ENABLE:-1}"; then
-    LOCAL_RULES+=("-p udp --dport 53 -j RETURN")
-    while IFS= read -r chunk; do
-      [[ -n "${chunk}" ]] && LOCAL_RULES+=("-p tcp -m multiport --dports ${chunk} -j RETURN")
-    done < <(port_chunks "${LOCAL_ALLOW}")
-    # SSH ke VPS ini dari dalam VPN-nya sendiri: koneksi keluar lewat Xray atau
-    # Dropbear, jadi masuk ke sini, bukan ke batas brute force per IP di INPUT
-    # (yang melewati lo). Satu ember bersama untuk semua akun VPN, 4/menit.
+    if [[ "${fam}" == "4" ]]; then
+      OUT_RULES+=("-p icmp --icmp-type echo-request -j RETURN")
+    else
+      OUT_RULES+=("-p ipv6-icmp --icmpv6-type echo-request -j RETURN")
+    fi
+    LOCAL_RULES+=("-p tcp --dport 10085 -j REJECT --reject-with tcp-reset")
     if flag_on "${TUNNEL_ADMIN_SSH_ALLOW:-1}" && [[ -n "${SSHD_PORTS}" ]]; then
       while IFS= read -r chunk; do
         [[ -n "${chunk}" ]] || continue
         LOCAL_RULES+=("-p tcp -m multiport --dports ${chunk} -m hashlimit --hashlimit-name sc_tunssh${fam} --hashlimit-above 4/minute --hashlimit-burst 8 -j REJECT --reject-with tcp-reset")
         LOCAL_RULES+=("-p tcp -m multiport --dports ${chunk} -j RETURN")
       done < <(port_chunks "${SSHD_PORTS}")
+    elif [[ -n "${SSHD_PORTS}" ]]; then
+      while IFS= read -r chunk; do
+        [[ -n "${chunk}" ]] && LOCAL_RULES+=("-p tcp -m multiport --dports ${chunk} -j REJECT --reject-with tcp-reset")
+      done < <(port_chunks "${SSHD_PORTS}")
     fi
-    LOCAL_RULES+=("-p tcp -j REJECT --reject-with tcp-reset" "-j REJECT")
-    PRIV_RULES=("-p udp --dport 53 -j RETURN" "-p tcp --dport 53 -j RETURN" "-p tcp -j REJECT --reject-with tcp-reset" "-j REJECT")
+    LOCAL_RULES+=("-j RETURN")
+    PRIV_RULES=("-p tcp -j REJECT --reject-with tcp-reset" "-j REJECT")
     OUT_RULES+=("-m addrtype --dst-type LOCAL -j ${LOCAL_CHAIN}")
     if [[ "${fam}" == "4" ]]; then
-      for cidr in 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
-        OUT_RULES+=("-d ${cidr} -j ${PRIV_CHAIN}")
-      done
+      OUT_RULES+=("-d 169.254.169.254 -j ${PRIV_CHAIN}")
     else
-      for cidr in fe80::/10 fc00::/7; do
-        OUT_RULES+=("-d ${cidr} -j ${PRIV_CHAIN}")
-      done
+      OUT_RULES+=("-d fd00:ec2::254 -j ${PRIV_CHAIN}")
     fi
   fi
   if flag_on "${TUNNEL_ABUSE_GUARD_ENABLE:-1}" && [[ -n "${ABUSE_PORTS}" ]]; then
@@ -22625,9 +22635,9 @@ cmd_apply() {
 }
 
 cmd_status() {
-  echo "Pembatas lokal/privat : $( [[ "$(state_value LOCAL_GUARD)" == "1" ]] && echo AKTIF || echo NONAKTIF )"
+  echo "Pembatas lokal/privat : $( [[ "$(state_value LOCAL_GUARD)" == "1" ]] && echo "AKTIF (mode longgar: tutup hanya Xray 10085 + metadata cloud)" || echo NONAKTIF )"
   echo "Batas brute force sshd: $( [[ "$(state_value SSH_BRUTE_GUARD)" == "1" ]] && echo "AKTIF (port $(state_value SSHD_PORTS))" || echo NONAKTIF )"
-  echo "Port lokal diizinkan  : $(state_value LOCAL_ALLOW)"
+  echo "Ping/konek akun VPN   : bebas ke VPS ini dan ke luar (ICMP echo lolos)"
   echo "SSH admin lewat VPN   : $( [[ "$(state_value ADMIN_SSH)" == "1" ]] && echo "DIIZINKAN (port $(state_value SSHD_PORTS), 4/menit)" || echo DITOLAK )"
 }
 

@@ -200,34 +200,33 @@ try {
     '-m conntrack --ctstate NEW -m owner --uid-owner 65534 -j SC1FORCR_TUN_OUT',
     '-m conntrack --ctstate NEW -m owner --gid-owner 998 -j SC1FORCR_TUN_OUT'
   ], 'only NEW packets from the tunnel group and Xray (nobody) are inspected');
+  // Mode longgar: akun VPN bebas ping/konek ke mana saja. Yang tetap ditutup
+  // cuma Xray API 10085, metadata cloud, dan port abuse. ICMP echo lolos.
   assert.deepStrictEqual(chain(4, 'SC1FORCR_TUN_OUT'), [
+    '-p icmp --icmp-type echo-request -j RETURN',
     '-m addrtype --dst-type LOCAL -j SC1FORCR_TUN_LOCAL',
-    '-d 169.254.0.0/16 -j SC1FORCR_TUN_PRIV',
-    '-d 10.0.0.0/8 -j SC1FORCR_TUN_PRIV',
-    '-d 172.16.0.0/12 -j SC1FORCR_TUN_PRIV',
-    '-d 192.168.0.0/16 -j SC1FORCR_TUN_PRIV',
-    '-d 100.64.0.0/10 -j SC1FORCR_TUN_PRIV',
+    '-d 169.254.169.254 -j SC1FORCR_TUN_PRIV',
     '-p tcp -m multiport --dports 3389,5900,5901,5902,445,135,139,25,465,587 -j REJECT --reject-with tcp-reset'
-  ], 'local, private, metadata and abuse ports');
+  ], 'ICMP allowed; only the VPS itself, the cloud metadata IP, and abuse ports are inspected (other private ranges pass)');
   assert.deepStrictEqual(chain(4, 'SC1FORCR_TUN_LOCAL'), [
-    '-p udp --dport 53 -j RETURN',
-    '-p tcp -m multiport --dports 53,80,443,8088,7300,7200 -j RETURN',
+    '-p tcp --dport 10085 -j REJECT --reject-with tcp-reset',
     '-p tcp -m multiport --dports 22,2222 -m hashlimit --hashlimit-name sc_tunssh4 --hashlimit-above 4/minute --hashlimit-burst 8 -j REJECT --reject-with tcp-reset',
     '-p tcp -m multiport --dports 22,2222 -j RETURN',
-    '-p tcp -j REJECT --reject-with tcp-reset',
-    '-j REJECT'
-  ], 'only DNS, 80/443, the API (ZIVPN auth), UDPGW and rate-limited sshd (owner logging in through their own VPN) stay reachable');
-  assert(!chain(4, 'SC1FORCR_TUN_LOCAL').some((r) => /--dports [^ ]*\b(109|143|10085|2082)\b/.test(r)), 'Dropbear, Xray API and mux stay closed to tunnels');
+    '-j RETURN'
+  ], 'to the VPS itself everything is allowed except Xray API 10085; sshd stays rate-limited; final RETURN lets the rest (Dropbear, ping, bug loopback) through');
+  assert(chain(4, 'SC1FORCR_TUN_LOCAL').some((r) => /--dport 10085 .*REJECT/.test(r)), 'Xray API 10085 stays closed to tunnels');
+  assert(!chain(4, 'SC1FORCR_TUN_LOCAL').some((r) => /\b(109|143|2082)\b/.test(r)), 'Dropbear and mux are no longer blocked (loose mode)');
   assert.deepStrictEqual(chain(4, 'SC1FORCR_TUN_PRIV'), [
-    '-p udp --dport 53 -j RETURN', '-p tcp --dport 53 -j RETURN', '-p tcp -j REJECT --reject-with tcp-reset', '-j REJECT'
-  ], 'private networks and metadata: DNS only');
+    '-p tcp -j REJECT --reject-with tcp-reset', '-j REJECT'
+  ], 'the cloud metadata IP is fully blocked (credential theft)');
   assert.deepStrictEqual(chain(4, 'INPUT'), ['! -i lo -p tcp -m conntrack --ctstate NEW -j SC1FORCR_SSH_GUARD']);
   assert.deepStrictEqual(chain(4, 'SC1FORCR_SSH_GUARD'), [
     '-p tcp -m multiport --dports 22,2222 -m hashlimit --hashlimit-name sc_sshd4 --hashlimit-mode srcip --hashlimit-srcmask 32 --hashlimit-above 15/minute --hashlimit-burst 30 -j DROP'
   ], 'new sshd connections are rate limited per IP (Dropbear 109 is never included)');
   assert.deepStrictEqual(chain(6, 'SC1FORCR_TUN_OUT').filter((r) => r.startsWith('-d ')), [
-    '-d fe80::/10 -j SC1FORCR_TUN_PRIV', '-d fc00::/7 -j SC1FORCR_TUN_PRIV'
-  ], 'IPv6 private ranges');
+    '-d fd00:ec2::254 -j SC1FORCR_TUN_PRIV'
+  ], 'IPv6: only the cloud metadata IP is blocked');
+  assert(chain(6, 'SC1FORCR_TUN_OUT').includes('-p ipv6-icmp --icmpv6-type echo-request -j RETURN'), 'IPv6 ping (echo-request) is allowed too');
   assert(chain(6, 'SC1FORCR_SSH_GUARD')[0].includes('--hashlimit-name sc_sshd6 --hashlimit-mode srcip --hashlimit-srcmask 64'), 'IPv6 rate limit per /64');
   assert.strictEqual(read('persist').trim(), 'save', 'changed rules are saved once');
 
@@ -245,20 +244,23 @@ try {
     'a missing jump is restored without rebuilding the chains');
 
   // Isi chain berubah: dibangun ulang.
-  write(path.join(tmp, 'rules4'), read('rules4').split('\n').filter((l) => !l.startsWith('SC1FORCR_TUN_PRIV -p tcp --dport 53')).join('\n'));
+  write(path.join(tmp, 'rules4'), read('rules4').split('\n').filter((l) => !l.startsWith('SC1FORCR_TUN_PRIV -p tcp -j REJECT')).join('\n'));
   guard('apply');
-  assert.strictEqual(chain(4, 'SC1FORCR_TUN_PRIV').length, 4, 'a damaged chain is rebuilt');
+  assert.strictEqual(chain(4, 'SC1FORCR_TUN_PRIV').length, 2, 'a damaged chain is rebuilt');
   assert.strictEqual(chain(4, 'OUTPUT').length, 2, 'rebuild keeps exactly one jump per owner');
 
-  // Config berubah: aturan ikut berubah.
+  // Config berubah: mode longgar tetap (port API/UDPGW tidak lagi memengaruhi chain).
   write(envFile, 'API_PORT=9090\nSSHWS_UDPGW_PORTS=7300\n');
   guard('apply');
-  assert(chain(4, 'SC1FORCR_TUN_LOCAL').includes('-p tcp -m multiport --dports 53,80,443,9090,7300 -j RETURN'), 'API/UDPGW port changes are applied');
+  assert(chain(4, 'SC1FORCR_TUN_LOCAL').includes('-p tcp --dport 10085 -j REJECT --reject-with tcp-reset')
+    && chain(4, 'SC1FORCR_TUN_LOCAL').slice(-1)[0] === '-j RETURN', 'loose mode stays: only 10085 closed, rest allowed');
 
   // Pemilik bisa menolak SSH lewat VPN sama sekali.
   write(envFile, 'TUNNEL_ADMIN_SSH_ALLOW=0\n');
   guard('apply');
-  assert(!chain(4, 'SC1FORCR_TUN_LOCAL').some((r) => r.includes('22,2222')), 'TUNNEL_ADMIN_SSH_ALLOW=0 closes sshd to tunnels again');
+  assert(chain(4, 'SC1FORCR_TUN_LOCAL').some((r) => r.includes('22,2222') && /REJECT/.test(r))
+    && !chain(4, 'SC1FORCR_TUN_LOCAL').some((r) => r.includes('22,2222') && /-j RETURN/.test(r)),
+    'TUNNEL_ADMIN_SSH_ALLOW=0 closes sshd to tunnels again');
   assert(guard('status').includes('SSH admin lewat VPN   : DITOLAK'));
 
   // Hanya penjaga port penyalahgunaan yang aktif.

@@ -12,6 +12,7 @@ const sqlite3 = require('sqlite3').verbose();
 const { buildPayload, headers, API_URL } = require('./api-cekpayment-orkut');
 const { parseForeignBackupBuffer } = require('./lib/foreign-backup-parser');
 const serverMigration = require('./lib/server-migration');
+const vpsRebuild = require('./lib/vps-rebuild');
 
 const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
 if (!BOT_TOKEN) {
@@ -438,6 +439,32 @@ async function initDb() {
   await dbRun(
     "DELETE FROM migration_rollback_jobs WHERE expires_at < ? OR (status IN ('rolled_back','cancelled') AND used_at IS NOT NULL AND used_at < ?)",
     [Date.now(), Date.now() - DAY_MS]
+  ).catch(() => {});
+  // Job rebuild VPS (install ulang OS). Password root TIDAK disimpan di sini;
+  // password hanya ada di memori (rebuildSecrets) selama proses. Kolom host key
+  // lama/baru dipakai poller untuk mendeteksi OS sudah benar-benar diganti.
+  await dbRun(`CREATE TABLE IF NOT EXISTS vps_rebuild_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    vps_ip TEXT NOT NULL,
+    ssh_port INTEGER NOT NULL DEFAULT 22,
+    os_key TEXT NOT NULL,
+    os_label TEXT NOT NULL,
+    old_fingerprint TEXT,
+    new_fingerprint TEXT,
+    stable_count INTEGER DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'running',
+    note TEXT,
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    finished_at INTEGER
+  )`);
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_vps_rebuild_status ON vps_rebuild_jobs(status)').catch(() => {});
+  // Job yang ketinggalan (mis. bot mati lama) ditutup supaya tidak dipoll selamanya.
+  await dbRun(
+    "UPDATE vps_rebuild_jobs SET status='timeout', note=COALESCE(note,'')||' (ditutup saat start)', finished_at=?, updated_at=? WHERE status='running' AND started_at < ?",
+    [Date.now(), Date.now(), Date.now() - (6 * 60 * 60 * 1000)]
   ).catch(() => {});
   await ensureScRegistrationSchema();
   await ensureScServerKeySchema();
@@ -3492,6 +3519,7 @@ function mainMenu() {
     [coloredButton('Top Up Saldo', 'm_topup_saldo', 'success'), coloredButton('Cek Saldo', 'm_cek_saldo', 'success')],
     [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Fitur SC 1FORCR NEXUS', 'm_sc_features')],
     [Markup.button.callback('Migrasi Akun', 'm_migrate_accounts'), Markup.button.callback('Hapus Semua Akun', 'm_delete_all_accounts')],
+    [coloredButton('Rebuild VPS (Install Ulang OS)', 'm_rebuild_vps', 'danger')],
     [Markup.button.callback('Backup SC', 'm_backup_now'), Markup.button.callback('Restore SC', 'm_restore_upload')],
     [Markup.button.callback('Jadi Reseller', 'm_become_reseller'), Markup.button.callback('Grup SC 1FORCR', 'm_group_sc_1forcr')],
     [Markup.button.callback('Menu Admin', 'm_admin_menu')]
@@ -7895,6 +7923,298 @@ bot.action(/^m_admin_srv_freeze_confirm_([a-f0-9]{12})$/, async (ctx) => {
   return undefined;
 });
 
+// ===== Rebuild VPS (install ulang OS lewat bin456789/reinstall) =====
+// Destruktif: WIPE TOTAL VPS lalu pasang Debian/Ubuntu baru. Pengaman:
+// - target wajib IP yang terdaftar atas nama user (bukan IP sembarangan),
+// - konfirmasi dengan mengetik ulang IP,
+// - password root hanya di memori (rebuildSecrets), tidak pernah disimpan/di-log,
+// - satu job rebuild aktif per user.
+const REBUILD_POLL_INTERVAL_MS = Math.max(30000, Number(process.env.REBUILD_POLL_INTERVAL_MS || 60000) || 60000);
+const REBUILD_MIN_SETTLE_MS = Math.max(3 * 60 * 1000, Number(process.env.REBUILD_MIN_SETTLE_MS || 7 * 60 * 1000) || 7 * 60 * 1000);
+const REBUILD_JOB_DEADLINE_MS = Math.max(15 * 60 * 1000, Number(process.env.REBUILD_JOB_DEADLINE_MS || 50 * 60 * 1000) || 50 * 60 * 1000);
+const rebuildSecrets = new Map(); // jobId -> { username, password } (memori saja)
+let rebuildPollBusy = false;
+
+function rebuildOsKeyboard() {
+  const rows = vpsRebuild.REBUILD_OS_OPTIONS.map((o) => [Markup.button.callback(o.label, `m_rvps_os_${o.key}`)]);
+  rows.push([Markup.button.callback('Batal', 'm_rebuild_cancel')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function listUserActiveRebuildHosts(userId) {
+  const uid = Number(userId || 0);
+  if (!uid) return [];
+  const now = Date.now();
+  await dbRun(
+    "UPDATE sc_registrations SET status='expired', updated_at=? WHERE status='active' AND expires_at IS NOT NULL AND expires_at>0 AND expires_at<=?",
+    [now, now]
+  ).catch(() => {});
+  const rows = await dbAll(
+    "SELECT vps_ip, client_name FROM sc_registrations WHERE user_id=? AND status='active' " +
+      "AND (expires_at IS NULL OR expires_at<=0 OR expires_at>?) ORDER BY updated_at DESC LIMIT 30",
+    [uid, now]
+  ).catch(() => []);
+  return rows || [];
+}
+
+function getActiveRebuildJobForUser(uid) {
+  return dbGet(
+    "SELECT * FROM vps_rebuild_jobs WHERE user_id=? AND status='running' ORDER BY started_at DESC LIMIT 1",
+    [Number(uid) || 0]
+  );
+}
+
+async function createRebuildJob({ userId, chatId, ip, port, osKey, osLabel, oldFp }) {
+  const now = Date.now();
+  const r = await dbRun(
+    "INSERT INTO vps_rebuild_jobs (user_id, chat_id, vps_ip, ssh_port, os_key, os_label, old_fingerprint, stable_count, status, started_at, updated_at) " +
+      "VALUES (?,?,?,?,?,?,?,0,'running',?,?)",
+    [Number(userId) || 0, Number(chatId) || 0, ip, Number(port) || 22, osKey, osLabel, oldFp || '', now, now]
+  );
+  return r.lastID;
+}
+
+function finishRebuildJob(id, status, note) {
+  const now = Date.now();
+  return dbRun(
+    "UPDATE vps_rebuild_jobs SET status=?, note=?, finished_at=?, updated_at=? WHERE id=?",
+    [status, note || null, now, now, id]
+  );
+}
+
+function rebuildFailureText(res, ip, port) {
+  const reason = String(res && res.reason ? res.reason : 'unknown');
+  if (reason === 'auth') {
+    return `Password root salah atau VPS menolak login. VPS TIDAK diubah.\n\nCek lagi password root ${ip}, lalu ulangi dari menu Rebuild VPS.`;
+  }
+  if (reason === 'unreachable') {
+    return `VPS ${ip} tidak bisa di-SSH di port ${port}. VPS TIDAK diubah.\n\nPastikan VPS menyala, port SSH benar, dan tidak diblok firewall, lalu ulangi.`;
+  }
+  if (reason === 'virt-unsupported') {
+    return `VPS ini virtualisasi ${res.detail || 'OpenVZ/LXC'} yang TIDAK didukung skrip reinstall. VPS TIDAK diubah.\n\nRebuild hanya jalan di VPS KVM.`;
+  }
+  if (reason === 'no-downloader') {
+    return `VPS tidak punya curl maupun wget untuk mengunduh skrip. VPS TIDAK diubah.\n\nPasang salah satunya (apt install curl) lalu ulangi.`;
+  }
+  if (reason === 'reinstall-failed') {
+    // tail sudah disensor dari password oleh lib/vps-rebuild.
+    const tail = String(res.tail || '').trim();
+    return `Skrip reinstall berhenti dengan error (${res.detail || '-'}) sebelum reboot. VPS TIDAK diubah.\n\n${tail ? `Cuplikan output:\n${tail.slice(-800)}` : 'Tidak ada detail.'}`;
+  }
+  if (reason === 'prep-timeout') {
+    return `Skrip reinstall tidak selesai dalam batas waktu, jadi dibatalkan otomatis (entri boot installer direset). VPS TIDAK diubah.\n\nCoba lagi nanti; mirror OS mungkin sedang lambat.`;
+  }
+  if (reason === 'disconnected') {
+    return (
+      `Koneksi ke VPS ${ip} putus saat skrip reinstall berjalan. Status VPS tidak pasti dan VPS belum di-reboot oleh bot.\n\n` +
+      'Kalau TIDAK jadi rebuild, login ke VPS lalu jalankan:\nbash /root/reinstall.sh reset\n' +
+      'supaya reboot berikutnya tidak memulai install ulang. Kalau tetap mau rebuild, ulangi dari menu Rebuild VPS.'
+    );
+  }
+  return `Gagal memulai rebuild (${reason}). VPS kemungkinan tidak berubah. Coba lagi atau hubungi admin.`;
+}
+
+async function sendRebuildDoneNotif(job, uncertain) {
+  let guide = { ok: false, text: '', parse_mode: 'HTML' };
+  try {
+    const serverKey = await getServerKeyForHost(job.user_id, job.vps_ip).catch(() => '');
+    guide = await buildInstallerQuickCopyText({ ip: job.vps_ip, serverKey, clientName: job.vps_ip });
+  } catch (_) {}
+  const lines = [
+    '<b>REBUILD VPS SELESAI</b>',
+    '',
+    `VPS <b>${escapeHtml(job.vps_ip)}</b> sudah selesai di-install ulang ke <b>${escapeHtml(job.os_label)}</b>.`
+  ];
+  if (uncertain) {
+    lines.push('(Terdeteksi dari perubahan sistem VPS. Kalau belum bisa login, tunggu beberapa menit lagi.)');
+  }
+  lines.push(`Login sebagai <b>root</b> pakai password yang kamu masukkan tadi (port SSH ${job.ssh_port}).`);
+  lines.push('');
+  lines.push('Langkah berikutnya: install ulang SC 1FORCR di VPS ini dengan panduan di bawah.');
+  lines.push('Catatan: karena OS diganti, machine-id VPS berubah. Kalau installer menolak dengan alasan machine-id, pakai menu admin "Reset Binding VPS" lalu jalankan installer lagi.');
+  lines.push('');
+  const header = lines.join('\n');
+  const body = guide && guide.text ? `${header}\n${guide.text}` : header;
+  await bot.telegram
+    .sendMessage(job.chat_id, body, { parse_mode: 'HTML', disable_web_page_preview: true })
+    .catch((err) => console.error(`[rebuild] gagal kirim notif selesai job=${job.id}: ${formatStartError(err)}`));
+}
+
+async function sendRebuildTimeoutNotif(job) {
+  const mins = Math.round(REBUILD_JOB_DEADLINE_MS / 60000);
+  const text = uiBox('REBUILD VPS', [
+    `VPS ${job.vps_ip} belum terdeteksi selesai setelah ${mins} menit.`,
+    '',
+    'Kemungkinan masih berjalan, atau perlu dicek manual.',
+    `Coba SSH ke VPS: kalau sudah jadi ${job.os_label}, berarti rebuild selesai`,
+    'dan tinggal install ulang SC dari menu "Link Instalasi".'
+  ]);
+  await bot.telegram
+    .sendMessage(job.chat_id, text)
+    .catch((err) => console.error(`[rebuild] gagal kirim notif timeout job=${job.id}: ${formatStartError(err)}`));
+}
+
+// Poller: deteksi OS baru sudah nyala. Anti false-positive dengan syarat
+// gabungan (login OS baru + os-release cocok + host key BERUBAH), dua kali
+// berturut, dan minimal beberapa menit sejak mulai. Tanpa password di memori
+// (mis. bot sempat restart) dipakai fallback perubahan host key saja.
+async function pollRebuildJobs() {
+  if (rebuildPollBusy) return;
+  rebuildPollBusy = true;
+  try {
+    const jobs = await dbAll("SELECT * FROM vps_rebuild_jobs WHERE status='running' ORDER BY started_at ASC LIMIT 20").catch(() => []);
+    const now = Date.now();
+    for (const job of jobs || []) {
+      try {
+        const ageMs = now - Number(job.started_at || 0);
+        const port = Number(job.ssh_port) || 22;
+        const secret = rebuildSecrets.get(job.id);
+        let done = false;
+        let uncertain = false;
+        if (secret) {
+          const r = await vpsRebuild.verifyRebuiltOs({
+            host: job.vps_ip,
+            port,
+            username: secret.username,
+            password: secret.password,
+            osKey: job.os_key
+          });
+          const good = r && r.ok && r.matches && vpsRebuild.fingerprintChanged(job.old_fingerprint, r.fingerprint);
+          if (good) {
+            const stable = Number(job.stable_count || 0) + 1;
+            await dbRun('UPDATE vps_rebuild_jobs SET stable_count=?, new_fingerprint=?, updated_at=? WHERE id=?', [stable, r.fingerprint, now, job.id]).catch(() => {});
+            if (stable >= 2 && ageMs >= REBUILD_MIN_SETTLE_MS) done = true;
+          } else if (Number(job.stable_count || 0) !== 0) {
+            await dbRun('UPDATE vps_rebuild_jobs SET stable_count=0, updated_at=? WHERE id=?', [now, job.id]).catch(() => {});
+          }
+        } else {
+          const r = await vpsRebuild.probeHostKey({ host: job.vps_ip, port });
+          if (r && r.ok && vpsRebuild.fingerprintChanged(job.old_fingerprint, r.fingerprint)) {
+            const stable = job.new_fingerprint === r.fingerprint ? Number(job.stable_count || 0) + 1 : 1;
+            await dbRun('UPDATE vps_rebuild_jobs SET stable_count=?, new_fingerprint=?, updated_at=? WHERE id=?', [stable, r.fingerprint, now, job.id]).catch(() => {});
+            if (stable >= 3 && ageMs >= REBUILD_MIN_SETTLE_MS) { done = true; uncertain = true; }
+          } else if (Number(job.stable_count || 0) !== 0) {
+            await dbRun('UPDATE vps_rebuild_jobs SET stable_count=0, updated_at=? WHERE id=?', [now, job.id]).catch(() => {});
+          }
+        }
+        if (done) {
+          await finishRebuildJob(job.id, 'done', uncertain ? 'terdeteksi dari host key' : null).catch(() => {});
+          rebuildSecrets.delete(job.id);
+          await sendRebuildDoneNotif(job, uncertain);
+          continue;
+        }
+        if (ageMs >= REBUILD_JOB_DEADLINE_MS) {
+          await finishRebuildJob(job.id, 'timeout', null).catch(() => {});
+          rebuildSecrets.delete(job.id);
+          await sendRebuildTimeoutNotif(job);
+        }
+      } catch (_) {
+        // VPS lagi reboot/putus saat install: wajar, job tetap running.
+      }
+    }
+  } finally {
+    rebuildPollBusy = false;
+  }
+}
+
+bot.action('m_rebuild_cancel', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  userState.delete(ctx.chat.id);
+  await ctx.reply('Rebuild dibatalkan.', mainMenu());
+});
+
+bot.action('m_rebuild_vps', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const uid = ctx.from.id;
+  const running = await getActiveRebuildJobForUser(uid).catch(() => null);
+  if (running) {
+    return ctx.reply(
+      `Masih ada rebuild berjalan untuk VPS ${running.vps_ip} (${running.os_label}). Tunggu sampai ada notif selesai dulu.`,
+      mainMenu()
+    );
+  }
+  const hosts = await listUserActiveRebuildHosts(uid);
+  if (!hosts.length) {
+    return ctx.reply(
+      uiBox('REBUILD VPS', [
+        'Belum ada VPS aktif terdaftar atas namamu.',
+        '',
+        'Kamu hanya bisa rebuild VPS yang sudah kamu daftarkan di bot ini.',
+        'Daftarkan SC dulu lewat menu "Daftar / Perpanjang SC".'
+      ]),
+      mainMenu()
+    );
+  }
+  const rows = hosts.map((h) => [Markup.button.callback(
+    h.client_name ? `${h.vps_ip} (${String(h.client_name).slice(0, 20)})` : h.vps_ip,
+    `m_rvps_ip_${h.vps_ip}`
+  )]);
+  rows.push([Markup.button.callback('Batal', 'm_rebuild_cancel')]);
+  await ctx.reply(
+    uiBox('REBUILD VPS (INSTALL ULANG OS)', [
+      'PERINGATAN: rebuild akan MENGHAPUS TOTAL isi VPS',
+      'lalu memasang ulang Debian/Ubuntu dari nol.',
+      '',
+      'Semua akun, data, dan SC di VPS itu HILANG.',
+      'Setelah selesai kamu harus install ulang SC.',
+      '',
+      'Syarat: VPS tipe KVM (bukan OpenVZ/LXC), dan',
+      'bot bisa SSH ke VPS pakai password root yang kamu masukkan.',
+      '',
+      'Pilih VPS yang mau di-rebuild:'
+    ]),
+    Markup.inlineKeyboard(rows)
+  );
+});
+
+bot.action(/^m_rvps_ip_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const ip = normalizeHost(ctx.match[1]);
+  const owner = await getRegistrationStateByIp(ctx.from.id, ip, isAdmin(ctx.from.id)).catch(() => null);
+  if (!owner) {
+    return ctx.reply(`IP ${ip} tidak terdaftar aktif atas namamu. Rebuild dibatalkan.`, mainMenu());
+  }
+  userState.set(ctx.chat.id, { step: 'rebuild_port', ip });
+  await ctx.reply(
+    uiBox('REBUILD VPS', [
+      `VPS target: ${ip}`,
+      '',
+      'Masukkan port SSH root VPS.',
+      'Kalau default, ketik 22.',
+      '',
+      'Ketik "batal" untuk membatalkan.'
+    ])
+  );
+});
+
+bot.action(/^m_rvps_os_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (!state || state.step !== 'rebuild_os' || !state.ip || !state.password) {
+    userState.delete(ctx.chat.id);
+    return ctx.reply('Sesi rebuild kadaluarsa. Ulangi dari menu Rebuild VPS.', mainMenu());
+  }
+  const opt = vpsRebuild.getOsOption(ctx.match[1]);
+  if (!opt) return ctx.reply('OS tidak valid. Pilih dari tombol yang tersedia.');
+  state.step = 'rebuild_confirm';
+  state.osKey = opt.key;
+  state.osLabel = opt.label;
+  userState.set(ctx.chat.id, state);
+  await ctx.reply(
+    uiBox('KONFIRMASI REBUILD', [
+      `VPS   : ${state.ip}`,
+      `Port  : ${state.port}`,
+      `OS baru: ${opt.label}`,
+      '',
+      'INI MENGHAPUS TOTAL VPS DAN TIDAK BISA DIBATALKAN',
+      'setelah dimulai. Semua akun & data hilang.',
+      '',
+      `Untuk konfirmasi, ketik ulang IP VPS persis: ${state.ip}`,
+      'Atau ketik "batal".'
+    ])
+  );
+});
+
 bot.on('text', async (ctx) => {
   const state = userState.get(ctx.chat.id);
   if (!state) return;
@@ -7906,6 +8226,96 @@ bot.on('text', async (ctx) => {
     return ctx.reply('Dibatalkan.', mainMenu());
   }
   try {
+    if (state.step === 'rebuild_port') {
+      const port = text.toLowerCase() === 'default' ? 22 : Number.parseInt(text, 10);
+      if (!Number.isInteger(port) || port < 1 || port > 65535 || !/^\d+$|^default$/i.test(text)) {
+        return ctx.reply('Port tidak valid. Kirim angka 1-65535 (default 22), atau "batal".');
+      }
+      userState.set(ctx.chat.id, { step: 'rebuild_pw', ip: state.ip, port });
+      return ctx.reply(
+        uiBox('REBUILD VPS', [
+          `VPS target: ${state.ip} (port ${port})`,
+          '',
+          'Kirim password root VPS saat ini.',
+          'Password yang sama dipakai jadi password root OS baru.',
+          '',
+          'Pesan password akan dicoba dihapus otomatis dan',
+          'tidak disimpan di database bot.',
+          '',
+          'Ketik "batal" untuk membatalkan.'
+        ])
+      );
+    }
+
+    if (state.step === 'rebuild_pw') {
+      await deleteServerPasswordMessage(ctx);
+      // Teks sudah di-trim di atas; password berspasi di ujung tidak didukung.
+      userState.set(ctx.chat.id, { step: 'rebuild_os', ip: state.ip, port: state.port, password: text });
+      return ctx.reply(
+        uiBox('REBUILD VPS', [
+          `VPS target: ${state.ip} (port ${state.port})`,
+          '',
+          'Pilih OS baru:'
+        ]),
+        rebuildOsKeyboard()
+      );
+    }
+
+    if (state.step === 'rebuild_os') {
+      return ctx.reply('Pilih OS lewat tombol di atas, atau ketik "batal".');
+    }
+
+    if (state.step === 'rebuild_confirm') {
+      if (normalizeHost(text) !== state.ip) {
+        return ctx.reply(`Teks tidak sama dengan IP. Ketik persis ${state.ip} untuk konfirmasi, atau "batal".`);
+      }
+      const { ip, port, password, osKey, osLabel } = state;
+      const uid = ctx.from.id;
+      userState.delete(ctx.chat.id);
+      // Cek ulang kepemilikan & job aktif (bisa berubah sejak langkah awal).
+      const owner = await getRegistrationStateByIp(uid, ip, isAdmin(uid)).catch(() => null);
+      if (!owner) return ctx.reply(`IP ${ip} tidak lagi terdaftar aktif atas namamu. Dibatalkan.`, mainMenu());
+      const running = await getActiveRebuildJobForUser(uid).catch(() => null);
+      if (running) return ctx.reply('Masih ada rebuild lain yang berjalan. Tunggu selesai dulu.', mainMenu());
+
+      await ctx.reply(
+        uiBox('REBUILD VPS', [
+          `Login ke ${ip} dan menjalankan install ulang ${osLabel}...`,
+          '',
+          'Jangan matikan VPS. Tahap ini bisa 1-5 menit.'
+        ])
+      );
+      let res;
+      try {
+        res = await vpsRebuild.runReinstall({ host: ip, port, username: 'root', password, osKey });
+      } catch (err) {
+        if (err && err.code === 'NO_SSH2') {
+          console.error('[rebuild] modul ssh2 belum terpasang di server bot');
+          return ctx.reply('Fitur rebuild belum siap di server bot (modul ssh2 belum terpasang). Hubungi admin.', mainMenu());
+        }
+        return ctx.reply(`Gagal memulai rebuild: ${formatStartError(err)}`, mainMenu());
+      }
+      if (!res || !res.ok) {
+        console.log(`[rebuild] gagal ip=${ip} os=${osKey} user=${uid} reason=${res && res.reason}`);
+        return ctx.reply(rebuildFailureText(res, ip, port), mainMenu());
+      }
+      const jobId = await createRebuildJob({ userId: uid, chatId: ctx.chat.id, ip, port, osKey, osLabel, oldFp: res.fingerprint });
+      rebuildSecrets.set(jobId, { username: 'root', password });
+      console.log(`[rebuild] dimulai job=${jobId} ip=${ip} os=${osKey} user=${uid}`);
+      return ctx.reply(
+        uiBox('REBUILD DIMULAI', [
+          `VPS ${ip} sedang di-install ulang ke ${osLabel}.`,
+          '',
+          'VPS akan reboot beberapa kali. Biasanya selesai',
+          '5-20 menit, tergantung kecepatan VPS dan mirror.',
+          '',
+          'Bot akan kirim notif di sini kalau sudah selesai,',
+          'lengkap dengan panduan install ulang SC.'
+        ]),
+        mainMenu()
+      );
+    }
+
     if (state.step === 'admin_srv_backup_password') {
       await deleteServerPasswordMessage(ctx);
       if (!isAdmin(ctx.from.id)) {
@@ -10160,6 +10570,14 @@ function startBackgroundJobs() {
       console.error('natural expiry job failed:', formatStartError(err));
     });
   }, 5000);
+
+  // Rebuild VPS: hanya bekerja kalau ada job running, jadi idle-nya cuma satu
+  // query SQLite per interval.
+  setInterval(() => {
+    pollRebuildJobs().catch((err) => {
+      console.error('rebuild poll failed:', formatStartError(err));
+    });
+  }, REBUILD_POLL_INTERVAL_MS);
 
   pollPendingTopups().catch((err) => {
     console.error('initial topup poll failed:', formatStartError(err));

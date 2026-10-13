@@ -80,13 +80,15 @@ assert.deepStrictEqual(
     ['success', 'success'],
     ['primary', 'primary'],
     ['primary', 'danger'],
+    ['danger'],
     ['primary', 'primary'],
     ['primary', 'primary'],
     ['primary']
   ],
   'warna menu utama harus rapi per baris'
 );
-assert.strictEqual(mainRows[4][1].text, 'Hapus Semua Akun', 'tombol merah menu utama hanya Hapus Semua Akun');
+assert.strictEqual(mainRows[4][1].text, 'Hapus Semua Akun', 'tombol merah menu utama: Hapus Semua Akun');
+assert.strictEqual(mainRows[5][0].text, 'Rebuild VPS (Install Ulang OS)', 'baris rebuild VPS merah sendiri');
 
 // Menu admin: biru, merah hanya untuk hapus/nonaktifkan, Kembali tanpa warna.
 const adminButtons = rowsOf(menus.adminMenu()).flat();

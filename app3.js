@@ -8058,58 +8058,75 @@ async function sendRebuildTimeoutNotif(job) {
 // gabungan (login OS baru + os-release cocok + host key BERUBAH), dua kali
 // berturut, dan minimal beberapa menit sejak mulai. Tanpa password di memori
 // (mis. bot sempat restart) dipakai fallback perubahan host key saja.
+// Evaluasi satu job: cek apakah OS baru sudah nyala, update stable_count, dan
+// kembalikan { done, uncertain, ageMs, loginOk, matched, changed, stable }.
+// Dua sinyal supaya tidak menggantung: (1) login OS baru + os-release cocok +
+// host key berubah = pasti; (2) kalau login gagal (OS baru menolak login root
+// password, atau beda port) tetap pakai perubahan host key saja = kemungkinan.
+async function evaluateRebuildJob(job) {
+  const now = Date.now();
+  const ageMs = now - Number(job.started_at || 0);
+  const port = Number(job.ssh_port) || 22;
+  const secret = rebuildSecrets.get(job.id);
+  let fp = '';
+  let loginOk = false;
+  let matched = false;
+  if (secret) {
+    const r = await vpsRebuild.verifyRebuiltOs({
+      host: job.vps_ip, port, username: secret.username, password: secret.password, osKey: job.os_key
+    }).catch(() => null);
+    if (r) { loginOk = !!r.ok; matched = !!r.matches; if (r.fingerprint) fp = r.fingerprint; }
+  }
+  if (!fp) {
+    const p = await vpsRebuild.probeHostKey({ host: job.vps_ip, port }).catch(() => null);
+    if (p && p.ok && p.fingerprint) fp = p.fingerprint;
+  }
+  const changed = Boolean(fp) && vpsRebuild.fingerprintChanged(job.old_fingerprint, fp);
+  let stable = 0;
+  if (changed) {
+    stable = (job.new_fingerprint && job.new_fingerprint === fp ? Number(job.stable_count || 0) : 0) + 1;
+    await dbRun('UPDATE vps_rebuild_jobs SET stable_count=?, new_fingerprint=?, updated_at=? WHERE id=?', [stable, fp, now, job.id]).catch(() => {});
+  } else if (Number(job.stable_count || 0) !== 0) {
+    await dbRun('UPDATE vps_rebuild_jobs SET stable_count=0, updated_at=? WHERE id=?', [now, job.id]).catch(() => {});
+  }
+  const settled = ageMs >= REBUILD_MIN_SETTLE_MS;
+  let done = false;
+  let uncertain = false;
+  if (settled && changed) {
+    if (matched && stable >= 2) { done = true; uncertain = false; }
+    else if (stable >= 3) { done = true; uncertain = true; }
+  }
+  // Log tanpa password: untuk diagnosa kenapa belum terdeteksi selesai.
+  console.log(
+    `[rebuild] poll job=${job.id} ip=${job.vps_ip} port=${port} secret=${secret ? 1 : 0} ` +
+    `loginOk=${loginOk ? 1 : 0} matched=${matched ? 1 : 0} fpChanged=${changed ? 1 : 0} ` +
+    `stable=${stable} ageMin=${Math.round(ageMs / 60000)} done=${done ? 1 : 0}${uncertain ? ' (uncertain)' : ''}`
+  );
+  return { done, uncertain, ageMs, loginOk, matched, changed, stable };
+}
+
 async function pollRebuildJobs() {
   if (rebuildPollBusy) return;
   rebuildPollBusy = true;
   try {
     const jobs = await dbAll("SELECT * FROM vps_rebuild_jobs WHERE status='running' ORDER BY started_at ASC LIMIT 20").catch(() => []);
-    const now = Date.now();
     for (const job of jobs || []) {
       try {
-        const ageMs = now - Number(job.started_at || 0);
-        const port = Number(job.ssh_port) || 22;
-        const secret = rebuildSecrets.get(job.id);
-        let done = false;
-        let uncertain = false;
-        if (secret) {
-          const r = await vpsRebuild.verifyRebuiltOs({
-            host: job.vps_ip,
-            port,
-            username: secret.username,
-            password: secret.password,
-            osKey: job.os_key
-          });
-          const good = r && r.ok && r.matches && vpsRebuild.fingerprintChanged(job.old_fingerprint, r.fingerprint);
-          if (good) {
-            const stable = Number(job.stable_count || 0) + 1;
-            await dbRun('UPDATE vps_rebuild_jobs SET stable_count=?, new_fingerprint=?, updated_at=? WHERE id=?', [stable, r.fingerprint, now, job.id]).catch(() => {});
-            if (stable >= 2 && ageMs >= REBUILD_MIN_SETTLE_MS) done = true;
-          } else if (Number(job.stable_count || 0) !== 0) {
-            await dbRun('UPDATE vps_rebuild_jobs SET stable_count=0, updated_at=? WHERE id=?', [now, job.id]).catch(() => {});
-          }
-        } else {
-          const r = await vpsRebuild.probeHostKey({ host: job.vps_ip, port });
-          if (r && r.ok && vpsRebuild.fingerprintChanged(job.old_fingerprint, r.fingerprint)) {
-            const stable = job.new_fingerprint === r.fingerprint ? Number(job.stable_count || 0) + 1 : 1;
-            await dbRun('UPDATE vps_rebuild_jobs SET stable_count=?, new_fingerprint=?, updated_at=? WHERE id=?', [stable, r.fingerprint, now, job.id]).catch(() => {});
-            if (stable >= 3 && ageMs >= REBUILD_MIN_SETTLE_MS) { done = true; uncertain = true; }
-          } else if (Number(job.stable_count || 0) !== 0) {
-            await dbRun('UPDATE vps_rebuild_jobs SET stable_count=0, updated_at=? WHERE id=?', [now, job.id]).catch(() => {});
-          }
-        }
-        if (done) {
-          await finishRebuildJob(job.id, 'done', uncertain ? 'terdeteksi dari host key' : null).catch(() => {});
+        const r = await evaluateRebuildJob(job);
+        if (r.done) {
+          await finishRebuildJob(job.id, 'done', r.uncertain ? 'terdeteksi dari host key' : null).catch(() => {});
           rebuildSecrets.delete(job.id);
-          await sendRebuildDoneNotif(job, uncertain);
+          await sendRebuildDoneNotif(job, r.uncertain);
           continue;
         }
-        if (ageMs >= REBUILD_JOB_DEADLINE_MS) {
+        if (r.ageMs >= REBUILD_JOB_DEADLINE_MS) {
           await finishRebuildJob(job.id, 'timeout', null).catch(() => {});
           rebuildSecrets.delete(job.id);
           await sendRebuildTimeoutNotif(job);
         }
-      } catch (_) {
+      } catch (err) {
         // VPS lagi reboot/putus saat install: wajar, job tetap running.
+        console.log(`[rebuild] poll job=${job.id} error: ${formatStartError(err)}`);
       }
     }
   } finally {
@@ -8123,15 +8140,83 @@ bot.action('m_rebuild_cancel', async (ctx) => {
   await ctx.reply('Rebuild dibatalkan.', mainMenu());
 });
 
+function rebuildRunningStatusKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Cek Status Sekarang', 'm_rebuild_check')],
+    [Markup.button.callback('Sudah Selesai, Kirim Panduan Install', 'm_rebuild_guide')],
+    [Markup.button.callback('Stop Pantau Rebuild Ini', 'm_rebuild_forget')],
+    [Markup.button.callback('Kembali', 'm_rebuild_cancel')]
+  ]);
+}
+
+function rebuildRunningStatusText(job) {
+  const ageMin = Math.max(0, Math.round((Date.now() - Number(job.started_at || 0)) / 60000));
+  return uiBox('REBUILD BERJALAN', [
+    `VPS   : ${job.vps_ip} (port ${job.ssh_port})`,
+    `OS    : ${job.os_label}`,
+    `Mulai : ${ageMin} menit lalu`,
+    '',
+    'Bot otomatis cek tiap menit dan kirim notif kalau sudah selesai.',
+    'Kalau kamu yakin VPS sudah bisa login OS baru, pakai',
+    '"Sudah Selesai" untuk langsung ambil panduan install SC.'
+  ]);
+}
+
+bot.action('m_rebuild_check', async (ctx) => {
+  await ctx.answerCbQuery('Mengecek...').catch(() => {});
+  const uid = ctx.from.id;
+  const job = await getActiveRebuildJobForUser(uid).catch(() => null);
+  if (!job) return ctx.reply('Tidak ada rebuild yang sedang berjalan.', mainMenu());
+  let r;
+  try {
+    r = await evaluateRebuildJob(job);
+  } catch (err) {
+    return ctx.reply(`Gagal cek VPS: ${formatStartError(err)}. VPS mungkin masih reboot, coba lagi sebentar lagi.`);
+  }
+  if (r.done) {
+    await finishRebuildJob(job.id, 'done', r.uncertain ? 'terdeteksi dari host key (manual)' : 'manual').catch(() => {});
+    rebuildSecrets.delete(job.id);
+    await sendRebuildDoneNotif(job, r.uncertain);
+    return;
+  }
+  const lines = [
+    `VPS ${job.vps_ip}: belum terdeteksi selesai.`,
+    '',
+    r.changed ? 'Sistem VPS terlihat sudah berubah (host key baru).' : 'VPS belum bisa dihubungi / masih seperti semula.',
+    r.loginOk ? 'Login OS baru berhasil.' : 'Login OS baru belum berhasil (mungkin masih install / beda port / belum izinkan login).',
+    '',
+    'Kalau kamu sudah bisa SSH ke VPS dengan OS baru, pakai',
+    '"Sudah Selesai, Kirim Panduan Install".'
+  ];
+  return ctx.reply(uiBox('CEK REBUILD', lines), rebuildRunningStatusKeyboard());
+});
+
+bot.action('m_rebuild_guide', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const uid = ctx.from.id;
+  const job = await getActiveRebuildJobForUser(uid).catch(() => null);
+  if (!job) return ctx.reply('Tidak ada rebuild yang sedang berjalan.', mainMenu());
+  await finishRebuildJob(job.id, 'done', 'ditandai selesai manual').catch(() => {});
+  rebuildSecrets.delete(job.id);
+  await sendRebuildDoneNotif(job, false);
+});
+
+bot.action('m_rebuild_forget', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const uid = ctx.from.id;
+  const job = await getActiveRebuildJobForUser(uid).catch(() => null);
+  if (!job) return ctx.reply('Tidak ada rebuild yang sedang berjalan.', mainMenu());
+  await finishRebuildJob(job.id, 'cancelled', 'stop pantau manual').catch(() => {});
+  rebuildSecrets.delete(job.id);
+  await ctx.reply(`Berhenti memantau rebuild VPS ${job.vps_ip}. Kamu bisa mulai rebuild baru kapan saja.`, mainMenu());
+});
+
 bot.action('m_rebuild_vps', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   const uid = ctx.from.id;
   const running = await getActiveRebuildJobForUser(uid).catch(() => null);
   if (running) {
-    return ctx.reply(
-      `Masih ada rebuild berjalan untuk VPS ${running.vps_ip} (${running.os_label}). Tunggu sampai ada notif selesai dulu.`,
-      mainMenu()
-    );
+    return ctx.reply(rebuildRunningStatusText(running), rebuildRunningStatusKeyboard());
   }
   const hosts = await listUserActiveRebuildHosts(uid);
   if (!hosts.length) {

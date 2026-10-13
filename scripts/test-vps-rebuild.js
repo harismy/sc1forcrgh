@@ -77,6 +77,12 @@ assert.throws(() => rebuild.buildReinstallCommand({ osKey: 'debian12', password:
 const ubuntuCmd = rebuild.buildReinstallCommand({ osKey: 'ubuntu2404', password: 'secret' });
 assert(ubuntuCmd.includes("'ubuntu' '24.04'"), 'ubuntu 24.04 terkutip');
 
+// --ssh-port hanya kalau bukan 22, supaya OS baru tetap di port yang sama.
+assert(!cmd.includes('--ssh-port'), 'port 22 (default) tidak perlu --ssh-port');
+assert(!rebuild.buildReinstallCommand({ osKey: 'debian12', password: 'x', sshPort: 22 }).includes('--ssh-port'), 'port 22 eksplisit tetap tanpa --ssh-port');
+const cmdPort = rebuild.buildReinstallCommand({ osKey: 'debian12', password: 'x', sshPort: 2222 });
+assert(cmdPort.includes("--ssh-port '2222'"), 'port non-22 harus dioper ke --ssh-port');
+
 // --- parseOsRelease ---
 const deb = rebuild.parseOsRelease('PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nID=debian\nVERSION_ID="12"\n');
 assert.deepStrictEqual(deb, { id: 'debian', versionId: '12' });

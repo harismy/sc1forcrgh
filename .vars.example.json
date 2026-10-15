@@ -1,12 +1,6 @@
 {
   "PAYMENT_GATEWAY_MODE": "both",
-  "PAYMENT_GATEWAY_BASE_URL": "https://api.rajaserver.web.id/orderkuota/createpayment",
-  "RAJASERVER_API_KEY": "ISI_API_KEY_ORDERKUOTA",
-  "DATA_QRIS": "ISI_STRING_QRIS_ORDERKUOTA",
-  "ORKUT_USERNAME": "ISI_USERNAME_ORKUT",
-  "ORKUT_TOKEN": "ISI_TOKEN_ORKUT",
-  "ORDERKUOTA_MIN_TOPUP": 2000,
-  "GOPAY_API_BASE_URL": "https://api-gopay.sawargipay.cloud",
-  "GOPAY_API_KEY": "ISI_API_KEY_GOPAY",
+  "GOPAY_API_BASE_URL": "https://v1-gateway.autogopay.site",
+  "GOPAY_API_KEY": "ISI_API_KEY_AUTOGOPAY",
   "GOPAY_MIN_TOPUP": 2000
 }

@@ -9,7 +9,7 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
-const { buildPayload, headers, API_URL } = require('./api-cekpayment-orkut');
+const autoGoPay = require('./lib/autogopay');
 const { parseForeignBackupBuffer } = require('./lib/foreign-backup-parser');
 const serverMigration = require('./lib/server-migration');
 const vpsRebuild = require('./lib/vps-rebuild');
@@ -480,7 +480,6 @@ async function initDb() {
   await ensureScUpdateTriggerSchema();
   await ensureUsersSchema();
   await ensurePendingDepositSchema();
-  await ensureOrderKuotaAmountLockSchema();
   await seedDefaultSettings();
   await autoMigrateLegacyInstallerPathSetting();
   for (const file of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
@@ -571,14 +570,6 @@ async function ensurePendingDepositSchema() {
       if (!/duplicate column name/i.test(String(e?.message || ''))) throw e;
     });
   }
-}
-
-async function ensureOrderKuotaAmountLockSchema() {
-  await dbRun(`CREATE TABLE IF NOT EXISTS orderkuota_amount_locks (
-    amount INTEGER PRIMARY KEY,
-    created_at INTEGER NOT NULL,
-    last_seen_at INTEGER NOT NULL
-  )`);
 }
 
 async function seedDefaultSettings() {
@@ -960,7 +951,7 @@ async function notifyAdminsTopupSuccess(row) {
   const adminIds = await getTopupSuccessNotifyAdminIds().catch(() => ADMIN_IDS);
   if (!Array.isArray(adminIds) || !adminIds.length) return;
   const userId = Number(row?.user_id || 0);
-  const provider = String(row?.gateway_provider || 'gopay').toUpperCase();
+  const provider = autoGoPay.providerLabel(row?.gateway_provider || 'gopay');
   const saldoMasuk = Number(row?.original_amount || row?.amount || 0);
   const fee = Number(row?.admin_fee || 0);
   const totalTransfer = Number(row?.amount || saldoMasuk || 0);
@@ -1437,295 +1428,51 @@ function normalizeHttpUrl(urlLike) {
   return `https://${raw.replace(/\/$/, '')}`;
 }
 
+// Payment gateway AutoGoPay (lib/autogopay.js): GoPay dan ShopeePay memakai
+// URL dan API key yang sama (GOPAY_API_BASE_URL dan GOPAY_API_KEY, nama lama
+// dipertahankan supaya .vars.json yang ada tetap terbaca). OrderKuota sudah
+// dihapus; mode lama dipetakan oleh autoGoPay.normalizeMode.
 function getPaymentConfig() {
   const vars = loadVars();
-  let mode = String(vars.PAYMENT_GATEWAY_MODE || 'gopay').trim().toLowerCase();
-  if (!['orderkuota', 'gopay', 'both'].includes(mode)) mode = 'gopay';
   return {
-    mode,
-    orderkuotaBaseUrl: normalizeHttpUrl(vars.PAYMENT_GATEWAY_BASE_URL || 'https://api.rajaserver.web.id/orderkuota/createpayment'),
-    orderkuotaApiKey: String(vars.RAJASERVER_API_KEY || '').trim(),
-    qrisString: String(vars.DATA_QRIS || '').trim(),
-    gopayBaseUrl: normalizeHttpUrl(vars.GOPAY_API_BASE_URL || 'https://api-gopay.sawargipay.cloud'),
-    gopayApiKey: String(vars.GOPAY_API_KEY || '').trim()
+    mode: autoGoPay.normalizeMode(vars.PAYMENT_GATEWAY_MODE),
+    baseUrl: autoGoPay.normalizeBaseUrl(vars.GOPAY_API_BASE_URL),
+    apiKey: String(vars.GOPAY_API_KEY || '').trim()
   };
 }
 
-function paymentGatewayModeLabel(mode) {
-  const m = String(mode || '').toLowerCase();
-  if (m === 'orderkuota') return 'OrderKuota saja';
-  if (m === 'gopay') return 'GoPay saja';
-  if (m === 'both') return 'OrderKuota + GoPay';
-  return m || '-';
-}
-
-function parseCurrencyNumber(value) {
-  if (typeof value === 'number') return Number.isFinite(value) ? Math.floor(value) : NaN;
-  const text = String(value || '').trim();
-  if (!text) return NaN;
-  const cleaned = text.replace(/[^\d.,-]/g, '');
-  if (!cleaned) return NaN;
-  const normalized = cleaned.includes(',')
-    ? cleaned.replace(/\./g, '').replace(',', '.')
-    : cleaned.replace(/\./g, '');
-  const parsed = Number(normalized);
-  return Number.isFinite(parsed) ? Math.floor(parsed) : NaN;
-}
-
-function parseOrderKuotaMutations(responseData) {
-  const mutations = [];
-  const seen = new Set();
-  const pushAmount = (amount, raw) => {
-    const parsed = parseCurrencyNumber(amount);
-    if (!Number.isFinite(parsed) || parsed <= 0) return;
-    const key = `${parsed}:${String(raw || '').slice(0, 80)}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    mutations.push({ amount: parsed, raw: String(raw || '').slice(0, 200) });
-  };
-  const scanText = (text) => {
-    const value = String(text || '');
-    if (!value) return;
-    const kreditRegex = /(?:Kredit|Credit|Masuk|Nominal|Amount|Jumlah|Total)\s*[:=]\s*(?:Rp\s*)?([\d.,]+)/gi;
-    let match;
-    while ((match = kreditRegex.exec(value)) !== null) pushAmount(match[1], match[0]);
-  };
-  const scanObject = (value) => {
-    if (Array.isArray(value)) return value.forEach(scanObject);
-    if (!value || typeof value !== 'object') return;
-    for (const [key, item] of Object.entries(value)) {
-      const lowerKey = key.toLowerCase();
-      if (/kredit|credit|amount|nominal|jumlah|total|nilai|mutasi/.test(lowerKey)) pushAmount(item, JSON.stringify(value));
-      if (item && typeof item === 'object') scanObject(item);
-      else if (typeof item === 'string' && /kredit|credit|nominal|amount|jumlah|masuk/i.test(item)) scanText(item);
-    }
-  };
-  if (typeof responseData === 'string') {
-    scanText(responseData);
-    try { scanObject(JSON.parse(responseData)); } catch (_) {}
-  } else {
-    scanObject(responseData);
-    scanText(JSON.stringify(responseData || {}));
-  }
-  return mutations;
-}
-
-async function checkOrderKuotaPaidByAmount(expectedAmount) {
-  const data = buildPayload();
-  const resultcek = await axios.post(API_URL, data, { headers, timeout: 10000 });
-  const muts = parseOrderKuotaMutations(resultcek?.data);
-  const target = Math.floor(Number(expectedAmount || 0));
-  const amounts = new Set(muts.map((m) => Math.floor(Number(m.amount || 0))).filter((n) => Number.isFinite(n) && n > 0));
-  return { paid: amounts.has(target), amounts };
-}
-
-async function syncOrderKuotaAmountLocks(currentAmountsSet) {
-  const now = Date.now();
-  const rows = await dbAll('SELECT amount FROM orderkuota_amount_locks');
-  for (const row of rows) {
-    const amt = Math.floor(Number(row?.amount || 0));
-    if (!amt) continue;
-    if (!currentAmountsSet.has(amt)) {
-      await dbRun('DELETE FROM orderkuota_amount_locks WHERE amount = ?', [amt]);
-    } else {
-      await dbRun('UPDATE orderkuota_amount_locks SET last_seen_at = ? WHERE amount = ?', [now, amt]);
-    }
-  }
-}
-
-async function lockOrderKuotaAmount(amount) {
-  const amt = Math.floor(Number(amount || 0));
-  if (!Number.isFinite(amt) || amt <= 0) return;
-  const now = Date.now();
-  await dbRun(
-    `INSERT INTO orderkuota_amount_locks (amount, created_at, last_seen_at)
-     VALUES (?, ?, ?)
-     ON CONFLICT(amount) DO UPDATE SET last_seen_at = excluded.last_seen_at`,
-    [amt, now, now]
-  );
-}
-
-async function getReservedOrderKuotaAmounts() {
-  const reserved = new Set();
-  const pendingRows = await dbAll(
-    "SELECT amount FROM pending_deposits_app3 WHERE status = 'pending' AND LOWER(COALESCE(gateway_provider,'')) = 'orderkuota'"
-  ).catch(() => []);
-  for (const row of pendingRows) {
-    const amt = Math.floor(Number(row?.amount || 0));
-    if (Number.isFinite(amt) && amt > 0) reserved.add(amt);
-  }
-  const lockRows = await dbAll('SELECT amount FROM orderkuota_amount_locks').catch(() => []);
-  for (const row of lockRows) {
-    const amt = Math.floor(Number(row?.amount || 0));
-    if (Number.isFinite(amt) && amt > 0) reserved.add(amt);
-  }
-  return reserved;
-}
-
-function getGopayConfig() {
+function paymentClient() {
   const cfg = getPaymentConfig();
-  return { baseUrl: cfg.gopayBaseUrl, apiKey: cfg.gopayApiKey };
+  return autoGoPay.createAutoGoPayClient({ baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, http: axios });
 }
 
-async function createGoPayQr(amount) {
+// Mode "both": GoPay dulu, ShopeePay kalau GoPay gagal membuat QRIS.
+async function createPaymentQrByMode(amount) {
   const cfg = getPaymentConfig();
-  const { baseUrl, apiKey } = getGopayConfig();
-  if (!(cfg.mode === 'gopay' || cfg.mode === 'both')) throw new Error('Gateway GoPay sedang nonaktif di konfigurasi admin.');
-  if (!apiKey) throw new Error('GOPAY_API_KEY belum diisi di .vars.json');
-
-  const response = await axios.post(
-    `${baseUrl}/qris/generate`,
-    { amount: Number(amount) },
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 15000
-    }
-  );
-  const body = response?.data || {};
-  if (!body.success || !body?.data?.transaction_id || !body?.data?.qr_url) {
-    throw new Error('GoPay gagal create QR: ' + JSON.stringify(body));
-  }
-  return {
-    provider: 'gopay',
-    providerTxId: String(body.data.transaction_id),
-    qrUrl: String(body.data.qr_url),
-    billedAmount: Number(amount),
-    originalAmount: Number(amount),
-    adminFee: 0
-  };
+  return paymentClient().createQrisByMode(cfg.mode, amount, (provider, err) => {
+    console.error(`[payment] ${autoGoPay.providerLabel(provider)} gagal membuat QRIS, pindah ke cadangan: ${parseErr(err)}`);
+  });
 }
 
-async function createOrderKuotaQr(amount, referenceId) {
-  const cfg = getPaymentConfig();
-  if (!(cfg.mode === 'orderkuota' || cfg.mode === 'both')) throw new Error('Gateway OrderKuota sedang nonaktif di konfigurasi admin.');
-  if (!cfg.orderkuotaApiKey) throw new Error('RAJASERVER_API_KEY belum diisi di .vars.json');
-  if (!cfg.qrisString) throw new Error('DATA_QRIS belum diisi di .vars.json');
-  const gatewayUrl = `${cfg.orderkuotaBaseUrl}?${new URLSearchParams({
-    apikey: cfg.orderkuotaApiKey,
-    amount: String(amount),
-    codeqr: cfg.qrisString,
-    reference: String(referenceId || '')
-  }).toString()}`;
-  const bayar = await axios.get(gatewayUrl, { timeout: 15000 });
-  if (String(bayar?.data?.status || '').toLowerCase() !== 'success') {
-    throw new Error('OrderKuota gagal create QR: ' + JSON.stringify(bayar?.data || {}));
+// Status QRIS dari gateway yang membuatnya. Transaksi OrderKuota lama tidak
+// bisa dicek lagi dan dibiarkan kedaluwarsa.
+async function checkDepositGatewayStatus(row) {
+  const provider = String(row?.gateway_provider || 'gopay').toLowerCase();
+  if (!autoGoPay.isProvider(provider)) {
+    throw new Error(`Gateway ${autoGoPay.providerLabel(provider)} sudah tidak dipakai. Hubungi admin dengan Ref transaksi ini.`);
   }
-  const qrUrl = String(bayar?.data?.result?.imageqris?.url || '');
-  if (!qrUrl || qrUrl.includes('undefined')) {
-    throw new Error('OrderKuota mengembalikan URL QR tidak valid.');
-  }
-  return {
-    provider: 'orderkuota',
-    providerTxId: String(bayar?.data?.result?.reference || referenceId || ''),
-    qrUrl,
-    billedAmount: Number(amount),
-    originalAmount: Number(amount),
-    adminFee: 0
-  };
-}
-
-function randomOrderKuotaFee() {
-  return Math.floor(Math.random() * 200) + 1;
-}
-
-async function createPaymentQrByMode(amount, referenceId) {
-  const cfg = getPaymentConfig();
-  if (cfg.mode === 'orderkuota') {
-    const reserved = await getReservedOrderKuotaAmounts();
-    let fee = randomOrderKuotaFee();
-    let billedAmount = Number(amount) + fee;
-    for (let i = 0; i < 300 && reserved.has(billedAmount); i++) {
-      fee = randomOrderKuotaFee();
-      billedAmount = Number(amount) + fee;
-    }
-    if (reserved.has(billedAmount)) {
-      for (let f = 1; f <= 200; f++) {
-        const candidate = Number(amount) + f;
-        if (!reserved.has(candidate)) {
-          fee = f;
-          billedAmount = candidate;
-          break;
-        }
-      }
-    }
-    if (reserved.has(billedAmount)) {
-      throw new Error('Tidak ada nominal unik OrderKuota tersedia (range fee 1-200 penuh).');
-    }
-    const out = await createOrderKuotaQr(billedAmount, referenceId);
-    return { ...out, billedAmount, originalAmount: Number(amount), adminFee: fee };
-  }
-  if (cfg.mode === 'gopay') return createGoPayQr(amount);
-  try {
-    const reserved = await getReservedOrderKuotaAmounts();
-    let fee = randomOrderKuotaFee();
-    let billedAmount = Number(amount) + fee;
-    for (let i = 0; i < 300 && reserved.has(billedAmount); i++) {
-      fee = randomOrderKuotaFee();
-      billedAmount = Number(amount) + fee;
-    }
-    if (reserved.has(billedAmount)) {
-      for (let f = 1; f <= 200; f++) {
-        const candidate = Number(amount) + f;
-        if (!reserved.has(candidate)) {
-          fee = f;
-          billedAmount = candidate;
-          break;
-        }
-      }
-    }
-    if (reserved.has(billedAmount)) {
-      throw new Error('Tidak ada nominal unik OrderKuota tersedia (range fee 1-200 penuh).');
-    }
-    const out = await createOrderKuotaQr(billedAmount, referenceId);
-    return { ...out, billedAmount, originalAmount: Number(amount), adminFee: fee };
-  } catch (_) {
-    return createGoPayQr(amount);
-  }
+  return paymentClient().checkQris(provider, row?.provider_tx_id, Number(row?.amount || 0));
 }
 
 function getGatewayMinTopup() {
-  const cfg = getPaymentConfig();
-  const vars = loadVars();
-  const okRaw = Number(vars.ORDERKUOTA_MIN_TOPUP || 0);
-  const gopayRaw = Number(vars.GOPAY_MIN_TOPUP || 0);
-  const okMin = Number.isFinite(okRaw) && okRaw >= 1000 ? Math.floor(okRaw) : 0;
-  const gopayMin = Number.isFinite(gopayRaw) && gopayRaw >= 1000 ? Math.floor(gopayRaw) : 0;
-  if (cfg.mode === 'orderkuota') return okMin;
-  if (cfg.mode === 'both') return Math.max(okMin || 0, gopayMin || 0);
-  return gopayMin;
+  const raw = Number(loadVars().GOPAY_MIN_TOPUP || 0);
+  return Number.isFinite(raw) && raw >= 1000 ? Math.floor(raw) : 0;
 }
 
 async function getEffectiveTopupMin() {
   const gatewayMin = Number(getGatewayMinTopup() || 0);
   if (gatewayMin >= 1000) return gatewayMin;
   return getTopupMin();
-}
-
-async function checkGoPayStatus(transactionId) {
-  const { baseUrl, apiKey } = getGopayConfig();
-  if (!apiKey) throw new Error('GOPAY_API_KEY belum diisi di .vars.json');
-
-  const response = await axios.post(
-    `${baseUrl}/qris/status`,
-    { transaction_id: transactionId },
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000
-    }
-  );
-  const body = response?.data || {};
-  const status = String(body?.data?.transaction_status || '').toLowerCase();
-  return {
-    status,
-    settled: status === 'settlement' || status === 'paid' || status === 'success',
-    pending: status === 'pending' || !status
-  };
 }
 
 async function ensureUser(userId) {
@@ -4098,34 +3845,21 @@ async function sendMyScPage(ctx, page = 0) {
 }
 
 function adminPaymentGatewayMainMenu() {
-  const cfg = getPaymentConfig();
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Mode: OrderKuota saja', 'm_pg_mode_orderkuota')],
     [Markup.button.callback('Mode: GoPay saja', 'm_pg_mode_gopay')],
-    [Markup.button.callback('Mode: Keduanya (fallback)', 'm_pg_mode_both')],
+    [Markup.button.callback('Mode: ShopeePay saja', 'm_pg_mode_shopee')],
+    [Markup.button.callback('Mode: GoPay, cadangan ShopeePay', 'm_pg_mode_both')],
     [Markup.button.callback('Set Masa Aktif QRIS', 'm_pg_set_qris_expire')],
-    [Markup.button.callback('Setting OrderKuota', 'm_pg_menu_orderkuota')],
-    [Markup.button.callback('Setting GoPay', 'm_pg_menu_gopay')],
+    [Markup.button.callback('Setting AutoGoPay', 'm_pg_menu_gopay')],
     [Markup.button.callback('Kembali', 'm_admin_menu')]
-  ]);
-}
-
-function adminPaymentGatewayOrderKuotaMenu() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('Set Gateway URL', 'm_pg_set_orderkuota_url')],
-    [Markup.button.callback('Set RajaServer API Key', 'm_pg_set_orderkuota_api_key')],
-    [Markup.button.callback('Set DATA_QRIS String', 'm_pg_set_orderkuota_qris')],
-    [Markup.button.callback('Set ORKUT Username', 'm_pg_set_orkut_username')],
-    [Markup.button.callback('Set ORKUT Token', 'm_pg_set_orkut_token')],
-    [Markup.button.callback('Set Minimal TopUp', 'm_pg_set_orderkuota_min_topup')],
-    [Markup.button.callback('Kembali', 'm_admin_payment_gateway_menu')]
   ]);
 }
 
 function adminPaymentGatewayGoPayMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('Set GoPay API Base URL', 'm_pg_set_gopay_base_url')],
-    [Markup.button.callback('Set GoPay API Key', 'm_pg_set_gopay_api_key')],
+    [Markup.button.callback('Set API Base URL', 'm_pg_set_gopay_base_url')],
+    [Markup.button.callback('Set API Key', 'm_pg_set_gopay_api_key')],
+    [Markup.button.callback('Tes Koneksi', 'm_pg_test_gateway')],
     [Markup.button.callback('Set Minimal TopUp', 'm_pg_set_gopay_min_topup')],
     [Markup.button.callback('Kembali', 'm_admin_payment_gateway_menu')]
   ]);
@@ -5704,19 +5438,7 @@ function parseDepositPayload(row) {
 
 // Tanya gateway apakah transaksi pending sudah dibayar. Tidak mengubah saldo.
 async function checkPendingDepositPaid(row) {
-  const provider = String(row?.gateway_provider || 'gopay').toLowerCase();
-  if (provider !== 'gopay') {
-    const check = await checkOrderKuotaPaidByAmount(Number(row?.amount || 0));
-    if (check && check.amounts instanceof Set) {
-      await syncOrderKuotaAmountLocks(check.amounts).catch(() => {});
-    }
-    if (check && check.paid === true) {
-      await lockOrderKuotaAmount(Number(row?.amount || 0)).catch(() => {});
-      return { paid: true, status: 'paid' };
-    }
-    return { paid: false, status: 'pending' };
-  }
-  const st = await checkGoPayStatus(String(row?.provider_tx_id || ''));
+  const st = await checkDepositGatewayStatus(row);
   return { paid: st.settled === true, status: st.status || 'pending' };
 }
 
@@ -5778,7 +5500,7 @@ async function settleScRenewalDeposit(row) {
 async function announceScRenewalDeposit(row, outcome, send) {
   const { payload, payerId, ownerId, host, days, paidAmount } = outcome;
   const chatId = Number(payload.chatId || payerId || 0);
-  const provider = String(row?.gateway_provider || 'gopay').toUpperCase();
+  const provider = autoGoPay.providerLabel(row?.gateway_provider || 'gopay');
   const ref = String(row?.reference_id || row?.unique_code || '-');
   const result = outcome.renewal;
   if (!result) {
@@ -5900,8 +5622,8 @@ async function pollPendingTopups() {
       const expiresAt = Number(row.expires_at || 0);
       if (expiresAt > 0 && now > expiresAt) {
         if (renewal) {
-          // Cek gateway sekali lagi sebelum hangus: bayar di detik terakhir,
-          // atau OrderKuota yang lupa ditekan "Cek Status", tetap diperpanjang.
+          // Cek gateway sekali lagi sebelum hangus: bayar di detik terakhir
+          // tetap diperpanjang.
           const check = await checkPendingDepositPaid(row).catch(() => null);
           if (check?.paid) {
             await completeScRenewalDeposit(row, scRenewalDepositSender(row)).catch((err) => {
@@ -5921,9 +5643,7 @@ async function pollPendingTopups() {
         continue;
       }
 
-      const provider = String(row.gateway_provider || 'gopay').toLowerCase();
-      if (provider !== 'gopay') continue;
-      const st = await checkGoPayStatus(String(row.provider_tx_id || '')).catch(() => null);
+      const st = await checkDepositGatewayStatus(row).catch(() => null);
       if (!st || st.pending) continue;
       if (st.settled) {
         if (renewal) {
@@ -6089,7 +5809,7 @@ bot.action(/m_admin_topup_hist_(today|yesterday|month)_(\d+)/, async (ctx) => {
     const fee = Number(r?.admin_fee || 0);
     const billed = Number(r?.amount || 0);
     const status = formatDepositStatus(r);
-    const provider = String(r?.gateway_provider || 'gopay').toUpperCase();
+    const provider = autoGoPay.providerLabel(r?.gateway_provider || 'gopay');
     const ref = String(r?.reference_id || r?.unique_code || '-');
     const at = formatDateTime(r?.created_at);
     const renewal = isScRenewalDeposit(r) ? parseDepositPayload(r) : null;
@@ -6118,113 +5838,76 @@ bot.action('m_admin_payment_gateway_menu', async (ctx) => {
   const expMinute = Math.max(1, Math.floor(Number(expMs || 0) / 60000));
   return ctx.reply(
     uiBox('SETTING PAYMENT GATEWAY', [
-      `Mode aktif: ${paymentGatewayModeLabel(cfg.mode)}`,
+      `Mode aktif: ${autoGoPay.modeLabel(cfg.mode)}`,
       `Masa Aktif QRIS: ${expMinute} menit`,
       '',
-      'Pilih mode atau masuk ke submenu provider.'
+      'GoPay dan ShopeePay lewat AutoGoPay, satu URL dan satu API key.',
+      'Mode cadangan memakai ShopeePay kalau GoPay gagal membuat QRIS.'
     ]),
     adminPaymentGatewayMainMenu()
   );
 });
 
 async function setPaymentMode(ctx, mode) {
+  if (!isAdmin(ctx.from.id)) {
+    await ctx.answerCbQuery().catch(() => {});
+    return ctx.reply('Akses ditolak. Hanya admin.');
+  }
   const m = String(mode || '').toLowerCase();
-  if (!['orderkuota', 'gopay', 'both'].includes(m)) return ctx.reply('Mode gateway tidak valid.');
+  if (!['gopay', 'shopee', 'both'].includes(m)) return ctx.reply('Mode gateway tidak valid.');
   const v = loadVars();
   v.PAYMENT_GATEWAY_MODE = m;
   saveVars(v);
   await ctx.answerCbQuery('Mode gateway tersimpan.').catch(() => {});
-  return ctx.reply(`Mode gateway aktif: ${paymentGatewayModeLabel(m)}`, adminPaymentGatewayMainMenu());
+  return ctx.reply(`Mode gateway aktif: ${autoGoPay.modeLabel(m)}`, adminPaymentGatewayMainMenu());
 }
 
-bot.action('m_pg_mode_orderkuota', async (ctx) => setPaymentMode(ctx, 'orderkuota'));
 bot.action('m_pg_mode_gopay', async (ctx) => setPaymentMode(ctx, 'gopay'));
+bot.action('m_pg_mode_shopee', async (ctx) => setPaymentMode(ctx, 'shopee'));
 bot.action('m_pg_mode_both', async (ctx) => setPaymentMode(ctx, 'both'));
-
-bot.action('m_pg_menu_orderkuota', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  const cfg = getPaymentConfig();
-  return ctx.reply(
-    uiBox('SETTING ORDERKUOTA', [
-      `Gateway URL: ${cfg.orderkuotaBaseUrl || '-'}`,
-      `API Key: ${cfg.orderkuotaApiKey ? 'Tersimpan' : 'Belum diisi'}`,
-      `DATA_QRIS: ${cfg.qrisString ? 'Tersimpan' : 'Belum diisi'}`,
-      `ORKUT Username: ${String(loadVars().ORKUT_USERNAME || '').trim() ? 'Tersimpan' : 'Belum diisi'}`,
-      `ORKUT Token: ${String(loadVars().ORKUT_TOKEN || '').trim() ? 'Tersimpan' : 'Belum diisi'}`,
-      `Minimal TopUp: Rp ${Math.max(1000, Number(loadVars().ORDERKUOTA_MIN_TOPUP || 2000) || 2000).toLocaleString('id-ID')}`
-    ]),
-    adminPaymentGatewayOrderKuotaMenu()
-  );
-});
 
 bot.action('m_pg_menu_gopay', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   const cfg = getPaymentConfig();
   return ctx.reply(
-    uiBox('SETTING GOPAY', [
-      `Base URL: ${cfg.gopayBaseUrl || '-'}`,
-      `API Key: ${cfg.gopayApiKey ? 'Tersimpan' : 'Belum diisi'}`,
-      `Minimal TopUp: Rp ${Math.max(1000, Number(loadVars().GOPAY_MIN_TOPUP || 2000) || 2000).toLocaleString('id-ID')}`
+    uiBox('SETTING AUTOGOPAY', [
+      `Base URL: ${cfg.baseUrl}`,
+      `API Key: ${cfg.apiKey ? 'Tersimpan' : 'Belum diisi'}`,
+      `Minimal TopUp: Rp ${Math.max(1000, Number(loadVars().GOPAY_MIN_TOPUP || 2000) || 2000).toLocaleString('id-ID')}`,
+      '',
+      'URL dan API key ini dipakai GoPay dan ShopeePay.'
     ]),
     adminPaymentGatewayGoPayMenu()
   );
 });
 
-bot.action('m_pg_set_orderkuota_url', async (ctx) => {
+bot.action('m_pg_test_gateway', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_url' });
-  return ctx.reply('Kirim Gateway URL OrderKuota.');
+  await ctx.reply('Mengecek koneksi AutoGoPay, tunggu...');
+  const lines = await paymentClient().testConnection().catch((err) => [`Gagal: ${parseErr(err)}`]);
+  return ctx.reply(uiBox('TES KONEKSI AUTOGOPAY', [`Base URL: ${getPaymentConfig().baseUrl}`, '', ...lines]), adminPaymentGatewayGoPayMenu());
 });
-bot.action('m_pg_set_orderkuota_api_key', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_api_key' });
-  return ctx.reply('Kirim RAJASERVER_API_KEY baru.');
-});
-bot.action('m_pg_set_orderkuota_qris', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_qris' });
-  return ctx.reply('Kirim DATA_QRIS string baru.');
-});
-bot.action('m_pg_set_orderkuota_min_topup', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  userState.set(ctx.chat.id, { step: 'pg_set_orderkuota_min_topup' });
-  return ctx.reply('Kirim minimal topup OrderKuota (angka rupiah).');
-});
-bot.action('m_pg_set_orkut_username', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  userState.set(ctx.chat.id, { step: 'pg_set_orkut_username' });
-  return ctx.reply('Kirim ORKUT_USERNAME baru.');
-});
-bot.action('m_pg_set_orkut_token', async (ctx) => {
-  await ctx.answerCbQuery().catch(() => {});
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  userState.set(ctx.chat.id, { step: 'pg_set_orkut_token' });
-  return ctx.reply('Kirim ORKUT_TOKEN baru.');
-});
+
 bot.action('m_pg_set_gopay_base_url', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_gopay_base_url' });
-  return ctx.reply('Kirim GoPay API Base URL.');
+  return ctx.reply(`Kirim API Base URL AutoGoPay (dipakai GoPay dan ShopeePay).
+Contoh: ${autoGoPay.DEFAULT_BASE_URL}`);
 });
 bot.action('m_pg_set_gopay_api_key', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_gopay_api_key' });
-  return ctx.reply('Kirim GoPay API Key baru.');
+  return ctx.reply('Kirim API key AutoGoPay baru (dipakai GoPay dan ShopeePay).');
 });
 bot.action('m_pg_set_gopay_min_topup', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'pg_set_gopay_min_topup' });
-  return ctx.reply('Kirim minimal topup GoPay (angka rupiah).');
+  return ctx.reply('Kirim minimal topup QRIS (angka rupiah).');
 });
 bot.action('m_pg_set_qris_expire', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
@@ -7235,7 +6918,7 @@ bot.action('m_extend_pay_qris', async (ctx) => {
     const now = Date.now();
     const expireMs = await getTopupExpireMs();
     const ref = `SCRENEW_APP3_${ctx.from.id}_${now}`;
-    const qr = await createPaymentQrByMode(totalFee, ref);
+    const qr = await createPaymentQrByMode(totalFee);
     const gatewayProvider = String(qr.provider || 'gopay').toLowerCase();
     const billedAmount = Number(qr.billedAmount || totalFee);
     const originalAmount = Number(qr.originalAmount || totalFee);
@@ -7275,13 +6958,11 @@ bot.action('m_extend_pay_qris', async (ctx) => {
       `Harga: Rp ${originalAmount.toLocaleString('id-ID')}`,
       adminFee > 0 ? `Fee Unik: Rp ${adminFee.toLocaleString('id-ID')}` : null,
       `Total Transfer: Rp ${billedAmount.toLocaleString('id-ID')}`,
-      `Gateway: ${gatewayProvider.toUpperCase()}`,
+      `Gateway: ${autoGoPay.providerLabel(gatewayProvider)}`,
       `Ref: ${ref}`,
       `Expired: ${Math.floor(expireMs / 60000)} menit`,
       '',
-      gatewayProvider === 'gopay'
-        ? 'SC otomatis diperpanjang begitu pembayaran terdeteksi.'
-        : 'Setelah bayar, tekan "Cek Status" supaya SC langsung diperpanjang.'
+      'SC otomatis diperpanjang begitu pembayaran terdeteksi.'
     ].filter((line) => line !== null).join('\n');
     await sendDepositQrMessage(ctx, code, qr.qrUrl, caption);
     return null;
@@ -7363,27 +7044,7 @@ bot.action(/m_check_topup_(.+)/, async (ctx) => {
     return ctx.reply('Top Up Saldo sudah kedaluwarsa.');
   }
 
-  const provider = String(row.gateway_provider || 'gopay').toLowerCase();
-  if (provider !== 'gopay') {
-    const check = await checkOrderKuotaPaidByAmount(Number(row.amount || 0)).catch((e) => ({ err: e }));
-    if (check && check.err) return ctx.reply(`Gagal cek status: ${String(check.err?.message || check.err)}`);
-    if (check && check.amounts instanceof Set) {
-      await syncOrderKuotaAmountLocks(check.amounts).catch(() => {});
-    }
-    if (check && check.paid === true) {
-      await lockOrderKuotaAmount(Number(row.amount || 0)).catch(() => {});
-      const credited = await markPendingPaid(row);
-      const saldoNow = await getSaldo(ctx.from.id).catch(() => 0);
-      if (credited) {
-        await cleanupTopupQrMessage(row).catch(() => {});
-        await notifyAdminsTopupSuccess(row).catch(() => {});
-        return ctx.reply(`Top Up Saldo berhasil. Saldo sekarang: Rp ${Number(saldoNow).toLocaleString('id-ID')}`, mainMenu());
-      }
-      return ctx.reply('Top Up Saldo sudah diproses sebelumnya.');
-    }
-    return ctx.reply('Top Up Saldo masih menunggu. Status gateway: pending');
-  }
-  const st = await checkGoPayStatus(String(row.provider_tx_id || '')).catch((e) => ({ error: e.message }));
+  const st = await checkDepositGatewayStatus(row).catch((e) => ({ error: parseErr(e) }));
   if (st?.error) return ctx.reply(`Gagal cek status: ${st.error}`);
   if (st.settled) {
     const credited = await markPendingPaid(row);
@@ -8791,98 +8452,18 @@ bot.on('text', async (ctx) => {
       return ctx.reply(`Berhasil update "${getSettingLabel(key)}" menjadi: ${value}`, adminEnvMenu());
     }
 
-    if (state.step === 'pg_set_orderkuota_url') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      const normalized = normalizeHttpUrl(text);
-      if (!normalized) return ctx.reply('URL tidak valid.');
-      const v = loadVars();
-      v.PAYMENT_GATEWAY_BASE_URL = normalized;
-      saveVars(v);
-      userState.delete(ctx.chat.id);
-      return ctx.reply(`Gateway URL OrderKuota disimpan:\n${normalized}`, adminPaymentGatewayOrderKuotaMenu());
-    }
-
-    if (state.step === 'pg_set_orderkuota_api_key') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      if (text.length < 6) return ctx.reply('API Key terlalu pendek.');
-      const v = loadVars();
-      v.RAJASERVER_API_KEY = text;
-      saveVars(v);
-      userState.delete(ctx.chat.id);
-      return ctx.reply('RAJASERVER_API_KEY berhasil disimpan.', adminPaymentGatewayOrderKuotaMenu());
-    }
-
-    if (state.step === 'pg_set_orderkuota_qris') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      if (text.length < 8) return ctx.reply('DATA_QRIS terlalu pendek.');
-      const v = loadVars();
-      v.DATA_QRIS = text;
-      saveVars(v);
-      userState.delete(ctx.chat.id);
-      return ctx.reply('DATA_QRIS berhasil disimpan.', adminPaymentGatewayOrderKuotaMenu());
-    }
-
-    if (state.step === 'pg_set_orderkuota_min_topup') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      const amount = Number(String(text).replace(/[^0-9]/g, ''));
-      if (!Number.isFinite(amount) || amount < 1000) return ctx.reply('Minimal topup harus angka, minimal 1000.');
-      const v = loadVars();
-      v.ORDERKUOTA_MIN_TOPUP = Math.floor(amount);
-      saveVars(v);
-      userState.delete(ctx.chat.id);
-      return ctx.reply(`Minimal TopUp OrderKuota disimpan: Rp ${Math.floor(amount).toLocaleString('id-ID')}`, adminPaymentGatewayOrderKuotaMenu());
-    }
-
-    if (state.step === 'pg_set_orkut_username') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      if (text.length < 3) return ctx.reply('ORKUT_USERNAME terlalu pendek.');
-      const v = loadVars();
-      v.ORKUT_USERNAME = text;
-      saveVars(v);
-      userState.delete(ctx.chat.id);
-      return ctx.reply('ORKUT_USERNAME berhasil disimpan.', adminPaymentGatewayOrderKuotaMenu());
-    }
-
-    if (state.step === 'pg_set_orkut_token') {
-      if (!isAdmin(ctx.from.id)) {
-        userState.delete(ctx.chat.id);
-        return ctx.reply('Akses ditolak. Hanya admin.');
-      }
-      if (text.length < 8) return ctx.reply('ORKUT_TOKEN terlalu pendek.');
-      const v = loadVars();
-      v.ORKUT_TOKEN = text;
-      saveVars(v);
-      userState.delete(ctx.chat.id);
-      return ctx.reply('ORKUT_TOKEN berhasil disimpan.', adminPaymentGatewayOrderKuotaMenu());
-    }
-
     if (state.step === 'pg_set_gopay_base_url') {
       if (!isAdmin(ctx.from.id)) {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      const normalized = normalizeHttpUrl(text);
-      if (!normalized) return ctx.reply('URL GoPay tidak valid.');
+      if (!normalizeHttpUrl(text)) return ctx.reply('URL AutoGoPay tidak valid.');
+      const normalized = autoGoPay.normalizeBaseUrl(text);
       const v = loadVars();
       v.GOPAY_API_BASE_URL = normalized;
       saveVars(v);
       userState.delete(ctx.chat.id);
-      return ctx.reply(`GoPay API Base URL disimpan:\n${normalized}`, adminPaymentGatewayGoPayMenu());
+      return ctx.reply(`API Base URL AutoGoPay disimpan (GoPay dan ShopeePay):\n${normalized}`, adminPaymentGatewayGoPayMenu());
     }
 
     if (state.step === 'pg_set_gopay_api_key') {
@@ -8890,12 +8471,12 @@ bot.on('text', async (ctx) => {
         userState.delete(ctx.chat.id);
         return ctx.reply('Akses ditolak. Hanya admin.');
       }
-      if (text.length < 8) return ctx.reply('GoPay API key terlalu pendek.');
+      if (text.length < 8) return ctx.reply('API key AutoGoPay terlalu pendek.');
       const v = loadVars();
       v.GOPAY_API_KEY = text;
       saveVars(v);
       userState.delete(ctx.chat.id);
-      return ctx.reply('GoPay API Key berhasil disimpan.', adminPaymentGatewayGoPayMenu());
+      return ctx.reply('API key AutoGoPay berhasil disimpan (GoPay dan ShopeePay).', adminPaymentGatewayGoPayMenu());
     }
 
     if (state.step === 'pg_set_gopay_min_topup') {
@@ -8909,7 +8490,7 @@ bot.on('text', async (ctx) => {
       v.GOPAY_MIN_TOPUP = Math.floor(amount);
       saveVars(v);
       userState.delete(ctx.chat.id);
-      return ctx.reply(`Minimal TopUp GoPay disimpan: Rp ${Math.floor(amount).toLocaleString('id-ID')}`, adminPaymentGatewayGoPayMenu());
+      return ctx.reply(`Minimal TopUp QRIS disimpan: Rp ${Math.floor(amount).toLocaleString('id-ID')}`, adminPaymentGatewayGoPayMenu());
     }
 
     if (state.step === 'pg_set_qris_expire') {
@@ -10027,7 +9608,7 @@ bot.on('text', async (ctx) => {
       const now = Date.now();
       const expires = now + topupExpireMs;
       const ref = `TOPUP_APP3_${ctx.from.id}_${now}`;
-      const qr = await createPaymentQrByMode(amount, ref);
+      const qr = await createPaymentQrByMode(amount);
       const gatewayProvider = String(qr.provider || 'gopay').toLowerCase();
       const billedAmount = Number(qr.billedAmount || amount || 0);
       const originalAmount = Number(qr.originalAmount || amount || 0);
@@ -10046,7 +9627,7 @@ bot.on('text', async (ctx) => {
         `Saldo Masuk: Rp ${originalAmount.toLocaleString('id-ID')}\n` +
         `${adminFee > 0 ? `Fee Unik: Rp ${adminFee.toLocaleString('id-ID')}\n` : ''}` +
         `Total Transfer: Rp ${billedAmount.toLocaleString('id-ID')}\n` +
-        `Gateway: ${gatewayProvider.toUpperCase()}\n` +
+        `Gateway: ${autoGoPay.providerLabel(gatewayProvider)}\n` +
         `Ref: ${ref}\n` +
         `Expired: ${Math.floor(topupExpireMs / 60000)} menit`;
 

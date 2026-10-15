@@ -30,20 +30,20 @@ const SALES = [
   'Gabung channel kami t.me/infovpngratis',
   't.me/+AbCdEf123xyz',
   'gabung yuk chat.whatsapp.com/AbCdEf123',
-  'Sewa VPS 30 hari 15k',
+  'Sewa VPS 30 hari 15k, pm',
   'jasa install sc, fast respon, wa 081234567890',
-  '\u{1d5dd}\u{1d5e8}\u{1d5d4}\u{1d5df} \u{1d5d4}\u{1d5de}\u{1d5e8}\u{1d5e1} \u{1d5e3}\u{1d5e5}\u{1d5d8}\u{1d5e0}\u{1d5dc}\u{1d5e8}\u{1d5e0} \u{1d5e0}\u{1d5e8}\u{1d5e5}\u{1d5d4}\u{1d5db}',
-  'PROMO 50% hari ini, order sekarang!',
-  'Netflix premium murah bergaransi, minat?',
-  'j u a l akun premium murah',
+  '\u{1d5dd}\u{1d5e8}\u{1d5d4}\u{1d5df} \u{1d5d4}\u{1d5de}\u{1d5e8}\u{1d5e1} \u{1d5e3}\u{1d5e5}\u{1d5d8}\u{1d5e0}\u{1d5dc}\u{1d5e8}\u{1d5e0} \u{1d5e0}\u{1d5e8}\u{1d5e5}\u{1d5d4}\u{1d5db}\nminat pm',
+  'PROMO 50% hari ini, order sekarang! wa 081234567890',
+  'Netflix premium murah bergaransi, minat? japri',
+  'j u a l akun premium murah, pm',
   'j.u.a.l akun premium, pm',
   'Situs slot online maxwin hari ini, daftar sekarang bit.ly/abc123',
   'jual akun, bayar via dana, wa 08123456789',
   'Yang cari vps murah pm aja',
   'Jual akun, yang mau beli pm',
-  'Juaaal sc premium murahhh',
+  'Juaaal sc premium murahhh, japri',
   'Harga 10k aja, wa 0812-3456-7890',
-  'Jualannya ready stock kak',
+  'Jualannya ready stock kak, langsung pm',
   'pri​ce​list vps cek bio'
 ];
 const NORMAL = [
@@ -77,6 +77,24 @@ for (const text of SALES) {
   const r = analyzeSalesText(text);
   assert(r.flagged, `harus terdeteksi jualan: ${JSON.stringify(text)} (skor ${r.score}: ${r.reasons.join(',')})`);
 }
+// Pesan pendek tanpa jalur kontak/beli tidak ditindak walau berbau jualan:
+// obrolan pendek seperti ini pernah salah kena (laporan grup, pesan pertama).
+const SHORT_NO_CONTACT = [
+  'Update juga atuh bang fitur di bot  jualan yang premium 30k perbulan itu pass order gak harus top up dlu langsung ada pembayaran menu qris nya juga',
+  'Sewa VPS 30 hari 15k',
+  'PROMO 50% hari ini, order sekarang!',
+  'Netflix premium murah bergaransi, minat?',
+  'Juaaal sc premium murahhh',
+  '𝗢𝗣𝗘𝗡 𝗥𝗘𝗦𝗘𝗟𝗟𝗘𝗥 SC harga mulai 5k',
+  'mode bot panel buat jualan akun udah bisa qris belum min? harga premium 30k/bulan kan'
+];
+for (const text of SHORT_NO_CONTACT) {
+  const r = analyzeSalesText(text);
+  assert(!r.flagged, `pesan pendek tanpa kontak tidak boleh kena: ${JSON.stringify(text)} (skor ${r.score}: ${r.reasons.join(',')})`);
+}
+// "bot jualan" adalah nama fitur, bukan kata jual.
+assert(!analyzeSalesText('fitur bot jualan premium').reasons.includes('jual'));
+assert(analyzeSalesText('saya jualan akun').reasons.includes('jual'));
 for (const text of NORMAL) {
   const r = analyzeSalesText(text);
   assert(!r.flagged, `tidak boleh terdeteksi jualan: ${JSON.stringify(text)} (skor ${r.score}: ${r.reasons.join(',')})`);
@@ -262,8 +280,9 @@ function makeEnv(opts = {}) {
     assert.strictEqual(mute[3].permissions.can_send_messages, false);
     assert.strictEqual(mute[3].until_date, Math.floor(env.now() / 1000) + 3600, 'mute harus 1 jam');
     const [warn] = env.of('sendMessage');
-    assert(warn[2].includes('Dilarang jualan dan promosi'), 'peringatan harus dikirim');
-    assert(warn[2].includes('dimute 1 jam'));
+    assert(warn[2].includes('dimute 1 jam karena melanggar aturan grup: dilarang jualan dan promosi.'), 'peringatan harus dikirim');
+    assert(!/terdeteksi|harga|jual,/i.test(warn[2].replace('dilarang jualan', '')), 'peringatan tidak boleh merinci alasan deteksi');
+    assert(env.logs.some((l) => l.includes('alasan=') && l.includes('jual')), 'alasan rinci tetap tercatat di log');
     assert(warn[2].includes(`tg://user?id=${MEMBER.id}`), 'peringatan harus menyebut pengirim');
     assert(warn[2].includes('Budi &lt;b&gt;'), 'nama pengirim harus di-escape');
     assert.strictEqual(warn[3].parse_mode, 'HTML');
@@ -334,6 +353,20 @@ function makeEnv(opts = {}) {
     env.reset();
     await env.say({ id: 31, first_name: 'Lain' }, SALE_TEXT);
     assert(!env.of('sendMessage')[0][2].includes('Blokir Pengguna'), 'catatan izin tidak boleh diulang tiap pesan');
+    assert(env.of('sendMessage')[0][2].includes('dihapus karena melanggar aturan grup'));
+  }
+
+  // Bot tanpa izin hapus maupun mute: tidak boleh menuduh siapa pun di grup,
+  // hanya mengingatkan izin sekali, lalu diam.
+  {
+    const env = makeEnv({ fail: { restrict: true, delete: true } });
+    await env.say(MEMBER, SALE_TEXT);
+    const [notice] = env.of('sendMessage');
+    assert(notice[2].includes('Hapus Pesan dan Blokir Pengguna'), 'harus mengingatkan izin');
+    assert(!notice[2].includes('tg://user'), 'tanpa tindakan tidak boleh menyebut pengirim');
+    env.reset();
+    await env.say({ id: 31, first_name: 'Lain' }, SALE_TEXT);
+    assert.strictEqual(env.of('sendMessage').length, 0, 'tanpa izin, bot diam setelah pengingat pertama');
   }
 
   // Perintah di grup hanya untuk admin: anggota biasa didiamkan tanpa balasan.

@@ -6,7 +6,10 @@
 // - Penindakan: hapus pesan, mute sesuai durasi, satu peringatan per masa
 //   mute, admin grup/admin bot/admin anonim tidak pernah ditindak, daftar admin
 //   yang tidak terbaca berarti tidak menindak.
-// - /antijualan on|off hanya untuk admin grup; tombol Buka Mute hanya admin.
+// - Perintah di grup hanya untuk admin (anggota biasa didiamkan); tombol
+//   Buka Mute hanya admin.
+// - Promosi jualan VPN (fixture contoh nyata dengan kontak disamarkan dan
+//   variasi buatan) tertangkap, obrolan bantuan grup VPN dan detail akun tidak.
 // - app3.js: middleware grup terdaftar sebelum handler lain dan tidak
 //   meneruskan update grup ke menu jualan.
 
@@ -80,6 +83,82 @@ for (const text of NORMAL) {
 }
 assert.strictEqual(analyzeSalesText('').flagged, false);
 
+// --- Promosi jualan VPN ------------------------------------------------------
+// Contoh nyata dari grup (kontak, username, dan link sudah disamarkan). Gaya
+// iklan selalu berganti, jadi deteksi diuji juga dengan variasi buatan dan
+// obrolan bantuan khas grup VPN yang memakai kosakata yang sama.
+const VPN_PROMOS = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts', 'fixtures', 'anti-sales-vpn-promos.json'), 'utf8'));
+const VPN_SALES = [
+  'OPEN RESELLER VPN\nSSH / VMESS / VLESS 10K/bulan\nminat chat @contoh_store',
+  'Jual akun zivpn udp custom 30 hari 8rb, order via bot @contoh_bot',
+  'VPS SG DO R2C1 50rb/bulan ready, pm aja',
+  '\u{1f525} PROMO SC TUNNELING \u{1f525}\nsewa script 10k/bulan, auto install, garansi\nOrder: t.me/contohstore',
+  'Akun vless premium murah server ID/SG, trial gratis, cek bio',
+  'Yang mau vpn murah 5rb sebulan langsung ke @contohvpnbot ya',
+  'Kuota xl edukasi 15gb 7hari 10rb ready, wa 0812 3456 7890',
+  'ᴊᴜᴀʟ ᴠᴘɴ ᴘʀᴇᴍɪᴜᴍ ᴍᴜʀᴀʜ\nᴏʀᴅᴇʀ : @contoh_admin',
+  'Numpang promo ya min, config HC xl opok 15rb/bulan, japri',
+  'VPN SSH/VMESS/VLESS/TROJAN\n7 hari 3k\n15 hari 6k\n30 hari 10k\n60 hari 18k\nbot: @contohvpn_bot',
+  'Big sale akhir bulan! top up saldo dapat bonus 30%, cuma di @contohsaldo_bot',
+  'Sedia VPS biznet R1C1 bandwidth unli, harga bersahabat. Admin: @contoh_vps',
+  'Bot auto order vpn 24 jam, bayar QRIS langsung jadi: t.me/contohautobot',
+  'Mau internetan lancar? pakai VPN premium kami, cuma 5rb sebulan, langsung order di @contoh_bot',
+  'NEW SERVER SG READY\nVmess/Vless/Trojan 30 hari 10K\nGaransi full 30 hari\nOwner : @contoh_owner',
+  'Ready akun netflix, canva, youtube premium. Harga mulai 5rb. Chat wa.me/6281200000009',
+  'Jasa install SC tunneling + domain, fast respon, cek t.me/contohjasa',
+  'Info server baru ya guys, langsung meluncur ke bot kita @contohnew_bot harga cuma 7rb/30 hari',
+  'Testimoni pelanggan ada di whatsapp.com/channel/ContohKodeChannel09'
+];
+const VPN_CHAT = [
+  'min ssh sg4 ga konek, payload GET / HTTP/1.1[crlf]Host: bug.com[crlf]Upgrade: websocket[crlf][crlf]',
+  'harga sc 1forcr berapa min sebulan?',
+  'bot @contohvpn_bot lagi error ya min?',
+  'saya beli vless 30 hari 10rb di bot, kok sudah expired?',
+  'udah top up 25rb tapi saldo belum masuk, wa saya 08123456789',
+  'server SG leaseweb sama ID biznet lebih stabil mana?',
+  'config HC xl edukasi ada yang punya? bagi dong',
+  'Admin: @admin_sc tolong cek akun saya',
+  'VPS DO 6$/bulan, vultr 5$, mending mana buat tunneling?',
+  'udp custom 1-65535@user:pass ga konek min',
+  'makasih min, vmess udah jalan lagi',
+  'status server: sg4 normal, id2 maintenance sampai jam 3',
+  'renew vps biznet 75rb kemarin, sekarang install ulang sc',
+  'reseller saya kok ga bisa tambah saldo?',
+  'list server yang ready apa aja min?',
+  'promo bulan ini ada ga min?',
+  'udah ready vps nya min, tinggal install sc',
+  'pakai zivpn sama udp custom bedanya apa? ssh vmess vless juga bisa?',
+  'tadi bayar 10.000 terus 20.000 lagi buat perpanjang, kok saldo cuma 10.000?',
+  'kalau mau perpanjang sc 30 hari bayar lewat bot kan min?',
+  'izin min mau tanya, cara ganti domain gimana?',
+  'mulai besok server sg4 dipindah ke vps baru',
+  'vpn premium saya error terus dari pagi',
+  'harga reseller berapa min?',
+  'tolong cek @contoh_member akun dia kena lock',
+  'xl edukasi 15gb masih bisa dipakai buat inject?',
+  'kenapa vless grpc lemot ya? vmess ws lancar'
+];
+VPN_PROMOS.forEach((text, i) => {
+  const r = analyzeSalesText(text);
+  assert(r.flagged, `contoh promosi VPN #${i + 1} harus tertangkap (skor ${r.score}: ${r.reasons.join(',')})`);
+});
+for (const text of VPN_SALES) {
+  const r = analyzeSalesText(text);
+  assert(r.flagged, `promosi VPN harus tertangkap: ${JSON.stringify(text)} (skor ${r.score}: ${r.reasons.join(',')})`);
+}
+for (const text of VPN_CHAT) {
+  const r = analyzeSalesText(text);
+  assert(!r.flagged, `obrolan grup VPN tidak boleh kena: ${JSON.stringify(text)} (skor ${r.score}: ${r.reasons.join(',')})`);
+}
+// Detail akun yang sering ditempel member saat minta bantuan.
+const accountMessages = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts', 'fixtures', 'account-message-parity.json'), 'utf8'));
+for (const c of accountMessages.cases) {
+  const r = analyzeSalesText(c.expected);
+  assert(!r.flagged, `detail akun tidak boleh kena (skor ${r.score}: ${r.reasons.join(',')})`);
+}
+// Huruf kapital kecil dan huruf Kiril yang mirip Latin terbaca.
+assert.strictEqual(antiSales.normalizeText('ᴘʀᴏᴍᴏ јуаl'), 'promo jyal');
+
 // Link tersembunyi di balik teks, caption, dan tombol ikut diperiksa.
 const hidden = collectMessageText({
   text: 'cek ini kak',
@@ -110,11 +189,12 @@ function makeEnv(opts = {}) {
   const store = new Map();
   let clock = 1_700_000_000_000;
   const fail = opts.fail || {};
+  const adminIds = [ADMIN.id];
   const telegram = {
     getChatAdministrators: async (chatId) => {
       calls.push(['getChatAdministrators', chatId]);
       if (fail.admins) throw new Error('timeout');
-      return [{ user: { id: ADMIN.id }, status: 'creator' }];
+      return adminIds.map((id, i) => ({ user: { id }, status: i === 0 ? 'creator' : 'administrator' }));
     },
     deleteMessage: async (chatId, messageId) => {
       calls.push(['deleteMessage', chatId, messageId]);
@@ -163,7 +243,7 @@ function makeEnv(opts = {}) {
   }));
   const of = (name) => calls.filter((c) => c[0] === name);
   return {
-    calls, logs, store, guard, telegram, ctxFor, say, of,
+    calls, logs, store, guard, telegram, ctxFor, say, of, adminIds,
     advance: (ms) => { clock += ms; },
     now: () => clock,
     reset: () => { calls.length = 0; }
@@ -256,15 +336,36 @@ function makeEnv(opts = {}) {
     assert(!env.of('sendMessage')[0][2].includes('Blokir Pengguna'), 'catatan izin tidak boleh diulang tiap pesan');
   }
 
-  // /antijualan: status untuk siapa saja, on/off hanya admin grup.
+  // Perintah di grup hanya untuk admin: anggota biasa didiamkan tanpa balasan.
   {
     const env = makeEnv();
-    await env.say(MEMBER, '/antijualan');
-    assert(env.of('sendMessage')[0][2].includes('Status: AKTIF'));
+    for (const cmd of ['/antijualan', '/antijualan off', '/antijualan@TestBot on', '/start', '/menu', '/admin']) {
+      await env.say(MEMBER, cmd);
+    }
+    assert.strictEqual(env.of('sendMessage').length, 0, 'perintah anggota biasa tidak boleh dibalas');
+    assert.strictEqual(env.store.size, 0, 'anggota biasa tidak boleh mengubah anti jualan');
+    assert.strictEqual(env.of('getChatAdministrators').length, 1, 'spam perintah anggota tidak boleh memanggil API terus');
+
+    // Perintah yang ternyata promosi tetap ditindak.
+    await env.say(MEMBER, '/jual akun vpn murah 10k, wa 081234567890');
+    assert.strictEqual(env.of('restrictChatMember').length, 1, 'promosi berbentuk perintah tetap ditindak');
+
+    // Admin baru dikenali tanpa menunggu cache 10 menit habis.
+    const NEW_ADMIN = { id: 40, first_name: 'Admin Baru' };
+    env.adminIds.push(NEW_ADMIN.id);
     env.reset();
-    await env.say(MEMBER, '/antijualan off');
-    assert(env.of('sendMessage')[0][2].includes('Hanya admin grup'));
-    assert.strictEqual(env.store.size, 0, 'anggota biasa tidak boleh mematikan');
+    await env.say(NEW_ADMIN, '/antijualan');
+    assert.strictEqual(env.of('sendMessage').length, 0, 'jawaban cache masih dipakai di menit pertama');
+    env.advance(61 * 1000);
+    await env.say(NEW_ADMIN, '/antijualan');
+    assert(env.of('sendMessage')[0][2].includes('Status: AKTIF'), 'admin baru dikenali setelah cek ulang');
+  }
+
+  // /antijualan: status dan on/off untuk admin grup.
+  {
+    const env = makeEnv();
+    await env.say(ADMIN, '/antijualan');
+    assert(env.of('sendMessage')[0][2].includes('Status: AKTIF'));
     env.reset();
     await env.say(ADMIN, '/antijualan@TestBot off');
     assert.strictEqual(env.store.get(String(GROUP.id)), false);
@@ -302,11 +403,11 @@ function makeEnv(opts = {}) {
     assert.strictEqual(env.of('restrictChatMember').length, 1);
   }
 
-  // Menu jualan di grup diarahkan ke chat pribadi (dibatasi per menit).
+  // Menu jualan di grup diarahkan ke chat pribadi (khusus admin, dibatasi per menit).
   {
     const env = makeEnv();
-    await env.say(MEMBER, '/start');
-    await env.say(MEMBER, '/menu');
+    await env.say(ADMIN, '/start');
+    await env.say(OWNER, '/menu');
     const sent = env.of('sendMessage');
     assert.strictEqual(sent.length, 1, 'pemberitahuan chat pribadi dibatasi');
     assert(sent[0][2].includes('chat pribadi'));

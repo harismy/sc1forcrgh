@@ -55,7 +55,7 @@ set -euo pipefail
 #   UDPCUSTOM_BIN_URL=https://raw.github.com/http-custom/udp-custom/main/bin/udp-custom-linux-amd64
 #   UDPCUSTOM_SERVICE_NAME=sc-1forcr-udpcustom
 #   UDPCUSTOM_LISTEN_PORT=5667
-#   UDPCUSTOM_DNAT_RANGE=                        (opsional, default kosong = tanpa DNAT range untuk performa)
+#   UDPCUSTOM_DNAT_RANGE=                        (legacy, tidak dipakai; port range UDP Custom selalu 1:65535)
 #   UDPCUSTOM_DNAT_AUTO_RANGE=                  (opsional legacy, default kosong/tidak dipakai)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   SSHWS_UDPGW_PORTS=7300,7200                (opsional, port TCP badvpn-udpgw untuk SSH/SSHWS)
@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.102}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.103}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -4903,30 +4903,37 @@ fw_delete_udp_dnat_range() {
   esac
 }
 
-fw_delete_udp_dnat_to_port_all() {
-  local to_port="$1" fw handle
-  [[ -z "${to_port}" ]] && return 0
-  fw="$(fw_backend_kind)"
-  case "${fw}" in
-    iptables)
-      while IFS= read -r handle; do
-        [[ -z "${handle}" ]] && continue
-        iptables -w 10 -t nat -D PREROUTING "${handle}" >/dev/null 2>&1 || true
-      done < <(
-        iptables -w 10 -t nat -L PREROUTING --line-numbers -n 2>/dev/null | \
-          awk -v p="${to_port}" '$0 ~ /DNAT/ && $0 ~ ("to::" p "($|[^0-9])") {print $1}' | sort -rn
-      )
-      ;;
-    nft)
-      while IFS= read -r handle; do
-        [[ -z "${handle}" ]] && continue
-        nft delete rule ip nat prerouting handle "${handle}" >/dev/null 2>&1 || true
-      done < <(
-        nft -a list chain ip nat prerouting 2>/dev/null | \
-          awk -v p="${to_port}" '$0 ~ ("dnat to :" p "($|[^0-9])") {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
-      )
-      ;;
-  esac
+# Klien UDP Custom (HTTP Custom, host:1-65535@user:pass) mengirim ke port acak
+# di rentang itu, jadi semua port UDP harus dialihkan ke port listen. Binary
+# udp-custom memasang DNAT 1:65535 sendiri saat start, tapi rule itu hilang
+# kalau dihapus pihak lain sampai binary restart, dan interface-nya ditebak
+# dari `ip route get` (bisa salah di VPS tertentu). Rule ini milik SC: ditandai
+# comment, hanya untuk paket ke alamat VPS sendiri (trafik docker/forward tidak
+# ikut berbelok), dan ditambah di akhir PREROUTING supaya DNAT lain didahulukan.
+# Jangan hapus DNAT lain yang menuju port UDP Custom: rule binary ikut terhapus.
+# Binary tidak membuang rule-nya saat mati, jadi `del` (backend ZIVPN) membuang
+# rule SC dan rule sisa binary; DNAT range milik ZIVPN tidak pernah disentuh.
+# Tanpa iptables dilewati (binary udp-custom juga butuh iptables).
+udpcustom_port_range_rule() {
+  local action="${1:-}" port="${2:-}" line
+  local binary_rule='^-A PREROUTING -i [^ ]+ -p udp -m udp --dport 1:65535 -j DNAT --to-destination [0-9.]*:[0-9]+$'
+  local -a rule
+  command -v iptables >/dev/null 2>&1 || return 0
+  [[ "${action}" == "add" && "${port}" =~ ^[0-9]+$ ]] || port=""
+  while IFS= read -r line; do
+    line="${line//\"/}"
+    if [[ "${line} " == *" sc-udpcustom-range "* ]]; then
+      [[ -n "${port}" && "${line} " == *" --to-destination :${port} "* ]] && continue
+    elif [[ "${action}" != "del" || ! "${line}" =~ ${binary_rule} ]]; then
+      continue
+    fi
+    # shellcheck disable=SC2086
+    iptables -w 10 -t nat -D ${line#-A } >/dev/null 2>&1 || true
+  done < <(iptables -w 10 -t nat -S PREROUTING 2>/dev/null | grep -F -e 'sc-udpcustom-range' -e '--dport 1:65535 -j DNAT' || true)
+  [[ -n "${port}" ]] || return 0
+  rule=(-p udp -m udp --dport 1:65535 -m addrtype --dst-type LOCAL -m comment --comment sc-udpcustom-range -j DNAT --to-destination ":${port}")
+  iptables -w 10 -t nat -C PREROUTING "${rule[@]}" >/dev/null 2>&1 || \
+    iptables -w 10 -t nat -A PREROUTING "${rule[@]}" >/dev/null 2>&1 || true
 }
 
 setup_zivpn_extra_udp_ports() {
@@ -5184,16 +5191,17 @@ setup_udpcustom_udp_nat_rules() {
     listen_port="5667"
   fi
 
-  log "Set rule UDP UDPHC: listen=${listen_port}, dnat_range=disabled"
+  log "Set rule UDP UDPHC: listen=${listen_port}, port range=1:65535"
 
   fw_allow_udp_input "${listen_port}"
 
-  # UDPHC default: tanpa DNAT range. Bersihkan semua DNAT legacy yang menuju port UDPHC.
+  # DNAT milik ZIVPN dibersihkan. DNAT lain ke port ini dibiarkan, karena binary
+  # udp-custom memasang DNAT 1:65535 miliknya sendiri ke port yang sama.
   if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
-    fw_delete_udp_dnat_to_port_all "${listen_port}"
     fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${listen_port}"
     cleanup_zivpn_extra_udp_ports_to_port "${listen_port}"
-    log "DNAT legacy ke port ${listen_port} dibersihkan (backend UDPHC aktif)."
+    udpcustom_port_range_rule add "${listen_port}"
+    log "Port UDP 1:65535 dialihkan ke port ${listen_port} (backend UDPHC aktif)."
   fi
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
@@ -5314,6 +5322,7 @@ enforce_single_udp_backend() {
         systemctl restart "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
       fi
       setup_zivpn_udp_nat_rules
+      udpcustom_port_range_rule del
       log "Backend UDP aktif: ZIVPN (${ZIVPN_SERVICE_NAME})"
       ;;
   esac
@@ -16689,29 +16698,37 @@ fw_delete_udp_dnat_range() {
   esac
 }
 
-fw_delete_udp_dnat_to_port_all() {
-  local to_port="$1" handle
-  [[ -z "${to_port}" ]] && return 0
-  case "$(fw_backend_kind)" in
-    iptables)
-      while IFS= read -r handle; do
-        [[ -z "${handle}" ]] && continue
-        iptables -w 10 -t nat -D PREROUTING "${handle}" >/dev/null 2>&1 || true
-      done < <(
-        iptables -w 10 -t nat -L PREROUTING --line-numbers -n 2>/dev/null | \
-          awk -v p="${to_port}" '$0 ~ /DNAT/ && $0 ~ ("to::" p "($|[^0-9])") {print $1}' | sort -rn
-      )
-      ;;
-    nft)
-      while IFS= read -r handle; do
-        [[ -z "${handle}" ]] && continue
-        nft delete rule ip nat prerouting handle "${handle}" >/dev/null 2>&1 || true
-      done < <(
-        nft -a list chain ip nat prerouting 2>/dev/null | \
-          awk -v p="${to_port}" '$0 ~ ("dnat to :" p "($|[^0-9])") {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
-      )
-      ;;
-  esac
+# Klien UDP Custom (HTTP Custom, host:1-65535@user:pass) mengirim ke port acak
+# di rentang itu, jadi semua port UDP harus dialihkan ke port listen. Binary
+# udp-custom memasang DNAT 1:65535 sendiri saat start, tapi rule itu hilang
+# kalau dihapus pihak lain sampai binary restart, dan interface-nya ditebak
+# dari `ip route get` (bisa salah di VPS tertentu). Rule ini milik SC: ditandai
+# comment, hanya untuk paket ke alamat VPS sendiri (trafik docker/forward tidak
+# ikut berbelok), dan ditambah di akhir PREROUTING supaya DNAT lain didahulukan.
+# Jangan hapus DNAT lain yang menuju port UDP Custom: rule binary ikut terhapus.
+# Binary tidak membuang rule-nya saat mati, jadi `del` (backend ZIVPN) membuang
+# rule SC dan rule sisa binary; DNAT range milik ZIVPN tidak pernah disentuh.
+# Tanpa iptables dilewati (binary udp-custom juga butuh iptables).
+udpcustom_port_range_rule() {
+  local action="${1:-}" port="${2:-}" line
+  local binary_rule='^-A PREROUTING -i [^ ]+ -p udp -m udp --dport 1:65535 -j DNAT --to-destination [0-9.]*:[0-9]+$'
+  local -a rule
+  command -v iptables >/dev/null 2>&1 || return 0
+  [[ "${action}" == "add" && "${port}" =~ ^[0-9]+$ ]] || port=""
+  while IFS= read -r line; do
+    line="${line//\"/}"
+    if [[ "${line} " == *" sc-udpcustom-range "* ]]; then
+      [[ -n "${port}" && "${line} " == *" --to-destination :${port} "* ]] && continue
+    elif [[ "${action}" != "del" || ! "${line}" =~ ${binary_rule} ]]; then
+      continue
+    fi
+    # shellcheck disable=SC2086
+    iptables -w 10 -t nat -D ${line#-A } >/dev/null 2>&1 || true
+  done < <(iptables -w 10 -t nat -S PREROUTING 2>/dev/null | grep -F -e 'sc-udpcustom-range' -e '--dport 1:65535 -j DNAT' || true)
+  [[ -n "${port}" ]] || return 0
+  rule=(-p udp -m udp --dport 1:65535 -m addrtype --dst-type LOCAL -m comment --comment sc-udpcustom-range -j DNAT --to-destination ":${port}")
+  iptables -w 10 -t nat -C PREROUTING "${rule[@]}" >/dev/null 2>&1 || \
+    iptables -w 10 -t nat -A PREROUTING "${rule[@]}" >/dev/null 2>&1 || true
 }
 
 setup_zivpn_extra_udp_ports() {
@@ -16794,9 +16811,9 @@ case "${ACTIVE_UDP_BACKEND}" in
     systemctl enable "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
     systemctl restart "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
     fw_allow_udp_input "${udphc_port}"
-    fw_delete_udp_dnat_to_port_all "${udphc_port}"
     fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${udphc_port}"
     cleanup_zivpn_extra_udp_ports_to_port "${udphc_port}"
+    udpcustom_port_range_rule add "${udphc_port}"
     ;;
   *)
     stop_disable_udp_unit "${UDPCUSTOM_SERVICE}" "udp-custom" || exit 1
@@ -16805,6 +16822,7 @@ case "${ACTIVE_UDP_BACKEND}" in
     fw_allow_udp_input "${zivpn_port}"
     fw_add_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${zivpn_port}"
     setup_zivpn_extra_udp_ports "${zivpn_port}"
+    udpcustom_port_range_rule del
     ;;
 esac
 
@@ -30537,27 +30555,37 @@ cleanup_zivpn_dnat_for_udphc() {
   done
 }
 
-cleanup_udphc_dnat_for_port() {
-  local udphc_port handle
-  udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
-  [[ -z "${udphc_port}" ]] && udphc_port="5667"
-  if command -v iptables >/dev/null 2>&1; then
-    while IFS= read -r handle; do
-      [[ -z "${handle}" ]] && continue
-      iptables -w 10 -t nat -D PREROUTING "${handle}" >/dev/null 2>&1 || true
-    done < <(
-      iptables -w 10 -t nat -L PREROUTING --line-numbers -n 2>/dev/null | \
-        awk -v p="${udphc_port}" '$0 ~ /DNAT/ && $0 ~ ("to::" p "($|[^0-9])") {print $1}' | sort -rn
-    )
-  elif command -v nft >/dev/null 2>&1; then
-    while IFS= read -r handle; do
-      [[ -z "${handle}" ]] && continue
-      nft delete rule ip nat prerouting handle "${handle}" >/dev/null 2>&1 || true
-    done < <(
-      nft -a list chain ip nat prerouting 2>/dev/null | \
-        awk -v p="${udphc_port}" '$0 ~ ("dnat to :" p "($|[^0-9])") {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
-    )
-  fi
+# Klien UDP Custom (HTTP Custom, host:1-65535@user:pass) mengirim ke port acak
+# di rentang itu, jadi semua port UDP harus dialihkan ke port listen. Binary
+# udp-custom memasang DNAT 1:65535 sendiri saat start, tapi rule itu hilang
+# kalau dihapus pihak lain sampai binary restart, dan interface-nya ditebak
+# dari `ip route get` (bisa salah di VPS tertentu). Rule ini milik SC: ditandai
+# comment, hanya untuk paket ke alamat VPS sendiri (trafik docker/forward tidak
+# ikut berbelok), dan ditambah di akhir PREROUTING supaya DNAT lain didahulukan.
+# Jangan hapus DNAT lain yang menuju port UDP Custom: rule binary ikut terhapus.
+# Binary tidak membuang rule-nya saat mati, jadi `del` (backend ZIVPN) membuang
+# rule SC dan rule sisa binary; DNAT range milik ZIVPN tidak pernah disentuh.
+# Tanpa iptables dilewati (binary udp-custom juga butuh iptables).
+udpcustom_port_range_rule() {
+  local action="${1:-}" port="${2:-}" line
+  local binary_rule='^-A PREROUTING -i [^ ]+ -p udp -m udp --dport 1:65535 -j DNAT --to-destination [0-9.]*:[0-9]+$'
+  local -a rule
+  command -v iptables >/dev/null 2>&1 || return 0
+  [[ "${action}" == "add" && "${port}" =~ ^[0-9]+$ ]] || port=""
+  while IFS= read -r line; do
+    line="${line//\"/}"
+    if [[ "${line} " == *" sc-udpcustom-range "* ]]; then
+      [[ -n "${port}" && "${line} " == *" --to-destination :${port} "* ]] && continue
+    elif [[ "${action}" != "del" || ! "${line}" =~ ${binary_rule} ]]; then
+      continue
+    fi
+    # shellcheck disable=SC2086
+    iptables -w 10 -t nat -D ${line#-A } >/dev/null 2>&1 || true
+  done < <(iptables -w 10 -t nat -S PREROUTING 2>/dev/null | grep -F -e 'sc-udpcustom-range' -e '--dport 1:65535 -j DNAT' || true)
+  [[ -n "${port}" ]] || return 0
+  rule=(-p udp -m udp --dport 1:65535 -m addrtype --dst-type LOCAL -m comment --comment sc-udpcustom-range -j DNAT --to-destination ":${port}")
+  iptables -w 10 -t nat -C PREROUTING "${rule[@]}" >/dev/null 2>&1 || \
+    iptables -w 10 -t nat -A PREROUTING "${rule[@]}" >/dev/null 2>&1 || true
 }
 
 ensure_zivpn_dnat_for_zivpn() {
@@ -30661,6 +30689,7 @@ switch_udp_to_zivpn() {
   update_sc_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
   update_app_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
   ensure_zivpn_dnat_for_zivpn
+  udpcustom_port_range_rule del
   echo "Mode UDP aktif: ZIVPN (UDPHC dimatikan)."
 }
 
@@ -30673,7 +30702,6 @@ switch_udp_to_udpcustom() {
   systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
   systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
   cleanup_zivpn_dnat_for_udphc
-  # UDPHC mode default: tanpa DNAT range.
   if command -v iptables >/dev/null 2>&1; then
     iptables -w 10 -C INPUT -p udp --dport "${udphc_port}" -j ACCEPT >/dev/null 2>&1 || \
       iptables -w 10 -I INPUT -p udp --dport "${udphc_port}" -j ACCEPT
@@ -30686,7 +30714,7 @@ switch_udp_to_udpcustom() {
         nft add rule ip filter input udp dport "${udphc_port}" accept
     fi
   fi
-  cleanup_udphc_dnat_for_port
+  udpcustom_port_range_rule add "${udphc_port}"
   ACTIVE_UDP_BACKEND="udpcustom"
   update_sc_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
   update_app_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"

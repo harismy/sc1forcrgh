@@ -13,6 +13,7 @@ const { buildPayload, headers, API_URL } = require('./api-cekpayment-orkut');
 const { parseForeignBackupBuffer } = require('./lib/foreign-backup-parser');
 const serverMigration = require('./lib/server-migration');
 const vpsRebuild = require('./lib/vps-rebuild');
+const antiSales = require('./lib/anti-sales');
 
 const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
 if (!BOT_TOKEN) {
@@ -459,6 +460,14 @@ async function initDb() {
     started_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     finished_at INTEGER
+  )`);
+  // Anti jualan di grup: baris hanya ada kalau admin grup pernah memakai
+  // /antijualan on|off. Grup tanpa baris memakai default (aktif).
+  await dbRun(`CREATE TABLE IF NOT EXISTS anti_sales_groups (
+    chat_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    title TEXT,
+    updated_at INTEGER NOT NULL
   )`);
   await dbRun('CREATE INDEX IF NOT EXISTS idx_vps_rebuild_status ON vps_rebuild_jobs(status)').catch(() => {});
   // Job yang ketinggalan (mis. bot mati lama) ditutup supaya tidak dipoll selamanya.
@@ -5939,6 +5948,34 @@ async function pollPendingTopups() {
     // ignore polling errors
   }
 }
+
+// Grup hanya dilayani anti jualan (lib/anti-sales.js). Menu jualan dan alur
+// input (userState per chat.id) khusus chat pribadi: di grup, teks anggota lain
+// bisa terbaca sebagai input alur orang lain. Middleware ini wajib terdaftar
+// sebelum handler lain supaya update grup tidak pernah sampai ke menu.
+const antiSalesGuard = antiSales.createAntiSalesGuard({
+  isOwner: (userId) => isAdmin(userId),
+  loadEnabled: async (chatId) => {
+    const row = await dbGet('SELECT enabled FROM anti_sales_groups WHERE chat_id = ?', [chatId]);
+    return row ? Number(row.enabled) === 1 : null;
+  },
+  saveEnabled: (chatId, enabled, title) => dbRun(
+    `INSERT INTO anti_sales_groups (chat_id, enabled, title, updated_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled, title=excluded.title, updated_at=excluded.updated_at`,
+    [chatId, enabled ? 1 : 0, title, Date.now()]
+  ),
+  buildKeyboard: (rows) => Markup.inlineKeyboard(rows),
+  muteMinutes: Number(process.env.ANTI_SALES_MUTE_MINUTES || 60)
+});
+
+bot.use(async (ctx, next) => {
+  if (!antiSales.isGroupChat(ctx.chat)) return next();
+  try {
+    await antiSalesGuard.handleUpdate(ctx);
+  } catch (err) {
+    console.error(`[anti-jualan] gagal: ${parseErr(err)}`);
+  }
+});
 
 bot.start(async (ctx) => {
   userState.delete(ctx.chat.id);

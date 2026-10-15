@@ -4,7 +4,7 @@
   "private": true,
   "main": "app3.js",
   "scripts": {
-    "test": "npm run test:license && npm run test:xray-iplimit && npm run test:iplimit-devices && npm run test:xray-hot-add && npm run test:resource-guards && npm run test:xray-monitor && npm run test:online-notify && npm run test:menu-ui && npm run test:sc-renewal-payment && npm run test:dns-guard && npm run test:foreign-backup && npm run test:server-migration && npm run test:button-style && npm run test:telegram-notify && npm run test:service-gate && npm run test:udpcustom-port-range && npm run test:extra-ports && npm run test:mux-multipath && npm run test:tunnel-security && npm run test:bot-panel && npm run test:online-monitor && npm run test:xray-links && npm run test:account-parity && npm run test:license-recovery && npm run test:bullseye-repo && npm run test:installer-ui && npm run test:install-guide && npm run test:os-support && npm run test:vps-rebuild && npm run test:update-compat && npm run test:cli-output",
+    "test": "npm run test:license && npm run test:xray-iplimit && npm run test:iplimit-devices && npm run test:xray-hot-add && npm run test:resource-guards && npm run test:xray-monitor && npm run test:online-notify && npm run test:menu-ui && npm run test:sc-renewal-payment && npm run test:dns-guard && npm run test:foreign-backup && npm run test:server-migration && npm run test:button-style && npm run test:telegram-notify && npm run test:service-gate && npm run test:udpcustom-port-range && npm run test:extra-ports && npm run test:mux-multipath && npm run test:tunnel-security && npm run test:bot-panel && npm run test:online-monitor && npm run test:xray-links && npm run test:account-parity && npm run test:license-recovery && npm run test:bullseye-repo && npm run test:installer-ui && npm run test:install-guide && npm run test:os-support && npm run test:vps-rebuild && npm run test:anti-sales && npm run test:update-compat && npm run test:cli-output",
     "start": "node app3.js",
     "start:api": "node license-api.js",
     "start:expiry": "node app3.js --run-sc-expiry-scheduler",
@@ -39,7 +39,8 @@
     "test:mux-multipath": "node scripts/test-mux-multipath.js",
     "test:tunnel-security": "node scripts/test-tunnel-security.js",
     "test:bot-panel": "node scripts/test-bot-panel.js",
-    "test:vps-rebuild": "node scripts/test-vps-rebuild.js"
+    "test:vps-rebuild": "node scripts/test-vps-rebuild.js",
+    "test:anti-sales": "node scripts/test-anti-sales.js"
   },
   "dependencies": {
     "axios": "^1.12.2",

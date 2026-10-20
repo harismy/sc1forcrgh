@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.104}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.103}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -2975,34 +2975,6 @@ ExecStart=
 ExecStart=${xray_bin} run -config /usr/local/etc/xray/config.json
 EOF
   systemctl daemon-reload >/dev/null 2>&1 || true
-  ensure_xray_log_permissions
-}
-
-# Xray dari installer resmi jalan sebagai User=nobody, sedangkan folder log
-# dibuat script ini sebagai root. Tanpa chown, xray gagal start dengan
-# "failed to initialize access logger > open /var/log/xray/access.log:
-# permission denied" dan berulang tiap restart (exit code 23).
-ensure_xray_log_permissions() {
-  local xuser xgroup f
-  xuser="$(systemctl show xray -p User --value 2>/dev/null | tr -d '[:space:]' || true)"
-  [[ -z "${xuser}" ]] && xuser="nobody"
-  xgroup="$(systemctl show xray -p Group --value 2>/dev/null | tr -d '[:space:]' || true)"
-  if [[ -z "${xgroup}" ]]; then
-    if getent group nogroup >/dev/null 2>&1; then
-      xgroup="nogroup"
-    else
-      xgroup="nobody"
-    fi
-  fi
-  mkdir -p /var/log/xray >/dev/null 2>&1 || true
-  chown "${xuser}:${xgroup}" /var/log/xray >/dev/null 2>&1 || true
-  chmod 755 /var/log/xray >/dev/null 2>&1 || true
-  for f in /var/log/xray/access.log /var/log/xray/error.log; do
-    [[ -s "${f}" ]] || : > "${f}" 2>/dev/null || true
-    chown "${xuser}:${xgroup}" "${f}" >/dev/null 2>&1 || true
-    chmod 644 "${f}" >/dev/null 2>&1 || true
-  done
-  return 0
 }
 
 install_xray() {
@@ -12923,44 +12895,6 @@ function isTcpPortListening(port) {
   return String(out).split('\n').some((line) => re.test(String(line || '')));
 }
 
-// Xray resmi jalan sebagai User=nobody. Kalau folder/file log dibuat ulang
-// oleh root (install, restore, atau rotasi manual), xray gagal start dengan
-// "failed to initialize access logger > open ... permission denied" (exit 23).
-// Checker jalan sebagai root, jadi bisa memperbaiki sendiri sebelum restart.
-function ensureXrayLogWritable() {
-  const dir = '/var/log/xray';
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    let user = String(readExec('systemctl', ['show', 'xray', '-p', 'User', '--value']) || '').trim();
-    if (!user) user = 'nobody';
-    let group = String(readExec('systemctl', ['show', 'xray', '-p', 'Group', '--value']) || '').trim();
-    if (!group) {
-      const ng = String(readExec('id', ['-g', 'nogroup']) || '').trim();
-      group = ng ? 'nogroup' : 'nobody';
-    }
-    const uidRaw = String(readExec('id', ['-u', user]) || '').trim();
-    const gidRaw = String(readExec('id', ['-g', group]) || '').trim();
-    const uid = Number(uidRaw);
-    const gid = Number(gidRaw);
-    if (!Number.isInteger(uid) || uid < 0) return false;
-    try { fs.chmodSync(dir, 0o755); } catch (_) {}
-    if (Number.isInteger(gid) && gid >= 0) {
-      try { fs.chownSync(dir, uid, gid); } catch (_) {}
-    }
-    for (const name of ['access.log', 'error.log']) {
-      const p = `${dir}/${name}`;
-      try { if (!fs.existsSync(p)) fs.writeFileSync(p, ''); } catch (_) {}
-      if (Number.isInteger(gid) && gid >= 0) {
-        try { fs.chownSync(p, uid, gid); } catch (_) {}
-      }
-      try { fs.chmodSync(p, 0o644); } catch (_) {}
-    }
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
 function ensureXrayInboundsHealthy() {
   const required = [10001, 10002, 10003];
   const missing = required.filter((port) => !isTcpPortListening(port));
@@ -12968,7 +12902,6 @@ function ensureXrayInboundsHealthy() {
   if (IPLIMIT_DEBUG) {
     console.log(`[iplimit-debug][xray] inbound missing ports=${missing.join(',')} -> restart xray`);
   }
-  ensureXrayLogWritable();
   restartService('xray');
 }
 
@@ -14946,9 +14879,6 @@ function stopXrayFailClosed(reason) {
 }
 
 function restartXrayChecked() {
-  // Cegah crash-loop "access.log: permission denied" saat xray jalan sebagai
-  // nobody tetapi folder log dibuat ulang oleh root (install/restore/rotasi).
-  ensureXrayLogWritable();
   const restarted = safeExec('systemctl', ['restart', 'xray']) || safeExec('service', ['xray', 'restart']);
   if (!restarted) return false;
   const requiredPorts = [10001, 10002, 10003, 11001, 11002, 11003];
@@ -39079,9 +39009,6 @@ main() {
     enforce_install_license
     install_go_if_missing
     init_db
-    # Xray jalan sebagai nobody; pastikan log bisa ditulis agar update tidak
-    # meninggalkan xray crash-loop "permission denied" di access.log.
-    ensure_xray_log_permissions
     setup_udpgw_service_if_possible
     setup_nginx_and_cert
     write_api_files

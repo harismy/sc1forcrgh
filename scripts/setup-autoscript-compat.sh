@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.104}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.105}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -3937,9 +3937,10 @@ setup_vnstat() {
 }
 
 issue_letsencrypt_cert() {
-  local certbot_email_arg cert_domain xray_alias_hosts alias_host
-  local -a cert_extra_args
+  local certbot_email_arg cert_email="" cert_domain xray_alias_hosts alias_host
+  local -a cert_extra_args cert_extra_hosts
   cert_extra_args=()
+  cert_extra_hosts=()
   cert_domain="$(tls_cert_domain)"
   if [[ -z "${cert_domain}" ]]; then
     log "Domain sertifikat TLS kosong. Skip issue cert."
@@ -3954,6 +3955,7 @@ issue_letsencrypt_cert() {
     certbot_email_arg="--register-unsafely-without-email"
   else
     certbot_email_arg="-m ${EMAIL}"
+    cert_email="${EMAIL}"
   fi
 
   if flag_enabled "${WILDCARD_ENABLE:-0}"; then
@@ -3983,9 +3985,12 @@ issue_letsencrypt_cert() {
       fi
       if ! domain_covered_by_one_label_wildcard "${alias_host}" "${WILDCARD_BASE_DOMAIN}"; then
         cert_extra_args+=(-d "${alias_host}")
+        cert_extra_hosts+=("${alias_host}")
         log "Tambahkan SAN exact untuk alias Xray wildcard: ${alias_host}"
       fi
     done
+    write_cert_request_file cloudflare "${WILDCARD_BASE_DOMAIN}" "${cert_email}" \
+      "${WILDCARD_BASE_DOMAIN}" "*.${WILDCARD_BASE_DOMAIN}" "${cert_extra_hosts[@]}"
     log "Issue wildcard cert Let's Encrypt untuk *.${WILDCARD_BASE_DOMAIN} (DNS-01 Cloudflare)..."
     certbot certonly \
       --dns-cloudflare \
@@ -4009,8 +4014,10 @@ issue_letsencrypt_cert() {
       continue
     fi
     cert_extra_args+=(-d "${alias_host}")
+    cert_extra_hosts+=("${alias_host}")
     log "Tambahkan SAN exact untuk alias Xray: ${alias_host}"
   done
+  write_cert_request_file webroot "${cert_domain}" "${cert_email}" "${DOMAIN}" "${cert_extra_hosts[@]}"
   log "Issue cert Let's Encrypt (webroot) untuk ${DOMAIN}..."
   certbot certonly --webroot -w /var/www/html \
     --cert-name "${cert_domain}" \
@@ -4042,6 +4049,361 @@ prepare_haproxy_pem() {
   cat "/etc/haproxy/certs/${cert_domain}.crt" "/etc/haproxy/certs/${cert_domain}.key" > "${pem}" || return 1
   chmod 600 "${pem}" || true
   echo "${pem}"
+  return 0
+}
+
+# HAProxy membaca satu pem gabungan (fullchain + privkey) di /etc/haproxy/certs,
+# sedangkan certbot hanya memperbarui /etc/letsencrypt/live. Dulu pem itu hanya
+# dibangun saat install penuh (update aman tidak memanggil setup_haproxy_tls_mux),
+# jadi dua hal pernah terjadi sungguhan: HAProxy menyajikan cert lama sampai
+# kedaluwarsa walau certbot sudah renew, dan cert self-signed sementara (3 hari)
+# saat Let's Encrypt gagal tidak pernah diganti. sc-1forcr-cert-sync menutup
+# keduanya lewat deploy hook certbot dan timer tiap 12 jam.
+setup_cert_sync() {
+  mkdir -p /usr/local/sbin /var/lib/sc-1forcr /etc/letsencrypt/renewal-hooks/deploy
+  cat > /usr/local/sbin/sc-1forcr-cert-sync <<'CERT_SYNC_EOF'
+#!/usr/bin/env bash
+# sc-1forcr-cert-sync {sync|ensure|status}
+#
+# - sync   : kalau cert di /etc/letsencrypt/live lebih baru dari pem HAProxy,
+#            bangun ulang pem, cek dengan haproxy -c, lalu reload HAProxy
+#            (graceful; koneksi aktif tetap dilayani proses lama). Gagal = pem
+#            lama dipulihkan. Dipanggil deploy hook certbot, install/update, dan
+#            timer.
+# - ensure : sync, lalu kalau cert tinggal <= RENEW_DAYS hari (atau cert LE belum
+#            ada dan HAProxy masih memakai self-signed sementara), minta certbot
+#            renew atau terbitkan ulang. Paling sering sekali per 12 jam supaya
+#            tidak kena batas Let's Encrypt. Dipanggil timer tiap 12 jam.
+# - status : cetak masa berlaku cert yang disajikan HAProxy dan cert di live.
+#
+# Script ini tidak memanggil daemon-reload dan tidak me-restart service apa pun.
+set -uo pipefail
+
+HAPROXY_CFG="${CERT_SYNC_HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}"
+LIVE_DIR="${CERT_SYNC_LIVE_DIR:-/etc/letsencrypt/live}"
+STATE_DIR="${CERT_SYNC_STATE_DIR:-/var/lib/sc-1forcr}"
+REQUEST_FILE="${STATE_DIR}/cert-request"
+ATTEMPT_FILE="${STATE_DIR}/cert-attempt"
+LOCK_FILE="${CERT_SYNC_LOCK_FILE:-/run/sc-1forcr-cert-sync.lock}"
+WEBROOT="${CERT_SYNC_WEBROOT:-/var/www/html}"
+CF_CREDENTIALS="${CERT_SYNC_CF_CREDENTIALS:-/root/.secrets/certbot/cloudflare.ini}"
+RENEW_DAYS=30
+RETRY_SECONDS=$((12 * 3600))
+
+say() { echo "[cert-sync] $*"; }
+
+# Path pem diambil dari config HAProxy, jadi ikut berubah saat domain diganti.
+haproxy_pem() {
+  local pem
+  [[ -f "${HAPROXY_CFG}" ]] || return 1
+  pem="$(awk '$1 == "bind" && / ssl / { for (i = 1; i < NF; i++) if ($i == "crt") { print $(i + 1); exit } }' "${HAPROXY_CFG}")"
+  [[ -n "${pem}" ]] || return 1
+  echo "${pem}"
+}
+
+# Epoch akhir masa berlaku cert pertama di file; kosong kalau tidak terbaca.
+cert_end() {
+  local end
+  end="$(openssl x509 -noout -enddate -in "$1" 2>/dev/null)" || return 1
+  date -d "${end#notAfter=}" +%s 2>/dev/null
+}
+
+fmt_date() { date -u -d "@$1" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "$1"; }
+
+describe_end() {
+  local end="$1" now="$2"
+  if [[ -z "${end}" ]]; then
+    echo "tidak terbaca"
+  elif (( end <= now )); then
+    echo "$(fmt_date "${end}") (KEDALUWARSA)"
+  else
+    echo "$(fmt_date "${end}") ($(( (end - now) / 86400 )) hari lagi)"
+  fi
+}
+
+# Cert dan kunci privat harus satu pasang; pem dari pasangan yang salah membuat
+# HAProxy gagal memuat config.
+same_key() {
+  local a b
+  a="$(openssl x509 -noout -pubkey -in "$1" 2>/dev/null)"
+  b="$(openssl pkey -pubout -in "$2" 2>/dev/null)"
+  [[ -n "${a}" && "${a}" == "${b}" ]]
+}
+
+# Lock dilepas sebelum certbot jalan, karena deploy hook certbot memanggil
+# `sync` lagi dan akan menunggu lock yang sama.
+take_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"${LOCK_FILE}" || return 0
+  flock -w 120 9
+}
+
+release_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+  return 0
+}
+
+do_sync() {
+  local pem name fullchain privkey live_end pem_end backup
+  if ! pem="$(haproxy_pem)"; then
+    say "Config HAProxy tanpa cert TLS; tidak ada yang disinkronkan."
+    return 0
+  fi
+  name="$(basename "${pem}" .pem)"
+  fullchain="${LIVE_DIR}/${name}/fullchain.pem"
+  privkey="${LIVE_DIR}/${name}/privkey.pem"
+  [[ -s "${fullchain}" && -s "${privkey}" ]] || return 0
+  live_end="$(cert_end "${fullchain}")"
+  if [[ -z "${live_end}" ]]; then
+    say "Cert Let's Encrypt ${name} tidak terbaca; pem HAProxy tidak diubah."
+    return 1
+  fi
+  pem_end="$(cert_end "${pem}")"
+  if [[ -n "${pem_end}" ]] && (( live_end <= pem_end )); then
+    return 0
+  fi
+  if ! same_key "${fullchain}" "${privkey}"; then
+    say "Kunci privat ${name} tidak cocok dengan cert-nya; pem HAProxy tidak diubah."
+    return 1
+  fi
+  backup="${pem}.sc-bak"
+  mkdir -p "$(dirname "${pem}")"
+  if [[ -f "${pem}" ]]; then
+    cp -p "${pem}" "${backup}" || return 1
+  fi
+  if ! ( umask 077; cat "${fullchain}" "${privkey}" > "${pem}.new" ); then
+    rm -f "${pem}.new"
+    return 1
+  fi
+  if ! mv -f "${pem}.new" "${pem}"; then
+    rm -f "${pem}.new"
+    return 1
+  fi
+  chmod 600 "${pem}" 2>/dev/null || true
+  if ! haproxy -c -f "${HAPROXY_CFG}" >/dev/null 2>&1; then
+    [[ -f "${backup}" ]] && mv -f "${backup}" "${pem}"
+    say "haproxy -c menolak pem baru ${name}; pem lama dipulihkan."
+    return 1
+  fi
+  rm -f "${backup}"
+  say "Cert HAProxy diperbarui: ${name}, berlaku sampai $(fmt_date "${live_end}")."
+  if systemctl is-active --quiet haproxy 2>/dev/null && ! systemctl reload haproxy >/dev/null 2>&1; then
+    say "PERINGATAN: reload HAProxy gagal; cert baru dipakai saat HAProxy restart berikutnya."
+    return 1
+  fi
+  return 0
+}
+
+sync_locked() {
+  local rc
+  if ! take_lock; then
+    say "Sinkron cert lain masih berjalan; dilewati."
+    return 0
+  fi
+  do_sync
+  rc=$?
+  release_lock
+  return "${rc}"
+}
+
+read_request() {
+  local key value
+  REQ_MODE=""
+  REQ_NAME=""
+  REQ_DOMAINS=""
+  REQ_EMAIL=""
+  [[ -f "${REQUEST_FILE}" ]] || return 1
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      MODE) REQ_MODE="${value}" ;;
+      NAME) REQ_NAME="${value}" ;;
+      DOMAINS) REQ_DOMAINS="${value}" ;;
+      EMAIL) REQ_EMAIL="${value}" ;;
+    esac
+  done < "${REQUEST_FILE}"
+  [[ -n "${REQ_NAME}" && -n "${REQ_DOMAINS}" ]]
+}
+
+do_ensure() {
+  local pem name live now target_end last out rc d
+  local -a doms args
+  sync_locked || true
+  pem="$(haproxy_pem)" || return 0
+  name="$(basename "${pem}" .pem)"
+  live="${LIVE_DIR}/${name}/fullchain.pem"
+  now="$(date +%s)"
+  if [[ -s "${live}" ]]; then
+    target_end="$(cert_end "${live}")"
+  else
+    target_end="$(cert_end "${pem}")"
+  fi
+  target_end="${target_end:-0}"
+  (( target_end - now > RENEW_DAYS * 86400 )) && return 0
+  if ! command -v certbot >/dev/null 2>&1; then
+    say "certbot tidak ada; cert ${name} tidak bisa diperbarui otomatis."
+    return 0
+  fi
+  last="$(tr -cd '0-9' < "${ATTEMPT_FILE}" 2>/dev/null)"
+  if [[ -n "${last}" ]] && (( now - last < RETRY_SECONDS )); then
+    return 0
+  fi
+
+  if [[ -s "${live}" ]]; then
+    say "Cert ${name} berakhir $(fmt_date "${target_end}"); minta certbot renew."
+    args=(renew --cert-name "${name}" --non-interactive)
+  else
+    if ! read_request; then
+      say "Cert Let's Encrypt ${name} belum ada dan data permintaannya tidak tersimpan; jalankan update SC."
+      return 0
+    fi
+    if [[ "${REQ_NAME}" != "${name}" ]]; then
+      say "Data permintaan cert (${REQ_NAME}) bukan untuk domain HAProxy (${name}); dilewati."
+      return 0
+    fi
+    # read tidak melakukan glob, jadi *.domain wildcard tetap utuh.
+    read -ra doms <<< "${REQ_DOMAINS}"
+    (( ${#doms[@]} > 0 )) || return 0
+    args=(certonly --cert-name "${REQ_NAME}" --expand --non-interactive --agree-tos)
+    if [[ "${REQ_MODE}" == "cloudflare" ]]; then
+      if [[ ! -s "${CF_CREDENTIALS}" ]]; then
+        say "Kredensial Cloudflare untuk cert wildcard ${name} tidak ada; dilewati."
+        return 0
+      fi
+      args+=(--dns-cloudflare --dns-cloudflare-credentials "${CF_CREDENTIALS}" --dns-cloudflare-propagation-seconds 30)
+    else
+      args+=(--webroot -w "${WEBROOT}")
+    fi
+    for d in "${doms[@]}"; do
+      args+=(-d "${d}")
+    done
+    if [[ -n "${REQ_EMAIL}" ]]; then
+      args+=(-m "${REQ_EMAIL}")
+    else
+      args+=(--register-unsafely-without-email)
+    fi
+    say "Cert Let's Encrypt ${name} belum ada (HAProxy memakai cert sementara); coba terbitkan lagi."
+  fi
+
+  echo "${now}" > "${ATTEMPT_FILE}" 2>/dev/null || true
+  if out="$(certbot "${args[@]}" 2>&1)"; then
+    say "certbot selesai."
+  else
+    rc=$?
+    say "certbot gagal (kode ${rc}); dicoba lagi paling cepat 12 jam lagi. Pesan terakhir:"
+    printf '%s\n' "${out}" | tail -n 5 | sed 's/^/[cert-sync]   /'
+    return 0
+  fi
+  sync_locked
+}
+
+do_status() {
+  local pem name now end issuer subject last
+  now="$(date +%s)"
+  if ! pem="$(haproxy_pem)"; then
+    echo "Cert HAProxy : tidak ada di config"
+    return 0
+  fi
+  name="$(basename "${pem}" .pem)"
+  end="$(cert_end "${pem}")"
+  issuer="$(openssl x509 -noout -issuer -in "${pem}" 2>/dev/null | sed 's/^issuer= *//')"
+  subject="$(openssl x509 -noout -subject -in "${pem}" 2>/dev/null | sed 's/^subject= *//')"
+  echo "Cert HAProxy : ${pem}"
+  echo "Berlaku s/d  : $(describe_end "${end}" "${now}")"
+  if [[ -n "${issuer}" && "${issuer}" == "${subject}" ]]; then
+    echo "Penerbit     : self-signed (sementara)"
+  else
+    echo "Penerbit     : ${issuer:-tidak terbaca}"
+  fi
+  if [[ -s "${LIVE_DIR}/${name}/fullchain.pem" ]]; then
+    echo "Cert LE live : $(describe_end "$(cert_end "${LIVE_DIR}/${name}/fullchain.pem")" "${now}")"
+  else
+    echo "Cert LE live : belum ada"
+  fi
+  last="$(tr -cd '0-9' < "${ATTEMPT_FILE}" 2>/dev/null)"
+  if [[ -n "${last}" ]]; then
+    echo "Coba certbot : $(fmt_date "${last}")"
+  fi
+  return 0
+}
+
+case "${1:-sync}" in
+  sync) sync_locked ;;
+  ensure) do_ensure ;;
+  status) do_status ;;
+  *)
+    echo "Pakai: sc-1forcr-cert-sync {sync|ensure|status}" >&2
+    exit 2
+    ;;
+esac
+CERT_SYNC_EOF
+  if ! bash -n /usr/local/sbin/sc-1forcr-cert-sync; then
+    log "PERINGATAN: script sinkron cert tidak valid; dilewati."
+    return 0
+  fi
+  chmod 700 /usr/local/sbin/sc-1forcr-cert-sync
+
+  cat > /etc/letsencrypt/renewal-hooks/deploy/sc-1forcr-haproxy <<'EOF'
+#!/bin/sh
+# Dipasang SC 1FORCR. certbot menjalankan hook ini setiap kali renew berhasil,
+# supaya pem HAProxy langsung dibangun ulang dan cert baru disajikan di 443.
+exec /usr/local/sbin/sc-1forcr-cert-sync sync
+EOF
+  chmod 755 /etc/letsencrypt/renewal-hooks/deploy/sc-1forcr-haproxy
+
+  cat > /etc/systemd/system/sc-1forcr-cert-sync.service <<'EOF'
+[Unit]
+Description=SC 1FORCR TLS Certificate Sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-cert-sync ensure
+# certbot renew bisa menunggu acak beberapa menit sebelum menghubungi Let's Encrypt.
+TimeoutStartSec=20min
+Nice=10
+CPUQuota=50%
+MemoryMax=256M
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-cert-sync.timer <<'EOF'
+[Unit]
+Description=Run SC 1FORCR TLS Certificate Sync every 12 hours
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=12h
+RandomizedDelaySec=20min
+Persistent=false
+Unit=sc-1forcr-cert-sync.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sc-1forcr-cert-sync.timer >/dev/null 2>&1 || true
+  if ! /usr/local/sbin/sc-1forcr-cert-sync sync; then
+    log "PERINGATAN: sinkron cert HAProxy belum berhasil; timer sc-1forcr-cert-sync akan mencoba lagi."
+  fi
+  return 0
+}
+
+# Simpan permintaan cert terakhir supaya sc-1forcr-cert-sync bisa mencoba lagi
+# dengan domain dan cara yang sama kalau Let's Encrypt gagal sekarang.
+write_cert_request_file() {
+  local mode="$1" name="$2" email="$3"
+  shift 3
+  mkdir -p /var/lib/sc-1forcr 2>/dev/null || true
+  {
+    echo "MODE=${mode}"
+    echo "NAME=${name}"
+    echo "DOMAINS=$*"
+    echo "EMAIL=${email}"
+  } > /var/lib/sc-1forcr/cert-request 2>/dev/null || true
+  date +%s > /var/lib/sc-1forcr/cert-attempt 2>/dev/null || true
   return 0
 }
 
@@ -26207,10 +26569,27 @@ EOF
   systemctl daemon-reload || true
 }
 
+# Simpan permintaan cert terakhir supaya sc-1forcr-cert-sync bisa mencoba lagi
+# dengan domain dan cara yang sama kalau Let's Encrypt gagal sekarang.
+write_cert_request_file() {
+  local mode="$1" name="$2" email="$3"
+  shift 3
+  mkdir -p /var/lib/sc-1forcr 2>/dev/null || true
+  {
+    echo "MODE=${mode}"
+    echo "NAME=${name}"
+    echo "DOMAINS=$*"
+    echo "EMAIL=${email}"
+  } > /var/lib/sc-1forcr/cert-request 2>/dev/null || true
+  date +%s > /var/lib/sc-1forcr/cert-attempt 2>/dev/null || true
+  return 0
+}
+
 issue_letsencrypt_cert() {
-  local certbot_email_arg cert_domain xray_alias_hosts alias_host
-  local -a cert_extra_args
+  local certbot_email_arg cert_email="" cert_domain xray_alias_hosts alias_host
+  local -a cert_extra_args cert_extra_hosts
   cert_extra_args=()
+  cert_extra_hosts=()
   cert_domain="$(tls_cert_domain)"
   if [[ -z "${cert_domain}" ]]; then
     echo "Domain sertifikat TLS kosong. Skip issue cert."
@@ -26221,6 +26600,7 @@ issue_letsencrypt_cert() {
     certbot_email_arg="--register-unsafely-without-email"
   else
     certbot_email_arg="-m ${EMAIL}"
+    cert_email="${EMAIL}"
   fi
 
   if flag_enabled "${WILDCARD_ENABLE:-0}"; then
@@ -26246,9 +26626,12 @@ issue_letsencrypt_cert() {
       fi
       if ! domain_covered_by_one_label_wildcard "${alias_host}" "${WILDCARD_BASE_DOMAIN}"; then
         cert_extra_args+=(-d "${alias_host}")
+        cert_extra_hosts+=("${alias_host}")
         echo "Tambahkan SAN exact untuk alias Xray wildcard: ${alias_host}"
       fi
     done
+    write_cert_request_file cloudflare "${WILDCARD_BASE_DOMAIN}" "${cert_email}" \
+      "${WILDCARD_BASE_DOMAIN}" "*.${WILDCARD_BASE_DOMAIN}" "${cert_extra_hosts[@]}"
     certbot certonly \
       --dns-cloudflare \
       --dns-cloudflare-credentials /root/.secrets/certbot/cloudflare.ini \
@@ -26271,8 +26654,10 @@ issue_letsencrypt_cert() {
       continue
     fi
     cert_extra_args+=(-d "${alias_host}")
+    cert_extra_hosts+=("${alias_host}")
     echo "Tambahkan SAN exact untuk alias Xray: ${alias_host}"
   done
+  write_cert_request_file webroot "${cert_domain}" "${cert_email}" "${DOMAIN}" "${cert_extra_hosts[@]}"
   certbot certonly --webroot -w /var/www/html \
     --cert-name "${cert_domain}" \
     --expand \
@@ -31832,10 +32217,11 @@ EONGINX
   if ! issue_letsencrypt_cert; then
     echo "Peringatan: issue cert Let's Encrypt untuk ${new_domain} gagal. Lanjut dengan cert sementara."
     if flag_enabled "${WILDCARD_ENABLE:-0}"; then
-      echo "Cek WILDCARD_BASE_DOMAIN dan kredensial Cloudflare, lalu jalankan renew cert nanti."
+      echo "Cek WILDCARD_BASE_DOMAIN dan kredensial Cloudflare."
     else
-      echo "Cek A record domain ke VPS, lalu jalankan renew cert nanti."
+      echo "Cek A record domain ke VPS."
     fi
+    echo "Cert dicoba terbitkan lagi otomatis tiap 12 jam. Cek status: sc-1forcr-cert-sync status"
   fi
 
   pem="$(prepare_haproxy_pem)" || {
@@ -36989,6 +37375,8 @@ systemctl stop sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
 systemctl disable --now sc-1forcr-dns-guard.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-dns-guard.service >/dev/null 2>&1 || true
+systemctl disable --now sc-1forcr-cert-sync.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-cert-sync.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
@@ -37037,6 +37425,8 @@ rm -f /etc/systemd/system/sc-1forcr-capacity-tune.service
 rm -f /etc/systemd/system/sc-1forcr-capacity-tune.timer
 rm -f /etc/systemd/system/sc-1forcr-dns-guard.service
 rm -f /etc/systemd/system/sc-1forcr-dns-guard.timer
+rm -f /etc/systemd/system/sc-1forcr-cert-sync.service
+rm -f /etc/systemd/system/sc-1forcr-cert-sync.timer
 rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/sc-1forcr-udpgw@.service
@@ -37073,6 +37463,8 @@ rm -f /usr/local/sbin/sc-1forcr-dns-guard
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 rm -f /usr/local/sbin/sc-1forcr-extra-ports
 rm -f /usr/local/sbin/sc-1forcr-tunnel-guard
+rm -f /usr/local/sbin/sc-1forcr-cert-sync
+rm -f /etc/letsencrypt/renewal-hooks/deploy/sc-1forcr-haproxy
 rm -f /etc/profile.d/sc-1forcr-auto-menu.sh
 
 echo "Uninstall SC 1FORCR selesai."
@@ -39091,6 +39483,7 @@ main() {
     setup_services
     activate_sshws_realip_runtime_if_needed
     activate_haproxy_connection_hardening_if_needed
+    setup_cert_sync
     setup_license_guard
     setup_auto_reboot_timer
     if ! setup_auto_backup_timer; then
@@ -39184,6 +39577,7 @@ main() {
   run_install_step "12_harden_shells" 47 "Harden shell akun tunnel" harden_ssh_tunnel_shells
   run_install_step "13_nginx_cert" 52 "Setup Nginx dan sertifikat" setup_nginx_and_cert
   run_install_step "14_haproxy_mux" 56 "Setup HAProxy TLS mux" setup_haproxy_tls_mux
+  run_install_step "14b_cert_sync" 57 "Setup sinkron sertifikat TLS" setup_cert_sync
   run_install_step "15_zivpn_service" 60 "Setup ZIVPN" setup_zivpn_service_if_possible
   run_install_step "16_zivpn_nat" 62 "Setup NAT ZIVPN" setup_zivpn_udp_nat_rules
   run_install_step "17_udpcustom_service" 64 "Setup UDP Custom" setup_udpcustom_service_if_possible

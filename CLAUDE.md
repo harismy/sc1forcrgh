@@ -130,6 +130,20 @@ Akun VPN tidak boleh bisa dipakai menyerang VPS ini atau server lain.
 - `apply` dipanggil di akhir install/update, dari menu, dan tiap siklus watchdog. Aturan dan `netfilter-persistent save` hanya ditulis kalau berbeda, jadi siklus watchdog tanpa perubahan tidak menyentuh iptables.
 - Hasilnya ditulis ke `/var/lib/sc-1forcr/extra-ports.state`. api.js membacanya untuk `port.tls_all`/`port.none_all`. Kunci `port.tls`/`port.none` tetap satu port (443/80), karena bot jualan lain membacanya sebagai satu angka. Test: `npm run test:extra-ports`.
 
+### Sertifikat TLS HAProxy (sinkron cert)
+
+HAProxy :443 membaca satu pem gabungan `/etc/haproxy/certs/<domain>.pem` (fullchain + privkey), sedangkan certbot hanya memperbarui `/etc/letsencrypt/live/<domain>/`. Dulu pem itu hanya dibangun `prepare_haproxy_pem` saat install penuh, karena update aman tidak memanggil `setup_haproxy_tls_mux`. Pernah terjadi sungguhan (V.1FSC.105): HAProxy id1 menyajikan cert yang sudah kedaluwarsa walau certbot sudah renew, dan id3 masih memakai self-signed sementara 3 hari dari saat install karena Let's Encrypt gagal dan tidak pernah dicoba lagi.
+
+- `/usr/local/sbin/sc-1forcr-cert-sync` (heredoc `CERT_SYNC_EOF`, dipasang `setup_cert_sync` di install penuh dan update aman):
+  - `sync`: pem hanya diganti kalau cert live **lebih baru** dan kuncinya cocok, lalu `haproxy -c` dan `systemctl reload haproxy` (graceful). Gagal cek = pem lama dipulihkan. Tanpa perubahan = tidak menyentuh apa pun.
+  - `ensure` (timer `sc-1forcr-cert-sync.timer` tiap 12 jam, `Nice`/`CPUQuota`/`MemoryMax`): kalau cert tinggal ≤30 hari atau cert LE belum ada, panggil `certbot renew`/`certonly` paling sering sekali per 12 jam (batas validasi gagal Let's Encrypt).
+  - `status`: masa berlaku cert HAProxy dan cert live.
+- Path pem dibaca dari `bind ... ssl crt` di haproxy.cfg, jadi ikut berubah saat domain diganti.
+- Deploy hook `/etc/letsencrypt/renewal-hooks/deploy/sc-1forcr-haproxy` memanggil `sync` setiap renew berhasil. Hook direktori certbot hanya jalan untuk `renew`, jadi setelah `certonly` script ini memanggil `sync` sendiri. Lock dilepas sebelum certbot jalan karena hook memanggil `sync` lagi.
+- `issue_letsencrypt_cert` (installer dan salinan menu) menyimpan domain dan cara terbit ke `/var/lib/sc-1forcr/cert-request` lewat `write_cert_request_file` (isi identik di dua tempat), supaya `ensure` mengulang dengan SAN dan mode (webroot/Cloudflare) yang sama.
+- Xray tidak terminasi TLS, jadi ganti cert tidak pernah me-restart Xray. Satu SAN yang tidak lagi mengarah ke VPS membuat renew seluruh cert gagal; alasannya tercatat di journal `sc-1forcr-cert-sync`.
+- Test: `npm run test:cert-sync`.
+
 ### Mode Bot Panel (bot jualan akun di VPS)
 
 `${APP_DIR}/bot-panel.js` (heredoc `BOT_PANEL_EOF` di `install_bot_panel`) adalah bot Telegram jualan akun: buat, trial, perpanjang, top up saldo, dan multi server. `BOT_PANEL_ENABLE=0` (default) = service `sc-1forcr-botpanel` mati. Dinyalakan dari menu Tools > Mode Bot Panel.

@@ -492,6 +492,141 @@ async function saldo(id) {
   assert(/bukan database SQLite/.test(texts(calls)), 'file bukan sqlite ditolak');
   assert.strictEqual(await saldo(BUYER), 15000, 'database tetap utuh setelah restore ditolak');
 
+  // ── Reseller dan paket limit IP ─────────────────────────────────────────
+  const localNow = await bot.get('SELECT * FROM servers WHERE local = 1');
+  const vmessData = fixture.cases.find((c) => c.name === 'vmess-create-multipath').data;
+  let lastApi = null;
+  httpHandler = (req) => {
+    lastApi = req;
+    if (/\/vps\/renewvmess\//.test(req.url)) return ok({ username: req.url.split('/')[5], exp: '2027-01-31 10:00:00' });
+    return ok({ ...vmessData, username: req.body.username });
+  };
+  async function buy(userId, serverId, username, days, packageId) {
+    await step(cbUpdate(userId, `b:p:${serverId}:vmess`));
+    let out = await step(textUpdate(userId, username));
+    if (packageId) out = await step(cbUpdate(userId, `b:k:${packageId}`));
+    const confirm = await step(cbUpdate(userId, `b:d:${days}`));
+    const done = await step(cbUpdate(userId, 'b:y'));
+    return { out, confirm: texts(confirm), done };
+  }
+
+  // Harga reseller per server: diisi admin, reseller ditambahkan admin.
+  await step(cbUpdate(ADMIN, `a:se:${localNow.id}:reseller_price_day`));
+  await step(textUpdate(ADMIN, '600'));
+  assert.strictEqual(Number((await bot.get('SELECT reseller_price_day FROM servers WHERE id = ?', [localNow.id])).reseller_price_day), 600);
+  await step(cbUpdate(ADMIN, 'a:rs'));
+  await step(cbUpdate(ADMIN, 'a:rsa'));
+  calls = await step(textUpdate(ADMIN, String(BUYER)));
+  assert.strictEqual(Number((await bot.get('SELECT reseller FROM users WHERE id = ?', [BUYER])).reseller), 1, 'admin bisa menambah reseller');
+  assert(calls.some((c) => c.method === 'sendMessage' && c.payload.chat_id === BUYER && /sekarang <b>reseller<\/b>/.test(c.payload.text)), 'reseller diberi tahu');
+  calls = await step(textUpdate(BUYER, '/start'));
+  assert(/Status      : <b>Reseller<\/b>/.test(texts(calls)), 'menu utama reseller menyebut status reseller');
+
+  let before = await saldo(BUYER);
+  let r = await buy(BUYER, localNow.id, 'resel01', 7);
+  assert(/Rp 4\.200 \(Rp 600 x 7 hari, harga reseller\)/.test(r.confirm), `konfirmasi reseller memakai harga reseller:\n${r.confirm}`);
+  assert.strictEqual(await saldo(BUYER), before - 4200, 'reseller dipotong harga reseller');
+  await step(cbUpdate(ADMIN, `a:ua:${OTHER}:+`));
+  await step(textUpdate(ADMIN, '50000'));
+  before = await saldo(OTHER);
+  await buy(OTHER, localNow.id, 'biasa01', 3);
+  assert.strictEqual(await saldo(OTHER), before - 3000, 'pembeli biasa tetap harga normal');
+
+  // Paket limit IP: 1 IP Rp300 (reseller Rp200), 2 IP Rp500 (reseller = harga normal).
+  for (const [limit, price, resellerPrice] of [['1', '300', '200'], ['2', '500', '0']]) {
+    await step(cbUpdate(ADMIN, `a:pka:${localNow.id}`));
+    await step(textUpdate(ADMIN, limit));
+    await step(textUpdate(ADMIN, price));
+    await step(textUpdate(ADMIN, resellerPrice));
+  }
+  await step(cbUpdate(ADMIN, `a:pka:${localNow.id}`));
+  calls = await step(textUpdate(ADMIN, '2'));
+  assert(/sudah ada/.test(texts(calls)), 'paket dengan limit IP yang sama ditolak');
+  const pkgs = await bot.all('SELECT * FROM server_packages WHERE server_id = ? ORDER BY limit_ip', [localNow.id]);
+  assert.deepStrictEqual(pkgs.map((p) => [p.limit_ip, p.price_day, p.reseller_price_day]), [[1, 300, 200], [2, 500, 0]]);
+
+  calls = await step(cbUpdate(OTHER, 'srv'));
+  assert(/1 IP: Rp 300 \/ hari/.test(texts(calls)) && /2 IP: Rp 500 \/ hari/.test(texts(calls)), 'daftar server menampilkan paket');
+  calls = await step(cbUpdate(BUYER, 'srv'));
+  assert(/HARGA RESELLER/.test(texts(calls)) && /1 IP: Rp 200 \/ hari/.test(texts(calls)), 'reseller melihat harga reseller paket');
+  calls = await step(cbUpdate(OTHER, 'b'));
+  assert(calls.some((c) => (c.payload.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((b) => /mulai Rp 300\/hari/.test(b.text))), 'tombol server menyebut harga termurah');
+
+  // Server dengan paket: pembeli wajib memilih paket sebelum durasi.
+  before = await saldo(OTHER);
+  r = await buy(OTHER, localNow.id, 'paket02', 3, pkgs[1].id);
+  assert(r.out.some((c) => /Pilih masa aktif/.test(c.payload.text || '') && /Paket 2 IP/.test(c.payload.text || '')), 'setelah paket dipilih, durasi ditampilkan');
+  assert(/Limit IP : 2/.test(r.confirm) && /Rp 1\.500 \(Rp 500 x 3 hari\)/.test(r.confirm), `konfirmasi memakai harga paket:\n${r.confirm}`);
+  assert.strictEqual(lastApi.body.limitip, 2, 'API menerima limit IP dari paket');
+  assert.strictEqual(await saldo(OTHER), before - 1500);
+  assert.strictEqual(Number((await bot.get("SELECT limit_ip FROM accounts WHERE username = 'paket02'")).limit_ip), 2, 'limit IP paket tersimpan di akun');
+
+  before = await saldo(BUYER);
+  await buy(BUYER, localNow.id, 'paket01', 7, pkgs[0].id);
+  assert.strictEqual(await saldo(BUYER), before - 1400, 'reseller memakai harga reseller paket');
+  assert.strictEqual(lastApi.body.limitip, 1);
+
+  // Pilih paket tanpa melewati langkah paket, atau paket server lain: ditolak.
+  await step(cbUpdate(OTHER, `b:p:${localNow.id}:vmess`));
+  calls = await step(textUpdate(OTHER, 'paket03'));
+  assert(calls.some((c) => /Pilih paket limit IP/.test(c.payload.text || '')), 'server berpaket menanyakan paket dulu');
+  calls = await step(cbUpdate(OTHER, 'b:d:3'));
+  assert(/Sesi pembelian sudah habis/.test(texts(calls)), 'durasi tidak bisa dipilih sebelum paket');
+  calls = await step(cbUpdate(OTHER, 'b:k:999'));
+  assert(/Sesi pembelian sudah habis|Paket tidak tersedia/.test(texts(calls)), 'paket rakitan ditolak');
+  assert(!(await bot.get("SELECT id FROM orders WHERE username = 'paket03'")), 'tidak ada pesanan dari paket rakitan');
+
+  // Perpanjang mengikuti limit IP akun (paket 2 IP), bukan limit IP server.
+  const acc2 = await bot.get("SELECT * FROM accounts WHERE username = 'paket02'");
+  before = await saldo(OTHER);
+  calls = await step(cbUpdate(OTHER, `r:a:${acc2.id}`));
+  assert(/Limit IP : 2/.test(texts(calls)) && /3 hari - Rp 1\.500/.test(JSON.stringify(calls)), 'perpanjang memakai harga paket akun');
+  await step(cbUpdate(OTHER, `r:d:${acc2.id}:3`));
+  await step(cbUpdate(OTHER, `r:y:${acc2.id}:3`));
+  assert.strictEqual(await saldo(OTHER), before - 1500);
+  assert.strictEqual(lastApi.body.limitip, 2, 'perpanjang tidak mengubah limit IP akun');
+
+  // Paket dihapus: perpanjang memakai harga dasar server dengan limit akun.
+  await step(cbUpdate(ADMIN, `a:pkd:${pkgs[1].id}`));
+  await step(cbUpdate(ADMIN, `a:pky:${pkgs[1].id}`));
+  assert(!(await bot.get('SELECT id FROM server_packages WHERE id = ?', [pkgs[1].id])), 'paket terhapus');
+  before = await saldo(OTHER);
+  await step(cbUpdate(OTHER, `r:d:${acc2.id}:1`));
+  await step(cbUpdate(OTHER, `r:y:${acc2.id}:1`));
+  assert.strictEqual(await saldo(OTHER), before - 1000, 'tanpa paket yang cocok, perpanjang memakai harga dasar server');
+  assert.strictEqual(lastApi.body.limitip, 2);
+
+  // ── Menu pengguna: cari (baca saja), edit saldo, edit info terpisah ──────
+  calls = await step(cbUpdate(ADMIN, 'a:u'));
+  const userMenu = calls.find((c) => /KELOLA PENGGUNA/.test(c.payload.text || ''));
+  const userButtons = userMenu.payload.reply_markup.inline_keyboard.flat().map((b) => b.text);
+  for (const label of ['Cari Pengguna', 'Edit Saldo', 'Edit Info Pengguna', 'Kelola Reseller']) assert(userButtons.includes(label), `menu pengguna punya ${label}`);
+  await step(cbUpdate(ADMIN, 'a:uf'));
+  calls = await step(textUpdate(ADMIN, `User${OTHER}`));
+  const detail = calls.find((c) => /DETAIL PENGGUNA/.test(c.payload.text || ''));
+  assert(detail, 'pencarian nama menemukan pengguna');
+  assert(!detail.payload.reply_markup.inline_keyboard.flat().some((b) => /Saldo|Blokir|Reseller/.test(b.text)), 'hasil pencarian hanya menampilkan data');
+  await step(cbUpdate(ADMIN, 'a:es'));
+  calls = await step(textUpdate(ADMIN, String(OTHER)));
+  assert(/EDIT SALDO/.test(texts(calls)) && calls.some((c) => (c.payload.reply_markup || { inline_keyboard: [] }).inline_keyboard.flat().some((b) => b.text === 'Tambah Saldo')), 'Edit Saldo menampilkan tombol tambah/kurangi');
+  await step(cbUpdate(ADMIN, 'a:ei'));
+  calls = await step(textUpdate(ADMIN, String(BUYER)));
+  assert(/EDIT INFO PENGGUNA/.test(texts(calls)) && /Reseller  : YA/.test(texts(calls)));
+  await step(cbUpdate(ADMIN, `a:ur:${BUYER}`));
+  assert.strictEqual(Number((await bot.get('SELECT reseller FROM users WHERE id = ?', [BUYER])).reseller), 0, 'reseller bisa dicabut dari Edit Info');
+  calls = await step(cbUpdate(BUYER, `a:ur:${BUYER}`));
+  assert(/khusus admin/.test(alerts(calls)), 'pembeli tidak bisa menjadikan dirinya reseller');
+
+  // Database lama (sebelum fitur reseller/paket) dimigrasi saat dibuka.
+  await bot.closeStore();
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec('ALTER TABLE users DROP COLUMN reseller; ALTER TABLE accounts DROP COLUMN limit_ip; DROP TABLE server_packages;');
+  legacy.close();
+  await bot.openStore();
+  assert((await bot.all('PRAGMA table_info(users)')).some((c) => c.name === 'reseller'), 'kolom reseller ditambahkan ke database lama');
+  assert((await bot.all('PRAGMA table_info(accounts)')).some((c) => c.name === 'limit_ip'), 'kolom limit_ip ditambahkan ke database lama');
+  assert.deepStrictEqual(await bot.all('SELECT * FROM server_packages'), [], 'tabel paket dibuat ulang');
+
   // Semua kabar toko lewat bot jualan ke chat pribadi admin, tidak pernah ke chat notif.
   assert.strictEqual(bot.CONFIG.token, '654321:JUALANTOKEN');
   assert(!tgCalls.some((c) => String(c.payload && c.payload.chat_id) === '-1009999'), 'bot jualan tidak boleh mengirim ke chat bot notif');

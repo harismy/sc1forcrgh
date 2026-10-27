@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.105}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.106}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23408,6 +23408,11 @@ CREATE TABLE IF NOT EXISTS ledger (
   balance INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT, note TEXT, created_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS server_packages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, server_id INTEGER NOT NULL, limit_ip INTEGER NOT NULL,
+  price_day INTEGER NOT NULL, reseller_price_day INTEGER NOT NULL DEFAULT 0, created_at INTEGER,
+  UNIQUE(server_id, limit_ip)
+);
 CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
 CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
 CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, id);
@@ -23451,11 +23456,28 @@ async function loadSettings() {
   for (const row of await all('SELECT key, value FROM settings')) settings.set(row.key, row.value);
 }
 
+// Kolom yang ditambahkan setelah rilis pertama. CREATE TABLE IF NOT EXISTS
+// tidak menambah kolom ke tabel lama (database lama dan file restore).
+const MIGRATIONS = [
+  ['users', 'reseller', 'INTEGER NOT NULL DEFAULT 0'],
+  ['servers', 'reseller_price_day', 'INTEGER NOT NULL DEFAULT 0'],
+  ['accounts', 'limit_ip', 'INTEGER'],
+  ['orders', 'limit_ip', 'INTEGER']
+];
+
+async function migrateSchema() {
+  for (const [table, column, type] of MIGRATIONS) {
+    const cols = await all(`PRAGMA table_info(${table})`);
+    if (!cols.some((c) => c.name === column)) await exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`);
+  }
+}
+
 async function openStore(file = CONFIG.dbPath) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   db = await deps.openDatabase(file);
   await exec('PRAGMA busy_timeout = 5000;');
   await exec(SCHEMA);
+  await migrateSchema();
   await loadSettings();
   await ensureLocalServer();
 }
@@ -24338,12 +24360,17 @@ async function startTopup(ctx, amount, gateway) {
 
 // ── Server ──────────────────────────────────────────────────────────────────
 
-const getServer = (id) => get('SELECT * FROM servers WHERE id = ?', [Number(id)]);
+// pkg_count = jumlah paket limit IP; server dengan paket dijual lewat paket.
+const SERVER_SELECT = 'SELECT s.*, (SELECT COUNT(*) FROM server_packages p WHERE p.server_id = s.id) AS pkg_count FROM servers s';
+const getServer = (id) => get(`${SERVER_SELECT} WHERE s.id = ?`, [Number(id)]);
+
+// Server dijual kalau punya harga dasar atau minimal satu paket limit IP.
+const SELLABLE_SQL = '(s.price_day > 0 OR EXISTS (SELECT 1 FROM server_packages p WHERE p.server_id = s.id))';
 
 async function sellableServers(admin) {
   return admin
-    ? all('SELECT * FROM servers WHERE enabled = 1 ORDER BY local DESC, id')
-    : all('SELECT * FROM servers WHERE enabled = 1 AND price_day > 0 ORDER BY local DESC, id');
+    ? all(`${SERVER_SELECT} WHERE s.enabled = 1 ORDER BY s.local DESC, s.id`)
+    : all(`${SERVER_SELECT} WHERE s.enabled = 1 AND ${SELLABLE_SQL} ORDER BY s.local DESC, s.id`);
 }
 
 async function activeCount(serverId) {
@@ -24353,7 +24380,68 @@ async function activeCount(serverId) {
 
 function serverUsable(server, admin) {
   if (!server || Number(server.enabled) !== 1) return false;
-  return admin || Number(server.price_day) > 0;
+  return admin || Number(server.price_day) > 0 || Number(server.pkg_count) > 0;
+}
+
+// ── Harga: reseller dan paket limit IP ──────────────────────────────────────
+// Harga selalu per hari. Paket (server_packages) menentukan limit IP dan
+// harganya sendiri; server tanpa paket memakai harga dasar dan limit IP
+// server. Reseller memakai harga reseller kalau diisi (> 0), selain itu harga
+// normal, jadi reseller tidak pernah dapat akun gratis karena harga lupa diisi.
+
+function isReseller(ctx) {
+  return Boolean(ctx && ctx.user && Number(ctx.user.reseller) === 1);
+}
+
+function unitPrice(item, reseller) {
+  const base = Number(item && item.price_day) || 0;
+  const special = Number(item && item.reseller_price_day) || 0;
+  return reseller && special > 0 ? special : base;
+}
+
+function limitIpText(limit) {
+  return Number(limit) > 0 ? `${Number(limit)} IP` : 'Unlimited IP';
+}
+
+const serverPackages = (serverId) => all('SELECT * FROM server_packages WHERE server_id = ? ORDER BY limit_ip', [Number(serverId)]);
+
+// Paket pembelian: { packageId, limitIp, price_day, reseller_price_day, label }.
+function planFromServer(server, limitIp) {
+  const limit = limitIp === undefined || limitIp === null ? Number(server.limit_ip) || 0 : Number(limitIp);
+  return { packageId: 0, limitIp: limit, price_day: Number(server.price_day) || 0, reseller_price_day: Number(server.reseller_price_day) || 0, label: limitIpText(limit) };
+}
+
+function planFromPackage(pkg) {
+  return { packageId: Number(pkg.id), limitIp: Number(pkg.limit_ip) || 0, price_day: Number(pkg.price_day) || 0, reseller_price_day: Number(pkg.reseller_price_day) || 0, label: `Paket ${limitIpText(pkg.limit_ip)}` };
+}
+
+// Paket yang dipilih saat membeli. null = paket wajib dipilih dulu / tidak valid.
+async function buyPlan(server, packageId) {
+  if (Number(server.pkg_count) > 0) {
+    if (!packageId) return null;
+    const pkg = await get('SELECT * FROM server_packages WHERE id = ? AND server_id = ?', [Number(packageId), server.id]);
+    return pkg ? planFromPackage(pkg) : null;
+  }
+  return planFromServer(server);
+}
+
+// Perpanjangan mengikuti limit IP akun itu sendiri: paket dengan limit yang
+// sama, atau harga dasar server. null = tidak ada harga untuk limit akun ini.
+async function renewPlan(server, acc) {
+  const limit = acc.limit_ip === undefined || acc.limit_ip === null ? Number(server.limit_ip) || 0 : Number(acc.limit_ip);
+  const pkg = await get('SELECT * FROM server_packages WHERE server_id = ? AND limit_ip = ?', [server.id, limit]);
+  if (pkg) return planFromPackage(pkg);
+  if (Number(server.price_day) > 0) return planFromServer(server, limit);
+  return null;
+}
+
+// Harga termurah per hari di server ini untuk pembeli ini (daftar server).
+async function cheapestPrice(server, reseller) {
+  if (Number(server.pkg_count) > 0) {
+    const prices = (await serverPackages(server.id)).map((pkg) => unitPrice(pkg, reseller)).filter((n) => n > 0);
+    return prices.length ? Math.min(...prices) : 0;
+  }
+  return unitPrice(server, reseller);
 }
 
 // ── Pesanan: buat dan perpanjang ────────────────────────────────────────────
@@ -24362,9 +24450,10 @@ function isUncertain(err) {
   return Boolean(err && err.uncertain);
 }
 
-async function placeOrder(ctx, { kind, server, protocol, username, password, days, accountId }) {
+async function placeOrder(ctx, { kind, server, plan, protocol, username, password, days, accountId }) {
   const uid = Number(ctx.from.id);
-  const amount = ctx.admin ? 0 : Number(server.price_day) * Number(days);
+  if (!plan) throw new UserError('Paket tidak tersedia. Ulangi pembelian.');
+  const amount = ctx.admin ? 0 : unitPrice(plan, isReseller(ctx)) * Number(days);
   if (!ctx.admin && amount <= 0) throw new UserError('Server ini belum punya harga.');
   if (kind === 'create' && Number(server.max_accounts) > 0 && (await activeCount(server.id)) >= Number(server.max_accounts)) {
     throw new UserError('Slot server ini sudah penuh. Pilih server lain.');
@@ -24372,8 +24461,8 @@ async function placeOrder(ctx, { kind, server, protocol, username, password, day
 
   const orderId = await tx(async () => {
     const ins = await run(
-      "INSERT INTO orders (user_id, server_id, kind, protocol, username, days, amount, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)",
-      [uid, server.id, kind, protocol, username, days, amount, now(), now()]
+      "INSERT INTO orders (user_id, server_id, kind, protocol, username, days, amount, limit_ip, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'processing', ?, ?)",
+      [uid, server.id, kind, protocol, username, days, amount, plan.limitIp, now(), now()]
     );
     if (amount > 0) {
       await applyBalance(uid, -amount, kind === 'create' ? 'buy' : 'renew', `order:${ins.lastID}`, `${kind === 'create' ? 'Beli' : 'Perpanjang'} ${PROTOCOLS[protocol].label} ${username} ${days} hari`);
@@ -24382,7 +24471,7 @@ async function placeOrder(ctx, { kind, server, protocol, username, password, day
   });
 
   const owner = { telegram_user_id: uid, telegram_chat_id: Number(ctx.chatId) };
-  const limits = { kuota: Number(server.quota_gb) || 0, limitip: Number(server.limit_ip) || 0 };
+  const limits = { kuota: Number(server.quota_gb) || 0, limitip: Number(plan.limitIp) || 0 };
   let data;
   try {
     if (kind === 'create') {
@@ -24405,7 +24494,7 @@ async function placeOrder(ctx, { kind, server, protocol, username, password, day
         `Order    : #${orderId} (${kind === 'create' ? 'buat' : 'perpanjang'})`,
         `Pengguna : <code>${uid}</code>`,
         `Server   : ${escapeHtml(server.name)}`,
-        `Akun     : ${escapeHtml(PROTOCOLS[protocol].label)} ${escapeHtml(username)} (${days} hari)`,
+        `Akun     : ${escapeHtml(PROTOCOLS[protocol].label)} ${escapeHtml(username)} (${days} hari, ${limitIpText(plan.limitIp)})`,
         `Nominal  : ${rupiah(amount)}`,
         'Server tidak menjawab tepat waktu. Cek akunnya, lalu pilih Refund atau Selesai di Menu Admin > Pesanan Bermasalah.'
       ].join('\n'));
@@ -24422,8 +24511,8 @@ async function placeOrder(ctx, { kind, server, protocol, username, password, day
     await run("UPDATE orders SET status = 'done', updated_at = ? WHERE id = ?", [now(), orderId]);
     if (kind === 'create') {
       await run(
-        'INSERT INTO accounts (user_id, server_id, protocol, username, expired, expired_at, trial, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?) ON CONFLICT(server_id, protocol, username) DO UPDATE SET user_id = excluded.user_id, expired = excluded.expired, expired_at = excluded.expired_at, trial = 0',
-        [uid, server.id, protocol, finalUser, expiredRaw, expiredAt, now()]
+        'INSERT INTO accounts (user_id, server_id, protocol, username, expired, expired_at, trial, limit_ip, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?) ON CONFLICT(server_id, protocol, username) DO UPDATE SET user_id = excluded.user_id, expired = excluded.expired, expired_at = excluded.expired_at, trial = 0, limit_ip = excluded.limit_ip',
+        [uid, server.id, protocol, finalUser, expiredRaw, expiredAt, plan.limitIp, now()]
       );
     } else {
       await run('UPDATE accounts SET expired = ?, expired_at = ? WHERE id = ?', [expiredRaw, expiredAt, accountId]);
@@ -24433,9 +24522,9 @@ async function placeOrder(ctx, { kind, server, protocol, username, password, day
     await notifyAdmins([
       `<b>${kind === 'create' ? 'PENJUALAN AKUN' : 'PERPANJANGAN AKUN'}</b>`,
       LINE,
-      `Pengguna : <code>${uid}</code>`,
+      `Pengguna : <code>${uid}</code>${isReseller(ctx) ? ' (reseller)' : ''}`,
       `Server   : ${escapeHtml(server.name)}`,
-      `Akun     : ${escapeHtml(PROTOCOLS[protocol].label)} ${escapeHtml(finalUser)} (${days} hari)`,
+      `Akun     : ${escapeHtml(PROTOCOLS[protocol].label)} ${escapeHtml(finalUser)} (${days} hari, ${limitIpText(plan.limitIp)})`,
       `Nominal  : ${rupiah(amount)}`
     ].join('\n'));
   }
@@ -24498,7 +24587,7 @@ async function showHome(ctx) {
   const uid = Number(ctx.from.id);
   const user = await get('SELECT * FROM users WHERE id = ?', [uid]);
   const stats = await get(
-    `SELECT (SELECT COUNT(*) FROM servers WHERE enabled = 1 AND price_day > 0) AS servers,
+    `SELECT (SELECT COUNT(*) FROM servers s WHERE s.enabled = 1 AND ${SELLABLE_SQL}) AS servers,
             (SELECT COUNT(*) FROM users) AS users,
             (SELECT COUNT(*) FROM accounts WHERE trial = 0 AND expired_at > ?) AS accounts,
             (SELECT COUNT(*) FROM accounts WHERE trial = 0 AND expired_at > ? AND user_id = ?) AS mine`,
@@ -24511,6 +24600,7 @@ async function showHome(ctx) {
     `ID Telegram : <code>${uid}</code>`,
     `Nama        : ${escapeHtml(user && user.name ? user.name : '-')}`,
     `Saldo       : <b>${rupiah(user ? user.saldo : 0)}</b>`,
+    isReseller(ctx) ? 'Status      : <b>Reseller</b> (harga khusus reseller)' : null,
     LINE,
     `Server aktif : ${stats.servers}`,
     `Pengguna bot : ${stats.users}`,
@@ -24520,19 +24610,31 @@ async function showHome(ctx) {
   ];
   const info = setting('info_text');
   if (info) lines.push(escapeHtml(info));
+  for (let i = lines.length - 1; i >= 0; i -= 1) if (lines[i] === null) lines.splice(i, 1);
   if (setting('contact')) lines.push(`Kontak admin: ${escapeHtml(setting('contact'))}`);
   return show(ctx, lines.join('\n'), homeKeyboard(ctx.admin));
 }
 
 async function showServerList(ctx) {
   const servers = await sellableServers(false);
-  const lines = ['<b>DAFTAR SERVER DAN HARGA</b>', LINE];
+  const reseller = isReseller(ctx);
+  const lines = [`<b>DAFTAR SERVER DAN HARGA${reseller ? ' RESELLER' : ''}</b>`, LINE];
   if (!servers.length) lines.push('Belum ada server yang dijual.');
   for (const [i, s] of servers.entries()) {
     const used = await activeCount(s.id);
     lines.push(`${i + 1}. <b>${escapeHtml(s.name)}</b>`);
-    lines.push(`   Harga    : ${rupiah(s.price_day)} / hari (${rupiah(s.price_day * 30)} / 30 hari)`);
-    lines.push(`   Quota    : ${Number(s.quota_gb) > 0 ? `${s.quota_gb} GB` : 'Unlimited'} | Limit IP: ${Number(s.limit_ip) > 0 ? s.limit_ip : 'Unlimited'}`);
+    if (Number(s.pkg_count) > 0) {
+      lines.push('   Paket    :');
+      for (const pkg of await serverPackages(s.id)) {
+        const price = unitPrice(pkg, reseller);
+        lines.push(`   - ${limitIpText(pkg.limit_ip)}: ${rupiah(price)} / hari (${rupiah(price * 30)} / 30 hari)`);
+      }
+      lines.push(`   Quota    : ${Number(s.quota_gb) > 0 ? `${s.quota_gb} GB` : 'Unlimited'}`);
+    } else {
+      const price = unitPrice(s, reseller);
+      lines.push(`   Harga    : ${rupiah(price)} / hari (${rupiah(price * 30)} / 30 hari)`);
+      lines.push(`   Quota    : ${Number(s.quota_gb) > 0 ? `${s.quota_gb} GB` : 'Unlimited'} | Limit IP: ${Number(s.limit_ip) > 0 ? s.limit_ip : 'Unlimited'}`);
+    }
     lines.push(`   Slot     : ${Number(s.max_accounts) > 0 ? `${used}/${s.max_accounts}` : `${used} terpakai`}`);
   }
   lines.push(LINE, 'Layanan: SSH/UDP (ZIVPN, UDP Custom), VMess, VLESS, Trojan.');
@@ -24546,10 +24648,16 @@ async function chooseServer(ctx, mode) {
   const servers = await sellableServers(ctx.admin);
   if (!servers.length) return show(ctx, 'Belum ada server yang tersedia. Hubungi admin.', kb([backRow()]));
   const title = mode === 'b' ? 'BUAT AKUN' : 'TRIAL GRATIS';
-  const buttons = servers.map((s) => btn(
-    mode === 'b' ? `${s.name} - ${Number(s.price_day) > 0 ? `${rupiah(s.price_day)}/hari` : 'harga belum diisi'}` : s.name,
-    `${mode}:s:${s.id}`
-  ));
+  const buttons = [];
+  for (const s of servers) {
+    let label = s.name;
+    if (mode === 'b') {
+      const price = await cheapestPrice(s, isReseller(ctx));
+      const prefix = Number(s.pkg_count) > 1 ? 'mulai ' : '';
+      label = `${s.name} - ${price > 0 ? `${prefix}${rupiah(price)}/hari` : 'harga belum diisi'}`;
+    }
+    buttons.push(btn(label, `${mode}:s:${s.id}`));
+  }
   return show(ctx, `<b>${title}</b>\n${LINE}\nPilih server:`, kb([...buttons.map((b) => [b]), backRow()]));
 }
 
@@ -24558,7 +24666,11 @@ async function chooseProtocol(ctx, mode, serverId) {
   if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server tidak tersedia.', kb([backRow(mode)]));
   const buttons = Object.keys(PROTOCOLS).map((p) => btn(PROTOCOLS[p].label, `${mode}:p:${server.id}:${p}`));
   const lines = [`<b>${mode === 'b' ? 'BUAT AKUN' : 'TRIAL GRATIS'}</b>`, LINE, `Server : ${escapeHtml(server.name)}`];
-  if (mode === 'b') lines.push(`Harga  : ${ctx.admin ? 'gratis (admin)' : `${rupiah(server.price_day)} / hari`}`);
+  if (mode === 'b') {
+    const price = await cheapestPrice(server, isReseller(ctx));
+    const prefix = Number(server.pkg_count) > 1 ? 'mulai ' : '';
+    lines.push(`Harga  : ${ctx.admin ? 'gratis (admin)' : `${prefix}${rupiah(price)} / hari`}`);
+  }
   else lines.push('Masa aktif trial: 60 menit.');
   lines.push(LINE, 'Pilih layanan:');
   return show(ctx, lines.join('\n'), kb([...pairs(buttons), backRow(mode)]));
@@ -24584,17 +24696,15 @@ async function askUsername(ctx, serverId, protocol) {
   ].join('\n'), kb([backRow('b', 'Batal')]));
 }
 
-function durationKeyboard(prefix, server, admin, extra = '') {
+function durationKeyboard(prefix, unit, admin, extra = '') {
   const buttons = DURATIONS.map((d) => btn(
-    admin ? `${d} hari` : `${d} hari - ${rupiah(Number(server.price_day) * d)}`,
+    admin ? `${d} hari` : `${d} hari - ${rupiah(Number(unit) * d)}`,
     `${prefix}${extra}${d}`
   ));
   return pairs(buttons);
 }
 
-async function askDuration(ctx, order) {
-  const server = await getServer(order.serverId);
-  setPending(ctx.from.id, 'buy_days', order);
+function buyHeader(server, order) {
   const lines = [
     `<b>BUAT AKUN ${escapeHtml(PROTOCOLS[order.protocol].label.toUpperCase())}</b>`,
     LINE,
@@ -24602,8 +24712,36 @@ async function askDuration(ctx, order) {
     `Username : <code>${escapeHtml(order.username)}</code>`
   ];
   if (order.protocol === 'ssh') lines.push(`Password : <code>${escapeHtml(order.password)}</code>`);
+  return lines;
+}
+
+// Server dengan paket limit IP: paket dipilih dulu, baru masa aktif.
+async function askPackage(ctx, order) {
+  const server = await getServer(order.serverId);
+  if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server tidak tersedia.', kb([backRow()]));
+  const packages = await serverPackages(server.id);
+  const reseller = isReseller(ctx);
+  setPending(ctx.from.id, 'buy_pkg', order);
+  const buttons = packages.map((pkg) => btn(
+    ctx.admin ? limitIpText(pkg.limit_ip) : `${limitIpText(pkg.limit_ip)} - ${rupiah(unitPrice(pkg, reseller))}/hari`,
+    `b:k:${pkg.id}`
+  ));
+  const lines = [...buyHeader(server, order), LINE, 'Pilih paket limit IP (jumlah perangkat yang boleh login bersamaan):'];
+  return reply(ctx, lines.join('\n'), kb([...buttons.map((b) => [b]), backRow('h', 'Batal')]));
+}
+
+async function askDuration(ctx, order) {
+  const server = await getServer(order.serverId);
+  if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server tidak tersedia.', kb([backRow()]));
+  if (Number(server.pkg_count) > 0 && !order.packageId) return askPackage(ctx, order);
+  const plan = await buyPlan(server, order.packageId);
+  if (!plan) return show(ctx, 'Paket tidak tersedia. Ulangi dari Buat Akun.', kb([backRow()]));
+  setPending(ctx.from.id, 'buy_days', order);
+  const lines = buyHeader(server, order);
+  if (Number(server.pkg_count) > 0) lines.push(`Paket    : ${escapeHtml(plan.label)}`);
   lines.push(LINE, 'Pilih masa aktif:');
-  return reply(ctx, lines.join('\n'), kb([...durationKeyboard('b:d:', server, ctx.admin), backRow('h', 'Batal')]));
+  const send = ctx.cb ? show : reply;
+  return send(ctx, lines.join('\n'), kb([...durationKeyboard('b:d:', unitPrice(plan, isReseller(ctx)), ctx.admin), backRow('h', 'Batal')]));
 }
 
 // Pesan "sedang diproses" menggantikan menu; kalau langkah berikutnya gagal,
@@ -24620,8 +24758,11 @@ async function confirmBuy(ctx, days) {
   const order = { ...item.data, days };
   const server = await getServer(order.serverId);
   if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server tidak tersedia.', kb([backRow()]));
+  const plan = await buyPlan(server, order.packageId);
+  if (!plan) return show(ctx, 'Paket tidak tersedia. Ulangi dari Buat Akun.', kb([backRow()]));
   const user = await get('SELECT saldo FROM users WHERE id = ?', [Number(ctx.from.id)]);
-  const amount = ctx.admin ? 0 : Number(server.price_day) * days;
+  const unit = unitPrice(plan, isReseller(ctx));
+  const amount = ctx.admin ? 0 : unit * days;
   setPending(ctx.from.id, 'buy_confirm', order);
   const lines = [
     '<b>KONFIRMASI PEMBELIAN</b>',
@@ -24631,8 +24772,8 @@ async function confirmBuy(ctx, days) {
     `Username : <code>${escapeHtml(order.username)}</code>`,
     `Durasi   : ${days} hari`,
     `Quota    : ${Number(server.quota_gb) > 0 ? `${server.quota_gb} GB` : 'Unlimited'}`,
-    `Limit IP : ${Number(server.limit_ip) > 0 ? server.limit_ip : 'Unlimited'}`,
-    `Harga    : ${ctx.admin ? 'gratis (admin)' : rupiah(amount)}`
+    `Limit IP : ${Number(plan.limitIp) > 0 ? plan.limitIp : 'Unlimited'}`,
+    `Harga    : ${ctx.admin ? 'gratis (admin)' : `${rupiah(amount)} (${rupiah(unit)} x ${days} hari${isReseller(ctx) ? ', harga reseller' : ''})`}`
   ];
   if (!ctx.admin) {
     lines.push(`Saldo    : ${rupiah(user.saldo)} -> ${rupiah(user.saldo - amount)}`);
@@ -24652,9 +24793,11 @@ async function executeBuy(ctx) {
   const order = item.data;
   const server = await getServer(order.serverId);
   if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server tidak tersedia.', kb([backRow()]));
+  const plan = await buyPlan(server, order.packageId);
+  if (!plan) return show(ctx, 'Paket tidak tersedia. Ulangi dari Buat Akun.', kb([backRow()]));
   await progress(ctx, `Membuat akun <code>${escapeHtml(order.username)}</code> di ${escapeHtml(server.name)}...`);
-  const result = await placeOrder(ctx, { kind: 'create', server, protocol: order.protocol, username: order.username, password: order.password, days: order.days });
-  await sendAccountMessage(ctx.chatId, formatAccountMessage(order.protocol, result.data, { username: result.username, quota: server.quota_gb, limitip: server.limit_ip }), kb([backRow('h', 'Menu Utama')]));
+  const result = await placeOrder(ctx, { kind: 'create', server, plan, protocol: order.protocol, username: order.username, password: order.password, days: order.days });
+  await sendAccountMessage(ctx.chatId, formatAccountMessage(order.protocol, result.data, { username: result.username, quota: server.quota_gb, limitip: plan.limitIp }), kb([backRow('h', 'Menu Utama')]));
   await show(ctx, `Akun <code>${escapeHtml(result.username)}</code> berhasil dibuat.${result.amount > 0 ? ` Saldo terpotong ${rupiah(result.amount)}.` : ''}`, kb([]));
 }
 
@@ -24732,15 +24875,19 @@ async function chooseRenewDays(ctx, accountId) {
   if (!acc) return show(ctx, 'Akun tidak ditemukan.', kb([backRow('r')]));
   const server = await getServer(acc.server_id);
   if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server akun ini sedang tidak menerima perpanjangan.', kb([backRow('r')]));
+  const plan = await renewPlan(server, acc);
+  if (!plan && !ctx.admin) return show(ctx, 'Paket limit IP akun ini sudah tidak dijual. Hubungi admin.', kb([backRow('r')]));
+  const usePlan = plan || planFromServer(server, acc.limit_ip);
   return show(ctx, [
     '<b>PERPANJANG AKUN</b>',
     LINE,
-    `Akun   : ${escapeHtml(PROTOCOLS[acc.protocol].label)} <code>${escapeHtml(acc.username)}</code>`,
-    `Server : ${escapeHtml(server.name)}`,
-    `Exp    : ${escapeHtml(acc.expired || wib(acc.expired_at))}`,
+    `Akun     : ${escapeHtml(PROTOCOLS[acc.protocol].label)} <code>${escapeHtml(acc.username)}</code>`,
+    `Server   : ${escapeHtml(server.name)}`,
+    `Limit IP : ${Number(usePlan.limitIp) > 0 ? usePlan.limitIp : 'Unlimited'}`,
+    `Exp      : ${escapeHtml(acc.expired || wib(acc.expired_at))}`,
     LINE,
     'Pilih tambahan masa aktif:'
-  ].join('\n'), kb([...durationKeyboard('r:d:', server, ctx.admin, `${acc.id}:`), backRow('r')]));
+  ].join('\n'), kb([...durationKeyboard('r:d:', unitPrice(usePlan, isReseller(ctx)), ctx.admin, `${acc.id}:`), backRow('r')]));
 }
 
 async function confirmRenew(ctx, accountId, days) {
@@ -24748,18 +24895,23 @@ async function confirmRenew(ctx, accountId, days) {
   if (!acc) return show(ctx, 'Akun tidak ditemukan.', kb([backRow('r')]));
   const server = await getServer(acc.server_id);
   if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server akun ini sedang tidak menerima perpanjangan.', kb([backRow('r')]));
+  const plan = await renewPlan(server, acc);
+  if (!plan && !ctx.admin) return show(ctx, 'Paket limit IP akun ini sudah tidak dijual. Hubungi admin.', kb([backRow('r')]));
+  const usePlan = plan || planFromServer(server, acc.limit_ip);
   const user = await get('SELECT saldo FROM users WHERE id = ?', [Number(ctx.from.id)]);
-  const amount = ctx.admin ? 0 : Number(server.price_day) * days;
+  const unit = unitPrice(usePlan, isReseller(ctx));
+  const amount = ctx.admin ? 0 : unit * days;
   const lines = [
     '<b>KONFIRMASI PERPANJANGAN</b>',
     LINE,
-    `Akun   : ${escapeHtml(PROTOCOLS[acc.protocol].label)} <code>${escapeHtml(acc.username)}</code>`,
-    `Server : ${escapeHtml(server.name)}`,
-    `Tambah : ${days} hari`,
-    `Harga  : ${ctx.admin ? 'gratis (admin)' : rupiah(amount)}`
+    `Akun     : ${escapeHtml(PROTOCOLS[acc.protocol].label)} <code>${escapeHtml(acc.username)}</code>`,
+    `Server   : ${escapeHtml(server.name)}`,
+    `Limit IP : ${Number(usePlan.limitIp) > 0 ? usePlan.limitIp : 'Unlimited'}`,
+    `Tambah   : ${days} hari`,
+    `Harga    : ${ctx.admin ? 'gratis (admin)' : `${rupiah(amount)} (${rupiah(unit)} x ${days} hari${isReseller(ctx) ? ', harga reseller' : ''})`}`
   ];
   if (!ctx.admin) {
-    lines.push(`Saldo  : ${rupiah(user.saldo)} -> ${rupiah(user.saldo - amount)}`);
+    lines.push(`Saldo    : ${rupiah(user.saldo)} -> ${rupiah(user.saldo - amount)}`);
     if (user.saldo < amount) {
       lines.push(LINE, `Saldo kurang ${rupiah(amount - user.saldo)}. Silakan top up dulu.`);
       return show(ctx, lines.join('\n'), kb([[btn('Top Up Saldo', 'tu')], backRow('r')]));
@@ -24780,8 +24932,10 @@ async function executeRenew(ctx, accountId, days) {
   if (!acc) return show(ctx, 'Akun tidak ditemukan.', kb([backRow('r')]));
   const server = await getServer(acc.server_id);
   if (!serverUsable(server, ctx.admin)) return show(ctx, 'Server akun ini sedang tidak menerima perpanjangan.', kb([backRow('r')]));
+  const plan = (await renewPlan(server, acc)) || (ctx.admin ? planFromServer(server, acc.limit_ip) : null);
+  if (!plan) return show(ctx, 'Paket limit IP akun ini sudah tidak dijual. Hubungi admin.', kb([backRow('r')]));
   await progress(ctx, `Memperpanjang <code>${escapeHtml(acc.username)}</code>...`);
-  const result = await placeOrder(ctx, { kind: 'renew', server, protocol: acc.protocol, username: acc.username, days, accountId: acc.id });
+  const result = await placeOrder(ctx, { kind: 'renew', server, plan, protocol: acc.protocol, username: acc.username, days, accountId: acc.id });
   await show(ctx, [
     '<b>PERPANJANGAN BERHASIL</b>',
     LINE,
@@ -24847,7 +25001,8 @@ async function showAdmin(ctx) {
     `SELECT (SELECT COUNT(*) FROM users) AS users,
             (SELECT COALESCE(SUM(saldo), 0) FROM users) AS saldo,
             (SELECT COUNT(*) FROM servers) AS servers,
-            (SELECT COUNT(*) FROM servers WHERE enabled = 1 AND price_day > 0) AS live,
+            (SELECT COUNT(*) FROM servers s WHERE s.enabled = 1 AND ${SELLABLE_SQL}) AS live,
+            (SELECT COUNT(*) FROM users WHERE reseller = 1) AS resellers,
             (SELECT COALESCE(SUM(delta), 0) FROM ledger WHERE kind = 'topup' AND created_at >= ?) AS topup,
             (SELECT COUNT(*) FROM ledger WHERE kind = 'topup' AND created_at >= ?) AS topup_n,
             (SELECT COALESCE(-SUM(delta), 0) FROM ledger WHERE kind IN ('buy', 'renew', 'refund') AND created_at >= ?) AS sales,
@@ -24858,7 +25013,7 @@ async function showAdmin(ctx) {
   const text = [
     '<b>MENU ADMIN</b>',
     LINE,
-    `Pengguna       : ${s.users}`,
+    `Pengguna       : ${s.users} (reseller ${s.resellers})`,
     `Saldo beredar  : ${rupiah(s.saldo)}`,
     `Server         : ${s.servers} (dijual ${s.live})`,
     `Top up hari ini: ${rupiah(s.topup)} (${s.topup_n}x)`,
@@ -24877,12 +25032,12 @@ async function showAdmin(ctx) {
 
 async function showAdminServers(ctx) {
   clearPending(ctx.from.id);
-  const servers = await all('SELECT * FROM servers ORDER BY local DESC, id');
+  const servers = await all(`${SERVER_SELECT} ORDER BY s.local DESC, s.id`);
   const lines = ['<b>KELOLA SERVER</b>', LINE];
   for (const s of servers) {
-    const state = Number(s.enabled) !== 1 ? 'NONAKTIF' : (Number(s.price_day) > 0 ? 'DIJUAL' : 'HARGA KOSONG');
+    const state = Number(s.enabled) !== 1 ? 'NONAKTIF' : (serverUsable(s, false) ? 'DIJUAL' : 'HARGA KOSONG');
     lines.push(`#${s.id} <b>${escapeHtml(s.name)}</b>${Number(s.local) === 1 ? ' (server ini)' : ''} - ${state}`);
-    lines.push(`   ${escapeHtml(s.domain)} | ${rupiah(s.price_day)}/hari`);
+    lines.push(`   ${escapeHtml(s.domain)} | ${Number(s.pkg_count) > 0 ? `${s.pkg_count} paket limit IP` : `${rupiah(s.price_day)}/hari`}`);
   }
   lines.push(LINE, 'Server baru didaftarkan dengan domain + Auth Token SC-nya (menu Tools > Informasi Key Script di VPS itu).');
   const buttons = servers.map((s) => btn(`#${s.id} ${s.name}`, `a:sv:${s.id}`));
@@ -24901,14 +25056,17 @@ async function showAdminServer(ctx, id) {
     `Nama      : ${escapeHtml(s.name)}`,
     `Domain    : ${escapeHtml(s.domain)}`,
     `Token     : ${local ? 'otomatis (lokal)' : escapeHtml(maskSecret(s.token))}`,
-    `Harga     : ${rupiah(s.price_day)} / hari`,
+    `Harga     : ${rupiah(s.price_day)} / hari${Number(s.pkg_count) > 0 ? ' (tidak dipakai, server ini dijual per paket)' : ''}`,
+    `Reseller  : ${Number(s.reseller_price_day) > 0 ? `${rupiah(s.reseller_price_day)} / hari` : 'sama dengan harga normal'}`,
     `Quota     : ${Number(s.quota_gb) > 0 ? `${s.quota_gb} GB` : 'Unlimited'}`,
-    `Limit IP  : ${Number(s.limit_ip) > 0 ? s.limit_ip : 'Unlimited'}`,
+    `Limit IP  : ${Number(s.pkg_count) > 0 ? 'mengikuti paket' : (Number(s.limit_ip) > 0 ? s.limit_ip : 'Unlimited')}`,
+    `Paket IP  : ${Number(s.pkg_count) > 0 ? `${s.pkg_count} paket` : 'belum ada (pakai harga dan limit IP di atas)'}`,
     `Maks akun : ${Number(s.max_accounts) > 0 ? `${s.max_accounts} (terpakai ${used})` : `tanpa batas (terpakai ${used})`}`,
-    `Status    : ${Number(s.enabled) === 1 ? 'AKTIF' : 'NONAKTIF'}${Number(s.price_day) > 0 ? '' : ' (tidak tampil ke pembeli sampai harga diisi)'}`
+    `Status    : ${Number(s.enabled) === 1 ? 'AKTIF' : 'NONAKTIF'}${serverUsable(s, false) ? '' : ' (tidak tampil ke pembeli sampai harga atau paket diisi)'}`
   ].join('\n');
   return show(ctx, text, kb([
-    [btn('Ubah Harga', `a:se:${s.id}:price_day`), btn('Ubah Quota', `a:se:${s.id}:quota_gb`)],
+    [btn('Ubah Harga', `a:se:${s.id}:price_day`), btn('Harga Reseller', `a:se:${s.id}:reseller_price_day`)],
+    [btn(`Paket Limit IP (${s.pkg_count})`, `a:pk:${s.id}`), btn('Ubah Quota', `a:se:${s.id}:quota_gb`)],
     [btn('Ubah Limit IP', `a:se:${s.id}:limit_ip`), btn('Ubah Maks Akun', `a:se:${s.id}:max_accounts`)],
     [btn('Ubah Nama', `a:se:${s.id}:name`), local ? null : btn('Ganti Token', `a:se:${s.id}:token`)].filter(Boolean),
     [btn('Cek Koneksi', `a:sc:${s.id}`), btn(Number(s.enabled) === 1 ? 'Nonaktifkan' : 'Aktifkan', `a:so:${s.id}`)],
@@ -24920,6 +25078,7 @@ async function showAdminServer(ctx, id) {
 const SERVER_FIELDS = {
   name: { label: 'nama server (maks 32 karakter)' },
   price_day: { label: 'harga per hari dalam rupiah (contoh 1000). Isi 0 untuk berhenti menjual', min: 0, max: 10000000 },
+  reseller_price_day: { label: 'harga reseller per hari dalam rupiah (contoh 700). Isi 0 supaya reseller memakai harga normal', min: 0, max: 10000000 },
   quota_gb: { label: 'quota per akun dalam GB (0 = unlimited)', min: 0, max: 100000 },
   limit_ip: { label: 'limit IP per akun (0 = unlimited)', min: 0, max: 100 },
   max_accounts: { label: 'maksimal akun aktif di server ini (0 = tanpa batas)', min: 0, max: 100000 },
@@ -24983,35 +25142,235 @@ async function addServerStep(ctx, step, data, text) {
   return null;
 }
 
+// ── Paket limit IP per server ───────────────────────────────────────────────
+
+async function showAdminPackages(ctx, serverId) {
+  clearPending(ctx.from.id);
+  const s = await getServer(serverId);
+  if (!s) return show(ctx, 'Server tidak ditemukan.', kb([backRow('a:sv')]));
+  const packages = await serverPackages(s.id);
+  const lines = [`<b>PAKET LIMIT IP - ${escapeHtml(s.name)}</b>`, LINE];
+  if (!packages.length) {
+    lines.push('Belum ada paket. Server ini memakai harga dan limit IP dasar.');
+  } else {
+    for (const pkg of packages) {
+      lines.push(`<b>${limitIpText(pkg.limit_ip)}</b>: ${rupiah(pkg.price_day)}/hari | reseller ${Number(pkg.reseller_price_day) > 0 ? `${rupiah(pkg.reseller_price_day)}/hari` : 'harga normal'}`);
+    }
+  }
+  lines.push(LINE, 'Kalau server punya paket, pembeli memilih paket (limit IP) saat membeli dan harga mengikuti paket. Perpanjangan memakai paket dengan limit IP yang sama dengan akunnya.');
+  const buttons = packages.map((pkg) => btn(`Ubah ${limitIpText(pkg.limit_ip)}`, `a:pk:${s.id}:${pkg.id}`));
+  return show(ctx, lines.join('\n'), kb([...pairs(buttons), [btn('Tambah Paket', `a:pka:${s.id}`)], backRow(`a:sv:${s.id}`)]));
+}
+
+async function showAdminPackage(ctx, serverId, packageId) {
+  clearPending(ctx.from.id);
+  const pkg = await get('SELECT * FROM server_packages WHERE id = ? AND server_id = ?', [Number(packageId), Number(serverId)]);
+  if (!pkg) return showAdminPackages(ctx, serverId);
+  const s = await getServer(pkg.server_id);
+  return show(ctx, [
+    `<b>PAKET ${escapeHtml(limitIpText(pkg.limit_ip).toUpperCase())}</b>`,
+    LINE,
+    `Server         : ${escapeHtml(s ? s.name : '-')}`,
+    `Limit IP       : ${limitIpText(pkg.limit_ip)}`,
+    `Harga          : ${rupiah(pkg.price_day)} / hari (${rupiah(pkg.price_day * 30)} / 30 hari)`,
+    `Harga reseller : ${Number(pkg.reseller_price_day) > 0 ? `${rupiah(pkg.reseller_price_day)} / hari` : 'sama dengan harga normal'}`
+  ].join('\n'), kb([
+    [btn('Ubah Harga', `a:pke:${pkg.id}:price_day`), btn('Harga Reseller', `a:pke:${pkg.id}:reseller_price_day`)],
+    [btn('Hapus Paket', `a:pkd:${pkg.id}`)],
+    backRow(`a:pk:${pkg.server_id}`)
+  ]));
+}
+
+const PACKAGE_FIELDS = {
+  price_day: { label: 'harga paket per hari dalam rupiah (contoh 300)', min: 1, max: 10000000 },
+  reseller_price_day: { label: 'harga reseller paket per hari (contoh 200). Isi 0 supaya reseller memakai harga normal', min: 0, max: 10000000 }
+};
+
+function packageNumber(raw, spec) {
+  const value = toInt(raw);
+  if (!Number.isFinite(value) || value < spec.min || value > spec.max) throw new UserError(`Masukkan angka ${spec.min}-${spec.max}.`);
+  return value;
+}
+
+async function addPackageStep(ctx, data, text) {
+  const s = await getServer(data.serverId);
+  if (!s) throw new UserError('Server tidak ditemukan.');
+  if (data.step === 'limit') {
+    const limit = toInt(text);
+    if (!Number.isFinite(limit) || limit < 1 || limit > 100) throw new UserError('Limit IP harus angka 1-100.');
+    if (await get('SELECT id FROM server_packages WHERE server_id = ? AND limit_ip = ?', [s.id, limit])) {
+      throw new UserError(`Paket ${limit} IP sudah ada di server ini. Ubah harganya dari daftar paket.`);
+    }
+    setPending(ctx.from.id, 'a_pkg_add', { ...data, step: 'price', limit });
+    return reply(ctx, `Paket <b>${limit} IP</b>. Kirim ${PACKAGE_FIELDS.price_day.label}.`, kb([backRow(`a:pk:${s.id}`, 'Batal')]));
+  }
+  if (data.step === 'price') {
+    const price = packageNumber(text, PACKAGE_FIELDS.price_day);
+    setPending(ctx.from.id, 'a_pkg_add', { ...data, step: 'reseller', price });
+    return reply(ctx, `Kirim ${PACKAGE_FIELDS.reseller_price_day.label}.`, kb([backRow(`a:pk:${s.id}`, 'Batal')]));
+  }
+  if (data.step === 'reseller') {
+    const reseller = packageNumber(text, PACKAGE_FIELDS.reseller_price_day);
+    await write(
+      'INSERT INTO server_packages (server_id, limit_ip, price_day, reseller_price_day, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(server_id, limit_ip) DO UPDATE SET price_day = excluded.price_day, reseller_price_day = excluded.reseller_price_day',
+      [s.id, data.limit, data.price, reseller, now()]
+    );
+    clearPending(ctx.from.id);
+    await reply(ctx, `Paket <b>${data.limit} IP</b> ditambahkan: ${rupiah(data.price)}/hari, reseller ${reseller > 0 ? `${rupiah(reseller)}/hari` : 'harga normal'}.`);
+    return showAdminPackages({ ...ctx, cb: null }, s.id);
+  }
+  return null;
+}
+
+async function savePackageField(ctx, packageId, field, raw) {
+  const pkg = await get('SELECT * FROM server_packages WHERE id = ?', [Number(packageId)]);
+  if (!pkg || !PACKAGE_FIELDS[field]) throw new UserError('Paket tidak ditemukan.');
+  const value = packageNumber(raw, PACKAGE_FIELDS[field]);
+  await write(`UPDATE server_packages SET ${field} = ? WHERE id = ?`, [value, pkg.id]);
+  return pkg;
+}
+
+// ── Pengguna: cari, edit saldo, edit info, reseller ─────────────────────────
+// Pencarian hanya menampilkan data. Ubah saldo dan ubah info punya menu
+// sendiri supaya admin tidak salah tekan saat sekadar mencari pengguna.
+
+async function findUsers(query) {
+  const text = String(query || '').trim();
+  if (!text) return [];
+  const id = toInt(text);
+  if (Number.isFinite(id) && /^\d+$/.test(text)) return all('SELECT * FROM users WHERE id = ?', [id]);
+  if (text.startsWith('@')) return all('SELECT * FROM users WHERE LOWER(username) = LOWER(?) LIMIT 10', [text.slice(1)]);
+  const like = `%${text.replace(/[%_]/g, '')}%`;
+  return all('SELECT * FROM users WHERE name LIKE ? OR username LIKE ? ORDER BY last_seen DESC LIMIT 10', [like, like]);
+}
+
+function userLabel(u) {
+  return `${u.name || '-'}${u.username ? ` @${u.username}` : ''} (${u.id})`;
+}
+
+function userFlags(u) {
+  return [Number(u.reseller) === 1 ? 'RESELLER' : '', Number(u.banned) === 1 ? 'DIBLOKIR' : ''].filter(Boolean).join(', ');
+}
+
+const USER_PICK = {
+  view: { prompt: 'Kirim ID Telegram, @username, atau nama pengguna yang dicari.', cb: 'a:u', back: 'a:u', show: (ctx, id) => showAdminUser(ctx, id) },
+  saldo: { prompt: 'EDIT SALDO\nKirim ID Telegram atau @username pengguna.', cb: 'a:es', back: 'a:u', show: (ctx, id) => showSaldoUser(ctx, id) },
+  info: { prompt: 'EDIT INFO PENGGUNA\nKirim ID Telegram atau @username pengguna.', cb: 'a:ei', back: 'a:u', show: (ctx, id) => showInfoUser(ctx, id) },
+  reseller: { prompt: 'TAMBAH RESELLER\nKirim ID Telegram atau @username pengguna. Pengguna harus pernah /start bot ini.', cb: 'a:rsy', back: 'a:rs', show: (ctx, id) => confirmReseller(ctx, id) }
+};
+
+async function pickUser(ctx, mode, text) {
+  const spec = USER_PICK[mode];
+  const rows = await findUsers(text);
+  if (!rows.length) throw new UserError('Pengguna tidak ditemukan. Pengguna harus pernah /start bot ini.');
+  clearPending(ctx.from.id);
+  if (rows.length === 1) return spec.show({ ...ctx, cb: null }, rows[0].id);
+  const buttons = rows.map((u) => btn(userLabel(u).slice(0, 60), `${spec.cb}:${u.id}`));
+  return reply(ctx, `<b>${rows.length} pengguna cocok</b>\n${LINE}\nPilih salah satu:`, kb([...buttons.map((b) => [b]), backRow(spec.back)]));
+}
+
 async function showAdminUsers(ctx) {
   clearPending(ctx.from.id);
   const recent = await all('SELECT * FROM users ORDER BY created_at DESC LIMIT 8');
   const lines = ['<b>KELOLA PENGGUNA</b>', LINE, 'Pengguna terbaru:'];
-  for (const u of recent) lines.push(`<code>${u.id}</code> ${escapeHtml(u.name || '-')} ${u.username ? `@${escapeHtml(u.username)}` : ''} - ${rupiah(u.saldo)}${Number(u.banned) ? ' (DIBLOKIR)' : ''}`);
-  return show(ctx, lines.join('\n'), kb([[btn('Cari Pengguna', 'a:uf')], backRow('a')]));
+  for (const u of recent) {
+    const flags = userFlags(u);
+    lines.push(`<code>${u.id}</code> ${escapeHtml(u.name || '-')} ${u.username ? `@${escapeHtml(u.username)}` : ''} - ${rupiah(u.saldo)}${flags ? ` (${flags})` : ''}`);
+  }
+  lines.push(LINE, 'Cari Pengguna hanya menampilkan data. Ubah saldo lewat Edit Saldo, dan ubah status reseller atau blokir lewat Edit Info Pengguna.');
+  return show(ctx, lines.join('\n'), kb([
+    [btn('Cari Pengguna', 'a:uf')],
+    [btn('Edit Saldo', 'a:es'), btn('Edit Info Pengguna', 'a:ei')],
+    [btn('Kelola Reseller', 'a:rs')],
+    backRow('a')
+  ]));
 }
 
-async function showAdminUser(ctx, id) {
-  clearPending(ctx.from.id);
+async function userSummary(id) {
   const u = await get('SELECT * FROM users WHERE id = ?', [Number(id)]);
-  if (!u) return show(ctx, 'Pengguna tidak ditemukan. Pengguna harus pernah /start bot ini.', kb([backRow('a:u')]));
+  if (!u) return null;
   const acc = await get('SELECT COUNT(*) AS n FROM accounts WHERE user_id = ? AND trial = 0 AND expired_at > ?', [u.id, now()]);
   const spent = await get("SELECT COALESCE(-SUM(delta), 0) AS n FROM ledger WHERE user_id = ? AND kind IN ('buy', 'renew', 'refund')", [u.id]);
-  return show(ctx, [
-    '<b>DETAIL PENGGUNA</b>',
-    LINE,
+  return { u, lines: [
     `ID        : <code>${u.id}</code>`,
     `Nama      : ${escapeHtml(u.name || '-')} ${u.username ? `@${escapeHtml(u.username)}` : ''}`,
     `Saldo     : <b>${rupiah(u.saldo)}</b>`,
     `Akun aktif: ${acc.n}`,
     `Belanja   : ${rupiah(spent.n)}`,
     `Bergabung : ${wib(u.created_at).slice(0, 16)} WIB`,
+    `Reseller  : ${Number(u.reseller) === 1 ? 'YA (harga reseller)' : 'tidak'}`,
     `Status    : ${Number(u.banned) ? 'DIBLOKIR' : 'normal'}`
+  ] };
+}
+
+// Hasil Cari Pengguna: hanya baca.
+async function showAdminUser(ctx, id) {
+  clearPending(ctx.from.id);
+  const info = await userSummary(id);
+  if (!info) return show(ctx, 'Pengguna tidak ditemukan. Pengguna harus pernah /start bot ini.', kb([backRow('a:u')]));
+  return show(ctx, ['<b>DETAIL PENGGUNA</b>', LINE, ...info.lines].join('\n'), kb([[btn('Cari Lagi', 'a:uf')], backRow('a:u')]));
+}
+
+async function showSaldoUser(ctx, id) {
+  clearPending(ctx.from.id);
+  const info = await userSummary(id);
+  if (!info) return show(ctx, 'Pengguna tidak ditemukan. Pengguna harus pernah /start bot ini.', kb([backRow('a:u')]));
+  const { u } = info;
+  return show(ctx, [
+    '<b>EDIT SALDO</b>',
+    LINE,
+    `Pengguna : ${escapeHtml(userLabel(u))}`,
+    `Saldo    : <b>${rupiah(u.saldo)}</b>`
   ].join('\n'), kb([
     [btn('Tambah Saldo', `a:ua:${u.id}:+`), btn('Kurangi Saldo', `a:ua:${u.id}:-`)],
-    [btn(Number(u.banned) ? 'Buka Blokir' : 'Blokir', `a:ub:${u.id}`)],
+    [btn('Pengguna Lain', 'a:es')],
     backRow('a:u')
   ]));
+}
+
+async function showInfoUser(ctx, id) {
+  clearPending(ctx.from.id);
+  const info = await userSummary(id);
+  if (!info) return show(ctx, 'Pengguna tidak ditemukan. Pengguna harus pernah /start bot ini.', kb([backRow('a:u')]));
+  const { u } = info;
+  return show(ctx, ['<b>EDIT INFO PENGGUNA</b>', LINE, ...info.lines].join('\n'), kb([
+    [btn(Number(u.reseller) === 1 ? 'Cabut Reseller' : 'Jadikan Reseller', `a:ur:${u.id}`)],
+    [btn(Number(u.banned) ? 'Buka Blokir' : 'Blokir', `a:ub:${u.id}`)],
+    [btn('Pengguna Lain', 'a:ei')],
+    backRow('a:u')
+  ]));
+}
+
+async function showResellers(ctx) {
+  clearPending(ctx.from.id);
+  const rows = await all('SELECT * FROM users WHERE reseller = 1 ORDER BY name LIMIT 40');
+  const lines = ['<b>KELOLA RESELLER</b>', LINE];
+  if (!rows.length) lines.push('Belum ada reseller.');
+  for (const u of rows) lines.push(`<code>${u.id}</code> ${escapeHtml(u.name || '-')} ${u.username ? `@${escapeHtml(u.username)}` : ''} - ${rupiah(u.saldo)}`);
+  lines.push(LINE, 'Reseller membeli dan memperpanjang dengan harga reseller tiap server/paket. Kalau harga reseller tidak diisi, dipakai harga normal.');
+  const buttons = rows.map((u) => btn(userLabel(u).slice(0, 60), `a:ei:${u.id}`));
+  return show(ctx, lines.join('\n'), kb([...buttons.map((b) => [b]), [btn('Tambah Reseller', 'a:rsa')], backRow('a:u')]));
+}
+
+async function confirmReseller(ctx, id) {
+  const u = await get('SELECT * FROM users WHERE id = ?', [Number(id)]);
+  if (!u) return show(ctx, 'Pengguna tidak ditemukan.', kb([backRow('a:rs')]));
+  if (Number(u.reseller) === 1) return show(ctx, `${escapeHtml(userLabel(u))} sudah reseller.`, kb([backRow('a:rs')]));
+  return setReseller(ctx, u.id, true, 'a:rs');
+}
+
+async function setReseller(ctx, id, enabled, back) {
+  const u = await get('SELECT * FROM users WHERE id = ?', [Number(id)]);
+  if (!u) return show(ctx, 'Pengguna tidak ditemukan.', kb([backRow('a:u')]));
+  await write('UPDATE users SET reseller = ? WHERE id = ?', [enabled ? 1 : 0, u.id]);
+  await sendHtml(u.id, enabled
+    ? 'Akun Anda sekarang <b>reseller</b>. Harga reseller berlaku untuk pembelian dan perpanjangan berikutnya.'
+    : 'Status reseller Anda dicabut admin. Pembelian berikutnya memakai harga normal.').catch(() => {});
+  if (back === 'a:rs') {
+    await reply(ctx, `${escapeHtml(userLabel(u))} sekarang reseller.`);
+    return showResellers({ ...ctx, cb: null });
+  }
+  return showInfoUser(ctx, u.id);
 }
 
 async function adjustSaldo(ctx, userId, sign, raw) {
@@ -25022,7 +25381,7 @@ async function adjustSaldo(ctx, userId, sign, raw) {
   clearPending(ctx.from.id);
   await sendHtml(Number(userId), `Saldo Anda ${delta > 0 ? 'ditambah' : 'dikurangi'} admin ${rupiah(amount)}.\nSaldo sekarang: <b>${rupiah(balance)}</b>`).catch(() => {});
   await reply(ctx, `Saldo pengguna <code>${userId}</code> sekarang ${rupiah(balance)}.`);
-  return showAdminUser({ ...ctx, cb: null }, userId);
+  return showSaldoUser({ ...ctx, cb: null }, userId);
 }
 
 async function showAdminPayment(ctx) {
@@ -25221,7 +25580,7 @@ async function restoreDatabase(ctx, doc) {
 
 // Callback lanjutan sebuah alur memakai input yang tersimpan; callback lain
 // membuang input setengah jadi supaya teks berikutnya tidak salah ditafsirkan.
-const CONTINUATION_CALLBACK = /^(b:rp|b:d:|b:y$|r:y:)/;
+const CONTINUATION_CALLBACK = /^(b:rp|b:k:|b:d:|b:y$|r:y:)/;
 
 async function handleCallback(ctx) {
   const data = String(ctx.cb.data || '');
@@ -25244,6 +25603,13 @@ async function handleCallback(ctx) {
       const item = takePending(uid);
       if (!item || item.step !== 'buy_pass') return show(ctx, 'Sesi pembelian sudah habis.', kb([backRow()]));
       return askDuration(ctx, { ...item.data, password: crypto.randomBytes(6).toString('hex').slice(0, 8) });
+    }
+    if (parts[1] === 'k') {
+      const item = takePending(uid);
+      if (!item || item.step !== 'buy_pkg') return show(ctx, 'Sesi pembelian sudah habis. Ulangi dari Buat Akun.', kb([backRow()]));
+      const pkg = await get('SELECT id FROM server_packages WHERE id = ? AND server_id = ?', [Number(parts[2]), Number(item.data.serverId)]);
+      if (!pkg) return show(ctx, 'Paket tidak tersedia. Ulangi dari Buat Akun.', kb([backRow()]));
+      return askDuration(ctx, { ...item.data, packageId: pkg.id });
     }
     if (parts[1] === 'd') return confirmBuy(ctx, Number(parts[2]));
     if (parts[1] === 'y') return executeBuy(ctx);
@@ -25337,22 +25703,67 @@ async function handleAdminCallback(ctx, data, parts) {
       if (s && Number(s.local) !== 1) await write('DELETE FROM servers WHERE id = ?', [s.id]);
       return showAdminServers(ctx);
     }
+    case 'pk':
+      if (parts[3]) return showAdminPackage(ctx, parts[2], parts[3]);
+      return showAdminPackages(ctx, parts[2]);
+    case 'pka': {
+      const s = await getServer(parts[2]);
+      if (!s) return showAdminServers(ctx);
+      setPending(uid, 'a_pkg_add', { serverId: s.id, step: 'limit' });
+      return prompt(`<b>TAMBAH PAKET LIMIT IP</b>\nServer: ${escapeHtml(s.name)}\nKirim limit IP paket ini (angka 1-100, contoh 1, 2, atau 3).`, `a:pk:${s.id}`);
+    }
+    case 'pke': {
+      const pkg = await get('SELECT * FROM server_packages WHERE id = ?', [Number(parts[2])]);
+      if (!pkg || !PACKAGE_FIELDS[parts[3]]) return showAdminServers(ctx);
+      setPending(uid, 'a_pkg', { id: pkg.id, field: parts[3] });
+      return prompt(`Paket ${limitIpText(pkg.limit_ip)}: kirim ${PACKAGE_FIELDS[parts[3]].label}.`, `a:pk:${pkg.server_id}:${pkg.id}`);
+    }
+    case 'pkd': {
+      const pkg = await get('SELECT * FROM server_packages WHERE id = ?', [Number(parts[2])]);
+      if (!pkg) return showAdminServers(ctx);
+      return show(ctx, `Hapus paket <b>${limitIpText(pkg.limit_ip)}</b>?\nAkun yang sudah dibeli dengan paket ini tidak terhapus, tapi hanya bisa diperpanjang kalau server masih punya harga dasar atau paket ini dibuat lagi.`,
+        kb([[btn('Ya, Hapus Paket', `a:pky:${pkg.id}`, 'danger'), btn('Batal', `a:pk:${pkg.server_id}:${pkg.id}`, '')]]));
+    }
+    case 'pky': {
+      const pkg = await get('SELECT * FROM server_packages WHERE id = ?', [Number(parts[2])]);
+      if (!pkg) return showAdminServers(ctx);
+      await write('DELETE FROM server_packages WHERE id = ?', [pkg.id]);
+      return showAdminPackages(ctx, pkg.server_id);
+    }
     case 'u': return parts[2] ? showAdminUser(ctx, parts[2]) : showAdminUsers(ctx);
     case 'uf':
-      setPending(uid, 'a_user_find');
-      return prompt('Kirim ID Telegram pengguna.', 'a:u');
+      setPending(uid, 'a_user_pick', { mode: 'view' });
+      return prompt(USER_PICK.view.prompt, 'a:u');
+    case 'es':
+      if (parts[2]) return showSaldoUser(ctx, parts[2]);
+      setPending(uid, 'a_user_pick', { mode: 'saldo' });
+      return prompt(`<b>${USER_PICK.saldo.prompt}</b>`, 'a:u');
+    case 'ei':
+      if (parts[2]) return showInfoUser(ctx, parts[2]);
+      setPending(uid, 'a_user_pick', { mode: 'info' });
+      return prompt(`<b>${USER_PICK.info.prompt}</b>`, 'a:u');
+    case 'rs': return showResellers(ctx);
+    case 'rsa':
+      setPending(uid, 'a_user_pick', { mode: 'reseller' });
+      return prompt(`<b>${USER_PICK.reseller.prompt}</b>`, 'a:rs');
+    case 'rsy': return confirmReseller(ctx, parts[2]);
+    case 'ur': {
+      const target = await get('SELECT * FROM users WHERE id = ?', [Number(parts[2])]);
+      if (!target) return showAdminUsers(ctx);
+      return setReseller(ctx, target.id, Number(target.reseller) !== 1, 'info');
+    }
     case 'ua': {
       const target = await get('SELECT id FROM users WHERE id = ?', [Number(parts[2])]);
       if (!target) return showAdminUsers(ctx);
       setPending(uid, 'a_saldo', { id: target.id, sign: parts[3] === '-' ? '-' : '+' });
-      return prompt(`Kirim nominal yang akan ${parts[3] === '-' ? 'dikurangi dari' : 'ditambahkan ke'} saldo <code>${target.id}</code>.`, `a:u:${target.id}`);
+      return prompt(`Kirim nominal yang akan ${parts[3] === '-' ? 'dikurangi dari' : 'ditambahkan ke'} saldo <code>${target.id}</code>.`, `a:es:${target.id}`);
     }
     case 'ub': {
       const target = await get('SELECT * FROM users WHERE id = ?', [Number(parts[2])]);
       if (!target) return showAdminUsers(ctx);
       if (isAdmin(target.id)) return answer(ctx, 'Admin tidak bisa diblokir.', true);
       await write('UPDATE users SET banned = ? WHERE id = ?', [Number(target.banned) ? 0 : 1, target.id]);
-      return showAdminUser(ctx, target.id);
+      return showInfoUser(ctx, target.id);
     }
     case 'pg': return showAdminPayment(ctx);
     case 'pt': {
@@ -25402,8 +25813,8 @@ async function handleAdminCallback(ctx, data, parts) {
           await write("UPDATE orders SET status = 'done', note = ?, updated_at = ? WHERE id = ? AND status = 'review'", [`ditandai selesai oleh admin ${uid}`, now(), orderId]);
           if (order.kind === 'create') {
             await write(
-              'INSERT OR IGNORE INTO accounts (user_id, server_id, protocol, username, expired, expired_at, trial, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)',
-              [order.user_id, order.server_id, order.protocol, order.username, '', Number(order.created_at) + Number(order.days) * 86400000, now()]
+              'INSERT OR IGNORE INTO accounts (user_id, server_id, protocol, username, expired, expired_at, trial, limit_ip, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)',
+              [order.user_id, order.server_id, order.protocol, order.username, '', Number(order.created_at) + Number(order.days) * 86400000, order.limit_ip === undefined ? null : order.limit_ip, now()]
             );
           }
         }
@@ -25470,11 +25881,18 @@ async function handleText(ctx) {
       clearPending(uid);
       await reply(ctx, 'Tersimpan.');
       return showAdminServer({ ...ctx, cb: null }, item.data.id);
-    case 'a_user_find': {
+    case 'a_user_pick':
+      if (!ctx.admin || !USER_PICK[item.data.mode]) return showHome(ctx);
+      return pickUser(ctx, item.data.mode, text);
+    case 'a_pkg_add':
       if (!ctx.admin) return showHome(ctx);
-      const id = toInt(text.replace(/^@/, ''));
-      if (!Number.isFinite(id)) throw new UserError('Kirim ID Telegram berupa angka.');
-      return showAdminUser({ ...ctx, cb: null }, id);
+      return addPackageStep(ctx, item.data, text);
+    case 'a_pkg': {
+      if (!ctx.admin) return showHome(ctx);
+      const pkg = await savePackageField(ctx, item.data.id, item.data.field, text);
+      clearPending(uid);
+      await reply(ctx, 'Tersimpan.');
+      return showAdminPackage({ ...ctx, cb: null }, pkg.server_id, pkg.id);
     }
     case 'a_saldo':
       if (!ctx.admin) return showHome(ctx);

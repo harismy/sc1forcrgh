@@ -9,6 +9,8 @@
 //   (durasi aneh, menu admin, akun orang lain) ditolak.
 // - Backup dan restore database (caption /restore dan menu dengan konfirmasi).
 // - Broadcast teks/gambar ke semua pengguna atau reseller lewat copyMessage.
+// - Broadcast teks + lampiran video/stiker: teks jadi caption atau pesan kedua,
+//   dan retry 429 tidak mengirim ulang media.
 // - Integrasi installer: service hemat resource dan mati secara default.
 //
 // Database memakai SQLite sungguhan lewat node:sqlite (Node 22.5+), dipasang
@@ -129,8 +131,15 @@ let downloadSource = '';
 
 bot.deps.openDatabase = openShim;
 const blockedChats = new Set();
+let copyRateLimit = null;
 bot.deps.tgRequest = async (method, payload) => {
   tgCalls.push({ method, payload });
+  if (method === 'copyMessage' && copyRateLimit && copyRateLimit(payload)) {
+    const err = new Error('Too Many Requests: retry after 0');
+    err.code = 429;
+    err.retryAfter = 0;
+    throw err;
+  }
   if (method === 'copyMessage' && blockedChats.has(Number(payload.chat_id))) {
     const err = new Error('Forbidden: bot was blocked by the user');
     err.code = 403;
@@ -800,15 +809,62 @@ async function saldo(id) {
   calls = await step(cbUpdate(ADMIN, 'a:bcy'));
   assert(/Sesi broadcast sudah habis/.test(texts(calls)), 'konfirmasi broadcast hanya berlaku sekali');
 
-  // Teks ke reseller saja.
+  // Teks ke reseller saja: teks ditanya lampiran dulu, lalu "Kirim Teks Saja".
   await step(cbUpdate(ADMIN, 'a:bc'));
-  await step(textUpdate(ADMIN, 'Harga reseller turun mulai besok'));
+  calls = await step(textUpdate(ADMIN, 'Harga reseller turun mulai besok'));
+  assert(/LAMPIRAN BROADCAST/.test(texts(calls)) && !/PRATINJAU BROADCAST/.test(texts(calls)), 'teks broadcast ditanya lampiran media dulu');
+  calls = await step(cbUpdate(ADMIN, 'a:bct'));
+  assert(/PRATINJAU BROADCAST/.test(texts(calls)) && /Pesan teks di atas/.test(texts(calls)), 'Kirim Teks Saja lanjut ke pratinjau');
   await step(cbUpdate(ADMIN, 'a:bcs:reseller'));
   mark = tgCalls.length;
   await step(cbUpdate(ADMIN, 'a:bcy'));
   await waitBroadcast();
   copies = since(mark).filter((c) => c.method === 'copyMessage');
   assert.deepStrictEqual(copies.map((c) => Number(c.payload.chat_id)), [RESELLER], 'broadcast reseller hanya ke reseller');
+
+  // Teks + video: teks jadi caption video, formatnya ikut.
+  await step(cbUpdate(ADMIN, 'a:bc'));
+  const promoText = { update_id: updateSeq++, message: { message_id: 5100, from: { id: ADMIN, first_name: 'A' }, chat: { id: ADMIN, type: 'private' }, text: 'hallo test pesan', entities: [{ type: 'bold', offset: 0, length: 5 }] } };
+  await step(promoText);
+  calls = await step(cbUpdate(ADMIN, 'a:bcm'));
+  assert(/Kirim 1 gambar, video, GIF, atau stiker/.test(texts(calls)), 'Tambah Media meminta media');
+  calls = await step(textUpdate(ADMIN, 'ini bukan media'));
+  assert(/Kirim 1 gambar, video, GIF, atau stiker/.test(texts(calls)) && !/PRATINJAU/.test(texts(calls)), 'teks biasa ditolak saat menunggu media');
+  mark = tgCalls.length;
+  const videoMsg = { update_id: updateSeq++, message: { message_id: 5101, from: { id: ADMIN, first_name: 'A' }, chat: { id: ADMIN, type: 'private' }, video: { file_id: 'vid1' }, caption: 'caption lama' } };
+  calls = await step(videoMsg);
+  const videoPreview = since(mark).filter((c) => c.method === 'copyMessage');
+  assert.deepStrictEqual(videoPreview.map((c) => [Number(c.payload.chat_id), c.payload.message_id, c.payload.caption]), [[ADMIN, 5101, 'hallo test pesan']], 'pratinjau gabungan dikirim ke admin');
+  assert.deepStrictEqual(videoPreview[0].payload.caption_entities, [{ type: 'bold', offset: 0, length: 5 }], 'format teks ikut jadi format caption');
+  assert(/Pesan video \+ teks di atas/.test(texts(calls)), 'pratinjau menyebut video + teks');
+  await step(cbUpdate(ADMIN, 'a:bcs:reseller'));
+  mark = tgCalls.length;
+  await step(cbUpdate(ADMIN, 'a:bcy'));
+  await waitBroadcast();
+  copies = since(mark).filter((c) => c.method === 'copyMessage');
+  assert.deepStrictEqual(copies.map((c) => [Number(c.payload.chat_id), c.payload.message_id, c.payload.caption]), [[RESELLER, 5101, 'hallo test pesan']], 'video + teks terkirim sebagai satu pesan');
+
+  // Teks + stiker: stiker dulu, lalu teks. Kena 429 di teks -> stiker tidak dikirim ulang.
+  await step(cbUpdate(ADMIN, 'a:bc'));
+  await step({ update_id: updateSeq++, message: { message_id: 5200, from: { id: ADMIN, first_name: 'A' }, chat: { id: ADMIN, type: 'private' }, text: 'promo stiker' } });
+  await step(cbUpdate(ADMIN, 'a:bcm'));
+  await step({ update_id: updateSeq++, message: { message_id: 5201, from: { id: ADMIN, first_name: 'A' }, chat: { id: ADMIN, type: 'private' }, sticker: { file_id: 'stk1' } } });
+  await step(cbUpdate(ADMIN, 'a:bcs:reseller'));
+  let limited = false;
+  copyRateLimit = (payload) => {
+    if (limited || Number(payload.chat_id) !== RESELLER || payload.message_id !== 5200) return false;
+    limited = true;
+    return true;
+  };
+  mark = tgCalls.length;
+  await step(cbUpdate(ADMIN, 'a:bcy'));
+  await waitBroadcast();
+  copyRateLimit = null;
+  copies = since(mark).filter((c) => c.method === 'copyMessage');
+  assert(limited, '429 tersimulasi');
+  assert.deepStrictEqual(copies.map((c) => c.payload.message_id), [5201, 5200, 5200], 'stiker sekali, teks diulang setelah 429');
+  assert(copies.every((c) => c.payload.caption === undefined), 'stiker tidak diberi caption');
+  assert(/Terkirim : 1/.test(since(mark).filter((c) => c.method === 'editMessageText').pop().payload.text), 'stiker + teks dihitung satu kiriman');
 
   // /batal saat menunggu pesan broadcast tidak menyebarkan apa pun.
   await step(cbUpdate(ADMIN, 'a:bc'));

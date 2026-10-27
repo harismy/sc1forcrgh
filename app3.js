@@ -3543,23 +3543,46 @@ async function sendBroadcastToAllUsers(senderCtx, message, entities = []) {
   return result;
 }
 
-async function sendPhotoBroadcastToAllUsers(senderCtx) {
-  const photos = Array.isArray(senderCtx.message?.photo) ? senderCtx.message.photo : [];
-  const photo = photos[photos.length - 1];
-  const fileId = String(photo?.file_id || '').trim();
-  if (!fileId) return { total: 0, ok: 0, fail: 0 };
+const BROADCAST_CAPTION_MAX = 1024;
+const BROADCAST_MEDIA_LABELS = { photo: 'foto', video: 'video', animation: 'GIF', sticker: 'stiker' };
 
-  const caption = String(senderCtx.message?.caption || '');
-  const captionEntities = Array.isArray(senderCtx.message?.caption_entities)
-    ? senderCtx.message.caption_entities
-    : [];
+// Ambil media dari pesan admin. Media dikirim ulang pakai file_id, jadi file
+// tidak diunduh/diunggah server bot (server Telegram yang mengirim ke tiap user).
+function extractBroadcastMedia(msg) {
+  if (!msg) return null;
+  const caption = String(msg.caption || '');
+  const caption_entities = Array.isArray(msg.caption_entities) ? msg.caption_entities : [];
+  const photos = Array.isArray(msg.photo) ? msg.photo : [];
+  if (photos.length) {
+    return { type: 'photo', fileId: photos[photos.length - 1].file_id, caption, caption_entities };
+  }
+  // Pesan GIF juga punya field document, jadi animation dicek lebih dulu.
+  if (msg.animation?.file_id) return { type: 'animation', fileId: msg.animation.file_id, caption, caption_entities };
+  if (msg.video?.file_id) return { type: 'video', fileId: msg.video.file_id, caption, caption_entities };
+  if (msg.sticker?.file_id) return { type: 'sticker', fileId: msg.sticker.file_id, caption: '', caption_entities: [] };
+  return null;
+}
+
+function sendBroadcastMedia(telegram, chatId, media, extra) {
+  if (media.type === 'video') return telegram.sendVideo(chatId, media.fileId, { ...extra, supports_streaming: true });
+  if (media.type === 'animation') return telegram.sendAnimation(chatId, media.fileId, extra);
+  if (media.type === 'sticker') return telegram.sendSticker(chatId, media.fileId);
+  return telegram.sendPhoto(chatId, media.fileId, extra);
+}
+
+// textPayload (hasil buildBroadcastTextPayload) dipakai sebagai caption. Stiker
+// tidak bisa diberi caption, dan teks di atas 1024 karakter tidak muat sebagai
+// caption, jadi keduanya dikirim sebagai pesan teks tepat setelah media.
+async function sendMediaBroadcastToAllUsers(senderCtx, media, textPayload = null) {
+  if (!media?.fileId) return { total: 0, ok: 0, fail: 0 };
+  const separateText = Boolean(textPayload) &&
+    (media.type === 'sticker' || textPayload.text.length > BROADCAST_CAPTION_MAX);
   const extra = {};
-  const captionPayload = caption.trim() ? buildBroadcastTextPayload(caption, captionEntities) : null;
-  if (captionPayload) {
-    extra.caption = captionPayload.text;
-    if (captionPayload.options.parse_mode) extra.parse_mode = captionPayload.options.parse_mode;
-    if (captionPayload.options.entities) extra.caption_entities = captionPayload.options.entities;
-    if (captionPayload.options.reply_markup) extra.reply_markup = captionPayload.options.reply_markup;
+  if (textPayload && !separateText) {
+    extra.caption = textPayload.text;
+    if (textPayload.options.parse_mode) extra.parse_mode = textPayload.options.parse_mode;
+    if (textPayload.options.entities) extra.caption_entities = textPayload.options.entities;
+    if (textPayload.options.reply_markup) extra.reply_markup = textPayload.options.reply_markup;
   }
 
   const ids = await listAllUserIds();
@@ -3567,13 +3590,14 @@ async function sendPhotoBroadcastToAllUsers(senderCtx) {
     total: ids.length,
     ok: 0,
     fail: 0,
-    mode: captionPayload?.mode || '',
-    copyCount: captionPayload?.copyCount || 0,
-    copyButtonCount: captionPayload?.copyButtonCount || 0
+    mode: textPayload?.mode || '',
+    copyCount: textPayload?.copyCount || 0,
+    copyButtonCount: textPayload?.copyButtonCount || 0
   };
   for (const uid of ids) {
     try {
-      await senderCtx.telegram.sendPhoto(uid, fileId, extra);
+      await sendBroadcastMedia(senderCtx.telegram, uid, media, extra);
+      if (separateText) await senderCtx.telegram.sendMessage(uid, textPayload.text, textPayload.options);
       result.ok += 1;
     } catch (err) {
       result.fail += 1;
@@ -3581,6 +3605,32 @@ async function sendPhotoBroadcastToAllUsers(senderCtx) {
     }
   }
   return result;
+}
+
+async function runMediaBroadcast(ctx, media, textPayload) {
+  const label = BROADCAST_MEDIA_LABELS[media.type] || 'media';
+  try {
+    await ctx.reply(`Broadcast ${label} sedang dikirim ke semua user...`);
+    const result = await sendMediaBroadcastToAllUsers(ctx, media, textPayload);
+    return ctx.reply(formatBroadcastResult(`Broadcast ${label} selesai.`, result), adminMenu());
+  } catch (err) {
+    return ctx.reply(`Broadcast ${label} gagal: ${parseErr(err)}`, adminMenu());
+  }
+}
+
+// Setelah admin menulis pesan broadcast, tanya apakah mau dilampiri media.
+async function askBroadcastAttachMedia(ctx, message, entities = []) {
+  buildBroadcastTextPayload(message, entities); // cek format [copy] sebelum disimpan
+  userState.set(ctx.chat.id, { step: 'admin_broadcast_confirm', message, entities });
+  return ctx.reply(
+    'Pesan broadcast sudah disimpan.\n\n' +
+    'Mau sekalian kirim foto, video, GIF, atau stiker bersama pesan ini?',
+    Markup.inlineKeyboard([
+      [Markup.button.callback('Ya, tambah media', 'm_admin_broadcast_attach')],
+      [Markup.button.callback('Kirim teks saja', 'm_admin_broadcast_text_only')],
+      [Markup.button.callback('Batal', 'm_admin_broadcast_cancel')]
+    ])
+  );
 }
 
 async function sendPhotoAlbumBroadcastToAllUsers(senderCtx, itemsInput) {
@@ -5745,7 +5795,8 @@ bot.action('m_admin_broadcast', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
   userState.set(ctx.chat.id, { step: 'admin_broadcast_message' });
   return ctx.reply(
-    'Kirim teks, satu foto, atau album maksimal 10 foto.\n' +
+    'Kirim teks, satu foto, album maksimal 10 foto, video, GIF, atau stiker.\n' +
+    'Kalau mengirim teks, bot akan menanyakan apakah mau dilampiri media.\n' +
     'Teks/caption mendukung format bawaan Telegram dan HTML.\n\n' +
     'Contoh HTML:\n' +
     '<b>Judul tebal</b>\n' +
@@ -5758,16 +5809,67 @@ bot.action('m_admin_broadcast', async (ctx) => {
   );
 });
 
-bot.command('broadcast', async (ctx) => {
-  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
-  const text = String(ctx.message?.text || '').replace(/^\/broadcast(@\w+)?/i, '').trim();
-  if (!text) {
-    return ctx.reply('Gunakan /broadcast lalu isi pesan. HTML dan [copy]teks[/copy] didukung.');
+bot.action('m_admin_broadcast_attach', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (!isAdmin(ctx.from.id) || state?.step !== 'admin_broadcast_confirm') {
+    return ctx.reply('Sesi broadcast sudah habis. Ulangi /broadcast atau menu admin.');
   }
+  state.step = 'admin_broadcast_attach_media';
+  return ctx.reply(
+    'Kirim 1 foto, video, GIF, atau stiker sekarang.\n' +
+    'Foto/video/GIF: pesan tadi jadi caption (caption bawaan media diabaikan).\n' +
+    'Stiker: pesan dikirim tepat setelah stiker.\n\n' +
+    'Ketik "batal" untuk membatalkan.',
+    Markup.inlineKeyboard([[Markup.button.callback('Kirim teks saja', 'm_admin_broadcast_text_only')]])
+  );
+});
+
+bot.action('m_admin_broadcast_text_only', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (!isAdmin(ctx.from.id) || !['admin_broadcast_confirm', 'admin_broadcast_attach_media'].includes(state?.step)) {
+    return ctx.reply('Sesi broadcast sudah habis. Ulangi /broadcast atau menu admin.');
+  }
+  userState.delete(ctx.chat.id);
   try {
     await ctx.reply('Broadcast sedang dikirim ke semua user...');
-    const result = await sendBroadcastToAllUsers(ctx, text);
+    const result = await sendBroadcastToAllUsers(ctx, state.message, state.entities);
     return ctx.reply(formatBroadcastResult('Broadcast selesai.', result), adminMenu());
+  } catch (err) {
+    return ctx.reply(`Broadcast gagal: ${parseErr(err)}`, adminMenu());
+  }
+});
+
+bot.action('m_admin_broadcast_cancel', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const state = userState.get(ctx.chat.id);
+  if (['admin_broadcast_confirm', 'admin_broadcast_attach_media'].includes(state?.step)) {
+    userState.delete(ctx.chat.id);
+  }
+  return ctx.reply('Broadcast dibatalkan.', adminMenu());
+});
+
+bot.command('broadcast', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  // Reply foto/video/GIF/stiker dengan /broadcast untuk langsung menyiarkan media itu.
+  const repliedMedia = extractBroadcastMedia(ctx.message?.reply_to_message);
+  if (repliedMedia) {
+    const captionPayload = repliedMedia.caption.trim()
+      ? buildBroadcastTextPayload(repliedMedia.caption, repliedMedia.caption_entities)
+      : null;
+    return runMediaBroadcast(ctx, repliedMedia, captionPayload);
+  }
+
+  const text = String(ctx.message?.text || '').replace(/^\/broadcast(@\w+)?/i, '').trim();
+  if (!text) {
+    return ctx.reply(
+      'Gunakan /broadcast lalu isi pesan. HTML dan [copy]teks[/copy] didukung.\n' +
+      'Untuk media: reply foto/video/GIF/stiker dengan /broadcast.'
+    );
+  }
+  try {
+    return await askBroadcastAttachMedia(ctx, text);
   } catch (err) {
     return ctx.reply(`Broadcast gagal: ${parseErr(err)}`, adminMenu());
   }
@@ -8211,10 +8313,15 @@ bot.on('text', async (ctx) => {
       const msg = String(ctx.message?.text || '');
       if (!msg.trim()) return ctx.reply('Pesan broadcast tidak boleh kosong.');
       const entities = Array.isArray(ctx.message?.entities) ? ctx.message.entities : [];
-      await ctx.reply('Broadcast sedang dikirim ke semua user...');
-      const result = await sendBroadcastToAllUsers(ctx, msg, entities);
-      userState.delete(ctx.chat.id);
-      return ctx.reply(formatBroadcastResult('Broadcast selesai.', result), adminMenu());
+      return askBroadcastAttachMedia(ctx, msg, entities);
+    }
+
+    if (state.step === 'admin_broadcast_confirm') {
+      return ctx.reply('Pilih salah satu tombol di atas, atau ketik "batal".');
+    }
+
+    if (state.step === 'admin_broadcast_attach_media') {
+      return ctx.reply('Kirim foto, video, GIF, atau stiker. Ketik "batal" untuk membatalkan.');
     }
 
     if (state.step === 'admin_set_env_key') {
@@ -9830,19 +9937,35 @@ bot.on('text', async (ctx) => {
   }
 });
 
-bot.on('photo', async (ctx) => {
+bot.on(['photo', 'video', 'animation', 'sticker'], async (ctx, next) => {
   const state = userState.get(ctx.chat.id);
-  if (!state || state.step !== 'admin_broadcast_message') return;
+  const step = state?.step;
+  if (step !== 'admin_broadcast_message' && step !== 'admin_broadcast_attach_media') return next();
 
   if (!isAdmin(ctx.from.id)) {
     userState.delete(ctx.chat.id);
     return ctx.reply('Akses ditolak. Hanya admin.');
   }
 
-  const photos = Array.isArray(ctx.message?.photo) ? ctx.message.photo : [];
-  if (!photos.length) return ctx.reply('Foto broadcast tidak valid. Silakan kirim ulang.');
+  const media = extractBroadcastMedia(ctx.message);
+  if (!media?.fileId) return ctx.reply('Media broadcast tidak valid. Silakan kirim ulang.');
 
-  if (ctx.message?.media_group_id) {
+  if (step === 'admin_broadcast_attach_media') {
+    if (ctx.message?.media_group_id) {
+      // Satu balasan per album, bukan per foto.
+      if (state.rejectedGroup === ctx.message.media_group_id) return;
+      state.rejectedGroup = ctx.message.media_group_id;
+      return ctx.reply('Lampiran hanya bisa 1 media, bukan album. Kirim ulang 1 foto, video, GIF, atau stiker.');
+    }
+    userState.delete(ctx.chat.id);
+    try {
+      return await runMediaBroadcast(ctx, media, buildBroadcastTextPayload(state.message, state.entities));
+    } catch (err) {
+      return ctx.reply(`Broadcast gagal: ${parseErr(err)}`, adminMenu());
+    }
+  }
+
+  if (media.type === 'photo' && ctx.message?.media_group_id) {
     if (!queueBroadcastPhotoAlbum(ctx)) {
       return ctx.reply('Album broadcast tidak valid. Silakan kirim ulang.');
     }
@@ -9851,11 +9974,12 @@ bot.on('photo', async (ctx) => {
 
   userState.delete(ctx.chat.id);
   try {
-    await ctx.reply('Broadcast foto sedang dikirim ke semua user...');
-    const result = await sendPhotoBroadcastToAllUsers(ctx);
-    return ctx.reply(formatBroadcastResult('Broadcast foto selesai.', result), adminMenu());
+    const captionPayload = media.caption.trim()
+      ? buildBroadcastTextPayload(media.caption, media.caption_entities)
+      : null;
+    return await runMediaBroadcast(ctx, media, captionPayload);
   } catch (err) {
-    return ctx.reply(`Broadcast foto gagal: ${parseErr(err)}`, adminMenu());
+    return ctx.reply(`Broadcast gagal: ${parseErr(err)}`, adminMenu());
   }
 });
 

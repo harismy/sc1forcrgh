@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.108}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.109}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -25834,10 +25834,15 @@ async function previewRestore(ctx, doc) {
 // ── Broadcast ───────────────────────────────────────────────────────────────
 
 // Pesan admin disalin apa adanya lewat copyMessage: teks, gambar, video, GIF,
-// atau file beserta caption dan formatnya, tanpa label "diteruskan dari".
+// stiker, atau file beserta caption dan formatnya, tanpa label "diteruskan dari".
+// Teks bisa dilampiri satu media: teks jadi caption media (stiker, atau teks di
+// atas 1024 karakter, dikirim sebagai pesan kedua tepat setelah media).
 // Telegram membatasi sekitar 30 pesan per detik; bot memakai 20 per detik dan
 // mengikuti retry_after kalau tetap kena batas.
-const BROADCAST_KINDS = { text: 'teks', photo: 'gambar', video: 'video', animation: 'GIF', document: 'file' };
+// Urutan kunci penting: pesan GIF juga punya field document.
+const BROADCAST_KINDS = { text: 'teks', photo: 'gambar', video: 'video', animation: 'GIF', sticker: 'stiker', document: 'file' };
+const BROADCAST_ATTACH_KINDS = ['photo', 'video', 'animation', 'sticker'];
+const BROADCAST_CAPTION_MAX = 1024;
 const BROADCAST_TARGETS = {
   all: { label: 'semua pengguna', where: 'banned = 0' },
   reseller: { label: 'reseller', where: 'banned = 0 AND reseller = 1' }
@@ -25896,7 +25901,8 @@ async function askBroadcast(ctx) {
   return show(ctx, [
     '<b>BROADCAST</b>',
     LINE,
-    'Kirim pesan yang akan disebar ke pengguna bot. Bisa teks, gambar dengan caption, video, GIF, atau file.',
+    'Kirim pesan yang akan disebar ke pengguna bot. Bisa teks, gambar dengan caption, video, GIF, stiker, atau file.',
+    'Kalau mengirim teks, bot menanyakan apakah mau dilampiri gambar, video, GIF, atau stiker.',
     'Tebal, miring, dan link ikut terkirim seperti yang Anda tulis. Album: hanya gambar pertama yang dikirim.',
     '',
     'Ketik /batal untuk membatalkan.'
@@ -25905,15 +25911,71 @@ async function askBroadcast(ctx) {
 
 async function draftBroadcast(ctx) {
   const kind = broadcastKind(ctx.msg);
-  if (!kind) throw new UserError('Jenis pesan ini belum bisa di-broadcast. Kirim teks, gambar, video, GIF, atau file.');
+  if (!kind) throw new UserError('Jenis pesan ini belum bisa di-broadcast. Kirim teks, gambar, video, GIF, stiker, atau file.');
+  const source = { chatId: ctx.chatId, messageId: ctx.msg.message_id, kind };
+  if (kind !== 'text') return previewBroadcast(ctx, source);
+  setPending(ctx.from.id, 'a_bc_text', { ...source, text: ctx.msg.text, entities: ctx.msg.entities || [] });
+  return reply(ctx, [
+    '<b>LAMPIRAN BROADCAST</b>',
+    LINE,
+    'Mau sekalian kirim gambar, video, GIF, atau stiker bersama pesan di atas?'
+  ].join('\n'), kb([
+    [btn('Tambah Media', 'a:bcm'), btn('Kirim Teks Saja', 'a:bct')],
+    [btn('Batal', 'a', '')]
+  ]));
+}
+
+async function askBroadcastMedia(ctx) {
   const uid = Number(ctx.from.id);
-  setPending(uid, 'a_bc_ready', { chatId: ctx.chatId, messageId: ctx.msg.message_id, kind });
+  const item = takePending(uid);
+  if (!item || item.step !== 'a_bc_text') return show(ctx, 'Sesi broadcast sudah habis. Ulangi dari Menu Admin > Broadcast.', kb([backRow('a')]));
+  setPending(uid, 'a_bc_media', item.data);
+  return show(ctx, [
+    '<b>LAMPIRAN BROADCAST</b>',
+    LINE,
+    'Kirim 1 gambar, video, GIF, atau stiker sekarang.',
+    'Gambar/video/GIF: pesan tadi jadi caption (caption bawaan media diganti). Stiker: pesan dikirim tepat setelah stiker.',
+    '',
+    'Ketik /batal untuk membatalkan.'
+  ].join('\n'), kb([[btn('Kirim Teks Saja', 'a:bct'), btn('Batal', 'a', '')]]));
+}
+
+async function broadcastTextOnly(ctx) {
+  const item = takePending(ctx.from.id);
+  if (!item || !['a_bc_text', 'a_bc_media'].includes(item.step)) return show(ctx, 'Sesi broadcast sudah habis. Ulangi dari Menu Admin > Broadcast.', kb([backRow('a')]));
+  return previewBroadcast(ctx, { chatId: item.data.chatId, messageId: item.data.messageId, kind: 'text' });
+}
+
+async function attachBroadcastMedia(ctx) {
+  const item = takePending(ctx.from.id);
+  if (!item || item.step !== 'a_bc_media') return reply(ctx, 'Sesi broadcast sudah habis. Ulangi dari Menu Admin > Broadcast.', kb([backRow('a')]));
+  const kind = broadcastKind(ctx.msg);
+  if (!BROADCAST_ATTACH_KINDS.includes(kind)) throw new UserError('Kirim 1 gambar, video, GIF, atau stiker. Ketik /batal untuk membatalkan.');
+  const source = {
+    chatId: ctx.chatId,
+    messageId: ctx.msg.message_id,
+    kind,
+    textMessageId: item.data.messageId,
+    text: item.data.text,
+    entities: item.data.entities
+  };
+  // Gabungan media + teks tidak sama dengan pesan aslinya, jadi tampilkan hasil jadinya dulu.
+  for (const call of broadcastCopyCalls(ctx.chatId, source)) await deps.tgRequest('copyMessage', call, 20000);
+  return previewBroadcast(ctx, source);
+}
+
+async function previewBroadcast(ctx, source) {
+  const uid = Number(ctx.from.id);
+  setPending(uid, 'a_bc_ready', source);
   const everyone = await broadcastCount('all', uid);
   const resellers = await broadcastCount('reseller', uid);
+  const what = source.textMessageId
+    ? `Pesan ${BROADCAST_KINDS[source.kind]} + teks di atas adalah tampilan yang akan diterima pengguna.`
+    : `Pesan ${BROADCAST_KINDS[source.kind]} di atas akan dikirim persis seperti itu.`;
   return reply(ctx, [
     '<b>PRATINJAU BROADCAST</b>',
     LINE,
-    `Pesan ${BROADCAST_KINDS[kind]} di atas akan dikirim persis seperti itu.`,
+    what,
     'Pengguna yang diblokir admin tidak ikut dikirimi.',
     '',
     'Pilih penerima:'
@@ -25969,10 +26031,28 @@ async function startBroadcast(ctx) {
   return null;
 }
 
+// Panggilan copyMessage untuk satu penerima, berurutan.
+function broadcastCopyCalls(chatId, source) {
+  const base = { chat_id: chatId, from_chat_id: source.chatId };
+  if (!source.textMessageId) return [{ ...base, message_id: source.messageId }];
+  const text = String(source.text || '');
+  if (source.kind !== 'sticker' && text.length <= BROADCAST_CAPTION_MAX) {
+    const call = { ...base, message_id: source.messageId, caption: text };
+    if (Array.isArray(source.entities) && source.entities.length) call.caption_entities = source.entities;
+    return [call];
+  }
+  const media = { ...base, message_id: source.messageId };
+  if (source.kind !== 'sticker') media.caption = '';
+  return [media, { ...base, message_id: source.textMessageId }];
+}
+
 async function deliverBroadcast(job, chatId, source) {
+  const calls = broadcastCopyCalls(chatId, source);
+  // Panggilan yang sudah sukses tidak diulang saat retry 429, supaya media tidak terkirim dua kali.
+  let next = 0;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      await deps.tgRequest('copyMessage', { chat_id: chatId, from_chat_id: source.chatId, message_id: source.messageId }, 20000);
+      for (; next < calls.length; next += 1) await deps.tgRequest('copyMessage', calls[next], 20000);
       job.sent += 1;
       return;
     } catch (err) {
@@ -26019,7 +26099,7 @@ async function runBroadcast(job, ids, source) {
 
 // Callback lanjutan sebuah alur memakai input yang tersimpan; callback lain
 // membuang input setengah jadi supaya teks berikutnya tidak salah ditafsirkan.
-const CONTINUATION_CALLBACK = /^(b:rp|b:k:|b:d:|b:y$|r:y:|a:bcs:|a:bcy$|a:rty$)/;
+const CONTINUATION_CALLBACK = /^(b:rp|b:k:|b:d:|b:y$|r:y:|a:bcm$|a:bct$|a:bcs:|a:bcy$|a:rty$)/;
 
 async function handleCallback(ctx) {
   const data = String(ctx.cb.data || '');
@@ -26290,6 +26370,8 @@ async function handleAdminCallback(ctx, data, parts) {
       return reply(ctx, 'Database Bot Panel berhasil dipulihkan. Database lama disimpan sebagai cadangan di VPS.', kb([backRow('a', 'Menu Admin')]));
     }
     case 'bc': return askBroadcast(ctx);
+    case 'bcm': return askBroadcastMedia(ctx);
+    case 'bct': return broadcastTextOnly(ctx);
     case 'bcs': return confirmBroadcast(ctx, parts[2]);
     case 'bcy': return startBroadcast(ctx);
     case 'bcx':
@@ -26426,6 +26508,8 @@ async function handleUpdate(update) {
       await reply(ctx, 'Database Bot Panel berhasil dipulihkan. Database lama disimpan sebagai cadangan di VPS.');
     } else if (step === 'a_bc' && !command) {
       await draftBroadcast(ctx);
+    } else if (step === 'a_bc_media' && !command) {
+      await attachBroadcastMedia(ctx);
     } else if (step === 'a_restore' && ctx.msg.document) {
       await previewRestore(ctx, ctx.msg.document);
     } else if (ctx.msg && typeof ctx.msg.text === 'string') {

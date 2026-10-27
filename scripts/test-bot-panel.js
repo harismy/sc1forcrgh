@@ -7,7 +7,8 @@
 //   hasil tidak pasti diserahkan ke admin, klik ganda tidak memotong dua kali.
 // - Server ini tersembunyi sampai admin mengisi harga; callback rakitan
 //   (durasi aneh, menu admin, akun orang lain) ditolak.
-// - Restore database lewat file dari admin.
+// - Backup dan restore database (caption /restore dan menu dengan konfirmasi).
+// - Broadcast teks/gambar ke semua pengguna atau reseller lewat copyMessage.
 // - Integrasi installer: service hemat resource dan mati secara default.
 //
 // Database memakai SQLite sungguhan lewat node:sqlite (Node 22.5+), dipasang
@@ -127,8 +128,14 @@ const sentDocs = [];
 let downloadSource = '';
 
 bot.deps.openDatabase = openShim;
+const blockedChats = new Set();
 bot.deps.tgRequest = async (method, payload) => {
   tgCalls.push({ method, payload });
+  if (method === 'copyMessage' && blockedChats.has(Number(payload.chat_id))) {
+    const err = new Error('Forbidden: bot was blocked by the user');
+    err.code = 403;
+    throw err;
+  }
   if (method === 'getMe') return { username: 'tokobot' };
   if (method === 'getFile') return { file_path: 'documents/backup.db' };
   if (['sendMessage', 'sendPhoto', 'editMessageText'].includes(method)) return { message_id: messageSeq++ };
@@ -469,7 +476,9 @@ async function saldo(id) {
   assert.strictEqual((await bot.get("SELECT status FROM orders WHERE username = 'putus01'")).status, 'review');
 
   // ── Backup dan restore ─────────────────────────────────────────────────
-  await step(cbUpdate(ADMIN, 'a:bk'));
+  calls = await step(cbUpdate(ADMIN, 'a:bk'));
+  assert(/BACKUP &amp; RESTORE/.test(texts(calls)) && sentDocs.length === 0, 'a:bk membuka menu backup, tidak langsung mengirim');
+  await step(cbUpdate(ADMIN, 'a:bks'));
   assert.strictEqual(sentDocs.length, 1, 'backup manual dikirim ke admin');
   assert(!fs.existsSync(sentDocs[0].filePath), 'file backup sementara dihapus');
   const backupFile = path.join(tmp, 'restore-me.db');
@@ -491,6 +500,32 @@ async function saldo(id) {
   calls = await step({ update_id: updateSeq++, message: { message_id: messageSeq++, from: { id: ADMIN, first_name: 'A' }, chat: { id: ADMIN, type: 'private' }, caption: '/restore', document: { file_id: 'f2', file_size: 20 } } });
   assert(/bukan database SQLite/.test(texts(calls)), 'file bukan sqlite ditolak');
   assert.strictEqual(await saldo(BUYER), 15000, 'database tetap utuh setelah restore ditolak');
+
+  // Restore lewat menu: kirim file tanpa caption, lihat ringkasan, baru konfirmasi.
+  const docUpdate = (userId, fileId) => ({ update_id: updateSeq++, message: { message_id: messageSeq++, from: { id: userId, first_name: 'A' }, chat: { id: userId, type: 'private' }, document: { file_id: fileId, file_size: 1000 } } });
+  await bot.tx(() => bot.applyBalance(BUYER, 7000, 'admin', 'test', 'sebelum restore menu'));
+  calls = await step(cbUpdate(ADMIN, 'a:rt'));
+  assert(/RESTORE DATABASE/.test(texts(calls)));
+  calls = await step(textUpdate(ADMIN, 'halo'));
+  assert(/sebagai file, bukan teks/.test(texts(calls)), 'teks saat menunggu file restore ditolak');
+  downloadSource = junk;
+  calls = await step(docUpdate(ADMIN, 'f3'));
+  assert(/bukan database SQLite/.test(texts(calls)), 'file rusak ditolak di menu restore');
+  downloadSource = backupFile;
+  calls = await step(docUpdate(ADMIN, 'f4'));
+  assert(/KONFIRMASI RESTORE/.test(texts(calls)) && /Saldo total: Rp/.test(texts(calls)), 'menu restore menampilkan isi backup dulu');
+  assert.strictEqual(await saldo(BUYER), 22000, 'database belum diganti sebelum konfirmasi');
+  assert(!fs.readdirSync(path.dirname(dbPath)).some((f) => f.startsWith('restore-')), 'file pratinjau tidak tertinggal di disk');
+  calls = await step(cbUpdate(BUYER, 'a:rty'));
+  assert(/khusus admin/.test(alerts(calls)) && await saldo(BUYER) === 22000, 'pembeli tidak bisa konfirmasi restore');
+  calls = await step(cbUpdate(ADMIN, 'a:rty'));
+  assert(/berhasil dipulihkan/.test(texts(calls)), 'restore lewat menu berhasil');
+  assert.strictEqual(await saldo(BUYER), 15000, 'saldo kembali ke isi backup lewat menu');
+  assert(tgCalls.some((c) => c.method === 'getFile' && c.payload.file_id === 'f4'), 'konfirmasi mengunduh file yang dipratinjau');
+  calls = await step(cbUpdate(ADMIN, 'a:rty'));
+  assert(/Sesi restore sudah habis/.test(texts(calls)), 'konfirmasi restore hanya berlaku sekali');
+  // Pengguna yang tidak ada di file backup harus terdaftar lagi untuk test berikutnya.
+  await step(textUpdate(OTHER, '/start'));
 
   // ── Reseller dan paket limit IP ─────────────────────────────────────────
   const localNow = await bot.get('SELECT * FROM servers WHERE local = 1');
@@ -616,6 +651,67 @@ async function saldo(id) {
   assert.strictEqual(Number((await bot.get('SELECT reseller FROM users WHERE id = ?', [BUYER])).reseller), 0, 'reseller bisa dicabut dari Edit Info');
   calls = await step(cbUpdate(BUYER, `a:ur:${BUYER}`));
   assert(/khusus admin/.test(alerts(calls)), 'pembeli tidak bisa menjadikan dirinya reseller');
+
+  // ── Broadcast ──────────────────────────────────────────────────────────
+  const waitBroadcast = async () => {
+    for (let i = 0; i < 200 && bot._state.broadcast(); i += 1) await new Promise((r) => setTimeout(r, 10));
+    assert(!bot._state.broadcast(), 'broadcast selesai');
+  };
+  const BANNED = 4004;
+  const RESELLER = 5005;
+  const BLOCKER = 6006;
+  for (const id of [BANNED, RESELLER, BLOCKER]) await step(textUpdate(id, '/start'));
+  await bot.write('UPDATE users SET banned = 1 WHERE id = ?', [BANNED]);
+  await bot.write('UPDATE users SET reseller = CASE WHEN id = ? THEN 1 ELSE 0 END', [RESELLER]);
+  blockedChats.add(BLOCKER);
+
+  calls = await step(cbUpdate(BUYER, 'a:bc'));
+  assert(/khusus admin/.test(alerts(calls)), 'pembeli tidak bisa membuka broadcast');
+  calls = await step(textUpdate(BUYER, 'promo palsu'));
+  assert(!calls.some((c) => /PRATINJAU BROADCAST/.test(c.payload.text || '')), 'pesan pembeli tidak pernah jadi draf broadcast');
+  calls = await step(cbUpdate(ADMIN, 'a:bcy'));
+  assert(/Sesi broadcast sudah habis/.test(texts(calls)), 'broadcast tidak bisa dimulai tanpa draf');
+
+  await step(cbUpdate(ADMIN, 'a:bc'));
+  const photoMsg = { update_id: updateSeq++, message: { message_id: 4242, from: { id: ADMIN, first_name: 'A' }, chat: { id: ADMIN, type: 'private' }, photo: [{ file_id: 'ph1', width: 90, height: 90 }], caption: 'PROMO <b>akhir bulan</b>' } };
+  calls = await step(photoMsg);
+  const previewText = texts(calls);
+  assert(/PRATINJAU BROADCAST/.test(previewText) && /Pesan gambar/.test(previewText), 'gambar diterima sebagai draf broadcast');
+  const previewButtons = calls.find((c) => /PRATINJAU/.test(c.payload.text || '')).payload.reply_markup.inline_keyboard.flat().map((b) => b.text);
+  const userCount = Number((await bot.get('SELECT COUNT(*) AS n FROM users WHERE banned = 0 AND id <> ?', [ADMIN])).n);
+  assert(previewButtons.includes(`Semua Pengguna (${userCount})`) && previewButtons.includes('Reseller (1)'), `jumlah penerima benar: ${previewButtons}`);
+  calls = await step(cbUpdate(ADMIN, 'a:bcs:all'));
+  assert(/KONFIRMASI BROADCAST/.test(texts(calls)) && new RegExp(`ke ${userCount} semua pengguna`).test(texts(calls)));
+  mark = tgCalls.length;
+  await step(cbUpdate(ADMIN, 'a:bcy'));
+  await waitBroadcast();
+  let copies = since(mark).filter((c) => c.method === 'copyMessage');
+  const targets = copies.map((c) => Number(c.payload.chat_id)).sort((x, y) => x - y);
+  assert(copies.every((c) => c.payload.from_chat_id === ADMIN && c.payload.message_id === 4242), 'pesan admin disalin apa adanya (copyMessage)');
+  assert(!targets.includes(BANNED) && !targets.includes(ADMIN), 'pengguna diblokir admin dan pengirim tidak dikirimi');
+  assert(targets.includes(BUYER) && targets.includes(RESELLER) && targets.includes(BLOCKER) && targets.length === userCount, `semua pengguna dikirimi: ${targets}`);
+  const finalStatus = since(mark).filter((c) => c.method === 'editMessageText').pop();
+  assert(/BROADCAST SELESAI/.test(finalStatus.payload.text) && /Terkirim : \d+/.test(finalStatus.payload.text) && /Diblokir : 1 /.test(finalStatus.payload.text), finalStatus.payload.text);
+  calls = await step(cbUpdate(ADMIN, 'a:bcy'));
+  assert(/Sesi broadcast sudah habis/.test(texts(calls)), 'konfirmasi broadcast hanya berlaku sekali');
+
+  // Teks ke reseller saja.
+  await step(cbUpdate(ADMIN, 'a:bc'));
+  await step(textUpdate(ADMIN, 'Harga reseller turun mulai besok'));
+  await step(cbUpdate(ADMIN, 'a:bcs:reseller'));
+  mark = tgCalls.length;
+  await step(cbUpdate(ADMIN, 'a:bcy'));
+  await waitBroadcast();
+  copies = since(mark).filter((c) => c.method === 'copyMessage');
+  assert.deepStrictEqual(copies.map((c) => Number(c.payload.chat_id)), [RESELLER], 'broadcast reseller hanya ke reseller');
+
+  // /batal saat menunggu pesan broadcast tidak menyebarkan apa pun.
+  await step(cbUpdate(ADMIN, 'a:bc'));
+  mark = tgCalls.length;
+  await step(textUpdate(ADMIN, '/batal'));
+  await step(cbUpdate(ADMIN, 'a:bcs:all'));
+  assert(!since(mark).some((c) => c.method === 'copyMessage') && /Sesi broadcast sudah habis/.test(texts(since(mark))), '/batal membuang draf broadcast');
+  blockedChats.clear();
 
   // Database lama (sebelum fitur reseller/paket) dimigrasi saat dibuka.
   await bot.closeStore();

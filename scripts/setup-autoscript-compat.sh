@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.106}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.107}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -24572,6 +24572,11 @@ function takePending(uid) {
 
 const clearPending = (uid) => pending.delete(Number(uid));
 
+function pendingStep(uid) {
+  const item = takePending(uid);
+  return item ? item.step : '';
+}
+
 function homeKeyboard(admin) {
   return kb([
     [btn('Buat Akun', 'b', 'success'), btn('Trial Gratis', 't', 'success')],
@@ -25025,7 +25030,8 @@ async function showAdmin(ctx) {
   return show(ctx, text, kb([
     [btn('Kelola Server', 'a:sv'), btn('Kelola Pengguna', 'a:u')],
     [btn('Payment Gateway', 'a:pg'), btn('Pengaturan Bot', 'a:cfg')],
-    [btn(`Pesanan Bermasalah (${s.review})`, 'a:or'), btn('Backup Database', 'a:bk')],
+    [btn('Broadcast', 'a:bc'), btn('Backup & Restore', 'a:bk')],
+    [btn(`Pesanan Bermasalah (${s.review})`, 'a:or')],
     backRow('h', 'Menu Utama')
   ]));
 }
@@ -25532,30 +25538,54 @@ async function sendBackup(targets, reason) {
 }
 
 const SQLITE_HEADER = 'SQLite format 3\u0000';
+const SUMMARY_SQL = `SELECT (SELECT COUNT(*) FROM users) AS users,
+       (SELECT COALESCE(SUM(saldo), 0) FROM users) AS saldo,
+       (SELECT COUNT(*) FROM servers) AS servers,
+       (SELECT MAX(created_at) FROM ledger) AS last_tx`;
 
-async function restoreDatabase(ctx, doc) {
-  if (!doc || Number(doc.file_size || 0) > 20 * 1024 * 1024) throw new UserError('File backup tidak valid atau lebih dari 20 MB.');
+function summaryText(s) {
+  return [
+    `Pengguna   : ${s.users}`,
+    `Saldo total: ${rupiah(s.saldo)}`,
+    `Server     : ${s.servers}`,
+    `Transaksi terakhir: ${s.last_tx ? `${wib(Number(s.last_tx)).slice(0, 16)} WIB` : '-'}`
+  ].join('\n');
+}
+
+// Unduh file dari admin ke folder state lalu pastikan isinya backup Bot Panel.
+// File yang ditolak langsung dihapus: isinya saldo pembeli.
+async function downloadBackup(doc) {
+  if (!doc || !doc.file_id || Number(doc.file_size || 0) > 20 * 1024 * 1024) throw new UserError('File backup tidak valid atau lebih dari 20 MB.');
   const info = await tg('getFile', { file_id: doc.file_id });
   const tmp = path.join(stateDir(), `restore-${now()}.db`);
-  await deps.downloadTelegramFile(info.file_path, tmp, 20 * 1024 * 1024);
+  let summary;
   try {
+    await deps.downloadTelegramFile(info.file_path, tmp, 20 * 1024 * 1024);
     const head = Buffer.alloc(16);
     const fd = fs.openSync(tmp, 'r');
     fs.readSync(fd, head, 0, 16, 0);
     fs.closeSync(fd);
     if (head.toString('binary') !== SQLITE_HEADER) throw new UserError('File bukan database SQLite.');
     const probe = await deps.openDatabase(tmp);
-    const check = await new Promise((resolve, reject) => probe.all(
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'servers', 'ledger', 'settings')", [],
-      (err, rows) => (err ? reject(err) : resolve(rows))
-    ));
-    await new Promise((resolve) => probe.close(() => resolve()));
-    if (check.length !== 4) throw new UserError('File bukan backup Bot Panel.');
+    try {
+      const check = await new Promise((resolve, reject) => probe.all(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'servers', 'ledger', 'settings')", [],
+        (err, rows) => (err ? reject(err) : resolve(rows))
+      ));
+      if (check.length !== 4) throw new UserError('File bukan backup Bot Panel.');
+      summary = await new Promise((resolve, reject) => probe.get(SUMMARY_SQL, [], (err, row) => (err ? reject(err) : resolve(row))));
+    } finally {
+      await new Promise((resolve) => probe.close(() => resolve()));
+    }
   } catch (err) {
     fs.unlink(tmp, () => {});
     throw err instanceof UserError ? err : new UserError(`File backup rusak: ${err.message}`);
   }
+  return { tmp, summary };
+}
 
+async function restoreDatabase(ctx, doc) {
+  const { tmp } = await downloadBackup(doc);
   restoring = true;
   try {
     await writeLock(async () => {
@@ -25576,11 +25606,234 @@ async function restoreDatabase(ctx, doc) {
   schedulePoll(1000);
 }
 
+async function showBackupMenu(ctx) {
+  clearPending(ctx.from.id);
+  const text = [
+    '<b>BACKUP &amp; RESTORE</b>',
+    LINE,
+    `Backup harian ke admin: ${setting('backup_daily') === '1' ? 'AKTIF' : 'NONAKTIF'} (atur di Pengaturan Bot)`,
+    '',
+    'Kirim Backup Sekarang: bot mengirim file database (.db) ke chat ini.',
+    'Restore Database: kirim file backup itu ke bot untuk mengembalikan isi database (pengguna, saldo, server, paket, akun).'
+  ].join('\n');
+  return show(ctx, text, kb([
+    [btn('Kirim Backup Sekarang', 'a:bks'), btn('Restore Database', 'a:rt')],
+    backRow('a')
+  ]));
+}
+
+// Restore lewat menu: file dicek dan diringkas dulu, baru diganti setelah
+// admin menekan konfirmasi. Yang disimpan di antara dua langkah hanya file_id
+// Telegram, supaya tidak ada salinan database tertinggal di disk.
+async function previewRestore(ctx, doc) {
+  const uid = Number(ctx.from.id);
+  await reply(ctx, 'Memeriksa file backup...');
+  const { tmp, summary } = await downloadBackup(doc);
+  fs.unlink(tmp, () => {});
+  const current = await get(SUMMARY_SQL);
+  setPending(uid, 'a_restore_ready', { file_id: doc.file_id, file_size: doc.file_size });
+  return reply(ctx, [
+    '<b>KONFIRMASI RESTORE</b>',
+    LINE,
+    '<b>Isi file backup:</b>',
+    summaryText(summary),
+    '',
+    '<b>Database sekarang:</b>',
+    summaryText(current),
+    LINE,
+    'Seluruh isi database sekarang akan diganti dengan isi backup. Database sekarang tetap disimpan sebagai cadangan di VPS (maksimal 3).'
+  ].join('\n'), kb([[btn('Ya, Pulihkan Database', 'a:rty'), btn('Batal', 'a:bk', '')]]));
+}
+
+// ── Broadcast ───────────────────────────────────────────────────────────────
+
+// Pesan admin disalin apa adanya lewat copyMessage: teks, gambar, video, GIF,
+// atau file beserta caption dan formatnya, tanpa label "diteruskan dari".
+// Telegram membatasi sekitar 30 pesan per detik; bot memakai 20 per detik dan
+// mengikuti retry_after kalau tetap kena batas.
+const BROADCAST_KINDS = { text: 'teks', photo: 'gambar', video: 'video', animation: 'GIF', document: 'file' };
+const BROADCAST_TARGETS = {
+  all: { label: 'semua pengguna', where: 'banned = 0' },
+  reseller: { label: 'reseller', where: 'banned = 0 AND reseller = 1' }
+};
+const BROADCAST_DELAY_MS = 50;
+let broadcastJob = null;
+
+function broadcastKind(msg) {
+  return Object.keys(BROADCAST_KINDS).find((kind) => msg && msg[kind]) || '';
+}
+
+async function broadcastTargets(target, senderId) {
+  const rows = await all(`SELECT id FROM users WHERE ${BROADCAST_TARGETS[target].where} AND id <> ? ORDER BY id`, [Number(senderId)]);
+  return rows.map((r) => Number(r.id));
+}
+
+async function broadcastCount(target, senderId) {
+  const row = await get(`SELECT COUNT(*) AS n FROM users WHERE ${BROADCAST_TARGETS[target].where} AND id <> ?`, [Number(senderId)]);
+  return Number(row.n);
+}
+
+function broadcastStatusText(job) {
+  const head = job.done ? (job.stopped ? 'BROADCAST DIHENTIKAN' : 'BROADCAST SELESAI') : 'BROADCAST BERJALAN';
+  const lines = [
+    `<b>${head}</b>`,
+    LINE,
+    `Target   : ${job.label} (${job.total})`,
+    `Terkirim : ${job.sent}`,
+    `Diblokir : ${job.blocked} (pengguna memblokir bot)`,
+    `Gagal    : ${job.failed}`
+  ];
+  if (!job.done) lines.push(`Sisa     : ${job.total - job.sent - job.blocked - job.failed}`);
+  else lines.push(`Durasi   : ${Math.max(1, Math.round((now() - job.startedAt) / 1000))} detik`);
+  if (job.error) lines.push('', escapeHtml(job.error));
+  return lines.join('\n');
+}
+
+function broadcastMarkup(job) {
+  return job.done ? kb([backRow('a', 'Menu Admin')]) : kb([[btn('Hentikan Broadcast', 'a:bcx', 'danger')]]);
+}
+
+async function updateBroadcastStatus(job) {
+  if (!job.statusId) return;
+  await tg('editMessageText', {
+    chat_id: job.chatId,
+    message_id: job.statusId,
+    text: broadcastStatusText(job),
+    parse_mode: 'HTML',
+    reply_markup: broadcastMarkup(job)
+  }).catch(() => {});
+}
+
+async function askBroadcast(ctx) {
+  if (broadcastJob) return show(ctx, broadcastStatusText(broadcastJob), broadcastMarkup(broadcastJob));
+  setPending(ctx.from.id, 'a_bc');
+  return show(ctx, [
+    '<b>BROADCAST</b>',
+    LINE,
+    'Kirim pesan yang akan disebar ke pengguna bot. Bisa teks, gambar dengan caption, video, GIF, atau file.',
+    'Tebal, miring, dan link ikut terkirim seperti yang Anda tulis. Album: hanya gambar pertama yang dikirim.',
+    '',
+    'Ketik /batal untuk membatalkan.'
+  ].join('\n'), kb([backRow('a', 'Batal')]));
+}
+
+async function draftBroadcast(ctx) {
+  const kind = broadcastKind(ctx.msg);
+  if (!kind) throw new UserError('Jenis pesan ini belum bisa di-broadcast. Kirim teks, gambar, video, GIF, atau file.');
+  const uid = Number(ctx.from.id);
+  setPending(uid, 'a_bc_ready', { chatId: ctx.chatId, messageId: ctx.msg.message_id, kind });
+  const everyone = await broadcastCount('all', uid);
+  const resellers = await broadcastCount('reseller', uid);
+  return reply(ctx, [
+    '<b>PRATINJAU BROADCAST</b>',
+    LINE,
+    `Pesan ${BROADCAST_KINDS[kind]} di atas akan dikirim persis seperti itu.`,
+    'Pengguna yang diblokir admin tidak ikut dikirimi.',
+    '',
+    'Pilih penerima:'
+  ].join('\n'), kb([
+    [btn(`Semua Pengguna (${everyone})`, 'a:bcs:all'), btn(`Reseller (${resellers})`, 'a:bcs:reseller')],
+    [btn('Ganti Pesan', 'a:bc'), btn('Batal', 'a', '')]
+  ]));
+}
+
+async function confirmBroadcast(ctx, target) {
+  const uid = Number(ctx.from.id);
+  const item = takePending(uid);
+  if (!item || item.step !== 'a_bc_ready' || !BROADCAST_TARGETS[target]) return show(ctx, 'Sesi broadcast sudah habis. Ulangi dari Menu Admin > Broadcast.', kb([backRow('a')]));
+  const total = await broadcastCount(target, uid);
+  if (!total) return answer(ctx, `Belum ada ${BROADCAST_TARGETS[target].label} yang bisa dikirimi.`, true);
+  setPending(uid, 'a_bc_ready', { ...item.data, target });
+  const minutes = Math.max(1, Math.ceil((total * BROADCAST_DELAY_MS) / 60000));
+  return show(ctx, [
+    '<b>KONFIRMASI BROADCAST</b>',
+    LINE,
+    `Kirim pesan tadi ke ${total} ${BROADCAST_TARGETS[target].label}?`,
+    `Perkiraan waktu: sekitar ${minutes} menit. Bot tetap melayani pembeli selama pengiriman.`
+  ].join('\n'), kb([[btn('Ya, Kirim Sekarang', 'a:bcy'), btn('Batal', 'a', '')]]));
+}
+
+async function startBroadcast(ctx) {
+  const uid = Number(ctx.from.id);
+  const item = takePending(uid);
+  if (!item || item.step !== 'a_bc_ready' || !item.data.target) return show(ctx, 'Sesi broadcast sudah habis. Ulangi dari Menu Admin > Broadcast.', kb([backRow('a')]));
+  clearPending(uid);
+  if (broadcastJob) return answer(ctx, 'Masih ada broadcast yang berjalan.', true);
+  const ids = await broadcastTargets(item.data.target, uid);
+  const job = {
+    label: BROADCAST_TARGETS[item.data.target].label,
+    total: ids.length,
+    sent: 0,
+    blocked: 0,
+    failed: 0,
+    startedAt: now(),
+    chatId: ctx.chatId,
+    statusId: null,
+    stop: false,
+    stopped: false,
+    done: false,
+    error: ''
+  };
+  broadcastJob = job;
+  await answer(ctx, 'Broadcast dimulai.');
+  const status = await reply(ctx, broadcastStatusText(job), broadcastMarkup(job)).catch(() => null);
+  job.statusId = status ? status.message_id : null;
+  log(`broadcast mulai: ${job.total} ${job.label} oleh admin ${uid}`);
+  job.finished = runBroadcast(job, ids, item.data).catch((err) => log('broadcast gagal:', err.message));
+  return null;
+}
+
+async function deliverBroadcast(job, chatId, source) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await deps.tgRequest('copyMessage', { chat_id: chatId, from_chat_id: source.chatId, message_id: source.messageId }, 20000);
+      job.sent += 1;
+      return;
+    } catch (err) {
+      if (err.code === 429) {
+        const wait = Number(err.retryAfter);
+        await sleep(Math.min(60, Number.isFinite(wait) && wait >= 0 ? wait : 5) * 1000);
+        continue;
+      }
+      if (err.code === 400 && /message to copy not found|message_id_invalid/i.test(err.message)) {
+        job.error = 'Pesan sumber sudah dihapus dari chat admin, broadcast dihentikan.';
+        job.stop = true;
+        return;
+      }
+      if (err.code === 403) job.blocked += 1;
+      else job.failed += 1;
+      return;
+    }
+  }
+  job.failed += 1;
+}
+
+async function runBroadcast(job, ids, source) {
+  let lastEdit = now();
+  try {
+    for (const id of ids) {
+      if (job.stop || stopping) break;
+      await deliverBroadcast(job, id, source);
+      if (now() - lastEdit > 5000) {
+        lastEdit = now();
+        await updateBroadcastStatus(job);
+      }
+      await sleep(BROADCAST_DELAY_MS);
+    }
+  } finally {
+    job.stopped = job.sent + job.blocked + job.failed < job.total;
+    job.done = true;
+    broadcastJob = null;
+    log(`broadcast selesai: terkirim ${job.sent}, diblokir ${job.blocked}, gagal ${job.failed} dari ${job.total}`);
+    await updateBroadcastStatus(job);
+  }
+}
+
 // ── Routing ─────────────────────────────────────────────────────────────────
 
 // Callback lanjutan sebuah alur memakai input yang tersimpan; callback lain
 // membuang input setengah jadi supaya teks berikutnya tidak salah ditafsirkan.
-const CONTINUATION_CALLBACK = /^(b:rp|b:k:|b:d:|b:y$|r:y:)/;
+const CONTINUATION_CALLBACK = /^(b:rp|b:k:|b:d:|b:y$|r:y:|a:bcs:|a:bcy$|a:rty$)/;
 
 async function handleCallback(ctx) {
   const data = String(ctx.cb.data || '');
@@ -25822,10 +26075,34 @@ async function handleAdminCallback(ctx, data, parts) {
       }
       return showReviewOrders(ctx);
     }
-    case 'bk':
+    case 'bk': return showBackupMenu(ctx);
+    case 'bks':
       await answer(ctx, 'Menyiapkan backup...');
       await sendBackup([uid], 'manual');
       return null;
+    case 'rt':
+      setPending(uid, 'a_restore');
+      return prompt([
+        '<b>RESTORE DATABASE</b>',
+        'Kirim file backup Bot Panel (.db) ke chat ini sebagai file. File backup dikirim bot setiap hari dan lewat tombol Kirim Backup Sekarang.',
+        'Bot menampilkan isi backup dulu; database baru diganti setelah Anda menekan konfirmasi.'
+      ].join('\n'), 'a:bk');
+    case 'rty': {
+      const item = takePending(uid);
+      clearPending(uid);
+      if (!item || item.step !== 'a_restore_ready') return show(ctx, 'Sesi restore sudah habis. Ulangi dari Menu Admin > Backup &amp; Restore.', kb([backRow('a:bk')]));
+      await answer(ctx, 'Memulihkan...');
+      await show(ctx, 'Memulihkan database dari file backup...', kb([]));
+      await restoreDatabase(ctx, item.data);
+      return reply(ctx, 'Database Bot Panel berhasil dipulihkan. Database lama disimpan sebagai cadangan di VPS.', kb([backRow('a', 'Menu Admin')]));
+    }
+    case 'bc': return askBroadcast(ctx);
+    case 'bcs': return confirmBroadcast(ctx, parts[2]);
+    case 'bcy': return startBroadcast(ctx);
+    case 'bcx':
+      if (!broadcastJob) return answer(ctx, 'Tidak ada broadcast yang berjalan.', true);
+      broadcastJob.stop = true;
+      return answer(ctx, 'Broadcast dihentikan.');
     default:
       return showAdmin(ctx);
   }
@@ -25903,6 +26180,9 @@ async function handleText(ctx) {
       clearPending(uid);
       await reply(ctx, 'Tersimpan.');
       return showAdminPayment({ ...ctx, cb: null });
+    case 'a_restore':
+      if (!ctx.admin) return showHome(ctx);
+      throw new UserError('Kirim file backup (.db) sebagai file, bukan teks. Ketik /batal untuk membatalkan.');
     case 'a_text':
       if (!ctx.admin) return showHome(ctx);
       await saveTextField(ctx, item.data.field, text);
@@ -25935,13 +26215,20 @@ async function handleUpdate(update) {
       else await reply(ctx, 'Akun Anda diblokir admin.');
       return;
     }
+    const step = ctx.admin && ctx.msg ? pendingStep(ctx.from.id) : '';
+    const command = ctx.msg && typeof ctx.msg.text === 'string' && ctx.msg.text.trim().startsWith('/');
     if (ctx.cb) {
       await handleCallback(ctx);
     } else if (ctx.msg && ctx.msg.document && /^\/restore\b/i.test(String(ctx.msg.caption || '').trim())) {
       if (!ctx.admin) return;
+      clearPending(ctx.from.id);
       await reply(ctx, 'Memulihkan database dari file...');
       await restoreDatabase(ctx, ctx.msg.document);
       await reply(ctx, 'Database Bot Panel berhasil dipulihkan. Database lama disimpan sebagai cadangan di VPS.');
+    } else if (step === 'a_bc' && !command) {
+      await draftBroadcast(ctx);
+    } else if (step === 'a_restore' && ctx.msg.document) {
+      await previewRestore(ctx, ctx.msg.document);
     } else if (ctx.msg && typeof ctx.msg.text === 'string') {
       await handleText(ctx);
     }
@@ -26146,7 +26433,7 @@ module.exports = {
   homeKeyboard,
   recoverInterruptedOrders,
   UserError,
-  _state: { pending, chains, depositLastCheck }
+  _state: { pending, chains, depositLastCheck, broadcast: () => broadcastJob }
 };
 BOT_PANEL_EOF
   chmod 644 "${APP_DIR}/bot-panel.js" >/dev/null 2>&1 || true

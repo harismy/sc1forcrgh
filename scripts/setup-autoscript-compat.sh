@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.107}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.108}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23417,6 +23417,7 @@ CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id);
 CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status);
 CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id, id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at);
 `;
 
 const SETTING_DEFAULTS = {
@@ -23435,7 +23436,10 @@ const SETTING_DEFAULTS = {
   topup_max: '1000000',
   qr_minutes: '15',
   backup_daily: '1',
-  last_backup_date: ''
+  last_backup_date: '',
+  reseller_auto_topup: '30000',
+  reseller_min_sales: '3',
+  reseller_warn_days: '7'
 };
 
 const settings = new Map();
@@ -23462,7 +23466,10 @@ const MIGRATIONS = [
   ['users', 'reseller', 'INTEGER NOT NULL DEFAULT 0'],
   ['servers', 'reseller_price_day', 'INTEGER NOT NULL DEFAULT 0'],
   ['accounts', 'limit_ip', 'INTEGER'],
-  ['orders', 'limit_ip', 'INTEGER']
+  ['orders', 'limit_ip', 'INTEGER'],
+  ['users', 'reseller_since', 'INTEGER'],
+  ['users', 'reseller_period_start', 'INTEGER'],
+  ['users', 'reseller_warned', 'INTEGER NOT NULL DEFAULT 0']
 ];
 
 async function migrateSchema() {
@@ -24224,10 +24231,17 @@ let pollTimer = null;
 let pollRunning = false;
 
 async function settleDeposit(dep) {
+  const rules = resellerRules();
+  let promoted = false;
   const balance = await tx(async () => {
     const res = await run("UPDATE deposits SET status = 'paid', paid_at = ? WHERE id = ? AND status = 'pending'", [now(), dep.id]);
     if (res.changes !== 1) return null;
-    return applyBalance(dep.user_id, dep.amount, 'topup', dep.ref, `Top up ${GATEWAYS[dep.gateway] ? GATEWAYS[dep.gateway].label : dep.gateway}`);
+    const out = await applyBalance(dep.user_id, dep.amount, 'topup', dep.ref, `Top up ${GATEWAYS[dep.gateway] ? GATEWAYS[dep.gateway].label : dep.gateway}`);
+    if (rules.topup && Number(dep.amount) >= rules.topup) {
+      const up = await run(`${RESELLER_ON_SQL} AND reseller = 0 AND banned = 0`, [now(), now(), dep.user_id]);
+      promoted = up.changes === 1;
+    }
+    return out;
   });
   if (balance === null) return false;
   depositLastCheck.delete(dep.id);
@@ -24237,7 +24251,12 @@ async function settleDeposit(dep) {
     LINE,
     `Nominal : ${rupiah(dep.amount)}`,
     `Saldo   : <b>${rupiah(balance)}</b>`,
-    `ID      : <code>${escapeHtml(dep.ref)}</code>`
+    `ID      : <code>${escapeHtml(dep.ref)}</code>`,
+    ...(promoted ? [
+      LINE,
+      '<b>Selamat, akun Anda sekarang reseller.</b> Harga reseller berlaku untuk pembelian dan perpanjangan berikutnya.',
+      rules.minSales ? `Syarat tetap reseller: jual minimal ${rules.minSales} akun tiap 30 hari.` : null
+    ].filter(Boolean) : [])
   ].join('\n'), kb([backRow('h', 'Menu Utama')])).catch(() => {});
   await notifyAdmins([
     '<b>TOP UP MASUK</b>',
@@ -24245,8 +24264,9 @@ async function settleDeposit(dep) {
     `Pengguna : <code>${dep.user_id}</code>`,
     `Nominal  : ${rupiah(dep.amount)}`,
     `Metode   : ${escapeHtml(GATEWAYS[dep.gateway] ? GATEWAYS[dep.gateway].label : dep.gateway)}`,
-    `ID       : <code>${escapeHtml(dep.ref)}</code>`
-  ].join('\n'));
+    `ID       : <code>${escapeHtml(dep.ref)}</code>`,
+    promoted ? 'Pengguna ini otomatis menjadi <b>reseller</b>.' : null
+  ].filter(Boolean).join('\n'));
   return true;
 }
 
@@ -24391,6 +24411,92 @@ function serverUsable(server, admin) {
 
 function isReseller(ctx) {
   return Boolean(ctx && ctx.user && Number(ctx.user.reseller) === 1);
+}
+
+// ── Reseller otomatis dan syarat penjualan ──────────────────────────────────
+// Top up sekaligus minimal reseller_auto_topup (0 = mati) menjadikan pengguna
+// reseller. Reseller wajib menjual minimal reseller_min_sales akun (buat +
+// perpanjang yang berhasil, 0 = tanpa syarat) tiap periode 30 hari sejak jadi
+// reseller. Yang belum memenuhi diperingatkan reseller_warn_days hari sebelum
+// batas, dan baru diturunkan setelah peringatan itu berumur penuh, jadi tidak
+// pernah ada penurunan tanpa peringatan (termasuk saat syarat baru dinyalakan
+// admin atau bot sempat mati). Admin bot tidak pernah diturunkan.
+const RESELLER_PERIOD_MS = 30 * 86400000;
+const RESELLER_SOLD_SQL = "(SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id AND o.status = 'done' AND o.kind IN ('create', 'renew') AND o.created_at >= COALESCE(u.reseller_period_start, 0))";
+const RESELLER_ON_SQL = 'UPDATE users SET reseller = 1, reseller_since = ?, reseller_period_start = ?, reseller_warned = 0 WHERE id = ?';
+
+function resellerRules() {
+  return {
+    topup: Math.max(0, Number(setting('reseller_auto_topup')) || 0),
+    minSales: Math.max(0, Number(setting('reseller_min_sales')) || 0),
+    warnDays: Math.min(29, Math.max(1, Number(setting('reseller_warn_days')) || 7))
+  };
+}
+
+// Batas akhir periode reseller; mundur kalau peringatan terlambat dikirim.
+function resellerDeadline(u, rules) {
+  const start = Number(u.reseller_period_start) || now();
+  const warned = Number(u.reseller_warned) >= start ? Number(u.reseller_warned) : 0;
+  return Math.max(start + RESELLER_PERIOD_MS, warned ? warned + rules.warnDays * 86400000 : 0);
+}
+
+async function resellerProgress(userId) {
+  return get(`SELECT u.*, ${RESELLER_SOLD_SQL} AS sold FROM users u WHERE u.id = ?`, [Number(userId)]);
+}
+
+function resellerTargetText(u, rules) {
+  if (!rules.minSales || isAdmin(u.id)) return 'tanpa syarat penjualan';
+  return `${Number(u.sold) || 0}/${rules.minSales} akun sampai ${wib(resellerDeadline(u, rules)).slice(0, 16)} WIB`;
+}
+
+async function checkResellers() {
+  const rules = resellerRules();
+  const rows = await all(`SELECT u.*, ${RESELLER_SOLD_SQL} AS sold FROM users u WHERE u.reseller = 1`);
+  for (const u of rows) {
+    const t = now();
+    const start = Number(u.reseller_period_start) || 0;
+    if (!start) {
+      await write('UPDATE users SET reseller_period_start = ?, reseller_warned = 0 WHERE id = ? AND reseller = 1 AND reseller_period_start IS NULL', [t, u.id]);
+      continue;
+    }
+    const sold = Number(u.sold) || 0;
+    const end = start + RESELLER_PERIOD_MS;
+    const warned = Number(u.reseller_warned) >= start ? Number(u.reseller_warned) : 0;
+    if (!rules.minSales || isAdmin(u.id) || sold >= rules.minSales) {
+      if (t < end) continue;
+      const next = t - end >= RESELLER_PERIOD_MS ? t : end;
+      const res = await write('UPDATE users SET reseller_period_start = ?, reseller_warned = 0 WHERE id = ? AND reseller = 1 AND reseller_period_start = ?', [next, u.id, start]);
+      if (res.changes && rules.minSales && !isAdmin(u.id)) {
+        await sendHtml(u.id, `<b>TARGET RESELLER TERPENUHI</b>\n${LINE}\nPenjualan periode lalu: ${sold} akun (minimal ${rules.minSales}).\nStatus reseller Anda berlanjut sampai ${wib(next + RESELLER_PERIOD_MS).slice(0, 16)} WIB.`).catch(() => {});
+      }
+      continue;
+    }
+    if (!warned) {
+      if (t < end - rules.warnDays * 86400000) continue;
+      const res = await write('UPDATE users SET reseller_warned = ? WHERE id = ? AND reseller = 1 AND reseller_period_start = ?', [t, u.id, start]);
+      if (!res.changes) continue;
+      const deadline = resellerDeadline({ ...u, reseller_warned: t }, rules);
+      await sendHtml(u.id, [
+        '<b>PERINGATAN RESELLER</b>',
+        LINE,
+        `Penjualan Anda periode ini: <b>${sold}</b> dari minimal <b>${rules.minSales}</b> akun.`,
+        `Batas: ${wib(deadline).slice(0, 16)} WIB.`,
+        `Kalau sampai batas itu belum terpenuhi, status reseller dicabut dan pembelian kembali memakai harga normal. Yang dihitung: pembuatan dan perpanjangan akun yang berhasil.`
+      ].join('\n'), kb([[btn('Buat Akun', 'b', 'success'), btn('Perpanjang Akun', 'r', 'success')]])).catch(() => {});
+      continue;
+    }
+    if (t < end || t < warned + rules.warnDays * 86400000) continue;
+    const res = await write('UPDATE users SET reseller = 0 WHERE id = ? AND reseller = 1 AND reseller_period_start = ?', [u.id, start]);
+    if (!res.changes) continue;
+    log(`reseller ${u.id} diturunkan: jual ${sold}/${rules.minSales}`);
+    await sendHtml(u.id, [
+      '<b>STATUS RESELLER DICABUT</b>',
+      LINE,
+      `Penjualan periode ini ${sold} dari minimal ${rules.minSales} akun, jadi status reseller Anda dicabut. Pembelian berikutnya memakai harga normal.`,
+      rules.topup ? `Top up minimal ${rupiah(rules.topup)} sekaligus untuk menjadi reseller lagi.` : 'Hubungi admin untuk menjadi reseller lagi.'
+    ].join('\n')).catch(() => {});
+    await notifyAdmins(`<b>RESELLER DITURUNKAN</b>\n${LINE}\n${escapeHtml(userLabel(u))}\nPenjualan ${sold}/${rules.minSales} akun dalam periode 30 hari.`);
+  }
 }
 
 function unitPrice(item, reseller) {
@@ -24577,20 +24683,59 @@ function pendingStep(uid) {
   return item ? item.step : '';
 }
 
+// Kontak admin yang bisa dibuka langsung: @username, link t.me, atau nomor
+// WhatsApp. Selain itu tombol membuka layar kontak, supaya URL aneh tidak
+// membuat Telegram menolak seluruh menu utama.
+function contactUrl(raw) {
+  const text = String(raw || '').trim();
+  let m = text.match(/^@([A-Za-z][A-Za-z0-9_]{3,31})$/);
+  if (m) return `https://t.me/${m[1]}`;
+  m = text.match(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/([A-Za-z0-9_+]{4,64})\/?$/i);
+  if (m) return `https://t.me/${m[1]}`;
+  m = text.match(/^(?:https?:\/\/)?wa\.me\/(\d{8,15})\/?$/i);
+  if (m) return `https://wa.me/${m[1]}`;
+  if (/^\+?[\d\s-]{9,20}$/.test(text)) {
+    const digits = text.replace(/\D/g, '').replace(/^0/, '62');
+    if (digits.length >= 9 && digits.length <= 15) return `https://wa.me/${digits}`;
+  }
+  return '';
+}
+
 function homeKeyboard(admin) {
+  const url = contactUrl(setting('contact'));
   return kb([
     [btn('Buat Akun', 'b', 'success'), btn('Trial Gratis', 't', 'success')],
     [btn('Perpanjang Akun', 'r', 'success'), btn('Akun Saya', 'acc', 'success')],
     [btn('Top Up Saldo', 'tu', 'success'), btn('Riwayat Saldo', 'hist', 'success')],
-    [btn('Server dan Harga', 'srv', 'primary')],
+    [btn('Server dan Harga', 'srv', 'primary'), url ? { text: 'Hubungi Admin', url, style: 'primary' } : btn('Hubungi Admin', 'ct', 'primary')],
     admin ? [btn('Menu Admin', 'a', 'primary')] : null
   ]);
+}
+
+async function showContact(ctx) {
+  const contact = setting('contact');
+  const lines = ['<b>HUBUNGI ADMIN</b>', LINE];
+  if (contact) lines.push(`Kontak admin: ${escapeHtml(contact)}`);
+  else if (CONFIG.adminIds.length) lines.push(`Kontak admin: ${CONFIG.adminIds.map((id, i) => `<a href="tg://user?id=${id}">Admin ${i + 1}</a>`).join(', ')}`);
+  else lines.push('Admin belum mengisi kontak.');
+  lines.push('', `Sebutkan ID Telegram Anda saat menghubungi admin: <code>${Number(ctx.from.id)}</code>`);
+  return show(ctx, lines.join('\n'), kb([backRow('h', 'Menu Utama')]));
+}
+
+// Layar utama bergaya pohon: hanya karakter garis Unicode, tanpa emoji.
+const BOX_TOP = `╭${'━'.repeat(20)}`;
+const BOX_MID = `┣${'━'.repeat(20)}`;
+const BOX_END = `╰${'━'.repeat(20)}`;
+
+function treeSection(title, rows) {
+  const items = rows.filter((row) => row !== null && row !== undefined);
+  return [`┃ <b>${title}</b>`, ...items.map((row, i) => `┃ ${i === items.length - 1 ? '╰' : '├'} ${row}`)];
 }
 
 async function showHome(ctx) {
   clearPending(ctx.from.id);
   const uid = Number(ctx.from.id);
-  const user = await get('SELECT * FROM users WHERE id = ?', [uid]);
+  const user = await resellerProgress(uid);
   const stats = await get(
     `SELECT (SELECT COUNT(*) FROM servers s WHERE s.enabled = 1 AND ${SELLABLE_SQL}) AS servers,
             (SELECT COUNT(*) FROM users) AS users,
@@ -24598,25 +24743,32 @@ async function showHome(ctx) {
             (SELECT COUNT(*) FROM accounts WHERE trial = 0 AND expired_at > ? AND user_id = ?) AS mine`,
     [now(), now(), uid]
   );
+  const rules = resellerRules();
+  const reseller = Boolean(user && Number(user.reseller) === 1);
   const trialOn = setting('trial_enable') === '1';
   const lines = [
-    `<b>${escapeHtml(storeName())}</b>`,
-    LINE,
-    `ID Telegram : <code>${uid}</code>`,
-    `Nama        : ${escapeHtml(user && user.name ? user.name : '-')}`,
-    `Saldo       : <b>${rupiah(user ? user.saldo : 0)}</b>`,
-    isReseller(ctx) ? 'Status      : <b>Reseller</b> (harga khusus reseller)' : null,
-    LINE,
-    `Server aktif : ${stats.servers}`,
-    `Pengguna bot : ${stats.users}`,
-    `Akun aktif   : ${stats.accounts} (milik Anda ${stats.mine})`,
-    `Trial gratis : ${trialOn ? `${Math.max(1, Number(setting('trial_per_day')) || 1)}x per hari` : 'tidak tersedia'}`,
-    LINE
+    BOX_TOP,
+    `┃ <b>${escapeHtml(storeName())}</b>`,
+    BOX_MID,
+    ...treeSection('AKUN SAYA', [
+      `ID     : <code>${uid}</code>`,
+      `Nama   : ${escapeHtml(user && user.name ? user.name : '-')}`,
+      `Status : ${reseller ? '<b>Reseller</b> (harga khusus reseller)' : 'Member'}`,
+      reseller && rules.minSales && !ctx.admin ? `Target : ${resellerTargetText(user, rules)}` : null,
+      `Saldo  : <b>${rupiah(user ? user.saldo : 0)}</b>`
+    ]),
+    '┃',
+    ...treeSection('INFO TOKO', [
+      `Server aktif : ${stats.servers}`,
+      `Pengguna bot : ${stats.users}`,
+      `Akun aktif   : ${stats.accounts} (milik Anda ${stats.mine})`,
+      `Trial gratis : ${trialOn ? `${Math.max(1, Number(setting('trial_per_day')) || 1)}x per hari` : 'tidak tersedia'}`
+    ]),
+    BOX_END
   ];
   const info = setting('info_text');
   if (info) lines.push(escapeHtml(info));
-  for (let i = lines.length - 1; i >= 0; i -= 1) if (lines[i] === null) lines.splice(i, 1);
-  if (setting('contact')) lines.push(`Kontak admin: ${escapeHtml(setting('contact'))}`);
+  if (!reseller && rules.topup) lines.push(`Top up minimal ${rupiah(rules.topup)} sekaligus untuk otomatis jadi reseller.`);
   return show(ctx, lines.join('\n'), homeKeyboard(ctx.admin));
 }
 
@@ -24968,6 +25120,7 @@ async function showTopup(ctx) {
     `Minimal : ${rupiah(min)}`,
     `Maksimal: ${rupiah(max)}`,
     LINE,
+    ...(resellerRules().topup && !isReseller(ctx) ? [`Top up minimal ${rupiah(resellerRules().topup)} sekaligus: otomatis jadi reseller dengan harga lebih murah.`, LINE] : []),
     'Pilih nominal:'
   ].join('\n'), kb([...pairs(buttons), [btn('Nominal Lain', 'tu:o')], backRow()]));
 }
@@ -25029,9 +25182,9 @@ async function showAdmin(ctx) {
   ].join('\n');
   return show(ctx, text, kb([
     [btn('Kelola Server', 'a:sv'), btn('Kelola Pengguna', 'a:u')],
-    [btn('Payment Gateway', 'a:pg'), btn('Pengaturan Bot', 'a:cfg')],
-    [btn('Broadcast', 'a:bc'), btn('Backup & Restore', 'a:bk')],
-    [btn(`Pesanan Bermasalah (${s.review})`, 'a:or')],
+    [btn('Kelola Reseller', 'a:rs'), btn('Payment Gateway', 'a:pg')],
+    [btn('Pengaturan Bot', 'a:cfg'), btn('Broadcast', 'a:bc')],
+    [btn('Backup & Restore', 'a:bk'), btn(`Pesanan Bermasalah (${s.review})`, 'a:or')],
     backRow('h', 'Menu Utama')
   ]));
 }
@@ -25304,7 +25457,7 @@ async function userSummary(id) {
     `Akun aktif: ${acc.n}`,
     `Belanja   : ${rupiah(spent.n)}`,
     `Bergabung : ${wib(u.created_at).slice(0, 16)} WIB`,
-    `Reseller  : ${Number(u.reseller) === 1 ? 'YA (harga reseller)' : 'tidak'}`,
+    `Reseller  : ${Number(u.reseller) === 1 ? `YA (harga reseller), jual ${resellerTargetText(await resellerProgress(u.id), resellerRules())}` : 'tidak'}`,
     `Status    : ${Number(u.banned) ? 'DIBLOKIR' : 'normal'}`
   ] };
 }
@@ -25347,15 +25500,47 @@ async function showInfoUser(ctx, id) {
   ]));
 }
 
+const RESELLER_FIELDS = {
+  reseller_auto_topup: { label: 'minimal top up sekaligus (rupiah) supaya pengguna otomatis jadi reseller. Kirim 0 untuk mematikan reseller otomatis', min: 0, max: 100000000 },
+  reseller_min_sales: { label: 'minimal akun terjual (buat + perpanjang yang berhasil) tiap 30 hari supaya tetap reseller. Kirim 0 untuk tanpa syarat', min: 0, max: 1000 },
+  reseller_warn_days: { label: 'berapa hari sebelum batas reseller diberi peringatan (1-29)', min: 1, max: 29 }
+};
+
+async function saveResellerField(field, raw) {
+  const spec = RESELLER_FIELDS[field];
+  const value = toInt(String(raw || '').trim());
+  if (!Number.isFinite(value) || value < spec.min || value > spec.max) throw new UserError(`Masukkan angka ${spec.min}-${spec.max}.`);
+  if (field === 'reseller_auto_topup' && value > 0 && value < 1000) throw new UserError('Minimal top up reseller Rp1.000, atau 0 untuk mematikan.');
+  return setSetting(field, String(value));
+}
+
 async function showResellers(ctx) {
   clearPending(ctx.from.id);
-  const rows = await all('SELECT * FROM users WHERE reseller = 1 ORDER BY name LIMIT 40');
-  const lines = ['<b>KELOLA RESELLER</b>', LINE];
+  const rules = resellerRules();
+  const rows = await all(`SELECT u.*, ${RESELLER_SOLD_SQL} AS sold FROM users u WHERE u.reseller = 1 ORDER BY u.name LIMIT 40`);
+  const lines = [
+    '<b>KELOLA RESELLER</b>',
+    LINE,
+    `Reseller otomatis : ${rules.topup ? `top up minimal ${rupiah(rules.topup)} sekaligus` : 'NONAKTIF'}`,
+    `Syarat penjualan  : ${rules.minSales ? `${rules.minSales} akun per 30 hari` : 'tanpa syarat'}`,
+    `Peringatan        : ${rules.warnDays} hari sebelum batas`,
+    LINE
+  ];
   if (!rows.length) lines.push('Belum ada reseller.');
-  for (const u of rows) lines.push(`<code>${u.id}</code> ${escapeHtml(u.name || '-')} ${u.username ? `@${escapeHtml(u.username)}` : ''} - ${rupiah(u.saldo)}`);
-  lines.push(LINE, 'Reseller membeli dan memperpanjang dengan harga reseller tiap server/paket. Kalau harga reseller tidak diisi, dipakai harga normal.');
+  for (const u of rows) {
+    lines.push(`<code>${u.id}</code> ${escapeHtml(u.name || '-')} ${u.username ? `@${escapeHtml(u.username)}` : ''} - ${rupiah(u.saldo)}`);
+    if (rules.minSales && !isAdmin(u.id)) lines.push(`   jual ${resellerTargetText(u, rules)}${Number(u.sold) < rules.minSales && Number(u.reseller_warned) >= Number(u.reseller_period_start) ? ' (sudah diperingatkan)' : ''}`);
+  }
+  lines.push(LINE,
+    'Reseller membeli dan memperpanjang dengan harga reseller tiap server/paket. Kalau harga reseller tidak diisi, dipakai harga normal.',
+    'Syarat penjualan berlaku untuk semua reseller, termasuk yang ditambahkan admin. Reseller yang tidak memenuhi diberi peringatan dulu, lalu diturunkan jadi member.');
   const buttons = rows.map((u) => btn(userLabel(u).slice(0, 60), `a:ei:${u.id}`));
-  return show(ctx, lines.join('\n'), kb([...buttons.map((b) => [b]), [btn('Tambah Reseller', 'a:rsa')], backRow('a:u')]));
+  return show(ctx, lines.join('\n'), kb([
+    [btn('Min Top Up Reseller', 'a:rc:reseller_auto_topup'), btn('Min Penjualan', 'a:rc:reseller_min_sales')],
+    [btn('Hari Peringatan', 'a:rc:reseller_warn_days'), btn('Tambah Reseller', 'a:rsa')],
+    ...buttons.map((b) => [b]),
+    backRow('a')
+  ]));
 }
 
 async function confirmReseller(ctx, id) {
@@ -25368,7 +25553,8 @@ async function confirmReseller(ctx, id) {
 async function setReseller(ctx, id, enabled, back) {
   const u = await get('SELECT * FROM users WHERE id = ?', [Number(id)]);
   if (!u) return show(ctx, 'Pengguna tidak ditemukan.', kb([backRow('a:u')]));
-  await write('UPDATE users SET reseller = ? WHERE id = ?', [enabled ? 1 : 0, u.id]);
+  if (enabled) await write(RESELLER_ON_SQL, [now(), now(), u.id]);
+  else await write('UPDATE users SET reseller = 0 WHERE id = ?', [u.id]);
   await sendHtml(u.id, enabled
     ? 'Akun Anda sekarang <b>reseller</b>. Harga reseller berlaku untuk pembelian dan perpanjangan berikutnya.'
     : 'Status reseller Anda dicabut admin. Pembelian berikutnya memakai harga normal.').catch(() => {});
@@ -25477,7 +25663,7 @@ async function showAdminSettings(ctx) {
 
 const TEXT_FIELDS = {
   store_name: { label: 'nama toko (maks 32 karakter, kirim - untuk memakai username bot)', max: 32 },
-  contact: { label: 'kontak admin, misalnya @username (kirim - untuk mengosongkan)', max: 64 },
+  contact: { label: 'kontak admin untuk tombol Hubungi Admin, misalnya @username, link t.me, atau nomor WhatsApp (kirim - untuk mengosongkan)', max: 64 },
   info_text: { label: 'teks info yang tampil di /start (maks 500 karakter, kirim - untuk mengosongkan)', max: 500 },
   trial_per_day: { label: 'jatah trial per pengguna per hari (1-10)', min: 1, max: 10 }
 };
@@ -25845,6 +26031,7 @@ async function handleCallback(ctx) {
   if (data === 'srv') return showServerList(ctx);
   if (data === 'acc') return showMyAccounts(ctx);
   if (data === 'hist') return showHistory(ctx);
+  if (data === 'ct') return showContact(ctx);
 
   if (parts[0] === 'b' || parts[0] === 't') {
     const mode = parts[0];
@@ -26000,6 +26187,12 @@ async function handleAdminCallback(ctx, data, parts) {
       setPending(uid, 'a_user_pick', { mode: 'reseller' });
       return prompt(`<b>${USER_PICK.reseller.prompt}</b>`, 'a:rs');
     case 'rsy': return confirmReseller(ctx, parts[2]);
+    case 'rc': {
+      const field = parts[2];
+      if (!RESELLER_FIELDS[field]) return showResellers(ctx);
+      setPending(uid, 'a_rcfg', { field });
+      return prompt(`Kirim ${RESELLER_FIELDS[field].label}.`, 'a:rs');
+    }
     case 'ur': {
       const target = await get('SELECT * FROM users WHERE id = ?', [Number(parts[2])]);
       if (!target) return showAdminUsers(ctx);
@@ -26180,6 +26373,12 @@ async function handleText(ctx) {
       clearPending(uid);
       await reply(ctx, 'Tersimpan.');
       return showAdminPayment({ ...ctx, cb: null });
+    case 'a_rcfg':
+      if (!ctx.admin) return showHome(ctx);
+      await saveResellerField(item.data.field, text);
+      clearPending(uid);
+      await reply(ctx, 'Tersimpan.');
+      return showResellers({ ...ctx, cb: null });
     case 'a_restore':
       if (!ctx.admin) return showHome(ctx);
       throw new UserError('Kirim file backup (.db) sebagai file, bukan teks. Ketik /batal untuk membatalkan.');
@@ -26331,6 +26530,7 @@ async function maintenance() {
     await setSetting('last_backup_date', today);
     await sendBackup(CONFIG.adminIds, 'harian').catch((err) => log('backup harian gagal:', err.message));
   }
+  await checkResellers().catch((err) => log('cek reseller gagal:', err.message));
   const left = await get("SELECT COUNT(*) AS n FROM deposits WHERE status = 'pending'");
   if (Number(left.n) > 0) schedulePoll(1000);
 }
@@ -26432,6 +26632,8 @@ module.exports = {
   inferStyle,
   homeKeyboard,
   recoverInterruptedOrders,
+  checkResellers,
+  contactUrl,
   UserError,
   _state: { pending, chains, depositLastCheck, broadcast: () => broadcastJob }
 };

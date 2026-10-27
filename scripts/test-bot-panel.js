@@ -228,7 +228,25 @@ async function saldo(id) {
   const buyerButtons = home.payload.reply_markup.inline_keyboard.flat().map((b) => b.text);
   assert(!buyerButtons.includes('Menu Admin'), 'pembeli tidak boleh melihat Menu Admin');
   assert.deepStrictEqual(home.payload.reply_markup.inline_keyboard.map((row) => row.map((b) => b.style || '')),
-    [['success', 'success'], ['success', 'success'], ['success', 'success'], ['primary']], 'warna menu utama per baris');
+    [['success', 'success'], ['success', 'success'], ['success', 'success'], ['primary', 'primary']], 'warna menu utama per baris');
+  assert(buyerButtons.includes('Hubungi Admin'), 'menu utama pembeli punya Hubungi Admin');
+  assert(/╭━+\n┃ <b>/.test(home.payload.text) && /┃ ╰ Saldo  : <b>Rp 0<\/b>/.test(home.payload.text) && /\n╰━+/.test(home.payload.text), `menu utama memakai bingkai garis:\n${home.payload.text}`);
+  assert(/Status : Member/.test(home.payload.text) && /Top up minimal Rp 30\.000 sekaligus untuk otomatis jadi reseller/.test(home.payload.text), 'pembeli biasa melihat status dan syarat reseller otomatis');
+  // Kontak admin: tanpa kontak tombol membuka layar kontak; @username dan nomor WA jadi link.
+  const contactBtn = (markup) => markup.inline_keyboard.flat().find((b) => b.text === 'Hubungi Admin');
+  assert.strictEqual(contactBtn(home.payload.reply_markup).callback_data, 'ct');
+  calls = await step(cbUpdate(BUYER, 'ct'));
+  assert(/HUBUNGI ADMIN/.test(texts(calls)) && /tg:\/\/user\?id=1001/.test(texts(calls)) && new RegExp(`<code>${BUYER}</code>`).test(texts(calls)), 'layar kontak menyebut admin dan ID pembeli');
+  assert.strictEqual(bot.contactUrl('@toko_vpn'), 'https://t.me/toko_vpn');
+  assert.strictEqual(bot.contactUrl('t.me/toko_vpn'), 'https://t.me/toko_vpn');
+  assert.strictEqual(bot.contactUrl('0812-3456-7890'), 'https://wa.me/6281234567890');
+  assert.strictEqual(bot.contactUrl('https://wa.me/6281234567890'), 'https://wa.me/6281234567890');
+  assert.strictEqual(bot.contactUrl('chat admin di grup'), '');
+  assert.strictEqual(bot.contactUrl('javascript:alert(1)'), '');
+  await bot.setSetting('contact', '@toko_vpn');
+  calls = await step(textUpdate(BUYER, '/start'));
+  assert.strictEqual(contactBtn(calls.find((c) => c.method === 'sendMessage').payload.reply_markup).url, 'https://t.me/toko_vpn', 'kontak @username jadi tombol link');
+  await bot.setSetting('contact', '');
   calls = await step(textUpdate(ADMIN, '/start'));
   assert(calls.find((c) => c.method === 'sendMessage').payload.reply_markup.inline_keyboard.flat().some((b) => b.text === 'Menu Admin'), 'admin harus melihat Menu Admin');
   await step(textUpdate(OTHER, '/start'));
@@ -555,7 +573,7 @@ async function saldo(id) {
   assert.strictEqual(Number((await bot.get('SELECT reseller FROM users WHERE id = ?', [BUYER])).reseller), 1, 'admin bisa menambah reseller');
   assert(calls.some((c) => c.method === 'sendMessage' && c.payload.chat_id === BUYER && /sekarang <b>reseller<\/b>/.test(c.payload.text)), 'reseller diberi tahu');
   calls = await step(textUpdate(BUYER, '/start'));
-  assert(/Status      : <b>Reseller<\/b>/.test(texts(calls)), 'menu utama reseller menyebut status reseller');
+  assert(/Status : <b>Reseller<\/b>/.test(texts(calls)), 'menu utama reseller menyebut status reseller');
 
   let before = await saldo(BUYER);
   let r = await buy(BUYER, localNow.id, 'resel01', 7);
@@ -651,6 +669,93 @@ async function saldo(id) {
   assert.strictEqual(Number((await bot.get('SELECT reseller FROM users WHERE id = ?', [BUYER])).reseller), 0, 'reseller bisa dicabut dari Edit Info');
   calls = await step(cbUpdate(BUYER, `a:ur:${BUYER}`));
   assert(/khusus admin/.test(alerts(calls)), 'pembeli tidak bisa menjadikan dirinya reseller');
+
+  // ── Reseller otomatis lewat top up dan syarat penjualan ─────────────────
+  const AUTO = 7007;
+  await step(textUpdate(AUTO, '/start'));
+  const depositFor = async (userId, amount, ref) => {
+    await bot.write("INSERT INTO deposits (ref, user_id, amount, gateway, provider_tx, chat_id, status, created_at, expires_at) VALUES (?, ?, ?, 'gopay', ?, ?, 'pending', ?, ?)", [ref, userId, amount, `P-${ref}`, userId, Date.now(), Date.now() + 600000]);
+    return bot.get('SELECT * FROM deposits WHERE ref = ?', [ref]);
+  };
+  const isRes = async (id) => Number((await bot.get('SELECT reseller FROM users WHERE id = ?', [id])).reseller) === 1;
+  mark = tgCalls.length;
+  await bot.settleDeposit(await depositFor(AUTO, 29999, 'AUTO1'));
+  assert(!(await isRes(AUTO)), 'top up di bawah minimal tidak jadi reseller');
+  await bot.settleDeposit(await depositFor(AUTO, 30000, 'AUTO2'));
+  assert(await isRes(AUTO), 'top up 30k sekaligus otomatis jadi reseller');
+  assert(since(mark).some((c) => c.payload.chat_id === AUTO && /sekarang reseller/.test(c.payload.text || '')), 'pembeli diberi tahu jadi reseller');
+  assert(since(mark).some((c) => c.payload.chat_id === '1001' && /otomatis menjadi <b>reseller<\/b>/.test(c.payload.text || '')), 'admin diberi tahu reseller otomatis');
+  calls = await step(textUpdate(AUTO, '/start'));
+  assert(/Target : 0\/3 akun sampai/.test(texts(calls)), `reseller melihat target penjualan:\n${texts(calls)}`);
+
+  // Pengaturan reseller di Kelola Reseller.
+  calls = await step(cbUpdate(ADMIN, 'a:rs'));
+  assert(/top up minimal Rp 30\.000 sekaligus/.test(texts(calls)) && /3 akun per 30 hari/.test(texts(calls)));
+  await step(cbUpdate(ADMIN, 'a:rc:reseller_auto_topup'));
+  calls = await step(textUpdate(ADMIN, '500'));
+  assert(/Minimal top up reseller Rp1\.000/.test(texts(calls)), 'minimal top up terlalu kecil ditolak');
+  calls = await step(textUpdate(ADMIN, '50000'));
+  assert.strictEqual(bot.setting('reseller_auto_topup'), '50000');
+  assert(/top up minimal Rp 50\.000 sekaligus/.test(texts(calls)));
+  await step(cbUpdate(ADMIN, 'a:rc:reseller_min_sales'));
+  await step(textUpdate(ADMIN, '2'));
+  assert.strictEqual(bot.setting('reseller_min_sales'), '2');
+  calls = await step(cbUpdate(BUYER, 'a:rc:reseller_min_sales'));
+  assert(/khusus admin/.test(alerts(calls)), 'pembeli tidak bisa mengubah syarat reseller');
+
+  // Periode 30 hari: peringatan dulu, lalu diturunkan setelah peringatan berumur penuh.
+  const DAY = 86400000;
+  const resUser = async (id) => bot.get('SELECT * FROM users WHERE id = ?', [id]);
+  await bot.write('UPDATE users SET reseller_period_start = ?, reseller_warned = 0 WHERE id = ?', [Date.now() - 20 * DAY, AUTO]);
+  mark = tgCalls.length;
+  await bot.checkResellers();
+  assert(!since(mark).some((c) => c.payload.chat_id === AUTO), 'belum masuk masa peringatan: diam');
+  await bot.write('UPDATE users SET reseller_period_start = ? WHERE id = ?', [Date.now() - 25 * DAY, AUTO]);
+  await bot.checkResellers();
+  const warning = since(mark).find((c) => c.payload.chat_id === AUTO && /PERINGATAN RESELLER/.test(c.payload.text || ''));
+  assert(warning && /<b>0<\/b> dari minimal <b>2<\/b>/.test(warning.payload.text), 'reseller kurang jual diperingatkan');
+  mark = tgCalls.length;
+  await bot.checkResellers();
+  assert(!since(mark).some((c) => c.payload.chat_id === AUTO), 'peringatan hanya dikirim sekali per periode');
+  // Periode habis dan peringatan sudah berumur 7 hari: diturunkan.
+  await bot.write('UPDATE users SET reseller_period_start = ?, reseller_warned = ? WHERE id = ?', [Date.now() - 31 * DAY, Date.now() - 8 * DAY, AUTO]);
+  mark = tgCalls.length;
+  await bot.checkResellers();
+  assert(!(await isRes(AUTO)), 'reseller yang tidak memenuhi target diturunkan');
+  assert(since(mark).some((c) => c.payload.chat_id === AUTO && /STATUS RESELLER DICABUT/.test(c.payload.text) && /Rp 50\.000/.test(c.payload.text)), 'pengguna diberi tahu cara jadi reseller lagi');
+  assert(since(mark).some((c) => c.payload.chat_id === '1001' && /RESELLER DITURUNKAN/.test(c.payload.text)), 'admin diberi tahu');
+
+  // Syarat baru dinyalakan untuk reseller lama: tidak pernah turun tanpa peringatan.
+  await bot.write('UPDATE users SET reseller = 1, reseller_period_start = ?, reseller_warned = 0 WHERE id = ?', [Date.now() - 45 * DAY, AUTO]);
+  mark = tgCalls.length;
+  await bot.checkResellers();
+  assert(await isRes(AUTO), 'periode lewat tanpa peringatan: belum diturunkan');
+  const late = since(mark).find((c) => c.payload.chat_id === AUTO && /PERINGATAN RESELLER/.test(c.payload.text || ''));
+  assert(late, 'peringatan dikirim dulu');
+  const lateUser = await resUser(AUTO);
+  assert(Number(lateUser.reseller_warned) > Date.now() - 60000, 'waktu peringatan dicatat');
+  await bot.checkResellers();
+  assert(await isRes(AUTO), 'masih diberi waktu sesuai hari peringatan');
+
+  // Target terpenuhi: periode baru, peringatan direset.
+  await bot.write("INSERT INTO orders (user_id, server_id, kind, protocol, username, days, amount, status, created_at, updated_at) VALUES (?, 1, 'create', 'vmess', 'jual01', 1, 100, 'done', ?, ?), (?, 1, 'renew', 'vmess', 'jual01', 1, 100, 'done', ?, ?)", [AUTO, Date.now(), Date.now(), AUTO, Date.now(), Date.now()]);
+  mark = tgCalls.length;
+  await bot.checkResellers();
+  assert(await isRes(AUTO), 'target terpenuhi tetap reseller');
+  const rolled = await resUser(AUTO);
+  assert(Math.abs(Number(rolled.reseller_period_start) - (Date.now() - 15 * DAY)) < 60000 && since(mark).some((c) => c.payload.chat_id === AUTO && /TARGET RESELLER TERPENUHI/.test(c.payload.text)), 'periode baru dimulai setelah target terpenuhi');
+  // Admin bot tidak pernah diturunkan; syarat 0 = tanpa syarat.
+  await bot.write('UPDATE users SET reseller = 1, reseller_period_start = ?, reseller_warned = ? WHERE id = ?', [Date.now() - 40 * DAY, Date.now() - 20 * DAY, ADMIN]);
+  await bot.checkResellers();
+  assert(await isRes(ADMIN), 'admin tidak diturunkan');
+  await bot.write('UPDATE users SET reseller = 0 WHERE id = ?', [ADMIN]);
+  await bot.setSetting('reseller_min_sales', '0');
+  await bot.write('UPDATE users SET reseller_period_start = ?, reseller_warned = ? WHERE id = ?', [Date.now() - 40 * DAY, Date.now() - 20 * DAY, AUTO]);
+  await bot.checkResellers();
+  assert(await isRes(AUTO), 'syarat penjualan 0 = tidak ada penurunan');
+  await bot.setSetting('reseller_min_sales', '3');
+  await bot.setSetting('reseller_auto_topup', '30000');
+  await bot.write('UPDATE users SET reseller = 0 WHERE id = ?', [AUTO]);
 
   // ── Broadcast ──────────────────────────────────────────────────────────
   const waitBroadcast = async () => {

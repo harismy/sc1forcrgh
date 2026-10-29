@@ -204,7 +204,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.109}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.110}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23195,6 +23195,7 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const dns = require('dns');
 
 const ENV = process.env;
 
@@ -23557,7 +23558,26 @@ async function touchUser(from) {
 
 // ── Telegram ────────────────────────────────────────────────────────────────
 
-const tgAgent = new https.Agent({ keepAlive: true, maxSockets: 6 });
+// Node 20+ mencoba alamat IPv4/IPv6 satu per satu dan hanya memberi tiap
+// percobaan 250 ms sebelum pindah ke alamat berikutnya. Dari VPS dengan RTT
+// tinggi ke Telegram (Indonesia ke DC Telegram sering lebih dari 250 ms) dan
+// IPv6 yang tidak tersambung, semua percobaan gagal dan bot tidak pernah bisa
+// polling. IPv4 dicoba dulu dengan jendela 2,5 detik per alamat. Node lama
+// mengabaikan opsi ini.
+if (typeof dns.setDefaultResultOrder === 'function') dns.setDefaultResultOrder('ipv4first');
+const NET_OPTS = { autoSelectFamilyAttemptTimeout: 2500 };
+
+// AggregateError dari Node 20+ (semua alamat gagal) tidak punya pesan. Isi
+// dengan pesan tiap alamat supaya log dan pesan ke admin bisa dibaca.
+function netError(err) {
+  if (err && !err.message) {
+    const inner = Array.isArray(err.errors) ? err.errors.map((e) => e && (e.message || e.code)).filter(Boolean) : [];
+    err.message = inner.length ? inner.join('; ') : String(err.code || err.name || 'koneksi gagal');
+  }
+  return err;
+}
+
+const tgAgent = new https.Agent({ keepAlive: true, maxSockets: 6, ...NET_OPTS });
 
 function readBody(res, limit) {
   return new Promise((resolve) => {
@@ -23596,7 +23616,7 @@ deps.tgRequest = function tgRequest(method, payload, timeoutMs) {
       else reject(tgError(data, res.statusCode));
     });
     req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
-    req.on('error', reject);
+    req.on('error', (err) => reject(netError(err)));
     req.end(body);
   });
 };
@@ -23626,7 +23646,7 @@ deps.sendDocument = function sendDocument(chatId, filePath, fileName, caption) {
       else reject(tgError(data, res.statusCode));
     });
     req.setTimeout(60000, () => req.destroy(new Error('timeout')));
-    req.on('error', reject);
+    req.on('error', (err) => reject(netError(err)));
     req.end(body);
   });
 };
@@ -23654,7 +23674,7 @@ deps.downloadTelegramFile = function downloadTelegramFile(filePath, target, maxB
       out.on('error', reject);
     });
     req.setTimeout(60000, () => req.destroy(new Error('timeout')));
-    req.on('error', reject);
+    req.on('error', (err) => reject(netError(err)));
   });
 };
 
@@ -24048,7 +24068,7 @@ function formatAccountMessage(protocol, data, options) {
 
 // ── HTTP keluar: API server SC dan payment gateway ──────────────────────────
 
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 4, ...NET_OPTS });
 
 deps.httpJson = function httpJson({ url, method = 'GET', headers = {}, body, timeoutMs = 30000 }) {
   return new Promise((resolve, reject) => {
@@ -24080,6 +24100,7 @@ deps.httpJson = function httpJson({ url, method = 'GET', headers = {}, body, tim
       req.destroy(err);
     });
     req.on('error', (err) => {
+      netError(err);
       // Timeout atau koneksi putus setelah request terkirim berarti hasilnya
       // tidak pasti. Gagal sambung (ECONNREFUSED, DNS, sertifikat) pasti gagal.
       if (err.timeout || ['ECONNRESET', 'EPIPE'].includes(err.code) || /socket hang up/i.test(err.message)) err.uncertain = true;
@@ -26717,6 +26738,7 @@ module.exports = {
   homeKeyboard,
   recoverInterruptedOrders,
   checkResellers,
+  netError,
   contactUrl,
   UserError,
   _state: { pending, chains, depositLastCheck, broadcast: () => broadcastJob }
@@ -36843,8 +36865,9 @@ set_bot_panel_menu() {
   echo "2) Set Token Bot Jualan"
   echo "3) Set ID Admin Bot Jualan"
   echo "4) Lihat Log Bot Panel"
+  echo "5) Tes Koneksi Telegram"
   echo "0) Kembali"
-  if ! prompt_input choice "Pilih [0-4]: "; then
+  if ! prompt_input choice "Pilih [0-5]: "; then
     return 0
   fi
   case "${choice}" in
@@ -36852,8 +36875,55 @@ set_bot_panel_menu() {
     2) set_bot_panel_token || true ;;
     3) set_bot_panel_admin_ids || true ;;
     4) journalctl -u sc-1forcr-botpanel.service -n 40 --no-pager -o cat 2>/dev/null || echo "Log Bot Panel belum tersedia." ;;
+    5) check_bot_panel_telegram || true ;;
     *) return 0 ;;
   esac
+  return 0
+}
+
+# Tes koneksi VPS ini ke api.telegram.org lewat IPv4 dan IPv6, lalu getMe
+# dengan token bot jualan. Token tidak pernah dicetak. Log "getUpdates gagal"
+# berarti bot tidak bisa menjangkau Telegram; layar ini menunjukkan jalurnya.
+check_bot_panel_telegram() {
+  local v res err ok_any=0 slow=0 code connect
+  draw_menu_header "TES KONEKSI TELEGRAM BOT JUALAN"
+  echo "Node.js          : $(node -v 2>/dev/null || echo "-")"
+  for v in 4 6; do
+    err="$(mktemp)"
+    res="$(curl -"${v}" -sS -m 15 -o /dev/null -w '%{http_code} %{time_connect}' https://api.telegram.org 2>"${err}" || true)"
+    code="${res%% *}"
+    connect="${res##* }"
+    if [[ -n "${code}" && "${code}" != "000" ]]; then
+      ok_any=1
+      echo "IPv${v}             : Berhasil (HTTP ${code}, sambung ${connect} detik)"
+      if [[ "${connect}" =~ ^0\.(2[5-9]|[3-9]) || "${connect}" =~ ^[1-9] ]]; then slow=1; fi
+    else
+      echo "IPv${v}             : Gagal ($(tr -d '\n' <"${err}" | head -c 100))"
+    fi
+    rm -f "${err}"
+  done
+  if [[ -n "${BOT_PANEL_TOKEN:-}" ]]; then
+    res="$(curl -sS -m 15 "https://api.telegram.org/bot${BOT_PANEL_TOKEN}/getMe" 2>/dev/null || true)"
+    if [[ "${res}" == *'"ok":true'* ]]; then
+      echo "Token bot jualan : Berhasil (@$(sed -n 's/.*"username":"\([^"]*\)".*/\1/p' <<<"${res}"))"
+    elif [[ -n "${res}" ]]; then
+      echo "Token bot jualan : Gagal ($(sed -n 's/.*"description":"\([^"]*\)".*/\1/p' <<<"${res}" | head -c 100))"
+    else
+      echo "Token bot jualan : Gagal (tidak ada respons dari Telegram)"
+    fi
+  else
+    echo "Token bot jualan : belum diisi"
+  fi
+  echo
+  if [[ "${ok_any}" != "1" ]]; then
+    echo "Peringatan: VPS ini tidak bisa menjangkau api.telegram.org lewat IPv4 maupun IPv6."
+    echo "Bot jualan tidak bisa jalan sampai provider atau firewall VPS membuka akses ke Telegram."
+  elif [[ "${slow}" == "1" ]]; then
+    echo "Koneksi ke Telegram lambat (lebih dari 0,25 detik). Bot Panel V.1FSC.110 ke atas"
+    echo "sudah menyesuaikan diri; versi lama bisa gagal polling di jalur seperti ini."
+  else
+    echo "Koneksi ke Telegram normal."
+  fi
   return 0
 }
 

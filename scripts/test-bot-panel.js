@@ -58,7 +58,7 @@ assert.deepStrictEqual(
 );
 assert(!/\bfetch\(/.test(source), 'jangan pakai fetch global (Node 18 ke bawah di VPS lama)');
 const requires = [...source.matchAll(/require\('([^']+)'\)/g)].map((m) => m[1]);
-assert.deepStrictEqual([...new Set(requires)].sort(), ['crypto', 'fs', 'http', 'https', 'path', 'sqlite3'],
+assert.deepStrictEqual([...new Set(requires)].sort(), ['crypto', 'dns', 'fs', 'http', 'https', 'path', 'sqlite3'],
   'bot-panel.js hanya boleh memakai modul bawaan Node dan sqlite3 milik api.js');
 assert(!/log\([^)]*CONFIG\.(token|localToken)/.test(source), 'token tidak boleh ditulis ke log');
 // Bot jualan terpisah dari bot notifikasi: token dan chat notif tidak dibaca.
@@ -229,6 +229,17 @@ async function saldo(id) {
   assert.strictEqual(bot.inferStyle('Buka Blokir'), 'primary');
   assert.strictEqual(bot.inferStyle('Ya, Buat Akun'), 'success');
   assert.strictEqual(bot.inferStyle('Kelola Server'), 'primary');
+
+  // Gagal sambung ke semua alamat (Node 20+ AggregateError) tidak boleh
+  // tercatat sebagai pesan kosong, dan percobaan per alamat tidak 250 ms.
+  const agg = new AggregateError([Object.assign(new Error('connect ETIMEDOUT 149.154.167.220:443'), { code: 'ETIMEDOUT' }), Object.assign(new Error('connect ENETUNREACH 2001:67c:4e8:f004::9:443'), { code: 'ENETUNREACH' })], '');
+  agg.code = 'ETIMEDOUT';
+  assert.strictEqual(bot.netError(agg).message, 'connect ETIMEDOUT 149.154.167.220:443; connect ENETUNREACH 2001:67c:4e8:f004::9:443');
+  assert.strictEqual(bot.netError(Object.assign(new AggregateError([], ''), { code: 'ECONNREFUSED' })).message, 'ECONNREFUSED');
+  assert.strictEqual(bot.netError(new Error('timeout')).message, 'timeout');
+  assert(/new https\.Agent\(\{ keepAlive: true, maxSockets: 6, \.\.\.NET_OPTS \}\)/.test(source) && /autoSelectFamilyAttemptTimeout: 2500/.test(source) && /setDefaultResultOrder\('ipv4first'\)/.test(source),
+    'koneksi Telegram memakai IPv4 dulu dan jendela percobaan 2,5 detik');
+  assert(!/req\.on\('error', reject\)/.test(source), 'semua error koneksi lewat netError');
 
   // ── /start, grup, dan menu admin ────────────────────────────────────────
   let calls = await step(textUpdate(BUYER, '/start'));

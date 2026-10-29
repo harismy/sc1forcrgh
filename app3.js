@@ -14,6 +14,7 @@ const { parseForeignBackupBuffer } = require('./lib/foreign-backup-parser');
 const serverMigration = require('./lib/server-migration');
 const vpsRebuild = require('./lib/vps-rebuild');
 const antiSales = require('./lib/anti-sales');
+const revenueReport = require('./lib/revenue-report');
 
 const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
 if (!BOT_TOKEN) {
@@ -310,6 +311,8 @@ async function initDb() {
     reference_id TEXT,
     timestamp INTEGER
   )`);
+  // Laporan pendapatan membaca transactions per rentang waktu.
+  await dbRun('CREATE INDEX IF NOT EXISTS idx_transactions_time ON transactions(timestamp)');
   await dbRun(`CREATE TABLE IF NOT EXISTS sc_registrations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
@@ -3342,7 +3345,7 @@ function adminMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback('Tambah Saldo User', 'm_admin_add_saldo'), Markup.button.callback('Cek Saldo User', 'm_admin_check_saldo')],
     [Markup.button.callback('Tambah Saldo Semua User', 'm_admin_add_saldo_all')],
-    [Markup.button.callback('Histori TopUp', 'm_admin_topup_history')],
+    [Markup.button.callback('Histori TopUp', 'm_admin_topup_history'), Markup.button.callback('Laporan Pendapatan', 'm_admin_revenue')],
     [Markup.button.callback('Broadcast Semua User', 'm_admin_broadcast'), Markup.button.callback('Daftarkan SC Unlimited', 'm_admin_sc_unlimited')],
 
     [Markup.button.callback('Jadikan Reseller', 'm_admin_reseller_enable'), Markup.button.callback('Nonaktifkan Reseller', 'm_admin_reseller_disable')],
@@ -5926,6 +5929,32 @@ bot.action(/m_admin_topup_hist_(today|yesterday|month)_(\d+)/, async (ctx) => {
   ]);
   return ctx.reply(text, adminTopupHistoryPageKeyboard(period, safePage, totalPages));
 });
+
+function adminRevenueKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('Per Hari (Bulan Ini)', 'm_admin_revenue_day_0'), Markup.button.callback('Per Hari (Bulan Lalu)', 'm_admin_revenue_day_1')],
+    [Markup.button.callback('Per Bulan (12 Bulan)', 'm_admin_revenue_month')],
+    [Markup.button.callback('Refresh', 'm_admin_revenue'), Markup.button.callback('Kembali', 'm_admin_menu')]
+  ]);
+}
+
+async function replyRevenueReport(ctx, build) {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  try {
+    const report = await build();
+    return ctx.reply(revenueReport.render(report), adminRevenueKeyboard());
+  } catch (err) {
+    console.error('[pendapatan] gagal membuat laporan:', parseErr(err));
+    return ctx.reply(`Gagal membuat laporan pendapatan: ${parseErr(err)}`, adminRevenueKeyboard());
+  }
+}
+
+bot.action('m_admin_revenue', (ctx) => replyRevenueReport(ctx, () => revenueReport.buildSummary(dbAll)));
+
+bot.action(/^m_admin_revenue_day_([01])$/, (ctx) => replyRevenueReport(ctx, () => revenueReport.buildDaily(dbAll, Date.now(), -Number(ctx.match[1]))));
+
+bot.action('m_admin_revenue_month', (ctx) => replyRevenueReport(ctx, () => revenueReport.buildMonthly(dbAll, Date.now(), 12)));
 
 bot.action('m_admin_back', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});

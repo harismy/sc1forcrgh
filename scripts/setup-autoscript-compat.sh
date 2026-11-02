@@ -88,6 +88,12 @@ set -euo pipefail
 #   BOT_PANEL_TOKEN=                            (opsional, token bot jualan; terpisah dari TELEGRAM_BOT_TOKEN notif)
 #   BOT_PANEL_ADMIN_IDS=                        (opsional, ID Telegram admin bot jualan, pisah koma)
 #   BOT_PANEL_MEMORY_MAX=128M                   (opsional, batas RAM service Bot Panel)
+#   SLOWDNS_ENABLE=0                            (opsional, 1=SlowDNS/DNSTT aktif; butuh record NS, atur di menu Tools)
+#   SLOWDNS_NS_DOMAIN=                          (domain tunnel yang didelegasikan ke VPS, contoh ns-sg.domain.com)
+#   SLOWDNS_LISTEN_PORT=5300                    (opsional, port UDP lokal dnstt; UDP 53 publik dialihkan ke sini)
+#   SLOWDNS_MTU=512                             (opsional, ukuran respons DNS maksimal; 512 paling kompatibel)
+#   SLOWDNS_MEMORY_MAX=auto                     (opsional, batas RAM service SlowDNS; auto 64M di VPS 1 GB)
+#   SLOWDNS_BIN_URL= / SLOWDNS_BIN_SHA256=      (opsional, binary dnstt-server siap pakai; default build dari source)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
@@ -204,7 +210,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.110}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.111}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -262,6 +268,15 @@ BOT_PANEL_ENABLE="${BOT_PANEL_ENABLE:-0}"
 BOT_PANEL_TOKEN="${BOT_PANEL_TOKEN:-}"
 BOT_PANEL_ADMIN_IDS="${BOT_PANEL_ADMIN_IDS:-}"
 BOT_PANEL_MEMORY_MAX="${BOT_PANEL_MEMORY_MAX:-128M}"
+# SlowDNS (dnstt): mati secara default karena butuh record NS di DNS domain.
+# Dikelola /usr/local/sbin/sc-1forcr-slowdns (menu Tools > SlowDNS).
+SLOWDNS_ENABLE="${SLOWDNS_ENABLE:-0}"
+SLOWDNS_NS_DOMAIN="${SLOWDNS_NS_DOMAIN:-}"
+SLOWDNS_LISTEN_PORT="${SLOWDNS_LISTEN_PORT:-5300}"
+SLOWDNS_MTU="${SLOWDNS_MTU:-512}"
+SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}"
+SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}"
+SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}"
 BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}"
 BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
@@ -9142,12 +9157,43 @@ function udpcustomPublicPort() {
   return String(Number(process.env.UDPCUSTOM_LISTEN_PORT) || 5667);
 }
 
+// SlowDNS (dnstt) dari sc-1forcr-slowdns, dibaca dari file state dan di-cache
+// 30 detik. Hanya dikirim saat service dan aturan UDP 53 aktif dan layanan SSH
+// ON, jadi respons VPS tanpa SlowDNS tidak berubah sama sekali.
+const SLOWDNS_STATE_FILE = '/var/lib/sc-1forcr/slowdns.state';
+let slowdnsCache = { at: 0, info: null };
+function slowdnsInfo() {
+  const now = Date.now();
+  if (now - slowdnsCache.at >= 30000) {
+    let info = null;
+    try {
+      const kv = {};
+      for (const line of fs.readFileSync(SLOWDNS_STATE_FILE, 'utf8').split(/\r?\n/)) {
+        const m = line.match(/^([A-Z_]+)=(.*)$/);
+        if (m) kv[m[1]] = m[2].trim();
+      }
+      const ns = String(kv.NS || '').toLowerCase();
+      const pubkey = String(kv.PUBKEY || '').toLowerCase();
+      if (kv.ENABLED === '1' && kv.ACTIVE === '1' && kv.RULES === '1'
+        && /^[0-9a-f]{64}$/.test(pubkey) && /^([a-z0-9-]+\.){2,}[a-z]{2,63}$/.test(ns)) {
+        const ip = /^\d{1,3}(\.\d{1,3}){3}$/.test(kv.PUBLIC_IP || '') ? kv.PUBLIC_IP : '';
+        info = { ns, pubkey, dns: ip ? `${ip}:53` : '' };
+      }
+    } catch (_) {}
+    slowdnsCache = { at: now, info };
+  }
+  if (!slowdnsCache.info) return null;
+  const ssh = String(readServiceToggles().SERVICE_SSH_ENABLE ?? '1').trim().toLowerCase();
+  return ['0', 'false', 'no', 'off'].includes(ssh) ? null : slowdnsCache.info;
+}
+
 // ovpntcp/ovpnudp/sshohp tetap dikirim supaya bot lain yang membacanya tanpa
 // nilai cadangan tidak menampilkan "undefined", walau SC tidak memasang
 // OpenVPN maupun OHP. Menu dan BotVPN tidak menampilkannya.
 function sshPayload(username, password, expDate, limitip, location = null, quota = 0) {
   const udpgwPorts = SSHWS_UDPGW_PORTS.length > 0 ? SSHWS_UDPGW_PORTS : ['7300', '7200'];
   const udpcustomPort = udpcustomPublicPort();
+  const slowdns = slowdnsInfo();
   return {
     hostname: DOMAIN,
     username,
@@ -9158,7 +9204,8 @@ function sshPayload(username, password, expDate, limitip, location = null, quota
     isp: sanitizeInfoText(location?.isp || '-'),
     port: publicPorts({
       ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpgw: udpgwPorts.join(','),
-      ...(udpcustomPort ? { udpcustom: udpcustomPort } : {})
+      ...(udpcustomPort ? { udpcustom: udpcustomPort } : {}),
+      ...(slowdns ? { slowdns: '53' } : {})
     }),
     ws_path: '/ssh-ws',
     ws_alt_path: '/ws',
@@ -9167,6 +9214,7 @@ function sshPayload(username, password, expDate, limitip, location = null, quota
       ports: udpgwPorts,
       notes: 'Untuk VC/telp/game di SSH/SSHWS, set badvpn/udpgw ke salah satu port ini.'
     },
+    ...(slowdns ? { slowdns: { ns: slowdns.ns, pubkey: slowdns.pubkey, dns: slowdns.dns } } : {}),
     limitip: String(limitip || 0),
     quota: String(quota || 0)
   };
@@ -17479,6 +17527,14 @@ if [[ -x /usr/local/sbin/sc-1forcr-tunnel-guard ]]; then
     log_health "GAGAL menerapkan pembatas trafik tunnel"
 fi
 
+# SlowDNS: aturan UDP 53 -> dnstt dipasang ulang kalau hilang atau tergeser
+# DNAT 1:65535 milik UDP Custom. Sebelum gerbang ON/OFF, karena aturan INPUT-nya
+# disisipkan di puncak chain. SlowDNS mati (default) = tidak menyentuh iptables.
+if [[ -x /usr/local/sbin/sc-1forcr-slowdns ]]; then
+  /usr/local/sbin/sc-1forcr-slowdns apply >/dev/null 2>&1 || \
+    log_health "GAGAL menerapkan aturan SlowDNS"
+fi
+
 # Layanan yang dimatikan lewat menu ON/OFF LAYANAN: gerbang iptables-nya
 # dipasang ulang kalau hilang (reboot tanpa netfilter-persistent) atau
 # tergeser dari puncak chain oleh rule ACCEPT di atas. Semua ON = no-op.
@@ -17499,6 +17555,8 @@ repair_unit_if_needed ssh.service || true
 repair_unit_if_needed dropbear.service || true
 repair_unit_if_needed xray.service || true
 repair_unit_if_needed sc-1forcr-api.service || true
+# Hanya kalau SlowDNS diaktifkan (unit enabled); port-nya UDP, jadi cukup status.
+repair_unit_if_needed sc-1forcr-slowdns.service || true
 
 declare -a nginx_ports=()
 declare -a sshws_ports=()
@@ -21890,9 +21948,9 @@ install_service_gate_manager() {
 # stop/mask service systemd. Watchdog, update, dan restart chain tetap melihat
 # semua service sehat sehingga tidak ada yang menyalakannya lagi, dan layanan
 # lain tidak ikut terputus:
-# - ssh    : 127.0.0.1:2082 (sshws: SSH-WS dan SSL/CONNECT lewat HAProxy/nginx)
-#            dan port Dropbear publik. Port sshd (22) tidak pernah ditutup
-#            supaya admin tetap bisa masuk ke VPS.
+# - ssh    : 127.0.0.1:2082 (sshws: SSH-WS dan SSL/CONNECT lewat HAProxy/nginx),
+#            port Dropbear publik, dan port listen SlowDNS (kalau aktif).
+#            Port sshd (22) tidak pernah ditutup supaya admin tetap bisa masuk.
 # - vmess/vless/trojan : port inbound Xray lokal (ws, grpc, httpupgrade,
 #            xhttp) yang dituju nginx. Xray tidak direstart.
 # - udp    : port listen ZIVPN/UDP Custom.
@@ -22043,6 +22101,16 @@ udp_ports() {
   printf '%s' "${found}" | join_ports "53 67 68 123"
 }
 
+# SlowDNS membawa sesi SSH, jadi ikut tertutup saat SSH OFF. UDP 53 publik
+# dialihkan ke port listen dnstt sebelum INPUT, jadi port itu yang ditolak.
+slowdns_port() {
+  local f="${SLOWDNS_STATE_FILE:-/var/lib/sc-1forcr/slowdns.state}" port
+  [[ -r "${f}" ]] || return 0
+  [[ "$(sed -n 's/^ENABLED=//p' "${f}" | tail -n1)" == "1" ]] || return 0
+  port="$(sed -n 's/^LISTEN=//p' "${f}" | tail -n1 | tr -cd '0-9')"
+  printf '%s' "${port}" | join_ports "53 67 68 123"
+}
+
 xray_rule() {
   printf -- '-o lo -p tcp -d 127.0.0.1 -m multiport --dports %s -m comment --comment sc-svc-%s -j REJECT --reject-with tcp-reset' "$2" "$1"
 }
@@ -22057,6 +22125,10 @@ build_rules() {
     ports="$(dropbear_ports)"
     if [[ -n "${ports}" ]]; then
       RULES_IN+=("! -i lo -p tcp -m multiport --dports ${ports} -m comment --comment sc-svc-ssh -j REJECT --reject-with tcp-reset")
+    fi
+    ports="$(slowdns_port)"
+    if [[ -n "${ports}" ]]; then
+      RULES_IN+=("! -i lo -p udp -m multiport --dports ${ports} -m comment --comment sc-svc-ssh -j DROP")
     fi
   fi
   if ! service_enabled vmess; then RULES_OUT+=("$(xray_rule vmess "${VMESS_PORTS}")"); fi
@@ -23152,6 +23224,946 @@ apply_extra_ports() {
   return 0
 }
 
+# ── SlowDNS (DNS tunnel) ────────────────────────────────────────────────────
+# dnstt-server membawa sesi SSH lewat query DNS untuk domain tunnel yang
+# didelegasikan (record NS) ke VPS ini. UDP 53 publik dialihkan kernel ke port
+# listen dnstt, lalu dnstt meneruskan ke Dropbear lokal. Opsional dan mati
+# secara default: helper selalu ditulis supaya menu bisa menyalakannya tanpa
+# update, tapi binary, service, dan aturan UDP 53 hanya ada saat
+# SLOWDNS_ENABLE=1.
+install_slowdns_manager() {
+  mkdir -p /usr/local/sbin /var/lib/sc-1forcr
+  cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
+#!/usr/bin/env bash
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|records|suggest|check|info|clear}
+#
+# - setup     : pasang binary, kunci, dan unit lalu nyalakan atau matikan service
+#               sesuai SLOWDNS_ENABLE. Dipanggil install/update dan menu. Hanya
+#               perintah ini (dan perintah menu) yang boleh daemon-reload/restart.
+# - apply     : pasang ulang aturan UDP 53 -> port dnstt dan tulis file state.
+#               Aman untuk tiap siklus watchdog: tidak menyentuh systemd, dan
+#               iptables hanya ditulis kalau aturan hilang atau tergeser.
+# - enable/disable/set-ns/regen-key : menu Tools > SlowDNS.
+# - records   : record DNS yang harus dibuat pemilik domain.
+# - check     : uji delegasi NS lewat resolver publik (DoH Google/Cloudflare).
+# - clear     : lepas semuanya (uninstall). Kunci server sengaja disimpan.
+#
+# Binary dibangun dari source resmi dnstt (versi dipin, checksum modul
+# diverifikasi sum.golang.org). Kalau Go sistem lebih tua dari 1.21, toolchain
+# resmi (checksum dipin) diunduh ke /var/tmp lalu dihapus setelah build, jadi Go
+# distro yang dipakai mux tidak tersentuh. dnstt-server jalan sebagai user
+# sistem sendiri (bukan root dan bukan grup tunnel); forwarding pengguna tetap
+# dibuka Dropbear, jadi pembatas trafik tunnel berlaku seperti SSH-WS.
+set -uo pipefail
+
+SC_ENV="${SC_ENV_FILE:-/etc/sc-1forcr.env}"
+STATE_FILE="${SLOWDNS_STATE_FILE:-/var/lib/sc-1forcr/slowdns.state}"
+KEY_DIR="${SLOWDNS_KEY_DIR:-/etc/sc-1forcr/slowdns}"
+BIN="${SLOWDNS_BIN_PATH:-/usr/local/lib/sc-1forcr/dnstt-server}"
+UNIT_FILE="${SLOWDNS_UNIT_FILE:-/etc/systemd/system/sc-1forcr-slowdns.service}"
+LOCK_FILE="${SLOWDNS_LOCK_FILE:-/run/sc-1forcr-slowdns.lock}"
+BUILD_ROOT="${SLOWDNS_BUILD_ROOT:-/var/tmp}"
+SERVICE_GATE_BIN="${SLOWDNS_SERVICE_GATE_BIN:-/usr/local/sbin/sc-1forcr-service-gate}"
+SERVICE="sc-1forcr-slowdns.service"
+SVC_USER="sc-1forcr-slowdns"
+CHAIN="SC1FORCR_SLOWDNS"
+TAG="sc-slowdns"
+PUBLIC_PORT="53"
+DNSTT_VERSION="v1.20260501.0"
+DNSTT_PKG="www.bamsoftware.com/git/dnstt.git/dnstt-server"
+GO_VERSION="go1.27.3"
+GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
+GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
+GO_MIN_MINOR=21
+BUILD_MIN_FREE_KB=819200
+WAIT_SECONDS="${SLOWDNS_WAIT_SECONDS:-8}"
+WAIT_SECONDS="${WAIT_SECONDS//[^0-9]/}"
+WAIT_SECONDS="${WAIT_SECONDS:-8}"
+BINARY_CHANGED=0
+KEY_CHANGED=0
+RULES_CHANGED=0
+RULES_OK=0
+PUBLIC_IP_NEW=""
+declare -A ENVV=() STATEV=()
+ENV_LOADED=0
+STATE_LOADED=0
+
+say() { printf '%s\n' "$*"; }
+die() { echo "Gagal: $*" >&2; exit 1; }
+
+# File KEY=VALUE dibaca sekali dengan builtin bash (nilai terakhir menang).
+# Watchdog memanggil apply tiap 5 menit; saat SlowDNS mati (default) jalur itu
+# selesai tanpa satu pun proses eksternal.
+read_kv_file() {
+  local file="$1" arr="$2" line key
+  [[ -r "${file}" ]] || return 0
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ "${line}" == *=* ]] || continue
+    key="${line%%=*}"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    line="${line#*=}"
+    printf -v "${arr}[${key}]" '%s' "${line%$'\r'}"
+  done < "${file}"
+}
+
+# Hasil di REPLY (tanpa subshell).
+env_val() {
+  if (( ENV_LOADED == 0 )); then
+    ENVV=()
+    read_kv_file "${SC_ENV}" ENVV
+    ENV_LOADED=1
+  fi
+  REPLY="${ENVV[$1]:-}"
+  REPLY="${REPLY//[\"\'[:space:]]/}"
+}
+
+env_get() { env_val "$1"; printf '%s' "${REPLY}"; }
+
+state_val() {
+  if (( STATE_LOADED == 0 )); then
+    STATEV=()
+    read_kv_file "${STATE_FILE}" STATEV
+    STATE_LOADED=1
+  fi
+  REPLY="${STATEV[$1]:-}"
+}
+
+state_get() { state_val "$1"; printf '%s' "${REPLY}"; }
+
+# Baris pertama file -> REPLY tanpa spasi.
+first_line() {
+  REPLY=""
+  [[ -r "$1" ]] || return 1
+  IFS= read -r REPLY < "$1" || true
+  REPLY="${REPLY//[[:space:]]/}"
+}
+
+set_env_value() {
+  local key="$1" value="$2" dir tmp
+  dir="$(dirname "${SC_ENV}")"
+  mkdir -p "${dir}" || return 1
+  [[ -f "${SC_ENV}" ]] || : > "${SC_ENV}"
+  tmp="$(mktemp "${dir}/.sc-slowdns-env.XXXXXX")" || return 1
+  if ! awk -F= -v key="${key}" -v value="${value}" '
+    BEGIN { done=0 }
+    $1==key { if (!done) print key "=" value; done=1; next }
+    { print }
+    END { if (!done) print key "=" value }
+  ' "${SC_ENV}" > "${tmp}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  chmod 600 "${tmp}" 2>/dev/null || true
+  mv -f "${tmp}" "${SC_ENV}" || return 1
+  ENV_LOADED=0
+}
+
+flag_on() {
+  local v="${1:-}"
+  case "${v,,}" in
+    1|true|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
+# Port valid -> REPLY, selain itu nilai cadangan $2.
+port_or() {
+  local p="${1:-}"
+  p="${p//[^0-9]/}"
+  if [[ -n "${p}" && ${#p} -le 5 ]] && (( 10#${p} >= 1 && 10#${p} <= 65535 )); then
+    REPLY="$((10#${p}))"
+  else
+    REPLY="$2"
+  fi
+}
+
+# Domain tunnel -> REPLY: subdomain yang didelegasikan (minimal 3 label), huruf
+# kecil, tanpa titik di ujung. Makin pendek makin besar data per query.
+normalize_ns() {
+  local d="${1:-}"
+  REPLY=""
+  d="${d,,}"
+  d="${d//[[:space:]]/}"
+  d="${d%.}"
+  (( ${#d} >= 1 && ${#d} <= 100 )) || return 1
+  [[ "${d}" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.){2,}[a-z]{2,63}$ ]] || return 1
+  REPLY="${d}"
+}
+
+# Usulan nama: sg.contoh.net -> ns-sg.contoh.net, contoh.net -> ns.contoh.net.
+suggest_ns() {
+  local d="${1:-}"
+  [[ -n "${d}" ]] || return 0
+  if [[ "${d}" == *.*.* ]]; then printf 'ns-%s' "${d}"; else printf 'ns.%s' "${d}"; fi
+}
+
+valid_hex_key() { [[ "${1:-}" =~ ^[0-9a-f]{64}$ ]]; }
+
+# Kunci hex dari file -> REPLY (huruf kecil); status 0 kalau formatnya benar.
+read_key_file() {
+  first_line "$1" || return 1
+  REPLY="${REPLY,,}"
+  valid_hex_key "${REPLY}"
+}
+
+key_ready() {
+  read_key_file "${KEY_DIR}/server.key" && read_key_file "${KEY_DIR}/server.pub"
+}
+
+# Pubkey -> REPLY ("" kalau belum ada).
+pubkey_val() {
+  read_key_file "${KEY_DIR}/server.pub" || REPLY=""
+}
+
+valid_ipv4() {
+  [[ "${1:-}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 ))
+}
+
+# Batas RAM: 64M di VPS 1 GB / 1 vCPU. Terukur dnstt-server sekitar 10 MB saat
+# sepi; buffer per pengguna kecil karena MTU respons 512.
+memory_max() {
+  local raw ram_kb cores
+  raw="$(env_get SLOWDNS_MEMORY_MAX | tr '[:lower:]' '[:upper:]')"
+  if [[ "${raw}" =~ ^([0-9]{1,5})M$ ]] && (( 10#${BASH_REMATCH[1]} >= 32 )); then
+    printf '%sM' "$((10#${BASH_REMATCH[1]}))"
+    return 0
+  fi
+  ram_kb="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || echo 0)"
+  cores="$(nproc 2>/dev/null || echo 1)"
+  if (( ${ram_kb:-0} >= 3600000 && ${cores:-1} >= 4 )); then
+    printf '128M'
+  elif (( ${ram_kb:-0} >= 1800000 && ${cores:-1} >= 2 )); then
+    printf '96M'
+  else
+    printf '64M'
+  fi
+}
+
+# GOMEMLIMIT 75% dari MemoryMax: GC bekerja lebih keras sebelum batas cgroup
+# tercapai, jadi service tidak dibunuh OOM saat trafik naik.
+go_mem_limit() {
+  local mib="${1%M}"
+  [[ "${mib}" =~ ^[0-9]+$ ]] || mib=64
+  printf '%sMiB' "$(( mib * 3 / 4 ))"
+}
+
+load_config() {
+  ENABLED=0
+  env_val SLOWDNS_ENABLE
+  if flag_on "${REPLY}"; then ENABLED=1; fi
+  env_val SLOWDNS_NS_DOMAIN
+  NS=""
+  if normalize_ns "${REPLY}"; then NS="${REPLY}"; fi
+  env_val SLOWDNS_LISTEN_PORT
+  port_or "${REPLY}" 5300
+  LISTEN="${REPLY}"
+  if [[ "${LISTEN}" == "${PUBLIC_PORT}" ]]; then LISTEN=5300; fi
+  # dnstt menolak (FORMERR) query yang mengiklankan payload EDNS di bawah MTU.
+  # 512 = ukuran DNS tanpa EDNS, jadi semua resolver dan aplikasi diterima.
+  env_val SLOWDNS_MTU
+  MTU="${REPLY//[^0-9]/}"
+  if [[ -z "${MTU}" || ${#MTU} -gt 4 ]] || (( 10#${MTU} < 512 || 10#${MTU} > 1400 )); then
+    MTU=512
+  else
+    MTU=$((10#${MTU}))
+  fi
+  env_val DROPBEAR_PORT
+  port_or "${REPLY}" 109
+  TARGET_PORT="${REPLY}"
+  env_val DOMAIN
+  DOMAIN_MAIN="${REPLY,,}"
+}
+
+go_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) return 1 ;;
+  esac
+}
+
+go_minor() {
+  local v
+  v="$("$1" env GOVERSION 2>/dev/null | head -n1)"
+  if [[ "${v}" =~ ^go1\.([0-9]+) ]]; then echo "${BASH_REMATCH[1]}"; else echo 0; fi
+}
+
+wanted_binary_id() {
+  if [[ -n "$(env_get SLOWDNS_BIN_URL)" ]]; then
+    printf 'sha256:%s' "$(env_get SLOWDNS_BIN_SHA256 | tr '[:upper:]' '[:lower:]')"
+  else
+    printf '%s' "${DNSTT_VERSION}"
+  fi
+}
+
+# Uji fungsi binary: -gen-key harus menghasilkan pasangan kunci 64 hex.
+binary_works() {
+  local bin="$1" t ok=1
+  t="$(mktemp -d "${BUILD_ROOT}/sc-dnstt-test.XXXXXX")" || return 1
+  if "${bin}" -gen-key -privkey-file "${t}/k" -pubkey-file "${t}/p" >/dev/null 2>&1 && \
+     read_key_file "${t}/k" && read_key_file "${t}/p"; then
+    ok=0
+  fi
+  rm -rf "${t}"
+  return "${ok}"
+}
+
+install_binary() {
+  local src="$1" id="$2"
+  mkdir -p "$(dirname "${BIN}")" || return 1
+  cp -f "${src}" "${BIN}.new" && chmod 755 "${BIN}.new" && mv -f "${BIN}.new" "${BIN}" || return 1
+  printf '%s\n' "${id}" > "${BIN}.version"
+  BINARY_CHANGED=1
+}
+
+# Binary siap pakai dari URL sendiri (VPS yang tidak bisa menjangkau go.dev).
+# Checksum wajib, supaya binary root-adjacent tidak bisa diganti diam-diam.
+fetch_binary_url() {
+  local url="$1" sha="$2" t got rc=1
+  if [[ ! "${sha}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "SLOWDNS_BIN_SHA256 (64 hex) wajib diisi kalau SLOWDNS_BIN_URL dipakai." >&2
+    return 1
+  fi
+  mkdir -p "${BUILD_ROOT}" || return 1
+  t="$(mktemp "${BUILD_ROOT}/sc-dnstt-bin.XXXXXX")" || return 1
+  if ! curl -fsSL --connect-timeout 15 --max-time 300 --retry 2 -o "${t}" "${url}"; then
+    echo "Download binary dnstt dari ${url} gagal." >&2
+  else
+    got="$(sha256sum "${t}" | awk '{ print $1 }')"
+    if [[ "${got}" != "${sha}" ]]; then
+      echo "Checksum binary dnstt tidak cocok (${got})." >&2
+    else
+      chmod 755 "${t}"
+      if binary_works "${t}" && install_binary "${t}" "sha256:${sha}"; then
+        rc=0
+      else
+        echo "Binary dnstt dari URL tidak bisa dijalankan." >&2
+      fi
+    fi
+  fi
+  rm -f "${t}"
+  return "${rc}"
+}
+
+build_binary() {
+  local arch sha work go_bin="" url proxy avail rc=1
+  arch="$(go_arch)" || { echo "Arsitektur $(uname -m) belum didukung untuk build dnstt." >&2; return 1; }
+  mkdir -p "${BUILD_ROOT}" || return 1
+  avail="$(df -Pk "${BUILD_ROOT}" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+  if [[ "${avail}" =~ ^[0-9]+$ ]] && (( avail < BUILD_MIN_FREE_KB )); then
+    echo "Ruang disk ${BUILD_ROOT} kurang; build dnstt butuh sekitar 800 MB sementara." >&2
+    return 1
+  fi
+  work="$(mktemp -d "${BUILD_ROOT}/sc-1forcr-dnstt.XXXXXX")" || return 1
+  if command -v go >/dev/null 2>&1 && (( $(go_minor "$(command -v go)") >= GO_MIN_MINOR )); then
+    go_bin="$(command -v go)"
+    say "Memakai Go sistem $("${go_bin}" env GOVERSION 2>/dev/null)."
+  else
+    if [[ "${arch}" == "amd64" ]]; then sha="${GO_SHA256_AMD64}"; else sha="${GO_SHA256_ARM64}"; fi
+    say "Unduh toolchain ${GO_VERSION} sementara (~70 MB, dihapus setelah build)..."
+    for url in "https://go.dev/dl/${GO_VERSION}.linux-${arch}.tar.gz" \
+               "https://dl.google.com/go/${GO_VERSION}.linux-${arch}.tar.gz" \
+               "https://golang.google.cn/dl/${GO_VERSION}.linux-${arch}.tar.gz"; do
+      rm -f "${work}/go.tgz"
+      curl -fsSL --connect-timeout 15 --max-time 900 --retry 2 -o "${work}/go.tgz" "${url}" || continue
+      if [[ "$(sha256sum "${work}/go.tgz" | awk '{ print $1 }')" != "${sha}" ]]; then
+        echo "Checksum toolchain dari ${url} tidak cocok; coba sumber lain." >&2
+        continue
+      fi
+      if tar -xzf "${work}/go.tgz" -C "${work}" && [[ -x "${work}/go/bin/go" ]]; then
+        go_bin="${work}/go/bin/go"
+      fi
+      rm -f "${work}/go.tgz"
+      break
+    done
+  fi
+  if [[ -z "${go_bin}" ]]; then
+    rm -rf "${work}"
+    echo "Toolchain Go tidak bisa diunduh (cek koneksi VPS ke go.dev)." >&2
+    return 1
+  fi
+  say "Build dnstt-server ${DNSTT_VERSION} (2-6 menit di VPS 1 vCPU)..."
+  # -p=1 dan GOMAXPROCS=1 menahan RAM build; nice supaya tunnel tetap lancar.
+  for proxy in "https://proxy.golang.org,direct" "https://goproxy.io,direct" "https://goproxy.cn,direct"; do
+    if env HOME="${work}" GOTOOLCHAIN=local GOENV=off GOPATH="${work}/gopath" \
+        GOMODCACHE="${work}/gopath/pkg/mod" GOCACHE="${work}/cache" GOBIN="${work}/bin" \
+        CGO_ENABLED=0 GOFLAGS="-modcacherw -p=1" GOMAXPROCS=1 GOPROXY="${proxy}" \
+        GOSUMDB=sum.golang.org GONOSUMDB= GOPRIVATE= GOINSECURE= \
+        timeout 1800 nice -n 10 "${go_bin}" install -trimpath -ldflags="-s -w" "${DNSTT_PKG}@${DNSTT_VERSION}" \
+        > "${work}/build.log" 2>&1 && [[ -x "${work}/bin/dnstt-server" ]]; then
+      rc=0
+      break
+    fi
+    echo "Build lewat ${proxy%%,*} gagal: $(tail -n 2 "${work}/build.log" 2>/dev/null | tr '\n' ' ')" >&2
+  done
+  if (( rc == 0 )); then
+    if ! binary_works "${work}/bin/dnstt-server" || ! install_binary "${work}/bin/dnstt-server" "${DNSTT_VERSION}"; then
+      echo "Binary hasil build tidak bisa dijalankan." >&2
+      rc=1
+    fi
+  fi
+  rm -rf "${work}"
+  return "${rc}"
+}
+
+# Binary versi lama tetap dipakai kalau build versi baru gagal (misalnya update
+# saat go.dev tidak terjangkau), supaya SlowDNS yang sudah jalan tidak mati.
+ensure_binary() {
+  local url
+  BINARY_CHANGED=0
+  first_line "${BIN}.version" || true
+  if [[ -x "${BIN}" && "${REPLY}" == "$(wanted_binary_id)" ]]; then
+    return 0
+  fi
+  url="$(env_get SLOWDNS_BIN_URL)"
+  if [[ -n "${url}" ]]; then
+    fetch_binary_url "${url}" "$(env_get SLOWDNS_BIN_SHA256 | tr '[:upper:]' '[:lower:]')" && return 0
+  else
+    build_binary && return 0
+  fi
+  if [[ -x "${BIN}" ]] && binary_works "${BIN}"; then
+    echo "Peringatan: binary dnstt baru gagal disiapkan; binary lama tetap dipakai." >&2
+    return 0
+  fi
+  return 1
+}
+
+ensure_user() {
+  local nologin
+  nologin="$(command -v nologin 2>/dev/null || echo /usr/sbin/nologin)"
+  getent group "${SVC_USER}" >/dev/null 2>&1 || groupadd -r "${SVC_USER}" >/dev/null 2>&1 || return 1
+  id -u "${SVC_USER}" >/dev/null 2>&1 || \
+    useradd -r -g "${SVC_USER}" -M -d /nonexistent -s "${nologin}" "${SVC_USER}" >/dev/null 2>&1 || return 1
+}
+
+# Kunci dibuat sekali dan dipertahankan lintas update/install ulang: kunci baru
+# berarti semua pengguna harus mengganti pubkey di aplikasinya.
+ensure_key() {
+  KEY_CHANGED=0
+  mkdir -p "${KEY_DIR}" || return 1
+  chown root:"${SVC_USER}" "${KEY_DIR}" 2>/dev/null || true
+  chmod 750 "${KEY_DIR}" 2>/dev/null || true
+  if ! key_ready; then
+    rm -f "${KEY_DIR}/server.key.new" "${KEY_DIR}/server.pub.new"
+    ( umask 077; "${BIN}" -gen-key -privkey-file "${KEY_DIR}/server.key.new" \
+      -pubkey-file "${KEY_DIR}/server.pub.new" >/dev/null 2>&1 ) || return 1
+    read_key_file "${KEY_DIR}/server.key.new" || return 1
+    read_key_file "${KEY_DIR}/server.pub.new" || return 1
+    mv -f "${KEY_DIR}/server.key.new" "${KEY_DIR}/server.key" || return 1
+    mv -f "${KEY_DIR}/server.pub.new" "${KEY_DIR}/server.pub" || return 1
+    KEY_CHANGED=1
+  fi
+  chown root:"${SVC_USER}" "${KEY_DIR}/server.key" 2>/dev/null || true
+  chmod 640 "${KEY_DIR}/server.key" 2>/dev/null || true
+  chmod 644 "${KEY_DIR}/server.pub" 2>/dev/null || true
+}
+
+unit_content() {
+  local mem
+  mem="$(memory_max)"
+  cat <<UNIT
+[Unit]
+Description=SC 1FORCR SlowDNS (dnstt-server)
+After=network-online.target dropbear.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${SVC_USER}
+Group=${SVC_USER}
+ExecStart=${BIN} -udp :${LISTEN} -privkey-file ${KEY_DIR}/server.key -mtu ${MTU} ${NS} 127.0.0.1:${TARGET_PORT}
+Restart=always
+RestartSec=3
+Environment=GOMEMLIMIT=$(go_mem_limit "${mem}")
+MemoryMax=${mem}
+TasksMax=64
+LimitNOFILE=8192
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=120
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+udp_port_rows() {
+  ss -H -lnup 2>/dev/null || ss -H -lnu 2>/dev/null || true
+}
+
+udp_listening() {
+  awk -v want="${LISTEN}" '{ a=$4; sub(/^.*:/, "", a); if (a == want) f=1 } END { exit(f ? 0 : 1) }' <<< "$(udp_port_rows)"
+}
+
+# Port listen dipakai program selain dnstt-server?
+listen_port_busy() {
+  awk -v want="${LISTEN}" '
+    { a=$4; sub(/^.*:/, "", a); if (a == want && $0 !~ /"dnstt-server"/) f=1 }
+    END { exit(f ? 0 : 1) }' <<< "$(udp_port_rows)"
+}
+
+wait_listening() {
+  local i
+  for (( i = 0; i < WAIT_SECONDS; i++ )); do
+    udp_listening && return 0
+    sleep 1
+  done
+  return 1
+}
+
+detect_public_ip() {
+  local ip url
+  ip="$(env_get VPS_PUBLIC_IP)"
+  if valid_ipv4 "${ip}"; then printf '%s' "${ip}"; return 0; fi
+  command -v curl >/dev/null 2>&1 || return 1
+  for url in https://api.ipify.org https://ifconfig.me/ip https://ipinfo.io/ip; do
+    ip="$(curl -4fsS --connect-timeout 4 --max-time 6 "${url}" 2>/dev/null | tr -d '[:space:]' || true)"
+    if valid_ipv4 "${ip}"; then printf '%s' "${ip}"; return 0; fi
+  done
+  return 1
+}
+
+# ── iptables ─────────────────────────────────────────────────────────────────
+# Chain nat SC1FORCR_SLOWDNS: UDP 53 -> REDIRECT ke port listen dnstt. Jump-nya
+# harus mendahului semua rule non-TCP di PREROUTING, karena UDP Custom memasang
+# DNAT --dport 1:65535 yang juga menelan port 53. Hanya paket ke alamat VPS ini
+# (dst-type LOCAL) yang dialihkan; DNS milik docker/VPN pemilik tidak ikut.
+
+nat_rules_ok() {
+  local tool="$1" rules
+  rules="$("${tool}" -w 10 -t nat -S "${CHAIN}" 2>/dev/null | grep '^-A ' || true)"
+  [[ -n "${rules}" && "${rules}" != *$'\n'* ]] || return 1
+  [[ "${rules}" == *"-p udp"* && "${rules}" == *"--dport ${PUBLIC_PORT} "* && "${rules}" == *"--to-ports ${LISTEN}" ]]
+}
+
+jump_ok() {
+  local tool="$1" line
+  while IFS= read -r line; do
+    [[ "${line}" == "-A PREROUTING "* ]] || continue
+    if [[ "${line}" == *"-j ${CHAIN}" ]]; then return 0; fi
+    [[ " ${line} " == *" -p tcp "* ]] || return 1
+  done < <("${tool}" -w 10 -t nat -S PREROUTING 2>/dev/null)
+  return 1
+}
+
+remove_jumps() {
+  local tool="$1" line
+  while IFS= read -r line; do
+    [[ "${line}" == "-A PREROUTING "*"-j ${CHAIN}" ]] || continue
+    # shellcheck disable=SC2086
+    if "${tool}" -w 10 -t nat -D ${line#-A } >/dev/null 2>&1; then RULES_CHANGED=1; fi
+  done < <("${tool}" -w 10 -t nat -S PREROUTING 2>/dev/null)
+}
+
+input_spec() {
+  printf -- '-p udp -m udp --dport %s -m comment --comment %s -j ACCEPT' "${LISTEN}" "${TAG}"
+}
+
+remove_input_rules() {
+  local tool="$1" keep="${2:-}" line
+  while IFS= read -r line; do
+    [[ "${line}" == "-A INPUT "*" ${TAG} "* && "${line}" != "${keep}" ]] || continue
+    # shellcheck disable=SC2086
+    if "${tool}" -w 10 -D ${line#-A } >/dev/null 2>&1; then RULES_CHANGED=1; fi
+  done < <("${tool}" -w 10 -S INPUT 2>/dev/null)
+}
+
+# 0 = aturan lengkap terpasang, 1 = gagal. RULES_CHANGED=1 kalau ada yang ditulis.
+apply_tool() {
+  local tool="$1"
+  command -v "${tool}" >/dev/null 2>&1 || return 1
+  "${tool}" -w 10 -t nat -S PREROUTING >/dev/null 2>&1 || return 1
+  remove_input_rules "${tool}" "-A INPUT $(input_spec)"
+  # shellcheck disable=SC2046
+  if ! "${tool}" -w 10 -C INPUT $(input_spec) >/dev/null 2>&1; then
+    # shellcheck disable=SC2046
+    "${tool}" -w 10 -I INPUT $(input_spec) >/dev/null 2>&1 || return 1
+    RULES_CHANGED=1
+  fi
+  if ! "${tool}" -w 10 -t nat -S "${CHAIN}" >/dev/null 2>&1; then
+    "${tool}" -w 10 -t nat -N "${CHAIN}" >/dev/null 2>&1 || return 1
+    RULES_CHANGED=1
+  fi
+  if ! nat_rules_ok "${tool}"; then
+    "${tool}" -w 10 -t nat -F "${CHAIN}" >/dev/null 2>&1 || return 1
+    "${tool}" -w 10 -t nat -A "${CHAIN}" -p udp -m udp --dport "${PUBLIC_PORT}" \
+      -m comment --comment "${TAG}" -j REDIRECT --to-ports "${LISTEN}" >/dev/null 2>&1 || return 1
+    RULES_CHANGED=1
+  fi
+  if ! jump_ok "${tool}"; then
+    remove_jumps "${tool}"
+    if ! "${tool}" -w 10 -t nat -I PREROUTING 1 -p udp -m addrtype --dst-type LOCAL -j "${CHAIN}" >/dev/null 2>&1; then
+      # Modul addrtype tidak ada: alihkan tanpa filter tujuan.
+      "${tool}" -w 10 -t nat -I PREROUTING 1 -p udp -j "${CHAIN}" >/dev/null 2>&1 || return 1
+    fi
+    RULES_CHANGED=1
+  fi
+  return 0
+}
+
+clear_tool() {
+  local tool="$1"
+  command -v "${tool}" >/dev/null 2>&1 || return 0
+  remove_jumps "${tool}"
+  if "${tool}" -w 10 -t nat -S "${CHAIN}" >/dev/null 2>&1; then
+    "${tool}" -w 10 -t nat -F "${CHAIN}" >/dev/null 2>&1 || true
+    "${tool}" -w 10 -t nat -X "${CHAIN}" >/dev/null 2>&1 || true
+    RULES_CHANGED=1
+  fi
+  remove_input_rules "${tool}"
+}
+
+ip6_nat_usable() {
+  command -v ip6tables >/dev/null 2>&1 || return 1
+  ip6tables -w 10 -t nat -S PREROUTING >/dev/null 2>&1 || return 1
+  ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
+}
+
+persist_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  fi
+}
+
+rules_sync() {
+  RULES_CHANGED=0
+  RULES_OK=0
+  if (( ENABLED == 1 )) && [[ -n "${NS}" && -x "${BIN}" ]] && key_ready; then
+    if apply_tool iptables; then RULES_OK=1; fi
+    # dnstt listen dual-stack; IPv6 hanya kalau VPS punya alamat global.
+    if ip6_nat_usable; then apply_tool ip6tables || true; fi
+  else
+    clear_tool iptables
+    clear_tool ip6tables
+  fi
+  if (( RULES_CHANGED )); then persist_rules; fi
+  return 0
+}
+
+write_state() {
+  local active=0 pub="" ip version body tmp
+  if (( ENABLED == 1 )) && systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then active=1; fi
+  if key_ready; then pubkey_val; pub="${REPLY}"; fi
+  state_val PUBLIC_IP
+  ip="${PUBLIC_IP_NEW:-${REPLY}}"
+  valid_ipv4 "${ip}" || ip=""
+  first_line "${BIN}.version" || true
+  version="${REPLY}"
+  body="ENABLED=${ENABLED}
+ACTIVE=${active}
+RULES=${RULES_OK}
+NS=${NS}
+PUBKEY=${pub}
+PORT=${PUBLIC_PORT}
+LISTEN=${LISTEN}
+TARGET=127.0.0.1:${TARGET_PORT}
+MTU=${MTU}
+PUBLIC_IP=${ip}
+VERSION=${version}"
+  STATE_LOADED=0
+  if [[ -f "${STATE_FILE}" && "$(< "${STATE_FILE}")" == "${body}" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "${STATE_FILE}")" >/dev/null 2>&1 || true
+  tmp="${STATE_FILE}.tmp.$$"
+  printf '%s\n' "${body}" > "${tmp}" && chmod 644 "${tmp}" && mv -f "${tmp}" "${STATE_FILE}"
+}
+
+# Aturan INPUT baru disisipkan di puncak chain; gerbang ON/OFF layanan harus
+# kembali menjadi aturan pertama (SSH OFF juga menutup SlowDNS).
+service_gate_apply() {
+  if [[ -x "${SERVICE_GATE_BIN}" ]]; then
+    "${SERVICE_GATE_BIN}" apply >/dev/null 2>&1 || true
+  fi
+}
+
+# ── Perintah ─────────────────────────────────────────────────────────────────
+
+cmd_setup() {
+  local want unit_changed=0
+  load_config
+  if (( ENABLED == 0 )); then
+    if [[ -f "${UNIT_FILE}" ]] && { systemctl is-active --quiet "${SERVICE}" 2>/dev/null || \
+         systemctl is-enabled --quiet "${SERVICE}" 2>/dev/null; }; then
+      systemctl disable --no-reload --now "${SERVICE}" >/dev/null 2>&1 || true
+    fi
+    rules_sync
+    write_state
+    return 0
+  fi
+  [[ -n "${NS}" ]] || die "SLOWDNS_NS_DOMAIN belum diisi atau tidak valid"
+  ensure_user || die "user ${SVC_USER} gagal dibuat"
+  ensure_binary || die "binary dnstt-server belum tersedia"
+  ensure_key || die "kunci server SlowDNS gagal dibuat"
+  if listen_port_busy; then
+    die "port UDP ${LISTEN} sudah dipakai program lain (ubah SLOWDNS_LISTEN_PORT)"
+  fi
+  PUBLIC_IP_NEW="$(detect_public_ip || state_get PUBLIC_IP)"
+  want="$(unit_content)"
+  if [[ ! -f "${UNIT_FILE}" || "$(cat "${UNIT_FILE}" 2>/dev/null)" != "${want}" ]]; then
+    printf '%s\n' "${want}" > "${UNIT_FILE}" || die "unit ${UNIT_FILE} gagal ditulis"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    unit_changed=1
+  fi
+  systemctl is-enabled --quiet "${SERVICE}" 2>/dev/null || \
+    systemctl enable --no-reload "${SERVICE}" >/dev/null 2>&1 || true
+  if (( unit_changed || BINARY_CHANGED || KEY_CHANGED )) || ! systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then
+    systemctl restart "${SERVICE}" >/dev/null 2>&1 || true
+  fi
+  wait_listening || true
+  rules_sync
+  write_state
+  systemctl is-active --quiet "${SERVICE}" 2>/dev/null || \
+    die "service ${SERVICE} tidak berjalan; cek: journalctl -u ${SERVICE} -n 30"
+  (( RULES_OK == 1 )) || die "aturan iptables UDP ${PUBLIC_PORT} -> ${LISTEN} gagal dipasang"
+  return 0
+}
+
+# SlowDNS mati dan state sudah mencatat aturan terlepas: tidak ada yang perlu
+# dikerjakan. Murni builtin bash, jadi watchdog di VPS default nyaris gratis.
+apply_noop() {
+  local st_enabled
+  load_config
+  (( ENABLED == 0 )) || return 1
+  state_val ENABLED
+  st_enabled="${REPLY}"
+  state_val RULES
+  [[ "${st_enabled}" == "0" && "${REPLY}" == "0" ]]
+}
+
+cmd_apply() {
+  load_config
+  rules_sync
+  write_state
+  if (( ENABLED == 1 && RULES_OK == 0 )); then return 1; fi
+  return 0
+}
+
+cmd_records() {
+  local ip host
+  state_val PUBLIC_IP
+  ip="${REPLY:-IP_VPS}"
+  host="${DOMAIN_MAIN:-domain-utama}"
+  say "Buat record ini di DNS domain Anda:"
+  say "  NS  ${NS:-$(suggest_ns "${DOMAIN_MAIN}")}  ->  ${host}"
+  say "Syarat: ${host} punya A record ke ${ip} TANPA proxy Cloudflare (awan abu-abu)."
+  say "Kalau domain utama memakai proxy, buat A record baru tanpa proxy"
+  say "(misalnya dns-${host} -> ${ip}) lalu arahkan record NS ke sana."
+  say "Record baru bisa butuh beberapa menit sampai beberapa jam untuk aktif."
+}
+
+cmd_enable() {
+  local ns prev_enable prev_ns
+  env_val SLOWDNS_ENABLE
+  prev_enable="${REPLY}"
+  env_val SLOWDNS_NS_DOMAIN
+  prev_ns="${REPLY}"
+  load_config
+  normalize_ns "${1:-${prev_ns}}" || \
+    die "domain NS tidak valid: ${1:-kosong} (contoh: $(suggest_ns "${DOMAIN_MAIN:-sg.domainanda.com}"))"
+  ns="${REPLY}"
+  if [[ -n "${DOMAIN_MAIN}" && "${ns}" == "${DOMAIN_MAIN}" ]]; then
+    die "domain NS tidak boleh sama dengan domain utama; pakai subdomain lain, misalnya $(suggest_ns "${DOMAIN_MAIN}")"
+  fi
+  set_env_value SLOWDNS_NS_DOMAIN "${ns}" || die "env ${SC_ENV} gagal ditulis"
+  set_env_value SLOWDNS_ENABLE 1 || die "env ${SC_ENV} gagal ditulis"
+  if ! ( cmd_setup ); then
+    set_env_value SLOWDNS_ENABLE "${prev_enable:-0}" || true
+    set_env_value SLOWDNS_NS_DOMAIN "${prev_ns}" || true
+    ( cmd_setup ) >/dev/null 2>&1 || true
+    die "SlowDNS belum bisa diaktifkan; pengaturan dikembalikan"
+  fi
+  service_gate_apply
+  load_config
+  STATE_LOADED=0
+  pubkey_val
+  say "Berhasil: SlowDNS aktif."
+  say "Pubkey: ${REPLY}"
+  cmd_records
+}
+
+cmd_disable() {
+  set_env_value SLOWDNS_ENABLE 0 || die "env ${SC_ENV} gagal ditulis"
+  ( cmd_setup ) || true
+  service_gate_apply
+  say "Berhasil: SlowDNS dimatikan. Aturan UDP ${PUBLIC_PORT} dilepas; kunci server tetap disimpan."
+}
+
+cmd_set_ns() {
+  local prev_ns ns
+  env_val SLOWDNS_NS_DOMAIN
+  prev_ns="${REPLY}"
+  load_config
+  normalize_ns "${1:-}" || die "domain NS tidak valid: ${1:-kosong}"
+  ns="${REPLY}"
+  if [[ -n "${DOMAIN_MAIN}" && "${ns}" == "${DOMAIN_MAIN}" ]]; then
+    die "domain NS tidak boleh sama dengan domain utama"
+  fi
+  set_env_value SLOWDNS_NS_DOMAIN "${ns}" || die "env ${SC_ENV} gagal ditulis"
+  if (( ENABLED == 1 )) && ! ( cmd_setup ); then
+    set_env_value SLOWDNS_NS_DOMAIN "${prev_ns}" || true
+    ( cmd_setup ) >/dev/null 2>&1 || true
+    die "domain NS baru gagal diterapkan; pengaturan dikembalikan"
+  fi
+  load_config
+  STATE_LOADED=0
+  say "Berhasil: domain NS = ${ns}"
+  cmd_records
+}
+
+cmd_regen_key() {
+  load_config
+  [[ -x "${BIN}" ]] || die "binary dnstt-server belum terpasang; aktifkan SlowDNS dulu"
+  rm -f "${KEY_DIR}/server.key.bak" "${KEY_DIR}/server.pub.bak"
+  [[ -f "${KEY_DIR}/server.key" ]] && mv -f "${KEY_DIR}/server.key" "${KEY_DIR}/server.key.bak"
+  [[ -f "${KEY_DIR}/server.pub" ]] && mv -f "${KEY_DIR}/server.pub" "${KEY_DIR}/server.pub.bak"
+  if (( ENABLED == 1 )); then
+    if ! ( cmd_setup ); then
+      mv -f "${KEY_DIR}/server.key.bak" "${KEY_DIR}/server.key" 2>/dev/null || true
+      mv -f "${KEY_DIR}/server.pub.bak" "${KEY_DIR}/server.pub" 2>/dev/null || true
+      ( cmd_setup ) >/dev/null 2>&1 || true
+      die "kunci baru gagal diterapkan; kunci lama dikembalikan"
+    fi
+  else
+    ensure_user && ensure_key || die "kunci baru gagal dibuat"
+    write_state
+  fi
+  pubkey_val
+  say "Berhasil: kunci baru dibuat. Pubkey lama tidak berlaku; kirim pubkey baru ke pengguna."
+  say "Pubkey: ${REPLY}"
+}
+
+cmd_status() {
+  local svc="tidak jalan" rules="BELUM" ip version pub
+  load_config
+  if systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then svc="berjalan"; fi
+  state_val RULES
+  if [[ "${REPLY}" == "1" ]]; then rules="TERPASANG"; fi
+  state_val PUBLIC_IP
+  ip="${REPLY}"
+  first_line "${BIN}.version" || true
+  version="${REPLY}"
+  pubkey_val
+  pub="${REPLY:--}"
+  if (( ENABLED == 1 )); then
+    printf '%-14s: %s\n' "SlowDNS" "AKTIF (service ${svc})"
+  else
+    printf '%-14s: %s\n' "SlowDNS" "NONAKTIF"
+  fi
+  printf '%-14s: %s\n' "NS" "${NS:--}"
+  printf '%-14s: %s\n' "Pubkey" "${pub}"
+  if [[ -n "${ip}" ]]; then ip="${ip}:${PUBLIC_PORT}"; else ip="-"; fi
+  printf '%-14s: %s\n' "DNS" "${ip}"
+  printf '%-14s: %s\n' "Jalur" "UDP ${PUBLIC_PORT} -> ${LISTEN} -> Dropbear 127.0.0.1:${TARGET_PORT}"
+  printf '%-14s: %s\n' "Aturan UDP 53" "${rules}"
+  printf '%-14s: %s\n' "MTU / RAM" "${MTU} / $(memory_max)"
+  printf '%-14s: %s\n' "Binary" "${version:-belum terpasang}"
+}
+
+nat_counter() {
+  iptables -w 10 -t nat -L "${CHAIN}" -n -v -x 2>/dev/null | awk '/REDIRECT/ { s += $1 } END { print s + 0 }'
+}
+
+# Query TXT acak lewat DoH Google dan Cloudflare. Kalau delegasi NS benar,
+# resolver publik mengirim query itu ke VPS ini dan penghitung rule naik.
+cmd_check() {
+  local before after label url
+  load_config
+  (( ENABLED == 1 )) && [[ -n "${NS}" ]] || die "SlowDNS belum aktif"
+  command -v curl >/dev/null 2>&1 || die "curl tidak tersedia"
+  before="$(nat_counter)"
+  label="cek$(date +%s)$(( RANDOM % 1000 ))"
+  for url in "https://dns.google/resolve?name=${label}a.${NS}&type=TXT" \
+             "https://cloudflare-dns.com/dns-query?name=${label}b.${NS}&type=TXT"; do
+    curl -fsS --connect-timeout 5 --max-time 12 -H 'accept: application/dns-json' "${url}" >/dev/null 2>&1 || true
+  done
+  sleep 1
+  after="$(nat_counter)"
+  if (( after > before )); then
+    say "Berhasil: query DNS untuk ${NS} dari resolver publik sampai ke VPS ini. Delegasi NS sudah benar."
+    return 0
+  fi
+  say "Gagal: query untuk ${NS} belum sampai ke VPS ini."
+  say "Cek record NS dan A record tujuannya (tanpa proxy Cloudflare), dan firewall"
+  say "panel provider untuk UDP 53. Record baru bisa butuh beberapa menit sampai beberapa jam."
+  return 1
+}
+
+cmd_clear() {
+  ENABLED=0
+  load_config
+  ENABLED=0
+  systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || true
+  rm -f "${UNIT_FILE}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  RULES_CHANGED=0
+  clear_tool iptables
+  clear_tool ip6tables
+  if (( RULES_CHANGED )); then persist_rules; fi
+  rm -f "${STATE_FILE}" "${BIN}" "${BIN}.version" "${BIN}.new"
+  userdel "${SVC_USER}" >/dev/null 2>&1 || true
+  groupdel "${SVC_USER}" >/dev/null 2>&1 || true
+  # Kunci di ${KEY_DIR} disimpan supaya install ulang memakai pubkey yang sama.
+}
+
+acquire_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  { exec 9>"${LOCK_FILE}"; } 2>/dev/null || return 0
+  if [[ "${1:-}" == "try" ]]; then
+    # Watchdog tidak menunggu build/setup yang sedang jalan.
+    flock -n 9 || exit 0
+  else
+    flock -w 60 9 || die "proses SlowDNS lain sedang berjalan"
+  fi
+}
+
+case "${1:-status}" in
+  setup) acquire_lock; cmd_setup ;;
+  apply)
+    if apply_noop; then exit 0; fi
+    acquire_lock try
+    cmd_apply
+    ;;
+  enable) acquire_lock; cmd_enable "${2:-}" ;;
+  disable) acquire_lock; cmd_disable ;;
+  set-ns) acquire_lock; cmd_set_ns "${2:-}" ;;
+  regen-key) acquire_lock; cmd_regen_key ;;
+  status) cmd_status ;;
+  records) load_config; cmd_records ;;
+  suggest) load_config; suggest_ns "${DOMAIN_MAIN}"; echo ;;
+  check) cmd_check ;;
+  info) cat "${STATE_FILE}" 2>/dev/null || true ;;
+  clear) acquire_lock; cmd_clear ;;
+  *)
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|records|suggest|check|info|clear}"
+    exit 1
+    ;;
+esac
+SLOWDNS_EOF
+  bash -n /usr/local/sbin/sc-1forcr-slowdns
+  chmod 700 /usr/local/sbin/sc-1forcr-slowdns
+}
+
+# Gagal di sini tidak boleh menggagalkan install atau memicu rollback update:
+# SlowDNS opsional, dan layanan lain tidak bergantung padanya. Saat mati
+# (default) tidak ada build, service, maupun aturan iptables.
+setup_slowdns() {
+  install_slowdns_manager || return 0
+  if ! /usr/local/sbin/sc-1forcr-slowdns setup; then
+    log "PERINGATAN: SlowDNS belum bisa diterapkan; cek menu Tools > SlowDNS."
+  fi
+  return 0
+}
+
 # ── Mode Bot Panel ──────────────────────────────────────────────────────────
 # Bot Telegram jualan akun dengan token sendiri (BOT_PANEL_TOKEN), terpisah
 # dari bot notifikasi (TELEGRAM_BOT_TOKEN) yang tidak disentuh sama sekali.
@@ -23877,6 +24889,17 @@ function sshDnsSelowLines(payload) {
   return [`*DNS SELOW*    : \`${payload && payload.hostname}:5300@${payload && payload.username}:${payload && payload.password}\``];
 }
 
+// SlowDNS (dnstt): API SC hanya mengirim data.slowdns saat SlowDNS aktif di
+// VPS, jadi server tanpa SlowDNS tidak mendapat baris tambahan.
+function sshSlowdnsLines(payload) {
+  const info = payload && payload.slowdns && typeof payload.slowdns === 'object' ? payload.slowdns : {};
+  const ns = pick(info.ns);
+  const pubkey = pick(info.pubkey);
+  if (!ns || !pubkey) return [];
+  const dns = pick(info.dns);
+  return ['', '*[ SLOWDNS ]*', '------------------------------', row('NS', ns), row('Pubkey', pubkey), dns ? row('DNS', dns) : null];
+}
+
 function sshLegacyPortLines(payload) {
   if (isSc1forcrPayload(payload)) return [];
   const port = (payload && payload.port) || {};
@@ -23977,6 +25000,7 @@ function formatSshAccountMessage(s, { trial = false, quota, limitip } = {}) {
     ...sshLegacyPortLines(s),
     udpgw ? row('UDPGW', udpgw) : null,
     udpCustom ? row('UDP Custom', udpCustom) : null,
+    ...sshSlowdnsLines(s),
     '',
     '*[ PAYLOAD WS ]*',
     '------------------------------',
@@ -26879,6 +27903,13 @@ BOT_PANEL_ENABLE=${BOT_PANEL_ENABLE}
 BOT_PANEL_TOKEN=${BOT_PANEL_TOKEN}
 BOT_PANEL_ADMIN_IDS=${BOT_PANEL_ADMIN_IDS}
 BOT_PANEL_MEMORY_MAX=${BOT_PANEL_MEMORY_MAX}
+SLOWDNS_ENABLE=${SLOWDNS_ENABLE}
+SLOWDNS_NS_DOMAIN=${SLOWDNS_NS_DOMAIN}
+SLOWDNS_LISTEN_PORT=${SLOWDNS_LISTEN_PORT}
+SLOWDNS_MTU=${SLOWDNS_MTU}
+SLOWDNS_MEMORY_MAX=${SLOWDNS_MEMORY_MAX}
+SLOWDNS_BIN_URL=${SLOWDNS_BIN_URL}
+SLOWDNS_BIN_SHA256=${SLOWDNS_BIN_SHA256}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
 BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN}
 AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
@@ -28943,9 +29974,11 @@ print_created_account() {
 
   case "${type}" in
     ssh)
-      # OpenVPN, SSH OHP, dan SlowDNS tidak dipasang SC, jadi tidak ditampilkan
-      # walau API masih mengirim kunci ovpntcp/ovpnudp/sshohp untuk bot lama.
+      # OpenVPN dan SSH OHP tidak dipasang SC, jadi tidak ditampilkan walau API
+      # masih mengirim kunci ovpntcp/ovpnudp/sshohp untuk bot lama. SlowDNS
+      # hanya tampil kalau API mengirim data.slowdns (SlowDNS aktif di VPS).
       local title host user pass exp exp_time quota lim city isp tls ntls tls_list ntls_list udpgw udp_custom
+      local slowdns_ns slowdns_pubkey slowdns_dns
       title="SSH ACCOUNT CREATED"
       [[ "${mode}" == "trial" ]] && title="TRIAL SSH ACCOUNT"
       host="$(created_json_value "${raw}" '.data.hostname // .data.host')"
@@ -28963,6 +29996,9 @@ print_created_account() {
       ntls_list="$(created_json_value "${raw}" '.data.port.none_all' "${ntls}")"
       udpgw="$(created_json_value "${raw}" '.data.port.udpgw' '')"
       udp_custom="$(created_json_value "${raw}" '.data.port.udpcustom // .data.port.udp_custom // .data.port.udphc' '')"
+      slowdns_ns="$(created_json_value "${raw}" '.data.slowdns.ns' '')"
+      slowdns_pubkey="$(created_json_value "${raw}" '.data.slowdns.pubkey' '')"
+      slowdns_dns="$(created_json_value "${raw}" '.data.slowdns.dns' '')"
       cat <<EOT_SSH | ui_fx
 =============================
  ${title}
@@ -28995,6 +30031,16 @@ EOT_SSH
       fi
       if [[ -n "${udp_custom}" ]]; then
         printf 'UDP Custom  : %s\n' "${udp_custom}" | ui_fx
+      fi
+      if [[ -n "${slowdns_ns}" && -n "${slowdns_pubkey}" ]]; then
+        {
+          printf '\n[ SLOWDNS ]\n------------------------------\n'
+          printf 'NS          : %s\n' "${slowdns_ns}"
+          printf 'Pubkey      : %s\n' "${slowdns_pubkey}"
+          if [[ -n "${slowdns_dns}" ]]; then
+            printf 'DNS         : %s\n' "${slowdns_dns}"
+          fi
+        } | ui_fx
       fi
       cat <<EOT_SSH_PAYLOAD | ui_fx
 
@@ -31800,9 +32846,10 @@ tools_menu() {
       "17) Tema Warna Menu" \
       "18) Port TLS/NTLS Tambahan" \
       "19) Mode Bot Panel (Jualan Akun)" \
+      "20) SlowDNS (DNS Tunnel)" \
       "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-19]: "; then
+    if ! prompt_input tm "Pilih menu [0-20]: "; then
       return
     fi
     clear
@@ -31826,6 +32873,7 @@ tools_menu() {
       17) set_menu_color_menu || true ;;
       18) set_extra_ports_menu || true ;;
       19) set_bot_panel_menu || true ;;
+      20) set_slowdns_menu || true ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -31899,6 +32947,99 @@ set_extra_ports_menu() {
     echo "Gagal menerapkan port tambahan. Watchdog akan mencoba lagi."
   fi
   "${bin}" status | ui_fx
+  return 0
+}
+
+# SlowDNS (dnstt) lewat sc-1forcr-slowdns. Butuh record NS di DNS domain yang
+# mendelegasikan domain tunnel ke VPS ini. Build binary pertama 2-6 menit.
+# Env dibaca ulang setelah tiap perubahan, supaya Update dari menu membawa
+# nilai SLOWDNS_* terbaru (helper menulis /etc/sc-1forcr.env sendiri).
+slowdns_enable_menu() {
+  local bin="$1" ns def_ns ans
+  def_ns="${SLOWDNS_NS_DOMAIN:-}"
+  [[ -n "${def_ns}" ]] || def_ns="$("${bin}" suggest 2>/dev/null || true)"
+  echo "Domain NS = subdomain khusus SlowDNS yang didelegasikan ke VPS ini."
+  echo "Pakai nama pendek dan jangan sama dengan domain utama (${DOMAIN:-})."
+  echo "Kosongkan untuk memakai usulan, ketik 'batal' untuk kembali."
+  if ! prompt_input ns "Domain NS [${def_ns}]: "; then
+    return 0
+  fi
+  [[ "${ns,,}" == "batal" ]] && return 0
+  [[ -z "${ns}" ]] && ns="${def_ns}"
+  if [[ ! -x /usr/local/lib/sc-1forcr/dnstt-server ]]; then
+    echo "Binary dnstt belum ada dan akan dibangun dari source resmi: 2-6 menit,"
+    echo "butuh sekitar 800 MB disk sementara. Layanan lain tetap jalan."
+  fi
+  echo "Pemakaian SlowDNS: RAM sekitar 10-30 MB (batas 64M di VPS 1 GB), CPU hampir 0% saat sepi."
+  if ! prompt_input ans "Lanjut aktifkan SlowDNS? [y/N]: "; then
+    return 0
+  fi
+  if [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
+    echo "Dibatalkan."
+    return 0
+  fi
+  "${bin}" enable "${ns}" 2>&1 | ui_fx || true
+  return 0
+}
+
+set_slowdns_menu() {
+  local bin="/usr/local/sbin/sc-1forcr-slowdns" choice ns ans
+  if [[ ! -x "${bin}" ]]; then
+    echo "Gagal: ${bin} belum terpasang. Jalankan update SC dulu."
+    return 0
+  fi
+  safe_source_env_file /etc/sc-1forcr.env
+  draw_menu_header "SLOWDNS (DNS TUNNEL)"
+  "${bin}" status | ui_fx
+  echo
+  echo "SlowDNS membawa SSH lewat query DNS, jadi tetap bisa konek di jaringan yang"
+  echo "hanya membuka DNS. Kecepatannya rendah. Pengguna memakai akun SSH biasa;"
+  echo "aplikasi butuh NS, Pubkey, dan DNS dari detail akun."
+  echo "Syarat: record NS di DNS domain yang mengarah ke VPS ini (lihat menu 5)."
+  echo "Catatan: IP limit tidak bisa menghitung perangkat yang lewat resolver publik."
+  echo
+  if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
+    echo "1) Nonaktifkan SlowDNS"
+  else
+    echo "1) Aktifkan SlowDNS"
+  fi
+  echo "2) Ganti Domain NS"
+  echo "3) Cek Delegasi NS"
+  echo "4) Buat Ulang Kunci (pubkey baru)"
+  echo "5) Lihat Record DNS yang Dibutuhkan"
+  echo "6) Lihat Log SlowDNS"
+  echo "0) Kembali"
+  if ! prompt_input choice "Pilih [0-6]: "; then
+    return 0
+  fi
+  case "${choice}" in
+    1)
+      if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
+        "${bin}" disable 2>&1 | ui_fx || true
+      else
+        slowdns_enable_menu "${bin}"
+      fi
+      ;;
+    2)
+      echo "Domain NS sekarang: ${SLOWDNS_NS_DOMAIN:--}"
+      if prompt_input ns "Domain NS baru (kosong = batal): " && [[ -n "${ns}" ]]; then
+        "${bin}" set-ns "${ns}" 2>&1 | ui_fx || true
+      fi
+      ;;
+    3) "${bin}" check 2>&1 | ui_fx || true ;;
+    4)
+      echo "Peringatan: semua pengguna SlowDNS harus mengganti pubkey di aplikasinya."
+      if prompt_input ans "Buat kunci baru? [y/N]: " && [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
+        "${bin}" regen-key 2>&1 | ui_fx || true
+      else
+        echo "Dibatalkan."
+      fi
+      ;;
+    5) "${bin}" records | ui_fx || true ;;
+    6) journalctl -u sc-1forcr-slowdns.service -n 40 --no-pager -o cat 2>/dev/null || echo "Log SlowDNS belum tersedia." ;;
+    *) return 0 ;;
+  esac
+  safe_source_env_file /etc/sc-1forcr.env
   return 0
 }
 
@@ -36427,6 +37568,13 @@ update_script_from_repo() {
     BOT_PANEL_TOKEN="${BOT_PANEL_TOKEN:-}" \
     BOT_PANEL_ADMIN_IDS="${BOT_PANEL_ADMIN_IDS:-}" \
     BOT_PANEL_MEMORY_MAX="${BOT_PANEL_MEMORY_MAX:-128M}" \
+    SLOWDNS_ENABLE="${SLOWDNS_ENABLE:-0}" \
+    SLOWDNS_NS_DOMAIN="${SLOWDNS_NS_DOMAIN:-}" \
+    SLOWDNS_LISTEN_PORT="${SLOWDNS_LISTEN_PORT:-5300}" \
+    SLOWDNS_MTU="${SLOWDNS_MTU:-512}" \
+    SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}" \
+    SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}" \
+    SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN="${BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN:-}" \
     AUTO_INSTALL_SUMMARY_API="0" \
@@ -38454,6 +39602,9 @@ systemctl disable --now sc-1forcr-udpgw-alias.service sc-1forcr-udpgw-drain.time
 systemctl disable --now sc-1forcr-botpanel.service >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-udpgw-alias clear >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-extra-ports clear >/dev/null 2>&1 || true
+# Kunci SlowDNS (/etc/sc-1forcr/slowdns) sengaja disimpan: install ulang memakai
+# pubkey yang sama, jadi pengguna tidak perlu mengganti pubkey.
+/usr/local/sbin/sc-1forcr-slowdns clear >/dev/null 2>&1 || true
 /usr/local/sbin/sc-1forcr-tunnel-guard clear >/dev/null 2>&1 || true
 rm -f /etc/ssh/sshd_config.d/00-sc-1forcr.conf
 rm -f /etc/systemd/system/dropbear.service.d/40-sc-1forcr-tunnel-group.conf /etc/systemd/system/zivpn.service.d/40-sc-1forcr-tunnel-group.conf /etc/systemd/system/sc-1forcr-udpcustom.service.d/40-sc-1forcr-tunnel-group.conf
@@ -38523,6 +39674,7 @@ rm -f /usr/local/sbin/sc-1forcr-capacity-tune
 rm -f /usr/local/sbin/sc-1forcr-dns-guard
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 rm -f /usr/local/sbin/sc-1forcr-extra-ports
+rm -f /usr/local/sbin/sc-1forcr-slowdns
 rm -f /usr/local/sbin/sc-1forcr-tunnel-guard
 rm -f /usr/local/sbin/sc-1forcr-cert-sync
 rm -f /etc/letsencrypt/renewal-hooks/deploy/sc-1forcr-haproxy
@@ -39346,6 +40498,7 @@ persist_pending_install_env() {
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
+    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE
@@ -40567,6 +41720,8 @@ main() {
     apply_tunnel_security
     restart_update_safe_services
     heal_dropbear_banner_override || true
+    # Sebelum gerbang ON/OFF: aturan INPUT SlowDNS disisipkan di puncak chain.
+    setup_slowdns
     apply_service_gates
     apply_extra_ports
     install_bot_panel || true
@@ -40672,6 +41827,9 @@ main() {
   run_install_step "37_tunnel_guard" 99 "Terapkan guard outbound tunnel" apply_tunnel_outbound_guard_rules
   run_install_step "37b_tunnel_security" 99 "Terapkan keamanan sshd dan trafik tunnel" apply_tunnel_security
   run_install_step "38_restart_chain" 99 "Restart layanan inti" apply_final_service_restart_chain
+  # Opsional dan mati secara default; dipasang sebelum gerbang ON/OFF supaya
+  # gerbang tetap menjadi aturan pertama di INPUT.
+  run_install_step "38a_slowdns" 99 "Setup SlowDNS (opsional)" setup_slowdns
   run_install_step "38b_service_gate" 99 "Terapkan status ON/OFF layanan" apply_service_gates
   run_install_step "38c_extra_ports" 99 "Terapkan port TLS/NTLS tambahan" apply_extra_ports
   # Opsional dan mati secara default; masalah Bot Panel tidak boleh membuat install gagal.

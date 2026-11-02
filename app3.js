@@ -577,7 +577,7 @@ async function ensurePendingDepositSchema() {
 
 async function seedDefaultSettings() {
   const now = Date.now();
-  const scFeaturesVersion = '2026-10-06.1';
+  const scFeaturesVersion = '2026-11-02.1';
   const defaultScFeaturesText = [
     'KOMPATIBILITAS & CORE',
     '- Debian 12 dan 13',
@@ -596,6 +596,7 @@ async function seedDefaultSettings() {
     '- VLESS WS dan gRPC',
     '- Trojan WS dan gRPC',
     '- ZIVPN atau UDP Custom / UDPHC',
+    '- SlowDNS (DNSTT) opsional, aktif dari menu Tools (butuh record NS di DNS domain)',
     '- BadVPN UDPGW melalui tunnel SSH',
     '- Akun SSH tunnel-only tanpa shell VPS',
     '- Akun trial berbasis menit',
@@ -616,6 +617,7 @@ async function seedDefaultSettings() {
     '- Xray gRPC: /vmess-grpc, /vless-grpc, /trojan-grpc',
     '- ZIVPN / UDPHC listen default: 5667',
     '- ZIVPN DNAT default: 6000-19999 dan UDP 553',
+    '- SlowDNS: UDP 53 (saat diaktifkan)',
     '- UDPGW TCP internal: 7300 dan 7200',
     '- API internal: 127.0.0.1:8088',
     '',

@@ -77,6 +77,49 @@
       "expected": "=============================\n TRIAL SSH ACCOUNT\n=============================\n\n[ SSH PREMIUM DETAILS ]\n-----------------------------\nSSH WS      : id1.example.com:80@trial0421:trial0421\nSSH SSL     : id1.example.com:443@trial0421:trial0421\n\n[ HOST INFORMATION ]\n-----------------------------\nHostname    : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\nUsername    : trial0421\nPassword    : trial0421\nExpiry Date : 2026-10-07 15:05:09\nExpiry Time : 15:05:09\nQuota       : 10 GB\nIP Limit    : 1\n\n[ PORTS ]\n------------------------------\nTLS         : 443\nNon-TLS     : 80\nUDPGW       : 7300,7200\nUDP Custom  : 5667\n\n[ PAYLOAD WS ]\n------------------------------\nGET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]\n\n[ PAYLOAD ENHANCED + SPLIT ]\n------------------------------\nPATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]\n------------------------------\nTerima kasih telah menggunakan layanan kami."
     },
     {
+      "name": "ssh-create-slowdns",
+      "type": "ssh",
+      "mode": "create",
+      "data": {
+        "hostname": "id1.example.com",
+        "username": "sari",
+        "password": "rahasia2",
+        "exp": "2026-11-06 14:05:09",
+        "time": "14:05:09",
+        "city": "Jakarta",
+        "isp": "PT Contoh Net",
+        "port": {
+          "tls": "443",
+          "none": "80",
+          "tls_all": "443, 8443, 2053",
+          "none_all": "80, 8080, 8880",
+          "ovpntcp": "1194",
+          "ovpnudp": "2200",
+          "sshohp": "8181",
+          "udpgw": "7300,7200",
+          "slowdns": "53"
+        },
+        "ws_path": "/ssh-ws",
+        "ws_alt_path": "/ws",
+        "udpgw": {
+          "mode": "badvpn",
+          "ports": [
+            "7300",
+            "7200"
+          ],
+          "notes": "Untuk VC/telp/game di SSH/SSHWS, set badvpn/udpgw ke salah satu port ini."
+        },
+        "limitip": "2",
+        "quota": "0",
+        "slowdns": {
+          "ns": "ns-id1.example.com",
+          "pubkey": "b851bf1a0573c74b08f2d2f076413cd7b9fefce9c90c028dd8df3a2eb9897338",
+          "dns": "203.0.113.7:53"
+        }
+      },
+      "expected": "=============================\n SSH ACCOUNT CREATED\n=============================\n\n[ SSH PREMIUM DETAILS ]\n-----------------------------\nSSH WS      : id1.example.com:80@sari:rahasia2\nSSH SSL     : id1.example.com:443@sari:rahasia2\n\n[ HOST INFORMATION ]\n-----------------------------\nHostname    : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\nUsername    : sari\nPassword    : rahasia2\nExpiry Date : 2026-11-06 14:05:09\nExpiry Time : 14:05:09\nQuota       : Unlimited\nIP Limit    : 2\n\n[ PORTS ]\n------------------------------\nTLS         : 443, 8443, 2053\nNon-TLS     : 80, 8080, 8880\nUDPGW       : 7300,7200\n\n[ SLOWDNS ]\n------------------------------\nNS          : ns-id1.example.com\nPubkey      : b851bf1a0573c74b08f2d2f076413cd7b9fefce9c90c028dd8df3a2eb9897338\nDNS         : 203.0.113.7:53\n\n[ PAYLOAD WS ]\n------------------------------\nGET wss://[host_port]/ HTTP/1.1[crlf]Host: [host_port][crlf]Upgrade: Websocket[crlf]Connection: Keep-Alive[crlf][crlf]\n\n[ PAYLOAD ENHANCED + SPLIT ]\n------------------------------\nPATCH /ssh-ws HTTP/1.1[crlf]Host: [host][crlf]Host: www.google.com[crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf][split]HTTP/1.1 200 OK[crlf][crlf]\n------------------------------\nTerima kasih telah menggunakan layanan kami."
+    },
+    {
       "name": "vmess-create-multipath",
       "type": "vmess",
       "mode": "create",

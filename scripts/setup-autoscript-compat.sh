@@ -91,8 +91,8 @@ set -euo pipefail
 #   SLOWDNS_ENABLE=0                            (opsional, 1=SlowDNS/DNSTT aktif; butuh record NS, atur di menu Tools)
 #   SLOWDNS_NS_DOMAIN=                          (domain tunnel yang didelegasikan ke VPS, contoh ns-sg.domain.com)
 #   SLOWDNS_LISTEN_PORT=5300                    (opsional, port UDP lokal dnstt; UDP 53 publik dialihkan ke sini)
-#   SLOWDNS_MTU=512                             (opsional, ukuran respons DNS maksimal; 512 paling kompatibel)
-#   SLOWDNS_MEMORY_MAX=auto                     (opsional, batas RAM service SlowDNS; auto 64M di VPS 1 GB)
+#   SLOWDNS_MTU=1232                            (opsional, batas ATAS ukuran respons DNS; app ber-buffer kecil tetap diterima)
+#   SLOWDNS_MEMORY_MAX=auto                     (opsional, batas RAM service SlowDNS; auto 128M di VPS 1 GB)
 #   SLOWDNS_BIN_URL= / SLOWDNS_BIN_SHA256=      (opsional, binary dnstt-server siap pakai; default build dari source)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
@@ -210,7 +210,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.111}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.112}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -273,7 +273,7 @@ BOT_PANEL_MEMORY_MAX="${BOT_PANEL_MEMORY_MAX:-128M}"
 SLOWDNS_ENABLE="${SLOWDNS_ENABLE:-0}"
 SLOWDNS_NS_DOMAIN="${SLOWDNS_NS_DOMAIN:-}"
 SLOWDNS_LISTEN_PORT="${SLOWDNS_LISTEN_PORT:-5300}"
-SLOWDNS_MTU="${SLOWDNS_MTU:-512}"
+SLOWDNS_MTU="${SLOWDNS_MTU:-1232}"
 SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}"
 SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}"
 SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}"
@@ -9587,6 +9587,9 @@ async function renewSsh(req, res) {
     const username = validateSshUsername(req.params.username);
     const exp = Number(req.params.exp || 30);
     const body = req.body || {};
+    // SlowDNS (NS/pubkey/dns) ikut di respons renew/recover supaya web/bot bisa
+    // menampilkannya lagi, sama seperti saat create. null kalau SlowDNS mati.
+    const slowdns = slowdnsInfo();
     const row = await get("SELECT password,limitip,quota,date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
     const owner = getOwnerInfo(req, body);
     const bodyPassRaw = String(body?.password || '').trim();
@@ -9624,7 +9627,8 @@ async function renewSsh(req, res) {
         created: true,
         recovered: true,
         status: 'AKTIF',
-        time: nowTime()
+        time: nowTime(),
+        ...(slowdns ? { slowdns, port: { slowdns: '53' } } : {})
       };
       await notifyAccountEvent('recover', 'ssh/zivpn', { ...recoverPayload, added_days: exp }, owner);
       return ok(res, recoverPayload);
@@ -9666,7 +9670,8 @@ async function renewSsh(req, res) {
       status: nextStatus,
       limitip: String(nextLimitIp),
       created: false,
-      time: nowTime()
+      time: nowTime(),
+      ...(slowdns ? { slowdns, port: { slowdns: '53' } } : {})
     };
     await notifyAccountEvent('renew', 'ssh/zivpn', { ...renewPayload, added_days: exp }, owner);
     return ok(res, renewPayload);
@@ -23270,7 +23275,15 @@ CHAIN="SC1FORCR_SLOWDNS"
 TAG="sc-slowdns"
 PUBLIC_PORT="53"
 DNSTT_VERSION="v1.20260501.0"
-DNSTT_PKG="www.bamsoftware.com/git/dnstt.git/dnstt-server"
+DNSTT_MODULE="www.bamsoftware.com/git/dnstt.git"
+# Checksum zip source module (proxy.golang.org) untuk versi di atas. Deps lain
+# tetap diverifikasi go.sum + GOSUMDB saat build.
+DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866ee5"
+# Penanda patch SC di atas dnstt resmi. Naikkan kalau isi patch berubah supaya
+# VPS lama rebuild. sc-fast1: terima QTYPE=NULL (record NULL, app HTTP Custom
+# dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
+# plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
+DNSTT_PATCH_ID="sc-fast1"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -23420,8 +23433,8 @@ valid_ipv4() {
   (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255 ))
 }
 
-# Batas RAM: 64M di VPS 1 GB / 1 vCPU. Terukur dnstt-server sekitar 10 MB saat
-# sepi; buffer per pengguna kecil karena MTU respons 512.
+# Batas RAM: 128M di VPS 1 GB / 1 vCPU. dnstt-server ~10 MB saat sepi; naik saat
+# throughput tinggi karena window KCP besar (QueueSize 8192) dan buffer smux.
 memory_max() {
   local raw ram_kb cores
   raw="$(env_get SLOWDNS_MEMORY_MAX | tr '[:lower:]' '[:upper:]')"
@@ -23432,11 +23445,11 @@ memory_max() {
   ram_kb="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || echo 0)"
   cores="$(nproc 2>/dev/null || echo 1)"
   if (( ${ram_kb:-0} >= 3600000 && ${cores:-1} >= 4 )); then
-    printf '128M'
+    printf '256M'
   elif (( ${ram_kb:-0} >= 1800000 && ${cores:-1} >= 2 )); then
-    printf '96M'
+    printf '192M'
   else
-    printf '64M'
+    printf '128M'
   fi
 }
 
@@ -23459,12 +23472,13 @@ load_config() {
   port_or "${REPLY}" 5300
   LISTEN="${REPLY}"
   if [[ "${LISTEN}" == "${PUBLIC_PORT}" ]]; then LISTEN=5300; fi
-  # dnstt menolak (FORMERR) query yang mengiklankan payload EDNS di bawah MTU.
-  # 512 = ukuran DNS tanpa EDNS, jadi semua resolver dan aplikasi diterima.
+  # Batas ATAS ukuran respons DNS. Patch SC menerima query ber-buffer EDNS kecil
+  # dan mengepas tiap jawaban ke ukuran yang diiklankan query, jadi 1232 aman
+  # untuk semua app sekaligus memberi jawaban besar saat app mengizinkan.
   env_val SLOWDNS_MTU
   MTU="${REPLY//[^0-9]/}"
   if [[ -z "${MTU}" || ${#MTU} -gt 4 ]] || (( 10#${MTU} < 512 || 10#${MTU} > 1400 )); then
-    MTU=512
+    MTU=1232
   else
     MTU=$((10#${MTU}))
   fi
@@ -23493,7 +23507,7 @@ wanted_binary_id() {
   if [[ -n "$(env_get SLOWDNS_BIN_URL)" ]]; then
     printf 'sha256:%s' "$(env_get SLOWDNS_BIN_SHA256 | tr '[:upper:]' '[:lower:]')"
   else
-    printf '%s' "${DNSTT_VERSION}"
+    printf '%s+%s' "${DNSTT_VERSION}" "${DNSTT_PATCH_ID}"
   fi
 }
 
@@ -23583,14 +23597,134 @@ build_binary() {
     echo "Toolchain Go tidak bisa diunduh (cek koneksi VPS ke go.dev)." >&2
     return 1
   fi
-  say "Build dnstt-server ${DNSTT_VERSION} (2-6 menit di VPS 1 vCPU)..."
+  # Unduh source dnstt (versi dipin, zip diverifikasi checksum) lalu patch SC:
+  # record NULL, terima EDNS kecil, ukuran jawaban per-query, KCP cepat + window
+  # besar. Deps lain diverifikasi go.sum (ada di zip) + GOSUMDB saat build.
+  if ! command -v python3 >/dev/null 2>&1; then
+    rm -rf "${work}"
+    echo "python3 tidak ada; patch dnstt tidak bisa diterapkan." >&2
+    return 1
+  fi
+  local zurl moddir dlok=1
+  for zurl in "https://proxy.golang.org/${DNSTT_MODULE}/@v/${DNSTT_VERSION}.zip" \
+              "https://goproxy.io/${DNSTT_MODULE}/@v/${DNSTT_VERSION}.zip" \
+              "https://goproxy.cn/${DNSTT_MODULE}/@v/${DNSTT_VERSION}.zip"; do
+    rm -f "${work}/dnstt.zip"
+    curl -fsSL --connect-timeout 15 --max-time 300 --retry 2 -o "${work}/dnstt.zip" "${zurl}" || continue
+    if [[ "$(sha256sum "${work}/dnstt.zip" | awk '{ print $1 }')" == "${DNSTT_ZIP_SHA256}" ]]; then dlok=0; break; fi
+    echo "Checksum source dnstt dari ${zurl} tidak cocok; coba sumber lain." >&2
+  done
+  if (( dlok != 0 )); then
+    rm -rf "${work}"
+    echo "Source dnstt tidak bisa diunduh/diverifikasi (cek koneksi ke proxy.golang.org)." >&2
+    return 1
+  fi
+  moddir="${work}/${DNSTT_MODULE}@${DNSTT_VERSION}"
+  # Ekstrak zip (aman) lalu terapkan patch ke main.go + consts.go. Gagal di sini
+  # (mis. struktur source berubah) menggagalkan build, bukan menghasilkan binary
+  # upstream tanpa dukungan NULL.
+  if ! python3 - "${work}/dnstt.zip" "${work}" "${DNSTT_VERSION}" <<'SLOWDNS_PATCH_PY'
+import sys, io, os, zipfile
+zippath, dest, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+with zipfile.ZipFile(zippath) as z:
+    for n in z.namelist():
+        if n.startswith('/') or '..' in n.split('/'):
+            raise SystemExit('unsafe path in zip: ' + n)
+    z.extractall(dest)
+mod = os.path.join(dest, 'www.bamsoftware.com', 'git', 'dnstt.git@' + ver)
+mainpath = os.path.join(mod, 'dnstt-server', 'main.go')
+conspath = os.path.join(mod, 'turbotunnel', 'consts.go')
+src = io.open(mainpath, encoding='utf-8').read()
+orig = src
+def repl(old, new):
+    global src
+    if src.count(old) != 1:
+        raise SystemExit('anchor count %d != 1: %r' % (src.count(old), old[:50]))
+    src = src.replace(old, new)
+repl("\tresponseTTL = 60\n",
+     "\tresponseTTL = 60\n\n\t// rrTypeNULL (RFC 1035 3.3.10): raw bytes in RDATA, no character-string\n\t// chunking. Clients with record type NULL send QTYPE=NULL; answer in kind.\n\trrTypeNULL = 10\n")
+repl("\tif question.Type != dns.RRTypeTXT {\n\t\t// We only support QTYPE == TXT.\n",
+     "\tif question.Type != dns.RRTypeTXT && question.Type != rrTypeNULL {\n\t\t// We only support QTYPE == TXT or NULL.\n")
+repl(
+"\t// We require clients to support EDNS(0) with a minimum payload size;\n"
+"\t// otherwise we would have to set a small KCP MTU (only around 200\n"
+"\t// bytes). https://tools.ietf.org/html/rfc6891#section-7 \"If there is a\n"
+"\t// problem with processing the OPT record itself, such as an option\n"
+"\t// value that is badly formatted or that includes out-of-range values, a\n"
+"\t// FORMERR MUST be returned.\"\n"
+"\tif payloadSize < maxUDPPayload {\n"
+"\t\tresp.Flags |= dns.RcodeFormatError\n"
+"\t\tlog.Printf(\"FORMERR: requester payload size %d is too small (minimum %d)\", payloadSize, maxUDPPayload)\n"
+"\t\treturn resp, nil\n"
+"\t}\n",
+"\t// Accept any EDNS buffer (clamped to >= 512 above); KCP MTU floors at the\n"
+"\t// 512 minimum and sendLoop sizes each response to the requester's buffer.\n"
+"\t_ = payloadSize\n")
+repl("\t\t\trec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())\n",
+     "\t\t\tif rec.Resp.Answer[0].Type == rrTypeNULL {\n"
+     "\t\t\t\trec.Resp.Answer[0].Data = append([]byte(nil), payload.Bytes()...)\n"
+     "\t\t\t} else {\n"
+     "\t\t\t\trec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())\n"
+     "\t\t\t}\n")
+repl("\t\t\tlimit := maxEncodedPayload\n",
+     "\t\t\tlimit := maxPayloadForResponse(rec.Resp, rec.Size)\n")
+repl("type record struct {\n\tResp     *dns.Message\n\tAddr     net.Addr\n\tClientID turbotunnel.ClientID\n}\n",
+     "type record struct {\n\tResp     *dns.Message\n\tAddr     net.Addr\n\tClientID turbotunnel.ClientID\n\tSize     int\n}\n")
+repl("\t\tresp, payload := responseFor(&query, domain)\n",
+     "\t\tresp, payload := responseFor(&query, domain)\n\t\tsize := requesterPayloadSize(&query)\n")
+repl("\t\t\tcase ch <- &record{resp, addr, clientID}:\n",
+     "\t\t\tcase ch <- &record{resp, addr, clientID, size}:\n")
+repl("\tmaxEncodedPayload := computeMaxEncodedPayload(maxUDPPayload)\n\t// 2 bytes accounts for a packet length prefix.\n",
+     "\t// KCP segments must fit the smallest response (a requester at the 512-byte\n"
+     "\t// EDNS minimum), so the MTU floors at 512's capacity; larger requesters go\n"
+     "\t// faster because sendLoop packs several segments per response.\n"
+     "\tkcpLimit := maxUDPPayload\n\tif kcpLimit > 512 {\n\t\tkcpLimit = 512\n\t}\n"
+     "\tmaxEncodedPayload := computeMaxEncodedPayload(kcpLimit)\n\t// 2 bytes accounts for a packet length prefix.\n")
+repl("// sendLoop repeatedly receives records from ch. Those that represent an error\n",
+     "// requesterPayloadSize returns the requester's advertised EDNS UDP payload\n"
+     "// size, clamped to [512, maxUDPPayload].\n"
+     "func requesterPayloadSize(query *dns.Message) int {\n"
+     "\tsize := 512\n\tfor _, rr := range query.Additional {\n\t\tif rr.Type == dns.RRTypeOPT {\n"
+     "\t\t\tif int(rr.Class) > size {\n\t\t\t\tsize = int(rr.Class)\n\t\t\t}\n\t\t\tbreak\n\t\t}\n\t}\n"
+     "\tif size < 512 {\n\t\tsize = 512\n\t}\n\tif size > maxUDPPayload {\n\t\tsize = maxUDPPayload\n\t}\n\treturn size\n}\n\n"
+     "// maxPayloadForResponse returns the largest inner-payload length whose\n"
+     "// encoding in resp.Answer[0] keeps the message within sizeCap, for this\n"
+     "// response's actual name and record type.\n"
+     "func maxPayloadForResponse(resp *dns.Message, sizeCap int) int {\n"
+     "\tif len(resp.Answer) == 0 {\n\t\treturn 0\n\t}\n"
+     "\tsaved := resp.Answer[0].Data\n\tdefer func() { resp.Answer[0].Data = saved }()\n"
+     "\tisNull := resp.Answer[0].Type == rrTypeNULL\n\tlow, high := 0, sizeCap+1\n"
+     "\tfor low+1 < high {\n\t\tmid := (low + high) / 2\n"
+     "\t\tif isNull {\n\t\t\tresp.Answer[0].Data = make([]byte, mid)\n"
+     "\t\t} else {\n\t\t\tresp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))\n\t\t}\n"
+     "\t\tbuf, err := resp.WireFormat()\n"
+     "\t\tif err == nil && len(buf) <= sizeCap {\n\t\t\tlow = mid\n\t\t} else {\n\t\t\thigh = mid\n\t\t}\n"
+     "\t}\n\treturn low\n}\n\n"
+     "// sendLoop repeatedly receives records from ch. Those that represent an error\n")
+repl("\t\tconn.SetNoDelay(\n\t\t\t0, // default nodelay\n\t\t\t0, // default interval\n\t\t\t0, // default resend\n\t\t\t1, // nc=1 => congestion window off\n\t\t)\n",
+     "\t\tconn.SetNoDelay(\n\t\t\t1,  // nodelay on (fast flush)\n\t\t\t10, // 10ms flush interval\n\t\t\t2,  // fast resend after 2 dup-acks\n\t\t\t1,  // nc=1 => congestion window off\n\t\t)\n")
+if src == orig:
+    raise SystemExit('no change applied to main.go')
+io.open(mainpath, 'w', encoding='utf-8', newline='\n').write(src)
+cc = io.open(conspath, encoding='utf-8').read()
+if cc.count('const QueueSize = 128') != 1:
+    raise SystemExit('QueueSize anchor not found')
+cc = cc.replace('const QueueSize = 128', 'const QueueSize = 8192')
+io.open(conspath, 'w', encoding='utf-8', newline='\n').write(cc)
+SLOWDNS_PATCH_PY
+  then
+    rm -rf "${work}"
+    echo "Patch dnstt gagal diterapkan (struktur source berubah?)." >&2
+    return 1
+  fi
+  say "Build dnstt-server ${DNSTT_VERSION}+${DNSTT_PATCH_ID} (2-6 menit di VPS 1 vCPU)..."
   # -p=1 dan GOMAXPROCS=1 menahan RAM build; nice supaya tunnel tetap lancar.
   for proxy in "https://proxy.golang.org,direct" "https://goproxy.io,direct" "https://goproxy.cn,direct"; do
     if env HOME="${work}" GOTOOLCHAIN=local GOENV=off GOPATH="${work}/gopath" \
-        GOMODCACHE="${work}/gopath/pkg/mod" GOCACHE="${work}/cache" GOBIN="${work}/bin" \
+        GOMODCACHE="${work}/gopath/pkg/mod" GOCACHE="${work}/cache" \
         CGO_ENABLED=0 GOFLAGS="-modcacherw -p=1" GOMAXPROCS=1 GOPROXY="${proxy}" \
         GOSUMDB=sum.golang.org GONOSUMDB= GOPRIVATE= GOINSECURE= \
-        timeout 1800 nice -n 10 "${go_bin}" install -trimpath -ldflags="-s -w" "${DNSTT_PKG}@${DNSTT_VERSION}" \
+        bash -c 'cd "$1" && timeout 1800 nice -n 10 "$2" build -trimpath -ldflags="-s -w" -o "$3/bin/dnstt-server" ./dnstt-server' _ "${moddir}" "${go_bin}" "${work}" \
         > "${work}/build.log" 2>&1 && [[ -x "${work}/bin/dnstt-server" ]]; then
       rc=0
       break
@@ -23598,7 +23732,7 @@ build_binary() {
     echo "Build lewat ${proxy%%,*} gagal: $(tail -n 2 "${work}/build.log" 2>/dev/null | tr '\n' ' ')" >&2
   done
   if (( rc == 0 )); then
-    if ! binary_works "${work}/bin/dnstt-server" || ! install_binary "${work}/bin/dnstt-server" "${DNSTT_VERSION}"; then
+    if ! binary_works "${work}/bin/dnstt-server" || ! install_binary "${work}/bin/dnstt-server" "${DNSTT_VERSION}+${DNSTT_PATCH_ID}"; then
       echo "Binary hasil build tidak bisa dijalankan." >&2
       rc=1
     fi
@@ -32958,19 +33092,16 @@ slowdns_enable_menu() {
   local bin="$1" ns def_ns ans
   def_ns="${SLOWDNS_NS_DOMAIN:-}"
   [[ -n "${def_ns}" ]] || def_ns="$("${bin}" suggest 2>/dev/null || true)"
-  echo "Domain NS = subdomain khusus SlowDNS yang didelegasikan ke VPS ini."
-  echo "Pakai nama pendek dan jangan sama dengan domain utama (${DOMAIN:-})."
-  echo "Kosongkan untuk memakai usulan, ketik 'batal' untuk kembali."
+  echo "Domain NS = subdomain khusus yang didelegasikan ke VPS ini (jangan sama dengan ${DOMAIN:-domain utama})."
+  echo "Usulan: ${def_ns:-ns-...}. Kosongkan = pakai usulan, 'batal' = kembali."
   if ! prompt_input ns "Domain NS [${def_ns}]: "; then
     return 0
   fi
   [[ "${ns,,}" == "batal" ]] && return 0
   [[ -z "${ns}" ]] && ns="${def_ns}"
   if [[ ! -x /usr/local/lib/sc-1forcr/dnstt-server ]]; then
-    echo "Binary dnstt belum ada dan akan dibangun dari source resmi: 2-6 menit,"
-    echo "butuh sekitar 800 MB disk sementara. Layanan lain tetap jalan."
+    echo "Binary dnstt dibangun dari source resmi dulu: 2-6 menit, ~800 MB disk sementara. Layanan lain tetap jalan."
   fi
-  echo "Pemakaian SlowDNS: RAM sekitar 10-30 MB (batas 64M di VPS 1 GB), CPU hampir 0% saat sepi."
   if ! prompt_input ans "Lanjut aktifkan SlowDNS? [y/N]: "; then
     return 0
   fi
@@ -32992,11 +33123,9 @@ set_slowdns_menu() {
   draw_menu_header "SLOWDNS (DNS TUNNEL)"
   "${bin}" status | ui_fx
   echo
-  echo "SlowDNS membawa SSH lewat query DNS, jadi tetap bisa konek di jaringan yang"
-  echo "hanya membuka DNS. Kecepatannya rendah. Pengguna memakai akun SSH biasa;"
-  echo "aplikasi butuh NS, Pubkey, dan DNS dari detail akun."
-  echo "Syarat: record NS di DNS domain yang mengarah ke VPS ini (lihat menu 5)."
-  echo "Catatan: IP limit tidak bisa menghitung perangkat yang lewat resolver publik."
+  echo "SlowDNS = SSH lewat query DNS: tetap konek di jaringan yang cuma buka DNS."
+  echo "Syarat: buat record NS di DNS domain -> VPS ini (pilih menu 5 untuk panduannya)."
+  echo "Di app: pilih Type NULL, isi NS + Pubkey + DNS dari detail akun, akun SSH biasa."
   echo
   if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
     echo "1) Nonaktifkan SlowDNS"
@@ -37571,7 +37700,7 @@ update_script_from_repo() {
     SLOWDNS_ENABLE="${SLOWDNS_ENABLE:-0}" \
     SLOWDNS_NS_DOMAIN="${SLOWDNS_NS_DOMAIN:-}" \
     SLOWDNS_LISTEN_PORT="${SLOWDNS_LISTEN_PORT:-5300}" \
-    SLOWDNS_MTU="${SLOWDNS_MTU:-512}" \
+    SLOWDNS_MTU="${SLOWDNS_MTU:-1232}" \
     SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}" \
     SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}" \
     SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}" \

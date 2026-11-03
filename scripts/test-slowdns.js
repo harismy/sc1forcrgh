@@ -52,7 +52,9 @@ const toBashPath = (p) => (process.platform === 'win32'
 
 const helper = extract(installer, "cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'\n", '\nSLOWDNS_EOF\n');
 const DNSTT_VERSION = (helper.match(/^DNSTT_VERSION="([^"]+)"/m) || [])[1];
-assert(DNSTT_VERSION, 'DNSTT_VERSION dipin di helper');
+const DNSTT_PATCH_ID = (helper.match(/^DNSTT_PATCH_ID="([^"]+)"/m) || [])[1];
+const DNSTT_ZIP_SHA256 = (helper.match(/^DNSTT_ZIP_SHA256="([0-9a-f]{64})"/m) || [])[1];
+assert(DNSTT_VERSION && DNSTT_PATCH_ID && DNSTT_ZIP_SHA256, 'DNSTT_VERSION, DNSTT_PATCH_ID, dan DNSTT_ZIP_SHA256 dipin di helper');
 
 // ── Isi statis ──────────────────────────────────────────────────────────────
 assert(/^GO_SHA256_AMD64="[0-9a-f]{64}"$/m.test(helper) && /^GO_SHA256_ARM64="[0-9a-f]{64}"$/m.test(helper),
@@ -65,6 +67,23 @@ assert(helper.includes('BUILD_ROOT="${SLOWDNS_BUILD_ROOT:-/var/tmp}"'),
   'build di /var/tmp (disk), bukan /tmp yang bisa tmpfs di VPS 1 GB');
 assert(/rm -rf "\$\{work\}"\n  return "\$\{rc\}"/.test(helper), 'folder build selalu dihapus');
 assert(helper.includes('SLOWDNS_BIN_SHA256 (64 hex) wajib diisi'), 'binary dari URL wajib checksum');
+
+// ── Build dari source yang di-patch (bukan go install upstream) ──────────────
+const buildFn = extract(helper, '\nbuild_binary() {', '\n  return "${rc}"\n}\n');
+assert(buildFn.includes('${DNSTT_MODULE}/@v/${DNSTT_VERSION}.zip') && buildFn.includes('${DNSTT_ZIP_SHA256}'),
+  'build mengunduh zip source yang dipin dan memverifikasi checksum-nya');
+assert(!buildFn.includes('go install') && /go_bin.*build -trimpath.*dnstt-server|build -trimpath[\s\S]*\.\/dnstt-server/.test(buildFn),
+  'build memakai go build atas source yang sudah dipatch, bukan go install upstream');
+assert(buildFn.includes('${DNSTT_VERSION}+${DNSTT_PATCH_ID}'), 'identitas binary menyertakan penanda patch');
+const patchPy = extract(buildFn, "<<'SLOWDNS_PATCH_PY'\n", '\nSLOWDNS_PATCH_PY\n');
+assert(patchPy.includes('rrTypeNULL = 10') && patchPy.includes('question.Type != rrTypeNULL'),
+  'patch menambah dukungan record NULL');
+assert(patchPy.includes('maxPayloadForResponse') && patchPy.includes('requesterPayloadSize') && patchPy.includes('_ = payloadSize'),
+  'patch: ukuran jawaban per-query + buang FORMERR minimum');
+assert(patchPy.includes('nodelay on (fast flush)') && patchPy.includes("const QueueSize = 8192"),
+  'patch: KCP mode cepat + window besar');
+assert(/wanted_binary_id\(\)[\s\S]*\$\{DNSTT_VERSION\}\+%s|printf '%s\+%s' "\$\{DNSTT_VERSION\}" "\$\{DNSTT_PATCH_ID\}"/.test(helper),
+  'wanted_binary_id memakai versi+patch sehingga VPS lama rebuild');
 const applyFn = extract(helper, '\ncmd_apply() {', '\n}\n');
 assert(!/systemctl\s+(restart|start|stop|enable|disable|daemon-reload)/.test(applyFn) &&
   !/cmd_setup|ensure_binary/.test(applyFn), 'apply (watchdog) tidak boleh mengubah systemd atau build');
@@ -230,7 +249,7 @@ function installFakeDnstt() {
   fs.mkdirSync(path.dirname(dnsttBin), { recursive: true });
   fs.writeFileSync(dnsttBin, fakeDnstt);
   fs.chmodSync(dnsttBin, 0o755);
-  fs.writeFileSync(`${dnsttBin}.version`, `${DNSTT_VERSION}\n`);
+  fs.writeFileSync(`${dnsttBin}.version`, `${DNSTT_VERSION}+${DNSTT_PATCH_ID}\n`);
 }
 
 function setEnv(values) {
@@ -300,9 +319,9 @@ try {
   assert.strictEqual(r.status, 0, r.out);
   const unit = fs.readFileSync(unitFile, 'utf8');
   for (const want of [
-    'User=sc-1forcr-slowdns', 'Group=sc-1forcr-slowdns', 'MemoryMax=64M', 'Environment=GOMEMLIMIT=48MiB',
+    'User=sc-1forcr-slowdns', 'Group=sc-1forcr-slowdns', 'MemoryMax=128M', 'Environment=GOMEMLIMIT=96MiB',
     'NoNewPrivileges=yes', 'ProtectSystem=strict', 'Restart=always', 'TasksMax=64',
-    ' -udp :5300 -privkey-file ', ' -mtu 512 ns-sg1.contoh.net 127.0.0.1:109'
+    ' -udp :5300 -privkey-file ', ' -mtu 1232 ns-sg1.contoh.net 127.0.0.1:109'
   ]) assert(unit.includes(want), `unit wajib memuat ${want}:\n${unit}`);
   assert(!/^User=root|Group=sc-1forcr-tunnel/m.test(unit), 'dnstt tidak jalan sebagai root atau grup tunnel');
   assert(/^0{63}1$/.test(fs.readFileSync(path.join(keyDir, 'server.key'), 'utf8').trim()), 'kunci server dibuat');
@@ -390,7 +409,7 @@ try {
   assert.strictEqual(envValue('SLOWDNS_NS_DOMAIN'), 'NS-SG1.Contoh.NET.', 'input salah tidak menyentuh env');
   r = run('set-ns', 'dns.contoh.net');
   assert.strictEqual(r.status, 0, r.out);
-  assert(fs.readFileSync(unitFile, 'utf8').includes(' -mtu 512 dns.contoh.net 127.0.0.1:109'));
+  assert(fs.readFileSync(unitFile, 'utf8').includes(' -mtu 1232 dns.contoh.net 127.0.0.1:109'));
   assert(mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'), 'NS baru me-restart service');
   assert(/NS  dns\.contoh\.net  ->  sg1\.contoh\.net/.test(r.out), `record NS ditampilkan:\n${r.out}`);
   // Setup gagal (service tidak mau start) saat set-ns: NS lama dipulihkan.

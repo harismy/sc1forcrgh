@@ -210,7 +210,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.113}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.114}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23909,6 +23909,15 @@ input_spec() {
   printf -- '-p udp -m udp --dport %s -m comment --comment %s -j ACCEPT' "${LISTEN}" "${TAG}"
 }
 
+# Balasan dnstt keluar dari port listen. Service jalan non-root, jadi balasannya
+# bisa kena chain OUTPUT lain (penghitung kuota SC_1FORCR_QUOTA_OUT, rule owner,
+# atau DROP non-SC) -> "sendto: operation not permitted" -> jawaban DNS hilang ->
+# throughput anjlok. Rule ini meloloskannya lebih dulu. PotatoNC tidak kena ini
+# karena jalan sebagai root; SC sengaja non-root demi keamanan.
+output_spec() {
+  printf -- '-p udp -m udp --sport %s -m comment --comment %s -j ACCEPT' "${LISTEN}" "${TAG}"
+}
+
 remove_input_rules() {
   local tool="$1" keep="${2:-}" line
   while IFS= read -r line; do
@@ -23916,6 +23925,15 @@ remove_input_rules() {
     # shellcheck disable=SC2086
     if "${tool}" -w 10 -D ${line#-A } >/dev/null 2>&1; then RULES_CHANGED=1; fi
   done < <("${tool}" -w 10 -S INPUT 2>/dev/null)
+}
+
+remove_output_rules() {
+  local tool="$1" keep="${2:-}" line
+  while IFS= read -r line; do
+    [[ "${line}" == "-A OUTPUT "*" ${TAG} "* && "${line}" != "${keep}" ]] || continue
+    # shellcheck disable=SC2086
+    if "${tool}" -w 10 -D ${line#-A } >/dev/null 2>&1; then RULES_CHANGED=1; fi
+  done < <("${tool}" -w 10 -S OUTPUT 2>/dev/null)
 }
 
 # 0 = aturan lengkap terpasang, 1 = gagal. RULES_CHANGED=1 kalau ada yang ditulis.
@@ -23928,6 +23946,14 @@ apply_tool() {
   if ! "${tool}" -w 10 -C INPUT $(input_spec) >/dev/null 2>&1; then
     # shellcheck disable=SC2046
     "${tool}" -w 10 -I INPUT $(input_spec) >/dev/null 2>&1 || return 1
+    RULES_CHANGED=1
+  fi
+  # Loloskan balasan dnstt di puncak OUTPUT, sebelum penghitung kuota / drop lain.
+  remove_output_rules "${tool}" "-A OUTPUT $(output_spec)"
+  # shellcheck disable=SC2046
+  if ! "${tool}" -w 10 -C OUTPUT $(output_spec) >/dev/null 2>&1; then
+    # shellcheck disable=SC2046
+    "${tool}" -w 10 -I OUTPUT 1 $(output_spec) >/dev/null 2>&1 || return 1
     RULES_CHANGED=1
   fi
   if ! "${tool}" -w 10 -t nat -S "${CHAIN}" >/dev/null 2>&1; then
@@ -23961,6 +23987,7 @@ clear_tool() {
     RULES_CHANGED=1
   fi
   remove_input_rules "${tool}"
+  remove_output_rules "${tool}"
 }
 
 ip6_nat_usable() {

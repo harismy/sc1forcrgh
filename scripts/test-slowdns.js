@@ -342,6 +342,9 @@ try {
     `jump SlowDNS di depan DNAT 1:65535 UDP Custom:\n${nat.join('\n')}`);
   assert(nat.includes('SC1FORCR_SLOWDNS -p udp -m udp --dport 53 -m comment --comment sc-slowdns -j REDIRECT --to-ports 5300'));
   assert(rules(4, 'filter').includes('INPUT -p udp -m udp --dport 5300 -m comment --comment sc-slowdns -j ACCEPT'));
+  // Balasan dnstt harus lolos di OUTPUT (service non-root bisa kena chain lain).
+  assert(rules(4, 'filter').includes('OUTPUT -p udp -m udp --sport 5300 -m comment --comment sc-slowdns -j ACCEPT'),
+    `OUTPUT ACCEPT balasan dnstt:\n${rules(4, 'filter').join('\n')}`);
   assert.strictEqual(rules(6, 'nat').length, 0, 'tanpa IPv6 global: ip6tables tidak disentuh');
   assert(read('persist').includes('save'), 'aturan baru disimpan netfilter-persistent');
 

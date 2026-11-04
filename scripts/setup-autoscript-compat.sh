@@ -210,7 +210,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.114}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.115}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -275,6 +275,7 @@ SLOWDNS_NS_DOMAIN="${SLOWDNS_NS_DOMAIN:-}"
 SLOWDNS_LISTEN_PORT="${SLOWDNS_LISTEN_PORT:-5300}"
 SLOWDNS_MTU="${SLOWDNS_MTU:-1232}"
 SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}"
+SLOWDNS_KCP_WINDOW="${SLOWDNS_KCP_WINDOW:-auto}"
 SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}"
 SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}"
 BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}"
@@ -23290,7 +23291,7 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # VPS lama rebuild. sc-fast1: terima QTYPE=NULL (record NULL, app HTTP Custom
 # dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
 # plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
-DNSTT_PATCH_ID="sc-fast1"
+DNSTT_PATCH_ID="sc-fast2"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -23468,6 +23469,29 @@ go_mem_limit() {
   printf '%sMiB' "$(( mib * 3 / 4 ))"
 }
 
+# Window KCP per sesi (jumlah paket). MTU per sesi bisa besar (sampai ~932 di
+# -mtu 1232), dan buffer per sesi ~ window x MTU, jadi window dibatasi per tier
+# supaya RAM aman saat banyak user di VPS kecil. 1 GB lebih kecil, VPS besar
+# lebih lega. Override lewat SLOWDNS_KCP_WINDOW (128..16384); binary meng-clamp
+# ke rentang itu dan jatuh ke 4096 kalau env tak valid.
+kcp_window() {
+  local raw ram_kb cores
+  raw="$(env_get SLOWDNS_KCP_WINDOW | tr -cd '0-9')"
+  if [[ -n "${raw}" ]] && (( 10#${raw} >= 128 && 10#${raw} <= 16384 )); then
+    printf '%s' "$((10#${raw}))"
+    return 0
+  fi
+  ram_kb="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || echo 0)"
+  cores="$(nproc 2>/dev/null || echo 1)"
+  if (( ${ram_kb:-0} >= 3600000 && ${cores:-1} >= 4 )); then
+    printf '4096'
+  elif (( ${ram_kb:-0} >= 1800000 && ${cores:-1} >= 2 )); then
+    printf '3072'
+  else
+    printf '2048'
+  fi
+}
+
 load_config() {
   ENABLED=0
   env_val SLOWDNS_ENABLE
@@ -23489,6 +23513,11 @@ load_config() {
   else
     MTU=$((10#${MTU}))
   fi
+  # 512 adalah default lama V.1FSC.111 yang memaksa semua sesi ke MTU 215 dan
+  # mencekik app ber-buffer EDNS besar (mis. HTTP Custom yang mengiklankan 1232).
+  # 1232 aman untuk semua: app kecil tetap dilayani di MTU-nya sendiri per sesi.
+  # Jadi nilai lama 512 dinaikkan otomatis saat update (env lama tidak ikut naik).
+  if (( MTU == 512 )); then MTU=1232; fi
   env_val DROPBEAR_PORT
   port_or "${REPLY}" 109
   TARGET_PORT="${REPLY}"
@@ -23710,6 +23739,131 @@ repl("// sendLoop repeatedly receives records from ch. Those that represent an e
      "// sendLoop repeatedly receives records from ch. Those that represent an error\n")
 repl("\t\tconn.SetNoDelay(\n\t\t\t0, // default nodelay\n\t\t\t0, // default interval\n\t\t\t0, // default resend\n\t\t\t1, // nc=1 => congestion window off\n\t\t)\n",
      "\t\tconn.SetNoDelay(\n\t\t\t1,  // nodelay on (fast flush)\n\t\t\t10, // 10ms flush interval\n\t\t\t2,  // fast resend after 2 dup-acks\n\t\t\t1,  // nc=1 => congestion window off\n\t\t)\n")
+# --- sc-fast2: MTU KCP per sesi (ukuran segmen sesuai buffer EDNS tiap
+# klien) + window KCP dari env SLOWDNS_KCP_WINDOW. Dipakai di atas sc-fast1.
+# F2-A: clientEdns map + helpers + kcpWindow, and widen acceptSessions signature.
+repl(
+    "// acceptSessions listens for incoming KCP connections and passes them to\n"
+    "// acceptStreams.\n"
+    "func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) error {\n",
+    "// clientEdns records the EDNS UDP payload size each tunnel client advertised,\n"
+    "// keyed by ClientID (turbotunnel also uses ClientID as the KCP remote address).\n"
+    "// acceptSessions reads it to pick a per-session KCP MTU: a client that\n"
+    "// advertised a large buffer gets large, fast segments, while a small-buffer\n"
+    "// client still gets one segment per DNS response. Entries drop when the\n"
+    "// session ends, and the map is capped so query floods cannot grow it forever.\n"
+    "var (\n"
+    "\tclientEdnsMu sync.Mutex\n"
+    "\tclientEdns   = make(map[turbotunnel.ClientID]int)\n"
+    ")\n\n"
+    "const clientEdnsMax = 8192\n\n"
+    "func clientEdnsRecord(cid turbotunnel.ClientID, size int) {\n"
+    "\tclientEdnsMu.Lock()\n"
+    "\tif cur, ok := clientEdns[cid]; ok {\n"
+    "\t\tif size > cur {\n"
+    "\t\t\tclientEdns[cid] = size\n"
+    "\t\t}\n"
+    "\t} else if len(clientEdns) < clientEdnsMax {\n"
+    "\t\tclientEdns[cid] = size\n"
+    "\t}\n"
+    "\tclientEdnsMu.Unlock()\n"
+    "}\n\n"
+    "func clientEdnsSize(cid turbotunnel.ClientID) int {\n"
+    "\tclientEdnsMu.Lock()\n"
+    "\tn := clientEdns[cid]\n"
+    "\tclientEdnsMu.Unlock()\n"
+    "\treturn n\n"
+    "}\n\n"
+    "func clientEdnsForget(cid turbotunnel.ClientID) {\n"
+    "\tclientEdnsMu.Lock()\n"
+    "\tdelete(clientEdns, cid)\n"
+    "\tclientEdnsMu.Unlock()\n"
+    "}\n\n"
+    "// kcpWindow is the KCP window (in packets) per session. It defaults to the\n"
+    "// turbotunnel queue half-depth but can be lowered on a small VPS via the\n"
+    "// SLOWDNS_KCP_WINDOW env var, so a larger per-session MTU does not multiply\n"
+    "// RAM when many clients connect at once.\n"
+    "func kcpWindow() int {\n"
+    "\tif s := os.Getenv(\"SLOWDNS_KCP_WINDOW\"); s != \"\" {\n"
+    "\t\tvar n int\n"
+    "\t\tif _, err := fmt.Sscanf(s, \"%d\", &n); err == nil && n >= 128 && n <= 16384 {\n"
+    "\t\t\treturn n\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\treturn turbotunnel.QueueSize / 2\n"
+    "}\n\n"
+    "// acceptSessions listens for incoming KCP connections and passes them to\n"
+    "// acceptStreams. mtu is the fallback (512-floor) MTU for a client we have not\n"
+    "// seen a query from yet; mtuCeil caps the per-session MTU chosen from each\n"
+    "// client's advertised EDNS buffer.\n"
+    "func acceptSessions(ln *kcp.Listener, privkey []byte, mtu, mtuCeil int, upstream string) error {\n")
+
+# F2-B: per-session window + MTU (sized to the client's advertised EDNS buffer).
+repl(
+    "\t\tconn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)\n"
+    "\t\tif rc := conn.SetMtu(mtu); !rc {\n"
+    "\t\t\tpanic(rc)\n"
+    "\t\t}\n",
+    "\t\t// Per-session window (tunable) and MTU. The MTU is sized to the EDNS\n"
+    "\t\t// buffer this client advertised, so capable clients get large segments.\n"
+    "\t\twin := kcpWindow()\n"
+    "\t\tconn.SetWindowSize(win, win)\n"
+    "\t\tpermtu := mtu\n"
+    "\t\tedns := 0\n"
+    "\t\tif cid, ok := conn.RemoteAddr().(turbotunnel.ClientID); ok {\n"
+    "\t\t\tedns = clientEdnsSize(cid)\n"
+    "\t\t\tif edns > 0 {\n"
+    "\t\t\t\tif cand := computeMaxEncodedPayload(edns) - 2; cand > permtu {\n"
+    "\t\t\t\t\tpermtu = cand\n"
+    "\t\t\t\t}\n"
+    "\t\t\t}\n"
+    "\t\t}\n"
+    "\t\tif permtu > mtuCeil {\n"
+    "\t\t\tpermtu = mtuCeil\n"
+    "\t\t}\n"
+    "\t\tif rc := conn.SetMtu(permtu); !rc {\n"
+    "\t\t\tpanic(rc)\n"
+    "\t\t}\n"
+    "\t\tlog.Printf(\"session %08x edns %d mtu %d win %d\", conn.GetConv(), edns, permtu, win)\n")
+
+# F2-C: forget the client's EDNS entry when its session ends (bounds the map).
+repl(
+    "\t\t\tdefer func() {\n"
+    "\t\t\t\tlog.Printf(\"end session %08x\", conn.GetConv())\n"
+    "\t\t\t\tconn.Close()\n"
+    "\t\t\t}()\n",
+    "\t\t\tdefer func() {\n"
+    "\t\t\t\tlog.Printf(\"end session %08x\", conn.GetConv())\n"
+    "\t\t\t\tif cid, ok := conn.RemoteAddr().(turbotunnel.ClientID); ok {\n"
+    "\t\t\t\t\tclientEdnsForget(cid)\n"
+    "\t\t\t\t}\n"
+    "\t\t\t\tconn.Close()\n"
+    "\t\t\t}()\n")
+
+# F2-D: compute the per-session MTU ceiling in run() (full maxUDPPayload capacity).
+repl(
+    "\tmaxEncodedPayload := computeMaxEncodedPayload(kcpLimit)\n"
+    "\t// 2 bytes accounts for a packet length prefix.\n"
+    "\tmtu := maxEncodedPayload - 2\n",
+    "\tmaxEncodedPayload := computeMaxEncodedPayload(kcpLimit)\n"
+    "\t// 2 bytes accounts for a packet length prefix.\n"
+    "\tmtu := maxEncodedPayload - 2\n"
+    "\t// mtuCeil is the largest MTU any requester could support (full\n"
+    "\t// maxUDPPayload), used to cap the per-session MTU in acceptSessions.\n"
+    "\tmtuCeil := computeMaxEncodedPayload(maxUDPPayload) - 2\n")
+
+# F2-E: pass the ceiling to acceptSessions.
+repl(
+    "\t\terr := acceptSessions(ln, privkey, mtu, upstream)\n",
+    "\t\terr := acceptSessions(ln, privkey, mtu, mtuCeil, upstream)\n")
+
+# F2-F: record each client's advertised EDNS size as its packets arrive.
+repl(
+    "\t\tif n == len(clientID) {\n"
+    "\t\t\t// Discard padding and pull out the packets contained in\n",
+    "\t\tif n == len(clientID) {\n"
+    "\t\t\tclientEdnsRecord(clientID, size)\n"
+    "\t\t\t// Discard padding and pull out the packets contained in\n")
 if src == orig:
     raise SystemExit('no change applied to main.go')
 io.open(mainpath, 'w', encoding='utf-8', newline='\n').write(src)
@@ -23817,6 +23971,7 @@ ExecStart=${BIN} -udp :${LISTEN} -privkey-file ${KEY_DIR}/server.key -mtu ${MTU}
 Restart=always
 RestartSec=3
 Environment=GOMEMLIMIT=$(go_mem_limit "${mem}")
+Environment=SLOWDNS_KCP_WINDOW=$(kcp_window)
 MemoryMax=${mem}
 TasksMax=64
 LimitNOFILE=8192
@@ -28076,6 +28231,7 @@ SLOWDNS_NS_DOMAIN=${SLOWDNS_NS_DOMAIN}
 SLOWDNS_LISTEN_PORT=${SLOWDNS_LISTEN_PORT}
 SLOWDNS_MTU=${SLOWDNS_MTU}
 SLOWDNS_MEMORY_MAX=${SLOWDNS_MEMORY_MAX}
+SLOWDNS_KCP_WINDOW=${SLOWDNS_KCP_WINDOW}
 SLOWDNS_BIN_URL=${SLOWDNS_BIN_URL}
 SLOWDNS_BIN_SHA256=${SLOWDNS_BIN_SHA256}
 BOT_ACCOUNT_EVENT_WEBHOOK_URL=${BOT_ACCOUNT_EVENT_WEBHOOK_URL}
@@ -37736,6 +37892,7 @@ update_script_from_repo() {
     SLOWDNS_LISTEN_PORT="${SLOWDNS_LISTEN_PORT:-5300}" \
     SLOWDNS_MTU="${SLOWDNS_MTU:-1232}" \
     SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}" \
+    SLOWDNS_KCP_WINDOW="${SLOWDNS_KCP_WINDOW:-auto}" \
     SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}" \
     SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
@@ -40661,7 +40818,7 @@ persist_pending_install_env() {
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
-    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
+    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE

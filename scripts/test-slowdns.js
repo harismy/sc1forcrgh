@@ -82,6 +82,15 @@ assert(patchPy.includes('maxPayloadForResponse') && patchPy.includes('requesterP
   'patch: ukuran jawaban per-query + buang FORMERR minimum');
 assert(patchPy.includes('nodelay on (fast flush)') && patchPy.includes("const QueueSize = 8192"),
   'patch: KCP mode cepat + window besar');
+assert(patchPy.includes('clientEdnsRecord') && patchPy.includes('func kcpWindow()') &&
+  patchPy.includes('session %08x edns %d mtu %d win %d') && patchPy.includes('mtuCeil'),
+  'patch sc-fast2: MTU KCP per sesi (sesuai buffer EDNS tiap klien)');
+assert(patchPy.includes('os.Getenv') && patchPy.includes('SLOWDNS_KCP_WINDOW'),
+  'patch sc-fast2: window KCP tunable lewat env SLOWDNS_KCP_WINDOW');
+assert(/if \(\( MTU == 512 \)\); then MTU=1232; fi/.test(helper),
+  'helper menaikkan SLOWDNS_MTU lama 512 ke 1232 (hindari choke app buffer besar)');
+assert(/^kcp_window\(\) \{/m.test(helper) && helper.includes('Environment=SLOWDNS_KCP_WINDOW=$(kcp_window)'),
+  'unit SlowDNS menyetel SLOWDNS_KCP_WINDOW per tier lewat kcp_window()');
 assert(/wanted_binary_id\(\)[\s\S]*\$\{DNSTT_VERSION\}\+%s|printf '%s\+%s' "\$\{DNSTT_VERSION\}" "\$\{DNSTT_PATCH_ID\}"/.test(helper),
   'wanted_binary_id memakai versi+patch sehingga VPS lama rebuild');
 const applyFn = extract(helper, '\ncmd_apply() {', '\n}\n');
@@ -323,6 +332,7 @@ try {
     'NoNewPrivileges=yes', 'ProtectSystem=strict', 'Restart=always', 'TasksMax=64',
     ' -udp :5300 -privkey-file ', ' -mtu 1232 ns-sg1.contoh.net 127.0.0.1:109'
   ]) assert(unit.includes(want), `unit wajib memuat ${want}:\n${unit}`);
+  assert(/Environment=SLOWDNS_KCP_WINDOW=\d+/.test(unit), `unit menyetel window KCP per tier:\n${unit}`);
   assert(!/^User=root|Group=sc-1forcr-tunnel/m.test(unit), 'dnstt tidak jalan sebagai root atau grup tunnel');
   assert(/^0{63}1$/.test(fs.readFileSync(path.join(keyDir, 'server.key'), 'utf8').trim()), 'kunci server dibuat');
   let s = state();

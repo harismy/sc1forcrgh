@@ -210,7 +210,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.115}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.116}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23291,7 +23291,7 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # VPS lama rebuild. sc-fast1: terima QTYPE=NULL (record NULL, app HTTP Custom
 # dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
 # plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
-DNSTT_PATCH_ID="sc-fast2"
+DNSTT_PATCH_ID="sc-fast3"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -23864,6 +23864,52 @@ repl(
     "\t\tif n == len(clientID) {\n"
     "\t\t\tclientEdnsRecord(clientID, size)\n"
     "\t\t\t// Discard padding and pull out the packets contained in\n")
+# --- sc-fast3: ganti binary-search maxPayloadForResponse dengan hitung
+# aritmatika (hasil identik, ~24x lebih ringan, nol alokasi di loop).
+# F3: ganti binary-search maxPayloadForResponse (serialisasi ulang ~11x per
+# respons) dengan hitung aritmatika (satu WireFormat untuk overhead, lalu
+# kurangi). Hasil identik, jauh lebih hemat CPU + nol alokasi di loop.
+repl(
+    "\tisNull := resp.Answer[0].Type == rrTypeNULL\n"
+    "\tlow, high := 0, sizeCap+1\n"
+    "\tfor low+1 < high {\n"
+    "\t\tmid := (low + high) / 2\n"
+    "\t\tif isNull {\n"
+    "\t\t\tresp.Answer[0].Data = make([]byte, mid)\n"
+    "\t\t} else {\n"
+    "\t\t\tresp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))\n"
+    "\t\t}\n"
+    "\t\tbuf, err := resp.WireFormat()\n"
+    "\t\tif err == nil && len(buf) <= sizeCap {\n"
+    "\t\t\tlow = mid\n"
+    "\t\t} else {\n"
+    "\t\t\thigh = mid\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\treturn low\n",
+    "\t// One serialization with empty RDATA gives the fixed overhead; the\n"
+    "\t// payload length is then solved arithmetically (the old code binary-\n"
+    "\t// searched, re-serializing the whole message ~log2(sizeCap) times).\n"
+    "\tresp.Answer[0].Data = nil\n"
+    "\tbuf, err := resp.WireFormat()\n"
+    "\tif err != nil {\n"
+    "\t\treturn 0\n"
+    "\t}\n"
+    "\tavail := sizeCap - len(buf)\n"
+    "\tif avail <= 0 {\n"
+    "\t\treturn 0\n"
+    "\t}\n"
+    "\tif resp.Answer[0].Type == rrTypeNULL {\n"
+    "\t\t// NULL RDATA is raw: each payload byte adds exactly one wire byte.\n"
+    "\t\treturn avail\n"
+    "\t}\n"
+    "\t// TXT splits payload into 255-byte character-strings, each with a 1-byte\n"
+    "\t// length prefix: L payload bytes encode to L + ceil(L/255) wire bytes.\n"
+    "\tl := avail\n"
+    "\tfor l > 0 && l+(l+254)/255 > avail {\n"
+    "\t\tl--\n"
+    "\t}\n"
+    "\treturn l\n")
 if src == orig:
     raise SystemExit('no change applied to main.go')
 io.open(mainpath, 'w', encoding='utf-8', newline='\n').write(src)

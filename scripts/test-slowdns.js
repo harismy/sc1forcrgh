@@ -87,6 +87,8 @@ assert(patchPy.includes('clientEdnsRecord') && patchPy.includes('func kcpWindow(
   'patch sc-fast2: MTU KCP per sesi (sesuai buffer EDNS tiap klien)');
 assert(patchPy.includes('os.Getenv') && patchPy.includes('SLOWDNS_KCP_WINDOW'),
   'patch sc-fast2: window KCP tunable lewat env SLOWDNS_KCP_WINDOW');
+assert(patchPy.includes('avail := sizeCap - len(buf)') && patchPy.includes('l+(l+254)/255'),
+  'patch sc-fast3: maxPayloadForResponse aritmatika (ganti binary-search per respons)');
 assert(/if \(\( MTU == 512 \)\); then MTU=1232; fi/.test(helper),
   'helper menaikkan SLOWDNS_MTU lama 512 ke 1232 (hindari choke app buffer besar)');
 assert(/^kcp_window\(\) \{/m.test(helper) && helper.includes('Environment=SLOWDNS_KCP_WINDOW=$(kcp_window)'),

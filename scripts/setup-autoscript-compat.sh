@@ -210,7 +210,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.117}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.118}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23494,10 +23494,11 @@ kcp_window() {
   fi
 }
 
-# GOMAXPROCS: dnstt I/O-bound (crypto/KCP <1% CPU; beban nyata = context-switch).
-# Di VPS banyak core, scheduler Go memantul thread antar-core dan itu dominan di
-# profil. Batasi ke min(core,2) supaya churn hilang tanpa membatasi throughput
-# SlowDNS (1 core sanggup puluhan Mbps). Override lewat SLOWDNS_GOMAXPROCS.
+# GOMAXPROCS: default = SEMUA core (perilaku bawaan Go). Membatasi ke sedikit core
+# memang menurunkan overhead context-switch, TAPI terbukti di lapangan (V.1FSC.117)
+# menurunkan throughput SlowDNS saat rame di VPS multi-core (speed prioritas utama).
+# Jadi tidak di-cap by default; cap hanya opt-in lewat SLOWDNS_GOMAXPROCS buat yang
+# mau menukar speed dengan CPU.
 go_maxprocs() {
   local raw cores
   raw="$(env_get SLOWDNS_GOMAXPROCS | tr -cd '0-9')"
@@ -23506,7 +23507,8 @@ go_maxprocs() {
     return 0
   fi
   cores="$(nproc 2>/dev/null || echo 1)"
-  if (( ${cores:-1} < 2 )); then printf '1'; else printf '2'; fi
+  (( ${cores:-1} < 1 )) && cores=1
+  printf '%s' "${cores}"
 }
 
 # GOGC lebih tinggi dari default 100: GC lebih jarang -> CPU dan context-switch

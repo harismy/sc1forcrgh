@@ -66,3 +66,49 @@ try {
 } finally {
   fs.rmSync(path.dirname(tmp), { recursive: true, force: true });
 }
+
+// Format MakhlukTunnel/Noobz (v4.x): .db hanya "### user tanggal jam", credential di JSON per-akun.
+const mtZip = buildStoredZip({
+  'backup/config.json': JSON.stringify({ version: 'v4.1', data: { domain: 'x.my.id' } }),
+  'backup/ssh/.ssh.db': '### tess 2026-11-06 06:36:56\n',
+  'backup/ssh/tess.json': JSON.stringify({ username: 'tess', pass: 'rahasia123', quota: 50, iplim: 2, status: 'unlocked', exp_date: '2026-11-06 06:36:56' }),
+  'backup/vless/.vless.db': '### Adfal 2026-11-10 10:53:18\n### Dewi 2026-11-21 10:53:20\n',
+  'backup/vless/Adfal.json': JSON.stringify({ username: 'Adfal', uuid: 'c4be398c-bf21-4f2a-b4eb-724ef7599625', quota: 50, iplim: 2, types: 'ws', status: 'unlocked', exp_date: '2026-11-10 10:53:18' }),
+  'backup/vless/Dewi.json': JSON.stringify({ username: 'Dewi', uuid: '3e5e7e9a-f8e2-406e-98c7-d655a7c0b185', quota: 100, iplim: 3, types: 'ws', status: 'unlocked', exp_date: '2026-11-21 10:53:20' }),
+  'backup/vless/archived/abbas.json': JSON.stringify({ username: 'abbas', uuid: '8cd49119-5c37-4db0-922c-b0523980cd8d', quota: 40, iplim: 2, status: 'unlocked', exp_date: '2027-11-02 10:53:18' }),
+  'backup/trojan/.trojan.db': '### imam 2026-12-01 10:53:36\n',
+  'backup/trojan/imam.json': JSON.stringify({ username: 'imam', uuid: 'ac1d3c08-6e85-42db-87b5-a33ed4d42617', quota: 100, iplim: 2, types: 'ws', status: 'unlocked', exp_date: '2026-12-01 10:53:36' }),
+  'backup/vmess/.vmess.db': ''
+});
+
+const mtTmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sc-foreign-mt-')), 'backup.zip');
+fs.writeFileSync(mtTmp, mtZip);
+try {
+  const { data, summary } = parseForeignBackupArchive(mtTmp);
+
+  assert.strictEqual(data.ssh.length, 1, 'MT ssh: 1 akun');
+  assert.strictEqual(data.ssh[0].username, 'tess');
+  assert.strictEqual(data.ssh[0].password, 'rahasia123', 'MT ssh: password asli dari JSON, bukan default');
+  assert.strictEqual(data.ssh[0].quota, 50);
+  assert.strictEqual(data.ssh[0].limitip, 2);
+  assert.strictEqual(data.ssh[0].date_exp, '2026-11-06');
+
+  assert.strictEqual(data.vless.length, 2, 'MT vless: 2 live (archived dilewati)');
+  const adfal = data.vless.find((r) => r.username === 'Adfal');
+  assert.strictEqual(adfal.uuid, 'c4be398c-bf21-4f2a-b4eb-724ef7599625', 'MT vless: uuid asli dari JSON, bukan jam');
+  assert.strictEqual(adfal.quota, 50);
+  assert.strictEqual(adfal.limitip, 2);
+  assert.strictEqual(data.vless.find((r) => r.username === 'Dewi').limitip, 3);
+  assert.ok(!data.vless.some((r) => r.username === 'abbas'), 'MT: akun archived tidak diimpor');
+
+  assert.strictEqual(data.trojan.length, 1, 'MT trojan: 1 akun');
+  assert.strictEqual(data.trojan[0].password, 'ac1d3c08-6e85-42db-87b5-a33ed4d42617', 'MT trojan: secret dari uuid JSON');
+
+  // Tidak ada warning konversi uuid palsu (jam tidak salah dibaca sebagai uuid).
+  assert.ok(!summary.warnings.some((w) => /ID pendek dikonversi/i.test(w)), 'MT: tidak ada konversi uuid palsu');
+  assert.ok(summary.warnings.some((w) => /archived/i.test(w)), 'MT: ada info akun archived dilewati');
+
+  console.log('test-foreign-backup-parser (MakhlukTunnel v4.x): OK');
+} finally {
+  fs.rmSync(path.dirname(mtTmp), { recursive: true, force: true });
+}

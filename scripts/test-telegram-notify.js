@@ -153,6 +153,18 @@ function assertLayout(text, title) {
   assert(msg.includes('Quota    : Tanpa batas'), 'quota 0 berarti tanpa batas');
   assert(msg.includes('Pembeli  : ID 5566778899'));
   assert(!/1194|2200|8181|OVPN|OHP/.test(msg), 'port OVPN/OHP tidak dipasang SC ini, jangan tampil');
+  assert(!/SlowDNS/.test(msg), 'tanpa data.slowdns (VPS tidak mengaktifkan SlowDNS) baris SlowDNS tidak tampil');
+
+  // SlowDNS tampil di notif create hanya kalau API mengirim account.slowdns.
+  await A.notifyAccountEvent('create', 'ssh/zivpn', {
+    hostname: 'sg1.contoh.com', username: 'sari', password: 'p4ssSD', exp: ymdPlus(30), limitip: '1', quota: '0',
+    port: { tls: '443', none: '80', udpgw: '7300', slowdns: '53' },
+    slowdns: { ns: 'ns-sg1.contoh.com', pubkey: 'ab'.repeat(32), dns: '203.0.113.7:53' }
+  }, owner);
+  const sd = takeCopyable()[0];
+  assert(/SlowDNS NS\s*:/.test(sd.text) && sd.text.includes('ns-sg1.contoh.com'), 'SlowDNS NS tampil di notif');
+  assert(sd.text.includes('ab'.repeat(32)) && sd.text.includes('SlowDNS DNS') && sd.text.includes('203.0.113.7:53'), 'SlowDNS Pubkey + DNS tampil');
+  assert(sd.codes.includes('ns-sg1.contoh.com') && sd.codes.includes('ab'.repeat(32)), 'NS & Pubkey SlowDNS bisa disalin sekali sentuh');
 
   await A.notifyAccountEvent('create', 'vmess', {
     username: 'budi', uuid: 'uuid-1', exp: ymdPlus(30), limitip: '0', quota: '100',

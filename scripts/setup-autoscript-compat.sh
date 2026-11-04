@@ -210,7 +210,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.112}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.113}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -6858,6 +6858,10 @@ function formatSshCreateNotification(action, service, account = {}, owner = {}, 
   const ntlsPort = notifyPortValue(port, ['none', 'ntls', 'ws'], '80');
   const udpgw = notifyPortValue(port, ['udpgw'], Array.isArray(account.udpgw?.ports) ? account.udpgw.ports.join(',') : '');
   const udpCustom = notifyPortValue(port, ['udpcustom', 'udp_custom', 'udphc'], notifyValue(account.udpcustom_port || account.udp_custom_port, ''));
+  // SlowDNS hanya ada kalau VPS mengaktifkannya (API mengirim account.slowdns).
+  const slowdns = account.slowdns && typeof account.slowdns === 'object'
+    && notifyValue(account.slowdns.ns, '') && notifyValue(account.slowdns.pubkey, '')
+    ? account.slowdns : null;
 
   return notifyMessage(isTrialAction(action, username) ? 'AKUN TRIAL SSH' : 'AKUN SSH BARU', [
     {
@@ -6878,6 +6882,9 @@ function formatSshCreateNotification(action, service, account = {}, owner = {}, 
         notifyRow('SSH SSL', notifyPortValue(port, ['tls_all'], tlsPort)),
         notifyRow('UDP Custom', udpCustom),
         notifyRow('UDPGW', udpgw),
+        slowdns ? notifyCopyRow('SlowDNS NS', notifyValue(slowdns.ns)) : null,
+        slowdns ? notifyCopyRow('SlowDNS Key', notifyValue(slowdns.pubkey)) : null,
+        slowdns ? notifyRow('SlowDNS DNS', notifyValue(slowdns.dns)) : null,
         notifyRow('Lokasi', notifyLocation(account, location))
       ]
     },

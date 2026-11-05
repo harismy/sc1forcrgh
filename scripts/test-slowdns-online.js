@@ -49,17 +49,18 @@ const env = {
   SSH_LIVE_STATE_FILE: B(F('auth.map')),
   SLOWDNS_SSH_LIVE_BIN: B(path.join(bin, 'ssh-live')),
   SLOWDNS_STATE_FILE: B(F('state')),
+  SLOWDNS_LOCK_FILE: B(F('lock')),
   SLOWDNS_KEY_DIR: B(F('keys')),
   SLOWDNS_BIN_PATH: B(F('dnstt-server'))
 };
 const helperPath = B(F('helper'));
-function run(command = 'online') {
+function run(command = 'online', expectedStatus = 0, ...args) {
   for (const name of ['systemctl.log', 'ss.log', 'tracker.log']) write(name, '');
-  const r = spawnSync(bash, ['-c', 'export PATH="$FAKE_BIN:$PATH"; exec bash "$1" "$2"', '_', helperPath, command], {
+  const r = spawnSync(bash, ['-c', 'export PATH="$FAKE_BIN:$PATH"; exec bash "$@"', '_', helperPath, command, ...args], {
     env, encoding: 'utf8', timeout: 30000
   });
   assert(!r.error, String(r.error));
-  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert.strictEqual(r.status, expectedStatus, r.stdout + r.stderr);
   assert(!/unexpected/.test(r.stderr), r.stderr);
   return r.stdout;
 }
@@ -96,7 +97,7 @@ try {
   assert(/Akun online\s*: 2 akun unik terverifikasi/.test(out), out);
   assert(/Koneksi SSH\s*: 5 melalui SlowDNS/.test(out), out);
   assert(/Belum dikenali\s*: 2 koneksi/.test(out), out);
-  assert(/^alice\s+2$/m.test(out) && /^bob\s+1$/m.test(out), out);
+  assert(/^alice\s+2\s+-$/m.test(out) && /^bob\s+1\s+-$/m.test(out), out);
   assert(!/sshws|stale|disconnected/.test(out), out);
   assert.strictEqual(read('tracker.log').trim(), 'refresh');
   assert(read('ss.log').includes('( sport = :109 or dport = :109 )'));
@@ -108,7 +109,7 @@ try {
   // ke socket SlowDNS. Kedua sisi harus merupakan pasangan endpoint yang sama.
   write('sockets', pair(40001, 301) + '\n' + pair(40001, 401, { addr: '[::1]', owner: 9000 }) + '\n');
   out = run();
-  assert(/^alice\s+1$/m.test(out), out);
+  assert(/^alice\s+1\s+-$/m.test(out), out);
   write('auth.map', '40001|401|sshws\n');
   out = run();
   assert(/0 akun/.test(out) && /Belum dikenali\s*: 1/.test(out) && !/^sshws/m.test(out), out);
@@ -170,6 +171,44 @@ try {
   out = run();
   assert(/1 akun/.test(out) && /Koneksi SSH\s*: 1/.test(out), out);
   assert(read('ss.log').includes('( sport = :2223 or dport = :2223 )'));
+
+  // Dua stream SSH pada ClientID yang sama adalah satu tunnel, lalu hanya
+  // koneksi dengan username/PID terverifikasi yang masuk data checker.
+  fs.writeFileSync(F('dnstt-server'), '#!/usr/bin/env bash\n[[ "$1" == -sc-online ]] || exit 1\ncat "$FAKE_DIR/native"\n');
+  fs.chmodSync(F('dnstt-server'), 0o755);
+  config(); write('sockets', mixed); write('auth.map', auth);
+  const native = 'SC_SLOWDNS_SESSIONS_V1|1008|1234567890\n' +
+    '40001|aaaaaaaaaaaaaaaa|100|1000000000\n40002|aaaaaaaaaaaaaaaa|200|1000000000\n' +
+    '40003|bbbbbbbbbbbbbbbb|300|1000000000\n40004|cccccccccccccccc|400|1000000000\n' +
+    '40005|dddddddddddddddd|500|1000000000\nEND\n';
+  write('native', native);
+  out = run();
+  assert(/Tunnel aktif\s*: 2 identitas/.test(out), out);
+  assert(/^alice\s+2\s+1$/m.test(out) && /^bob\s+1\s+1$/m.test(out), out);
+  out = run('sessions');
+  assert(out.startsWith('SC_SLOWDNS_USERS_V1|1008.1234567890\n'), out);
+  assert.strictEqual(out.split('\n').filter((l) => /^alice\|/.test(l)).length, 2, out);
+  assert(!/stale|sshws|cccccccccccccccc|dddddddddddddddd/.test(out), out);
+  assert(out.endsWith('END\n'), out);
+  write('native', native.replace('bbbbbbbbbbbbbbbb', 'aaaaaaaaaaaaaaaa'));
+  out = run();
+  assert(/Tunnel aktif\s*: 1 identitas/.test(out), 'satu ClientID dengan dua akun tidak menggandakan total tunnel: ' + out);
+  write('native', native.replace('|1008|', '|10080|'));
+  run('sessions', 1);
+  write('native', native.replace('END\n', ''));
+  run('sessions', 1);
+  // Port yang didaur ulang setelah snapshot ss tidak meminjam username lama.
+  const future = String((BigInt(Date.now()) + 100000n) * 1000000n);
+  write('native', 'SC_SLOWDNS_SESSIONS_V1|1008|1234567890\n40001|eeeeeeeeeeeeeeee|100|' + future + '\nEND\n');
+  out = run('sessions');
+  assert(!out.includes('alice|'), out);
+  write('native', native);
+  out = run('set-lock', 0, '0');
+  assert(/SLOWDNS_AUTO_LOCK_ENABLE=0/.test(read('env')), out);
+  out = run();
+  assert(/Auto-lock\s*: OFF/.test(out), out);
+  run('set-lock', 0, '1');
+  assert(/SLOWDNS_AUTO_LOCK_ENABLE=1/.test(read('env')));
 
   assert(installer.includes('7) ui_monitor show_slowdns_online ;;'), 'menu memakai monitor refresh/live yang sudah ada');
   assert(installer.includes('echo "7) Lihat Akun Online SlowDNS"'), 'opsi menu terlihat');

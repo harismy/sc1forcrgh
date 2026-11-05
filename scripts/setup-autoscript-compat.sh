@@ -93,6 +93,7 @@ set -euo pipefail
 #   SLOWDNS_LISTEN_PORT=5300                    (opsional, port UDP lokal dnstt; UDP 53 publik dialihkan ke sini)
 #   SLOWDNS_MTU=1232                            (opsional, batas ATAS ukuran respons DNS; app ber-buffer kecil tetap diterima)
 #   SLOWDNS_MEMORY_MAX=auto                     (opsional, batas RAM service SlowDNS; auto 128M di VPS 1 GB)
+#   SLOWDNS_AUTO_LOCK_ENABLE=1                  (batas tunnel aktif mengikuti limit akun SSH; lock sementara 15 menit)
 #   SLOWDNS_BIN_URL= / SLOWDNS_BIN_SHA256=      (opsional, binary dnstt-server siap pakai; default build dari source)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
@@ -210,7 +211,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.119}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.120}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -278,6 +279,7 @@ SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}"
 SLOWDNS_KCP_WINDOW="${SLOWDNS_KCP_WINDOW:-auto}"
 SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}"
 SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}"
+SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}"
 SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}"
 SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}"
 BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}"
@@ -5817,6 +5819,7 @@ IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 IPLIMIT_LOCK_HISTORY_RETENTION_DAYS=${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS}
 IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
+SLOWDNS_AUTO_LOCK_ENABLE=${SLOWDNS_AUTO_LOCK_ENABLE}
 QUOTA_LOCK_ENABLE=${QUOTA_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
@@ -11677,6 +11680,9 @@ const LOCK_HISTORY_RETENTION_DAYS = Number.isFinite(LOCK_HISTORY_RETENTION_DAYS_
   : 90;
 const LOCK_HISTORY_PRUNE_STATE_FILE = '/var/lib/sc-1forcr/iplimit-history-prune-at';
 const AUTO_LOCK_ENABLED = !/^(0|false|off|no)$/i.test(String(process.env.IPLIMIT_AUTO_LOCK_ENABLE || '1').trim());
+const SLOWDNS_AUTO_LOCK_ENABLED = /^(1|true|on|yes)$/i.test(String(process.env.SLOWDNS_AUTO_LOCK_ENABLE || '1').trim());
+const SLOWDNS_ACTIVITY_FILE = '/var/lib/sc-1forcr/iplimit-slowdns-activity.json';
+const SLOWDNS_LOCK_SECONDS = 15 * 60;
 const LOCK_SECONDS = LOCK_MINUTES * 60;
 const SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW = Number(process.env.SSHWS_ACCOUNT_SESSION_HARD_LIMIT || 8);
 const SSHWS_ACCOUNT_SESSION_HARD_LIMIT = Number.isFinite(SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW)
@@ -12026,6 +12032,7 @@ function normalizeMultiLoginEvidence(service, detected, ips = [], extra = null) 
 function buildMultiLoginMessage(event) {
   const list = Array.isArray(event?.ips) ? event.ips.filter(Boolean).slice(0, 8) : [];
   const isXray = ['vmess', 'vless', 'trojan'].includes(String(event?.service || '').trim().toLowerCase());
+  const isSlowdns = String(event?.service || '').trim().toLowerCase() === 'slowdns';
   const detected = Number(event?.detected || 0);
   const observed = Number(event?.observed_ip_raw_count || 0);
   const label = notifyText(event?.device_detected_label);
@@ -12034,8 +12041,8 @@ function buildMultiLoginMessage(event) {
       lines: [
         notifyRow('Layanan', notifyServiceLabel(event?.service)),
         notifyRow('Username', event?.username),
-        notifyRow('Limit IP', notifyLimitIp(event?.limitip)),
-        notifyRow('Deteksi', `${detected} ${isXray ? 'jaringan' : 'IP'}`),
+        notifyRow(isSlowdns ? 'Limit tunnel' : 'Limit IP', notifyLimitIp(event?.limitip)),
+        notifyRow('Deteksi', `${detected} ${isSlowdns ? 'tunnel' : isXray ? 'jaringan' : 'IP'}`),
         notifyRow('Dibuka', `otomatis ${Number(event?.unlock_minutes || LOCK_MINUTES || 15)} menit lagi`),
         notifyRow('Pembeli', notifyOwnerId(event?.owner_telegram_id, event?.owner_telegram_chat_id))
       ]
@@ -12129,7 +12136,7 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
       device_detected_label: evidence.label || null,
       lock_reason: String(extra?.lock_reason || '').trim() || null,
       ips: evidence.ips,
-      unlock_minutes: Number(LOCK_MINUTES || 15),
+      unlock_minutes: Number(extra?.unlock_minutes || LOCK_MINUTES || 15),
       owner_telegram_id: ownerIdNum > 0 ? ownerIdNum : null,
       owner_telegram_chat_id: ownerChatIdNum > 0 ? ownerChatIdNum : (ownerIdNum > 0 ? ownerIdNum : null),
       occurred_at: new Date().toISOString()
@@ -14527,6 +14534,75 @@ async function cleanupExpiredGrace(nowTs) {
   await pruneIpLimitLockHistory(nowTs);
 }
 
+// Identitas tunnel berasal dari DNSTT, bukan jumlah socket SSH/IP resolver.
+// Hanya tunnel berumur >=90 detik dengan trafik klien baru sejak sampel sebelumnya
+// yang menjadi bukti. Baseline hilang/gagal disimpan atau metadata tidak lengkap
+// selalu menghasilkan nol bukti, sehingga akun tidak terkunci karena data rusak.
+function readSlowdnsTunnelUsage(nowTs) {
+  const result = new Map();
+  let configured = SLOWDNS_AUTO_LOCK_ENABLED;
+  try {
+    const conf = fs.readFileSync('/etc/sc-1forcr.env', 'utf8');
+    const values = [...conf.matchAll(/^SLOWDNS_AUTO_LOCK_ENABLE=([^\r\n]*)/gm)];
+    if (values.length) configured = /^(1|true|on|yes)$/i.test(values.at(-1)[1].replace(/["'\s]/g, '') || '1');
+  } catch (_) {}
+  if (!configured) return result;
+  try {
+    const state = fs.readFileSync('/var/lib/sc-1forcr/slowdns.state', 'utf8');
+    if (!/^ENABLED=1\s*$/m.test(state)) return result;
+    const raw = execFileSync('/usr/local/sbin/sc-1forcr-slowdns', ['sessions'], {
+      encoding: 'utf8', timeout: 12000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']
+    });
+    const lines = String(raw).trim().split(/\r?\n/);
+    const header = /^SC_SLOWDNS_USERS_V1\|([0-9]+\.[0-9]+)$/.exec(lines.shift() || '');
+    if (!header || lines.pop() !== 'END') return result;
+    const instance = header[1];
+    let previous = null;
+    try { previous = JSON.parse(fs.readFileSync(SLOWDNS_ACTIVITY_FILE, 'utf8')); } catch (_) {}
+    const age = nowTs - Number(previous?.updatedAt || 0);
+    const baselineValid = previous?.instance === instance && age > 0 && age <= SSHWS_HARD_LIMIT_MAX_GAP_SECONDS;
+    const baseline = baselineValid && previous?.rows && typeof previous.rows === 'object' ? previous.rows : {};
+    const current = Object.create(null);
+    const observed = new Set();
+    for (const line of lines) {
+      const m = /^([a-z0-9._-]+)\|([0-9a-f]{16})\|([0-9]+)\|([0-9]+)\|([0-9]{10,20})$/.exec(line);
+      if (!m) return new Map();
+      const [, user, cid, upRaw, portRaw, started] = m;
+      const up = Number(upRaw), port = Number(portRaw);
+      if (!Number.isSafeInteger(up) || !Number.isInteger(port) || port < 1 || port > 65535 || observed.has(port)) return new Map();
+      observed.add(port);
+      const key = `${user}|${cid}|${port}|${started}`;
+      current[key] = up;
+      const old = baseline[key];
+      const startedSec = Number(started.slice(0, -9));
+      if (!baselineValid || !Number.isSafeInteger(old) || up <= old || nowTs - startedSec < 90) continue;
+      if (!result.has(user)) result.set(user, new Set());
+      result.get(user).add(`${instance}:${cid}`);
+    }
+    fs.mkdirSync(require('path').dirname(SLOWDNS_ACTIVITY_FILE), { recursive: true });
+    const tmp = `${SLOWDNS_ACTIVITY_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ instance, updatedAt: nowTs, rows: current }), { mode: 0o600 });
+    fs.renameSync(tmp, SLOWDNS_ACTIVITY_FILE);
+    return result;
+  } catch (_) {
+    try { fs.unlinkSync(`${SLOWDNS_ACTIVITY_FILE}.tmp.${process.pid}`); } catch (_) {}
+    return new Map();
+  }
+}
+
+async function sampleSlowdnsTunnelLimit(username, tunnels, limit, nowTs) {
+  const user = String(username || '').trim().toLowerCase();
+  const ids = [...new Set(tunnels || [])].sort();
+  const candidate = Number(limit) > 0 && ids.length > Number(limit);
+  const signal = candidate ? `slowdns-${crypto.createHash('sha256').update(JSON.stringify(ids)).digest('hex').slice(0, 20)}` : '';
+  await run(
+    "DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND username=? AND signal LIKE 'slowdns-%' AND signal<>?",
+    [user, signal]
+  ).catch(() => {});
+  if (!candidate) return { candidate: false, confirmed: false, hits: 0 };
+  return sampleSshwsViolation(user, signal, ids.length, true, nowTs);
+}
+
 async function sampleSshwsViolation(username, signalRaw, detected, candidate, nowTs) {
   const user = String(username || '').trim().toLowerCase();
   const count = Math.max(0, Number(detected || 0));
@@ -14860,6 +14936,7 @@ async function lockIfExceeded(nowTs) {
     return { ssh: 0, xray: 0 };
   }
   const sshUsage = parseSshAndUdpUsage();
+  const slowdnsTunnels = readSlowdnsTunnelUsage(nowTs);
   const zivpnLive = await readZivpnLiveMap(nowTs);
   const sshIpMap = sshUsage.ipMap;
   const sshSessionMap = sshUsage.sessionMap;
@@ -15011,6 +15088,9 @@ async function lockIfExceeded(nowTs) {
     // pengaman abuse terpisah dan wajib bertahan dua siklus pemeriksaan.
     const sshwsHardSample = await sampleSshwsHardLimit(userKey, cntWsPorts, nowTs);
     const hardSessionExceeded = sshwsHardSample.confirmed;
+    const userSlowdnsTunnels = slowdnsTunnels.get(userKey) || new Set();
+    const slowdnsSample = await sampleSlowdnsTunnelLimit(userKey, userSlowdnsTunnels, lim, nowTs);
+    const slowdnsExceeded = slowdnsSample.confirmed;
     // Long-term IP tracker: audit pola sharing dalam 24 jam.
     // Banyak IP historis tidak membuktikan sesi serentak, jadi tidak auto-lock.
     const LONG_TERM_HOURS = 24;
@@ -15054,10 +15134,23 @@ async function lockIfExceeded(nowTs) {
     if (longTermAlert) {
       await notifyLongTermIpWarning(user, lim, longTermIpCount, Array.from(longTermIpSet), nowTs);
     }
-    if (!accountLimitExceeded && !hardSessionExceeded) continue;
+    if (!accountLimitExceeded && !hardSessionExceeded && !slowdnsExceeded) continue;
     if (graceMap.has(`ssh|${userKey}`)) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
+
+    const lockBySlowdns = slowdnsExceeded && !accountLimitExceeded && !hardSessionExceeded;
+    const accountLockSeconds = lockBySlowdns ? SLOWDNS_LOCK_SECONDS : LOCK_SECONDS;
+    if (lockBySlowdns) {
+      // Simpan dan buktikan jalur pemulihan SEBELUM password/sesi diubah.
+      // Jika DB bermasalah, jangan meninggalkan password terkunci tanpa expiry.
+      try {
+        await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, 0)", [user, nowTs + accountLockSeconds]);
+        await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]);
+        const prepared = await get("SELECT l.locked_until, a.status FROM temp_ip_locks l JOIN account_sshs a ON LOWER(a.username)=LOWER(l.username) WHERE l.account_type='ssh' AND l.username=?", [user]);
+        if (Number(prepared?.locked_until) !== nowTs + accountLockSeconds || String(prepared?.status).toUpperCase() !== 'LOCK_TMP') continue;
+      } catch (_) { continue; }
+    }
 
     // Putuskan sesi aktif SSH user yang baru di-lock.
     // Bunuh per-PID lebih dulu: ini yang paling andal karena tidak bergantung
@@ -15101,14 +15194,16 @@ async function lockIfExceeded(nowTs) {
     if (removeUdpcustomUser(user)) udphcSecretChanged = true;
     if (udphcSecretChanged) udpcustomChanged = true;
     await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
-    await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + LOCK_SECONDS, removed]).catch(() => {});
+    await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + accountLockSeconds, removed]).catch(() => {});
     await run("DELETE FROM iplimit_violation_pending WHERE account_type='ssh' AND username=?", [userKey]).catch(() => {});
     let zivpnNotifyLabel = '';
     if (lim === 1 && cntZivpnRaw === 2 && cntZivpnEffective === 1) {
       zivpnNotifyLabel = `ZIVPN multi-login: ${cntZivpnRaw} IP terdeteksi bersamaan, dihitung ${cntZivpnEffective} IP/device`;
     }
     const lockByHardSession = hardSessionExceeded && !accountLimitExceeded;
-    const lockReasonText = lockByHardSession
+    const lockReasonText = lockBySlowdns
+      ? `tunnel SlowDNS aktif melewati limit akun selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan (bukan hitungan HP/IP resolver)`
+      : lockByHardSession
       ? `sesi SSHWS aktif melewati batas aman ${SSHWS_ACCOUNT_SESSION_HARD_LIMIT} selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`
       : `pemakaian perangkat/IP melewati limit akun selama ${SSHWS_HARD_LIMIT_CONFIRM_CYCLES} kali pengecekan`;
     // Urutan stabil: kalau SSH langsung dan SSH-WS sama besar, SSH langsung
@@ -15119,12 +15214,12 @@ async function lockIfExceeded(nowTs) {
       { service: 'udphc', count: cntUdphcIp },
       { service: 'zivpn', count: cntZivpnEffective }
     ].sort((a, b) => b.count - a.count);
-    const notifyService = lockByHardSession
+    const notifyService = lockBySlowdns ? 'slowdns' : lockByHardSession
       ? 'sshws'
       : (ipSourceCounts[0]?.service || 'ssh');
     const notifyLimit = lockByHardSession ? SSHWS_ACCOUNT_SESSION_HARD_LIMIT : lim;
-    const notifyDetected = lockByHardSession ? cntWsPorts : cnt;
-    const notifyDetectedRaw = lockByHardSession
+    const notifyDetected = lockBySlowdns ? userSlowdnsTunnels.size : lockByHardSession ? cntWsPorts : cnt;
+    const notifyDetectedRaw = lockBySlowdns ? userSlowdnsTunnels.size : lockByHardSession
       ? cntWsPorts
       : Math.max(cntIpRaw, cntWsIpRaw, cntSshCombinedRaw, cntUdphcIpRaw, cntZivpnRaw);
     const historyId = await createIpLimitLockHistory({
@@ -15137,11 +15232,11 @@ async function lockIfExceeded(nowTs) {
       detected_effective: notifyDetected,
       ips: lockIps,
       lock_reason: lockReasonText,
-      device_detected_label: zivpnNotifyLabel,
+      device_detected_label: lockBySlowdns ? `${userSlowdnsTunnels.size} tunnel SlowDNS aktif; batas ${lim}` : zivpnNotifyLabel,
       owner_telegram_id: Number(r.owner_telegram_id || 0) || null,
       owner_telegram_chat_id: Number(r.owner_telegram_chat_id || 0) || null,
       locked_at: nowTs,
-      locked_until: nowTs + LOCK_SECONDS
+      locked_until: nowTs + accountLockSeconds
     });
     await notifyMultiLoginLock(
       notifyService,
@@ -15154,8 +15249,9 @@ async function lockIfExceeded(nowTs) {
       {
         detected_raw: notifyDetectedRaw,
         detected_effective: notifyDetected,
-        device_detected_label: zivpnNotifyLabel,
-        lock_reason: lockReasonText
+        device_detected_label: lockBySlowdns ? `${userSlowdnsTunnels.size} tunnel SlowDNS aktif; batas ${lim}` : zivpnNotifyLabel,
+        lock_reason: lockReasonText,
+        unlock_minutes: accountLockSeconds / 60
       },
       historyId
     );
@@ -17984,6 +18080,7 @@ SETTINGS_KEYS = [
     "IPLIMIT_LOCK_MINUTES",
     "IPLIMIT_LOCK_HISTORY_RETENTION_DAYS",
     "IPLIMIT_AUTO_LOCK_ENABLE",
+    "SLOWDNS_AUTO_LOCK_ENABLE",
     "QUOTA_LOCK_ENABLE",
     "IPLIMIT_AUTO_TUNE",
     "IPLIMIT_DEBUG",
@@ -18858,6 +18955,7 @@ SETTINGS_KEYS = [
     "IPLIMIT_LOCK_MINUTES",
     "IPLIMIT_LOCK_HISTORY_RETENTION_DAYS",
     "IPLIMIT_AUTO_LOCK_ENABLE",
+    "SLOWDNS_AUTO_LOCK_ENABLE",
     "QUOTA_LOCK_ENABLE",
     "IPLIMIT_AUTO_TUNE",
     "IPLIMIT_DEBUG",
@@ -23250,7 +23348,7 @@ install_slowdns_manager() {
   mkdir -p /usr/local/sbin /var/lib/sc-1forcr
   cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
 #!/usr/bin/env bash
-# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|records|suggest|check|info|clear}
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|sessions|set-lock 0/1|records|suggest|check|info|clear}
 #
 # - setup     : pasang binary, kunci, dan unit lalu nyalakan atau matikan service
 #               sesuai SLOWDNS_ENABLE. Dipanggil install/update dan menu. Hanya
@@ -23282,6 +23380,7 @@ BUILD_ROOT="${SLOWDNS_BUILD_ROOT:-/var/tmp}"
 SERVICE_GATE_BIN="${SLOWDNS_SERVICE_GATE_BIN:-/usr/local/sbin/sc-1forcr-service-gate}"
 SSH_LIVE_BIN="${SLOWDNS_SSH_LIVE_BIN:-/usr/local/sbin/sc-1forcr-ssh-live}"
 SSH_LIVE_MAP="${SSH_LIVE_STATE_FILE:-/run/sc-1forcr/ssh-live.map}"
+SESSION_SOCKET="${SLOWDNS_SESSION_SOCKET:-/run/sc-1forcr-slowdns/sessions.sock}"
 SERVICE="sc-1forcr-slowdns.service"
 SVC_USER="sc-1forcr-slowdns"
 CHAIN="SC1FORCR_SLOWDNS"
@@ -23296,7 +23395,7 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # VPS lama rebuild. sc-fast1: terima QTYPE=NULL (record NULL, app HTTP Custom
 # dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
 # plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
-DNSTT_PATCH_ID="sc-fast3"
+DNSTT_PATCH_ID="sc-fast4"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -23952,6 +24051,133 @@ if cc.count('const QueueSize = 128') != 1:
     raise SystemExit('QueueSize anchor not found')
 cc = cc.replace('const QueueSize = 128', 'const QueueSize = 8192')
 io.open(conspath, 'w', encoding='utf-8', newline='\n').write(cc)
+# sc-fast4: IPC lokal untuk ClientID -> socket upstream dan trafik dari klien.
+# Tidak ada listener publik/flush file berkala. Data hanya disalin saat diminta.
+repl('func handleStream(stream *smux.Stream, upstream string, conv uint32) error {',
+     'func handleStream(stream *smux.Stream, upstream string, conv uint32, clientID string) error {')
+repl('\tupstreamTCPConn := upstreamConn.(*net.TCPConn)\n',
+     '\tupstreamTCPConn := upstreamConn.(*net.TCPConn)\n\ttracked := scTrackStream(upstreamTCPConn, clientID)\n\tdefer scUntrackStream(tracked)\n')
+repl('\t\t_, err := io.Copy(upstreamTCPConn, stream)\n',
+     '\t\t_, err := io.Copy(scSessionWriter(upstreamTCPConn, tracked), stream)\n')
+repl('\t\t\terr := handleStream(stream, upstream, conn.GetConv())\n',
+     '\t\t\tclientID := ""\n\t\t\tif cid, ok := conn.RemoteAddr().(turbotunnel.ClientID); ok {\n\t\t\t\tclientID = fmt.Sprintf("%x", cid[:])\n\t\t\t}\n\t\t\terr := handleStream(stream, upstream, conn.GetConv(), clientID)\n')
+repl('\tdefer dnsConn.Close()\n', '\tdefer dnsConn.Close()\n\tstopMonitor := scStartSessionMonitor()\n\tdefer stopMonitor()\n')
+repl('\tvar genKey bool\n', '\tvar genKey bool\n\tvar scOnlineSocket string\n')
+repl('\tflag.Parse()\n',
+     '\tflag.StringVar(&scOnlineSocket, "sc-online", "", "read SC session monitor Unix socket")\n\tflag.Parse()\n\tif scOnlineSocket != "" {\n\t\tif err := scReadSessionMonitor(scOnlineSocket); err != nil {\n\t\t\tfmt.Fprintln(os.Stderr, err)\n\t\t\tos.Exit(1)\n\t\t}\n\t\treturn\n\t}\n')
+io.open(mainpath, 'w', encoding='utf-8', newline='\n').write(src)
+io.open(os.path.join(mod, 'dnstt-server', 'sc_sessions.go'), 'w', encoding='utf-8', newline='\n').write(r'''package main
+
+import (
+    "bytes"
+    "fmt"
+    "io"
+    "log"
+    "net"
+    "os"
+    "sync"
+    "sync/atomic"
+    "time"
+)
+
+// Satu ClientID dapat memiliki banyak stream SSH; penghitung tunnel melakukan
+// deduplikasi ClientID setelah username dibuktikan oleh tracker autentikasi SSH.
+type scSession struct {
+    up uint64
+    port int
+    clientID string
+    started int64
+}
+
+var scSessionsMu sync.Mutex
+var scSessions = make(map[int]*scSession)
+var scMonitorEnabled bool
+var scMonitorStarted = time.Now().UnixNano()
+
+func scTrackStream(conn *net.TCPConn, clientID string) *scSession {
+    if !scMonitorEnabled || len(clientID) != 16 { return nil }
+    addr, ok := conn.LocalAddr().(*net.TCPAddr)
+    if !ok { return nil }
+    s := &scSession{port: addr.Port, clientID: clientID, started: time.Now().UnixNano()}
+    scSessionsMu.Lock()
+    scSessions[s.port] = s
+    scSessionsMu.Unlock()
+    return s
+}
+
+func scUntrackStream(s *scSession) {
+    if s == nil { return }
+    scSessionsMu.Lock()
+    if scSessions[s.port] == s { delete(scSessions, s.port) }
+    scSessionsMu.Unlock()
+}
+
+type scCountingWriter struct { io.Writer; session *scSession }
+func (w scCountingWriter) Write(p []byte) (int, error) {
+    n, err := w.Writer.Write(p)
+    if n > 0 { atomic.AddUint64(&w.session.up, uint64(n)) }
+    return n, err
+}
+
+func scSessionWriter(conn *net.TCPConn, s *scSession) io.Writer {
+    if s == nil { return conn }
+    return scCountingWriter{conn, s}
+}
+
+func scSessionSnapshot() []byte {
+    var b bytes.Buffer
+    fmt.Fprintf(&b, "SC_SLOWDNS_SESSIONS_V1|%d|%d\n", os.Getpid(), scMonitorStarted)
+    scSessionsMu.Lock()
+    for _, s := range scSessions {
+        fmt.Fprintf(&b, "%d|%s|%d|%d\n", s.port, s.clientID, atomic.LoadUint64(&s.up), s.started)
+    }
+    scSessionsMu.Unlock()
+    b.WriteString("END\n")
+    return b.Bytes()
+}
+
+func scStartSessionMonitor() func() {
+    path := os.Getenv("SLOWDNS_SESSION_SOCKET")
+    if path == "" { return func() {} }
+    if st, err := os.Lstat(path); err == nil {
+        if st.Mode()&os.ModeSocket == 0 {
+            log.Printf("SlowDNS monitor: path bukan socket")
+            return func() {}
+        }
+        if err := os.Remove(path); err != nil { return func() {} }
+    }
+    ln, err := net.Listen("unix", path)
+    if err != nil {
+        log.Printf("SlowDNS monitor tidak tersedia: %v", err)
+        return func() {}
+    }
+    if err := os.Chmod(path, 0600); err != nil {
+        ln.Close()
+        os.Remove(path)
+        return func() {}
+    }
+    scMonitorEnabled = true
+    go func() {
+        for {
+            conn, err := ln.Accept()
+            if err != nil { return }
+            conn.SetWriteDeadline(time.Now().Add(time.Second))
+            conn.Write(scSessionSnapshot())
+            conn.Close()
+        }
+    }()
+    return func() { ln.Close(); os.Remove(path) }
+}
+
+func scReadSessionMonitor(path string) error {
+    conn, err := net.DialTimeout("unix", path, time.Second)
+    if err != nil { return err }
+    defer conn.Close()
+    conn.SetReadDeadline(time.Now().Add(time.Second))
+    _, err = io.Copy(os.Stdout, io.LimitReader(conn, 1<<20))
+    return err
+}
+''')
 SLOWDNS_PATCH_PY
   then
     rm -rf "${work}"
@@ -24054,6 +24280,9 @@ Environment=GOMEMLIMIT=$(go_mem_limit "${mem}")
 Environment=SLOWDNS_KCP_WINDOW=$(kcp_window)
 Environment=GOMAXPROCS=$(go_maxprocs)
 Environment=GOGC=$(go_gc)
+Environment=SLOWDNS_SESSION_SOCKET=/run/sc-1forcr-slowdns/sessions.sock
+RuntimeDirectory=sc-1forcr-slowdns
+RuntimeDirectoryMode=0700
 MemoryMax=${mem}
 TasksMax=64
 LimitNOFILE=8192
@@ -24452,7 +24681,7 @@ cmd_regen_key() {
 # Username wajib cocok dengan port DAN PID Dropbear pada snapshot saat ini;
 # state/log lama tidak boleh menghidupkan kembali akun yang sudah disconnect.
 collect_online() {
-  local pid sockets map data kind a b c d
+  local pid sockets map data native cutoff kind a b c d e
   ONLINE_AVAILABLE=0
   ONLINE_CONNECTIONS=0
   ONLINE_USERS=0
@@ -24460,6 +24689,10 @@ collect_online() {
   ONLINE_UNKNOWN=0
   ONLINE_ROWS=""
   ONLINE_NOTE=""
+  ONLINE_TUNNELS_AVAILABLE=0
+  ONLINE_TUNNELS=0
+  ONLINE_INSTANCE=""
+  ONLINE_SESSION_ROWS=""
   load_config
   if (( ENABLED == 0 )); then
     ONLINE_AVAILABLE=1
@@ -24481,19 +24714,34 @@ collect_online() {
   if [[ -x "${SSH_LIVE_BIN}" ]]; then
     "${SSH_LIVE_BIN}" refresh >/dev/null 2>&1 || true
   fi
+  cutoff="$(date +%s)"
   if ! sockets="$(ss -Htnp state established "( sport = :${TARGET_PORT} or dport = :${TARGET_PORT} )" 2>/dev/null)"; then
     ONLINE_NOTE="Snapshot koneksi belum tersedia"
     return 0
   fi
   map="${SSH_LIVE_MAP}"
   [[ -r "${map}" ]] || map=/dev/null
-  if ! data="$(awk -F'|' -v owner="${pid}" -v target="${TARGET_PORT}" '
+  native=""
+  if [[ -x "${BIN}" ]]; then native="$(timeout 3 "${BIN}" -sc-online "${SESSION_SOCKET}" 2>/dev/null)" || native=""; fi
+  if ! data="$(awk -F'|' -v owner="${pid}" -v target="${TARGET_PORT}" -v cutoff="${cutoff}" '
     FILENAME==ARGV[1] {
       if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[a-z0-9._-]+$/ &&
           $3!="root" && $3!="priv" && $3!="net" && $3!="unknown") {
         auth_pid[$1]=$2; auth_user[$1]=$3;
       }
       next;
+    }
+    FILENAME==ARGV[2] {
+      if ($1=="SC_SLOWDNS_SESSIONS_V1" && $2==owner && $3 ~ /^[0-9]+$/) {
+        native=1; instance=$2 "." $3; next;
+      }
+      if ($0=="END") { ended=1; next; }
+      if ($1 ~ /^[0-9]+$/ && $1+0>0 && $1+0<=65535 && $2 ~ /^[0-9a-f]+$/ && length($2)==16 &&
+          $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && length($4)>=10 && length($4)<=20 && !($1 in cid)) {
+        cid[$1]=$2; up[$1]=$3; started[$1]=$4;
+        next;
+      }
+      bad=1; next;
     }
     function port_of(v, p) {
       p=v; sub(/^.*:/, "", p);
@@ -24530,32 +24778,44 @@ collect_online() {
       if (lp==target) server_pid[endpoint(r) SUBSEP endpoint(l)]=first_pid($0);
     }
     END {
-      total=0; verified=0; users=0;
+      total=0; verified=0; users=0; tunnelCount=0;
+      ready=native && ended && !bad;
       for (key in client) {
         p=client[key];
         total++;
         if (server_pid[key]!="" && auth_pid[p]==server_pid[key] && auth_user[p]!="") {
           u=auth_user[p]; per_user[u]++; verified++;
+          # Sesi baru setelah awal snapshot ss tidak boleh meminjam username
+          # koneksi sebelumnya yang kebetulan memakai port sumber yang sama.
+          if (ready && (p in cid) && substr(started[p],1,length(started[p])-9)+0 < cutoff+0) {
+            tunnelKey=u SUBSEP cid[p];
+            if (!(tunnelKey in tunnel)) { tunnel[tunnelKey]=1; user_tunnels[u]++; }
+            if (!(cid[p] in all_tunnels)) { all_tunnels[cid[p]]=1; tunnelCount++; }
+            print "stream|" u "|" cid[p] "|" up[p] "|" p "|" started[p];
+          }
         }
       }
       for (u in per_user) users++;
       print "summary|" total "|" users "|" verified "|" (total-verified);
+      if (ready) print "native|1|" instance "|" tunnelCount;
       if (hidden) print "hidden|1";
-      for (u in per_user) print "user|" u "|" per_user[u];
+      for (u in per_user) print "user|" u "|" per_user[u] "|" (ready ? user_tunnels[u]+0 : "-");
     }
-  ' "${map}" - <<< "${sockets}" | LC_ALL=C sort)"; then
+  ' "${map}" <(printf '%s\n' "${native}") - <<< "${sockets}" | LC_ALL=C sort)"; then
     ONLINE_NOTE="Data koneksi belum dapat dibaca"
     return 0
   fi
   ONLINE_AVAILABLE=1
-  while IFS='|' read -r kind a b c d; do
+  while IFS='|' read -r kind a b c d e; do
     case "${kind}" in
       summary)
         ONLINE_CONNECTIONS="${a}"; ONLINE_USERS="${b}"
         ONLINE_AUTHENTICATED="${c}"; ONLINE_UNKNOWN="${d}"
         ;;
       hidden) ONLINE_NOTE="Sebagian pemilik koneksi tidak terbaca; angka dapat kurang" ;;
-      user) ONLINE_ROWS+="${a}|${b}"$'\n' ;;
+      native) ONLINE_TUNNELS_AVAILABLE=1; ONLINE_INSTANCE="${b}"; ONLINE_TUNNELS="${c}" ;;
+      stream) ONLINE_SESSION_ROWS+="${a}|${b}|${c}|${d}|${e}"$'\n' ;;
+      user) ONLINE_ROWS+="${a}|${b}|${c}"$'\n' ;;
     esac
   done <<< "${data}"
   return 0
@@ -24569,25 +24829,57 @@ print_online_summary() {
   printf '%-14s: %s\n' "Akun online" "${ONLINE_USERS} akun unik terverifikasi"
   printf '%-14s: %s\n' "Koneksi SSH" "${ONLINE_CONNECTIONS} melalui SlowDNS"
   printf '%-14s: %s\n' "Belum dikenali" "${ONLINE_UNKNOWN} koneksi (belum login / belum terpetakan)"
+  if (( ONLINE_TUNNELS_AVAILABLE )); then
+    printf '%-14s: %s\n' "Tunnel aktif" "${ONLINE_TUNNELS} identitas tunnel terverifikasi"
+  elif (( ENABLED )); then
+    printf '%-14s: %s\n' "Tunnel aktif" "BELUM TERSEDIA (butuh binary dengan monitor sesi)"
+  fi
+  env_val SLOWDNS_AUTO_LOCK_ENABLE
+  if flag_on "${REPLY:-1}"; then
+    env_val IPLIMIT_AUTO_LOCK_ENABLE
+    if ! flag_on "${REPLY:-1}"; then
+      printf '%-14s: %s\n' "Auto-lock" "OFF (saklar auto-lock global mati)"
+    elif (( ONLINE_TUNNELS_AVAILABLE )); then
+      printf '%-14s: %s\n' "Auto-lock" "ON; ikut limit akun SSH, lock 15 menit setelah 2 cek aktif"
+    else
+      printf '%-14s: %s\n' "Auto-lock" "MENUNGGU DATA TUNNEL; akun tidak dikunci dari jumlah socket"
+    fi
+  else
+    printf '%-14s: %s\n' "Auto-lock" "OFF"
+  fi
   if [[ -n "${ONLINE_NOTE}" ]]; then printf '%-14s: %s\n' "Keterangan" "${ONLINE_NOTE}"; fi
   return 0
 }
 
 cmd_online() {
-  local user connections
+  local user connections tunnels
   collect_online
   print_online_summary
   if [[ -n "${ONLINE_ROWS}" ]]; then
-    printf '\n%-24s %s\n' "AKUN SSH" "KONEKSI SLOWDNS"
-    while IFS='|' read -r user connections; do
+    printf '\n%-24s %-14s %s\n' "AKUN SSH" "KONEKSI SSH" "TUNNEL"
+    while IFS='|' read -r user connections tunnels; do
       [[ -n "${user}" ]] || continue
-      printf '%-24s %s\n' "${user}" "${connections}"
+      printf '%-24s %-14s %s\n' "${user}" "${connections}" "${tunnels}"
     done <<< "${ONLINE_ROWS}"
   fi
   say ""
   say "Akun dihitung unik; satu akun bisa dipakai beberapa perangkat."
   say "Koneksi adalah snapshot SSH melalui SlowDNS, bukan jumlah orang/IP resolver."
   return 0
+}
+
+cmd_sessions() {
+  collect_online
+  (( ONLINE_AVAILABLE && ONLINE_TUNNELS_AVAILABLE )) || return 1
+  printf 'SC_SLOWDNS_USERS_V1|%s\n' "${ONLINE_INSTANCE}"
+  printf '%s' "${ONLINE_SESSION_ROWS}"
+  printf 'END\n'
+}
+
+cmd_set_lock() {
+  case "${1:-}" in 0|1) ;; *) die "Gunakan set-lock 0 atau set-lock 1" ;; esac
+  set_env_value SLOWDNS_AUTO_LOCK_ENABLE "$1" || die "pengaturan auto-lock gagal disimpan"
+  say "Berhasil: auto-lock SlowDNS=$1. Batas mengikuti limit akun SSH; lock sementara 15 menit."
 }
 
 cmd_status() {
@@ -24689,13 +24981,15 @@ case "${1:-status}" in
   regen-key) acquire_lock; cmd_regen_key ;;
   status) cmd_status ;;
   online) cmd_online ;;
+  sessions) cmd_sessions ;;
+  set-lock) acquire_lock; cmd_set_lock "${2:-}" ;;
   records) load_config; cmd_records ;;
   suggest) load_config; suggest_ns "${DOMAIN_MAIN}"; echo ;;
   check) cmd_check ;;
   info) cat "${STATE_FILE}" 2>/dev/null || true ;;
   clear) acquire_lock; cmd_clear ;;
   *)
-    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|records|suggest|check|info|clear}"
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|sessions|set-lock 0/1|records|suggest|check|info|clear}"
     exit 1
     ;;
 esac
@@ -28494,6 +28788,7 @@ IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 IPLIMIT_LOCK_HISTORY_RETENTION_DAYS=${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS}
 IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
+SLOWDNS_AUTO_LOCK_ENABLE=${SLOWDNS_AUTO_LOCK_ENABLE}
 QUOTA_LOCK_ENABLE=${QUOTA_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
@@ -33564,8 +33859,13 @@ set_slowdns_menu() {
   echo "5) Lihat Record DNS yang Dibutuhkan"
   echo "6) Lihat Log SlowDNS"
   echo "7) Lihat Akun Online SlowDNS"
+  if [[ "$(normalize_bool_01 "${SLOWDNS_AUTO_LOCK_ENABLE:-1}")" == "1" ]]; then
+    echo "8) Nonaktifkan Auto-lock SlowDNS"
+  else
+    echo "8) Aktifkan Auto-lock SlowDNS"
+  fi
   echo "0) Kembali"
-  if ! prompt_input choice "Pilih [0-7]: "; then
+  if ! prompt_input choice "Pilih [0-8]: "; then
     return 0
   fi
   case "${choice}" in
@@ -33594,6 +33894,13 @@ set_slowdns_menu() {
     5) "${bin}" records | ui_fx || true ;;
     6) journalctl -u sc-1forcr-slowdns.service -n 40 --no-pager -o cat 2>/dev/null || echo "Log SlowDNS belum tersedia." ;;
     7) ui_monitor show_slowdns_online ;;
+    8)
+      if [[ "$(normalize_bool_01 "${SLOWDNS_AUTO_LOCK_ENABLE:-1}")" == "1" ]]; then
+        "${bin}" set-lock 0 2>&1 | ui_fx || true
+      else
+        "${bin}" set-lock 1 2>&1 | ui_fx || true
+      fi
+      ;;
     *) return 0 ;;
   esac
   safe_source_env_file /etc/sc-1forcr.env
@@ -38133,6 +38440,7 @@ update_script_from_repo() {
     SLOWDNS_KCP_WINDOW="${SLOWDNS_KCP_WINDOW:-auto}" \
     SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}" \
     SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}" \
+    SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}" \
     SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}" \
     SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
@@ -41058,7 +41366,7 @@ persist_pending_install_env() {
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
-    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
+    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE

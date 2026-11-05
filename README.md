@@ -67,6 +67,38 @@ jumlah akun bukan jumlah orang. Koneksi SSHWS dan IP resolver tidak ikut dihitun
 Gunakan `r` untuk memperbarui data, `l` untuk mode live, dan `q` untuk kembali.
 Pengambilan data berjalan saat layar dibuka/refresh, tanpa daemon tambahan.
 
+### Auto-lock SlowDNS
+
+Versi `V.1FSC.120` menambahkan batas tunnel SlowDNS yang mengikuti `limitip` akun
+SSH: limit 1 mengizinkan satu tunnel, limit 2 mengizinkan dua, dan limit 0 tidak
+dibatasi. Banyak koneksi SSH dalam satu ClientID DNSTT tetap dihitung satu tunnel.
+ClientID adalah identitas tunnel, bukan identitas HP; satu aplikasi yang membuka
+beberapa tunnel terpisah tetap dapat mencapai batas ini.
+
+Checker mengunci akun setelah identitas tunnel yang sama melewati batas dalam
+dua pemeriksaan berturut-turut. Tunnel harus berumur minimal 90 detik dan mengirim
+trafik klien baru sejak sampel sebelumnya; sampel pertama membentuk baseline.
+Pemeriksaan mengikuti timer IP-limit (default 3 menit), sehingga bukan lock instan.
+Metadata hilang, binary lama, atau data yang gagal dibaca tidak menjadi alasan lock.
+
+Lock berlaku **15 menit**, lalu akun dipulihkan pada siklus checker berikutnya.
+Karena yang dikunci adalah akun SSH, akses lain yang memakai akun tersebut juga
+ikut terkunci. Riwayat lock mencatat layanan `slowdns` dan jumlah tunnel, bukan IP
+resolver. Saklar auto-lock global tetap berlaku.
+
+Auto-lock aktif secara default ketika SlowDNS aktif. Ubah melalui Tools > SlowDNS
+> 8, atau:
+
+```bash
+sc-1forcr-slowdns set-lock 0 # nonaktifkan
+sc-1forcr-slowdns set-lock 1 # aktifkan
+```
+
+Fitur membutuhkan binary DNSTT patch `sc-fast4`. Update membangunnya dengan kunci
+server yang sama dan mengaktifkannya melalui restart service SlowDNS. Monitor
+sesi memakai Unix socket lokal berizin 0600 di direktori runtime berizin 0700;
+tidak membuka port publik atau menulis data per paket ke disk.
+
 ## DNS Resolver Guard
 
 SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui

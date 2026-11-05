@@ -211,7 +211,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.120}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.121}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -5678,6 +5678,101 @@ stop_disable_udp_backend() {
   return 1
 }
 
+setup_udp_firewall_guard() {
+  cat > /usr/local/sbin/sc-1forcr-udp-firewall <<'UDP_FIREWALL_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Binary backend dapat memasang ACCEPT lagi saat restart. Hanya rapatkan run
+# pertama rule ACCEPT polos yang identik dan bersebelahan. Menghapus menurut
+# spesifikasi selalu menghapus salinan pertama: aman bila salinan berikutnya
+# tepat di belakangnya. Duplikat yang diselingi gate/DROP/rule lain dibiarkan,
+# supaya posisi efektif ACCEPT tidak bergeser melewati aturan keamanan.
+[[ "${1:-cleanup}" == "cleanup" ]] || exit 2
+(( $# == 0 )) || shift
+if ! command -v iptables >/dev/null 2>&1 && ! command -v ip6tables >/dev/null 2>&1; then
+  exit 0
+fi
+umask 077
+state_dir="${UDP_FIREWALL_STATE_DIR:-/run/sc-1forcr}"
+mkdir -p "${state_dir}" || exit 0
+exec 9>"${state_dir}/udp-firewall.lock"
+command -v flock >/dev/null 2>&1 || exit 0
+flock -n 9 || exit 0
+
+declare -A ports=()
+add_port() {
+  local p="${1##*:}"
+  [[ "${p}" =~ ^[0-9]{1,5}$ ]] || return 0
+  p=$((10#${p}))
+  if (( p >= 1 && p <= 65535 )); then ports[${p}]=1; fi
+}
+if (( $# )); then
+  for p in "$@"; do add_port "${p}"; done
+else
+  # Hanya port listen milik backend SC. Tidak menyentuh NAT maupun port lain.
+  zivpn_port="${ZIVPN_LISTEN_PORT:-5667}"
+  udpcustom_port="${UDPCUSTOM_LISTEN_PORT:-5667}"
+  while IFS='=' read -r key value; do
+    value="${value//\"/}"; value="${value//\'/}"
+    case "${key}" in
+      ZIVPN_LISTEN_PORT) zivpn_port="${value}" ;;
+      UDPCUSTOM_LISTEN_PORT) udpcustom_port="${value}" ;;
+    esac
+  done < <(cat "${SC_ENV_FILE:-/etc/sc-1forcr.env}" 2>/dev/null || true)
+  if command -v jq >/dev/null 2>&1; then
+    if [[ -r /etc/zivpn/config.json ]]; then
+      zivpn_port="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null || true)"
+    fi
+    if [[ -r /root/udp/config.json ]]; then
+      udpcustom_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null || true)"
+    fi
+  fi
+  add_port "${zivpn_port}"
+  add_port "${udpcustom_port}"
+fi
+
+first_run_has_duplicate() {
+  local line seen=0
+  while IFS= read -r line; do
+    if [[ "${line}" == "${spec}" ]]; then
+      if (( seen )); then return 0; fi
+      seen=1
+    elif (( seen )); then
+      return 1
+    fi
+  done <<< "${snapshot}"
+  return 1
+}
+
+changed=0
+for fw in iptables ip6tables; do
+  command -v "${fw}" >/dev/null 2>&1 || continue
+  snapshot="$("${fw}" -w 2 -S INPUT 2>/dev/null)" || continue
+  for p in "${!ports[@]}"; do
+    spec="-A INPUT -p udp -m udp --dport ${p} -j ACCEPT"
+    while (( changed < 32 )) && first_run_has_duplicate; do
+      "${fw}" -w 2 -D INPUT -p udp -m udp --dport "${p}" -j ACCEPT >/dev/null 2>&1 || break
+      changed=$((changed + 1))
+      # Baca ulang setelah setiap penghapusan; jika chain berubah atau gagal
+      # dibaca, hentikan. Tidak pernah menghapus lewat nomor baris atau flush.
+      if ! snapshot="$("${fw}" -w 2 -S INPUT 2>/dev/null)"; then
+        snapshot=""
+        break
+      fi
+    done
+  done
+done
+if (( changed )) && command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save >/dev/null 2>&1 || true
+fi
+exit 0
+UDP_FIREWALL_EOF
+  bash -n /usr/local/sbin/sc-1forcr-udp-firewall || return 1
+  chmod 755 /usr/local/sbin/sc-1forcr-udp-firewall
+  /usr/local/sbin/sc-1forcr-udp-firewall cleanup >/dev/null 2>&1 || true
+}
+
 # ZIVPN dan UDP Custom berbagi port. Menyalakan satu unit saat lawannya aktif
 # hanya berujung gagal bind lalu restart tiap 2-3 detik tanpa henti, dan tiap
 # percobaan ikut menjalankan cek lisensi Node. ExecCondition yang gagal membuat
@@ -5686,12 +5781,14 @@ stop_disable_udp_backend() {
 # sebelum menulis ACTIVE_UDP_BACKEND, tapi selalu mematikan backend lama dulu.
 write_udp_backend_exclusive_dropins() {
   local unit other dropin_file content changed=0
+  setup_udp_firewall_guard || return 1
   for unit in "${ZIVPN_SERVICE_NAME}" "${UDPCUSTOM_SERVICE_NAME}"; do
     other="${ZIVPN_SERVICE_NAME}"
     [[ "${unit}" == "${ZIVPN_SERVICE_NAME}" ]] && other="${UDPCUSTOM_SERVICE_NAME}"
     dropin_file="/etc/systemd/system/${unit}.service.d/20-sc-udp-exclusive.conf"
     content="[Service]
-ExecCondition=/bin/sh -c '! systemctl is-active --quiet ${other}.service'"
+ExecCondition=/bin/sh -c '! systemctl is-active --quiet ${other}.service'
+ExecStartPost=-/usr/local/sbin/sc-1forcr-udp-firewall cleanup"
     if [[ "$(cat "${dropin_file}" 2>/dev/null || true)" != "${content}" ]]; then
       mkdir -p "$(dirname "${dropin_file}")"
       printf '%s\n' "${content}" > "${dropin_file}"
@@ -17638,6 +17735,11 @@ if [[ -x /usr/local/sbin/sc-1forcr-tunnel-guard ]]; then
     log_health "GAGAL menerapkan pembatas trafik tunnel"
 fi
 
+# Rapikan ACCEPT berulang dari restart backend UDP, tanpa mengubah urutan gate.
+if [[ -x /usr/local/sbin/sc-1forcr-udp-firewall ]]; then
+  /usr/local/sbin/sc-1forcr-udp-firewall cleanup >/dev/null 2>&1 || true
+fi
+
 # SlowDNS: aturan UDP 53 -> dnstt dipasang ulang kalau hilang atau tergeser
 # DNAT 1:65535 milik UDP Custom. Sebelum gerbang ON/OFF, karena aturan INPUT-nya
 # disisipkan di puncak chain. SlowDNS mati (default) = tidak menyentuh iptables.
@@ -19313,7 +19415,14 @@ db_users="${tmp_dir}/db-users"
 # Snapshot socket adalah sumber kebenaran. State hanya menyimpan hubungan
 # port lokal Dropbear -> PID -> username agar sesi lama tidak bergantung pada
 # umur baris journal lagi.
-ss -Htnp state established 2>/dev/null | awk -v p1="${dropbear_port}" -v p2="${dropbear_alt_port}" '
+{
+  if [[ "${mode}" == "refresh-snapshot" ]]; then
+    # Snapshot baru dari pemanggil, hanya untuk siklus ini; tidak memakai cache.
+    cat
+  else
+    ss -Htnp state established 2>/dev/null
+  fi
+} | awk -v p1="${dropbear_port}" -v p2="${dropbear_alt_port}" '
   function port_of(v,   s,n,a,p) {
     s=v; gsub(/^\[/, "", s); gsub(/\]$/, "", s);
     n=split(s, a, ":"); p=a[n];
@@ -19479,7 +19588,7 @@ case "${mode}" in
   raw)
     cat "${state_file}" 2>/dev/null || true
     ;;
-  refresh)
+  refresh|refresh-snapshot)
     ;;
   *)
     sort -u "${session_rows}" 2>/dev/null | awk -F'|' '
@@ -23395,7 +23504,7 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # VPS lama rebuild. sc-fast1: terima QTYPE=NULL (record NULL, app HTTP Custom
 # dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
 # plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
-DNSTT_PATCH_ID="sc-fast4"
+DNSTT_PATCH_ID="sc-fast5"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -24178,6 +24287,110 @@ func scReadSessionMonitor(path string) error {
     return err
 }
 ''')
+# sc-fast5: jalur respons normal tanpa serializer sementara/name-cache. Bentuk
+# selain satu question + satu answer TXT/NULL dengan nama sama tetap memakai
+# serializer upstream. Byte wire, EDNS, TTL, dan kapasitas payload tidak berubah.
+repl(
+    '\tbuf, err := resp.WireFormat()\n\tif err != nil {\n\t\treturn 0\n\t}\n\tavail := sizeCap - len(buf)\n',
+    '\toverhead, ok := scResponseOverhead(resp)\n'
+    '\tif !ok {\n\t\tbuf, err := resp.WireFormat()\n\t\tif err != nil {\n\t\t\treturn 0\n\t\t}\n\t\toverhead = len(buf)\n\t}\n'
+    '\tavail := sizeCap - overhead\n')
+repl('\t\tbuf, err := rec.Resp.WireFormat()\n',
+     '\t\tbuf, err := scResponseWireFormat(rec.Resp)\n')
+io.open(mainpath, 'w', encoding='utf-8', newline='\n').write(src)
+io.open(os.path.join(mod, 'dnstt-server', 'sc_wire.go'), 'w', encoding='utf-8', newline='\n').write(r'''package main
+
+import (
+    "bytes"
+    "encoding/binary"
+
+    "www.bamsoftware.com/git/dnstt.git/dns"
+)
+
+// Hitung overhead hanya untuk bentuk respons yang dibangun responseFor.
+// Nama question pertama belum terkompresi; answer menunjuk ke offset 12.
+// Root memakai satu byte nol, termasuk OPT. Tidak ada cache global/buffer pool.
+func scResponseOverhead(resp *dns.Message) (int, bool) {
+    if len(resp.Question) != 1 || len(resp.Answer) != 1 ||
+        len(resp.Authority) != 0 || len(resp.Additional) > 1 {
+        return 0, false
+    }
+    q, a := &resp.Question[0], &resp.Answer[0]
+    if (a.Type != dns.RRTypeTXT && a.Type != rrTypeNULL) ||
+        q.Type != a.Type || len(q.Name) != len(a.Name) {
+        return 0, false
+    }
+    nameLen := 1
+    for i, label := range q.Name {
+        if len(label) == 0 || len(label) > 63 || !bytes.Equal(label, a.Name[i]) {
+            return 0, false
+        }
+        nameLen += 1 + len(label)
+    }
+    if nameLen > 255 {
+        return 0, false
+    }
+    answerNameLen := 2
+    if len(q.Name) == 0 {
+        answerNameLen = 1
+    }
+    overhead := 12 + nameLen + 4 + answerNameLen + 10
+    if len(resp.Additional) == 1 {
+        opt := &resp.Additional[0]
+        if opt.Type != dns.RRTypeOPT || len(opt.Name) != 0 || len(opt.Data) > 65535 {
+            return 0, false
+        }
+        overhead += 11 + len(opt.Data)
+    }
+    return overhead, true
+}
+
+func scAppend16(buf []byte, value uint16) []byte {
+    return append(buf, byte(value >> 8), byte(value))
+}
+
+func scAppendRRBody(buf []byte, rr *dns.RR) []byte {
+    buf = scAppend16(buf, rr.Type)
+    buf = scAppend16(buf, rr.Class)
+    buf = append(buf, byte(rr.TTL >> 24), byte(rr.TTL >> 16), byte(rr.TTL >> 8), byte(rr.TTL))
+    buf = scAppend16(buf, uint16(len(rr.Data)))
+    return append(buf, rr.Data...)
+}
+
+// Satu alokasi dengan ukuran tepat; kepemilikan buffer tetap per respons.
+// Seluruh bentuk lain dan error integer overflow memakai implementasi upstream.
+func scResponseWireFormat(resp *dns.Message) ([]byte, error) {
+    overhead, ok := scResponseOverhead(resp)
+    if !ok || len(resp.Answer[0].Data) > 65535 {
+        return resp.WireFormat()
+    }
+    q, a := &resp.Question[0], &resp.Answer[0]
+    buf := make([]byte, 12, overhead + len(a.Data))
+    binary.BigEndian.PutUint16(buf[0:2], resp.ID)
+    binary.BigEndian.PutUint16(buf[2:4], resp.Flags)
+    binary.BigEndian.PutUint16(buf[4:6], 1)
+    binary.BigEndian.PutUint16(buf[6:8], 1)
+    binary.BigEndian.PutUint16(buf[10:12], uint16(len(resp.Additional)))
+    for _, label := range q.Name {
+        buf = append(buf, byte(len(label)))
+        buf = append(buf, label...)
+    }
+    buf = append(buf, 0)
+    buf = scAppend16(buf, q.Type)
+    buf = scAppend16(buf, q.Class)
+    if len(q.Name) == 0 {
+        buf = append(buf, 0)
+    } else {
+        buf = append(buf, 0xc0, 0x0c)
+    }
+    buf = scAppendRRBody(buf, a)
+    if len(resp.Additional) == 1 {
+        buf = append(buf, 0)
+        buf = scAppendRRBody(buf, &resp.Additional[0])
+    }
+    return buf, nil
+}
+''')
 SLOWDNS_PATCH_PY
   then
     rm -rf "${work}"
@@ -24709,15 +24922,15 @@ collect_online() {
     ONLINE_NOTE="Service tidak berjalan"
     return 0
   fi
-  # Tracker yang sama dipakai monitor SSH; tidak membuat parser journal baru.
-  # Bila tracker/map belum tersedia, koneksi tetap terlihat sebagai belum dikenali.
-  if [[ -x "${SSH_LIVE_BIN}" ]]; then
-    "${SSH_LIVE_BIN}" refresh >/dev/null 2>&1 || true
-  fi
   cutoff="$(date +%s)"
-  if ! sockets="$(ss -Htnp state established "( sport = :${TARGET_PORT} or dport = :${TARGET_PORT} )" 2>/dev/null)"; then
+  if ! sockets="$(ss -Htnp state established 2>/dev/null)"; then
     ONLINE_NOTE="Snapshot koneksi belum tersedia"
     return 0
+  fi
+  # Satu snapshot segar dipakai tracker SSH dan pencocokan DNSTT. Tracker tetap
+  # membaca autentikasi baru, tetapi tidak menjalankan ss kedua dalam siklus ini.
+  if [[ -x "${SSH_LIVE_BIN}" ]]; then
+    printf '%s\n' "${sockets}" | "${SSH_LIVE_BIN}" refresh-snapshot >/dev/null 2>&1 || true
   fi
   map="${SSH_LIVE_MAP}"
   [[ -r "${map}" ]] || map=/dev/null
@@ -40541,6 +40754,7 @@ rm -f /usr/local/sbin/sc-1forcr-udpgw-drain
 rm -f /usr/local/sbin/sc-1forcr-capacity-tune
 rm -f /usr/local/sbin/sc-1forcr-dns-guard
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
+rm -f /usr/local/sbin/sc-1forcr-udp-firewall
 rm -f /usr/local/sbin/sc-1forcr-extra-ports
 rm -f /usr/local/sbin/sc-1forcr-slowdns
 rm -f /usr/local/sbin/sc-1forcr-tunnel-guard

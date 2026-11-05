@@ -41,6 +41,7 @@ exe('ss', `printf '%s\\n' "$*" >> "$FAKE_DIR/ss.log"
 [[ -f "$FAKE_DIR/fail-ss" ]] && exit 1
 cat "$FAKE_DIR/sockets"`);
 exe('ssh-live', `printf '%s\\n' "$*" >> "$FAKE_DIR/tracker.log"
+cat > "$FAKE_DIR/tracker-sockets"
 [[ -f "$FAKE_DIR/fail-tracker" ]] && exit 1
 exit 0`);
 const env = {
@@ -99,8 +100,9 @@ try {
   assert(/Belum dikenali\s*: 2 koneksi/.test(out), out);
   assert(/^alice\s+2\s+-$/m.test(out) && /^bob\s+1\s+-$/m.test(out), out);
   assert(!/sshws|stale|disconnected/.test(out), out);
-  assert.strictEqual(read('tracker.log').trim(), 'refresh');
-  assert(read('ss.log').includes('( sport = :109 or dport = :109 )'));
+  assert.strictEqual(read('tracker.log').trim(), 'refresh-snapshot');
+  assert.strictEqual(read('ss.log').trim(), '-Htnp state established', 'satu snapshot ss per siklus');
+  assert.strictEqual(read('tracker-sockets'), mixed, 'tracker memakai snapshot yang sama, tanpa cache');
   assert.strictEqual(read('systemctl.log').trim(), 'show sc-1forcr-slowdns.service -p MainPID --value');
   out = run('status');
   assert(/Akun online\s*: 2 akun unik/.test(out) && /Koneksi SSH\s*: 5/.test(out), out);
@@ -170,7 +172,7 @@ try {
   write('sockets', pair(40001, 301, { target: 2223, state: '  ESTAB ' }) + '\n');
   out = run();
   assert(/1 akun/.test(out) && /Koneksi SSH\s*: 1/.test(out), out);
-  assert(read('ss.log').includes('( sport = :2223 or dport = :2223 )'));
+  assert.strictEqual(read('ss.log').trim(), '-Htnp state established');
 
   // Dua stream SSH pada ClientID yang sama adalah satu tunnel, lalu hanya
   // koneksi dengan username/PID terverifikasi yang masuk data checker.

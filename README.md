@@ -94,10 +94,25 @@ sc-1forcr-slowdns set-lock 0 # nonaktifkan
 sc-1forcr-slowdns set-lock 1 # aktifkan
 ```
 
-Fitur membutuhkan binary DNSTT patch `sc-fast4`. Update membangunnya dengan kunci
+Fitur membutuhkan binary DNSTT patch `sc-fast4` atau lebih baru. Update membangunnya dengan kunci
 server yang sama dan mengaktifkannya melalui restart service SlowDNS. Monitor
 sesi memakai Unix socket lokal berizin 0600 di direktori runtime berizin 0700;
 tidak membuka port publik atau menulis data per paket ke disk.
+
+### Efisiensi SlowDNS V.1FSC.121
+
+Patch `sc-fast5` menghitung ukuran dan mengenkode respons normal TXT/NULL tanpa
+serializer sementara, dengan hasil byte yang sama. Bentuk respons lain memakai
+serializer upstream. MTU, window/interval KCP, GOMAXPROCS, dan GOGC dipertahankan.
+Monitor dan tracker SSH memakai satu snapshot socket segar per pemeriksaan;
+keputusan auto-lock tidak memakai cache tampilan.
+
+Helper `sc-1forcr-udp-firewall cleanup` merapikan salinan ACCEPT UDP polos yang
+identik dan bersebelahan pada port listen backend SC. Dijalankan saat update,
+setelah backend start, dan oleh watchdog; tanpa daemon baru. Rule yang diselingi
+gate/DROP/rule lain, NAT, dan rule dengan pembatas tambahan dipertahankan. Chain
+bersih tidak ditulis ulang. Pengukuran lokal dan batas interpretasinya ada di
+[catatan benchmark](docs/slowdns-efficiency-v121.md).
 
 ## DNS Resolver Guard
 

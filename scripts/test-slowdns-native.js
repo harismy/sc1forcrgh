@@ -21,6 +21,8 @@ async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-dnstt-native-'));
   const socket = path.join(tmp, 'sc.sock');
   const children = [], sockets = new Set();
+  let nullProxy;
+  let nullQueries = 0;
   let logs = '';
   const echo = net.createServer((s) => {
     sockets.add(s); s.once('close', () => sockets.delete(s)); s.on('error', () => {}); s.pipe(s);
@@ -71,6 +73,55 @@ async function main() {
     await new Promise((r) => echo.listen(0, '127.0.0.1', r));
     const dns = dgram.createSocket('udp4'); await new Promise((r) => dns.bind(0, '127.0.0.1', r));
     const dnsPort = dns.address().port; await new Promise((r) => dns.close(r));
+    // Satu klien melewati resolver lokal TXT <-> NULL, supaya kedua format
+    // diuji lewat transport Noise/KCP/smux sungguhan, termasuk paket besar.
+    const nameEnd = (p, start) => {
+      let i = start;
+      while (i < p.length) {
+        const n = p[i++];
+        if ((n & 0xc0) === 0xc0) return i + 1;
+        if (n === 0) return i;
+        if (n > 63 || i + n > p.length) throw Error('nama DNS proxy tidak valid');
+        i += n;
+      }
+      throw Error('nama DNS proxy terpotong');
+    };
+    nullProxy = dgram.createSocket('udp4');
+    let nullClient;
+    nullProxy.on('message', (packet, peer) => {
+      try {
+        const p = Buffer.from(packet);
+        const qtype = nameEnd(p, 12);
+        if (peer.port !== dnsPort) {
+          assert.strictEqual(p.readUInt16BE(qtype), 16);
+          p.writeUInt16BE(10, qtype); nullQueries++;
+          nullClient = peer;
+          nullProxy.send(p, dnsPort, '127.0.0.1');
+        } else if (nullClient) {
+          p.writeUInt16BE(16, qtype);
+          let response = p;
+          if (p.readUInt16BE(6) === 1) {
+            const rr = nameEnd(p, qtype + 4);
+            if (p.readUInt16BE(rr) === 10) {
+              const lenAt = rr + 8, dataAt = rr + 10;
+              const size = p.readUInt16BE(lenAt), end = dataAt + size;
+              assert(end <= p.length);
+              const chunks = [];
+              for (let i = dataAt; i < end; i += 255) {
+                const part = p.subarray(i, Math.min(i + 255, end));
+                chunks.push(Buffer.from([part.length]), part);
+              }
+              const txt = Buffer.concat(chunks), length = Buffer.alloc(2);
+              length.writeUInt16BE(txt.length);
+              p.writeUInt16BE(16, rr);
+              response = Buffer.concat([p.subarray(0, lenAt), length, txt, p.subarray(end)]);
+            }
+          }
+          nullProxy.send(response, nullClient.port, nullClient.address);
+        }
+      } catch (error) { logs += '\nNULL proxy: ' + error.stack; }
+    });
+    await new Promise((r) => nullProxy.bind(0, '127.0.0.1', r));
     const server = launch(serverBin, ['-udp', `127.0.0.1:${dnsPort}`, '-privkey-file', key, '-mtu', '1232', 't.local.test', `127.0.0.1:${echo.address().port}`], {
       SLOWDNS_SESSION_SOCKET: socket, SLOWDNS_KCP_WINDOW: '2048', GOMAXPROCS: '2'
     });
@@ -81,10 +132,10 @@ async function main() {
     }).status === 0);
     const a = await freeTcp(), b = await freeTcp();
     launch(clientBin, ['-udp', `127.0.0.1:${dnsPort}`, '-pubkey-file', pub, 't.local.test', `127.0.0.1:${a}`]);
-    launch(clientBin, ['-udp', `127.0.0.1:${dnsPort}`, '-pubkey-file', pub, 't.local.test', `127.0.0.1:${b}`]);
+    launch(clientBin, ['-udp', `127.0.0.1:${nullProxy.address().port}`, '-pubkey-file', pub, 't.local.test', `127.0.0.1:${b}`]);
     const first = await exchange(a, Buffer.alloc(100, 65));
-    const second = await exchange(a, Buffer.alloc(200, 66));
-    const third = await exchange(b, Buffer.alloc(300, 67));
+    const second = await exchange(a, Buffer.alloc(65536, 66));
+    const third = await exchange(b, Buffer.alloc(131072, 67));
     const query = () => {
       const r = spawnSync(serverBin, ['-sc-online', socket], { encoding: 'utf8', timeout: 4000, windowsHide: true });
       assert.strictEqual(r.status, 0, r.stderr);
@@ -95,21 +146,23 @@ async function main() {
     };
     let rows = await until(() => { const rows = query(); return rows.length === 3 && rows; });
     assert.strictEqual(new Set(rows.map((r) => r[1])).size, 2, 'dua klien harus dua ClientID; stream ganda klien pertama tetap satu');
-    assert.deepStrictEqual(rows.map((r) => Number(r[2])).sort((x, y) => x - y), [100, 200, 300], 'counter hanya payload dari klien');
+    assert.deepStrictEqual(rows.map((r) => Number(r[2])).sort((x, y) => x - y), [100, 65536, 131072], 'counter hanya payload dari klien');
+    assert(nullQueries > 0, 'klien kedua benar-benar menggunakan record NULL');
     first.end();
     rows = await until(() => { const rows = query(); return rows.length === 2 && rows; });
     assert.strictEqual(new Set(rows.map((r) => r[1])).size, 2);
     third.end();
     rows = await until(() => { const rows = query(); return rows.length === 1 && rows; });
-    assert.strictEqual(Number(rows[0][2]), 200, 'tunnel yang sudah putus hilang');
+    assert.strictEqual(Number(rows[0][2]), 65536, 'tunnel yang sudah putus hilang');
     second.end();
     await until(() => query().length === 0);
-    console.log('slowdns native integration passed (real DNS/Noise/KCP/smux, 2 clients, 3 streams, cleanup)');
+    console.log('slowdns native integration passed (TXT + NULL, real DNS/Noise/KCP/smux, bulk echo, 2 clients, 3 streams, cleanup)');
   } finally {
     for (const s of sockets) s.destroy();
     const exits = children.map((p) => new Promise((r) => { if (p.exitCode !== null || p.signalCode !== null) r(); else p.once('exit', r); }));
     for (const p of children) if (p.exitCode === null) p.kill();
     await Promise.all(exits);
+    if (nullProxy) await new Promise((r) => nullProxy.close(r));
     await new Promise((r) => echo.close(r));
     fs.rmSync(tmp, { recursive: true, force: true });
   }

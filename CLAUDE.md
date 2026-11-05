@@ -148,7 +148,8 @@ Akun VPN tidak boleh bisa dipakai menyerang VPS ini atau server lain.
 - Kunci di `/etc/sc-1forcr/slowdns` (privkey 640 root:sc-1forcr-slowdns) dibuat sekali dan dipertahankan lintas update, disable, dan uninstall, karena kunci baru memaksa semua pengguna mengganti pubkey. Ganti kunci hanya lewat menu "Buat Ulang Kunci".
 - State `/var/lib/sc-1forcr/slowdns.state` dibaca api.js (`slowdnsInfo`, cache 30 detik). `data.slowdns = {ns, pubkey, dns}` dan `port.slowdns` hanya dikirim saat `ENABLED=1`, `ACTIVE=1`, `RULES=1`, dan layanan SSH ON; respons VPS tanpa SlowDNS tidak berubah.
 - `SLOWDNS_*` ada di dump `/etc/sc-1forcr.env`, `persist_pending_install_env`, dan daftar env update dari menu. Menu membaca ulang env setelah tiap perubahan, karena helper menulis env sendiri.
-- Test: `npm run test:slowdns`.
+- Monitor akun: `sc-1forcr-slowdns online` dan Tools > SlowDNS > Lihat Akun Online SlowDNS. Status juga memuat ringkasan akun unik dan koneksi SSH. Cocokkan socket loopback ESTABLISHED milik MainPID DNSTT ke port upstream dengan port **dan PID** Dropbear pada map tracker SSH (`sc-1forcr-ssh-live refresh`). Jangan hitung semua koneksi port 109, baris journal lama, atau IP resolver sebagai pengguna SlowDNS. Akun unik bukan jumlah orang/perangkat; koneksi yang belum login/belum terpetakan ditampilkan terpisah. Collector hanya berjalan saat layar dibuka/refresh (live memakai `ui_monitor`), tanpa service baru atau rebuild DNSTT.
+- Test: `npm run test:slowdns` (termasuk `scripts/test-slowdns-online.js`).
 
 ### Sertifikat TLS HAProxy (sinkron cert)
 

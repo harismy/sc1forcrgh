@@ -51,6 +51,22 @@ UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setu
 SUMMARY_API_SETUP_URL=https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-summary-api.sh menu-sc-1forcr update-summary
 ```
 
+## Akun Online SlowDNS
+
+Sesudah memperbarui AutoSC, buka **Tools > SlowDNS > 7) Lihat Akun Online SlowDNS**,
+atau jalankan sebagai root:
+
+```bash
+sc-1forcr-slowdns online
+```
+
+Layar menampilkan jumlah akun SSH unik yang terverifikasi, jumlah koneksi SSH
+melalui SlowDNS, dan rincian koneksi per akun. Koneksi yang belum login atau belum
+terpetakan ditampilkan terpisah. Satu akun bisa dipakai beberapa perangkat, jadi
+jumlah akun bukan jumlah orang. Koneksi SSHWS dan IP resolver tidak ikut dihitung.
+Gunakan `r` untuk memperbarui data, `l` untuk mode live, dan `q` untuk kembali.
+Pengambilan data berjalan saat layar dibuka/refresh, tanpa daemon tambahan.
+
 ## DNS Resolver Guard
 
 SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui

@@ -210,7 +210,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.118}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.119}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23250,7 +23250,7 @@ install_slowdns_manager() {
   mkdir -p /usr/local/sbin /var/lib/sc-1forcr
   cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
 #!/usr/bin/env bash
-# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|records|suggest|check|info|clear}
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|records|suggest|check|info|clear}
 #
 # - setup     : pasang binary, kunci, dan unit lalu nyalakan atau matikan service
 #               sesuai SLOWDNS_ENABLE. Dipanggil install/update dan menu. Hanya
@@ -23261,6 +23261,7 @@ install_slowdns_manager() {
 # - enable/disable/set-ns/regen-key : menu Tools > SlowDNS.
 # - records   : record DNS yang harus dibuat pemilik domain.
 # - check     : uji delegasi NS lewat resolver publik (DoH Google/Cloudflare).
+# - online    : akun SSH unik dan koneksi yang benar-benar melalui proses dnstt.
 # - clear     : lepas semuanya (uninstall). Kunci server sengaja disimpan.
 #
 # Binary dibangun dari source resmi dnstt (versi dipin, checksum modul
@@ -23279,6 +23280,8 @@ UNIT_FILE="${SLOWDNS_UNIT_FILE:-/etc/systemd/system/sc-1forcr-slowdns.service}"
 LOCK_FILE="${SLOWDNS_LOCK_FILE:-/run/sc-1forcr-slowdns.lock}"
 BUILD_ROOT="${SLOWDNS_BUILD_ROOT:-/var/tmp}"
 SERVICE_GATE_BIN="${SLOWDNS_SERVICE_GATE_BIN:-/usr/local/sbin/sc-1forcr-service-gate}"
+SSH_LIVE_BIN="${SLOWDNS_SSH_LIVE_BIN:-/usr/local/sbin/sc-1forcr-ssh-live}"
+SSH_LIVE_MAP="${SSH_LIVE_STATE_FILE:-/run/sc-1forcr/ssh-live.map}"
 SERVICE="sc-1forcr-slowdns.service"
 SVC_USER="sc-1forcr-slowdns"
 CHAIN="SC1FORCR_SLOWDNS"
@@ -24444,6 +24447,149 @@ cmd_regen_key() {
   say "Pubkey: ${REPLY}"
 }
 
+# Diambil hanya saat status/layar online dibuka, bukan di watchdog. PID pemilik
+# socket membedakan SlowDNS dari SSHWS yang masuk ke port Dropbear yang sama.
+# Username wajib cocok dengan port DAN PID Dropbear pada snapshot saat ini;
+# state/log lama tidak boleh menghidupkan kembali akun yang sudah disconnect.
+collect_online() {
+  local pid sockets map data kind a b c d
+  ONLINE_AVAILABLE=0
+  ONLINE_CONNECTIONS=0
+  ONLINE_USERS=0
+  ONLINE_AUTHENTICATED=0
+  ONLINE_UNKNOWN=0
+  ONLINE_ROWS=""
+  ONLINE_NOTE=""
+  load_config
+  if (( ENABLED == 0 )); then
+    ONLINE_AVAILABLE=1
+    ONLINE_NOTE="SlowDNS nonaktif"
+    return 0
+  fi
+  if ! pid="$(systemctl show "${SERVICE}" -p MainPID --value 2>/dev/null)" ||
+     [[ ! "${pid}" =~ ^[0-9]+$ ]]; then
+    ONLINE_NOTE="Status proses belum tersedia"
+    return 0
+  fi
+  if (( pid == 0 )); then
+    ONLINE_AVAILABLE=1
+    ONLINE_NOTE="Service tidak berjalan"
+    return 0
+  fi
+  # Tracker yang sama dipakai monitor SSH; tidak membuat parser journal baru.
+  # Bila tracker/map belum tersedia, koneksi tetap terlihat sebagai belum dikenali.
+  if [[ -x "${SSH_LIVE_BIN}" ]]; then
+    "${SSH_LIVE_BIN}" refresh >/dev/null 2>&1 || true
+  fi
+  if ! sockets="$(ss -Htnp state established "( sport = :${TARGET_PORT} or dport = :${TARGET_PORT} )" 2>/dev/null)"; then
+    ONLINE_NOTE="Snapshot koneksi belum tersedia"
+    return 0
+  fi
+  map="${SSH_LIVE_MAP}"
+  [[ -r "${map}" ]] || map=/dev/null
+  if ! data="$(awk -F'|' -v owner="${pid}" -v target="${TARGET_PORT}" '
+    FILENAME==ARGV[1] {
+      if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[a-z0-9._-]+$/ &&
+          $3!="root" && $3!="priv" && $3!="net" && $3!="unknown") {
+        auth_pid[$1]=$2; auth_user[$1]=$3;
+      }
+      next;
+    }
+    function port_of(v, p) {
+      p=v; sub(/^.*:/, "", p);
+      return (p ~ /^[0-9]+$/ && p+0>0 && p+0<=65535 ? p : "");
+    }
+    function loopback(v) {
+      sub(/:[0-9]+$/, "", v); gsub(/[\[\]]/, "", v);
+      sub(/^::ffff:/, "", v);
+      return v=="::1" || v ~ /^127\./;
+    }
+    function endpoint(v, p) {
+      p=port_of(v); sub(/:[0-9]+$/, "", v); gsub(/[\[\]]/, "", v);
+      sub(/^::ffff:/, "", v);
+      return v ":" p;
+    }
+    function first_pid(line, p) {
+      if (match(line, /pid=[0-9]+/)) {
+        p=substr(line, RSTART+4, RLENGTH-4); return p;
+      }
+      return "";
+    }
+    {
+      line=$0; sub(/^[[:space:]]+/, "", line);
+      n=split(line, col, /[[:space:]]+/);
+      l=col[3]; r=col[4];
+      if (port_of(l)=="" || port_of(r)=="") { l=col[4]; r=col[5]; }
+      if (!loopback(l) || !loopback(r)) next;
+      lp=port_of(l); rp=port_of(r);
+      if (lp=="" || rp=="") next;
+      if (rp==target) {
+        if ($0 ~ ("pid=" owner "([^0-9]|$)")) client[endpoint(l) SUBSEP endpoint(r)]=lp;
+        else if (first_pid($0)=="") hidden=1;
+      }
+      if (lp==target) server_pid[endpoint(r) SUBSEP endpoint(l)]=first_pid($0);
+    }
+    END {
+      total=0; verified=0; users=0;
+      for (key in client) {
+        p=client[key];
+        total++;
+        if (server_pid[key]!="" && auth_pid[p]==server_pid[key] && auth_user[p]!="") {
+          u=auth_user[p]; per_user[u]++; verified++;
+        }
+      }
+      for (u in per_user) users++;
+      print "summary|" total "|" users "|" verified "|" (total-verified);
+      if (hidden) print "hidden|1";
+      for (u in per_user) print "user|" u "|" per_user[u];
+    }
+  ' "${map}" - <<< "${sockets}" | LC_ALL=C sort)"; then
+    ONLINE_NOTE="Data koneksi belum dapat dibaca"
+    return 0
+  fi
+  ONLINE_AVAILABLE=1
+  while IFS='|' read -r kind a b c d; do
+    case "${kind}" in
+      summary)
+        ONLINE_CONNECTIONS="${a}"; ONLINE_USERS="${b}"
+        ONLINE_AUTHENTICATED="${c}"; ONLINE_UNKNOWN="${d}"
+        ;;
+      hidden) ONLINE_NOTE="Sebagian pemilik koneksi tidak terbaca; angka dapat kurang" ;;
+      user) ONLINE_ROWS+="${a}|${b}"$'\n' ;;
+    esac
+  done <<< "${data}"
+  return 0
+}
+
+print_online_summary() {
+  if (( ONLINE_AVAILABLE == 0 )); then
+    printf '%-14s: %s\n' "Akun online" "BELUM TERSEDIA (${ONLINE_NOTE})"
+    return 0
+  fi
+  printf '%-14s: %s\n' "Akun online" "${ONLINE_USERS} akun unik terverifikasi"
+  printf '%-14s: %s\n' "Koneksi SSH" "${ONLINE_CONNECTIONS} melalui SlowDNS"
+  printf '%-14s: %s\n' "Belum dikenali" "${ONLINE_UNKNOWN} koneksi (belum login / belum terpetakan)"
+  if [[ -n "${ONLINE_NOTE}" ]]; then printf '%-14s: %s\n' "Keterangan" "${ONLINE_NOTE}"; fi
+  return 0
+}
+
+cmd_online() {
+  local user connections
+  collect_online
+  print_online_summary
+  if [[ -n "${ONLINE_ROWS}" ]]; then
+    printf '\n%-24s %s\n' "AKUN SSH" "KONEKSI SLOWDNS"
+    while IFS='|' read -r user connections; do
+      [[ -n "${user}" ]] || continue
+      printf '%-24s %s\n' "${user}" "${connections}"
+    done <<< "${ONLINE_ROWS}"
+  fi
+  say ""
+  say "Akun dihitung unik; satu akun bisa dipakai beberapa perangkat."
+  say "Koneksi adalah snapshot SSH melalui SlowDNS, bukan jumlah orang/IP resolver."
+  return 0
+}
+
 cmd_status() {
   local svc="tidak jalan" rules="BELUM" ip version pub
   load_config
@@ -24469,6 +24615,8 @@ cmd_status() {
   printf '%-14s: %s\n' "Aturan UDP 53" "${rules}"
   printf '%-14s: %s\n' "MTU / RAM" "${MTU} / $(memory_max)"
   printf '%-14s: %s\n' "Binary" "${version:-belum terpasang}"
+  collect_online
+  print_online_summary
 }
 
 nat_counter() {
@@ -24540,13 +24688,14 @@ case "${1:-status}" in
   set-ns) acquire_lock; cmd_set_ns "${2:-}" ;;
   regen-key) acquire_lock; cmd_regen_key ;;
   status) cmd_status ;;
+  online) cmd_online ;;
   records) load_config; cmd_records ;;
   suggest) load_config; suggest_ns "${DOMAIN_MAIN}"; echo ;;
   check) cmd_check ;;
   info) cat "${STATE_FILE}" 2>/dev/null || true ;;
   clear) acquire_lock; cmd_clear ;;
   *)
-    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|records|suggest|check|info|clear}"
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|records|suggest|check|info|clear}"
     exit 1
     ;;
 esac
@@ -33384,6 +33533,12 @@ slowdns_enable_menu() {
   return 0
 }
 
+show_slowdns_online() {
+  draw_menu_header "AKUN ONLINE SLOWDNS"
+  /usr/local/sbin/sc-1forcr-slowdns online
+  return 0
+}
+
 set_slowdns_menu() {
   local bin="/usr/local/sbin/sc-1forcr-slowdns" choice ns ans
   if [[ ! -x "${bin}" ]]; then
@@ -33408,8 +33563,9 @@ set_slowdns_menu() {
   echo "4) Buat Ulang Kunci (pubkey baru)"
   echo "5) Lihat Record DNS yang Dibutuhkan"
   echo "6) Lihat Log SlowDNS"
+  echo "7) Lihat Akun Online SlowDNS"
   echo "0) Kembali"
-  if ! prompt_input choice "Pilih [0-6]: "; then
+  if ! prompt_input choice "Pilih [0-7]: "; then
     return 0
   fi
   case "${choice}" in
@@ -33437,6 +33593,7 @@ set_slowdns_menu() {
       ;;
     5) "${bin}" records | ui_fx || true ;;
     6) journalctl -u sc-1forcr-slowdns.service -n 40 --no-pager -o cat 2>/dev/null || echo "Log SlowDNS belum tersedia." ;;
+    7) ui_monitor show_slowdns_online ;;
     *) return 0 ;;
   esac
   safe_source_env_file /etc/sc-1forcr.env

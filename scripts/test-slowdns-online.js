@@ -1,0 +1,179 @@
+'use strict';
+
+// Hitung akun hanya dari socket DNSTT aktif + port/PID autentikasi Dropbear.
+// SSHWS, journal lama, dan koneksi sebelum login tidak boleh menambah akun online.
+const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const root = path.resolve(__dirname, '..');
+const installer = fs.readFileSync(path.join(root, 'scripts/setup-autoscript-compat.sh'), 'utf8').replace(/\r\n/g, '\n');
+const start = "cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'\n";
+const begin = installer.indexOf(start);
+const end = installer.indexOf('\nSLOWDNS_EOF\n', begin);
+assert(begin >= 0 && end > begin, 'helper SlowDNS tersedia');
+const helper = installer.slice(begin + start.length, end);
+const bash = [process.env.BASH, process.platform === 'win32' ? 'C:\\Program Files\\Git\\bin\\bash.exe' : '', 'bash']
+  .filter(Boolean).find((candidate) => spawnSync(candidate, ['--version'], { encoding: 'utf8' }).status === 0);
+assert(bash, 'bash tersedia');
+const B = (file) => process.platform === 'win32'
+  ? spawnSync(bash, ['-c', 'cygpath -u "$1"', '_', file], { encoding: 'utf8' }).stdout.trim() : file;
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-slowdns-online-'));
+const F = (name) => path.join(tmp, name);
+const bin = F('bin');
+fs.mkdirSync(bin);
+fs.writeFileSync(F('helper'), helper + '\n');
+const write = (name, body) => fs.writeFileSync(F(name), body);
+const read = (name) => fs.existsSync(F(name)) ? fs.readFileSync(F(name), 'utf8') : '';
+const exe = (name, body) => {
+  fs.writeFileSync(path.join(bin, name), '#!/usr/bin/env bash\n' + body + '\n');
+  fs.chmodSync(path.join(bin, name), 0o755);
+};
+exe('systemctl', `printf '%s\\n' "$*" >> "$FAKE_DIR/systemctl.log"
+case "$1" in
+  show) [[ -f "$FAKE_DIR/fail-service" ]] && exit 1; cat "$FAKE_DIR/mainpid" ;;
+  is-active) [[ "$(cat "$FAKE_DIR/mainpid")" != 0 ]] ;;
+  *) echo 'unexpected systemctl mutation' >&2; exit 99 ;;
+esac`);
+exe('ss', `printf '%s\\n' "$*" >> "$FAKE_DIR/ss.log"
+[[ -f "$FAKE_DIR/fail-ss" ]] && exit 1
+cat "$FAKE_DIR/sockets"`);
+exe('ssh-live', `printf '%s\\n' "$*" >> "$FAKE_DIR/tracker.log"
+[[ -f "$FAKE_DIR/fail-tracker" ]] && exit 1
+exit 0`);
+const env = {
+  ...process.env,
+  FAKE_DIR: B(tmp), FAKE_BIN: B(bin), SC_ENV_FILE: B(F('env')),
+  SSH_LIVE_STATE_FILE: B(F('auth.map')),
+  SLOWDNS_SSH_LIVE_BIN: B(path.join(bin, 'ssh-live')),
+  SLOWDNS_STATE_FILE: B(F('state')),
+  SLOWDNS_KEY_DIR: B(F('keys')),
+  SLOWDNS_BIN_PATH: B(F('dnstt-server'))
+};
+const helperPath = B(F('helper'));
+function run(command = 'online') {
+  for (const name of ['systemctl.log', 'ss.log', 'tracker.log']) write(name, '');
+  const r = spawnSync(bash, ['-c', 'export PATH="$FAKE_BIN:$PATH"; exec bash "$1" "$2"', '_', helperPath, command], {
+    env, encoding: 'utf8', timeout: 30000
+  });
+  assert(!r.error, String(r.error));
+  assert.strictEqual(r.status, 0, r.stdout + r.stderr);
+  assert(!/unexpected/.test(r.stderr), r.stderr);
+  return r.stdout;
+}
+function config(enabled = 1, port = 109) {
+  write('env', `SLOWDNS_ENABLE=${enabled}\nDROPBEAR_PORT=${port}\nSLOWDNS_MEMORY_MAX=128M\n`);
+}
+function pair(port, serverPid, options = {}) {
+  const { owner = 1008, addr = '127.0.0.1', target = 109, state = '' } = options;
+  return [
+    `${state}0 0 ${addr}:${port} ${addr}:${target} users:(("dnstt-server",pid=${owner},fd=9))`,
+    `${state}0 0 ${addr}:${target} ${addr}:${port} users:(("dropbear-sc",pid=${serverPid},fd=4))`
+  ].join('\n');
+}
+try {
+  config();
+  write('mainpid', '1008\n');
+  const auth = '40001|301|alice\n40002|302|alice\n40003|303|bob\n40005|999|stale\n40006|306|disconnected\n41001|401|sshws\n';
+  const mixed = [
+    pair(40001, 301),
+    pair(40002, 302, { addr: '[::ffff:127.0.0.1]', state: 'ESTAB ' }),
+    pair(40003, 303, { addr: '[::1]' }),
+    pair(40004, 304), // belum ada autentikasi
+    pair(40005, 305), // port dipakai ulang oleh PID baru: map lama ditolak
+    pair(41001, 401, { owner: 9000 }), // SSHWS ke port Dropbear yang sama
+    pair(41002, 402, { owner: 10080 }), // prefix PID bukan PID DNSTT
+    pair(41003, 403, { target: 143 }), // tujuan bukan port upstream aktif
+    '0 0 127.0.0.1:42000 203.0.113.5:109 users:(("dnstt-server",pid=1008,fd=10))',
+    '0 0 127.0.0.1:109 198.51.100.8:40001 users:(("dropbear-sc",pid=500,fd=4))',
+    pair(40001, 301) // endpoint dan baris ganda tidak menggandakan hitungan
+  ].join('\n') + '\n';
+  write('auth.map', auth);
+  write('sockets', mixed);
+  let out = run();
+  assert(/Akun online\s*: 2 akun unik terverifikasi/.test(out), out);
+  assert(/Koneksi SSH\s*: 5 melalui SlowDNS/.test(out), out);
+  assert(/Belum dikenali\s*: 2 koneksi/.test(out), out);
+  assert(/^alice\s+2$/m.test(out) && /^bob\s+1$/m.test(out), out);
+  assert(!/sshws|stale|disconnected/.test(out), out);
+  assert.strictEqual(read('tracker.log').trim(), 'refresh');
+  assert(read('ss.log').includes('( sport = :109 or dport = :109 )'));
+  assert.strictEqual(read('systemctl.log').trim(), 'show sc-1forcr-slowdns.service -p MainPID --value');
+  out = run('status');
+  assert(/Akun online\s*: 2 akun unik/.test(out) && /Koneksi SSH\s*: 5/.test(out), out);
+
+  // Port sumber yang sama pada IPv4/IPv6 tidak boleh menghubungkan akun SSHWS
+  // ke socket SlowDNS. Kedua sisi harus merupakan pasangan endpoint yang sama.
+  write('sockets', pair(40001, 301) + '\n' + pair(40001, 401, { addr: '[::1]', owner: 9000 }) + '\n');
+  out = run();
+  assert(/^alice\s+1$/m.test(out), out);
+  write('auth.map', '40001|401|sshws\n');
+  out = run();
+  assert(/0 akun/.test(out) && /Belum dikenali\s*: 1/.test(out) && !/^sshws/m.test(out), out);
+  write('auth.map', auth);
+
+  // Socket ditutup: map lama tidak boleh menambah akun ataupun koneksi.
+  write('sockets', '');
+  out = run();
+  assert(/Akun online\s*: 0 akun/.test(out) && /Koneksi SSH\s*: 0/.test(out), out);
+  assert(!/^alice|^bob/m.test(out), out);
+
+  // Map hilang atau PID server tidak terlihat: tampilkan koneksi yang belum terpetakan.
+  write('sockets', mixed);
+  fs.rmSync(F('auth.map'));
+  out = run();
+  assert(/Akun online\s*: 0 akun/.test(out) && /Belum dikenali\s*: 5/.test(out), out);
+  write('auth.map', auth);
+  write('sockets', '0 0 127.0.0.1:40001 127.0.0.1:109 users:(("dnstt-server",pid=1008,fd=9))\n');
+  out = run();
+  assert(/Akun online\s*: 0 akun/.test(out) && /Belum dikenali\s*: 1/.test(out), out);
+
+  // Semua pemilik socket tersembunyi: beri peringatan bahwa angka belum lengkap.
+  write('sockets', mixed.replace(/ users:.*$/gm, ''));
+  out = run();
+  assert(/Sebagian pemilik koneksi tidak terbaca/.test(out), out);
+
+  // Tracker gagal refresh: map yang masih cocok dengan PID/socket tetap dapat digunakan.
+  write('sockets', mixed);
+  write('fail-tracker', '');
+  out = run();
+  assert(/Akun online\s*: 2 akun/.test(out), out);
+  fs.rmSync(F('fail-tracker'));
+
+  // Kegagalan ss/systemctl adalah data tidak tersedia, bukan nol pengguna.
+  write('fail-ss', '');
+  out = run();
+  assert(/BELUM TERSEDIA/.test(out) && !/0 akun/.test(out), out);
+  fs.rmSync(F('fail-ss'));
+  write('fail-service', '');
+  out = run();
+  assert(/BELUM TERSEDIA/.test(out), out);
+  assert.strictEqual(read('ss.log'), '');
+  fs.rmSync(F('fail-service'));
+
+  // Service berhenti dan mode OFF tidak menjalankan tracker atau mengambil socket.
+  write('mainpid', '0\n');
+  out = run();
+  assert(/Service tidak berjalan/.test(out) && /0 akun/.test(out), out);
+  assert.strictEqual(read('ss.log') + read('tracker.log'), '');
+  config(0);
+  out = run();
+  assert(/SlowDNS nonaktif/.test(out), out);
+  assert.strictEqual(read('systemctl.log') + read('ss.log') + read('tracker.log'), '');
+
+  // Port upstream non-default dan output ss yang diawali spasi tetap didukung.
+  config(1, 2223);
+  write('mainpid', '1008\n');
+  write('sockets', pair(40001, 301, { target: 2223, state: '  ESTAB ' }) + '\n');
+  out = run();
+  assert(/1 akun/.test(out) && /Koneksi SSH\s*: 1/.test(out), out);
+  assert(read('ss.log').includes('( sport = :2223 or dport = :2223 )'));
+
+  assert(installer.includes('7) ui_monitor show_slowdns_online ;;'), 'menu memakai monitor refresh/live yang sudah ada');
+  assert(installer.includes('echo "7) Lihat Akun Online SlowDNS"'), 'opsi menu terlihat');
+} finally {
+  fs.rmSync(tmp, { recursive: true, force: true });
+}
+console.log('slowdns online tests passed');

@@ -211,7 +211,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.122}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.123}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23504,7 +23504,7 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # VPS lama rebuild. sc-fast1: terima QTYPE=NULL (record NULL, app HTTP Custom
 # dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
 # plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
-DNSTT_PATCH_ID="sc-fast6"
+DNSTT_PATCH_ID="sc-fast7"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -24412,6 +24412,63 @@ ds = ds.replace(old,
     '\t\tif length <= 255 {\n\t\t\tlength += 1 + len(label)\n\t\t}\n\t}\n'
     '\tif length > 255 {\n')
 io.open(dnspath, 'w', encoding='utf-8', newline='\n').write(ds)
+# sc-fast7: format RR bersama klien Android; TXT/NULL tetap kompatibel.
+from pathlib import Path
+io.open(os.path.join(mod, 'dns', 'sc_records.go'), 'w', encoding='utf-8', newline='\n').write('package dns\n\n// Shared by the Android client and AutoSC server. TXT/NULL retain upstream wire compatibility.\nimport (\n\t"bytes"\n\t"encoding/base32"\n\t"encoding/binary"\n\t"errors"\n\t"io"\n\t"strings"\n)\n\nvar tunnelEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)\nvar tunnelSuffix = Name{[]byte("dnstt"), []byte("invalid")}\nvar errTunnelRecord = errors.New("invalid tunnel DNS record")\n\nfunc TunnelType(t uint16) bool {\n\tswitch t {\n\tcase 1, 2, 5, 10, 15, 16, 28, 33:\n\t\treturn true\n\t}\n\treturn false\n}\n\n// TunnelCapacity includes the two-byte packet prefixes carried inside the payload.\n// nameLen is the uncompressed question name length, including the root label.\nfunc TunnelCapacity(t uint16, size, nameLen int) int {\n\tbase := 12 + nameLen + 4 + 11 // header, question, OPT\n\tavail := size - base - 12     // one answer header with compressed owner name\n\tif avail < 0 {\n\t\treturn 0\n\t}\n\tswitch t {\n\tcase 10:\n\t\treturn avail\n\tcase 16:\n\t\tn := avail\n\t\tfor n > 0 && n+(n+254)/255 > avail {\n\t\t\tn--\n\t\t}\n\t\treturn n\n\tcase 1, 28:\n\t\tunit, chunk := 16, 3\n\t\tif t == 28 {\n\t\t\tunit, chunk = 28, 15\n\t\t}\n\t\tcount := (size - base) / unit\n\t\tif count > 256 {\n\t\t\tcount = 256\n\t\t}\n\t\tif count < 1 {\n\t\t\treturn 0\n\t\t}\n\t\treturn count*chunk - 2\n\tcase 2, 5, 15, 33:\n\t\tprefix := 0\n\t\tif t == 15 {\n\t\t\tprefix = 2\n\t\t}\n\t\tif t == 33 {\n\t\t\tprefix = 6\n\t\t}\n\t\tavail -= prefix\n\t\tif avail > 255 {\n\t\t\tavail = 255\n\t\t}\n\t\t// The suffix occupies 15 octets. Each data label adds a length octet.\n\t\tfor n := 147; n >= 0; n-- {\n\t\t\tchars := tunnelEncoding.EncodedLen(n)\n\t\t\tlabels := (chars + 62) / 63\n\t\t\tif chars+labels+15 <= avail {\n\t\t\t\treturn n\n\t\t\t}\n\t\t}\n\t}\n\treturn 0\n}\n\nfunc TunnelAnswers(q Question, ttl uint32, payload []byte) ([]RR, error) {\n\trr := RR{Name: q.Name, Type: q.Type, Class: q.Class, TTL: ttl}\n\tswitch q.Type {\n\tcase 16:\n\t\trr.Data = EncodeRDataTXT(payload)\n\tcase 10:\n\t\trr.Data = append([]byte(nil), payload...)\n\tcase 2, 5, 15, 33:\n\t\tencoded := strings.ToLower(tunnelEncoding.EncodeToString(payload))\n\t\tlabels := Name{}\n\t\tfor len(encoded) > 0 {\n\t\t\tn := len(encoded)\n\t\t\tif n > 63 {\n\t\t\t\tn = 63\n\t\t\t}\n\t\t\tlabels = append(labels, []byte(encoded[:n]))\n\t\t\tencoded = encoded[n:]\n\t\t}\n\t\tlabels = append(labels, tunnelSuffix...)\n\t\tif _, err := NewName(labels); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t\tprefix := 0\n\t\tif q.Type == 15 {\n\t\t\tprefix = 2\n\t\t}\n\t\tif q.Type == 33 {\n\t\t\tprefix = 6\n\t\t}\n\t\trr.Data = make([]byte, prefix)\n\t\tfor _, label := range labels {\n\t\t\trr.Data = append(rr.Data, byte(len(label)))\n\t\t\trr.Data = append(rr.Data, label...)\n\t\t}\n\t\trr.Data = append(rr.Data, 0)\n\tcase 1, 28:\n\t\twidth := 4\n\t\tif q.Type == 28 {\n\t\t\twidth = 16\n\t\t}\n\t\tchunk := width - 1\n\t\tif len(payload)+2 > 256*chunk {\n\t\t\treturn nil, errTunnelRecord\n\t\t}\n\t\tframed := make([]byte, 2+len(payload))\n\t\tbinary.BigEndian.PutUint16(framed, uint16(len(payload)))\n\t\tcopy(framed[2:], payload)\n\t\tresult := make([]RR, 0, (len(framed)+chunk-1)/chunk)\n\t\tfor i, off := 0, 0; off < len(framed); i, off = i+1, off+chunk {\n\t\t\tpart := rr\n\t\t\tpart.Data = make([]byte, width)\n\t\t\tpart.Data[0] = byte(i)\n\t\t\tcopy(part.Data[1:], framed[off:])\n\t\t\tresult = append(result, part)\n\t\t}\n\t\treturn result, nil\n\tdefault:\n\t\treturn nil, errTunnelRecord\n\t}\n\treturn []RR{rr}, nil\n}\n\n// DecodeTunnelResponse resolves compressed RDATA names against the original message,\n// rather than interpreting a copied RDATA slice as an independent DNS packet.\nfunc DecodeTunnelResponse(wire []byte, domain Name, kind uint16) ([]byte, error) {\n\tmsg, err := MessageFromWireFormat(wire)\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\tif msg.Flags&0x820f != 0x8000 || len(msg.Question) != 1 || msg.Question[0].Type != kind {\n\t\treturn nil, errTunnelRecord\n\t}\n\tif _, ok := msg.Question[0].Name.TrimSuffix(domain); !ok {\n\t\treturn nil, errTunnelRecord\n\t}\n\t// Preserve the one-parse fast path for the default TXT/NULL transports.\n\tif kind == 16 || kind == 10 {\n\t\tif len(msg.Answer) != 1 {\n\t\t\treturn nil, errTunnelRecord\n\t\t}\n\t\trr := msg.Answer[0]\n\t\tif rr.Type != kind || rr.Class != ClassIN || !tunnelNameEqual(rr.Name, msg.Question[0].Name) {\n\t\t\treturn nil, errTunnelRecord\n\t\t}\n\t\tif kind == 10 {\n\t\t\treturn rr.Data, nil\n\t\t}\n\t\treturn DecodeRDataTXT(rr.Data)\n\t}\n\tvar r *bytes.Reader\n\tif kind != 1 && kind != 28 {\n\t\tr = bytes.NewReader(wire)\n\t\tr.Seek(12, io.SeekStart)\n\t\tif _, err = readQuestion(r); err != nil {\n\t\t\treturn nil, err\n\t\t}\n\t}\n\tvar single []byte\n\tfound := false\n\tparts := make(map[int][]byte)\n\twidth := 4\n\tif kind == 28 {\n\t\twidth = 16\n\t}\n\tfor _, answer := range msg.Answer {\n\t\trr := answer\n\t\tvar end int64\n\t\tif r != nil {\n\t\t\trr, err = readRR(r)\n\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n\t\t\tend, _ = r.Seek(0, io.SeekCurrent)\n\t\t}\n\t\tif rr.Type != kind || rr.Class != ClassIN || !tunnelNameEqual(rr.Name, msg.Question[0].Name) {\n\t\t\tcontinue\n\t\t}\n\t\tswitch kind {\n\t\tcase 1, 28:\n\t\t\tif len(rr.Data) != width {\n\t\t\t\treturn nil, errTunnelRecord\n\t\t\t}\n\t\t\tindex := int(rr.Data[0])\n\t\t\tpart := rr.Data[1:]\n\t\t\tif old, ok := parts[index]; ok && !bytes.Equal(old, part) {\n\t\t\t\treturn nil, errTunnelRecord\n\t\t\t}\n\t\t\tparts[index] = part\n\t\tcase 16, 10, 2, 5, 15, 33:\n\t\t\tif found {\n\t\t\t\treturn nil, errTunnelRecord\n\t\t\t}\n\t\t\tfound = true\n\t\t\tswitch kind {\n\t\t\tcase 16:\n\t\t\t\tsingle, err = DecodeRDataTXT(rr.Data)\n\t\t\tcase 10:\n\t\t\t\tsingle = rr.Data\n\t\t\tdefault:\n\t\t\t\tprefix := 0\n\t\t\t\tif kind == 15 {\n\t\t\t\t\tprefix = 2\n\t\t\t\t}\n\t\t\t\tif kind == 33 {\n\t\t\t\t\tprefix = 6\n\t\t\t\t}\n\t\t\t\tif len(rr.Data) < prefix+1 {\n\t\t\t\t\treturn nil, errTunnelRecord\n\t\t\t\t}\n\t\t\t\tnr := bytes.NewReader(wire)\n\t\t\t\tnr.Seek(end-int64(len(rr.Data))+int64(prefix), io.SeekStart)\n\t\t\t\tname, e := readName(nr)\n\t\t\t\tif e != nil {\n\t\t\t\t\treturn nil, e\n\t\t\t\t}\n\t\t\t\tpos, _ := nr.Seek(0, io.SeekCurrent)\n\t\t\t\tif pos != end {\n\t\t\t\t\treturn nil, errTunnelRecord\n\t\t\t\t}\n\t\t\t\tlabels, ok := name.TrimSuffix(tunnelSuffix)\n\t\t\t\tif !ok {\n\t\t\t\t\treturn nil, errTunnelRecord\n\t\t\t\t}\n\t\t\t\tsingle, err = tunnelEncoding.DecodeString(strings.ToUpper(string(bytes.Join(labels, nil))))\n\t\t\t}\n\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n\t\tdefault:\n\t\t\treturn nil, errTunnelRecord\n\t\t}\n\t}\n\tif kind != 1 && kind != 28 {\n\t\tif !found {\n\t\t\treturn nil, errTunnelRecord\n\t\t}\n\t\treturn single, nil\n\t}\n\tif len(parts) == 0 {\n\t\treturn nil, errTunnelRecord\n\t}\n\tjoined := make([]byte, 0, len(parts)*(width-1))\n\tfor i := 0; i < len(parts); i++ {\n\t\tp, ok := parts[i]\n\t\tif !ok {\n\t\t\treturn nil, errTunnelRecord\n\t\t}\n\t\tjoined = append(joined, p...)\n\t}\n\tif len(joined) < 2 {\n\t\treturn nil, errTunnelRecord\n\t}\n\tn := int(binary.BigEndian.Uint16(joined))\n\tif n > len(joined)-2 || (n+2+width-2)/(width-1) != len(parts) {\n\t\treturn nil, errTunnelRecord\n\t}\n\treturn joined[2 : 2+n], nil\n}\n\nfunc tunnelNameEqual(a, b Name) bool {\n\tif len(a) != len(b) {\n\t\treturn false\n\t}\n\tfor i := range a {\n\t\tif !bytes.EqualFold(a[i], b[i]) {\n\t\t\treturn false\n\t\t}\n\t}\n\treturn true\n}\n')
+def patch_server(mod):
+    path = Path(mod) / 'dnstt-server/main.go'
+    src = path.read_text(encoding='utf-8')
+    def replace(old, new):
+        nonlocal src
+        if src.count(old) != 1:
+            raise RuntimeError('server anchor count: ' + repr(old[:90]))
+        src = src.replace(old, new)
+    replace('if question.Type != dns.RRTypeTXT && question.Type != rrTypeNULL {',
+            'if !dns.TunnelType(question.Type) {')
+    replace('\t_ = payloadSize', '''\tcapacitySize := payloadSize
+    if capacitySize > maxUDPPayload { capacitySize = maxUDPPayload }
+    if len(payload) >= 8 && ((question.Type == 1 && capacitySize < 1232) || dns.TunnelCapacity(question.Type, capacitySize, 255) < 52) {
+        resp.Flags |= dns.RcodeFormatError
+        return resp, nil
+    }''')
+    # Keep the existing bounded map and lock. New types need their own downstream MTU.
+    replace('clientEdns   = make(map[turbotunnel.ClientID]int)',
+            'clientEdns   = make(map[turbotunnel.ClientID]int)\n clientKinds = make(map[turbotunnel.ClientID]uint16)')
+    replace('delete(clientEdns, cid)', 'delete(clientEdns, cid)\n delete(clientKinds, cid)')
+    replace('func clientEdnsRecord(cid turbotunnel.ClientID, size int) {',
+            'func clientEdnsRecord(cid turbotunnel.ClientID, size int, kinds ...uint16) {')
+    replace('} else if len(clientEdns) < clientEdnsMax {\n\t\tclientEdns[cid] = size',
+            '} else if len(clientEdns) < clientEdnsMax {\n\t\tclientEdns[cid] = size\n        if len(kinds) != 0 { clientKinds[cid] = kinds[0] }')
+    replace('clientEdnsRecord(clientID, size)', 'clientEdnsRecord(clientID, size, query.Question[0].Type)')
+    replace('\t\t\tedns = clientEdnsSize(cid)', '''\t\t\tedns = clientEdnsSize(cid)
+            clientEdnsMu.Lock()
+            kind := clientKinds[cid]
+            clientEdnsMu.Unlock()
+            if kind != 0 && kind != dns.RRTypeTXT && kind != rrTypeNULL {
+                // Fixed for the lifetime of the ClientID; never shrink a live KCP session.
+                permtu = dns.TunnelCapacity(kind, 512, 255) - 2
+                if kind == 1 { permtu = dns.TunnelCapacity(kind, 1232, 255) - 2 }
+                edns = 0
+            }''')
+    replace('\tsaved := resp.Answer[0].Data', '''\tif kind := resp.Answer[0].Type; kind != dns.RRTypeTXT && kind != rrTypeNULL {
+        nameLen := 1
+        for _, label := range resp.Question[0].Name { nameLen += len(label)+1 }
+        return dns.TunnelCapacity(kind, sizeCap, nameLen)
+    }
+    saved := resp.Answer[0].Data''')
+    old='''\t\t\tif rec.Resp.Answer[0].Type == rrTypeNULL {
+\t\t\t\trec.Resp.Answer[0].Data = append([]byte(nil), payload.Bytes()...)
+\t\t\t} else {
+\t\t\t\trec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
+\t\t\t}'''
+    replace(old, '''            answers, encodeErr := dns.TunnelAnswers(rec.Resp.Question[0], responseTTL, payload.Bytes())
+            if encodeErr != nil { continue }
+            rec.Resp.Answer = answers''')
+    path.write_text(src, encoding='utf-8', newline='\n')
+
+
+patch_server(mod)
+
 SLOWDNS_PATCH_PY
   then
     rm -rf "${work}"

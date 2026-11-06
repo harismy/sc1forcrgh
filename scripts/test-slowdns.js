@@ -91,7 +91,7 @@ assert(patchPy.includes('avail := sizeCap - len(buf)') && patchPy.includes('l+(l
   'patch sc-fast3: maxPayloadForResponse aritmatika (ganti binary-search per respons)');
 assert(patchPy.includes('NewName length anchor not found') && patchPy.includes('length <= 255'),
   'patch sc-fast6: validasi panjang nama tanpa serializer/cache sementara');
-assert(patchPy.includes("'\\tvar buf [4096]byte\\n\\tfor {") && helper.includes('DNSTT_PATCH_ID="sc-fast6"'),
+assert(patchPy.includes("'\\tvar buf [4096]byte\\n\\tfor {") && helper.includes('DNSTT_PATCH_ID="sc-fast7"'),
   'patch sc-fast6: buffer baca dipakai ulang dan binary lama dibangun ulang');
 assert(/if \(\( MTU == 512 \)\); then MTU=1232; fi/.test(helper),
   'helper menaikkan SLOWDNS_MTU lama 512 ke 1232 (hindari choke app buffer besar)');

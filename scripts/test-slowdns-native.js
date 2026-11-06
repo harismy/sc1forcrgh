@@ -111,6 +111,7 @@ async function main() {
                 const part = p.subarray(i, Math.min(i + 255, end));
                 chunks.push(Buffer.from([part.length]), part);
               }
+              if (chunks.length === 0) chunks.push(Buffer.from([0]));
               const txt = Buffer.concat(chunks), length = Buffer.alloc(2);
               length.writeUInt16BE(txt.length);
               p.writeUInt16BE(16, rr);

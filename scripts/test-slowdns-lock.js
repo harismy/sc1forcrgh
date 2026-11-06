@@ -144,6 +144,8 @@ function fixture() {
   f.snapshot([['a', 300, 40001], ['b', 300, 40002]]); await f.api.lockIfExceeded(1360);
   assert(f.actions.some((a) => a[0] === 'passwd' && a[1] === '-l' && a[2] === 'alice'));
   assert(f.actions.some((a) => a[0] === 'disconnect' && a[1] === 'alice'));
+  assert(f.actions.findIndex((a) => a[0] === 'passwd' && a[1] === '-l') <
+    f.actions.findIndex((a) => a[0] === 'disconnect'), 'password harus terkunci sebelum sesi diputus agar reconnect tidak lolos');
   assert(f.actions.some((a) => a[0] === 'temporary-lock' && a[2] === 2260));
   assert.strictEqual(f.histories[0].service, 'slowdns');
   assert.strictEqual(f.histories[0].locked_until - f.histories[0].locked_at, 900);

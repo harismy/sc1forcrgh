@@ -36,7 +36,7 @@
     "test:update-compat": "node scripts/test-update-compat.js",
     "test:cli-output": "node scripts/test-cli-account-output.js",
     "test:extra-ports": "node scripts/test-extra-ports.js",
-    "test:slowdns": "node scripts/test-slowdns.js && node scripts/test-slowdns-online.js && node scripts/test-slowdns-lock.js && node scripts/test-slowdns-efficiency.js",
+    "test:slowdns": "node scripts/test-slowdns.js && node scripts/test-slowdns-online.js && node scripts/test-slowdns-lock.js && node scripts/test-ssh-lock-enforcement.js && node scripts/test-slowdns-efficiency.js",
     "test:slowdns-native": "node scripts/test-slowdns-native.js",
     "test:cert-sync": "node scripts/test-cert-sync.js",
     "test:mux-multipath": "node scripts/test-mux-multipath.js",

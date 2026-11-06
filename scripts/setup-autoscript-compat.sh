@@ -211,7 +211,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.123}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.124}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -12446,20 +12446,69 @@ function safeExec(cmd, args, input) {
 //     pola lama tidak cocok.
 // Dibaca segar (bukan snapshot awal siklus) supaya tidak ada risiko PID
 // sudah didaur ulang ke proses lain saat dibunuh.
-function collectSshSessionPids(username) {
-  const u = String(username || '').trim().toLowerCase();
-  if (!u || u === 'root' || !/^[a-z0-9._-]+$/.test(u)) return [];
+function readSshSessionSnapshot() {
   let psOut = '';
+  let available = true;
   try {
     psOut = execFileSync('ps', ['-eo', 'pid=,user=,args='], {
-      encoding: 'utf8',
+      encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 5000,
       stdio: ['ignore', 'pipe', 'ignore']
     });
-  } catch (_) {
-    return [];
+  } catch (_) { available = false; }
+  const snapshot = { psOut: String(psOut || ''), dropbear: new Map(), starts: new Map(), available };
+  // Dropbear forwarding-only berjalan sebagai root dengan argumen daemon asli.
+  // Identitasnya harus dari autentikasi, lalu dicocokkan PID DAN port socket segar.
+  let state = '';
+  try { state = fs.readFileSync('/run/sc-1forcr/ssh-live.map', 'utf8'); } catch (_) {}
+  const auth = new Map();
+  const conflicts = new Set();
+  for (const line of String(state || '').split(/\r?\n/)) {
+    const [port, rawPid, rawUser] = line.trim().split('|');
+    const pid = Number(rawPid), user = String(rawUser || '').toLowerCase();
+    if (!/^\d{1,5}$/.test(port || '') || Number(port) < 1 || Number(port) > 65535 ||
+        !Number.isSafeInteger(pid) || pid <= 1 || !/^[a-z0-9._-]+$/.test(user) ||
+        ['root', 'priv', 'net', 'unknown'].includes(user)) continue;
+    if (auth.has(pid) && auth.get(pid).user !== user) conflicts.add(pid);
+    if (!auth.has(pid)) auth.set(pid, { user, ports: new Set() });
+    auth.get(pid).ports.add(Number(port));
   }
+  if (auth.size === 0) return snapshot;
+  let sockets = '';
+  try {
+    // Semua state dibutuhkan agar PID listener tidak pernah ikut diputus.
+    sockets = execFileSync('ss', ['-Htanp'], {
+      encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+  } catch (_) { snapshot.available = false; return snapshot; }
+  const listeners = new Set(), connected = new Set();
+  const ports = new Set([Number(DROPBEAR_PORT), Number(DROPBEAR_ALT_PORT)]
+    .filter((p) => Number.isInteger(p) && p >= 1 && p <= 65535));
+  for (const line of String(sockets || '').split('\n')) {
+    const cols = line.trim().split(/\s+/);
+    const pids = Array.from(line.matchAll(/\bpid=(\d+)/g), (m) => Number(m[1]));
+    if (cols[0] === 'LISTEN') { for (const pid of pids) listeners.add(pid); continue; }
+    if (cols[0] !== 'ESTAB') continue;
+    const localPort = Number(cols[3]?.match(/:(\d+)$/)?.[1]);
+    const remotePort = Number(cols[4]?.match(/:(\d+)$/)?.[1]);
+    if (!ports.has(localPort)) continue;
+    for (const pid of pids) {
+      if (auth.get(pid)?.ports.has(remotePort) && !conflicts.has(pid)) connected.add(pid);
+    }
+  }
+  for (const pid of connected) {
+    if (listeners.has(pid) || pid === process.pid || pid === process.ppid) continue;
+    snapshot.dropbear.set(pid, auth.get(pid).user);
+  }
+  return snapshot;
+}
+
+function collectSshSessionPids(username, suppliedSnapshot = null) {
+  const u = String(username || '').trim().toLowerCase();
+  if (!u || u === 'root' || !/^[a-z0-9._-]+$/.test(u)) return [];
+  const snapshot = suppliedSnapshot || readSshSessionSnapshot();
   const out = new Set();
-  for (const lineRaw of String(psOut || '').split('\n')) {
+  for (const lineRaw of snapshot.psOut.split('\n')) {
     const m = String(lineRaw || '').match(/^\s*(\d+)\s+(\S+)\s+(.*)$/);
     if (!m) continue;
     const pid = Number(m[1]);
@@ -12479,21 +12528,70 @@ function collectSshSessionPids(username) {
     if (!hit && /dropbear/i.test(args)) {
       const brack = args.match(/\[([^\]]+)\]/);
       if (brack && String(brack[1] || '').trim().toLowerCase() === u) hit = true;
+      const executable = args.split(/\s+/, 1)[0].split('/').pop();
+      if (/^dropbear(?:[-.][0-9][a-z0-9.-]*)?$/i.test(executable) && snapshot.dropbear.get(pid) === u) hit = true;
     }
     // proses apa pun yang memang dimiliki akun tunnel itu sendiri
     if (!hit && owner === u) hit = true;
-    if (hit) out.add(pid);
+    if (hit) {
+      const started = readProcStartTicks(pid);
+      if (started !== '0') { out.add(pid); snapshot.starts.set(pid, started); }
+    }
   }
   return Array.from(out);
 }
 
-function killSshSessionsForUser(username) {
-  const pids = collectSshSessionPids(username);
+function killSshSessionsForUser(username, suppliedSnapshot = null) {
+  const snapshot = suppliedSnapshot || readSshSessionSnapshot();
+  const pids = collectSshSessionPids(username, snapshot);
   let killed = 0;
   for (const pid of pids) {
+    if (readProcStartTicks(pid) !== snapshot.starts.get(pid)) continue;
     if (safeExec('kill', ['-KILL', String(pid)])) killed += 1;
   }
   return { attempted: pids.length, killed };
+}
+
+// Status LOCK_TMP tidak ikut query akun AKTIF. Karena itu lock lama wajib
+// ditegakkan lagi setiap siklus, tanpa memperpanjang expiry atau mengirim notif ulang.
+async function enforceTemporarySshLocks(nowTs) {
+  const rows = await all(
+    "SELECT a.username FROM temp_ip_locks l JOIN account_sshs a ON LOWER(a.username)=LOWER(l.username) " +
+    "WHERE l.account_type='ssh' AND l.locked_until > ? AND UPPER(TRIM(COALESCE(a.status,'')))='LOCK_TMP'",
+    [nowTs]
+  );
+  if (rows.length === 0) return;
+  let shadow = '';
+  try { shadow = fs.readFileSync('/etc/shadow', 'utf8'); } catch (_) {}
+  const lockedPasswords = new Set();
+  for (const line of shadow.split('\n')) {
+    const [user, hash] = line.split(':');
+    if (/^[!*]/.test(hash || '')) lockedPasswords.add(user.toLowerCase());
+  }
+  const snapshot = readSshSessionSnapshot();
+  const cut = [];
+  for (const row of rows) {
+    const user = String(row.username || '').trim();
+    if (!user || user.toLowerCase() === 'root' || !/^[a-zA-Z0-9._-]+$/.test(user)) continue;
+    if (!lockedPasswords.has(user.toLowerCase()) &&
+        !safeExec('passwd', ['-l', user]) && !safeExec('usermod', ['-L', user])) {
+      console.error(`[iplimit-lock] temporary-lock user=${user}: gagal mengunci password Linux; akan dicoba siklus berikutnya.`);
+    }
+    const result = killSshSessionsForUser(user, snapshot);
+    if (result.attempted > 0) cut.push(user);
+  }
+  if (cut.length > 0) {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const after = readSshSessionSnapshot();
+    if (!after.available) {
+      console.error('[iplimit-lock] temporary-lock: snapshot proses/socket gagal; pemutusan belum dapat diverifikasi.');
+      return;
+    }
+    for (const user of cut) {
+      const remaining = collectSshSessionPids(user, after);
+      if (remaining.length > 0) console.error(`[iplimit-lock] temporary-lock user=${user}: ${remaining.length} sesi masih hidup setelah percobaan ulang.`);
+    }
+  }
 }
 
 // Dipanggil setelah semua upaya pemutusan supaya kegagalan memutus sesi
@@ -12501,9 +12599,14 @@ function killSshSessionsForUser(username) {
 async function verifySshSessionsClosed(username, context) {
   try {
     await new Promise((resolve) => setTimeout(resolve, 400));
-    const leftover = collectSshSessionPids(username);
+    const snapshot = readSshSessionSnapshot();
+    if (!snapshot.available) {
+      console.error(`[iplimit-lock] ${context} user=${username}: snapshot proses/socket gagal; pemutusan belum dapat diverifikasi.`);
+      return false;
+    }
+    const leftover = collectSshSessionPids(username, snapshot);
     if (leftover.length > 0) {
-      console.error(`[iplimit-lock] ${context} user=${username}: ${leftover.length} sesi SSH masih hidup setelah lock (pid=${leftover.slice(0, 10).join(',')}). Cek dukungan 'ss -K' dan judul proses SSH di VPS ini.`);
+      console.error(`[iplimit-lock] ${context} user=${username}: ${leftover.length} sesi SSH masih hidup setelah lock (pid=${leftover.slice(0, 10).join(',')}). Cek pemetaan autentikasi dan izin kill di VPS ini.`);
       return false;
     }
     return true;
@@ -15249,14 +15352,17 @@ async function lockIfExceeded(nowTs) {
       } catch (_) { continue; }
     }
 
+    // Tutup autentikasi baru sebelum memutus sesi, agar reconnect tidak lolos
+    // di sela sapuan pertama dan penguncian password.
+    if (!safeExec('passwd', ['-l', user]) && !safeExec('usermod', ['-L', user])) {
+      console.error(`[iplimit-lock] multi-login user=${user}: gagal mengunci password Linux.`);
+    }
     // Putuskan sesi aktif SSH user yang baru di-lock.
-    // Bunuh per-PID lebih dulu: ini yang paling andal karena tidak bergantung
-    // pada format judul proses maupun kepemilikan proses. pkill pola lama
-    // tetap dijalankan sebagai lapisan cadangan.
+    // PID terverifikasi menangani Dropbear root; UID menangani proses user.
+    // Hindari pkill -f berbasis prefix nama: user lain dengan nama lebih panjang
+    // bisa ikut cocok dengan pola seperti "sshd: alice".
     killSshSessionsForUser(user);
     safeExec('pkill', ['-KILL', '-u', user]);
-    safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
-    safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
     const activeWsPorts = Array.from(setUnionValues(sshWsClientPortMap));
     const recentAuthPorts = Array.from(extractClientPortsFromSessionKeys(setUnionValues(sshRecentAuthMap)));
     const sessionPorts = Array.from(extractClientPortsFromSessionKeys(setUnionValues(sshSessionMap)));
@@ -15763,6 +15869,7 @@ async function main() {
   const u = await unlockExpired(now);
   const q = await enforceQuotaLimits();
   const l = await lockIfExceeded(now);
+  await enforceTemporarySshLocks(now);
   const staleLockSync = await detectLockedUsersStillInXrayConfig().catch(() => ({ changed: false, users: [] }));
   await cleanupOrphanXrayDropRules().catch(() => {});
   if (staleLockSync.changed && IPLIMIT_DEBUG) {

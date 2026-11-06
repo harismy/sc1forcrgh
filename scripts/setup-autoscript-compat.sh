@@ -211,7 +211,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.121}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.122}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -23504,7 +23504,7 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # VPS lama rebuild. sc-fast1: terima QTYPE=NULL (record NULL, app HTTP Custom
 # dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
 # plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
-DNSTT_PATCH_ID="sc-fast5"
+DNSTT_PATCH_ID="sc-fast6"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -24391,6 +24391,27 @@ func scResponseWireFormat(resp *dns.Message) ([]byte, error) {
     return buf, nil
 }
 ''')
+# sc-fast6: satu buffer baca untuk umur recvLoop. Parser DNS menyalin label dan
+# RDATA; payload base32/nextPacket juga punya buffer sendiri. Record tertunda
+# tidak meminjam buf ini, sehingga paket berikutnya boleh menimpanya.
+repl('\tfor {\n\t\tvar buf [4096]byte\n\t\tn, addr, err := dnsConn.ReadFrom(buf[:])',
+     '\tvar buf [4096]byte\n\tfor {\n\t\tn, addr, err := dnsConn.ReadFrom(buf[:])')
+io.open(mainpath, 'w', encoding='utf-8', newline='\n').write(src)
+# NewName hanya perlu validasi batas 255 byte. Hindari membangun nama/cache
+# sementara untuk menghitung panjang. Validasi label upstream tetap didahulukan
+# agar ErrZeroLengthLabel/ErrLabelTooLong tidak berubah ketika nama terlalu panjang.
+dnspath = os.path.join(mod, 'dns', 'dns.go')
+ds = io.open(dnspath, encoding='utf-8').read()
+old = '\t// Check the total length.\n\tbuilder := newMessageBuilder()\n\tbuilder.WriteName(name)\n\tif len(builder.Bytes()) > 255 {\n'
+if ds.count(old) != 1:
+    raise SystemExit('NewName length anchor not found')
+ds = ds.replace(old,
+    '\t// Panjang wire nama = byte root + panjang setiap label dan prefiksnya.\n'
+    '\tlength := 1\n\tfor _, label := range labels {\n'
+    '\t\t// Batasi akumulator, tetapi seluruh label telah divalidasi di atas.\n'
+    '\t\tif length <= 255 {\n\t\t\tlength += 1 + len(label)\n\t\t}\n\t}\n'
+    '\tif length > 255 {\n')
+io.open(dnspath, 'w', encoding='utf-8', newline='\n').write(ds)
 SLOWDNS_PATCH_PY
   then
     rm -rf "${work}"

@@ -114,6 +114,19 @@ gate/DROP/rule lain, NAT, dan rule dengan pembatas tambahan dipertahankan. Chain
 bersih tidak ditulis ulang. Pengukuran lokal dan batas interpretasinya ada di
 [catatan benchmark](docs/slowdns-efficiency-v121.md).
 
+### Penerimaan query lebih ringan V.1FSC.122
+
+Patch `sc-fast6` memakai ulang satu buffer baca 4096 byte sepanjang receive-loop
+dan memvalidasi panjang nama DNS tanpa membentuk paket/cache sementara.
+Parser tetap memiliki salinan label dan payload sendiri, sehingga paket yang
+menunggu diproses tidak berubah ketika buffer baca dipakai untuk query berikutnya.
+MTU, KCP, interval, jumlah core, GC, dan ukuran buffer socket UDP tetap sama.
+
+Pada simulasi receive-loop lokal, alokasi turun dari 6105 menjadi 840 B/query
+dan waktu pemrosesan sekitar 2,3 kali lebih cepat. Ini belum menyatakan penurunan
+CPU total VPS; pengukuran setelah update tetap diperlukan. Lihat
+[benchmark penerimaan query](docs/slowdns-receive-v122.md).
+
 ## DNS Resolver Guard
 
 SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui

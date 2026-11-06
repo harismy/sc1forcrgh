@@ -47,7 +47,8 @@ lintas siklus yang dapat mengubah keputusan lock.
 
 - `npm run test:slowdns`: helper, online, auto-lock, firewall, dan snapshot tracker.
 - Terapkan `SLOWDNS_PATCH_PY` dari installer ke ZIP DNSTT yang checksum-nya dipin,
-  lalu salin dua file `scripts/go/slowdns_*_test.go` ke paket `dnstt-server`.
+  lalu salin `scripts/go/slowdns_sessions_test.go` dan
+  `scripts/go/slowdns_wire_test.go` ke paket `dnstt-server`.
 - `go test ./...` dan
   `go test ./dnstt-server -run '^TestSC' -bench '^BenchmarkSCResponse' -benchmem -count=3`.
   Paritas wire meliputi TXT/NULL, root/nama maksimum/label biner, EDNS/TTL/flags,

@@ -1,0 +1,33 @@
+[Unit]
+Description=Portable SlowDNS server (DNSTT sc-fast8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dnstt-portable
+Group=dnstt-portable
+EnvironmentFile=/etc/dnstt-portable/server.env
+Environment=SLOWDNS_SESSION_SOCKET=/run/dnstt-portable/sessions.sock
+ExecStart=/usr/local/lib/dnstt-portable/dnstt-server -udp :${DNS_UDP_PORT} -privkey-file /etc/dnstt-portable/server.key -mtu ${DNS_MTU} ${TUNNEL_DOMAIN} ${SSH_UPSTREAM}
+Restart=always
+RestartSec=3
+RuntimeDirectory=dnstt-portable
+RuntimeDirectoryMode=0700
+MemoryMax=128M
+TasksMax=64
+LimitNOFILE=8192
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=120
+
+[Install]
+WantedBy=multi-user.target

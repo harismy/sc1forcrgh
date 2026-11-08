@@ -93,6 +93,8 @@ set -euo pipefail
 #   SLOWDNS_LISTEN_PORT=5300                    (opsional, port UDP lokal dnstt; UDP 53 publik dialihkan ke sini)
 #   SLOWDNS_MTU=1232                            (opsional, batas ATAS ukuran respons DNS; app ber-buffer kecil tetap diterima)
 #   SLOWDNS_MEMORY_MAX=auto                     (opsional, batas RAM service SlowDNS; auto 128M di VPS 1 GB)
+#   SLOWDNS_KCP_INTERVAL=10                     (opsional, interval KCP 10-50 ms untuk uji CPU; default 10)
+#   SLOWDNS_KCP_ACK_NODELAY=0                   (opsional, 1=ACK KCP dikirim langsung; default 0)
 #   SLOWDNS_AUTO_LOCK_ENABLE=1                  (batas tunnel aktif mengikuti limit akun SSH; lock sementara 15 menit)
 #   SLOWDNS_BIN_URL= / SLOWDNS_BIN_SHA256=      (opsional, binary dnstt-server siap pakai; default build dari source)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
@@ -211,7 +213,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.124}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.125}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -277,6 +279,8 @@ SLOWDNS_LISTEN_PORT="${SLOWDNS_LISTEN_PORT:-5300}"
 SLOWDNS_MTU="${SLOWDNS_MTU:-1232}"
 SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}"
 SLOWDNS_KCP_WINDOW="${SLOWDNS_KCP_WINDOW:-auto}"
+SLOWDNS_KCP_INTERVAL="${SLOWDNS_KCP_INTERVAL:-10}"
+SLOWDNS_KCP_ACK_NODELAY="${SLOWDNS_KCP_ACK_NODELAY:-0}"
 SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}"
 SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}"
 SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}"
@@ -23564,7 +23568,7 @@ install_slowdns_manager() {
   mkdir -p /usr/local/sbin /var/lib/sc-1forcr
   cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
 #!/usr/bin/env bash
-# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|sessions|set-lock 0/1|records|suggest|check|info|clear}
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|records|suggest|check|info|clear}
 #
 # - setup     : pasang binary, kunci, dan unit lalu nyalakan atau matikan service
 #               sesuai SLOWDNS_ENABLE. Dipanggil install/update dan menu. Hanya
@@ -23573,6 +23577,7 @@ install_slowdns_manager() {
 #               Aman untuk tiap siklus watchdog: tidak menyentuh systemd, dan
 #               iptables hanya ditulis kalau aturan hilang atau tergeser.
 # - enable/disable/set-ns/regen-key : menu Tools > SlowDNS.
+# - set-kcp   : uji CPU KCP, interval 10-50 ms + ACK langsung 0/1 (default 10 0).
 # - records   : record DNS yang harus dibuat pemilik domain.
 # - check     : uji delegasi NS lewat resolver publik (DoH Google/Cloudflare).
 # - online    : akun SSH unik dan koneksi yang benar-benar melalui proses dnstt.
@@ -23611,7 +23616,8 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # VPS lama rebuild. sc-fast1: terima QTYPE=NULL (record NULL, app HTTP Custom
 # dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
 # plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
-DNSTT_PATCH_ID="sc-fast7"
+# sc-fast8: interval KCP dan ACK langsung bisa diatur lewat environment.
+DNSTT_PATCH_ID="sc-fast8"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -23811,6 +23817,29 @@ kcp_window() {
     printf '2048'
   fi
 }
+
+# Interval KCP (ms) dan ACK langsung untuk uji CPU (patch sc-fast8). Default
+# 10 ms + ACK biasa = perilaku sc-fast7. Nilai di luar 10..50 atau rusak kembali
+# ke default; binary memvalidasi ulang dengan aturan yang sama. Hasil di REPLY
+# (builtin bash saja).
+kcp_interval_val() {
+  env_val SLOWDNS_KCP_INTERVAL
+  REPLY="${REPLY,,}"
+  REPLY="${REPLY%ms}"
+  if [[ "${REPLY}" =~ ^[0-9]{1,3}$ ]] && (( 10#${REPLY} >= 10 && 10#${REPLY} <= 50 )); then
+    REPLY="$((10#${REPLY}))"
+  else
+    REPLY=10
+  fi
+}
+
+kcp_ack_nodelay_val() {
+  env_val SLOWDNS_KCP_ACK_NODELAY
+  if flag_on "${REPLY}"; then REPLY=1; else REPLY=0; fi
+}
+
+kcp_interval() { kcp_interval_val; printf '%s' "${REPLY}"; }
+kcp_ack_nodelay() { kcp_ack_nodelay_val; printf '%s' "${REPLY}"; }
 
 # GOMAXPROCS: default = SEMUA core (perilaku bawaan Go). Membatasi ke sedikit core
 # memang menurunkan overhead context-switch, TAPI terbukti di lapangan (V.1FSC.117)
@@ -24571,10 +24600,102 @@ def patch_server(mod):
     replace(old, '''            answers, encodeErr := dns.TunnelAnswers(rec.Resp.Question[0], responseTTL, payload.Bytes())
             if encodeErr != nil { continue }
             rec.Resp.Answer = answers''')
-    path.write_text(src, encoding='utf-8', newline='\n')
+    # io.open, bukan Path.write_text(newline=): parameter itu baru ada di
+    # Python 3.10, sedangkan Ubuntu 20.04 (3.8) dan Debian 11 (3.9) masih dipakai.
+    io.open(str(path), 'w', encoding='utf-8', newline='\n').write(src)
 
 
 patch_server(mod)
+
+# sc-fast8: interval KCP dan ACK langsung dari environment, dibaca sekali saat
+# server start. Default identik sc-fast7 (10 ms, ACK biasa); nilai rusak kembali
+# ke default. Window, MTU per sesi, EDNS, tipe record, dan smux tidak berubah.
+def patch_kcp_tuning(mod):
+    path = os.path.join(mod, 'dnstt-server', 'main.go')
+    src = io.open(path, encoding='utf-8').read()
+    def replace(old, new):
+        nonlocal src
+        if src.count(old) != 1:
+            raise RuntimeError('kcp anchor count: ' + repr(old[:90]))
+        src = src.replace(old, new)
+    replace('mtu, mtuCeil int, upstream string) error {\n\tfor {\n\t\tconn, err := ln.AcceptKCP()\n',
+            'mtu, mtuCeil int, upstream string) error {\n\tkcpTuning := scLoadKCPTuning()\n'
+            '\tfor {\n\t\tconn, err := ln.AcceptKCP()\n')
+    replace('\t\t\t10, // 10ms flush interval\n',
+            '\t\t\tkcpTuning.interval, // SLOWDNS_KCP_INTERVAL, default 10 ms\n')
+    replace('\t\t\t1,  // nc=1 => congestion window off\n\t\t)\n',
+            '\t\t\t1,  // nc=1 => congestion window off\n\t\t)\n'
+            '\t\t// SLOWDNS_KCP_ACK_NODELAY=1: ACK dikirim segera untuk tiap paket masuk.\n'
+            '\t\tconn.SetACKNoDelay(kcpTuning.ackNoDelay)\n')
+    io.open(path, 'w', encoding='utf-8', newline='\n').write(src)
+    io.open(os.path.join(mod, 'dnstt-server', 'sc_kcp.go'), 'w', encoding='utf-8', newline='\n').write(r'''package main
+
+import (
+	"log"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// Pengaturan KCP dari environment (sc-fast8). Default sama persis dengan
+// sc-fast7: interval 10 ms dan ACK tidak dikirim langsung. Nilai kosong atau
+// rusak selalu kembali ke default supaya salah ketik tidak memperlambat tunnel.
+const (
+	scKCPIntervalDefault = 10
+	scKCPIntervalMin     = 10
+	scKCPIntervalMax     = 50
+)
+
+type scKCPTuning struct {
+	interval   int
+	ackNoDelay bool
+}
+
+// scParseKCPInterval menerima milidetik bulat 10..50. ok=false berarti ditolak.
+func scParseKCPInterval(raw string) (int, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return scKCPIntervalDefault, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < scKCPIntervalMin || n > scKCPIntervalMax {
+		return scKCPIntervalDefault, false
+	}
+	return n, true
+}
+
+// scParseKCPAckNoDelay: 1/true/yes/on menyalakan; 0/false/no/off/kosong mematikan.
+func scParseKCPAckNoDelay(raw string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "0", "false", "no", "off":
+		return false, true
+	case "1", "true", "yes", "on":
+		return true, true
+	}
+	return false, false
+}
+
+// scLoadKCPTuning dipanggil sekali saat acceptSessions mulai; semua sesi memakai
+// nilai yang sama sampai service di-restart.
+func scLoadKCPTuning() scKCPTuning {
+	var t scKCPTuning
+	var ok bool
+	raw := os.Getenv("SLOWDNS_KCP_INTERVAL")
+	if t.interval, ok = scParseKCPInterval(raw); !ok {
+		log.Printf("SLOWDNS_KCP_INTERVAL=%q tidak valid (%d..%d); memakai %d ms",
+			raw, scKCPIntervalMin, scKCPIntervalMax, scKCPIntervalDefault)
+	}
+	raw = os.Getenv("SLOWDNS_KCP_ACK_NODELAY")
+	if t.ackNoDelay, ok = scParseKCPAckNoDelay(raw); !ok {
+		log.Printf("SLOWDNS_KCP_ACK_NODELAY=%q tidak valid (0/1); ACK langsung mati", raw)
+	}
+	log.Printf("KCP interval %d ms ack-nodelay %t window %d", t.interval, t.ackNoDelay, kcpWindow())
+	return t
+}
+''')
+
+
+patch_kcp_tuning(mod)
 
 SLOWDNS_PATCH_PY
   then
@@ -24676,6 +24797,8 @@ Restart=always
 RestartSec=3
 Environment=GOMEMLIMIT=$(go_mem_limit "${mem}")
 Environment=SLOWDNS_KCP_WINDOW=$(kcp_window)
+Environment=SLOWDNS_KCP_INTERVAL=$(kcp_interval)
+Environment=SLOWDNS_KCP_ACK_NODELAY=$(kcp_ack_nodelay)
 Environment=GOMAXPROCS=$(go_maxprocs)
 Environment=GOGC=$(go_gc)
 Environment=SLOWDNS_SESSION_SOCKET=/run/sc-1forcr-slowdns/sessions.sock
@@ -25280,8 +25403,51 @@ cmd_set_lock() {
   say "Berhasil: auto-lock SlowDNS=$1. Batas mengikuti limit akun SSH; lock sementara 15 menit."
 }
 
+# Uji CPU KCP: set-kcp INTERVAL(10-50) ACK(0/1) atau set-kcp default (10 0).
+# Window, MTU, kunci, dan record tidak berubah. Saat SlowDNS aktif service
+# di-restart lewat setup (pengguna SlowDNS tersambung ulang otomatis); gagal =
+# nilai lama dikembalikan.
+cmd_set_kcp() {
+  local interval ack prev_interval prev_ack version
+  case "${1:-}" in
+    default|reset) interval=10; ack=0 ;;
+    *)
+      interval="${1:-}"
+      ack="${2:-}"
+      if [[ ! "${interval}" =~ ^[0-9]{1,3}$ ]] || (( 10#${interval} < 10 || 10#${interval} > 50 )); then
+        die "Gunakan set-kcp INTERVAL ACK (interval 10-50 ms, ACK 0/1), contoh: set-kcp 20 0, atau set-kcp default"
+      fi
+      interval="$((10#${interval}))"
+      case "${ack}" in 0|1) ;; *) die "ACK langsung harus 0 atau 1 (contoh: set-kcp ${interval} 0)" ;; esac
+      ;;
+  esac
+  env_val SLOWDNS_KCP_INTERVAL
+  prev_interval="${REPLY}"
+  env_val SLOWDNS_KCP_ACK_NODELAY
+  prev_ack="${REPLY}"
+  set_env_value SLOWDNS_KCP_INTERVAL "${interval}" || die "env ${SC_ENV} gagal ditulis"
+  set_env_value SLOWDNS_KCP_ACK_NODELAY "${ack}" || die "env ${SC_ENV} gagal ditulis"
+  load_config
+  if (( ENABLED == 1 )) && ! ( cmd_setup ); then
+    set_env_value SLOWDNS_KCP_INTERVAL "${prev_interval:-10}" || true
+    set_env_value SLOWDNS_KCP_ACK_NODELAY "${prev_ack:-0}" || true
+    ( cmd_setup ) >/dev/null 2>&1 || true
+    die "pengaturan KCP gagal diterapkan; pengaturan dikembalikan"
+  fi
+  say "Berhasil: KCP interval ${interval} ms, ACK langsung ${ack}. Window tetap $(kcp_window)."
+  if (( ENABLED == 1 )); then
+    first_line "${BIN}.version" || true
+    version="${REPLY}"
+    if [[ "${version}" != "$(wanted_binary_id)" ]]; then
+      say "Peringatan: binary ${version:-?} belum ${DNSTT_PATCH_ID}; nilai ini baru berlaku setelah binary diperbarui."
+    fi
+  else
+    say "SlowDNS nonaktif; nilai dipakai saat SlowDNS diaktifkan."
+  fi
+}
+
 cmd_status() {
-  local svc="tidak jalan" rules="BELUM" ip version pub
+  local svc="tidak jalan" rules="BELUM" ip version pub ack
   load_config
   if systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then svc="berjalan"; fi
   state_val RULES
@@ -25304,6 +25470,10 @@ cmd_status() {
   printf '%-14s: %s\n' "Jalur" "UDP ${PUBLIC_PORT} -> ${LISTEN} -> Dropbear 127.0.0.1:${TARGET_PORT}"
   printf '%-14s: %s\n' "Aturan UDP 53" "${rules}"
   printf '%-14s: %s\n' "MTU / RAM" "${MTU} / $(memory_max)"
+  kcp_ack_nodelay_val
+  if [[ "${REPLY}" == "1" ]]; then ack="langsung"; else ack="biasa"; fi
+  kcp_interval_val
+  printf '%-14s: %s\n' "KCP" "interval ${REPLY} ms, ACK ${ack}, window $(kcp_window)"
   printf '%-14s: %s\n' "Binary" "${version:-belum terpasang}"
   collect_online
   print_online_summary
@@ -25381,13 +25551,14 @@ case "${1:-status}" in
   online) cmd_online ;;
   sessions) cmd_sessions ;;
   set-lock) acquire_lock; cmd_set_lock "${2:-}" ;;
+  set-kcp) acquire_lock; cmd_set_kcp "${2:-}" "${3:-}" ;;
   records) load_config; cmd_records ;;
   suggest) load_config; suggest_ns "${DOMAIN_MAIN}"; echo ;;
   check) cmd_check ;;
   info) cat "${STATE_FILE}" 2>/dev/null || true ;;
   clear) acquire_lock; cmd_clear ;;
   *)
-    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|sessions|set-lock 0/1|records|suggest|check|info|clear}"
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|records|suggest|check|info|clear}"
     exit 1
     ;;
 esac
@@ -29152,6 +29323,8 @@ SLOWDNS_LISTEN_PORT=${SLOWDNS_LISTEN_PORT}
 SLOWDNS_MTU=${SLOWDNS_MTU}
 SLOWDNS_MEMORY_MAX=${SLOWDNS_MEMORY_MAX}
 SLOWDNS_KCP_WINDOW=${SLOWDNS_KCP_WINDOW}
+SLOWDNS_KCP_INTERVAL=${SLOWDNS_KCP_INTERVAL}
+SLOWDNS_KCP_ACK_NODELAY=${SLOWDNS_KCP_ACK_NODELAY}
 SLOWDNS_GOMAXPROCS=${SLOWDNS_GOMAXPROCS}
 SLOWDNS_GOGC=${SLOWDNS_GOGC}
 SLOWDNS_BIN_URL=${SLOWDNS_BIN_URL}
@@ -34232,6 +34405,43 @@ show_slowdns_online() {
   return 0
 }
 
+# Uji CPU KCP (patch sc-fast8). Ubah satu hal per percobaan, lalu bandingkan CPU
+# dan speed SlowDNS di jam ramai yang sama. Default = 10 ms, ACK biasa.
+slowdns_kcp_menu() {
+  local bin="$1" choice interval ack ans
+  echo "Sekarang: interval ${SLOWDNS_KCP_INTERVAL:-10} ms, ACK langsung ${SLOWDNS_KCP_ACK_NODELAY:-0} (default 10 ms, ACK 0)."
+  echo "Untuk uji CPU. Ubah satu hal saja, lalu bandingkan CPU dan speed di jam ramai yang sama."
+  echo "Kalau speed turun atau ping naik, kembali ke Default."
+  echo "1) Default: 10 ms, ACK biasa"
+  echo "2) Uji interval 20 ms (ACK biasa)"
+  echo "3) Uji ACK langsung (interval 10 ms)"
+  echo "4) Interval 20 ms + ACK langsung"
+  echo "0) Batal"
+  if ! prompt_input choice "Pilih [0-4]: "; then
+    return 0
+  fi
+  case "${choice}" in
+    1) interval=10; ack=0 ;;
+    2) interval=20; ack=0 ;;
+    3) interval=10; ack=1 ;;
+    4) interval=20; ack=1 ;;
+    *) return 0 ;;
+  esac
+  if [[ "${SLOWDNS_KCP_INTERVAL:-10}" == "${interval}" && "${SLOWDNS_KCP_ACK_NODELAY:-0}" == "${ack}" ]]; then
+    echo "Pengaturan ini sudah dipakai; tidak ada yang diubah."
+    return 0
+  fi
+  if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
+    echo "Peringatan: service SlowDNS di-restart; pengguna SlowDNS tersambung ulang otomatis dalam beberapa detik."
+    if ! prompt_input ans "Lanjut? [y/N]: " || [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
+      echo "Dibatalkan."
+      return 0
+    fi
+  fi
+  "${bin}" set-kcp "${interval}" "${ack}" 2>&1 | ui_fx || true
+  return 0
+}
+
 set_slowdns_menu() {
   local bin="/usr/local/sbin/sc-1forcr-slowdns" choice ns ans
   if [[ ! -x "${bin}" ]]; then
@@ -34262,8 +34472,9 @@ set_slowdns_menu() {
   else
     echo "8) Aktifkan Auto-lock SlowDNS"
   fi
+  echo "9) Uji CPU KCP (interval/ACK)"
   echo "0) Kembali"
-  if ! prompt_input choice "Pilih [0-8]: "; then
+  if ! prompt_input choice "Pilih [0-9]: "; then
     return 0
   fi
   case "${choice}" in
@@ -34299,6 +34510,7 @@ set_slowdns_menu() {
         "${bin}" set-lock 1 2>&1 | ui_fx || true
       fi
       ;;
+    9) slowdns_kcp_menu "${bin}" ;;
     *) return 0 ;;
   esac
   safe_source_env_file /etc/sc-1forcr.env
@@ -38836,6 +39048,8 @@ update_script_from_repo() {
     SLOWDNS_MTU="${SLOWDNS_MTU:-1232}" \
     SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}" \
     SLOWDNS_KCP_WINDOW="${SLOWDNS_KCP_WINDOW:-auto}" \
+    SLOWDNS_KCP_INTERVAL="${SLOWDNS_KCP_INTERVAL:-10}" \
+    SLOWDNS_KCP_ACK_NODELAY="${SLOWDNS_KCP_ACK_NODELAY:-0}" \
     SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}" \
     SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}" \
     SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}" \
@@ -41765,7 +41979,7 @@ persist_pending_install_env() {
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
-    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
+    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_KCP_INTERVAL SLOWDNS_KCP_ACK_NODELAY SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE

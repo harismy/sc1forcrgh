@@ -2,6 +2,8 @@
 
 // Integrasi lokal memakai binary server/client dari source DNSTT yang dipin.
 // DNSTT_NATIVE_DIR berisi dnstt-server[.exe] dan dnstt-client[.exe].
+// Skenario yang sama dijalankan untuk tiap kombinasi KCP sc-fast8 (interval
+// 10/20 ms x ACK langsung 0/1) plus env rusak yang wajib jatuh ke default.
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -12,18 +14,32 @@ const { spawn, spawnSync } = require('child_process');
 const dir = process.env.DNSTT_NATIVE_DIR;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const KCP_CASES = [
+  { env: {}, interval: 10, ack: false },
+  { env: { SLOWDNS_KCP_INTERVAL: '20', SLOWDNS_KCP_ACK_NODELAY: '0' }, interval: 20, ack: false },
+  { env: { SLOWDNS_KCP_INTERVAL: '10', SLOWDNS_KCP_ACK_NODELAY: '1' }, interval: 10, ack: true },
+  { env: { SLOWDNS_KCP_INTERVAL: '20', SLOWDNS_KCP_ACK_NODELAY: '1' }, interval: 20, ack: true },
+  { env: { SLOWDNS_KCP_INTERVAL: '5', SLOWDNS_KCP_ACK_NODELAY: 'mungkin' }, interval: 10, ack: false, invalid: true }
+];
+
 async function main() {
   if (!dir) { console.log('slowdns native integration skipped (set DNSTT_NATIVE_DIR)'); return; }
   const suffix = process.platform === 'win32' ? '.exe' : '';
   const serverBin = path.join(dir, 'dnstt-server' + suffix);
   const clientBin = path.join(dir, 'dnstt-client' + suffix);
   assert(fs.existsSync(serverBin) && fs.existsSync(clientBin), 'native binaries tersedia');
+  for (const kcp of KCP_CASES) await scenario(serverBin, clientBin, kcp);
+  console.log(`slowdns native integration passed (TXT + NULL, real DNS/Noise/KCP/smux, bulk echo, 2 clients, 3 streams, cleanup; KCP ${KCP_CASES.length} konfigurasi)`);
+}
+
+async function scenario(serverBin, clientBin, kcp) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-dnstt-native-'));
   const socket = path.join(tmp, 'sc.sock');
   const children = [], sockets = new Set();
   let nullProxy;
   let nullQueries = 0;
   let logs = '';
+  let serverHead = '';
   const echo = net.createServer((s) => {
     sockets.add(s); s.once('close', () => sockets.delete(s)); s.on('error', () => {}); s.pipe(s);
   });
@@ -124,8 +140,10 @@ async function main() {
     });
     await new Promise((r) => nullProxy.bind(0, '127.0.0.1', r));
     const server = launch(serverBin, ['-udp', `127.0.0.1:${dnsPort}`, '-privkey-file', key, '-mtu', '1232', 't.local.test', `127.0.0.1:${echo.address().port}`], {
-      SLOWDNS_SESSION_SOCKET: socket, SLOWDNS_KCP_WINDOW: '2048', GOMAXPROCS: '2'
+      SLOWDNS_SESSION_SOCKET: socket, SLOWDNS_KCP_WINDOW: '2048', GOMAXPROCS: '2',
+      SLOWDNS_KCP_INTERVAL: '', SLOWDNS_KCP_ACK_NODELAY: '', ...kcp.env
     });
+    server.stderr.on('data', (data) => { if (serverHead.length < 8192) serverHead += data; });
     // AF_UNIX pada Windows tidak selalu dapat di-stat oleh Node; buktikan
     // kesiapan lewat klien IPC Go yang sama dengan helper produksi.
     await until(() => spawnSync(serverBin, ['-sc-online', socket], {
@@ -157,7 +175,11 @@ async function main() {
     assert.strictEqual(Number(rows[0][2]), 65536, 'tunnel yang sudah putus hilang');
     second.end();
     await until(() => query().length === 0);
-    console.log('slowdns native integration passed (TXT + NULL, real DNS/Noise/KCP/smux, bulk echo, 2 clients, 3 streams, cleanup)');
+    // Binary benar-benar memakai nilai yang diminta (dibaca sekali saat start).
+    assert(serverHead.includes(`KCP interval ${kcp.interval} ms ack-nodelay ${kcp.ack} window 2048`),
+      `log tuning KCP ${JSON.stringify(kcp.env)}:\n${serverHead}`);
+    assert.strictEqual(/tidak valid/.test(serverHead), Boolean(kcp.invalid), `peringatan env rusak:\n${serverHead}`);
+    console.log(`  KCP interval ${kcp.interval} ms, ACK langsung ${kcp.ack ? 1 : 0}${kcp.invalid ? ' (env rusak -> default)' : ''}: OK`);
   } finally {
     for (const s of sockets) s.destroy();
     const exits = children.map((p) => new Promise((r) => { if (p.exitCode !== null || p.signalCode !== null) r(); else p.once('exit', r); }));

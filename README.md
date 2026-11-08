@@ -127,6 +127,27 @@ dan waktu pemrosesan sekitar 2,3 kali lebih cepat. Ini belum menyatakan penuruna
 CPU total VPS; pengukuran setelah update tetap diperlukan. Lihat
 [benchmark penerimaan query](docs/slowdns-receive-v122.md).
 
+### Uji CPU KCP V.1FSC.125
+
+Patch `sc-fast8` membuat interval KCP dan ACK langsung bisa diatur tanpa rebuild.
+Default tetap 10 ms dan ACK biasa, sama dengan versi sebelumnya. Window KCP, MTU,
+pubkey, record, auto-lock, dan monitor akun tidak berubah. Ubah satu nilai per
+percobaan lewat **Tools > SlowDNS > 9) Uji CPU KCP**, atau sebagai root:
+
+```bash
+sc-1forcr-slowdns set-kcp 20 0      # interval 20 ms, ACK biasa
+sc-1forcr-slowdns set-kcp 10 1      # interval 10 ms, ACK langsung
+sc-1forcr-slowdns set-kcp 20 1      # keduanya
+sc-1forcr-slowdns set-kcp default   # kembali ke 10 ms, ACK biasa
+sc-1forcr-slowdns status            # baris "KCP" menampilkan nilai aktif
+```
+
+Setiap perubahan me-restart service SlowDNS; pengguna SlowDNS tersambung ulang
+otomatis. Nilai disimpan di `/etc/sc-1forcr.env` dan ikut update. Bandingkan CPU
+dan speed pada jam ramai yang sama, lalu kembali ke `default` jika speed turun
+atau ping naik. Hasil uji lokal dan batasnya ada di
+[catatan uji KCP](docs/slowdns-kcp-tuning-v125.md).
+
 ## DNS Resolver Guard
 
 SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui

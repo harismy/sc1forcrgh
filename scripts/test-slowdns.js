@@ -91,8 +91,23 @@ assert(patchPy.includes('avail := sizeCap - len(buf)') && patchPy.includes('l+(l
   'patch sc-fast3: maxPayloadForResponse aritmatika (ganti binary-search per respons)');
 assert(patchPy.includes('NewName length anchor not found') && patchPy.includes('length <= 255'),
   'patch sc-fast6: validasi panjang nama tanpa serializer/cache sementara');
-assert(patchPy.includes("'\\tvar buf [4096]byte\\n\\tfor {") && helper.includes('DNSTT_PATCH_ID="sc-fast7"'),
-  'patch sc-fast6: buffer baca dipakai ulang dan binary lama dibangun ulang');
+assert(patchPy.includes("'\\tvar buf [4096]byte\\n\\tfor {"),
+  'patch sc-fast6: buffer baca dipakai ulang');
+assert(helper.includes('DNSTT_PATCH_ID="sc-fast8"') && patchPy.includes('\npatch_kcp_tuning(mod)\n') &&
+  patchPy.includes('kcpTuning := scLoadKCPTuning()') &&
+  patchPy.includes('kcpTuning.interval, // SLOWDNS_KCP_INTERVAL, default 10 ms') &&
+  patchPy.includes('conn.SetACKNoDelay(kcpTuning.ackNoDelay)') &&
+  patchPy.includes('os.Getenv("SLOWDNS_KCP_INTERVAL")') && patchPy.includes('os.Getenv("SLOWDNS_KCP_ACK_NODELAY")') &&
+  patchPy.includes('scKCPIntervalDefault = 10') && patchPy.includes('scKCPIntervalMax     = 50'),
+  'patch sc-fast8: interval KCP + ACK langsung dari env (default 10 ms, ACK biasa) dan VPS lama rebuild');
+assert(patchPy.includes('conn.SetWindowSize(win, win)') && !/SetWindowSize\(512|MaxReceiveBuffer|MaxStreamBuffer/.test(patchPy),
+  'sc-fast8 tidak menyalin window 512 atau buffer smux Potato; window tetap kcpWindow()');
+assert(!/^[^#\n]*\.write_text\([^)]*newline=/m.test(patchPy),
+  'patch tidak memakai Path.write_text(newline=) (Python 3.10+; Ubuntu 20.04 = 3.8, Debian 11 = 3.9)');
+assert(/^kcp_interval_val\(\) \{/m.test(helper) && /^kcp_ack_nodelay_val\(\) \{/m.test(helper) &&
+  helper.includes('Environment=SLOWDNS_KCP_INTERVAL=$(kcp_interval)') &&
+  helper.includes('Environment=SLOWDNS_KCP_ACK_NODELAY=$(kcp_ack_nodelay)'),
+  'unit SlowDNS menyetel interval KCP dan ACK langsung lewat helper tervalidasi');
 assert(/if \(\( MTU == 512 \)\); then MTU=1232; fi/.test(helper),
   'helper menaikkan SLOWDNS_MTU lama 512 ke 1232 (hindari choke app buffer besar)');
 assert(/^kcp_window\(\) \{/m.test(helper) && helper.includes('Environment=SLOWDNS_KCP_WINDOW=$(kcp_window)'),
@@ -378,6 +393,59 @@ try {
   assert.strictEqual(read('writes'), '', 'apply tanpa perubahan: iptables tidak ditulis');
   assert.strictEqual(read('persist'), '', 'apply tanpa perubahan: tidak menyimpan ulang');
 
+  // ── 3b. Uji CPU KCP: interval/ACK lewat env, default = sc-fast7 ─────────
+  const kcpUnit = () => {
+    const u = fs.readFileSync(unitFile, 'utf8');
+    return {
+      interval: (u.match(/^Environment=SLOWDNS_KCP_INTERVAL=(.*)$/m) || [])[1],
+      ack: (u.match(/^Environment=SLOWDNS_KCP_ACK_NODELAY=(.*)$/m) || [])[1],
+      window: (u.match(/^Environment=SLOWDNS_KCP_WINDOW=(.*)$/m) || [])[1]
+    };
+  };
+  const kcpEnv = () => [envValue('SLOWDNS_KCP_INTERVAL'), envValue('SLOWDNS_KCP_ACK_NODELAY')];
+  const window0 = kcpUnit().window;
+  assert.deepStrictEqual(kcpUnit(), { interval: '10', ack: '0', window: window0 }, 'default: interval 10 ms, ACK biasa');
+  for (const [interval, ack] of [['20', '0'], ['10', '1'], ['20', '1']]) {
+    r = run('set-kcp', interval, ack);
+    assert.strictEqual(r.status, 0, r.out);
+    assert(new RegExp(`Berhasil: KCP interval ${interval} ms, ACK langsung ${ack}\\. Window tetap ${window0}`).test(r.out), r.out);
+    assert.deepStrictEqual(kcpEnv(), [interval, ack], 'nilai disimpan di env (ikut update)');
+    assert.deepStrictEqual(kcpUnit(), { interval, ack, window: window0 }, 'window tidak ikut berubah');
+    assert(mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'), 'nilai baru langsung dipakai service');
+  }
+  r = run('setup');
+  assert.deepStrictEqual(mutatingSystemctl(), [], 'setup ulang tanpa perubahan KCP: tanpa restart');
+  r = run('status');
+  assert(new RegExp(`KCP\\s+: interval 20 ms, ACK langsung, window ${window0}`).test(r.out), r.out);
+  for (const bad of [['9', '0'], ['51', '0'], ['20', '2'], ['abc', '1'], ['20', ''], ['', '']]) {
+    r = run('set-kcp', ...bad);
+    assert.notStrictEqual(r.status, 0, `set-kcp ${bad} harus ditolak`);
+    assert.deepStrictEqual(kcpEnv(), ['20', '1'], `input salah ${bad} tidak menyentuh env`);
+  }
+  fs.writeFileSync(F('fail-start'), '');
+  r = run('set-kcp', '10', '0');
+  assert.notStrictEqual(r.status, 0, 'service gagal start: set-kcp gagal');
+  assert(/pengaturan KCP gagal diterapkan; pengaturan dikembalikan/.test(r.out), r.out);
+  assert.deepStrictEqual(kcpEnv(), ['20', '1'], 'nilai lama dikembalikan');
+  fs.rmSync(F('fail-start'));
+  run('setup');
+  assert.deepStrictEqual(kcpUnit(), { interval: '20', ack: '1', window: window0 });
+  // Env rusak/di luar batas (diedit manual) jatuh ke default yang aman.
+  for (const [interval, ack, want] of [['abc', 'mungkin', ['10', '0']], ['5', '2', ['10', '0']], ['500', 'yes', ['10', '1']],
+    ['20ms', 'on', ['20', '1']], ['"30"', 'TRUE', ['30', '1']], ['', '', ['10', '0']]]) {
+    setEnv({ SLOWDNS_ENABLE: '1', SLOWDNS_NS_DOMAIN: 'NS-SG1.Contoh.NET.', SLOWDNS_KCP_INTERVAL: interval, SLOWDNS_KCP_ACK_NODELAY: ack });
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.deepStrictEqual([kcpUnit().interval, kcpUnit().ack], want, `env ${interval}/${ack}`);
+  }
+  r = run('set-kcp', 'default');
+  assert.strictEqual(r.status, 0, r.out);
+  assert.deepStrictEqual(kcpEnv(), ['10', '0']);
+  assert.deepStrictEqual(kcpUnit(), { interval: '10', ack: '0', window: window0 }, 'default dipulihkan');
+  setEnv({ SLOWDNS_ENABLE: '1', SLOWDNS_NS_DOMAIN: 'NS-SG1.Contoh.NET.' });
+  run('setup');
+  assert.deepStrictEqual(mutatingSystemctl(), [], 'env tanpa kunci KCP = unit default yang sama');
+
   // ── 4. Jump tergeser DNAT UDP Custom: dikembalikan ke depan oleh watchdog ─
   fs.writeFileSync(F('rules4.nat'), ['PREROUTING -i eth0 -p udp -m udp --dport 1:65535 -j DNAT --to-destination :36712', read('rules4.nat')].join('\n'));
   r = run('apply');
@@ -587,7 +655,8 @@ for (const [name, body, gateCall] of [['update aman', safePath, '\n    apply_ser
 }
 assert(/^setup_slowdns\(\) \{\n  install_slowdns_manager \|\| return 0\n[\s\S]*?\n  return 0\n\}/m.test(installer),
   'setup_slowdns tidak boleh menggagalkan install/update');
-const envKeys = ['SLOWDNS_ENABLE', 'SLOWDNS_NS_DOMAIN', 'SLOWDNS_LISTEN_PORT', 'SLOWDNS_MTU', 'SLOWDNS_MEMORY_MAX', 'SLOWDNS_BIN_URL', 'SLOWDNS_BIN_SHA256'];
+const envKeys = ['SLOWDNS_ENABLE', 'SLOWDNS_NS_DOMAIN', 'SLOWDNS_LISTEN_PORT', 'SLOWDNS_MTU', 'SLOWDNS_MEMORY_MAX',
+  'SLOWDNS_KCP_WINDOW', 'SLOWDNS_KCP_INTERVAL', 'SLOWDNS_KCP_ACK_NODELAY', 'SLOWDNS_BIN_URL', 'SLOWDNS_BIN_SHA256'];
 const envDump = extract(installer, '\n  cat > /etc/sc-1forcr.env <<EOF\n', '\nEOF\n');
 const pending = extract(installer, '\npersist_pending_install_env() {', '\n}\n');
 const menuUpdate = extract(installer, 'echo "Menjalankan update installer..."', 'bash "${tmp}" 2>&1 | tee "${update_log}"');
@@ -596,6 +665,16 @@ for (const key of envKeys) {
   assert(new RegExp(`\\b${key}\\b`).test(pending), `${key} wajib ada di persist_pending_install_env`);
   assert(menuUpdate.includes(`${key}="\${${key}:-`), `${key} wajib diteruskan update dari menu`);
 }
+for (const [key, def] of [['SLOWDNS_KCP_INTERVAL', '10'], ['SLOWDNS_KCP_ACK_NODELAY', '0']]) {
+  assert(installer.includes(`\n${key}="\${${key}:-${def}}"\n`), `${key} default ${def} di installer`);
+  assert(menuUpdate.includes(`${key}="\${${key}:-${def}}"`), `${key} default ${def} saat update dari menu`);
+}
+const kcpMenu = extract(installer, '\nslowdns_kcp_menu() {', '\n}\n');
+for (const pair of ['1) interval=10; ack=0', '2) interval=20; ack=0', '3) interval=10; ack=1', '4) interval=20; ack=1']) {
+  assert(kcpMenu.includes(pair), `menu uji KCP memuat kombinasi ${pair}`);
+}
+assert(kcpMenu.includes('"${bin}" set-kcp "${interval}" "${ack}"') && installer.includes('    9) slowdns_kcp_menu "${bin}" ;;'),
+  'menu Tools > SlowDNS [9] memanggil set-kcp');
 const uninstall = extract(installer, '\n/usr/local/sbin/sc-1forcr-extra-ports clear', '\necho "Uninstall SC 1FORCR selesai');
 assert(uninstall.includes('/usr/local/sbin/sc-1forcr-slowdns clear') && uninstall.includes('rm -f /usr/local/sbin/sc-1forcr-slowdns'),
   'uninstall melepas SlowDNS');

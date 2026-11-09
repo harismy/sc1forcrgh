@@ -13,6 +13,18 @@
 //   --jitter 0 --combos 10:0,20:0,10:1,20:1 --baseline <dir binary pembanding>
 //   --phases idle,ping,download,upload,parallel (mis. --phases idle --idle-clients 40)
 //
+// Matriks bebas (V.1FSC.126), menggantikan --combos kalau diisi:
+//   --configs 'w512=SLOWDNS_KCP_WINDOW=512;w2048-A=SLOWDNS_KCP_WINDOW=2048;w2048-B=SLOWDNS_KCP_WINDOW=2048'
+//   Tiap konfigurasi: label=KUNCI=NILAI,KUNCI=NILAI. Kunci BIN=<dir> memakai
+//   binary server lain. Pakai dua label dengan isi sama sebagai pembanding A/A.
+// --resolver-qps N   batas query/detik per klien di resolver tiruan (token
+//                    bucket, burst N/10, kelebihan dibuang). 0 = tanpa batas.
+// --instr 1          binary server dibangun dengan tag `scbench` lewat
+//                    scripts/go/slowdns-bench/build-bench-tree.sh (lihat
+//                    docs/slowdns-cpu-research-v126.md): baca kcp.DefaultSnmp,
+//                    kedalaman antrean keluar, dan srtt/rto per fase.
+// --profile-dir DIR  (butuh --instr) profil CPU pprof selama fase download.
+//
 // Yang diukur per fase: CPU-detik proses dnstt-server (bukan klien/harness),
 // CPU per MiB payload, throughput, latensi ping-pong p50/p95, retransmisi KCP
 // (dihitung dari segmen PUSH ganda yang lewat resolver tiruan), query tanpa
@@ -24,6 +36,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const net = require('net');
+const http = require('http');
 const dgram = require('dgram');
 const { spawn, spawnSync } = require('child_process');
 
@@ -36,7 +49,7 @@ function parseArgs(argv) {
     rounds: 3, rtt: 60, jitter: 0, loss: 1, window: 2048, gomaxprocs: 1,
     'down-mib': 4, 'up-mib': 0.5, parallel: 4, 'par-mib': 1, 'idle-clients': 8, 'idle-sec': 20,
     pings: 30, combos: '10:0,20:0,10:1,20:1', baseline: '', json: '', mtu: 1232,
-    phases: 'idle,ping,download,upload,parallel'
+    phases: 'idle,ping,download,upload,parallel', configs: '', 'resolver-qps': 0, instr: 0, 'profile-dir': ''
   };
   for (let i = 0; i < argv.length; i += 2) {
     const k = argv[i].replace(/^--/, '');
@@ -174,8 +187,9 @@ class Resolver {
     this.jitter = opt.jitter;
     this.loss = opt.loss / 100;
     this.rand = mulberry32(12345);
+    this.qps = opt['resolver-qps'] || 0;
     this.clients = new Map();
-    this.c = { queries: 0, responses: 0, lostQ: 0, lostR: 0, unanswered: 0, down: newDirStats(), up: newDirStats(), downBytes: 0 };
+    this.c = { queries: 0, responses: 0, lostQ: 0, lostR: 0, rateDropped: 0, unanswered: 0, down: newDirStats(), up: newDirStats(), downBytes: 0 };
     this.sock = dgram.createSocket('udp4');
     this.sock.on('message', (p, peer) => this.fromClient(p, peer));
   }
@@ -187,12 +201,21 @@ class Resolver {
     const key = `${peer.address}:${peer.port}`;
     let cl = this.clients.get(key);
     if (!cl) {
-      cl = { up: dgram.createSocket('udp4'), pending: new Map(), peer };
+      cl = { up: dgram.createSocket('udp4'), pending: new Map(), peer, tokens: this.qps / 10, last: Date.now() };
       cl.up.on('message', (r) => this.fromServer(r, cl));
       cl.up.bind(0, '127.0.0.1');
       this.clients.set(key, cl);
     }
     this.c.queries++;
+    // Resolver sungguhan membatasi laju per klien; kelebihan dibuang sebelum
+    // sampai server (tidak dihitung sebagai segmen KCP yang lewat).
+    if (this.qps > 0) {
+      const now = Date.now();
+      cl.tokens = Math.min(this.qps / 10, cl.tokens + (now - cl.last) * this.qps / 1000);
+      cl.last = now;
+      if (cl.tokens < 1) { this.c.rateDropped++; return; }
+      cl.tokens -= 1;
+    }
     try { parseQuery(p, this.c.up); } catch (_) { /* query bukan tunnel */ }
     if (this.rand() < this.loss) { this.c.lostQ++; return; }
     setTimeout(() => {
@@ -219,7 +242,7 @@ class Resolver {
     this.sweep();
     const c = this.c;
     return {
-      queries: c.queries, responses: c.responses, lostQ: c.lostQ, lostR: c.lostR, unanswered: c.unanswered,
+      queries: c.queries, responses: c.responses, lostQ: c.lostQ, lostR: c.lostR, rateDropped: c.rateDropped, unanswered: c.unanswered,
       downPush: c.down.push, downRetrans: c.down.retrans, downAck: c.down.ack,
       upPush: c.up.push, upRetrans: c.up.retrans, upAck: c.up.ack
     };
@@ -375,11 +398,24 @@ async function runConfig(cfg, opt, bins) {
     const g = spawnSync(cfg.serverBin, ['-gen-key', '-privkey-file', key, '-pubkey-file', pub], { encoding: 'utf8', windowsHide: true });
     assert.strictEqual(g.status, 0, g.stderr);
     const dnsPort = await freePort(true);
+    const instrPort = opt.instr ? await freePort(false) : 0;
     const server = launch(cfg.serverBin, ['-udp', `127.0.0.1:${dnsPort}`, '-privkey-file', key, '-mtu', String(opt.mtu), DOMAIN,
       `127.0.0.1:${backend.server.address().port}`], {
       SLOWDNS_KCP_WINDOW: String(opt.window), GOMAXPROCS: String(opt.gomaxprocs), GOGC: '300', GOMEMLIMIT: '96MiB',
-      SLOWDNS_KCP_INTERVAL: '', SLOWDNS_KCP_ACK_NODELAY: '', ...cfg.env
+      SLOWDNS_KCP_INTERVAL: '', SLOWDNS_KCP_ACK_NODELAY: '', SC_BENCH_ADDR: instrPort ? `127.0.0.1:${instrPort}` : '', ...cfg.env
     });
+    const instr = (pathAndQuery) => new Promise((resolve, reject) => {
+      http.get({ host: '127.0.0.1', port: instrPort, path: pathAndQuery, timeout: 5000 }, (res) => {
+        let body = '';
+        res.on('data', (d) => { body += d; });
+        res.on('end', () => (res.statusCode === 200 ? resolve(body) : reject(Error(`${pathAndQuery}: ${res.statusCode} ${body}`))));
+      }).on('error', reject);
+    });
+    // Binary tanpa tag scbench (mis. BIN=build produksi) tidak punya endpoint: lewati.
+    const snmp = async () => {
+      if (!instrPort) return null;
+      try { return JSON.parse(await instr('/snmp')); } catch (_) { return null; }
+    };
     let head = '';
     server.stderr.on('data', (d) => { if (head.length < 4096) head += d; });
     resolver = new Resolver(dnsPort, opt);
@@ -399,14 +435,35 @@ async function runConfig(cfg, opt, bins) {
     const wanted = new Set(opt.phases.split(','));
     const phase = async (name, fn) => {
       if (!wanted.has(name)) return;
+      const k0 = await snmp();
+      const prof = opt['profile-dir'] && instrPort && name === 'download'
+        ? path.resolve(opt['profile-dir'], `${cfg.label.replace(/[^\w.-]+/g, '_')}-r${cfg.round}-${name}.pprof`) : '';
+      if (prof) await instr(`/prof/start?path=${encodeURIComponent(prof)}`);
       const s0 = procStats(server.pid), r0 = resolver.snapshot(), d0 = udpDrops(dnsPort);
       const t0 = process.hrtime.bigint();
       const extra = await fn();
       const wall = Number(process.hrtime.bigint() - t0) / 1e9;
       await sleep(200);
       const s1 = procStats(server.pid), r1 = resolver.snapshot(), d1 = udpDrops(dnsPort);
+      if (prof) await instr('/prof/stop');
+      const k1 = await snmp();
       const delta = {};
       for (const k of Object.keys(r1)) delta[k] = r1[k] - r0[k];
+      if (k0 && k1) {
+        // Segmen KCP server selama fase ini: total retransmisi dan pecahannya
+        // (Lost = RTO, Fast = fast resend, Early = early retransmit kcp-go).
+        const kcp = {};
+        for (const k of ['RetransSegs', 'LostSegs', 'FastRetransSegs', 'EarlyRetransSegs', 'OutSegs', 'InSegs', 'RepeatSegs', 'OutPkts', 'InPkts', 'BytesSent', 'BytesReceived']) {
+          kcp[k] = k1.Snmp[k] - k0.Snmp[k];
+        }
+        kcp.dedup = (k1.Dedup || 0) - (k0.Dedup || 0);
+        const qn = k1.QN - k0.QN;
+        kcp.queueAvg = qn > 0 ? (k1.QSum - k0.QSum) / qn : null;
+        kcp.queueMax = k1.QMax;
+        kcp.srttMax = Math.max(0, ...(k1.Sessions || []).map((s) => s.SRTT));
+        kcp.rtoMax = Math.max(0, ...(k1.Sessions || []).map((s) => s.RTO));
+        delta.kcp = kcp;
+      }
       out.phases[name] = { wall, cpu: s1.cpu - s0.cpu, udpDrops: d0 === null ? null : d1 - d0, ...delta, ...extra };
     };
     // 1. Idle: semua klien tersambung tanpa trafik.
@@ -467,11 +524,20 @@ const median = (xs) => {
 };
 const fmt = (x, d = 2) => (x === null || x === undefined ? 'n/a' : x.toFixed(d));
 
+const stat = (xs) => {
+  const a = xs.filter((x) => x !== null && x !== undefined && Number.isFinite(x));
+  if (!a.length) return null;
+  return { med: median(a), min: Math.min(...a), max: Math.max(...a) };
+};
+// Median dengan rentang min-maks antar-putaran.
+const fmtR = (st, d = 2) => (st ? `${st.med.toFixed(d)} (${st.min.toFixed(d)}-${st.max.toFixed(d)})` : 'n/a');
+const fmtM = (st, d = 2) => (st ? st.med.toFixed(d) : 'n/a');
+
 function summarize(results, labels) {
   const rows = [];
   for (const label of labels) {
     const runs = results.filter((r) => r.label === label);
-    const m = (fn) => median(runs.map(fn));
+    const m = (fn) => stat(runs.map(fn));
     const ph = (name, key) => m((r) => (r.phases[name] ? r.phases[name][key] : null));
     const per = (name) => m((r) => (r.phases[name] ? r.phases[name].cpu / r.phases[name].mib : null));
     const retr = (name, dir) => m((r) => {
@@ -479,6 +545,8 @@ function summarize(results, labels) {
       if (!p) return null;
       return p[`${dir}Push`] ? 100 * p[`${dir}Retrans`] / p[`${dir}Push`] : 0;
     });
+    const kcp = (name, fn) => m((r) => (r.phases[name] && r.phases[name].kcp ? fn(r.phases[name].kcp, r.phases[name]) : null));
+    const xfer = ['download', 'upload', 'parallel'];
     rows.push({
       label, runs: runs.length,
       idleCpuPct: m((r) => (r.phases.idle ? 100 * r.phases.idle.cpu / r.phases.idle.wall : null)),
@@ -487,11 +555,29 @@ function summarize(results, labels) {
       downRetr: retr('download', 'down'),
       upMbps: ph('upload', 'mbps'), upCpuMiB: per('upload'), upRetr: retr('upload', 'up'),
       parMbps: ph('parallel', 'mbps'), parCpuMiB: per('parallel'), parRetr: retr('parallel', 'down'),
+      allCpuMiB: m((r) => {
+        const ps = xfer.map((n) => r.phases[n]).filter(Boolean);
+        const mib = ps.reduce((t, p) => t + p.mib, 0);
+        return mib ? ps.reduce((t, p) => t + p.cpu, 0) / mib : null;
+      }),
       downQps: m((r) => (r.phases.download ? r.phases.download.queries / r.phases.download.wall : null)),
+      downQPerMiB: m((r) => (r.phases.download ? r.phases.download.queries / r.phases.download.mib : null)),
       downCpuPerKQ: m((r) => (r.phases.download ? 1e6 * r.phases.download.cpu / r.phases.download.queries : null)),
-      unanswered: m((r) => Object.values(r.phases).reduce((s, p) => s + p.unanswered, 0)),
-      lost: m((r) => Object.values(r.phases).reduce((s, p) => s + p.lostQ + p.lostR, 0)),
-      udpDrops: m((r) => { const v = Object.values(r.phases).map((p) => p.udpDrops); return v.includes(null) ? null : v.reduce((s, x) => s + x, 0); }),
+      // Retransmisi server per MiB download, dipecah menurut jenis (instrumen kcp-go).
+      kRetr: kcp('download', (k, p) => k.RetransSegs / p.mib),
+      kLost: kcp('download', (k, p) => k.LostSegs / p.mib),
+      kFast: kcp('download', (k, p) => k.FastRetransSegs / p.mib),
+      kEarly: kcp('download', (k, p) => k.EarlyRetransSegs / p.mib),
+      kDedup: kcp('download', (k, p) => k.dedup / p.mib),
+      kQAvg: kcp('download', (k) => k.queueAvg),
+      kQMax: kcp('download', (k) => k.queueMax),
+      kSrtt: kcp('download', (k) => k.srttMax),
+      kRto: kcp('download', (k) => k.rtoMax),
+      kUpRetr: kcp('upload', (k, p) => k.RetransSegs / p.mib),
+      unanswered: m((r) => Object.values(r.phases).reduce((t, p) => t + p.unanswered, 0)),
+      lost: m((r) => Object.values(r.phases).reduce((t, p) => t + p.lostQ + p.lostR, 0)),
+      rateDropped: m((r) => Object.values(r.phases).reduce((t, p) => t + (p.rateDropped || 0), 0)),
+      udpDrops: m((r) => { const v = Object.values(r.phases).map((p) => p.udpDrops); return v.includes(null) ? null : v.reduce((t, x) => t + x, 0); }),
       peakMiB: m((r) => r.ram.peak / MiB)
     });
   }
@@ -499,28 +585,48 @@ function summarize(results, labels) {
 }
 
 function printTable(rows) {
-  const cols = [
-    ['Konfigurasi', (r) => r.label],
-    ['Idle %core', (r) => fmt(r.idleCpuPct, 2)],
-    ['Down Mbps', (r) => fmt(r.downMbps)],
-    ['Down CPU-s/MiB', (r) => fmt(r.downCpuMiB, 3)],
-    ['Up Mbps', (r) => fmt(r.upMbps)],
-    ['Up CPU-s/MiB', (r) => fmt(r.upCpuMiB, 3)],
-    ['Paralel Mbps', (r) => fmt(r.parMbps)],
-    ['Paralel CPU-s/MiB', (r) => fmt(r.parCpuMiB, 3)],
-    ['Ping p50/p95 ms', (r) => `${fmt(r.pingP50, 0)}/${fmt(r.pingP95, 0)}`],
-    ['Ping saat download p50/p95', (r) => `${fmt(r.downP50, 0)}/${fmt(r.downP95, 0)}`],
-    ['Retrans down/up/paralel %', (r) => `${fmt(r.downRetr, 1)}/${fmt(r.upRetr, 1)}/${fmt(r.parRetr, 1)}`],
-    ['Query/s download', (r) => fmt(r.downQps, 0)],
-    ['CPU-ms/1000 query', (r) => fmt(r.downCpuPerKQ, 1)],
-    ['Tanpa jawaban', (r) => fmt(r.unanswered, 0)],
-    ['Dibuang resolver', (r) => fmt(r.lost, 0)],
-    ['Drop UDP', (r) => fmt(r.udpDrops, 0)],
-    ['RAM puncak MiB', (r) => fmt(r.peakMiB, 1)]
+  const tables = [
+    [
+      ['Konfigurasi', (r) => r.label],
+      ['Semua transfer CPU-s/MiB', (r) => fmtR(r.allCpuMiB, 3)],
+      ['Down Mbps', (r) => fmtR(r.downMbps)],
+      ['Down CPU-s/MiB', (r) => fmtR(r.downCpuMiB, 3)],
+      ['Paralel Mbps', (r) => fmtR(r.parMbps)],
+      ['Paralel CPU-s/MiB', (r) => fmtR(r.parCpuMiB, 3)],
+      ['Up Mbps', (r) => fmtR(r.upMbps)],
+      ['Up CPU-s/MiB', (r) => fmtR(r.upCpuMiB, 3)]
+    ],
+    [
+      ['Konfigurasi', (r) => r.label],
+      ['Ping sepi p50', (r) => fmtR(r.pingP50, 0)],
+      ['Ping sepi p95', (r) => fmtR(r.pingP95, 0)],
+      ['Ping saat download p50', (r) => fmtR(r.downP50, 0)],
+      ['Ping saat download p95', (r) => fmtR(r.downP95, 0)],
+      ['Idle %core', (r) => fmtM(r.idleCpuPct, 2)],
+      ['RAM puncak MiB', (r) => fmtM(r.peakMiB, 1)]
+    ],
+    [
+      ['Konfigurasi', (r) => r.label],
+      ['Retrans down/up/paralel % (resolver)', (r) => `${fmtM(r.downRetr, 1)}/${fmtM(r.upRetr, 1)}/${fmtM(r.parRetr, 1)}`],
+      ['Query/MiB download', (r) => fmtM(r.downQPerMiB, 0)],
+      ['Query/s download', (r) => fmtM(r.downQps, 0)],
+      ['CPU-ms/1000 query', (r) => fmtM(r.downCpuPerKQ, 1)],
+      ['Retrans/MiB total (RTO/fast/early)', (r) => `${fmtM(r.kRetr, 0)} (${fmtM(r.kLost, 0)}/${fmtM(r.kFast, 0)}/${fmtM(r.kEarly, 0)})`],
+      ['Dedup dibuang/MiB', (r) => fmtM(r.kDedup, 0)],
+      ['Antrean keluar avg/max', (r) => `${fmtM(r.kQAvg, 0)}/${fmtM(r.kQMax, 0)}`],
+      ['srtt/rto ms akhir download', (r) => `${fmtM(r.kSrtt, 0)}/${fmtM(r.kRto, 0)}`],
+      ['Retrans/MiB upload', (r) => fmtM(r.kUpRetr, 0)],
+      ['Tanpa jawaban', (r) => fmtM(r.unanswered, 0)],
+      ['Dibuang resolver (loss/laju)', (r) => `${fmtM(r.lost, 0)}/${fmtM(r.rateDropped, 0)}`],
+      ['Drop UDP', (r) => fmtM(r.udpDrops, 0)]
+    ]
   ];
-  console.log(`| ${cols.map((c) => c[0]).join(' | ')} |`);
-  console.log(`|${cols.map(() => '---').join('|')}|`);
-  for (const r of rows) console.log(`| ${cols.map((c) => c[1](r)).join(' | ')} |`);
+  for (const cols of tables) {
+    console.log(`| ${cols.map((c) => c[0]).join(' | ')} |`);
+    console.log(`|${cols.map(() => '---').join('|')}|`);
+    for (const r of rows) console.log(`| ${cols.map((c) => c[1](r)).join(' | ')} |`);
+    console.log('');
+  }
 }
 
 async function main() {
@@ -530,27 +636,45 @@ async function main() {
   const sfx = process.platform === 'win32' ? '.exe' : '';
   const bins = { server: path.join(dir, `dnstt-server${sfx}`), client: path.join(dir, `dnstt-client${sfx}`) };
   assert(fs.existsSync(bins.server) && fs.existsSync(bins.client), 'binary dnstt-server dan dnstt-client tersedia');
-  const configs = opt.combos.split(',').map((c) => {
-    const [iv, ack] = c.split(':');
-    return {
-      label: `${iv} ms, ACK ${ack === '1' ? 'langsung' : 'biasa'}`, serverBin: bins.server,
-      env: { SLOWDNS_KCP_INTERVAL: iv, SLOWDNS_KCP_ACK_NODELAY: ack },
-      expectLog: `KCP interval ${iv} ms ack-nodelay ${ack === '1'} window ${opt.window}`
-    };
-  });
+  const configs = opt.configs
+    ? opt.configs.split(';').filter(Boolean).map((spec) => {
+      const eq = spec.indexOf('=');
+      const label = eq < 0 ? spec : spec.slice(0, eq);
+      const env = {};
+      let serverBin = bins.server;
+      for (const kv of (eq < 0 ? '' : spec.slice(eq + 1)).split(',').filter(Boolean)) {
+        const i = kv.indexOf('=');
+        assert(i > 0, `konfigurasi rusak: ${spec}`);
+        if (kv.slice(0, i) === 'BIN') serverBin = path.join(kv.slice(i + 1), `dnstt-server${sfx}`);
+        else env[kv.slice(0, i)] = kv.slice(i + 1);
+      }
+      assert(fs.existsSync(serverBin), `binary tidak ada: ${serverBin}`);
+      return { label, serverBin, env, expectLog: `window ${env.SLOWDNS_KCP_WINDOW || opt.window}` };
+    })
+    : opt.combos.split(',').map((c) => {
+      const [iv, ack] = c.split(':');
+      return {
+        label: `${iv} ms, ACK ${ack === '1' ? 'langsung' : 'biasa'}`, serverBin: bins.server,
+        env: { SLOWDNS_KCP_INTERVAL: iv, SLOWDNS_KCP_ACK_NODELAY: ack },
+        expectLog: `KCP interval ${iv} ms ack-nodelay ${ack === '1'} window ${opt.window}`
+      };
+    });
+  assert.strictEqual(new Set(configs.map((c) => c.label)).size, configs.length, 'label konfigurasi harus unik');
+  if (opt['profile-dir']) fs.mkdirSync(opt['profile-dir'], { recursive: true });
   if (opt.baseline) {
     configs.push({ label: 'pembanding (binary lama)', serverBin: path.join(opt.baseline, `dnstt-server${sfx}`), env: {} });
   }
   console.log(`Bench KCP SlowDNS: ${process.platform}/${os.arch()}, ${os.cpus()[0].model}, GOMAXPROCS=${opt.gomaxprocs}, ` +
     `window ${opt.window}, MTU ${opt.mtu}, RTT ${opt.rtt} ms, jitter ${opt.jitter} ms, loss ${opt.loss}%/arah, ` +
     `${opt.rounds} putaran (urutan diputar), download ${opt['down-mib']} MiB, upload ${opt['up-mib']} MiB, ` +
-    `paralel ${opt.parallel}x${opt['par-mib']} MiB, idle ${opt['idle-clients'] + 1} klien ${opt['idle-sec']} s`);
+    `paralel ${opt.parallel}x${opt['par-mib']} MiB, idle ${opt['idle-clients'] + 1} klien ${opt['idle-sec']} s, ` +
+    `resolver ${opt['resolver-qps'] ? `${opt['resolver-qps']} query/s per klien` : 'tanpa batas laju'}, fase ${opt.phases}`);
   const results = [];
   for (let round = 0; round < opt.rounds; round++) {
     const order = configs.map((_, i) => configs[(i + round) % configs.length]);
     for (const cfg of order) {
       const t0 = Date.now();
-      const r = await runConfig(cfg, opt, bins);
+      const r = await runConfig({ ...cfg, round: round + 1 }, opt, bins);
       results.push(r);
       const d = r.phases.download, idle = r.phases.idle;
       console.log(`  putaran ${round + 1} ${cfg.label}: down ${fmt(d ? d.mbps : null)} Mbps, ` +
@@ -559,7 +683,7 @@ async function main() {
     }
   }
   const rows = summarize(results, configs.map((c) => c.label));
-  console.log('\nMedian per konfigurasi:');
+  console.log('\nMedian (min-maks) per konfigurasi:');
   printTable(rows);
   if (opt.json) fs.writeFileSync(opt.json, JSON.stringify({ opt, host: { platform: process.platform, cpu: os.cpus()[0].model, cores: os.cpus().length }, results, rows }, null, 2));
 }

@@ -213,7 +213,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.125}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.126}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -17142,6 +17142,33 @@ raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
 mapfile -t ports < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}')
 (( ${#ports[@]} > 1 )) || exit 0
 
+unit_active_state() {
+  systemctl show -p ActiveState --value "$1" 2>/dev/null || true
+}
+
+# Satu snapshot `ss` per siklus, diambil hanya kalau ada alias yang aktif, lalu
+# dipakai untuk semua alias. Dulu `ss` dipanggil per alias dan kegagalannya
+# terbaca sebagai 0 koneksi, sehingga alias yang masih dipakai ikut di-stop.
+declare -A established_by_port=()
+snapshot_ready=0
+take_snapshot() {
+  local sockets port count
+  if ! sockets="$(ss -Htn state established 2>/dev/null)"; then
+    return 1
+  fi
+  # Port lokal ada di kolom 3, atau kolom 4 kalau ss ikut mencetak kolom State.
+  # Endpoint IPv6 berbentuk [::1]:7300, jadi port diambil dari bagian terakhir.
+  while read -r port count; do
+    [[ "${port}" =~ ^[0-9]+$ && "${count}" =~ ^[0-9]+$ ]] || continue
+    established_by_port["${port}"]="${count}"
+  done < <(awk '
+    function p(v,   s,n,a,port) { s=v; gsub(/^\[/,"",s); gsub(/\]$/,"",s); n=split(s,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port+0 : ""); }
+    { port=p($3); if (port=="") port=p($4); if (port!="") count[port]++; }
+    END { for (port in count) print port, count[port] }
+  ' <<< "${sockets}")
+  snapshot_ready=1
+}
+
 for alias_port in "${ports[@]:1}"; do
   unit="sc-1forcr-udpgw@${alias_port}.service"
   # `systemctl disable` tanpa --no-reload ikut menjalankan daemon-reload penuh.
@@ -17151,20 +17178,32 @@ for alias_port in "${ports[@]:1}"; do
   if [[ "$(systemctl is-enabled "${unit}" 2>/dev/null || true)" == enabled* ]]; then
     systemctl disable --no-reload "${unit}" >/dev/null 2>&1 || true
   fi
-  if ! systemctl is-active --quiet "${unit}"; then
-    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
-    continue
+  active_state="$(unit_active_state "${unit}")"
+  case "${active_state}" in
+    active|reloading) ;;
+    failed)
+      systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+      continue
+      ;;
+    *) continue ;;
+  esac
+  if (( snapshot_ready == 0 )) && ! take_snapshot; then
+    # Exit 0 sengaja: kegagalan sesaat bukan kerusakan unit drain. Status failed
+    # hanya menambah sampah di `systemctl --failed`; timer mencoba lagi 2 menit
+    # kemudian. Tidak ada alias yang di-stop tanpa data koneksi yang valid.
+    logger -t sc-1forcr-udpgw "Drain ditunda: snapshot koneksi (ss) gagal; alias UDPGW yang aktif dibiarkan jalan." || true
+    exit 0
   fi
-  established="$(ss -Htn state established 2>/dev/null | awk -v wanted="${alias_port}" '
-    function p(v,   s,n,a,port) { s=v; gsub(/^\[/,"",s); gsub(/\]$/,"",s); n=split(s,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port : ""); }
-    { local_ep=$3; if (p(local_ep)=="") local_ep=$4; if (p(local_ep)==wanted) count++; }
-    END {print count+0}')"
+  established="${established_by_port[$(( 10#${alias_port} ))]:-0}"
   if [[ "${established}" == "0" ]]; then
     systemctl stop "${unit}" >/dev/null 2>&1 || true
-    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    if [[ "$(unit_active_state "${unit}")" == failed ]]; then
+      systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    fi
     logger -t sc-1forcr-udpgw "Drain selesai; proses alias UDPGW port ${alias_port} dihentikan." || true
   fi
 done
+exit 0
 EOF
   chmod 755 /usr/local/sbin/sc-1forcr-udpgw-drain
 
@@ -17724,26 +17763,33 @@ unit_managed() {
     systemctl is-enabled --quiet "${unit}" 2>/dev/null
 }
 
+# listener_present PORT SNAPSHOT: SNAPSHOT adalah keluaran `ss -H -lnt`.
 listener_present() {
   local port="$1"
   [[ "${port}" =~ ^[0-9]+$ ]] || return 1
-  ss -H -lnt 2>/dev/null | awk -v want="${port}" '
+  awk -v want="${port}" '
     {
       address=$4;
       sub(/^.*:/, "", address);
       if (address == want) found=1;
     }
     END { exit(found ? 0 : 1) }
-  '
+  ' <<< "${2:-}"
 }
 
 unit_healthy() {
   local unit="$1"
   shift
   systemctl is-active --quiet "${unit}" 2>/dev/null || return 1
-  local port
+  # Unit tanpa port cukup dicek statusnya; `ss` tidak dipanggil.
+  (( $# > 0 )) || return 0
+  # Satu snapshot per percobaan, dipakai semua port unit ini. Snapshot tidak
+  # disimpan: percobaan berikutnya (setelah sleep/restart) mengambil yang baru.
+  # `ss` gagal = tidak sehat, sama seperti sebelumnya.
+  local port listeners
+  listeners="$(ss -H -lnt 2>/dev/null)" || return 1
   for port in "$@"; do
-    listener_present "${port}" || return 1
+    listener_present "${port}" "${listeners}" || return 1
   done
   return 0
 }

@@ -148,6 +148,13 @@ dan speed pada jam ramai yang sama, lalu kembali ke `default` jika speed turun
 atau ping naik. Hasil uji lokal dan batasnya ada di
 [catatan uji KCP](docs/slowdns-kcp-tuning-v125.md).
 
+Dalam keadaan sehat, speed test SlowDNS di VPS 1 vCPU hanya memakai 12–16%
+satu core. dnstt yang memakai hampir satu core penuh dengan trafik kecil adalah
+keadaan macet pada proses yang sudah lama jalan, dan penyebabnya masih
+diselidiki. Window, nodelay, dan pembuangan retransmisi ganda sudah diuji dan
+tidak menurunkan CPU tanpa mengorbankan speed atau ping. Detail ada di
+[riset CPU SlowDNS](docs/slowdns-cpu-research-v126.md).
+
 ## DNS Resolver Guard
 
 SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui

@@ -14,6 +14,8 @@ type remoteRecord struct {
 	LastSeen  time.Time
 	SendQueue chan []byte
 	Stash     chan []byte
+	// Wake (SC) menerima satu tanda saat SendQueue dibuat.
+	Wake chan struct{}
 }
 
 // RemoteMap manages a mapping of live remote peers, keyed by address, to their
@@ -68,7 +70,7 @@ func NewRemoteMap(timeout time.Duration) *RemoteMap {
 func (m *RemoteMap) SendQueue(addr net.Addr) chan []byte {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	return m.inner.Lookup(addr, time.Now()).SendQueue
+	return m.inner.Lookup(addr, time.Now()).ensureSendQueue()
 }
 
 // Stash places p in the stash corresponding to addr, if the stash is not
@@ -107,7 +109,9 @@ type remoteMapInner struct {
 func (inner *remoteMapInner) removeExpired(now time.Time, timeout time.Duration) {
 	for len(inner.byAge) > 0 && now.Sub(inner.byAge[0].LastSeen) >= timeout {
 		record := heap.Pop(inner).(*remoteRecord)
-		close(record.SendQueue)
+		if record.SendQueue != nil {
+			close(record.SendQueue)
+		}
 	}
 }
 
@@ -127,8 +131,8 @@ func (inner *remoteMapInner) Lookup(addr net.Addr, now time.Time) *remoteRecord 
 		record = &remoteRecord{
 			Addr:      addr,
 			LastSeen:  now,
-			SendQueue: make(chan []byte, QueueSize),
 			Stash:     make(chan []byte, 1),
+			Wake:      make(chan struct{}, 1),
 		}
 		heap.Push(inner, record)
 	}

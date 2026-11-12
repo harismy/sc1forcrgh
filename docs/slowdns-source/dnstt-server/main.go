@@ -242,11 +242,15 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32, clientID st
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. It passes each stream to handleStream.
 func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error {
-	// Put a Noise channel on top of the KCP conn.
+	// Put a Noise channel on top of the KCP conn. SC: handshake wajib selesai
+	// sebelum tenggat; sesi dari paket sampah tidak boleh hidup selamanya.
+	handshakeDeadline := time.Now().Add(scHandshakeTimeout)
+	conn.SetReadDeadline(handshakeDeadline)
 	rw, err := noise.NewServer(conn, privkey)
 	if err != nil {
-		return err
+		return scHandshakeError(err, handshakeDeadline)
 	}
+	conn.SetReadDeadline(time.Time{})
 
 	// Put an smux session on top of the encrypted Noise channel.
 	smuxConfig := smux.DefaultConfig()
@@ -302,6 +306,7 @@ const clientEdnsMax = 8192
 
 func clientEdnsRecord(cid turbotunnel.ClientID, size int, kinds ...uint16) {
 	clientEdnsMu.Lock()
+	scEdnsSweepIfFull(cid)
 	if cur, ok := clientEdns[cid]; ok {
 		if size > cur {
 			clientEdns[cid] = size
@@ -310,6 +315,7 @@ func clientEdnsRecord(cid turbotunnel.ClientID, size int, kinds ...uint16) {
 		clientEdns[cid] = size
         if len(kinds) != 0 { clientKinds[cid] = kinds[0] }
 	}
+	scEdnsMarkSeen(cid)
 	clientEdnsMu.Unlock()
 }
 
@@ -324,6 +330,7 @@ func clientEdnsForget(cid turbotunnel.ClientID) {
 	clientEdnsMu.Lock()
 	delete(clientEdns, cid)
  delete(clientKinds, cid)
+	delete(clientSeen, cid)
 	clientEdnsMu.Unlock()
 }
 
@@ -347,6 +354,7 @@ func kcpWindow() int {
 // client's advertised EDNS buffer.
 func acceptSessions(ln *kcp.Listener, privkey []byte, mtu, mtuCeil int, upstream string) error {
 	kcpTuning := scLoadKCPTuning()
+	scLoadSessionGuard()
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
@@ -408,7 +416,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu, mtuCeil int, upstream
 				conn.Close()
 			}()
 			err := acceptStreams(conn, privkey, upstream)
-			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			if err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, errSCHandshakeTimeout) {
 				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
 			}
 		}()
@@ -756,8 +764,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			timerExpired := false
 			for {
 				var p []byte
-				unstash := ttConn.Unstash(rec.ClientID)
-				outgoing := ttConn.OutgoingQueue(rec.ClientID)
+				unstash, outgoing, wake := ttConn.PeekQueues(rec.ClientID)
 				// Prioritize taking a packet first from the
 				// stash, then from the outgoing queue, then
 				// finally check for the expiration of the timer
@@ -776,6 +783,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 						case <-timer.C:
 							timerExpired = true
 						case nextRec = <-ch:
+						case <-wake:
+							// Antrean kirim baru dibuat: ambil ulang, timer tetap jalan.
+							continue
 						}
 					}
 				}
@@ -1123,6 +1133,7 @@ Example:
 			fmt.Fprintf(os.Stderr, "opening UDP listener: %v\n", err)
 			os.Exit(1)
 		}
+		scSetUDPReadBuffer(dnsConn)
 
 		if pubkeyFilename != "" {
 			fmt.Fprintf(os.Stderr, "-pubkey-file may only be used with -gen-key\n")

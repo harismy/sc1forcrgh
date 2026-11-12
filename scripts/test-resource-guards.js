@@ -99,4 +99,64 @@ assert(updatePath.includes('setup_logrotate_optimizations'), 'logrotate config m
 const notify = extract(installer, "cat > /usr/local/sbin/sc-1forcr-online-notify <<'EOF'\n", '\nEOF\n');
 assert(!/systemctl list-unit-files \| grep -q/.test(notify), 'online-notify must not load every unit file just to check one');
 
+// --- Conntrack + rmem_max untuk SlowDNS (V.1FSC.127) ------------------------
+// Tabel 65536 penuh di id3 membuang jutaan paket UDP. Tuning wajib ikut install
+// penuh dan update aman, bertahan lewat reboot (modules-load.d sebelum
+// systemd-sysctl), dan tidak pernah menurunkan nilai yang sudah lebih besar.
+const ctFn = extract(installer, 'conntrack_target_max() {', '\napply_system_optimizations() {');
+assert(extract(installer, 'apply_system_optimizations() {', '\n}\n').includes('apply_conntrack_tuning || true'),
+  'install penuh menjalankan apply_conntrack_tuning');
+const safeUpdate = extract(installer, '    heal_dropbear_banner_override || true\n', '    apply_service_gates\n');
+assert(safeUpdate.indexOf('apply_conntrack_tuning || true') >= 0 &&
+  safeUpdate.indexOf('apply_conntrack_tuning || true') < safeUpdate.indexOf('setup_slowdns'),
+  'update aman menjalankan apply_conntrack_tuning sebelum setup_slowdns');
+assert(!/udp_timeout_stream/.test(ctFn.replace(/^\s*#.*$/gm, '')),
+  'udp_timeout_stream (NAT UDP Custom/ZIVPN) tidak boleh disentuh');
+assert(!/rmem_default/.test(ctFn), 'rmem_default global tidak diubah; buffer 4 MiB diminta dnstt sendiri');
+{
+  const ram = { 1: 985, 2: 1950, 4: 3900, 8: 7900 };
+  const runCt = (ramMib, cur) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-ct-'));
+    const w = (p, v) => { fs.mkdirSync(path.dirname(path.join(root, p)), { recursive: true }); fs.writeFileSync(path.join(root, p), `${v}\n`); };
+    w('proc/sys/net/netfilter/nf_conntrack_max', cur.max);
+    w('proc/sys/net/netfilter/nf_conntrack_udp_timeout', cur.timeout);
+    w('proc/sys/net/core/rmem_max', cur.rmem);
+    w('sys/module/nf_conntrack/parameters/hashsize', cur.hash);
+    const body = ctFn.replace(/(["'\s>=])\/(etc|proc|sys)\//g, '$1${R}/$2/');
+    const script = [
+      'set -euo pipefail',
+      `R="$(cygpath -u '${root}' 2>/dev/null || echo '${root}')"`,
+      `get_total_ram_mib(){ echo ${ramMib}; }`,
+      extract(installer, 'ram_mib_to_nominal_gb() {', '\n}\n') + '\n}',
+      'log(){ :; }; modprobe(){ :; }; sysctl(){ :; }',
+      body,
+      'apply_conntrack_tuning'
+    ].join('\n');
+    const r = spawnSync(bash, ['-c', script], { encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, `apply_conntrack_tuning gagal:\n${r.stderr}`);
+    const rd = (p) => fs.readFileSync(path.join(root, p), 'utf8');
+    return {
+      conf: rd('etc/sysctl.d/98-sc-1forcr-conntrack.conf'),
+      modules: rd('etc/modules-load.d/sc-1forcr-conntrack.conf'),
+      modprobe: rd('etc/modprobe.d/sc-1forcr-conntrack.conf'),
+      hash: rd('sys/module/nf_conntrack/parameters/hashsize').trim()
+    };
+  };
+  const def = { max: 65536, timeout: 30, rmem: 212992, hash: 16384 };
+  const r2 = runCt(ram[2], def);
+  assert(/^net\.netfilter\.nf_conntrack_max=262144$/m.test(r2.conf) &&
+    /^net\.netfilter\.nf_conntrack_udp_timeout=10$/m.test(r2.conf) &&
+    /^net\.core\.rmem_max=4194304$/m.test(r2.conf), `VPS 2 GB: 262144/10/4 MiB\n${r2.conf}`);
+  assert(/^nf_conntrack$/m.test(r2.modules), 'nf_conntrack dimuat saat boot sebelum systemd-sysctl');
+  assert(r2.modprobe.trim() === 'options nf_conntrack hashsize=65536' && r2.hash === '65536',
+    `hashsize dinaikkan ke max/4 (runtime dan saat boot): ${r2.modprobe} / ${r2.hash}`);
+  assert(/nf_conntrack_max=131072$/m.test(runCt(ram[1], def).conf), 'VPS 1 GB: 131072');
+  assert(/nf_conntrack_max=524288$/m.test(runCt(ram[4], def).conf), 'VPS 4 GB: 524288');
+  assert(/nf_conntrack_max=524288$/m.test(runCt(ram[8], def).conf), 'VPS 8 GB: 524288');
+  const big = runCt(ram[2], { max: 1048576, timeout: 5, rmem: 16777216, hash: 262144 });
+  assert(/nf_conntrack_max=1048576$/m.test(big.conf) && /nf_conntrack_udp_timeout=5$/m.test(big.conf) &&
+    /rmem_max=16777216$/m.test(big.conf) && big.hash === '262144',
+    `nilai yang sudah lebih besar/ketat tidak boleh diturunkan atau dilonggarkan\n${big.conf}`);
+}
+
 console.log('resource guard tests passed');

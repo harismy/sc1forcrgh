@@ -1,6 +1,6 @@
 # Memasang binary SlowDNS pada SC lain
 
-Panduan ini ditujukan kepada pemilik atau developer auto script tunneling lain. Paket berisi source **DNSTT `v1.20260501.0` + patch `sc-fast8`**, dengan dukungan TXT, NULL, NS, CNAME, MX, SRV, A, dan AAAA. Paket dapat dibangun tanpa installer, lisensi API, bot, menu, atau database SC 1FORCR.
+Panduan ini ditujukan kepada pemilik atau developer auto script tunneling lain. Paket berisi source **DNSTT `v1.20260501.0` + patch `sc-fast9`**, dengan dukungan TXT, NULL, NS, CNAME, MX, SRV, A, dan AAAA. Paket dapat dibangun tanpa installer, lisensi API, bot, menu, atau database SC 1FORCR.
 
 Contoh pemasangan memakai Linux dengan **systemd dan iptables**, seperti lingkungan Debian/Ubuntu. Untuk SC yang mengelola firewall melalui nftables native atau firewalld, terapkan aturan ekuivalen melalui pengelola firewall SC tersebut. Jangan memasang helper iptables sekaligus menganggap aturan native yang menimpanya akan mengikuti secara otomatis.
 
@@ -97,6 +97,17 @@ DNS_ENABLE_IPV6=0
 ```
 
 `SLOWDNS_KCP_INTERVAL` (10-50 ms) dan `SLOWDNS_KCP_ACK_NODELAY` (0/1) hanya untuk uji CPU. Nilai default 10 dan 0 sama dengan perilaku `sc-fast7`. Nilai kosong atau di luar batas kembali ke default, dan binary mencatat nilai yang dipakai pada log start: `KCP interval 10 ms ack-nodelay false window 2048`. Ubah satu nilai per percobaan dan bandingkan CPU per MiB sekaligus throughput; lihat [hasil uji V.1FSC.125](../slowdns-kcp-tuning-v125.md).
+
+`sc-fast9` menambah dua pengaman yang aktif tanpa setelan. Sesi KCP yang tidak menyelesaikan handshake Noise dalam 30 detik ditutup (`SLOWDNS_HANDSHAKE_TIMEOUT`, 3-300 detik). Tanpa batas ini, query sampah dengan ClientID acak menumpuk sesi yang tidak pernah berakhir dan memakan CPU terus-menerus. Socket UDP DNS juga meminta buffer terima 2 MiB (`SLOWDNS_UDP_RCVBUF`, byte, `0` = bawaan OS), yang oleh kernel digandakan menjadi 4 MiB. Buffer sebesar itu hanya didapat kalau `net.core.rmem_max` minimal 2 MiB.
+
+Di host yang ramai, set juga sysctl berikut dan pastikan `nf_conntrack` dimuat sebelum `systemd-sysctl` (lewat `/etc/modules-load.d/`). Tanpa itu, tabel conntrack bawaan bisa penuh oleh query SlowDNS. Akibatnya kernel membuang paket, dan dnstt gagal mengirim dengan `sendto: operation not permitted`.
+
+```ini
+# /etc/sysctl.d/98-dnstt-portable.conf (2 GB RAM; 1 GB: 131072, 4 GB+: 524288)
+net.netfilter.nf_conntrack_max=262144
+net.netfilter.nf_conntrack_udp_timeout=10
+net.core.rmem_max=4194304
+```
 
 ## 4. Buat kunci sekali
 

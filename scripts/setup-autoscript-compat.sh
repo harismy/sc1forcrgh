@@ -213,7 +213,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.126}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.127}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -3876,6 +3876,62 @@ EOF
   apply_network_mss_rules
 }
 
+# Conntrack dan buffer UDP untuk SlowDNS (V.1FSC.127). Terbukti di id3 (2 GB,
+# 11-11-2026): tabel conntrack 65536 penuh 94% waktu jam ramai, 3,8 juta paket
+# UDP dibuang dalam 3 jam, dan dnstt mencatat "sendto: operation not permitted".
+# Uji 12-11-2026 dengan max 262144 + nf_conntrack_udp_timeout 10 + buffer 4 MiB:
+# drop ~0 dan error itu hilang. Batas hanya dinaikkan (nilai lebih besar milik
+# OS/pemilik dipertahankan). udp_timeout_stream tidak disentuh karena dipakai
+# NAT UDP Custom/ZIVPN. Memori conntrack hanya terpakai per entri yang ada.
+conntrack_target_max() {
+  local gb
+  gb="$(ram_mib_to_nominal_gb "$(get_total_ram_mib)")"
+  if (( gb >= 4 )); then
+    echo 524288
+  elif (( gb >= 2 )); then
+    echo 262144
+  else
+    echo 131072
+  fi
+}
+
+apply_conntrack_tuning() {
+  local file=/etc/sysctl.d/98-sc-1forcr-conntrack.conf
+  local max hash timeout=10 rmem=4194304 cur
+  max="$(conntrack_target_max)"
+  hash=$(( max / 4 ))
+  mkdir -p /etc/modules-load.d /etc/modprobe.d /etc/sysctl.d
+  # nf_conntrack dimuat sebelum systemd-sysctl saat boot. Tanpa ini kunci
+  # net.netfilter.* belum ada dan nilainya diabaikan sampai reboot berikutnya.
+  printf '%s\n' '# SC 1FORCR: kunci net.netfilter.* harus ada saat systemd-sysctl jalan.' 'nf_conntrack' \
+    > /etc/modules-load.d/sc-1forcr-conntrack.conf
+  printf 'options nf_conntrack hashsize=%s\n' "${hash}" > /etc/modprobe.d/sc-1forcr-conntrack.conf
+  modprobe nf_conntrack >/dev/null 2>&1 || true
+
+  cur="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)"
+  if [[ "${cur}" =~ ^[0-9]+$ ]] && (( cur > max )); then max="${cur}"; fi
+  cur="$(cat /proc/sys/net/netfilter/nf_conntrack_udp_timeout 2>/dev/null || echo 0)"
+  if [[ "${cur}" =~ ^[0-9]+$ ]] && (( cur > 0 && cur < timeout )); then timeout="${cur}"; fi
+  cur="$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo 0)"
+  if [[ "${cur}" =~ ^[0-9]+$ ]] && (( cur > rmem )); then rmem="${cur}"; fi
+
+  cat > "${file}" <<EOF
+# SC 1FORCR (V.1FSC.127): tabel conntrack cukup untuk query SlowDNS, flow UDP
+# sekali jalan cepat dibuang, dan dnstt boleh meminta buffer terima 4 MiB.
+net.netfilter.nf_conntrack_max=${max}
+net.netfilter.nf_conntrack_udp_timeout=${timeout}
+net.core.rmem_max=${rmem}
+EOF
+  sysctl -q -p "${file}" >/dev/null 2>&1 || true
+
+  cur="$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo 0)"
+  if [[ "${cur}" =~ ^[0-9]+$ ]] && (( cur > 0 && cur < hash )) && [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
+    echo "${hash}" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+  fi
+  log "Conntrack: max ${max}, udp_timeout ${timeout}s, hashsize min ${hash}, rmem_max ${rmem}."
+  return 0
+}
+
 apply_system_optimizations() {
   log "Apply basic optimization (1GB RAM friendly)..."
 
@@ -3901,6 +3957,7 @@ net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_max_syn_backlog=4096
 EOF
   sysctl --system >/dev/null 2>&1 || true
+  apply_conntrack_tuning || true
 
   mkdir -p /etc/systemd/journald.conf.d
   cat > /etc/systemd/journald.conf.d/limit.conf <<'EOF'
@@ -23663,7 +23720,9 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # dkk), terima EDNS kecil (buang FORMERR minimum), ukuran jawaban per-query,
 # plus KCP mode cepat + window besar (throughput di jalur DNS RTT tinggi).
 # sc-fast8: interval KCP dan ACK langsung bisa diatur lewat environment.
-DNSTT_PATCH_ID="sc-fast8"
+# sc-fast9: tahan banjir sesi palsu (batas waktu handshake, entri EDNS basi
+# dibuang, antrean kirim baru dibuat saat ada paket untuk klien).
+DNSTT_PATCH_ID="sc-fast9"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -24742,6 +24801,290 @@ func scLoadKCPTuning() scKCPTuning {
 
 
 patch_kcp_tuning(mod)
+
+# sc-fast9: tahan banjir sesi palsu. Terbukti di sg4 (12-11-2026): query sampah
+# dengan ClientID acak membuat 1.297 sesi KCP yang tidak pernah handshake dan
+# tidak pernah ditutup (tiap sesi di-flush tiap 10 ms selamanya -> dnstt rata
+# 115% satu core), map EDNS penuh sehingga klien asli turun ke MTU 173, dan tiap
+# ClientID sampah mendapat antrean kirim QueueSize slot (~196 KB) selama 4 menit.
+# (1) handshake Noise wajib selesai dalam batas waktu; (2) entri EDNS ClientID
+# yang lama tidak bertanya dibuang saat map penuh; (3) antrean kirim besar baru
+# dibuat saat server benar-benar menulis paket ke klien itu.
+def patch_session_guard(mod):
+    path = os.path.join(mod, 'dnstt-server', 'main.go')
+    src = io.open(path, encoding='utf-8').read()
+    def replace(old, new):
+        nonlocal src
+        if src.count(old) != 1:
+            raise RuntimeError('guard anchor count: ' + repr(old[:90]))
+        src = src.replace(old, new)
+    # (1) batas waktu handshake. Error timeout kcp-go bukan net.Error, jadi
+    # timeout dikenali dari tenggat yang sudah lewat.
+    replace('\t// Put a Noise channel on top of the KCP conn.\n'
+            '\trw, err := noise.NewServer(conn, privkey)\n'
+            '\tif err != nil {\n\t\treturn err\n\t}\n',
+            '\t// Put a Noise channel on top of the KCP conn. SC: handshake wajib selesai\n'
+            '\t// sebelum tenggat; sesi dari paket sampah tidak boleh hidup selamanya.\n'
+            '\thandshakeDeadline := time.Now().Add(scHandshakeTimeout)\n'
+            '\tconn.SetReadDeadline(handshakeDeadline)\n'
+            '\trw, err := noise.NewServer(conn, privkey)\n'
+            '\tif err != nil {\n\t\treturn scHandshakeError(err, handshakeDeadline)\n\t}\n'
+            '\tconn.SetReadDeadline(time.Time{})\n')
+    replace('\t\t\tif err != nil && !errors.Is(err, io.ErrClosedPipe) {\n'
+            '\t\t\t\tlog.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)\n',
+            '\t\t\tif err != nil && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, errSCHandshakeTimeout) {\n'
+            '\t\t\t\tlog.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)\n')
+    replace('\tkcpTuning := scLoadKCPTuning()\n',
+            '\tkcpTuning := scLoadKCPTuning()\n\tscLoadSessionGuard()\n')
+    # (2) entri EDNS kedaluwarsa. Semua akses map tetap di bawah clientEdnsMu.
+    replace('func clientEdnsRecord(cid turbotunnel.ClientID, size int, kinds ...uint16) {\n'
+            '\tclientEdnsMu.Lock()\n',
+            'func clientEdnsRecord(cid turbotunnel.ClientID, size int, kinds ...uint16) {\n'
+            '\tclientEdnsMu.Lock()\n\tscEdnsSweepIfFull(cid)\n')
+    replace('\t}\n\tclientEdnsMu.Unlock()\n}\n\nfunc clientEdnsSize(',
+            '\t}\n\tscEdnsMarkSeen(cid)\n\tclientEdnsMu.Unlock()\n}\n\nfunc clientEdnsSize(')
+    replace('\tdelete(clientEdns, cid)\n delete(clientKinds, cid)\n',
+            '\tdelete(clientEdns, cid)\n delete(clientKinds, cid)\n\tdelete(clientSeen, cid)\n')
+    # (3) sendLoop tidak lagi membuat antrean kirim untuk ClientID yang belum
+    # pernah dikirimi paket. wake membangunkan penantian saat antrean dibuat.
+    replace('\t\t\t\tunstash := ttConn.Unstash(rec.ClientID)\n'
+            '\t\t\t\toutgoing := ttConn.OutgoingQueue(rec.ClientID)\n',
+            '\t\t\t\tunstash, outgoing, wake := ttConn.PeekQueues(rec.ClientID)\n')
+    replace('\t\t\t\t\t\tcase <-timer.C:\n\t\t\t\t\t\t\ttimerExpired = true\n'
+            '\t\t\t\t\t\tcase nextRec = <-ch:\n\t\t\t\t\t\t}\n',
+            '\t\t\t\t\t\tcase <-timer.C:\n\t\t\t\t\t\t\ttimerExpired = true\n'
+            '\t\t\t\t\t\tcase nextRec = <-ch:\n'
+            '\t\t\t\t\t\tcase <-wake:\n'
+            '\t\t\t\t\t\t\t// Antrean kirim baru dibuat: ambil ulang, timer tetap jalan.\n'
+            '\t\t\t\t\t\t\tcontinue\n'
+            '\t\t\t\t\t\t}\n')
+    # (4) buffer terima socket UDP DNS diminta sendiri, bukan rmem_default global.
+    replace('\t\t\tfmt.Fprintf(os.Stderr, "opening UDP listener: %v\\n", err)\n'
+            '\t\t\tos.Exit(1)\n\t\t}\n',
+            '\t\t\tfmt.Fprintf(os.Stderr, "opening UDP listener: %v\\n", err)\n'
+            '\t\t\tos.Exit(1)\n\t\t}\n'
+            '\t\tscSetUDPReadBuffer(dnsConn)\n')
+    io.open(path, 'w', encoding='utf-8', newline='\n').write(src)
+
+    rpath = os.path.join(mod, 'turbotunnel', 'remotemap.go')
+    rsrc = io.open(rpath, encoding='utf-8').read()
+    def rreplace(old, new):
+        nonlocal rsrc
+        if rsrc.count(old) != 1:
+            raise RuntimeError('remotemap anchor count: ' + repr(old[:90]))
+        rsrc = rsrc.replace(old, new)
+    rreplace('\tSendQueue chan []byte\n\tStash     chan []byte\n}\n',
+             '\tSendQueue chan []byte\n\tStash     chan []byte\n'
+             '\t// Wake (SC) menerima satu tanda saat SendQueue dibuat.\n'
+             '\tWake chan struct{}\n}\n')
+    rreplace('\t\t\tSendQueue: make(chan []byte, QueueSize),\n\t\t\tStash:     make(chan []byte, 1),\n',
+             '\t\t\tStash:     make(chan []byte, 1),\n\t\t\tWake:      make(chan struct{}, 1),\n')
+    rreplace('\treturn m.inner.Lookup(addr, time.Now()).SendQueue\n',
+             '\treturn m.inner.Lookup(addr, time.Now()).ensureSendQueue()\n')
+    rreplace('\t\tclose(record.SendQueue)\n',
+             '\t\tif record.SendQueue != nil {\n\t\t\tclose(record.SendQueue)\n\t\t}\n')
+    io.open(rpath, 'w', encoding='utf-8', newline='\n').write(rsrc)
+
+    io.open(os.path.join(mod, 'turbotunnel', 'sc_lazy.go'), 'w', encoding='utf-8', newline='\n').write(r'''package turbotunnel
+
+import (
+	"net"
+	"time"
+)
+
+// Antrean kirim malas (SC sc-fast9). Record dibuat ringan oleh Lookup; antrean
+// QueueSize slot baru dialokasikan saat ada paket untuk addr (SendQueue/WriteTo),
+// supaya ClientID dari query sampah tidak memakan ~196 KB masing-masing.
+
+// ensureSendQueue dipanggil dengan RemoteMap.lock terpegang.
+func (record *remoteRecord) ensureSendQueue() chan []byte {
+	if record.SendQueue == nil {
+		record.SendQueue = make(chan []byte, QueueSize)
+		select {
+		case record.Wake <- struct{}{}:
+		default:
+		}
+	}
+	return record.SendQueue
+}
+
+// Peek mengembalikan stash, antrean kirim (nil kalau belum pernah ada paket
+// untuk addr), dan kanal wake, tanpa membuat antrean kirim. LastSeen diperbarui
+// seperti Lookup biasa.
+func (m *RemoteMap) Peek(addr net.Addr) (<-chan []byte, <-chan []byte, <-chan struct{}) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	record := m.inner.Lookup(addr, time.Now())
+	return record.Stash, record.SendQueue, record.Wake
+}
+
+// PeekQueues: lihat RemoteMap.Peek. OutgoingQueue tetap selalu membuat antrean.
+func (c *QueuePacketConn) PeekQueues(addr net.Addr) (<-chan []byte, <-chan []byte, <-chan struct{}) {
+	return c.remotes.Peek(addr)
+}
+''')
+
+    io.open(os.path.join(mod, 'dnstt-server', 'sc_guard.go'), 'w', encoding='utf-8', newline='\n').write(r'''package main
+
+import (
+	"errors"
+	"log"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+)
+
+// Buffer terima socket UDP DNS (sc-fast9). Bawaan Linux ~208 KB meluap saat
+// lonjakan query (id3: 3,8 juta paket dibuang dalam 3 jam). 2 MiB diminta dan
+// kernel menggandakannya jadi 4 MiB selama net.core.rmem_max mengizinkan
+// (installer menaikkannya ke >= 4 MiB). SLOWDNS_UDP_RCVBUF=0 = bawaan OS.
+const (
+	scUDPRcvbufDefault = 2 << 20
+	scUDPRcvbufMin     = 64 << 10
+	scUDPRcvbufMax     = 32 << 20
+)
+
+func scParseUDPRcvbuf(raw string) (int, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return scUDPRcvbufDefault, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 || n > scUDPRcvbufMax || (n > 0 && n < scUDPRcvbufMin) {
+		return scUDPRcvbufDefault, false
+	}
+	return n, true
+}
+
+func scSetUDPReadBuffer(c net.PacketConn) {
+	raw := os.Getenv("SLOWDNS_UDP_RCVBUF")
+	size, ok := scParseUDPRcvbuf(raw)
+	if !ok {
+		log.Printf("SLOWDNS_UDP_RCVBUF=%q tidak valid (0 atau %d..%d byte); memakai %d",
+			raw, scUDPRcvbufMin, scUDPRcvbufMax, size)
+	}
+	if size == 0 {
+		return
+	}
+	s, ok := c.(interface{ SetReadBuffer(int) error })
+	if !ok {
+		return
+	}
+	if err := s.SetReadBuffer(size); err != nil {
+		log.Printf("UDP receive buffer %d byte gagal: %v", size, err)
+		return
+	}
+	log.Printf("UDP receive buffer diminta %d byte (dibatasi net.core.rmem_max)", size)
+}
+
+// Penjaga banjir sesi palsu (sc-fast9).
+const (
+	scHandshakeTimeoutDefault = 30 * time.Second
+	scHandshakeTimeoutMin     = 3 * time.Second
+	scHandshakeTimeoutMax     = 300 * time.Second
+	// Entri EDNS ClientID yang tidak bertanya selama ini boleh dibuang saat map
+	// penuh. Klien hidup bertanya paling lambat tiap ~10 detik.
+	scEdnsTTL = int64(idleTimeout / time.Second)
+	// Sapuan map paling sering sekali per sekian detik.
+	scEdnsSweepEvery = 10
+)
+
+var (
+	// scHandshakeTimeout dihitung sejak sesi KCP dibuat. Klien asli mengirim
+	// pesan handshake di paket pertamanya, jadi 30 detik sangat longgar.
+	scHandshakeTimeout    = scHandshakeTimeoutDefault
+	errSCHandshakeTimeout = errors.New("handshake Noise tidak selesai sebelum tenggat")
+	scHandshakeTimeouts   uint64
+	// clientSeen: waktu terakhir (detik Unix) tiap ClientID di clientEdns
+	// bertanya. Dijaga clientEdnsMu, kuncinya selalu sama dengan clientEdns.
+	clientSeen      = make(map[turbotunnel.ClientID]int64)
+	scEdnsLastSweep int64
+)
+
+// scParseHandshakeTimeout menerima detik bulat 3..300; kosong = default.
+func scParseHandshakeTimeout(raw string) (time.Duration, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return scHandshakeTimeoutDefault, true
+	}
+	n, err := strconv.Atoi(raw)
+	d := time.Duration(n) * time.Second
+	if err != nil || d < scHandshakeTimeoutMin || d > scHandshakeTimeoutMax {
+		return scHandshakeTimeoutDefault, false
+	}
+	return d, true
+}
+
+// scLoadSessionGuard dipanggil sekali saat acceptSessions mulai.
+func scLoadSessionGuard() {
+	raw := os.Getenv("SLOWDNS_HANDSHAKE_TIMEOUT")
+	d, ok := scParseHandshakeTimeout(raw)
+	if !ok {
+		log.Printf("SLOWDNS_HANDSHAKE_TIMEOUT=%q tidak valid (3..300 detik); memakai %d", raw, int(d/time.Second))
+	}
+	scHandshakeTimeout = d
+	log.Printf("handshake timeout %d s", int(d/time.Second))
+	go scHandshakeReport()
+}
+
+// scHandshakeError mengganti error handshake yang terjadi setelah tenggat
+// dengan errSCHandshakeTimeout (tidak dilog per sesi, hanya dihitung).
+func scHandshakeError(err error, deadline time.Time) error {
+	if err != nil && !time.Now().Before(deadline) {
+		atomic.AddUint64(&scHandshakeTimeouts, 1)
+		return errSCHandshakeTimeout
+	}
+	return err
+}
+
+// scHandshakeReport menulis satu baris per menit selama ada sesi yang ditutup
+// karena handshake tidak selesai, supaya banjir sesi palsu terlihat di journal.
+func scHandshakeReport() {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for range t.C {
+		if n := atomic.SwapUint64(&scHandshakeTimeouts, 0); n > 0 {
+			log.Printf("handshake timeout: %d sesi tanpa handshake ditutup dalam 1 menit terakhir", n)
+		}
+	}
+}
+
+// scEdnsSweepIfFull dipanggil dengan clientEdnsMu terkunci sebelum entri
+// dicatat. Kalau map penuh dan cid belum ada, entri yang tidak bertanya selama
+// scEdnsTTL dibuang (paling sering sekali per scEdnsSweepEvery detik).
+func scEdnsSweepIfFull(cid turbotunnel.ClientID) {
+	if _, ok := clientEdns[cid]; ok || len(clientEdns) < clientEdnsMax {
+		return
+	}
+	now := time.Now().Unix()
+	if now-scEdnsLastSweep < scEdnsSweepEvery {
+		return
+	}
+	scEdnsLastSweep = now
+	for k, seen := range clientSeen {
+		if now-seen >= scEdnsTTL {
+			delete(clientEdns, k)
+			delete(clientKinds, k)
+			delete(clientSeen, k)
+		}
+	}
+}
+
+// scEdnsMarkSeen dipanggil dengan clientEdnsMu terkunci setelah entri dicatat.
+func scEdnsMarkSeen(cid turbotunnel.ClientID) {
+	if _, ok := clientEdns[cid]; ok {
+		clientSeen[cid] = time.Now().Unix()
+	}
+}
+''')
+
+
+patch_session_guard(mod)
 
 SLOWDNS_PATCH_PY
   then
@@ -43247,6 +43590,9 @@ main() {
     apply_tunnel_security
     restart_update_safe_services
     heal_dropbear_banner_override || true
+    # Update aman tidak memanggil apply_system_optimizations; conntrack dan
+    # rmem_max untuk SlowDNS tetap harus ikut (tidak me-restart apa pun).
+    apply_conntrack_tuning || true
     # Sebelum gerbang ON/OFF: aturan INPUT SlowDNS disisipkan di puncak chain.
     setup_slowdns
     apply_service_gates

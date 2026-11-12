@@ -1,6 +1,6 @@
 # Source Go binary SlowDNS
 
-Folder ini berisi **kode server DNSTT setelah seluruh patch SC diterapkan**, termasuk dukungan TXT/NULL/NS/CNAME/MX/SRV/A/AAAA, monitor stream, serta optimisasi encoder dan receiver. Source diekstrak dari installer SC V.1FSC.125, DNSTT `v1.20260501.0`, patch `sc-fast8`.
+Folder ini berisi **kode server DNSTT setelah seluruh patch SC diterapkan**, termasuk dukungan TXT/NULL/NS/CNAME/MX/SRV/A/AAAA, monitor stream, serta optimisasi encoder dan receiver. Source diekstrak dari installer SC V.1FSC.127, DNSTT `v1.20260501.0`, patch `sc-fast9`.
 
 Paket ini dapat dibangun dan dipasang pada **SC lain**. Panduan lengkapnya ada di **[INSTALL.md](INSTALL.md)**, dengan contoh environment, unit systemd, firewall, delegasi DNS, dan kontrak adapter akun. Binary tidak memerlukan menu, lisensi API, bot, atau database SC asal.
 
@@ -14,6 +14,8 @@ Pada repo asal, source dihasilkan oleh `SLOWDNS_PATCH_PY` dalam `scripts/setup-a
 | [`dnstt-server/sc_sessions.go`](dnstt-server/sc_sessions.go) | Pemetaan ClientID ke stream/port TCP, counter upload atomik, dan Unix socket monitor. |
 | [`dnstt-server/sc_wire.go`](dnstt-server/sc_wire.go) | Encoder cepat respons DNS TXT/NULL dan fallback serializer. |
 | [`dnstt-server/sc_kcp.go`](dnstt-server/sc_kcp.go) | Interval KCP dan ACK langsung dari `SLOWDNS_KCP_INTERVAL`/`SLOWDNS_KCP_ACK_NODELAY`, dengan validasi dan default 10 ms/ACK biasa. |
+| [`dnstt-server/sc_guard.go`](dnstt-server/sc_guard.go) | Penjaga banjir sesi palsu: batas waktu handshake Noise (`SLOWDNS_HANDSHAKE_TIMEOUT`), pembersihan entri EDNS ClientID yang tidak aktif, dan buffer terima socket UDP (`SLOWDNS_UDP_RCVBUF`). |
+| [`turbotunnel/sc_lazy.go`](turbotunnel/sc_lazy.go) | Antrean kirim per klien baru dibuat saat server punya paket untuk klien itu (`PeekQueues`). |
 | [`dns/sc_records.go`](dns/sc_records.go) | Daftar tipe yang didukung, perhitungan kapasitas, encoding dan decoding record multi tipe. |
 | [`dns/dns.go`](dns/dns.go) | Parser/serializer DNS, nama DNS, question, dan resource record. |
 | [`noise/noise.go`](noise/noise.go) | Handshake dan pembungkus saluran Noise. |

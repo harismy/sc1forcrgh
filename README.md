@@ -155,6 +155,51 @@ diselidiki. Window, nodelay, dan pembuangan retransmisi ganda sudah diuji dan
 tidak menurunkan CPU tanpa mengorbankan speed atau ping. Detail ada di
 [riset CPU SlowDNS](docs/slowdns-cpu-research-v126.md).
 
+### Tahan banjir sesi palsu V.1FSC.127
+
+Satu penyebab keadaan macet sudah ditemukan di VPS produksi. Query sampah dengan
+ClientID acak membuat sesi KCP yang tidak pernah menyelesaikan handshake dan
+tidak pernah ditutup. Dalam 16 jam terkumpul 1.297 sesi seperti itu, dan dnstt
+rata-rata memakai 115% satu core. Map EDNS juga penuh, sehingga pengguna asli
+turun dari MTU 932 ke 173.
+
+Patch `sc-fast9` menutup sesi yang belum handshake setelah 30 detik, membuang
+entri EDNS ClientID yang 2 menit tidak bertanya saat map penuh, dan baru membuat
+antrean kirim 8.192 slot saat server benar-benar punya paket untuk klien itu.
+Pada reproduksi lokal dengan 1.500 sesi palsu plus 9.000 ClientID sampah:
+
+| | sc-fast8 | sc-fast9 |
+|---|---|---|
+| CPU dnstt saat idle sesudahnya | 119% satu core | 0% |
+| RAM dnstt | 1.857 MB | 97 MB |
+| MTU klien asli sesudahnya | 215 | 932 |
+
+Speed, ping, dan CPU per MiB pada trafik normal tidak berubah terukur (A/A
+benchmark lokal). Journal mencatat satu baris per menit selama banjir:
+`handshake timeout: N sesi tanpa handshake ditutup dalam 1 menit terakhir`.
+
+### Conntrack dan buffer UDP SlowDNS V.1FSC.127
+
+Di VPS 2 GB yang ramai, tabel conntrack bawaan (65536) penuh hampir sepanjang
+jam ramai. Kernel membuang jutaan paket query SlowDNS, dan dnstt gagal mengirim
+jawaban (`sendto: operation not permitted`). Installer sekarang menaikkan
+`nf_conntrack_max` per RAM (1 GB: 131072, 2 GB: 262144, 4 GB ke atas: 524288),
+memendekkan `nf_conntrack_udp_timeout` ke 10 detik, dan memastikan
+`net.core.rmem_max` minimal 4 MiB. dnstt meminta buffer terima 4 MiB untuk
+socket-nya sendiri. Nilai yang sudah lebih besar tidak diturunkan, dan setelan
+ini bertahan lewat reboot.
+
+Uji 3 jam di VPS produksi 2 GB dengan setelan yang sama:
+
+| | Sebelum | Sesudah |
+|---|---|---|
+| Waktu conntrack penuh | 94% | 0% |
+| Paket UDP dibuang | 3,8 juta | 11.887 |
+| Error `operation not permitted` dnstt | ≥ 9.859 | 0 |
+| Data per jawaban SlowDNS (median) | 349 byte | 446 byte |
+
+CPU total tidak turun, karena query yang dulu dibuang sekarang ikut dilayani.
+
 ## DNS Resolver Guard
 
 SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui

@@ -1,10 +1,10 @@
 {
-  "script_version": "V.1FSC.125",
+  "script_version": "V.1FSC.127",
   "module": "www.bamsoftware.com/git/dnstt.git",
   "module_version": "v1.20260501.0",
-  "patch_id": "sc-fast8",
+  "patch_id": "sc-fast9",
   "source_zip_sha256": "e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866ee5",
-  "installer_patch_sha256": "fa4a39101e93de945e7960759f366903a3c1f223710398555b0c7f5c4af31506",
+  "installer_patch_sha256": "9ea5d8ec4973e82cd8a25cc9dcd6ecdf301b231cd6ad9010079768410a6a564e",
   "files_sha256": {
     "COPYING": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
     "dns/dns.go": "d86387cb4d896d06bc92016ac3b4c58f4627a168bfb969de4eaa683e2ab62352",
@@ -13,10 +13,12 @@
     "dns/sc_records.go": "d99f13de2b2b125143e1b74a449d8f89bdd80c3761992419209cc67caeb9560c",
     "dns/slowdns_name_test.go": "dd97e52c2be99ff39d6e49745942aee7063af8b708e711d71afec68ddd1f8997",
     "dns/slowdns_records_test.go": "9d9878d2acdc430ce44864079eebe8d4eef59a803902bc0c772cc54c4485b497",
-    "dnstt-server/main.go": "702e4ee0e8acf4291775a16ca74a7852e7c55cb8de7e0d63faf153f1956f7733",
+    "dnstt-server/main.go": "ad1a535799fd98c8693c4f8a50b65e326f559fefa10bf1c7d20cb327095d914e",
+    "dnstt-server/sc_guard.go": "71db22d242fedc2660f86464f4f13296c52a28f2bb283ac0dd5ff7740cbcee1e",
     "dnstt-server/sc_kcp.go": "e6985dca623772eba6eb369bf4d576d7cd8f53b252ced31d041c819d5a68c896",
     "dnstt-server/sc_sessions.go": "9846092ef4a99a7da76356dd546ab6419a9efad8b7c20853e987fd523e289859",
     "dnstt-server/sc_wire.go": "3afdcd1555879b9d5674ff7cd156a68becb5cfc9d679dd5c59082fd618538d1c",
+    "dnstt-server/slowdns_guard_test.go": "86fb1c318d03482541fab5d44cb10fdf3b17ef376acdb547907926229427412c",
     "dnstt-server/slowdns_kcp_tuning_test.go": "736f3a33d7aee02a7d26a5e6b02fded22e55af2d24e9b4c998b6cb25ea0fc880",
     "dnstt-server/slowdns_recv_test.go": "f8a01430b09d2943c4e0fac75ee780e72390bb845a8a879a2e6e515800532a1d",
     "dnstt-server/slowdns_sessions_test.go": "ca2dbeb4a61cc8212de794917e8b85df56e0d97f0e6fc9bcef373fbaea47fa5b",
@@ -29,7 +31,9 @@
     "turbotunnel/clientid.go": "80e16984c072ddbb197ed9cd03b480c4f5ad2e15b9e68e8901187fc1cd8b7dc3",
     "turbotunnel/consts.go": "1ddf1c582bcfa1234165cf1ff650eaa93bf52bcc249ccd1fd3c6818a1d37be5e",
     "turbotunnel/queuepacketconn.go": "5f89b88474d980a56c7555591673980844200dc862929aa4cb1a7f2d292e4d93",
-    "turbotunnel/remotemap.go": "eed357efec52b55de396cc1ce998287e2f0a7e730ce0fa53a8366145f424abd3"
+    "turbotunnel/remotemap.go": "bf1de1c8704cae8420bff9c5279d55df416021ce8336c0e70a7a71cdb0230709",
+    "turbotunnel/sc_lazy.go": "daae190a61fbbd2ebc699da61d776c31138eaf925dccb3d556841863d5960314",
+    "turbotunnel/slowdns_lazyqueue_test.go": "3b7e4dcf1e085b54ec01535c164f47425f717088e5e11f16ed0e96fb3c6b0858"
   },
   "text_line_endings": "LF"
 }

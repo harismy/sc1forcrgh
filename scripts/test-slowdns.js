@@ -93,13 +93,30 @@ assert(patchPy.includes('NewName length anchor not found') && patchPy.includes('
   'patch sc-fast6: validasi panjang nama tanpa serializer/cache sementara');
 assert(patchPy.includes("'\\tvar buf [4096]byte\\n\\tfor {"),
   'patch sc-fast6: buffer baca dipakai ulang');
-assert(helper.includes('DNSTT_PATCH_ID="sc-fast8"') && patchPy.includes('\npatch_kcp_tuning(mod)\n') &&
+assert(patchPy.includes('\npatch_kcp_tuning(mod)\n') &&
   patchPy.includes('kcpTuning := scLoadKCPTuning()') &&
   patchPy.includes('kcpTuning.interval, // SLOWDNS_KCP_INTERVAL, default 10 ms') &&
   patchPy.includes('conn.SetACKNoDelay(kcpTuning.ackNoDelay)') &&
   patchPy.includes('os.Getenv("SLOWDNS_KCP_INTERVAL")') && patchPy.includes('os.Getenv("SLOWDNS_KCP_ACK_NODELAY")') &&
   patchPy.includes('scKCPIntervalDefault = 10') && patchPy.includes('scKCPIntervalMax     = 50'),
   'patch sc-fast8: interval KCP + ACK langsung dari env (default 10 ms, ACK biasa) dan VPS lama rebuild');
+const guardPy = patchPy.split('\npatch_kcp_tuning(mod)\n')[1] || '';
+assert(helper.includes('DNSTT_PATCH_ID="sc-fast9"') && guardPy.includes('\npatch_session_guard(mod)\n') &&
+  guardPy.includes('conn.SetReadDeadline(handshakeDeadline)') && guardPy.includes('conn.SetReadDeadline(time.Time{})') &&
+  guardPy.includes('return scHandshakeError(err, handshakeDeadline)') &&
+  guardPy.includes('!errors.Is(err, errSCHandshakeTimeout)') &&
+  guardPy.includes('scHandshakeTimeoutDefault = 30 * time.Second') &&
+  guardPy.includes('\\tclientEdnsMu.Lock()\\n\\tscEdnsSweepIfFull(cid)\\n') &&
+  guardPy.includes('\\tscEdnsMarkSeen(cid)\\n\\tclientEdnsMu.Unlock()') &&
+  guardPy.includes('delete(clientSeen, cid)') && guardPy.includes('scEdnsTTL = int64(idleTimeout / time.Second)') &&
+  guardPy.includes('unstash, outgoing, wake := ttConn.PeekQueues(rec.ClientID)') &&
+  guardPy.includes('case <-wake:') && guardPy.includes('ensureSendQueue()') &&
+  guardPy.includes('if record.SendQueue != nil {') && guardPy.includes('Wake:      make(chan struct{}, 1)') &&
+  guardPy.includes('\\t\\tscSetUDPReadBuffer(dnsConn)\\n') && guardPy.includes('scUDPRcvbufDefault = 2 << 20'),
+  'patch sc-fast9 setelah sc-fast8: handshake bertenggat, entri EDNS basi dibuang, antrean kirim malas (banjir sesi palsu sg4)');
+assert(guardPy.includes('OutgoingQueue tetap selalu membuat antrean') &&
+  guardPy.includes("rreplace('\\t\\t\\tSendQueue: make(chan []byte, QueueSize),"),
+  'sc-fast9: hanya Peek yang malas; OutgoingQueue milik dnstt-client tetap selalu membuat antrean');
 assert(patchPy.includes('conn.SetWindowSize(win, win)') && !/SetWindowSize\(512|MaxReceiveBuffer|MaxStreamBuffer/.test(patchPy),
   'sc-fast8 tidak menyalin window 512 atau buffer smux Potato; window tetap kcpWindow()');
 assert(!/^[^#\n]*\.write_text\([^)]*newline=/m.test(patchPy),

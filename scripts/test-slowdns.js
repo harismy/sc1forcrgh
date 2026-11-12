@@ -72,6 +72,17 @@ assert(helper.includes('SLOWDNS_BIN_SHA256 (64 hex) wajib diisi'), 'binary dari 
 const buildFn = extract(helper, '\nbuild_binary() {', '\n  return "${rc}"\n}\n');
 assert(buildFn.includes('${DNSTT_MODULE}/@v/${DNSTT_VERSION}.zip') && buildFn.includes('${DNSTT_ZIP_SHA256}'),
   'build mengunduh zip source yang dipin dan memverifikasi checksum-nya');
+{
+  // V.1FSC.128: VPS Linode mendapat 404 dari ketiga sumber Google; mirror
+  // non-Google wajib dicoba setelahnya, tetap dengan checksum yang dipin.
+  const goUrls = (buildFn.match(/"https:\/\/[^"]*\$\{GO_VERSION\}\.linux-\$\{arch\}\.tar\.gz"/g) || []);
+  const nonGoogle = goUrls.filter((u) => !/go\.dev|google/.test(u));
+  assert(goUrls.length >= 5 && /go\.dev/.test(goUrls[0]) && nonGoogle.length >= 2 &&
+    goUrls.indexOf(nonGoogle[0]) > goUrls.findIndex((u) => /golang\.google\.cn/.test(u)),
+    `toolchain Go: sumber resmi dulu, lalu minimal 2 mirror non-Google (${goUrls.join(' ')})`);
+  assert(/sha256sum "\$\{work\}\/go\.tgz"[^\n]*!= "\$\{sha\}"/.test(buildFn) && /continue/.test(buildFn),
+    'tarball toolchain dari sumber mana pun wajib cocok dengan checksum yang dipin');
+}
 assert(!buildFn.includes('go install') && /go_bin.*build -trimpath.*dnstt-server|build -trimpath[\s\S]*\.\/dnstt-server/.test(buildFn),
   'build memakai go build atas source yang sudah dipatch, bukan go install upstream');
 assert(buildFn.includes('${DNSTT_VERSION}+${DNSTT_PATCH_ID}'), 'identitas binary menyertakan penanda patch');

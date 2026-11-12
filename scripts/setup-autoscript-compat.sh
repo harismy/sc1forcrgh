@@ -213,7 +213,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.127}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.128}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -24095,9 +24095,15 @@ build_binary() {
   else
     if [[ "${arch}" == "amd64" ]]; then sha="${GO_SHA256_AMD64}"; else sha="${GO_SHA256_ARM64}"; fi
     say "Unduh toolchain ${GO_VERSION} sementara (~70 MB, dihapus setelah build)..."
+    # Tiga sumber pertama sama-sama server Google. Pernah terjadi (VPS Linode,
+    # V.1FSC.127): ketiganya menjawab 404 dari VPS itu sementara normal dari luar,
+    # jadi mirror non-Google ikut dicoba. Isi tarball identik; checksum tetap
+    # dipin, jadi file berbeda ditolak.
     for url in "https://go.dev/dl/${GO_VERSION}.linux-${arch}.tar.gz" \
                "https://dl.google.com/go/${GO_VERSION}.linux-${arch}.tar.gz" \
-               "https://golang.google.cn/dl/${GO_VERSION}.linux-${arch}.tar.gz"; do
+               "https://golang.google.cn/dl/${GO_VERSION}.linux-${arch}.tar.gz" \
+               "https://mirrors.aliyun.com/golang/${GO_VERSION}.linux-${arch}.tar.gz" \
+               "https://mirrors.nju.edu.cn/golang/${GO_VERSION}.linux-${arch}.tar.gz"; do
       rm -f "${work}/go.tgz"
       curl -fsSL --connect-timeout 15 --max-time 900 --retry 2 -o "${work}/go.tgz" "${url}" || continue
       if [[ "$(sha256sum "${work}/go.tgz" | awk '{ print $1 }')" != "${sha}" ]]; then
@@ -24113,7 +24119,7 @@ build_binary() {
   fi
   if [[ -z "${go_bin}" ]]; then
     rm -rf "${work}"
-    echo "Toolchain Go tidak bisa diunduh (cek koneksi VPS ke go.dev)." >&2
+    echo "Toolchain Go tidak bisa diunduh dari go.dev maupun mirror (cek koneksi/DNS VPS: curl -I https://dl.google.com/go/${GO_VERSION}.linux-${arch}.tar.gz)." >&2
     return 1
   fi
   # Unduh source dnstt (versi dipin, zip diverifikasi checksum) lalu patch SC:

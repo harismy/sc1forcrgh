@@ -20,6 +20,7 @@ function fixture() {
   const context = vm.createContext({
     console, crypto, require, process: { pid: 7 },
     SLOWDNS_AUTO_LOCK_ENABLED: true, SLOWDNS_ACTIVITY_FILE: activity, SLOWDNS_LOCK_SECONDS: 900,
+    SLOWDNS_QUOTA_STREAMS_FILE: '/var/lib/sc-1forcr/iplimit-slowdns-quota.json', lastSlowdnsSnapshot: null,
     SSHWS_HARD_LIMIT_CONFIRM_CYCLES: 2, SSHWS_HARD_LIMIT_MIN_GAP_SECONDS: 90, SSHWS_HARD_LIMIT_MAX_GAP_SECONDS: 420,
     AUTO_LOCK_ENABLED: true, IPLIMIT_DEBUG: false, ZIVPN_AUTH_MODE: 'http', XRAY_IP_GROUP_MASK: 16,
     SSHWS_ACCOUNT_SESSION_HARD_LIMIT: 8, LOCK_SECONDS: 3600,
@@ -78,7 +79,7 @@ function fixture() {
     notifyMultiLoginLock: async (...args) => notifications.push(args),
     notifyLongTermIpWarning: async () => {}
   });
-  new vm.Script(policy + '\n' + lock + '\nglobalThis.api={readSlowdnsTunnelUsage,sampleSlowdnsTunnelLimit,lockIfExceeded};').runInContext(context);
+  new vm.Script(policy + '\n' + lock + '\nglobalThis.api={readSlowdnsTunnelUsage,sampleSlowdnsTunnelLimit,lockIfExceeded,parseSlowdnsSessions,readSlowdnsQuotaCounters};').runInContext(context);
   const snapshot = (rows, instance = '1008.1234567890') => {
     raw = 'SC_SLOWDNS_USERS_V1|' + instance + '\n' + rows.map(([cid, up, port, started = 500]) =>
       `alice|${cid.repeat(16)}|${up}|${port}|${BigInt(started) * 1000000000n}`).join('\n') + '\nEND\n';
@@ -167,5 +168,58 @@ function fixture() {
   assert.strictEqual(f.actions.length, 0);
   f.context.AUTO_LOCK_ENABLED = false;
   const before = f.calls(); await f.api.lockIfExceeded(1540); assert.strictEqual(f.calls(), before);
+  // Kuota SSH lewat SlowDNS (V.1FSC.130): upload+download per stream yang
+  // username-nya terverifikasi, stream putus dipetakan dari sampel saat masih
+  // hidup, dan data tidak utuh atau binary lama tidak menghasilkan pemakaian.
+  {
+    const q = fixture();
+    const v2 = (live, ended = [], ver = 2, instance = '1008.1234567890') => q.raw(
+      `SC_SLOWDNS_USERS_V2|${instance}|${ver}\n` +
+      live.map(([u, c, up, port, down]) => `${u}|${c.repeat(16)}|${up}|${port}|500000000000|${down}\n`).join('') +
+      ended.map(([c, up, port, down]) => `E|${c.repeat(16)}|${up}|${port}|500000000000|${down}|600000000000\n`).join('') + 'END\n');
+    const key = (c, port, instance = '1008.1234567890') => `slowdns:${instance}:${c.repeat(16)}:${port}:500000000000`;
+    const counters = (at) => { q.context.lastSlowdnsSnapshot = null; return q.api.readSlowdnsQuotaCounters(at); };
+
+    v2([['alice', 'a', 100, 40001, 900], ['bob', 'b', 50, 40002, 50]], [['c', 70, 39000, 30]]);
+    let c = counters(1000);
+    assert.strictEqual(c.get('alice').get(key('a', 40001)), 1000, 'upload + download per stream');
+    assert.strictEqual(c.get('bob').get(key('b', 40002)), 100);
+    assert(![...c.values()].some((m) => [...m.keys()].some((k) => k.includes('c'.repeat(16)))),
+      'stream putus yang tidak pernah terlihat hidup tidak dibebankan ke siapa pun');
+
+    v2([['bob', 'b', 60, 40002, 140]], [['a', 150, 40001, 1850]]);
+    c = counters(1300);
+    assert.strictEqual(c.get('alice').get(key('a', 40001)), 2000, 'byte akhir stream putus tetap milik alice');
+    assert.strictEqual(c.get('bob').get(key('b', 40002)), 200);
+
+    v2([['bob', 'b', 60, 40002, 140]], [['a', 150, 40001, 1850]], 2, '2000.1234567890');
+    c = counters(1600);
+    assert(!c.has('alice'), 'DNSTT restart (instance baru) tidak memakai peta stream lama');
+
+    q.raw('SC_SLOWDNS_USERS_V2|1008.1234567890|1\nalice|' + 'a'.repeat(16) + '|100|40001|500000000000|-\nEND\n');
+    assert.strictEqual(counters(1900).size, 0, 'binary lama tanpa byte download tidak dihitung');
+    q.raw('SC_SLOWDNS_USERS_V2|1008.1234567890|2\nalice|' + 'a'.repeat(16) + '|100|40001|500000000000|-\nEND\n');
+    assert.strictEqual(counters(1900).size, 0, 'monitor V2 tanpa kolom down = data rusak');
+    q.raw('SC_SLOWDNS_USERS_V2|1008.1234567890|2\nalice|' + 'a'.repeat(16) + '|100|40001|500000000000|9\n');
+    assert.strictEqual(counters(1900).size, 0, 'tanpa END = tidak utuh');
+    q.files.set('/var/lib/sc-1forcr/slowdns.state', 'ENABLED=0\n');
+    const callsBefore = q.calls();
+    assert.strictEqual(counters(1900).size, 0); assert.strictEqual(q.calls(), callsBefore, 'SlowDNS mati: helper tidak dipanggil');
+
+    // Satu panggilan helper per siklus: limit tunnel lalu kuota memakai snapshot yang sama.
+    const r = fixture();
+    r.raw('SC_SLOWDNS_USERS_V2|1008.1234567890|2\nalice|' + 'a'.repeat(16) + '|100|40001|500000000000|900\nEND\n');
+    r.api.readSlowdnsTunnelUsage(1000);
+    assert.strictEqual(r.calls(), 1);
+    assert.strictEqual(r.api.readSlowdnsQuotaCounters(1000).get('alice').size, 1);
+    assert.strictEqual(r.calls(), 1, 'kuota memakai snapshot limit tunnel, bukan panggilan helper kedua');
+
+    const p = q.api.parseSlowdnsSessions;
+    assert.strictEqual(p('SC_SLOWDNS_USERS_V1|1.2\nalice|' + 'a'.repeat(16) + '|1|40001|500000000000\nEND').bytes, false);
+    assert.strictEqual(p('SC_SLOWDNS_USERS_V2|1.2|1\nE|' + 'a'.repeat(16) + '|1|40001|500000000000|1|600000000000\nEND'), null,
+      'baris E dari monitor lama tidak mungkin = rusak');
+    assert.strictEqual(p('SC_SLOWDNS_USERS_V2|1.2|2\nalice|' + 'a'.repeat(16) + '|1|40001|500000000000|1\nbob|' +
+      'b'.repeat(16) + '|1|40001|500000000000|1\nEND'), null, 'port ganda = rusak');
+  }
   console.log('slowdns auto-lock tests passed');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

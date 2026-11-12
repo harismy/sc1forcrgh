@@ -211,7 +211,7 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32, clientID st
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(stream, upstreamTCPConn)
+		_, err := io.Copy(scStreamWriter(stream, tracked), upstreamTCPConn)
 		if err == io.EOF {
 			// smux Stream.Write may return io.EOF.
 			err = nil

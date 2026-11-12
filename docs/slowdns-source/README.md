@@ -1,6 +1,6 @@
 # Source Go binary SlowDNS
 
-Folder ini berisi **kode server DNSTT setelah seluruh patch SC diterapkan**, termasuk dukungan TXT/NULL/NS/CNAME/MX/SRV/A/AAAA, monitor stream, serta optimisasi encoder dan receiver. Source diekstrak dari installer SC V.1FSC.127, DNSTT `v1.20260501.0`, patch `sc-fast9`.
+Folder ini berisi **kode server DNSTT setelah seluruh patch SC diterapkan**, termasuk dukungan TXT/NULL/NS/CNAME/MX/SRV/A/AAAA, monitor stream, serta optimisasi encoder dan receiver. Source diekstrak dari installer SC V.1FSC.130, DNSTT `v1.20260501.0`, patch `sc-fast10`.
 
 Paket ini dapat dibangun dan dipasang pada **SC lain**. Panduan lengkapnya ada di **[INSTALL.md](INSTALL.md)**, dengan contoh environment, unit systemd, firewall, delegasi DNS, dan kontrak adapter akun. Binary tidak memerlukan menu, lisensi API, bot, atau database SC asal.
 
@@ -77,4 +77,4 @@ Tujuh file pengujian SC dari `scripts/go/slowdns_*_test.go` disertakan pada pake
 
 [`source-manifest.json`](source-manifest.json) mencatat versi, checksum arsip upstream, checksum patch installer, dan hash file source/test hasil ekspor. Lisensi upstream disertakan dalam [`COPYING`](COPYING). Folder ini hanya mengekspor server serta paket lokal pendukungnya; binary klien APK berada pada proyek aplikasi yang terpisah.
 
-Contoh pemasangan mandiri dan batas integrasi akun tersedia pada **[INSTALL.md](INSTALL.md)**. Paket sengaja mempertahankan nama `SLOWDNS_*` dan header monitor `SC_SLOWDNS_SESSIONS_V1` agar format metadata tetap kompatibel; nama tersebut tidak mewajibkan penggunaan SC 1FORCR.
+Contoh pemasangan mandiri dan batas integrasi akun tersedia pada **[INSTALL.md](INSTALL.md)**. Paket sengaja mempertahankan nama `SLOWDNS_*` dan header monitor `SC_SLOWDNS_SESSIONS_V2` (penerus V1, lihat INSTALL.md) agar format metadata tetap kompatibel; nama tersebut tidak mewajibkan penggunaan SC 1FORCR.

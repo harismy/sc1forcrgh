@@ -538,20 +538,26 @@ esac
     `unexpected capacity state:\n${capOut.stdout}`);
 
   // Prompt live: read -t yang habis waktunya menjalankan satu siklus live,
-  // pilihan yang diketik tetap diterima, perubahan ukuran terminal
-  // menghentikan live tanpa menggambar apa pun, idle menghentikan live sambil
-  // menghapus penanda, dan EOF tetap batal seperti prompt_input.
+  // pilihan yang diketik tetap diterima, ukuran terminal yang benar-benar
+  // berubah mengembalikan 200 (menu digambar ulang, live jalan lagi kalau
+  // muat), WINCH dengan ukuran sama tidak menghentikan live, idle menghentikan
+  // live sambil menghapus penanda, dan EOF tetap batal seperti prompt_input.
+  // Argumen ketiga 0 = layar belum muat: tanpa siklus live, ukuran tetap
+  // dipantau. Keluhan nyata V.1FSC.129: di Termius HP live berhenti saat
+  // keyboard muncul dan penanda "● live" tertinggal, bar CPU/RAM terlihat macet.
   const liveLoop = extract(menuRuntime, 'menu_read_choice_live() {', '\n}\n') + '\n}\n';
   const loopSh = path.join(tmpDir, 'loop.sh');
-  const loopCase = (actions, idle) => `
+  const loopCase = (actions, idle, liveArg = '') => `
 DASHBOARD_LIVE_SECONDS=2; DASHBOARD_LIVE_IDLE_MINUTES=${idle}; DASH_LIVE_ON=0; DASH_WINCH=0
 ACTIONS=(${actions}); READ_LOG=""; TICKS=""; m=""; rc=0
-menu_read_choice_live m 'PROMPT> ' || rc=$?
+menu_read_choice_live m 'PROMPT> ' ${liveArg} || rc=$?
 echo "RESULT m=\${m} rc=\${rc} reads=\${READ_LOG} ticks=\${TICKS} live=\${DASH_LIVE_ON} trap=[$(trap -p WINCH)]"
 `;
   fs.writeFileSync(loopSh, `set -euo pipefail\n${liveLoop}\n` +
     'cancelled() { echo "Dibatalkan."; }\n' +
     'dashboard_live_tick() { TICKS+="${DASH_LIVE_ON}"; }\n' +
+    'TTY_ROWS=50\n' +
+    'ui_tty_size() { UI_TTY_ROWS="${TTY_ROWS}"; UI_TTY_COLS=80; }\n' +
     'read() {\n' +
     '  local last="${!#}" act="${ACTIONS[0]}"\n' +
     '  ACTIONS=("${ACTIONS[@]:1}")\n' +
@@ -559,27 +565,41 @@ echo "RESULT m=\${m} rc=\${rc} reads=\${READ_LOG} ticks=\${TICKS} live=\${DASH_L
     '  case "${act}" in\n' +
     '    timeout) return 142 ;;\n' +
     '    winch) DASH_WINCH=1; return 142 ;;\n' +
+    '    resize) TTY_ROWS=$(( TTY_ROWS - 20 )); DASH_WINCH=1; return 142 ;;\n' +
     '    eof) return 1 ;;\n' +
     '    value:*) printf -v "${last}" \'%s\' "${act#value:}"; return 0 ;;\n' +
     '  esac\n' +
     '}\n' +
     'MENU_INPUT_TTY=/dev/null\n' +
     loopCase('timeout timeout value:3', 10) +
-    loopCase('winch value:5', 10) +
+    loopCase('resize value:5', 10) +
+    loopCase('winch timeout value:6', 10) +
     loopCase('timeout value:7', 0) +
-    loopCase('eof', 10));
+    loopCase('eof', 10) +
+    loopCase('timeout timeout value:4', 10, '0') +
+    loopCase('resize', 10, '0') +
+    loopCase('timeout value:2', 0, '0'));
   const loop = spawnSync(bash, [toBashPath(loopSh)], { encoding: 'utf8' });
   assert.strictEqual(loop.status, 0, `menu_read_choice_live failed:\n${loop.stderr}`);
   const results = loop.stdout.split('\n').filter((l) => l.includes('RESULT')).map((l) => l.slice(l.indexOf('RESULT')));
   assert.deepStrictEqual(results, [
     'RESULT m=3 rc=0 reads=ttt ticks=11 live=0 trap=[]',
-    'RESULT m=5 rc=0 reads=tb ticks= live=0 trap=[]',
+    'RESULT m= rc=200 reads=t ticks= live=0 trap=[]',
+    'RESULT m=6 rc=0 reads=ttt ticks=11 live=0 trap=[]',
     'RESULT m=7 rc=0 reads=tb ticks=0 live=0 trap=[]',
-    'RESULT m= rc=130 reads=t ticks= live=0 trap=[]'
+    'RESULT m= rc=130 reads=t ticks= live=0 trap=[]',
+    'RESULT m=4 rc=0 reads=ttt ticks= live=0 trap=[]',
+    'RESULT m= rc=200 reads=t ticks= live=0 trap=[]',
+    'RESULT m=2 rc=0 reads=tb ticks= live=0 trap=[]'
   ], `unexpected live prompt flow:\n${loop.stdout}`);
   assert(loop.stdout.includes('PROMPT> '), 'the prompt must be printed once before waiting');
   assert(loop.stdout.includes('Dibatalkan.'), 'EOF must be reported as cancelled like prompt_input');
   assert(/dashboard_live_allowed; then\n\s+menu_read_choice_live m /.test(mainLoop), 'main menu must use the live prompt only when allowed');
+  assert(/dashboard_watch_allowed; then\n(?:\s+#.*\n)*\s+menu_read_choice_live m "\$\{menu_prompt\}" 0 /.test(mainLoop),
+    'main menu must keep watching the terminal size when the screen does not fit yet');
+  assert(/if \(\( menu_rc == 200 \)\); then\n(?:\s+#.*\n)*\s+SHOW_FULL_MENU=1\n\s+continue\n/.test(mainLoop) &&
+    mainLoop.indexOf('menu_rc == 200') < mainLoop.indexOf('menu_rc != 0'),
+    'a real terminal resize must redraw the full menu (not be treated as cancel)');
 
   console.log('menu ui tests passed');
 } finally {

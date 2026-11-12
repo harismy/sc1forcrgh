@@ -200,6 +200,20 @@ Uji 3 jam di VPS produksi 2 GB dengan setelan yang sama:
 
 CPU total tidak turun, karena query yang dulu dibuang sekarang ikut dilayani.
 
+### Kuota SSH ikut menghitung SlowDNS V.1FSC.130
+
+Trafik SSH lewat SlowDNS sekarang masuk ke kuota akun SSH, seperti SSH-WS.
+Upload dan download tiap koneksi SlowDNS dihitung oleh dnstt (patch
+`sc-fast10`), lalu ditambahkan ke pemakaian akun yang login di koneksi itu.
+Kalau kuota habis, akun dikunci lewat jalur LOCK_QUOTA yang sama: semua sesi
+akun itu diputus, termasuk SlowDNS, dan akun tidak bisa login lagi sampai
+kuota direset atau diperpanjang.
+
+Hanya koneksi yang pemiliknya terverifikasi (port dan PID Dropbear) yang
+dihitung. Koneksi SlowDNS yang tersambung lalu putus dalam waktu kurang dari
+satu siklus pemeriksaan (5 menit) bisa tidak terhitung. Ini disengaja, supaya
+trafik tidak pernah dibebankan ke akun yang salah.
+
 ## DNS Resolver Guard
 
 SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui

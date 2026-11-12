@@ -159,13 +159,18 @@ async function scenario(serverBin, clientBin, kcp) {
       const r = spawnSync(serverBin, ['-sc-online', socket], { encoding: 'utf8', timeout: 4000, windowsHide: true });
       assert.strictEqual(r.status, 0, r.stderr);
       const lines = r.stdout.trim().split(/\r?\n/);
-      assert(lines.shift().startsWith(`SC_SLOWDNS_SESSIONS_V1|${server.pid}|`));
+      assert(lines.shift().startsWith(`SC_SLOWDNS_SESSIONS_V2|${server.pid}|`));
       assert.strictEqual(lines.pop(), 'END');
-      return lines.map((l) => l.split('|')).filter((r) => Number(r[2]) > 0);
+      // V2 (sc-fast10): stream hidup port|cid|up|started|down, stream putus
+      // E|port|cid|up|started|down|ended (dipakai kuota SSH).
+      ended = lines.filter((l) => l.startsWith('E|')).map((l) => l.split('|').slice(1));
+      return lines.filter((l) => !l.startsWith('E|')).map((l) => l.split('|')).filter((r) => Number(r[2]) > 0);
     };
+    let ended = [];
     let rows = await until(() => { const rows = query(); return rows.length === 3 && rows; });
     assert.strictEqual(new Set(rows.map((r) => r[1])).size, 2, 'dua klien harus dua ClientID; stream ganda klien pertama tetap satu');
     assert.deepStrictEqual(rows.map((r) => Number(r[2])).sort((x, y) => x - y), [100, 65536, 131072], 'counter hanya payload dari klien');
+    assert(rows.every((r) => r.length === 5 && Number(r[4]) === Number(r[2])), `byte download = payload echo: ${JSON.stringify(rows)}`);
     assert(nullQueries > 0, 'klien kedua benar-benar menggunakan record NULL');
     first.end();
     rows = await until(() => { const rows = query(); return rows.length === 2 && rows; });
@@ -175,6 +180,10 @@ async function scenario(serverBin, clientBin, kcp) {
     assert.strictEqual(Number(rows[0][2]), 65536, 'tunnel yang sudah putus hilang');
     second.end();
     await until(() => query().length === 0);
+    const finals = ended.filter((r) => Number(r[2]) > 0).map((r) => `${r[2]}/${r[4]}`).sort();
+    assert.deepStrictEqual(finals, ['100/100', '131072/131072', '65536/65536'],
+      `stream putus tetap tercatat dengan penghitung akhir: ${JSON.stringify(ended)}`);
+    assert(ended.every((r) => r.length === 6 && BigInt(r[5]) >= BigInt(r[3])), 'waktu putus setelah waktu mulai');
     // Binary benar-benar memakai nilai yang diminta (dibaca sekali saat start).
     assert(serverHead.includes(`KCP interval ${kcp.interval} ms ack-nodelay ${kcp.ack} window 2048`),
       `log tuning KCP ${JSON.stringify(kcp.env)}:\n${serverHead}`);

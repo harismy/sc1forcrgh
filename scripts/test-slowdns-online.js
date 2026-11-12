@@ -204,6 +204,34 @@ try {
   write('native', 'SC_SLOWDNS_SESSIONS_V1|1008|1234567890\n40001|eeeeeeeeeeeeeeee|100|' + future + '\nEND\n');
   out = run('sessions');
   assert(!out.includes('alice|'), out);
+  // sessions 2 (kuota SSH, V.1FSC.130). Binary lama (monitor V1): header
+  // versi 1 dan kolom down "-". Binary sc-fast10 (monitor V2): byte download
+  // ikut, dan stream yang sudah putus keluar sebagai baris E tanpa username.
+  write('native', native);
+  out = run('sessions', 0, '2');
+  assert(out.startsWith('SC_SLOWDNS_USERS_V2|1008.1234567890|1\n'), out);
+  assert(/^alice\|aaaaaaaaaaaaaaaa\|100\|40001\|1000000000\|-$/m.test(out) && !/^E\|/m.test(out), out);
+  const nativeV2 = 'SC_SLOWDNS_SESSIONS_V2|1008|1234567890\n' +
+    '40001|aaaaaaaaaaaaaaaa|100|1000000000|7000\n40002|aaaaaaaaaaaaaaaa|200|1000000000|8000\n' +
+    '40003|bbbbbbbbbbbbbbbb|300|1000000000|9000\n40004|cccccccccccccccc|400|1000000000|1\n' +
+    'E|39999|ffffffffffffffff|50|1000000000|60|2000000000\nEND\n';
+  write('native', nativeV2);
+  out = run('sessions', 0, '2');
+  assert(out.startsWith('SC_SLOWDNS_USERS_V2|1008.1234567890|2\n'), out);
+  assert(/^alice\|aaaaaaaaaaaaaaaa\|100\|40001\|1000000000\|7000$/m.test(out) &&
+    /^bob\|bbbbbbbbbbbbbbbb\|300\|40003\|1000000000\|9000$/m.test(out), out);
+  assert(/^E\|ffffffffffffffff\|50\|39999\|1000000000\|60\|2000000000$/m.test(out), out);
+  assert(!/cccccccccccccccc/.test(out) && out.endsWith('END\n'), 'koneksi tanpa username terverifikasi tidak ikut: ' + out);
+  out = run('sessions');
+  assert(out.startsWith('SC_SLOWDNS_USERS_V1|1008.1234567890\n') &&
+    /^alice\|aaaaaaaaaaaaaaaa\|100\|40001\|1000000000$/m.test(out) && !/^E\|/m.test(out),
+    'format V1 untuk limit tunnel tidak berubah walau monitor V2: ' + out);
+  out = run();
+  assert(/Tunnel aktif\s*: 2 identitas/.test(out), 'monitor V2 tetap dihitung untuk tunnel: ' + out);
+  write('native', nativeV2.replace('|1000000000|9000\n', '|1000000000\n'));
+  run('sessions', 1, '2');
+  write('native', nativeV2.replace('E|39999|', 'E|x|'));
+  run('sessions', 1, '2');
   write('native', native);
   out = run('set-lock', 0, '0');
   assert(/SLOWDNS_AUTO_LOCK_ENABLE=0/.test(read('env')), out);

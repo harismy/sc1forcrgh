@@ -213,7 +213,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.128}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.130}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -11840,6 +11840,10 @@ const LOCK_HISTORY_PRUNE_STATE_FILE = '/var/lib/sc-1forcr/iplimit-history-prune-
 const AUTO_LOCK_ENABLED = !/^(0|false|off|no)$/i.test(String(process.env.IPLIMIT_AUTO_LOCK_ENABLE || '1').trim());
 const SLOWDNS_AUTO_LOCK_ENABLED = /^(1|true|on|yes)$/i.test(String(process.env.SLOWDNS_AUTO_LOCK_ENABLE || '1').trim());
 const SLOWDNS_ACTIVITY_FILE = '/var/lib/sc-1forcr/iplimit-slowdns-activity.json';
+// Pemilik stream SlowDNS dari sampel sebelumnya, untuk kuota stream yang sudah putus.
+const SLOWDNS_QUOTA_STREAMS_FILE = '/var/lib/sc-1forcr/iplimit-slowdns-quota.json';
+// Snapshot helper terakhir siklus ini; limit tunnel dan kuota memakai satu panggilan.
+let lastSlowdnsSnapshot = null;
 const SLOWDNS_LOCK_SECONDS = 15 * 60;
 const LOCK_SECONDS = LOCK_MINUTES * 60;
 const SSHWS_ACCOUNT_SESSION_HARD_LIMIT_RAW = Number(process.env.SSHWS_ACCOUNT_SESSION_HARD_LIMIT || 8);
@@ -14696,6 +14700,7 @@ async function enforceQuotaLimits() {
   const sshCounters = setupSshQuotaAccounting(sshRows);
   const sshProcCounters = readSshProcessQuotaCounters();
   const sshWsCounters = readSshWsQuotaCounters();
+  const slowdnsCounters = sshRows.length ? readSlowdnsQuotaCounters(Math.floor(Date.now() / 1000)) : new Map();
   for (const row of sshRows) {
     const user = String(row?.username || '').trim();
     const key = user.toLowerCase();
@@ -14709,9 +14714,12 @@ async function enforceQuotaLimits() {
     }
     const procDelta = await addQuotaSessionDeltas('ssh', user, sshProcCounters.get(key) || new Map(), 'proc:');
     const sshWsDelta = await addQuotaSessionDeltas('ssh', user, sshWsCounters.get(key) || new Map(), 'sshws:', true);
-    const delta = Math.max(ownerDelta, procDelta, sshWsDelta);
+    // SlowDNS lewat DNSTT -> Dropbear tidak tumpang tindih dengan tiga sumber
+    // di atas (Dropbear jalan sebagai root, tanpa mux), jadi ditambahkan.
+    const slowdnsDelta = await addQuotaSessionDeltas('ssh', user, slowdnsCounters.get(key) || new Map(), 'slowdns:', true);
+    const delta = Math.max(ownerDelta, procDelta, sshWsDelta) + slowdnsDelta;
     const used = await addQuotaDelta('ssh', user, delta, counter);
-    if (IPLIMIT_DEBUG) console.log(`[quota-debug][ssh] user=${user} quota=${quotaBytes} used=${used} delta=${delta} owner_delta=${ownerDelta} proc_delta=${procDelta} sshws_delta=${sshWsDelta} counter=${counter}`);
+    if (IPLIMIT_DEBUG) console.log(`[quota-debug][ssh] user=${user} quota=${quotaBytes} used=${used} delta=${delta} owner_delta=${ownerDelta} proc_delta=${procDelta} sshws_delta=${sshWsDelta} slowdns_delta=${slowdnsDelta} counter=${counter}`);
     if (quotaBytes > 0 && used >= quotaBytes) {
       const out = await lockSshForQuota(row, used, quotaBytes);
       if (out.zivpnChanged) zivpnChanged = true;
@@ -14811,27 +14819,18 @@ function readSlowdnsTunnelUsage(nowTs) {
   try {
     const state = fs.readFileSync('/var/lib/sc-1forcr/slowdns.state', 'utf8');
     if (!/^ENABLED=1\s*$/m.test(state)) return result;
-    const raw = execFileSync('/usr/local/sbin/sc-1forcr-slowdns', ['sessions'], {
-      encoding: 'utf8', timeout: 12000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']
-    });
-    const lines = String(raw).trim().split(/\r?\n/);
-    const header = /^SC_SLOWDNS_USERS_V1\|([0-9]+\.[0-9]+)$/.exec(lines.shift() || '');
-    if (!header || lines.pop() !== 'END') return result;
-    const instance = header[1];
+    const snap = readSlowdnsSnapshot();
+    if (!snap) return result;
+    lastSlowdnsSnapshot = { at: Date.now(), snap };
+    const instance = snap.instance;
     let previous = null;
     try { previous = JSON.parse(fs.readFileSync(SLOWDNS_ACTIVITY_FILE, 'utf8')); } catch (_) {}
     const age = nowTs - Number(previous?.updatedAt || 0);
     const baselineValid = previous?.instance === instance && age > 0 && age <= SSHWS_HARD_LIMIT_MAX_GAP_SECONDS;
     const baseline = baselineValid && previous?.rows && typeof previous.rows === 'object' ? previous.rows : {};
     const current = Object.create(null);
-    const observed = new Set();
-    for (const line of lines) {
-      const m = /^([a-z0-9._-]+)\|([0-9a-f]{16})\|([0-9]+)\|([0-9]+)\|([0-9]{10,20})$/.exec(line);
-      if (!m) return new Map();
-      const [, user, cid, upRaw, portRaw, started] = m;
-      const up = Number(upRaw), port = Number(portRaw);
-      if (!Number.isSafeInteger(up) || !Number.isInteger(port) || port < 1 || port > 65535 || observed.has(port)) return new Map();
-      observed.add(port);
+    for (const row of snap.live) {
+      const { user, cid, up, port, started } = row;
       const key = `${user}|${cid}|${port}|${started}`;
       current[key] = up;
       const old = baseline[key];
@@ -14847,6 +14846,110 @@ function readSlowdnsTunnelUsage(nowTs) {
     return result;
   } catch (_) {
     try { fs.unlinkSync(`${SLOWDNS_ACTIVITY_FILE}.tmp.${process.pid}`); } catch (_) {}
+    return new Map();
+  }
+}
+
+// Output helper `sessions 2` (V2) atau `sessions` lama (V1). V2 membawa versi
+// monitor DNSTT: 2 = byte download dan stream yang sudah putus ("E|") tersedia.
+// Satu baris rusak, port ganda, atau END hilang = null, jadi tidak ada bukti
+// lock maupun pemakaian kuota dari data yang tidak utuh.
+function parseSlowdnsSessions(raw) {
+  const lines = String(raw || '').trim().split(/\r?\n/);
+  const head = lines.shift() || '';
+  let m = /^SC_SLOWDNS_USERS_V2\|([0-9]+\.[0-9]+)\|([12])$/.exec(head);
+  let v2 = true, bytes = false, instance = '';
+  if (m) {
+    instance = m[1];
+    bytes = m[2] === '2';
+  } else {
+    m = /^SC_SLOWDNS_USERS_V1\|([0-9]+\.[0-9]+)$/.exec(head);
+    if (!m) return null;
+    v2 = false;
+    instance = m[1];
+  }
+  if (lines.pop() !== 'END') return null;
+  const live = [], ended = [], observed = new Set();
+  for (const line of lines) {
+    if (v2 && line.startsWith('E|')) {
+      const e = /^E\|([0-9a-f]{16})\|([0-9]+)\|([0-9]+)\|([0-9]{10,20})\|([0-9]+)\|([0-9]{10,20})$/.exec(line);
+      if (!e || !bytes) return null;
+      const up = Number(e[2]), port = Number(e[3]), down = Number(e[5]);
+      if (!Number.isSafeInteger(up) || !Number.isSafeInteger(down) || port < 1 || port > 65535) return null;
+      ended.push({ cid: e[1], up, port, started: e[4], down });
+      continue;
+    }
+    const r = v2
+      ? /^([a-z0-9._-]+)\|([0-9a-f]{16})\|([0-9]+)\|([0-9]+)\|([0-9]{10,20})\|([0-9]+|-)$/.exec(line)
+      : /^([a-z0-9._-]+)\|([0-9a-f]{16})\|([0-9]+)\|([0-9]+)\|([0-9]{10,20})$/.exec(line);
+    if (!r) return null;
+    const up = Number(r[3]), port = Number(r[4]);
+    const down = v2 && r[6] !== '-' ? Number(r[6]) : null;
+    if (!Number.isSafeInteger(up) || !Number.isInteger(port) || port < 1 || port > 65535 || observed.has(port)) return null;
+    if (bytes && !Number.isSafeInteger(down)) return null;
+    observed.add(port);
+    live.push({ user: r[1], cid: r[2], up, port, started: r[5], down });
+  }
+  return { instance, bytes, live, ended };
+}
+
+function readSlowdnsSnapshot() {
+  try {
+    const raw = execFileSync('/usr/local/sbin/sc-1forcr-slowdns', ['sessions', '2'], {
+      encoding: 'utf8', timeout: 12000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']
+    });
+    return parseSlowdnsSessions(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
+// Kuota SSH lewat SlowDNS (V.1FSC.130). Trafik SlowDNS masuk ke Dropbear dari
+// DNSTT, jadi tidak terhitung counter iptables/proses sshd/mux SSH-WS. Per
+// stream dihitung upload+download dari monitor DNSTT (sc-fast10), dengan kunci
+// unik instance:cid:port:started. Stream yang sudah putus tidak membawa
+// username, jadi dipetakan dari sampel sebelumnya saat stream itu masih hidup
+// (SLOWDNS_QUOTA_STREAMS_FILE). Stream yang lahir dan putus di antara dua
+// pemeriksaan tidak terpetakan dan tidak dihitung: lebih baik kurang hitung
+// daripada membebankan trafik ke akun yang salah.
+function readSlowdnsQuotaCounters(nowTs) {
+  const out = new Map();
+  try {
+    const state = fs.readFileSync('/var/lib/sc-1forcr/slowdns.state', 'utf8');
+    if (!/^ENABLED=1\s*$/m.test(state)) return out;
+    const fresh = lastSlowdnsSnapshot && Date.now() - lastSlowdnsSnapshot.at < 120000;
+    const snap = fresh ? lastSlowdnsSnapshot.snap : readSlowdnsSnapshot();
+    if (!snap || !snap.bytes) return out;
+    let memory = Object.create(null);
+    try {
+      const prev = JSON.parse(fs.readFileSync(SLOWDNS_QUOTA_STREAMS_FILE, 'utf8'));
+      if (prev?.instance === snap.instance && prev.streams && typeof prev.streams === 'object') memory = prev.streams;
+    } catch (_) {}
+    const next = Object.create(null);
+    const add = (user, key, bytes) => {
+      if (!out.has(user)) out.set(user, new Map());
+      out.get(user).set(`slowdns:${snap.instance}:${key}`, bytes);
+    };
+    for (const s of snap.live) {
+      const key = `${s.cid}:${s.port}:${s.started}`;
+      next[key] = s.user;
+      add(s.user, key, s.up + s.down);
+    }
+    for (const s of snap.ended) {
+      const key = `${s.cid}:${s.port}:${s.started}`;
+      const user = String(memory[key] || '');
+      if (!/^[a-z0-9._-]+$/.test(user) || key in next) continue;
+      next[key] = user;
+      add(user, key, s.up + s.down);
+    }
+    try {
+      fs.mkdirSync(require('path').dirname(SLOWDNS_QUOTA_STREAMS_FILE), { recursive: true });
+      const tmp = `${SLOWDNS_QUOTA_STREAMS_FILE}.tmp.${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify({ instance: snap.instance, updatedAt: nowTs, streams: next }), { mode: 0o600 });
+      fs.renameSync(tmp, SLOWDNS_QUOTA_STREAMS_FILE);
+    } catch (_) {}
+    return out;
+  } catch (_) {
     return new Map();
   }
 }
@@ -23722,7 +23825,8 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # sc-fast8: interval KCP dan ACK langsung bisa diatur lewat environment.
 # sc-fast9: tahan banjir sesi palsu (batas waktu handshake, entri EDNS basi
 # dibuang, antrean kirim baru dibuat saat ada paket untuk klien).
-DNSTT_PATCH_ID="sc-fast9"
+# sc-fast10: byte download per stream + stream putus disimpan 30 menit (kuota SSH).
+DNSTT_PATCH_ID="sc-fast10"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -25092,6 +25196,109 @@ func scEdnsMarkSeen(cid turbotunnel.ClientID) {
 
 patch_session_guard(mod)
 
+# sc-fast10: kuota SSH lewat SlowDNS. Monitor sesi (sc-fast4) hanya menghitung
+# byte klien untuk bukti aktivitas, dan stream langsung hilang saat putus.
+# Sekarang byte download ikut dihitung, dan stream yang putus disimpan 30 menit
+# (maks 4096) dengan penghitung akhirnya, supaya pemeriksa kuota tidak
+# kehilangan trafik sejak sampel terakhir. Format monitor naik ke V2: baris
+# stream hidup = format V1 + kolom down; baris "E|" = stream yang sudah putus.
+def patch_session_bytes(mod):
+    spath = os.path.join(mod, 'dnstt-server', 'sc_sessions.go')
+    ssrc = io.open(spath, encoding='utf-8').read()
+    def sreplace(old, new):
+        nonlocal ssrc
+        if ssrc.count(old) != 1:
+            raise RuntimeError('sessions anchor count: ' + repr(old[:90]))
+        ssrc = ssrc.replace(old, new)
+    sreplace(r'''type scSession struct {
+    up uint64
+    port int
+''', r'''type scSession struct {
+    up uint64
+    down uint64
+    ended int64
+    port int
+''')
+    sreplace(r'''func scUntrackStream(s *scSession) {
+    if s == nil { return }
+    scSessionsMu.Lock()
+    if scSessions[s.port] == s { delete(scSessions, s.port) }
+    scSessionsMu.Unlock()
+}
+''', r'''// Stream yang sudah putus disimpan sebentar beserta penghitung akhirnya.
+const (
+    scEndedKeepNanos = int64(30 * time.Minute)
+    scEndedMax = 4096
+)
+
+var scEnded []*scSession
+
+func scPruneEndedLocked(now int64) {
+    drop := 0
+    for drop < len(scEnded) && (now-scEnded[drop].ended > scEndedKeepNanos || len(scEnded)-drop > scEndedMax) {
+        drop++
+    }
+    if drop > 0 {
+        n := copy(scEnded, scEnded[drop:])
+        for i := n; i < len(scEnded); i++ { scEnded[i] = nil }
+        scEnded = scEnded[:n]
+    }
+}
+
+func scUntrackStream(s *scSession) {
+    if s == nil { return }
+    now := time.Now().UnixNano()
+    scSessionsMu.Lock()
+    if scSessions[s.port] == s { delete(scSessions, s.port) }
+    s.ended = now
+    scEnded = append(scEnded, s)
+    scPruneEndedLocked(now)
+    scSessionsMu.Unlock()
+}
+
+// Byte dari Dropbear ke klien (download), untuk kuota.
+type scDownWriter struct { io.Writer; session *scSession }
+func (w scDownWriter) Write(p []byte) (int, error) {
+    n, err := w.Writer.Write(p)
+    if n > 0 { atomic.AddUint64(&w.session.down, uint64(n)) }
+    return n, err
+}
+
+func scStreamWriter(stream io.Writer, s *scSession) io.Writer {
+    if s == nil { return stream }
+    return scDownWriter{stream, s}
+}
+''')
+    sreplace(r'''    fmt.Fprintf(&b, "SC_SLOWDNS_SESSIONS_V1|%d|%d\n", os.Getpid(), scMonitorStarted)
+    scSessionsMu.Lock()
+    for _, s := range scSessions {
+        fmt.Fprintf(&b, "%d|%s|%d|%d\n", s.port, s.clientID, atomic.LoadUint64(&s.up), s.started)
+    }
+    scSessionsMu.Unlock()
+''', r'''    fmt.Fprintf(&b, "SC_SLOWDNS_SESSIONS_V2|%d|%d\n", os.Getpid(), scMonitorStarted)
+    scSessionsMu.Lock()
+    for _, s := range scSessions {
+        fmt.Fprintf(&b, "%d|%s|%d|%d|%d\n", s.port, s.clientID, atomic.LoadUint64(&s.up), s.started, atomic.LoadUint64(&s.down))
+    }
+    scPruneEndedLocked(time.Now().UnixNano())
+    for _, s := range scEnded {
+        fmt.Fprintf(&b, "E|%d|%s|%d|%d|%d|%d\n", s.port, s.clientID, atomic.LoadUint64(&s.up), s.started, atomic.LoadUint64(&s.down), s.ended)
+    }
+    scSessionsMu.Unlock()
+''')
+    io.open(spath, 'w', encoding='utf-8', newline='\n').write(ssrc)
+
+    path = os.path.join(mod, 'dnstt-server', 'main.go')
+    src = io.open(path, encoding='utf-8').read()
+    old = '\t\t_, err := io.Copy(stream, upstreamTCPConn)\n'
+    if src.count(old) != 1:
+        raise RuntimeError('download anchor count: ' + str(src.count(old)))
+    src = src.replace(old, '\t\t_, err := io.Copy(scStreamWriter(stream, tracked), upstreamTCPConn)\n')
+    io.open(path, 'w', encoding='utf-8', newline='\n').write(src)
+
+
+patch_session_bytes(mod)
+
 SLOWDNS_PATCH_PY
   then
     rm -rf "${work}"
@@ -25609,6 +25816,9 @@ collect_online() {
   ONLINE_TUNNELS=0
   ONLINE_INSTANCE=""
   ONLINE_SESSION_ROWS=""
+  ONLINE_SESSION_ROWS2=""
+  ONLINE_GONE_ROWS=""
+  ONLINE_NATIVE_VERSION=1
   load_config
   if (( ENABLED == 0 )); then
     ONLINE_AVAILABLE=1
@@ -25648,13 +25858,23 @@ collect_online() {
       next;
     }
     FILENAME==ARGV[2] {
-      if ($1=="SC_SLOWDNS_SESSIONS_V1" && $2==owner && $3 ~ /^[0-9]+$/) {
-        native=1; instance=$2 "." $3; next;
+      # V1: port|cid|up|started. V2 (sc-fast10): + |down, dan baris
+      # E|port|cid|up|started|down|ended untuk stream yang sudah putus.
+      if (($1=="SC_SLOWDNS_SESSIONS_V1" || $1=="SC_SLOWDNS_SESSIONS_V2") && $2==owner && $3 ~ /^[0-9]+$/) {
+        native=1; nver=($1=="SC_SLOWDNS_SESSIONS_V2" ? 2 : 1); instance=$2 "." $3; next;
       }
       if ($0=="END") { ended=1; next; }
+      if (nver==2 && $1=="E" && NF==7 && $2 ~ /^[0-9]+$/ && $2+0>0 && $2+0<=65535 &&
+          $3 ~ /^[0-9a-f]+$/ && length($3)==16 && $4 ~ /^[0-9]+$/ &&
+          $5 ~ /^[0-9]+$/ && length($5)>=10 && length($5)<=20 && $6 ~ /^[0-9]+$/ &&
+          $7 ~ /^[0-9]+$/ && length($7)>=10 && length($7)<=20) {
+        gone[++gone_n]=$3 "|" $4 "|" $2 "|" $5 "|" $6 "|" $7;
+        next;
+      }
       if ($1 ~ /^[0-9]+$/ && $1+0>0 && $1+0<=65535 && $2 ~ /^[0-9a-f]+$/ && length($2)==16 &&
-          $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && length($4)>=10 && length($4)<=20 && !($1 in cid)) {
-        cid[$1]=$2; up[$1]=$3; started[$1]=$4;
+          $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && length($4)>=10 && length($4)<=20 && !($1 in cid) &&
+          ((nver==2 && NF==5 && $5 ~ /^[0-9]+$/) || (nver!=2 && NF==4))) {
+        cid[$1]=$2; up[$1]=$3; started[$1]=$4; down[$1]=(nver==2 ? $5 : "-");
         next;
       }
       bad=1; next;
@@ -25707,13 +25927,14 @@ collect_online() {
             tunnelKey=u SUBSEP cid[p];
             if (!(tunnelKey in tunnel)) { tunnel[tunnelKey]=1; user_tunnels[u]++; }
             if (!(cid[p] in all_tunnels)) { all_tunnels[cid[p]]=1; tunnelCount++; }
-            print "stream|" u "|" cid[p] "|" up[p] "|" p "|" started[p];
+            print "stream|" u "|" cid[p] "|" up[p] "|" p "|" started[p] "|" down[p];
           }
         }
       }
       for (u in per_user) users++;
       print "summary|" total "|" users "|" verified "|" (total-verified);
-      if (ready) print "native|1|" instance "|" tunnelCount;
+      if (ready) print "native|1|" instance "|" tunnelCount "|" nver;
+      if (ready && nver==2) for (i=1; i<=gone_n; i++) print "gone|" gone[i];
       if (hidden) print "hidden|1";
       for (u in per_user) print "user|" u "|" per_user[u] "|" (ready ? user_tunnels[u]+0 : "-");
     }
@@ -25722,15 +25943,22 @@ collect_online() {
     return 0
   fi
   ONLINE_AVAILABLE=1
-  while IFS='|' read -r kind a b c d e; do
+  while IFS='|' read -r kind a b c d e f; do
     case "${kind}" in
       summary)
         ONLINE_CONNECTIONS="${a}"; ONLINE_USERS="${b}"
         ONLINE_AUTHENTICATED="${c}"; ONLINE_UNKNOWN="${d}"
         ;;
       hidden) ONLINE_NOTE="Sebagian pemilik koneksi tidak terbaca; angka dapat kurang" ;;
-      native) ONLINE_TUNNELS_AVAILABLE=1; ONLINE_INSTANCE="${b}"; ONLINE_TUNNELS="${c}" ;;
-      stream) ONLINE_SESSION_ROWS+="${a}|${b}|${c}|${d}|${e}"$'\n' ;;
+      native)
+        ONLINE_TUNNELS_AVAILABLE=1; ONLINE_INSTANCE="${b}"; ONLINE_TUNNELS="${c}"
+        ONLINE_NATIVE_VERSION="${d:-1}"
+        ;;
+      stream)
+        ONLINE_SESSION_ROWS+="${a}|${b}|${c}|${d}|${e}"$'\n'
+        ONLINE_SESSION_ROWS2+="${a}|${b}|${c}|${d}|${e}|${f}"$'\n'
+        ;;
+      gone) ONLINE_GONE_ROWS+="E|${a}|${b}|${c}|${d}|${e}|${f}"$'\n' ;;
       user) ONLINE_ROWS+="${a}|${b}|${c}"$'\n' ;;
     esac
   done <<< "${data}"
@@ -25784,11 +26012,22 @@ cmd_online() {
   return 0
 }
 
+# sessions   : V1 untuk limit tunnel (user|cid|up|port|started).
+# sessions 2 : V2 untuk limit tunnel + kuota SSH. Header membawa versi monitor
+#              DNSTT (1 = binary lama tanpa byte download). Baris hidup
+#              user|cid|up|port|started|down ("-" di binary lama), baris
+#              E|cid|up|port|started|down|ended = stream yang sudah putus
+#              (tanpa username; pemeriksa kuota memetakannya dari sampel lalu).
 cmd_sessions() {
   collect_online
   (( ONLINE_AVAILABLE && ONLINE_TUNNELS_AVAILABLE )) || return 1
-  printf 'SC_SLOWDNS_USERS_V1|%s\n' "${ONLINE_INSTANCE}"
-  printf '%s' "${ONLINE_SESSION_ROWS}"
+  if [[ "${1:-1}" == "2" ]]; then
+    printf 'SC_SLOWDNS_USERS_V2|%s|%s\n' "${ONLINE_INSTANCE}" "${ONLINE_NATIVE_VERSION}"
+    printf '%s' "${ONLINE_SESSION_ROWS2}" "${ONLINE_GONE_ROWS}"
+  else
+    printf 'SC_SLOWDNS_USERS_V1|%s\n' "${ONLINE_INSTANCE}"
+    printf '%s' "${ONLINE_SESSION_ROWS}"
+  fi
   printf 'END\n'
 }
 
@@ -25944,7 +26183,7 @@ case "${1:-status}" in
   regen-key) acquire_lock; cmd_regen_key ;;
   status) cmd_status ;;
   online) cmd_online ;;
-  sessions) cmd_sessions ;;
+  sessions) cmd_sessions "${2:-1}" ;;
   set-lock) acquire_lock; cmd_set_lock "${2:-}" ;;
   set-kcp) acquire_lock; cmd_set_kcp "${2:-}" "${3:-}" ;;
   records) load_config; cmd_records ;;
@@ -37392,13 +37631,18 @@ dashboard_live_tick() {
 # Live hanya kalau posisi baris pasti: seluruh layar (dashboard, menu, prompt)
 # muat di terminal tanpa tergulung dan tidak ada baris yang terlipat. Tema
 # none dan terminal dumb tetap polos tanpa kode kursor.
-dashboard_live_allowed() {
+dashboard_watch_allowed() {
   [[ "${DASHBOARD_LIVE_SECONDS}" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "${DASHBOARD_LIVE_IDLE_MINUTES}" =~ ^[0-9]+$ ]] || return 1
   [[ "${UI_MODE}" != "none" ]] || return 1
   case "${TERM:-}" in ''|dumb) return 1 ;; esac
   [[ -t 1 ]] || return 1
   (( ${D_ROW_CPU:-0} > 0 )) || return 1
+  return 0
+}
+
+dashboard_live_allowed() {
+  dashboard_watch_allowed || return 1
   ui_tty_size
   (( UI_TTY_ROWS > 0 && UI_ROWS + 1 <= UI_TTY_ROWS )) || return 1
   (( UI_TTY_COLS >= UI_BW + 1 )) || return 1
@@ -37407,30 +37651,51 @@ dashboard_live_allowed() {
 
 # Prompt menu utama sambil menjalankan dashboard live. Teks yang sedang
 # diketik aman: terminal (mode kanonik) menahan satu baris sampai Enter, jadi
-# read -t yang habis waktunya tidak memakan apa pun. Live berhenti kalau
-# ukuran terminal berubah (posisi baris tidak pasti lagi) dan setelah
+# read -t yang habis waktunya tidak memakan apa pun. Live berhenti setelah
 # DASHBOARD_LIVE_IDLE_MINUTES tanpa input, supaya sesi SSH yang ditinggal
 # tidak terus mengirim data. MENU_INPUT_TTY hanya untuk test.
+#
+# Ukuran terminal yang benar-benar berubah (keyboard HP muncul/hilang, layar
+# diputar) membuat fungsi kembali dengan kode 200: menu digambar ulang di
+# ukuran baru dan live jalan lagi kalau layar masih muat. Pernah jadi keluhan
+# nyata (V.1FSC.129, Termius di HP): dulu live berhenti begitu saja dan
+# penanda "● live" tertinggal, jadi bar CPU/RAM terlihat macet. Argumen ketiga
+# 0 = tanpa siklus live (layar belum muat), hanya memantau ukuran supaya live
+# bisa mulai setelah keyboard HP ditutup.
 menu_read_choice_live() {
-  local var_name="$1" prompt="$2" tty="${MENU_INPUT_TTY:-/dev/tty}" rc=0 idle_until
+  local var_name="$1" prompt="$2" live="${3:-1}" tty="${MENU_INPUT_TTY:-/dev/tty}" rc=0 idle_until rows0 cols0
   idle_until=$(( SECONDS + DASHBOARD_LIVE_IDLE_MINUTES * 60 ))
+  ui_tty_size
+  rows0="${UI_TTY_ROWS}"; cols0="${UI_TTY_COLS}"
   DASH_WINCH=0
-  DASH_LIVE_ON=1
+  DASH_LIVE_ON=0
+  if [[ "${live}" == "1" ]]; then DASH_LIVE_ON=1; fi
   printf '%s' "${prompt}"
   trap 'DASH_WINCH=1' WINCH
   while true; do
     rc=0
     read -r -t "${DASHBOARD_LIVE_SECONDS}" "${var_name}" < "${tty}" || rc=$?
     if (( rc <= 128 )); then break; fi
-    if (( DASH_WINCH == 1 || SECONDS >= idle_until )); then
+    if (( DASH_WINCH == 1 )); then
+      DASH_WINCH=0
+      ui_tty_size
+      if (( UI_TTY_ROWS != rows0 || UI_TTY_COLS != cols0 )); then
+        trap - WINCH
+        DASH_LIVE_ON=0
+        return 200
+      fi
+    fi
+    if (( SECONDS >= idle_until )); then
       trap - WINCH
-      DASH_LIVE_ON=0
-      if (( DASH_WINCH == 0 )); then dashboard_live_tick; fi
+      if (( DASH_LIVE_ON == 1 )); then
+        DASH_LIVE_ON=0
+        dashboard_live_tick
+      fi
       rc=0
       read -r "${var_name}" < "${tty}" || rc=$?
       break
     fi
-    dashboard_live_tick
+    if (( DASH_LIVE_ON == 1 )); then dashboard_live_tick; fi
   done
   trap - WINCH
   DASH_LIVE_ON=0
@@ -41314,8 +41579,17 @@ while true; do
   menu_rc=0
   if [[ "${SHOW_FULL_MENU}" == "1" ]] && dashboard_live_allowed; then
     menu_read_choice_live m "${menu_prompt}" || menu_rc=$?
+  elif [[ "${SHOW_FULL_MENU}" == "1" ]] && dashboard_watch_allowed; then
+    # Layar belum muat (mis. keyboard HP terbuka): tanpa live, tapi ukuran
+    # dipantau supaya dashboard digambar ulang dan live jalan saat layar cukup.
+    menu_read_choice_live m "${menu_prompt}" 0 || menu_rc=$?
   else
     prompt_input m "${menu_prompt}" || menu_rc=$?
+  fi
+  if (( menu_rc == 200 )); then
+    # Ukuran terminal berubah: gambar ulang dashboard di ukuran baru.
+    SHOW_FULL_MENU=1
+    continue
   fi
   if (( menu_rc != 0 )); then
     SHOW_FULL_MENU=0

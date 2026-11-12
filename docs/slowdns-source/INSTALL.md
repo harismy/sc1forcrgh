@@ -1,6 +1,6 @@
 # Memasang binary SlowDNS pada SC lain
 
-Panduan ini ditujukan kepada pemilik atau developer auto script tunneling lain. Paket berisi source **DNSTT `v1.20260501.0` + patch `sc-fast9`**, dengan dukungan TXT, NULL, NS, CNAME, MX, SRV, A, dan AAAA. Paket dapat dibangun tanpa installer, lisensi API, bot, menu, atau database SC 1FORCR.
+Panduan ini ditujukan kepada pemilik atau developer auto script tunneling lain. Paket berisi source **DNSTT `v1.20260501.0` + patch `sc-fast10`**, dengan dukungan TXT, NULL, NS, CNAME, MX, SRV, A, dan AAAA. Paket dapat dibangun tanpa installer, lisensi API, bot, menu, atau database SC 1FORCR.
 
 Contoh pemasangan memakai Linux dengan **systemd dan iptables**, seperti lingkungan Debian/Ubuntu. Untuk SC yang mengelola firewall melalui nftables native atau firewalld, terapkan aturan ekuivalen melalui pengelola firewall SC tersebut. Jangan memasang helper iptables sekaligus menganggap aturan native yang menimpanya akan mengikuti secara otomatis.
 
@@ -242,12 +242,15 @@ IPC dapat dibaca sebagai root dengan:
 Formatnya tetap mempertahankan nama protokol dari patch asal:
 
 ```text
-SC_SLOWDNS_SESSIONS_V1|PID_PROSES|WAKTU_MULAI_MONITOR_NANO
-PORT_SUMBER_BACKEND|CLIENT_ID_HEX|BYTE_KLIEN_KE_BACKEND|WAKTU_MULAI_STREAM_NANO
+SC_SLOWDNS_SESSIONS_V2|PID_PROSES|WAKTU_MULAI_MONITOR_NANO
+PORT_SUMBER_BACKEND|CLIENT_ID_HEX|BYTE_KLIEN_KE_BACKEND|WAKTU_MULAI_STREAM_NANO|BYTE_BACKEND_KE_KLIEN
+E|PORT_SUMBER_BACKEND|CLIENT_ID_HEX|BYTE_KLIEN_KE_BACKEND|WAKTU_MULAI_STREAM_NANO|BYTE_BACKEND_KE_KLIEN|WAKTU_PUTUS_NANO
 END
 ```
 
-Tidak ada username pada baris itu. Adapter SC tujuan perlu mencocokkan socket TCP aktif milik proses DNSTT dengan socket backend SSH, lalu menghubungkan **port dan PID backend yang sama** ke username yang benar-benar terautentikasi. Bukti autentikasi bisa berasal dari tracker atau log backend SSH milik SC tujuan. Gunakan snapshot segar; riwayat login atau IP resolver tidak cukup untuk menamai akun yang sedang online.
+Format V2 berlaku sejak `sc-fast10`. Baris stream hidup sama dengan V1, ditambah satu kolom byte download. Baris `E|` adalah stream yang sudah putus. Baris ini disimpan 30 menit (paling banyak 4096) beserta penghitung akhirnya, supaya adapter kuota tidak kehilangan byte yang lewat sejak sampel terakhirnya. Binary sebelum `sc-fast10` mengirim `SC_SLOWDNS_SESSIONS_V1` tanpa kolom download dan tanpa baris `E|`. Adapter sebaiknya menerima kedua header, tetapi hanya menghitung kuota dari V2.
+
+Tidak ada username pada baris-baris itu. Adapter SC tujuan perlu mencocokkan socket TCP aktif milik proses DNSTT dengan socket backend SSH, lalu menghubungkan **port dan PID backend yang sama** ke username yang benar-benar terautentikasi. Bukti autentikasi bisa berasal dari tracker atau log backend SSH milik SC tujuan. Gunakan snapshot segar; riwayat login atau IP resolver tidak cukup untuk menamai akun yang sedang online.
 
 Untuk jumlah tunnel, deduplikasi ClientID per akun. Satu ClientID dapat membawa beberapa stream, dan jumlahnya tidak membuktikan jumlah HP secara pasti. Jika backend tetap berjalan sebagai root, `pkill -u USER` saja tidak memutus sesi tersebut. Pemutusan memerlukan PID sesi yang sudah diverifikasi; listener bersama dan sesi administrator harus tetap dikecualikan.
 

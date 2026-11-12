@@ -16,6 +16,8 @@ import (
 // deduplikasi ClientID setelah username dibuktikan oleh tracker autentikasi SSH.
 type scSession struct {
     up uint64
+    down uint64
+    ended int64
     port int
     clientID string
     started int64
@@ -37,11 +39,48 @@ func scTrackStream(conn *net.TCPConn, clientID string) *scSession {
     return s
 }
 
+// Stream yang sudah putus disimpan sebentar beserta penghitung akhirnya.
+const (
+    scEndedKeepNanos = int64(30 * time.Minute)
+    scEndedMax = 4096
+)
+
+var scEnded []*scSession
+
+func scPruneEndedLocked(now int64) {
+    drop := 0
+    for drop < len(scEnded) && (now-scEnded[drop].ended > scEndedKeepNanos || len(scEnded)-drop > scEndedMax) {
+        drop++
+    }
+    if drop > 0 {
+        n := copy(scEnded, scEnded[drop:])
+        for i := n; i < len(scEnded); i++ { scEnded[i] = nil }
+        scEnded = scEnded[:n]
+    }
+}
+
 func scUntrackStream(s *scSession) {
     if s == nil { return }
+    now := time.Now().UnixNano()
     scSessionsMu.Lock()
     if scSessions[s.port] == s { delete(scSessions, s.port) }
+    s.ended = now
+    scEnded = append(scEnded, s)
+    scPruneEndedLocked(now)
     scSessionsMu.Unlock()
+}
+
+// Byte dari Dropbear ke klien (download), untuk kuota.
+type scDownWriter struct { io.Writer; session *scSession }
+func (w scDownWriter) Write(p []byte) (int, error) {
+    n, err := w.Writer.Write(p)
+    if n > 0 { atomic.AddUint64(&w.session.down, uint64(n)) }
+    return n, err
+}
+
+func scStreamWriter(stream io.Writer, s *scSession) io.Writer {
+    if s == nil { return stream }
+    return scDownWriter{stream, s}
 }
 
 type scCountingWriter struct { io.Writer; session *scSession }
@@ -58,10 +97,14 @@ func scSessionWriter(conn *net.TCPConn, s *scSession) io.Writer {
 
 func scSessionSnapshot() []byte {
     var b bytes.Buffer
-    fmt.Fprintf(&b, "SC_SLOWDNS_SESSIONS_V1|%d|%d\n", os.Getpid(), scMonitorStarted)
+    fmt.Fprintf(&b, "SC_SLOWDNS_SESSIONS_V2|%d|%d\n", os.Getpid(), scMonitorStarted)
     scSessionsMu.Lock()
     for _, s := range scSessions {
-        fmt.Fprintf(&b, "%d|%s|%d|%d\n", s.port, s.clientID, atomic.LoadUint64(&s.up), s.started)
+        fmt.Fprintf(&b, "%d|%s|%d|%d|%d\n", s.port, s.clientID, atomic.LoadUint64(&s.up), s.started, atomic.LoadUint64(&s.down))
+    }
+    scPruneEndedLocked(time.Now().UnixNano())
+    for _, s := range scEnded {
+        fmt.Fprintf(&b, "E|%d|%s|%d|%d|%d|%d\n", s.port, s.clientID, atomic.LoadUint64(&s.up), s.started, atomic.LoadUint64(&s.down), s.ended)
     }
     scSessionsMu.Unlock()
     b.WriteString("END\n")

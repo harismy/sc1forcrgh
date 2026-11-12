@@ -112,7 +112,7 @@ assert(patchPy.includes('\npatch_kcp_tuning(mod)\n') &&
   patchPy.includes('scKCPIntervalDefault = 10') && patchPy.includes('scKCPIntervalMax     = 50'),
   'patch sc-fast8: interval KCP + ACK langsung dari env (default 10 ms, ACK biasa) dan VPS lama rebuild');
 const guardPy = patchPy.split('\npatch_kcp_tuning(mod)\n')[1] || '';
-assert(helper.includes('DNSTT_PATCH_ID="sc-fast9"') && guardPy.includes('\npatch_session_guard(mod)\n') &&
+assert(guardPy.includes('\npatch_session_guard(mod)\n') &&
   guardPy.includes('conn.SetReadDeadline(handshakeDeadline)') && guardPy.includes('conn.SetReadDeadline(time.Time{})') &&
   guardPy.includes('return scHandshakeError(err, handshakeDeadline)') &&
   guardPy.includes('!errors.Is(err, errSCHandshakeTimeout)') &&
@@ -128,6 +128,16 @@ assert(helper.includes('DNSTT_PATCH_ID="sc-fast9"') && guardPy.includes('\npatch
 assert(guardPy.includes('OutgoingQueue tetap selalu membuat antrean') &&
   guardPy.includes("rreplace('\\t\\t\\tSendQueue: make(chan []byte, QueueSize),"),
   'sc-fast9: hanya Peek yang malas; OutgoingQueue milik dnstt-client tetap selalu membuat antrean');
+const bytesPy = guardPy.split('\npatch_session_guard(mod)\n')[1] || '';
+assert(helper.includes('DNSTT_PATCH_ID="sc-fast10"') && bytesPy.includes('\npatch_session_bytes(mod)\n') &&
+  bytesPy.includes('SC_SLOWDNS_SESSIONS_V2|%d|%d') && bytesPy.includes('E|%d|%s|%d|%d|%d|%d') &&
+  bytesPy.includes('scEndedKeepNanos = int64(30 * time.Minute)') && bytesPy.includes('scEndedMax = 4096') &&
+  bytesPy.includes('io.Copy(scStreamWriter(stream, tracked), upstreamTCPConn)') &&
+  bytesPy.includes('atomic.AddUint64(&w.session.down, uint64(n))'),
+  'patch sc-fast10 setelah sc-fast9: byte download per stream + stream putus disimpan 30 menit untuk kuota SSH');
+assert(helper.includes('  sessions) cmd_sessions "${2:-1}" ;;') &&
+  helper.includes("printf 'SC_SLOWDNS_USERS_V2|%s|%s\\n'") && helper.includes("printf 'SC_SLOWDNS_USERS_V1|%s\\n'"),
+  'helper: sessions (V1, limit tunnel) tetap ada, sessions 2 (V2) untuk kuota SSH');
 assert(patchPy.includes('conn.SetWindowSize(win, win)') && !/SetWindowSize\(512|MaxReceiveBuffer|MaxStreamBuffer/.test(patchPy),
   'sc-fast8 tidak menyalin window 512 atau buffer smux Potato; window tetap kcpWindow()');
 assert(!/^[^#\n]*\.write_text\([^)]*newline=/m.test(patchPy),

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "sc-1forcr-udpgw-drain",
+    "path": "/usr/local/sbin/sc-1forcr-udpgw-drain",
+    "before": "a307d19521fb8e2237924390830a5f2958f83bfdf6bacc44822c94d643a835c0",
+    "after": "ddea131de87463fad677fcbd0f60edda2984e08d902e929f5f790ab21c14eb10"
+  },
+  {
+    "name": "sc-1forcr-postboot-health",
+    "path": "/usr/local/sbin/sc-1forcr-postboot-health",
+    "before": "069d9ff7e51171559d08e1c8902e4d4fc24f6a4e72da905055536fd692fdcb3e",
+    "after": "1a116d38e7ab373f81f74773b1e97bda40c7fb44e3ee567cba5de79952155dd4"
+  },
+  {
+    "name": "restart_update_safe_services",
+    "path": "/usr/local/sbin/restart_update_safe_services",
+    "before": "8d977b6ad720fe9f8c885508721132d4d8465248c05dd76126aa096109c390fe",
+    "after": "2c5a4140cd9d35ef08bc792c19572dd00af83e49fe2e9a269a72c2320b27d94f"
+  },
+  {
+    "name": "menu-sc-1forcr.sh",
+    "path": "/opt/sc-1forcr/menu-sc-1forcr.sh",
+    "before": "35bfdd0d6d64b3d47b94871814cb6773c4a0beb13e749061b45c0ecec39f057e",
+    "after": "8233af13e4a253d60b8a32aaea7289806a4b742949063131878ffdd8e321a1be"
+  }
+]

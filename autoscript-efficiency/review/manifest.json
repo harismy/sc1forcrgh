@@ -1,0 +1,19 @@
+{
+  "base_file": "/var/lib/sc-1forcr/setup-autoscript-compat.lQgSVq.sh",
+  "base_version": "V.1FSC.124",
+  "patch_id": "2026-11-07.1",
+  "production_deployed": false,
+  "sha256": {
+    "original/setup-autoscript-compat.sh": "a1ff70af546a73d3f46857874af2429a907b00366532c0acc8289ccd9c5da0d3",
+    "src/setup-autoscript-compat.sh": "b148c461c4672377ffe6c8b3b073bfb6171b85fb424403d9b9ec6d1c1af15e88",
+    "review/efficiency.patch": "bd937f0a4fd9749d96fe0eccb5deca1fe268ac247a798c3e43bc9fb0b73f9a3d",
+    "CATATAN-PERUBAHAN.md": "266e45bdbc024ab920880a4946890be7ac2a30630f81ad0465578cee941745ba",
+    "review/test-results.txt": "032efe7ee860c1ebd34dfd116a9fdb5411e7d68e15f53c12b23c52894cddb7c1",
+    "tools/modify.py": "e0c996795d1ba51adc8db8e269725d9528072508920967387aeeacee76d04e0e",
+    "tools/systemd-batch.sh": "0f4385a1ee4c25c88aaf166ff88d60fa34a89f4046744f1141d607bdf3832fe7",
+    "apply-runtime.py": "984d77a2c9a903b3873fedcab860dcb1e00d4e4e0f5918e26c779b32c15b9214",
+    "PATCH-RUNTIME.md": "ab5fe337b3177dcfd5e520461951364f2271fdb4473944249a28ffd926387fbd",
+    "runtime-package/manifest.json": "c972629f04bcadb21730a609339d0ec11f295db0b05dc43c9da61c5b2d7773ae",
+    "review/runtime-deployment-status.json": "0dd6975798517c4e5ce7e7c421ec32917686ebef1d31eedaa54a0a501bda27c7"
+  }
+}

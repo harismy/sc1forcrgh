@@ -213,7 +213,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.130}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.132}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -6079,7 +6079,7 @@ const jsonBodyParser = express.json({ limit: '1mb' });
 // sini maka parser milik route tidak pernah berlaku dan unggahan di atas 1mb
 // selalu ditolak 413.
 app.use((req, res, next) => {
-  if (req.path === '/vps/backup/restore') return next();
+  if (['/vps/backup/restore', '/vps/backup/import'].includes(req.path)) return next();
   return jsonBodyParser(req, res, next);
 });
 
@@ -9017,9 +9017,10 @@ function runScriptAsync(cmd, args, timeoutMs) {
 // mentah tidak di-JSON.parse di server supaya hemat RAM di VPS 1GB; validasi
 // isinya tetap dikerjakan skrip restore memakai jq.
 function restoreBodyParser(req, res, next) {
+  if (req.path === '/vps/backup/import') return express.text({ limit: '50mb', type: () => true })(req, res, next);
   const ct = String(req.headers['content-type'] || '').toLowerCase();
-  if (ct.includes('application/json')) return express.json({ limit: '1mb' })(req, res, next);
-  return express.text({ limit: '16mb', type: () => true })(req, res, next);
+  if (ct.includes('application/json')) return express.json({ limit: '16mb' })(req, res, next);
+  return express.text({ limit: '50mb', type: () => true })(req, res, next);
 }
 
 const BACKUP_WEB_PAGE = `<!doctype html>
@@ -9246,8 +9247,23 @@ app.get('/vps/backup/file/:name', (req, res) => {
   return res.download(full);
 });
 
-app.post('/vps/backup/restore', restoreBodyParser, async (req, res) => {
-  if (!BACKUP_WEB_ENABLE) return fail(res, 404, 'web backup nonaktif');
+// Authenticated bot migration uses the same engine even when the web UI is off.
+app.post('/vps/backup/export', async (_req, res) => {
+  const target = require('path').join(require('os').tmpdir(), `sc1forcr-export-${crypto.randomBytes(12).toString('hex')}.json`);
+  try {
+    await runScriptAsync('/usr/local/sbin/sc-1forcr-auto-backup', ['export', target], 600000);
+    const backup = JSON.parse(fs.readFileSync(target, 'utf8'));
+    res.set('Cache-Control', 'no-store');
+    return ok(res, { backup });
+  } catch (_) {
+    return fail(res, 500, 'Backup lengkap gagal; periksa konfigurasi/kunci pada VPS sumber.');
+  } finally {
+    try { fs.unlinkSync(target); } catch (_) {}
+  }
+});
+
+async function restoreAccountBackup(req, res) {
+  if (req.path === '/vps/backup/restore' && !BACKUP_WEB_ENABLE) return fail(res, 404, 'web backup nonaktif');
   const body = req.body;
   let target = '';
   let tempFile = '';
@@ -9257,13 +9273,14 @@ app.post('/vps/backup/restore', restoreBodyParser, async (req, res) => {
       source = String(body.file);
       target = backupFileFullPath(body.file);
       if (!target || !fs.existsSync(target)) return fail(res, 404, 'file backup tidak ditemukan');
-    } else if (typeof body === 'string' && body.trim()) {
+    } else if ((typeof body === 'string' && body.trim()) || (body && typeof body === 'object' && body.data)) {
+      // Native bot backups and web uploads share the exact same restore script.
       // Ditulis apa adanya tanpa JSON.parse supaya tidak boros RAM.
       // Skrip restore yang memvalidasi isinya dengan jq.
       // Ditaruh di /tmp, BUKAN di folder backup, supaya tidak muncul di daftar
       // backup dan dibersihkan sendiri oleh sistem.
       tempFile = require('path').join(require('os').tmpdir(), `sc1forcr-restore-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.json`);
-      fs.writeFileSync(tempFile, body, { mode: 0o600 });
+      fs.writeFileSync(tempFile, typeof body === 'string' ? body : JSON.stringify(body), { mode: 0o600 });
       target = tempFile;
     } else {
       return fail(res, 400, 'kirim JSON {file:"nama.json"} atau isi file backup sebagai teks');
@@ -9277,7 +9294,9 @@ app.post('/vps/backup/restore', restoreBodyParser, async (req, res) => {
       try { fs.unlinkSync(tempFile); } catch (_) {}
     }
   }
-});
+}
+app.post('/vps/backup/restore', restoreBodyParser, restoreAccountBackup);
+app.post('/vps/backup/import', restoreBodyParser, restoreAccountBackup);
 
 app.get('/vps/capacity', (_req, res) => ok(res, readCapacityState()));
 
@@ -18360,9 +18379,493 @@ setup_auto_backup_timer() {
     (crontab -l 2>/dev/null | grep -v 'sc-1forcr-auto-backup' | crontab -) >/dev/null 2>&1 || true
   fi
 
+  mkdir -p /usr/local/lib/sc-1forcr
+  cat > /usr/local/lib/sc-1forcr/backup-state.py <<'BACKUP_STATE_PY'
+"""Portable identity and SSH runtime for native AutoSC account backups."""
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import tempfile
+from datetime import datetime, timedelta
+
+SC_ENV = "/etc/sc-1forcr.env"
+APP_ENV = "/opt/sc-1forcr/.env"
+KEY_DIR = "/etc/sc-1forcr/slowdns"
+HAPROXY = "/etc/haproxy/haproxy.cfg"
+NGINX = "/etc/nginx/sites-available/sc-1forcr.conf"
+SLOWDNS = "/usr/local/sbin/sc-1forcr-slowdns"
+SLOWDNS_UNIT = "/etc/systemd/system/sc-1forcr-slowdns.service"
+SLOWDNS_KEYS = (
+    "SLOWDNS_NS_DOMAIN", "SLOWDNS_LISTEN_PORT", "SLOWDNS_MTU",
+    "SLOWDNS_MEMORY_MAX", "SLOWDNS_KCP_WINDOW", "SLOWDNS_KCP_INTERVAL",
+    "SLOWDNS_KCP_ACK_NODELAY", "SLOWDNS_GOMAXPROCS", "SLOWDNS_GOGC",
+    "SLOWDNS_AUTO_LOCK_ENABLE",
+)
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def read_env(path=SC_ENV):
+    result = {}
+    for line in read_text(path).splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        try:
+            parts = shlex.split(value, comments=False)
+            result[key.strip()] = parts[0] if len(parts) == 1 else value.strip()
+        except ValueError:
+            result[key.strip()] = value.strip().strip("\"'")
+    return result
+
+
+def atomic_write(path, text, mode=0o600):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".sc-restore-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            os.fchmod(f.fileno(), mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def env_text(path, updates):
+    lines, seen = [], set()
+    for line in read_text(path).splitlines():
+        key = line.split("=", 1)[0].strip()
+        if "=" in line and not line.lstrip().startswith("#") and key in updates:
+            if key not in seen:
+                lines.append(key + "=" + shlex.quote(str(updates[key])))
+                seen.add(key)
+        else:
+            lines.append(line)
+    lines.extend(key + "=" + shlex.quote(str(value)) for key, value in updates.items() if key not in seen)
+    return "\n".join(lines) + "\n"
+
+
+def command(args, data=None, required=True):
+    result = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+    if required and result.returncode:
+        # Never include command input/output: it can contain private keys/passwords.
+        raise RuntimeError("Restore gagal pada " + os.path.basename(args[0]))
+    return result
+
+
+def domain_name(value, empty=False):
+    value = str(value or "").strip().lower().rstrip(".")
+    if not value and empty:
+        return ""
+    if len(value) > 253 or not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}", value):
+        raise ValueError("Domain backup tidak valid")
+    return value
+
+
+def key_pair(private, public):
+    private, public = str(private or "").strip().lower(), str(public or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", private) or not re.fullmatch(r"[0-9a-f]{64}", public):
+        raise ValueError("Pasangan kunci SlowDNS tidak lengkap/valid")
+    der = bytes.fromhex("302e020100300506032b656e04220420" + private)
+    derived = command(["openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"], der).stdout
+    if len(derived) != 44 or derived[-32:].hex() != public:
+        raise ValueError("Private key dan pubkey SlowDNS tidak cocok")
+    return private, public
+
+
+def validate_tls(pem, domain):
+    if not isinstance(pem, str) or len(pem) > 65536:
+        raise ValueError("Sertifikat backup tidak valid")
+    raw = pem.encode()
+    host_check = command(["openssl", "x509", "-noout", "-checkhost", domain], raw).stdout
+    if b"does match certificate" not in host_check:
+        raise ValueError("Sertifikat backup tidak mencakup domain")
+    command(["openssl", "x509", "-noout", "-checkend", "0"], raw)
+    cert_public = command(["openssl", "x509", "-pubkey", "-noout"], raw).stdout
+    key_public = command(["openssl", "pkey", "-pubout"], raw).stdout
+    if cert_public != key_public:
+        raise ValueError("Sertifikat dan private key domain tidak cocok")
+
+
+def export_identity():
+    env = read_env()
+    domain = domain_name(env.get("DOMAIN"), empty=True)
+    identity = {"version": 1, "domain": domain}
+    private = read_text(KEY_DIR + "/server.key").strip()
+    public = read_text(KEY_DIR + "/server.pub").strip()
+    enabled = str(env.get("SLOWDNS_ENABLE", "0")).lower() in ("1", "true", "yes", "on")
+    slowdns = {"enabled": enabled, "settings": {key: env[key] for key in SLOWDNS_KEYS if key in env}}
+    if private or public or enabled:
+        private, public = key_pair(private, public)
+        slowdns.update(private_key=private, public_key=public)
+    identity["slowdns"] = slowdns
+    match = re.search(r"\bcrt\s+(/etc/haproxy/certs/[^\s]+\.pem)", read_text(HAPROXY))
+    if match and domain:
+        cert_domain = domain_name(os.path.basename(match[1])[:-4])
+        pem = read_text(match[1])
+        validate_tls(pem, domain)
+        identity["tls"] = {"cert_domain": cert_domain, "pem": pem}
+    return identity
+
+
+class IdentityRestore:
+    def __init__(self, identity):
+        self.files, self.saved, self.touched = {}, {}, False
+        self.updates = {}
+        self.slowdns = None
+        self.was_active = self.was_enabled = False
+        if identity is None:
+            return  # v1/v2 account backups never change the destination identity.
+        if not isinstance(identity, dict) or identity.get("version") != 1:
+            raise ValueError("Identitas backup tidak didukung")
+        current = read_env()
+        domain = domain_name(identity.get("domain"), empty=True)
+        updates = {}
+        if domain:
+            updates["DOMAIN"] = domain
+        tls = identity.get("tls")
+        if domain and domain != current.get("DOMAIN", "") and not tls:
+            raise ValueError("Backup tanpa sertifikat: pasang AutoSC dengan domain asal sebelum restore")
+        if tls is not None:
+            if not isinstance(tls, dict) or not domain:
+                raise ValueError("Sertifikat backup tidak valid")
+            cert_domain = domain_name(tls.get("cert_domain"))
+            pem = tls.get("pem")
+            validate_tls(pem, domain)
+            cert_path = "/etc/haproxy/certs/" + cert_domain + ".pem"
+            self.files[cert_path] = (pem, 0o600)
+            haproxy = read_text(HAPROXY)
+            if not re.search(r"\bcrt\s+\S+", haproxy):
+                raise ValueError("Konfigurasi TLS HAProxy tujuan tidak ditemukan")
+            self.files[HAPROXY] = (re.sub(r"(\bcrt\s+)\S+", lambda m: m[1] + cert_path, haproxy), 0o644)
+        if domain and os.path.isfile(NGINX):
+            nginx = re.sub(r"(?m)^(\s*server_name\s+)[^;]*;", lambda m: m[1] + domain + " *." + domain + ";", read_text(NGINX))
+            self.files[NGINX] = (nginx, 0o644)
+        slowdns = identity.get("slowdns")
+        if slowdns is not None:
+            if not isinstance(slowdns, dict) or not isinstance(slowdns.get("enabled"), bool):
+                raise ValueError("Konfigurasi SlowDNS backup tidak valid")
+            private, public = slowdns.get("private_key"), slowdns.get("public_key")
+            if private or public or slowdns["enabled"]:
+                private, public = key_pair(private, public)
+            settings = slowdns.get("settings", {})
+            if not isinstance(settings, dict) or any(key not in SLOWDNS_KEYS for key in settings):
+                raise ValueError("Pengaturan SlowDNS backup tidak valid")
+            for key, value in settings.items():
+                if not isinstance(value, str) or len(value) > 100 or re.search(r"[^a-zA-Z0-9_.-]", value):
+                    raise ValueError("Nilai pengaturan SlowDNS tidak valid")
+                updates[key] = value
+            ns = domain_name(settings.get("SLOWDNS_NS_DOMAIN"), empty=not slowdns["enabled"])
+            if slowdns["enabled"] and (len(ns.split(".")) < 3 or ns == domain):
+                raise ValueError("Domain NS SlowDNS backup tidak valid")
+            if not os.path.isfile(SLOWDNS):
+                raise ValueError("Update AutoSC tujuan sebelum memulihkan SlowDNS")
+            updates["SLOWDNS_ENABLE"] = "1" if slowdns["enabled"] else "0"
+            if private:
+                self.files[KEY_DIR + "/server.key"] = (private + "\n", 0o600)
+                self.files[KEY_DIR + "/server.pub"] = (public + "\n", 0o644)
+            self.slowdns = slowdns
+        if updates:
+            self.updates = updates
+            self.files[SC_ENV] = (env_text(SC_ENV, updates), 0o600)
+            if os.path.isfile(APP_ENV):
+                self.files[APP_ENV] = (env_text(APP_ENV, updates), 0o600)
+        self.snapshot(set(self.files) | ({SLOWDNS_UNIT} if self.slowdns else set()))
+
+    def snapshot(self, paths):
+        for path in paths:
+            if path in self.saved:
+                continue
+            if os.path.isfile(path):
+                info = os.stat(path)
+                self.saved[path] = (read_text(path), stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid)
+            else:
+                self.saved[path] = None
+
+    def stage_runtime(self, settings, data):
+        # Native and legacy backups share one file transaction. Only allowlisted
+        # settings reach this method; identity-specific values keep precedence.
+        current = {**read_env(APP_ENV), **read_env(SC_ENV)}
+        changed_notifier = any(key in settings and settings[key] != current.get(key, "")
+                               for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"))
+        self.updates = {**settings, **self.updates}
+        if self.updates:
+            self.files[SC_ENV] = (env_text(SC_ENV, self.updates), 0o600)
+            if os.path.isfile(APP_ENV):
+                self.files[APP_ENV] = (env_text(APP_ENV, self.updates), 0o600)
+        self.files.update(banner_restore_files(data))
+        if changed_notifier:
+            # Backoff/last-send state belongs to the destination, not the backup.
+            self.files["/var/lib/sc-1forcr/online-notify.status"] = ("", 0o600)
+            self.files["/var/lib/sc-1forcr/online-notify.last"] = ("", 0o600)
+        self.snapshot(self.files)
+
+    def apply(self):
+        if not self.files:
+            return
+        self.touched = True
+        if self.slowdns:
+            self.was_active = command(["systemctl", "is-active", "--quiet", "sc-1forcr-slowdns.service"], required=False).returncode == 0
+            self.was_enabled = command(["systemctl", "is-enabled", "--quiet", "sc-1forcr-slowdns.service"], required=False).returncode == 0
+            command([SLOWDNS, "disable"])
+        for path, (text, mode) in self.files.items():
+            # Preserve all unrelated destination settings while applying the plan.
+            if path in (SC_ENV, APP_ENV):
+                text = env_text(path, self.updates)
+            atomic_write(path, text, mode)
+        if HAPROXY in self.files:
+            command(["haproxy", "-c", "-f", HAPROXY])
+        if NGINX in self.files:
+            command(["nginx", "-t"])
+        if "/etc/ssh/sshd_config" in self.files:
+            command(["sshd", "-t"])
+        if self.slowdns:
+            if os.path.isdir(KEY_DIR):
+                os.chmod(KEY_DIR, 0o750)
+            command([SLOWDNS, "setup"])
+            command(["/usr/local/sbin/sc-1forcr-service-gate", "apply"])
+
+    def rollback(self):
+        if not self.touched:
+            return
+        if self.slowdns:
+            command([SLOWDNS, "disable"], required=False)
+        for path, saved in self.saved.items():
+            if saved is None:
+                if os.path.exists(path):
+                    os.unlink(path)
+            else:
+                atomic_write(path, saved[0], saved[1])
+                os.chown(path, saved[2], saved[3])
+        if self.slowdns:
+            command(["systemctl", "daemon-reload"], required=False)
+            if self.was_enabled:
+                command(["systemctl", "enable", "--no-reload", "sc-1forcr-slowdns.service"], required=False)
+            if self.was_active:
+                command(["systemctl", "start", "sc-1forcr-slowdns.service"], required=False)
+            command([SLOWDNS, "apply"], required=False)
+            command(["/usr/local/sbin/sc-1forcr-service-gate", "apply"], required=False)
+
+
+def _banner_text(data, key):
+    value = data[key]
+    if value is None:
+        return ""
+    if not isinstance(value, str) or "\x00" in value:
+        raise ValueError("Isi banner backup harus teks tanpa NUL")
+    return value
+
+
+def _dropbear_banner_command(command_line, banner_path):
+    # Keep the original spelling of every non-banner argument, including
+    # executable/version, ports, hardening flags and systemd specifiers.
+    pattern = r'''(?:[^\s"'\\]+|\\.|"(?:[^"\\]|\\.)*"|'[^']*')+'''
+    tokens = list(re.finditer(pattern, command_line))
+    cursor, values = 0, []
+    for token in tokens:
+        if command_line[cursor:token.start()].strip():
+            raise ValueError("ExecStart Dropbear tidak dapat dibaca dengan aman")
+        try:
+            parsed = shlex.split(token[0], posix=True)
+        except ValueError:
+            raise ValueError("Kutip ExecStart Dropbear tidak valid") from None
+        if len(parsed) != 1:
+            raise ValueError("Argumen ExecStart Dropbear tidak valid")
+        values.append(parsed[0])
+        cursor = token.end()
+    if command_line[cursor:].strip() or not values:
+        raise ValueError("ExecStart Dropbear tidak dapat dibaca dengan aman")
+    executable = os.path.basename(values[0].lstrip("-+!:@"))
+    if not re.fullmatch(r"dropbear(?:-[A-Za-z0-9._-]+)?", executable):
+        raise ValueError("ExecStart layanan Dropbear bukan binary AutoSC yang dikenali")
+    removals, i = [], 1
+    while i < len(tokens):
+        if values[i] == "-b":
+            if i + 1 >= len(tokens) or values[i + 1].startswith("-"):
+                raise ValueError("Argumen banner Dropbear lama tidak lengkap")
+            removals.append((tokens[i].start(), tokens[i + 1].end()))
+            i += 2
+        elif values[i].startswith("-b") and len(values[i]) > 2:
+            removals.append((tokens[i].start(), tokens[i].end()))
+            i += 1
+        else:
+            i += 1
+    for start, end in reversed(removals):
+        command_line = command_line[:start].rstrip() + command_line[end:]
+    command_line = command_line.rstrip()
+    return command_line + (" -b " + banner_path if banner_path else "")
+
+
+def _dropbear_without_extra_banner(config):
+    def update(match):
+        value = match[1]
+        raw = value.strip()
+        if not raw:
+            return match[0]
+        quote = raw[0] if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"') else ""
+        args = raw[1:-1] if quote else raw
+        # Keep the outer shell quoting/expansions and every non-banner flag.
+        # DROPBEAR_BANNER below owns the sole safe banner path for defaults.
+        cleaned = _dropbear_banner_command("dropbear " + args, "")[len("dropbear "):]
+        if cleaned == args:
+            return match[0]
+        if not quote:
+            quote = '"'
+        return "DROPBEAR_EXTRA_ARGS=" + quote + cleaned + quote
+    return re.sub(r"(?m)^DROPBEAR_EXTRA_ARGS=([^\r\n]*)", update, config)
+
+
+def banner_restore_files(data):
+    """Plan only explicitly supplied banners; no writes, commands or restarts."""
+    html_path = "/etc/sc-1forcr/banner.html"
+    txt_path = "/etc/sc-1forcr/banner.txt"
+    compact_path = "/etc/sc-1forcr/banner-dropbear.html"
+    sshd_path = "/etc/ssh/sshd_config"
+    defaults_path = "/etc/default/dropbear"
+    override_path = "/etc/systemd/system/dropbear.service.d/override.conf"
+    files = {}
+    if "banner_txt" in data:
+        files[txt_path] = (_banner_text(data, "banner_txt"), 0o644)
+    if "banner_html" not in data:
+        return files
+    html = _banner_text(data, "banner_html")
+    files[html_path] = (html, 0o644)
+    # Never let a stale compact copy reappear after a later heal/restart.
+    files[compact_path] = ("", 0o644)
+    banner_path = html_path if html and len(html.encode("utf-8")) <= 1990 else ""
+    if html and not banner_path:
+        compact = html.replace("\r", "").replace("\n", " ").replace("\t", " ")
+        compact = re.sub(r"<!--(?:[^-]|-[^-])*-->", "", compact)
+        compact = re.sub(r" +", " ", compact).strip(" ")
+        if compact and len(compact.encode("utf-8")) <= 1990:
+            files[compact_path] = (compact, 0o644)
+            banner_path = compact_path
+    if os.path.isfile(sshd_path):
+        config = read_text(sshd_path)
+        prefix = "# SC 1FORCR restored banner\n"
+        config = re.sub(r"\A# SC 1FORCR restored banner\r?\nBanner [^\r\n]*\r?\n", "", config, count=1)
+        # Global first value, before existing Includes/Match blocks. Do not
+        # rewrite any authentication directives or administrator access.
+        files[sshd_path] = (prefix + "Banner " + (html_path if html else "none") + "\n" + config, 0o644)
+    if os.path.isfile(defaults_path):
+        config = _dropbear_without_extra_banner(read_text(defaults_path))
+        value = 'DROPBEAR_BANNER="' + banner_path + '"'
+        if re.search(r"(?m)^DROPBEAR_BANNER=", config):
+            config = re.sub(r"(?m)^DROPBEAR_BANNER=[^\r\n]*", lambda _: value, config)
+        else:
+            config += ("" if not config or config.endswith("\n") else "\n") + value + "\n"
+        files[defaults_path] = (config, 0o644)
+    if os.path.isfile(override_path):
+        config = read_text(override_path)
+        starts = list(re.finditer(r"(?m)^ExecStart=([^\r\n]+)", config))
+        if len(starts) > 1:
+            raise ValueError("Override Dropbear memiliki lebih dari satu ExecStart")
+        if starts:
+            start = starts[0]
+            updated = _dropbear_banner_command(start[1], banner_path)
+            config = config[:start.start(1)] + updated + config[start.end(1):]
+            files[override_path] = (config, 0o644)
+    return files
+
+def normalize_expiry(value):
+    raw = str(value or "").strip()
+    if raw.lower() in ("", "none", "null", "unlimited", "never", "0"):
+        return ""
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            return datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d")
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        raise ValueError("Tanggal kedaluwarsa backup tidak valid") from None
+
+
+def expired(value):
+    return bool(value) and (value < datetime.now().strftime("%Y-%m-%d") if len(value) == 10 else value <= datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def sync_ssh(rows, known_users=None):
+    if not rows:
+        return lambda: None
+    import pwd
+    env = read_env()
+    shell = env.get("SSH_TUNNEL_SHELL") or "/usr/local/sbin/sc-1forcr-tunnel-shell"
+    group = "sc-1forcr-tunnel"
+    previous = {}
+    for row in rows:
+        user = row["username"]
+        try:
+            existing = pwd.getpwnam(user)
+        except KeyError:
+            existing = None
+        if existing and existing.pw_uid < 1000:
+            raise ValueError("Backup tidak boleh menimpa akun sistem")
+        if existing and known_users is not None and user.lower() not in known_users:
+            raise ValueError("Backup tidak boleh menimpa user Linux di luar database AutoSC")
+        shadow = command(["getent", "shadow", user]).stdout.decode().strip().split(":") if existing else None
+        if existing and (len(shadow) < 8 or shadow[0] != user):
+            raise ValueError("Status akun Linux lama tidak dapat dicadangkan")
+        previous[user] = (existing, shadow)
+    changed = []
+
+    def undo():
+        for user in reversed(changed):
+            existing, shadow = previous[user]
+            if existing is None:
+                command(["userdel", user], required=False)
+            else:
+                command(["usermod", "-s", existing.pw_shell, "-g", str(existing.pw_gid), "-p", shadow[1], user], required=False)
+                command(["chage", "-E", shadow[7] or "-1", user], required=False)
+                command(["chage", "-d", shadow[2] or "-1", user], required=False)
+
+    command(["groupadd", "-r", "-f", group])
+    shells = read_text("/etc/shells").splitlines()
+    if shell not in shells:
+        atomic_write("/etc/shells", "\n".join(shells + [shell]) + "\n", 0o644)
+    try:
+        for row in rows:
+            user = row["username"]
+            existing, shadow = previous[user]
+            active = row["status"] == "AKTIF" and not expired(row["date_exp"])
+            if not active:
+                if existing:
+                    changed.append(user)
+                    command(["passwd", "-l", user])
+                    command(["usermod", "-s", "/usr/sbin/nologin", user])
+                continue
+            if not existing:
+                command(["useradd", "-m", "-d", "/home/" + user, "-s", shell, "-g", group, user])
+            changed.append(user)
+            command(["usermod", "-s", shell, "-g", group, user])
+            command(["chpasswd"], (user + ":" + row["password"] + "\n").encode())
+            # Linux chage is date-only: enforce the exact time in the existing checker.
+            expiry = (datetime.strptime(row["date_exp"][:10], "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d") if row["date_exp"] else "-1"
+            command(["chage", "-E", expiry, user])
+    except Exception:
+        undo()
+        raise
+    return undo
+BACKUP_STATE_PY
+  chmod 600 /usr/local/lib/sc-1forcr/backup-state.py
+
   cat > /usr/local/sbin/sc-1forcr-auto-backup <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
+exec 9>/run/sc-1forcr-account-restore.lock
+flock -s -w 30 9 || { echo "Backup menunggu restore yang masih berjalan."; exit 1; }
 
 ENV_FILE="/etc/sc-1forcr.env"
 load_env_file() {
@@ -18439,6 +18942,9 @@ fi
 
 ts_wib="$(TZ=Asia/Jakarta date +%Y%m%d-%H%M%S)"
 backup_json="${AUTO_BACKUP_DIR}/sc1forcr-accounts-${ts_wib}-WIB.json"
+if [[ "${mode}" == "export" ]]; then
+  backup_json="${2:?file tujuan export wajib diisi}"
+fi
 
 if [[ ! -f "${DB_PATH}" ]]; then
   echo "DB tidak ditemukan: ${DB_PATH}"
@@ -18455,10 +18961,16 @@ from datetime import datetime, timezone
 db_path = sys.argv[1]
 domain = sys.argv[2]
 out_path = sys.argv[3]
+import importlib.util
+spec = importlib.util.spec_from_file_location("backup_state", "/usr/local/lib/sc-1forcr/backup-state.py")
+state = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(state)
+identity = state.export_identity()
 
 conn = sqlite3.connect(db_path)
 conn.row_factory = sqlite3.Row
 cur = conn.cursor()
+conn.execute("BEGIN")
 
 def fetch(table, cols):
     q = "SELECT " + ",".join(cols) + f" FROM {table} ORDER BY username"
@@ -18488,6 +19000,8 @@ SETTINGS_KEYS = [
     "AUTO_PULL_UPDATE_ENABLE",
     "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
     "AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
     "ONLINE_NOTIFY_ENABLE",
     "ONLINE_NOTIFY_INTERVAL_HOURS",
     "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
@@ -18609,7 +19123,7 @@ def load_runtime_settings(paths=("/opt/sc-1forcr/.env", "/etc/sc-1forcr.env")):
 
 payload = {
     "meta": {
-        "format": "sc1forcr-accounts-backup-v2",
+        "format": "sc1forcr-accounts-backup-v3",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_domain": domain or "unknown",
     },
@@ -18624,6 +19138,7 @@ payload = {
         "banner_html": "",
         "banner_txt": "",
         "settings": load_runtime_settings(),
+        "identity": identity,
     },
 }
 
@@ -18649,23 +19164,19 @@ for item in payload["data"].get("trojan", []):
     if trojan_secret and not str(item.get("uuid", "") or "").strip():
         item["uuid"] = trojan_secret
 
-try:
-    with open("/etc/sc-1forcr/banner.html", "r", encoding="utf-8") as f:
-        payload["data"]["banner_html"] = f.read()
-except Exception:
-    pass
+payload["data"]["banner_html"] = state.read_text("/etc/sc-1forcr/banner.html")
+payload["data"]["banner_txt"] = state.read_text("/etc/sc-1forcr/banner.txt")
 
-try:
-    with open("/etc/sc-1forcr/banner.txt", "r", encoding="utf-8") as f:
-        payload["data"]["banner_txt"] = f.read()
-except Exception:
-    pass
-
+conn.close()
 with open(out_path, "w", encoding="utf-8") as f:
     json.dump(payload, f, ensure_ascii=False, indent=2)
 PY
 
 chmod 600 "${backup_json}" >/dev/null 2>&1 || true
+flock -u 9
+if [[ "${mode}" == "export" ]]; then
+  exit 0  # Internal export: no Telegram duplicate, retention sweep, or schedule stamp.
+fi
 
 if [[ "${mode}" == "scheduled" ]]; then
   date +%s > /var/lib/sc-1forcr/last-auto-backup-epoch
@@ -18781,11 +19292,14 @@ EOF
   cat > /usr/local/sbin/sc-1forcr-restore-backup <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Jalankan sebagai root."
   exit 1
 fi
+exec 9>/run/sc-1forcr-account-restore.lock
+flock -n 9 || { echo "Restore lain masih berjalan."; exit 1; }
 
 backup_file="${1:-}"
 if [[ -z "${backup_file}" || ! -f "${backup_file}" ]]; then
@@ -19137,9 +19651,35 @@ db_path = sys.argv[2]
 with open(backup_path, "r", encoding="utf-8") as f:
     root = json.load(f)
 data = root.get("data") or {}
+if not isinstance(data, dict):
+    raise ValueError("Data backup tidak valid")
+import importlib.util
+spec = importlib.util.spec_from_file_location("backup_state", "/usr/local/lib/sc-1forcr/backup-state.py")
+state = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(state)
+# Validate every identity/date before modifying accounts, files, or services.
+identity = state.IdentityRestore(data.get("identity"))
+reserved = {"root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail", "news", "uucp", "proxy", "www-data", "backup", "list", "irc", "gnats", "nobody", "sshd", "postgres", "mysql", "redis"}
+for kind in ("ssh", "vmess", "vless", "trojan"):
+    rows = data.get(kind) or []
+    if not isinstance(rows, list):
+        raise ValueError("Daftar akun backup tidak valid")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Baris akun backup tidak valid")
+        row["username"] = str(row.get("username") or "").strip()
+        if kind == "ssh":
+            row["username"] = row["username"].lower()
+            if not state.re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", row["username"]) or row["username"] in reserved:
+                raise ValueError("Username SSH backup tidak valid atau merupakan akun sistem")
+            row["password"] = str(row.get("password") or "")
+            if not row["password"] or any(c in row["password"] for c in "\r\n:"):
+                raise ValueError("Password SSH backup tidak valid")
+        row["date_exp"] = state.normalize_expiry(row.get("date_exp") or row.get("exp") or row.get("to"))
 
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
+previous_ssh_users = {r[0] for r in cur.execute("SELECT LOWER(username) FROM account_sshs")}
 
 def to_int(v, d=0):
     try:
@@ -19168,7 +19708,9 @@ def restored_status(raw):
         return "AKTIF"
     if s in ("EXPIRED", "KADALUARSA", "RECOVERY"):
         return "EXPIRED"
-    if s in ("LOCK", "LOCKED", "LOCK_TMP", "LOCK_QUOTA", "BANNED", "BAN"):
+    if s == "LOCK_QUOTA":
+        return "LOCK_QUOTA"
+    if s in ("LOCK", "LOCKED", "LOCK_TMP", "BANNED", "BAN"):
         return "LOCK"
     return "AKTIF"
 
@@ -19363,6 +19905,8 @@ SETTINGS_KEYS = [
     "AUTO_PULL_UPDATE_ENABLE",
     "AUTO_PULL_UPDATE_INTERVAL_MINUTES",
     "AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
     "ONLINE_NOTIFY_ENABLE",
     "ONLINE_NOTIFY_INTERVAL_HOURS",
     "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS",
@@ -19466,56 +20010,26 @@ def clean_setting_value(value):
     text = text.replace("\r", "").replace("\n", "")
     return text[:512]
 
-def read_env_lines(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().splitlines()
-    except Exception:
-        return []
-
-def write_env_settings(path, settings):
-    if not settings:
-        return 0
-    lines = read_env_lines(path)
-    out = []
-    seen = set()
-    for line in lines:
-        if "=" not in line or line.lstrip().startswith("#"):
-            out.append(line)
-            continue
-        key = line.split("=", 1)[0].strip()
-        if key in settings:
-            out.append(f"{key}={shlex.quote(settings[key])}")
-            seen.add(key)
-        else:
-            out.append(line)
-    for key in SETTINGS_KEYS:
-        if key in settings and key not in seen:
-            out.append(f"{key}={shlex.quote(settings[key])}")
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(out).rstrip() + "\n")
-        if path == SC_ENV_FILE:
-            os.chmod(path, 0o600)
-    except Exception:
-        pass
-    return len(settings)
-
 def restore_runtime_settings(settings_input):
-    if not isinstance(settings_input, dict):
-        return 0
     settings = {}
-    for key in SETTINGS_KEYS:
-        if key not in settings_input:
-            continue
-        settings[key] = clean_setting_value(settings_input.get(key))
-    if not settings:
-        return 0
-    write_env_settings(SC_ENV_FILE, settings)
-    if os.path.exists(APP_ENV_FILE):
-        write_env_settings(APP_ENV_FILE, settings)
+    if isinstance(settings_input, dict):
+        for key in SETTINGS_KEYS:
+            if key in settings_input:
+                settings[key] = clean_setting_value(settings_input.get(key))
+    # Plan files first, then atomically apply/rollback with the server identity.
+    identity.stage_runtime(settings, data)
     return len(settings)
+
+try:
+    restored_settings = restore_runtime_settings(data.get("settings") or data.get("runtime_settings") or {})
+except Exception:
+    conn.close()
+    raise
+
+for kind in ("ssh", "vmess", "vless", "trojan"):
+    for row in data.get(kind) or []:
+        status = restored_status(row.get("status") or row.get("status_lock"))
+        row["status"] = "EXPIRED" if status == "AKTIF" and state.expired(row["date_exp"]) else status
 
 upsert_ssh(data.get("ssh") or [])
 upsert_uuid("account_vmesses", data.get("vmess") or [])
@@ -19523,7 +20037,6 @@ upsert_uuid("account_vlesses", data.get("vless") or [])
 upsert_trojan(data.get("trojan") or [])
 upsert_quota_usage(data.get("quota_usage") or [])
 upsert_quota_locks(data.get("quota_locks") or [])
-restored_settings = restore_runtime_settings(data.get("settings") or data.get("runtime_settings") or {})
 
 zivpn_auth = data.get("zivpn_auth") or []
 if not isinstance(zivpn_auth, list) or len(zivpn_auth) == 0:
@@ -19559,21 +20072,28 @@ if isinstance(zivpn_auth, list):
         except Exception:
             pass
 
-banner_html = str(data.get("banner_html") or "")
-banner_txt = str(data.get("banner_txt") or "")
-try:
-    os.makedirs("/etc/sc-1forcr", exist_ok=True)
-    if banner_html:
-        with open("/etc/sc-1forcr/banner.html", "w", encoding="utf-8") as f:
-            f.write(banner_html)
-    if banner_txt:
-        with open("/etc/sc-1forcr/banner.txt", "w", encoding="utf-8") as f:
-            f.write(banner_txt)
-except Exception:
-    pass
 
-conn.commit()
-conn.close()
+undo_ssh = None
+try:
+    identity.apply()
+    # Respect quota locks applied above, even if the account row said AKTIF.
+    ssh_runtime = []
+    for row in data.get("ssh") or []:
+        values = cur.execute("SELECT username,password,date_exp,status FROM account_sshs WHERE username=?", (row["username"],)).fetchone()
+        ssh_runtime.append(dict(zip(("username", "password", "date_exp", "status"), values)))
+    # DB rows alone do not create SSH/Dropbear login users on a fresh VPS.
+    undo_ssh = state.sync_ssh(ssh_runtime, previous_ssh_users)
+    conn.commit()
+except Exception:
+    conn.rollback()
+    try:
+        if undo_ssh:
+            undo_ssh()
+    finally:
+        identity.rollback()
+    raise
+finally:
+    conn.close()
 if restored_settings:
     print(f"Runtime settings restored: {restored_settings}", file=sys.stderr)
 PY

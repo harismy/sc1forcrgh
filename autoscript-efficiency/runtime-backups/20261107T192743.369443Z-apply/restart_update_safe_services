@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+exit 0

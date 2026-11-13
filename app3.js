@@ -1334,7 +1334,7 @@ function toYmdUtc(dateObj) {
 function isDateExpExpired(dateExp) {
   const raw = String(dateExp || '').trim();
   if (!raw) return true;
-  const normalized = raw.replace(' ', 'T');
+  const normalized = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? `${raw}T23:59:59` : raw.replace(' ', 'T');
   const ms = Date.parse(normalized);
   if (!Number.isFinite(ms)) return true;
   const end = new Date(ms);
@@ -9871,6 +9871,22 @@ bot.on('text', async (ctx) => {
 
       await ctx.reply('Membuat backup, tunggu...');
 
+      try {
+        const full = await apiPost(state.host, key, '/internal/export-backup', {}, 600000);
+        if (!full.backup?.data || !full.backup?.meta) throw new Error('Format backup lengkap tidak valid.');
+        const filename = `backup-sc-${state.host}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+        await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip = ? AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.host]).catch(() => {});
+        userState.delete(ctx.chat.id);
+        await ctx.replyWithDocument(
+          { source: Buffer.from(JSON.stringify(full.backup, null, 2), 'utf8'), filename },
+          { caption: `Backup lengkap selesai.\nIP VPS: ${state.host}\nAkun, pengaturan bot notifikasi, banner, domain, dan kunci SlowDNS yang tersedia ikut tersimpan. Simpan file ini pribadi.` }
+        );
+        return;
+      } catch (error) {
+        if (Number(error?.response?.status) !== 404) throw error;
+        await ctx.reply('AutoSC/Summary API sumber belum mendukung backup lengkap. Backup akun lama tetap dibuat; update keduanya untuk menyertakan domain dan kunci SlowDNS.');
+      }
+
       const [ssh, vmess, vless, trojan] = await Promise.all([
         apiGet(state.host, key, '/internal/export-accounts', { type: 'ssh', limit: 50000, include_inactive: 1 }),
         apiGet(state.host, key, '/internal/export-accounts', { type: 'vmess', limit: 50000, include_inactive: 1 }),
@@ -10199,6 +10215,20 @@ bot.on('document', async (ctx) => {
     }
 
     const backupData = parsed?.data || {};
+    if (isJsonBackup) {
+      try {
+        const restored = await apiPost(state.host, state.key, '/internal/restore-backup', parsed, 600000);
+        if (restored.restored !== true) throw new Error('Restore lengkap belum dikonfirmasi VPS tujuan.');
+        await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip = ? AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.host]).catch(() => {});
+        userState.delete(ctx.chat.id);
+        await ctx.reply(`Restore lengkap selesai.\nTarget: ${state.host}\nAkun, pengaturan bot notifikasi, dan banner dipulihkan; domain/kunci mengikuti isi backup. Arahkan DNS domain ke IP VPS baru.`, mainMenu());
+        return;
+      } catch (error) {
+        if (Number(error?.response?.status) !== 404) throw error;
+        if (backupData.identity) throw new Error('Update AutoSC dan Summary API tujuan dahulu agar domain dan kunci SlowDNS dapat dipulihkan.');
+        // Older destinations retain the legacy account-only migration path.
+      }
+    }
     const types = ['ssh', 'vmess', 'vless', 'trojan'];
     const resultLines = [];
     const foreignSummary = isForeignZipBackup ? (parsed?.summary || null) : null;

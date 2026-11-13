@@ -1,0 +1,10 @@
+{
+  "action": "rollback",
+  "status": "complete",
+  "files": [
+    "/usr/local/sbin/sc-1forcr-udpgw-drain",
+    "/usr/local/sbin/sc-1forcr-postboot-health",
+    "/usr/local/sbin/restart_update_safe_services",
+    "/opt/sc-1forcr/menu-sc-1forcr.sh"
+  ]
+}

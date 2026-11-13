@@ -1,0 +1,12 @@
+# SESUDAH UJI A 1794223628
+low 0
+high 0
+max 2901
+oom 0
+oom_kill 0
+oom_group_kill 0
+anon 74792960
+file 2842624
+swapcached 765952
+workingset_refault_anon 121205
+pgmajfault 35839

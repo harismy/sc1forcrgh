@@ -1,0 +1,12 @@
+# SEBELUM UJI A 1794222772
+low 0
+high 0
+max 2901
+oom 0
+oom_kill 0
+oom_group_kill 0
+anon 99319808
+file 2895872
+swapcached 2686976
+workingset_refault_anon 117597
+pgmajfault 35221

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+runtime_value() {
+  local key="${1}" fallback="${2:-}" env_file parsed value=""
+  for env_file in /etc/sc-1forcr.env /opt/sc-1forcr/.env; do
+    [[ -r "${env_file}" ]] || continue
+    parsed="$(awk -v key="${key}" 'index($0, key "=")==1 {value=substr($0, length(key)+2)} END {print value}' "${env_file}" 2>/dev/null || true)"
+    [[ -n "${parsed}" ]] && value="${parsed}"
+  done
+  printf '%s' "${value:-${fallback}}"
+}
+
+SSHWS_UDPGW_PORTS="$(runtime_value SSHWS_UDPGW_PORTS "${SSHWS_UDPGW_PORTS:-7300,7200}")"
+SSHWS_UDPGW_SINGLE_PROCESS="$(runtime_value SSHWS_UDPGW_SINGLE_PROCESS "${SSHWS_UDPGW_SINGLE_PROCESS:-1}")"
+
+case "$(printf '%s' "${SSHWS_UDPGW_SINGLE_PROCESS:-1}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on|enable|enabled) ;;
+  *) exit 0 ;;
+esac
+
+raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
+mapfile -t ports < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}')
+(( ${#ports[@]} > 1 )) || exit 0
+
+declare -A established_by_port=()
+snapshot_ready=0
+for alias_port in "${ports[@]:1}"; do
+  unit="sc-1forcr-udpgw@${alias_port}.service"
+  # `systemctl disable` tanpa --no-reload ikut menjalankan daemon-reload penuh.
+  # Drain jalan tiap 2 menit, dan reload beruntun itu mereset OnActiveSec timer
+  # lain, sehingga notif online, auto-backup, dan pull-update tidak pernah jalan
+  # setelah reboot. Disable hanya bila masih enabled, dan tanpa reload.
+  if [[ "$(systemctl is-enabled "${unit}" 2>/dev/null || true)" == enabled* ]]; then
+    systemctl disable --no-reload "${unit}" >/dev/null 2>&1 || true
+  fi
+  active_state="$(systemctl show "${unit}" --property=ActiveState --value 2>/dev/null)" || active_state=unknown
+  if [[ "${active_state}" != active ]]; then
+    if [[ "${active_state}" == failed ]]; then
+      systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    fi
+    continue
+  fi
+  if (( snapshot_ready == 0 )); then
+    if ! sockets="$(ss -Htn state established 2>/dev/null)"; then
+      logger -t sc-1forcr-udpgw "Drain ditunda: snapshot koneksi gagal; proses aktif dipertahankan." || true
+      exit 1
+    fi
+    while read -r endpoint_port endpoint_count; do
+      [[ "${endpoint_port}" =~ ^[0-9]+$ ]] || continue
+      established_by_port["${endpoint_port}"]="${endpoint_count}"
+    done < <(awk '
+      function p(v,   n,a,port) { n=split(v,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port : ""); }
+      { port=p($3); if (port=="") port=p($4); if (port!="") count[port]++; }
+      END {for (port in count) print port, count[port]}
+    ' <<< "${sockets}")
+    snapshot_ready=1
+  fi
+  established="${established_by_port[${alias_port}]:-0}"
+  if [[ "${established}" == "0" ]]; then
+    systemctl stop "${unit}" >/dev/null 2>&1 || true
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    logger -t sc-1forcr-udpgw "Drain selesai; proses alias UDPGW port ${alias_port} dihentikan." || true
+  fi
+done

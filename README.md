@@ -214,6 +214,46 @@ dihitung. Koneksi SlowDNS yang tersambung lalu putus dalam waktu kurang dari
 satu siklus pemeriksaan (5 menit) bisa tidak terhitung. Ini disengaja, supaya
 trafik tidak pernah dibebankan ke akun yang salah.
 
+## Backup dan restore ke VPS baru
+
+Mulai V.1FSC.131, backup JSON dari web AutoSC, backup terjadwal, dan menu
+**Backup SC** pada `app3.js` memakai format yang sama. Selain akun, pemakaian
+kuota, banner, dan pengaturan, backup menyertakan domain utama, sertifikat TLS
+yang tersedia, domain NS serta pasangan private key/pubkey SlowDNS yang tersedia.
+File berisi kredensial dan private key; simpan pribadi.
+
+V.1FSC.132 juga menyertakan token dan chat ID bot notifikasi (`TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_CHAT_ID`), status/jadwal notifikasi online, serta banner HTML dan teks.
+Nilai kosong di backup menghapus nilai lama pada tujuan; field yang tidak ada
+pada backup lama tetap mempertahankan pengaturan tujuan. Banner diaktifkan pada
+SSH/Dropbear dengan batas ukuran Dropbear yang sama seperti menu banner. Jika
+penerapan gagal, pengaturan notifikasi, banner, dan konfigurasi layanan dipulihkan.
+
+Update AutoSC dan Summary API pada VPS sumber/tujuan serta `app3.js`, lalu buat
+backup baru. Pada VPS baru, instal AutoSC dan restore file melalui web
+`/vps/backup-ui` atau menu **Restore SC** pada bot. IP, token API, dan lisensi
+VPS tujuan tidak diganti oleh identitas VPS sumber. DNS di penyedia domain tetap
+perlu diarahkan ke IP VPS baru; restore tidak mengubah record DNS eksternal.
+
+Restore membentuk kembali user Linux SSH beserta password, shell, dan masa
+aktifnya. Tanggal tanpa jam berlaku sampai akhir hari; tanggal kosong tetap
+tanpa batas waktu. Akun yang benar-benar kedaluwarsa atau terkunci tidak
+diaktifkan kembali. Kunci SlowDNS divalidasi sebagai pasangan, konfigurasi
+nginx/HAProxy diperiksa sebelum aktivasi, dan kegagalan penerapan identitas
+mengembalikan konfigurasi sebelumnya. Koneksi layanan dapat tersambung ulang
+saat restore menerapkan identitas dan konfigurasi.
+
+Backup v1/v2 tetap dapat dipulihkan untuk akun/pengaturan, tetapi tidak dapat
+mengembalikan kunci yang memang belum disertakan. Backup baru yang membawa
+identitas tidak boleh diturunkan diam-diam menjadi restore akun saja pada VPS
+yang belum di-update. Sertifikat yang dipindahkan mempertahankan masa berlakunya;
+pengaturan penerbitan/perpanjangan Certbot di VPS baru perlu sesuai domain yang
+dipulihkan, terutama untuk sertifikat wildcard dengan verifikasi DNS.
+
+Pengujian: `npm run test:backup-restore` (Node dengan `node:sqlite`, Python 3.8+,
+OpenSSL). Uji memakai HTTP lokal, SQLite/file sungguhan, serta simulasi perintah
+user Linux/systemd; tidak menghubungi Telegram atau mengubah layanan VPS produksi.
+
 ## DNS Resolver Guard
 
 SC memeriksa resolusi beberapa domain sebelum instalasi dan secara berkala melalui

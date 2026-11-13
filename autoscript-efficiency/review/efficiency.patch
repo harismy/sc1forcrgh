@@ -1,0 +1,431 @@
+--- a/setup-autoscript-compat.sh
++++ b/setup-autoscript-compat.sh
+@@ -2456,14 +2456,89 @@
+   /usr/local/sbin/sc-1forcr-dns-guard
+ }
+ 
++# SC_EFFICIENCY_PATCH=2026-11-07.1
++# Helpers for one setup function at a time. The caller declares these locals:
++# SC_UNIT_CHANGED=0 SC_MANAGER_STALE=0; arrays SC_WRITTEN_UNITS SC_CHANGED_UNITS.
++# Do not export: independent child scripts keep their own systemd lifecycle.
++sc_write_unit_if_changed() {
++  local dest="$1" tmp unit="${1##*/}"
++  SC_WRITTEN_UNITS+=("${unit}")
++  if [[ -L "${dest}" ]]; then
++    echo "Refusing to replace symlink unit: ${dest}" >&2
++    return 1
++  fi
++  tmp="$(mktemp "${dest}.XXXXXX")" || return 1
++  if ! cat > "${tmp}"; then rm -f "${tmp}"; return 1; fi
++  if [[ -f "${dest}" ]] && cmp -s "${tmp}" "${dest}"; then
++    rm -f "${tmp}"
++    return 0
++  fi
++  if ! chmod 644 "${tmp}" || ! mv -f "${tmp}" "${dest}"; then
++    rm -f "${tmp}"
++    return 1
++  fi
++  SC_UNIT_CHANGED=1
++  SC_CHANGED_UNITS+=("${unit}")
++}
++
++sc_set_unit_enabled() {
++  local unit="$1" desired="$2" state
++  state="$(systemctl is-enabled "${unit}" 2>/dev/null)" || true
++  if [[ "${desired}" == 1 ]]; then
++    if [[ "${state}" != enabled ]]; then
++      systemctl enable --no-reload "${unit}" || return 1
++      SC_UNIT_CHANGED=1
++    fi
++  else
++    case "${state}" in
++      disabled|masked|not-found|'') return 0 ;;
++    esac
++    systemctl disable --no-reload "${unit}" || return 1
++    SC_UNIT_CHANGED=1
++  fi
++}
++
++sc_reload_changed_units() {
++  local status
++  # Detect a previous interrupted write, including a new unit not yet loaded.
++  if (( SC_UNIT_CHANGED == 0 && ${#SC_WRITTEN_UNITS[@]} > 0 )); then
++    if ! status="$(systemctl show --property=LoadState --property=NeedDaemonReload "${SC_WRITTEN_UNITS[@]}" 2>/dev/null)" ||
++       [[ "${status}" == *NeedDaemonReload=yes* || "${status}" == *LoadState=not-found* ]]; then
++      SC_MANAGER_STALE=1
++    fi
++  fi
++  if (( SC_UNIT_CHANGED || SC_MANAGER_STALE )); then
++    systemctl daemon-reload || return 1
++    SC_UNIT_CHANGED=0
++  fi
++}
++
++sc_start_timer_if_changed() {
++  local timer="$1" unit
++  for unit in "${SC_CHANGED_UNITS[@]}"; do
++    if [[ "${unit}" == "${timer}" ]]; then
++      systemctl restart "${timer}"
++      return $?
++    fi
++  done
++  if (( SC_MANAGER_STALE )); then
++    systemctl restart "${timer}"
++  else
++    # start is a no-op for an already active timer: its deadline is preserved.
++    systemctl start "${timer}"
++  fi
++}
++
+ setup_dns_resolver_guard() {
++  local SC_UNIT_CHANGED=0 SC_MANAGER_STALE=0
++  local -a SC_WRITTEN_UNITS=() SC_CHANGED_UNITS=()
+   if ! flag_enabled "${DNS_GUARD_ENABLE:-1}"; then
+     systemctl disable --now sc-1forcr-dns-guard.timer >/dev/null 2>&1 || true
+     return 0
+   fi
+ 
+   write_dns_resolver_guard
+-  cat > /etc/systemd/system/sc-1forcr-dns-guard.service <<'EOF'
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-dns-guard.service <<'EOF' || return 1
+ [Unit]
+ Description=SC 1FORCR DNS Resolver Guard
+ After=network-online.target
+@@ -2474,7 +2549,7 @@
+ ExecStart=/usr/local/sbin/sc-1forcr-dns-guard
+ EOF
+ 
+-  cat > /etc/systemd/system/sc-1forcr-dns-guard.timer <<EOF
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-dns-guard.timer <<EOF || return 1
+ [Unit]
+ Description=Periodic SC 1FORCR DNS Resolver Check
+ 
+@@ -2490,8 +2565,9 @@
+ WantedBy=timers.target
+ EOF
+ 
+-  systemctl daemon-reload
+-  systemctl enable --now sc-1forcr-dns-guard.timer >/dev/null
++  sc_set_unit_enabled sc-1forcr-dns-guard.timer 1 || return 1
++  sc_reload_changed_units || return 1
++  sc_start_timer_if_changed sc-1forcr-dns-guard.timer || return 1
+   systemctl start sc-1forcr-dns-guard.service
+ }
+ 
+@@ -17147,6 +17223,8 @@
+ mapfile -t ports < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}')
+ (( ${#ports[@]} > 1 )) || exit 0
+ 
++declare -A established_by_port=()
++snapshot_ready=0
+ for alias_port in "${ports[@]:1}"; do
+   unit="sc-1forcr-udpgw@${alias_port}.service"
+   # `systemctl disable` tanpa --no-reload ikut menjalankan daemon-reload penuh.
+@@ -17156,14 +17234,29 @@
+   if [[ "$(systemctl is-enabled "${unit}" 2>/dev/null || true)" == enabled* ]]; then
+     systemctl disable --no-reload "${unit}" >/dev/null 2>&1 || true
+   fi
+-  if ! systemctl is-active --quiet "${unit}"; then
+-    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
++  active_state="$(systemctl show "${unit}" --property=ActiveState --value 2>/dev/null)" || active_state=unknown
++  if [[ "${active_state}" != active ]]; then
++    if [[ "${active_state}" == failed ]]; then
++      systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
++    fi
+     continue
+   fi
+-  established="$(ss -Htn state established 2>/dev/null | awk -v wanted="${alias_port}" '
+-    function p(v,   s,n,a,port) { s=v; gsub(/^\[/,"",s); gsub(/\]$/,"",s); n=split(s,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port : ""); }
+-    { local_ep=$3; if (p(local_ep)=="") local_ep=$4; if (p(local_ep)==wanted) count++; }
+-    END {print count+0}')"
++  if (( snapshot_ready == 0 )); then
++    if ! sockets="$(ss -Htn state established 2>/dev/null)"; then
++      logger -t sc-1forcr-udpgw "Drain ditunda: snapshot koneksi gagal; proses aktif dipertahankan." || true
++      exit 1
++    fi
++    while read -r endpoint_port endpoint_count; do
++      [[ "${endpoint_port}" =~ ^[0-9]+$ ]] || continue
++      established_by_port["${endpoint_port}"]="${endpoint_count}"
++    done < <(awk '
++      function p(v,   n,a,port) { n=split(v,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port : ""); }
++      { port=p($3); if (port=="") port=p($4); if (port!="") count[port]++; }
++      END {for (port in count) print port, count[port]}
++    ' <<< "${sockets}")
++    snapshot_ready=1
++  fi
++  established="${established_by_port[${alias_port}]:-0}"
+   if [[ "${established}" == "0" ]]; then
+     systemctl stop "${unit}" >/dev/null 2>&1 || true
+     systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+@@ -17701,6 +17794,8 @@
+ }
+ 
+ setup_postboot_health_guard() {
++  local SC_UNIT_CHANGED=0 SC_MANAGER_STALE=0
++  local -a SC_WRITTEN_UNITS=() SC_CHANGED_UNITS=()
+   cat > /usr/local/sbin/sc-1forcr-postboot-health <<'POSTBOOT_HEALTH_EOF'
+ #!/usr/bin/env bash
+ set -uo pipefail
+@@ -17732,23 +17827,27 @@
+ listener_present() {
+   local port="$1"
+   [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+-  ss -H -lnt 2>/dev/null | awk -v want="${port}" '
++  awk -v want="${port}" '
+     {
+       address=$4;
+       sub(/^.*:/, "", address);
+       if (address == want) found=1;
+     }
+     END { exit(found ? 0 : 1) }
+-  '
++  ' <<< "$2"
+ }
+ 
+ unit_healthy() {
+   local unit="$1"
+   shift
+   systemctl is-active --quiet "${unit}" 2>/dev/null || return 1
+-  local port
++  # One fresh snapshot per health attempt, shared by this unit's ports.
++  # Never reuse it after sleep/restart: recovery must observe current listeners.
++  local port listeners
++  (( $# > 0 )) || return 0
++  listeners="$(ss -H -lnt 2>/dev/null)" || return 1
+   for port in "$@"; do
+-    listener_present "${port}" || return 1
++    listener_present "${port}" "${listeners}" || return 1
+   done
+   return 0
+ }
+@@ -17921,7 +18020,7 @@
+   bash -n /usr/local/sbin/sc-1forcr-postboot-health
+   chmod 755 /usr/local/sbin/sc-1forcr-postboot-health
+ 
+-  cat > /etc/systemd/system/sc-1forcr-postboot-health.service <<'POSTBOOT_HEALTH_SERVICE_EOF'
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-postboot-health.service <<'POSTBOOT_HEALTH_SERVICE_EOF' || return 1
+ [Unit]
+ Description=SC 1FORCR conservative post-boot health recovery
+ After=network-online.target
+@@ -17951,7 +18050,7 @@
+   # PENTING: tanpa OnUnitInactiveSec, timer ini hanya jalan SEKALI (90 detik
+   # setelah boot) lalu tidak pernah lagi. Service inti yang macet di tengah
+   # jalan jadi tidak pernah dipulihkan otomatis dan user harus restart manual.
+-  cat > /etc/systemd/system/sc-1forcr-postboot-health.timer <<POSTBOOT_HEALTH_TIMER_EOF
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-postboot-health.timer <<POSTBOOT_HEALTH_TIMER_EOF || return 1
+ [Unit]
+ Description=Check SC 1FORCR core services after boot and every ${health_interval_min} minutes
+ 
+@@ -17967,9 +18066,9 @@
+ WantedBy=timers.target
+ POSTBOOT_HEALTH_TIMER_EOF
+ 
+-  systemctl daemon-reload >/dev/null
+-  systemctl enable --now sc-1forcr-postboot-health.timer >/dev/null
+-  systemctl restart sc-1forcr-postboot-health.timer >/dev/null
++  sc_set_unit_enabled sc-1forcr-postboot-health.timer 1 || return 1
++  sc_reload_changed_units || return 1
++  sc_start_timer_if_changed sc-1forcr-postboot-health.timer || return 1
+ }
+ 
+ setup_auto_reboot_timer() {
+@@ -20273,6 +20372,8 @@
+ }
+ 
+ setup_online_notify_timer() {
++  local SC_UNIT_CHANGED=0 SC_MANAGER_STALE=0
++  local -a SC_WRITTEN_UNITS=() SC_CHANGED_UNITS=()
+   local notify_interval_h
+   notify_interval_h="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+   if [[ -z "${notify_interval_h}" || "${notify_interval_h}" -lt 1 || "${notify_interval_h}" -gt 168 ]]; then
+@@ -21109,7 +21210,7 @@
+ EOF
+   chmod +x /usr/local/sbin/sc-1forcr-online-notify
+ 
+-  cat > /etc/systemd/system/sc-1forcr-online-notify.service <<'EOF'
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-online-notify.service <<'EOF' || return 1
+ [Unit]
+ Description=SC 1FORCR Online Account Notify
+ After=network-online.target
+@@ -21128,7 +21229,7 @@
+ PrivateTmp=true
+ EOF
+ 
+-  cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF || return 1
+ [Unit]
+ Description=Check SC 1FORCR online account notifier every 15 minutes (report every ${notify_interval_h} hours)
+ 
+@@ -21150,16 +21251,19 @@
+ WantedBy=timers.target
+ EOF
+ 
+-  systemctl daemon-reload
++  sc_set_unit_enabled sc-1forcr-online-notify.timer "${ONLINE_NOTIFY_ENABLE}" || return 1
++  sc_reload_changed_units || return 1
+   if [[ "${ONLINE_NOTIFY_ENABLE}" == "1" ]]; then
+-    systemctl enable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
++    sc_start_timer_if_changed sc-1forcr-online-notify.timer || return 1
+     systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+   else
+-    systemctl disable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
++    systemctl stop sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+   fi
+ }
+ 
+ setup_auto_pull_update_timer() {
++  local SC_UNIT_CHANGED=0 SC_MANAGER_STALE=0
++  local -a SC_WRITTEN_UNITS=() SC_CHANGED_UNITS=()
+   local pull_interval_min pull_fail_cooldown_min pull_script_tmp summary_script_tmp god_script_tmp god_interval
+   pull_interval_min="$(echo "${AUTO_PULL_UPDATE_INTERVAL_MINUTES:-360}" | tr -cd '0-9')"
+   if [[ -z "${pull_interval_min}" || "${pull_interval_min}" -lt 1 || "${pull_interval_min}" -gt 1440 ]]; then
+@@ -21865,7 +21969,7 @@
+   chmod 755 "${god_script_tmp}"
+   mv -f "${god_script_tmp}" /usr/local/sbin/sc-1forcr-god-update
+ 
+-  cat > /etc/systemd/system/sc-1forcr-pull-update.service <<'EOF'
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-pull-update.service <<'EOF' || return 1
+ [Unit]
+ Description=SC 1FORCR Pull Update Trigger from Bot
+ After=network-online.target
+@@ -21881,7 +21985,7 @@
+ PrivateTmp=true
+ EOF
+ 
+-  cat > /etc/systemd/system/sc-1forcr-pull-summary-update.service <<'EOF'
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-pull-summary-update.service <<'EOF' || return 1
+ [Unit]
+ Description=SC 1FORCR Pull Summary API Update Trigger from Bot
+ After=network-online.target
+@@ -21897,7 +22001,7 @@
+ PrivateTmp=true
+ EOF
+ 
+-  cat > /etc/systemd/system/sc-1forcr-god-update.service <<'EOF'
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-god-update.service <<'EOF' || return 1
+ [Unit]
+ Description=SC 1FORCR Mandatory God Mode Update
+ After=network-online.target
+@@ -21913,7 +22017,7 @@
+ PrivateTmp=true
+ EOF
+ 
+-  cat > /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-pull-update.timer <<EOF || return 1
+ [Unit]
+ Description=Check SC 1FORCR update trigger every ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} minutes
+ 
+@@ -21929,7 +22033,7 @@
+ WantedBy=timers.target
+ EOF
+ 
+-  cat > /etc/systemd/system/sc-1forcr-pull-summary-update.timer <<EOF
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-pull-summary-update.timer <<EOF || return 1
+ [Unit]
+ Description=Check SC 1FORCR Summary API update trigger every ${AUTO_PULL_UPDATE_INTERVAL_MINUTES} minutes
+ 
+@@ -21947,7 +22051,7 @@
+ 
+   god_interval="$(echo "${GOD_UPDATE_CHECK_INTERVAL_MINUTES:-5}" | tr -cd '0-9')"
+   [[ -z "${god_interval}" || "${god_interval}" -lt 1 || "${god_interval}" -gt 60 ]] && god_interval="5"
+-  cat > /etc/systemd/system/sc-1forcr-god-update.timer <<EOF
++  sc_write_unit_if_changed /etc/systemd/system/sc-1forcr-god-update.timer <<EOF || return 1
+ [Unit]
+ Description=Check mandatory SC 1FORCR God Mode update every ${god_interval} minutes
+ 
+@@ -21971,20 +22075,18 @@
+ WantedBy=timers.target
+ EOF
+ 
+-  systemctl daemon-reload >/dev/null 2>&1 || true
+-  # Buang stamp persisten lama. Pernah ditemukan di lapangan file ini mandek
+-  # berhari-hari sehingga LastTrigger ikut mandek dan timer berhenti memicu
+-  # update wajib, padahal timer SC lain normal. Sekali dibuang, penjadwalan
+-  # kembali dihitung bersih dari sekarang.
+-  rm -f /var/lib/systemd/timers/stamp-sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+-  systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+-  systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++  # Batch enablement and unit writes before a single reload. Preserve timer
++  # deadlines on an unchanged update; restart only changed timer definitions.
++  sc_set_unit_enabled sc-1forcr-god-update.timer 1 || return 1
++  sc_set_unit_enabled sc-1forcr-pull-update.timer "${AUTO_PULL_UPDATE_ENABLE}" || return 1
++  sc_set_unit_enabled sc-1forcr-pull-summary-update.timer "${AUTO_PULL_UPDATE_ENABLE}" || return 1
++  sc_reload_changed_units || return 1
++  sc_start_timer_if_changed sc-1forcr-god-update.timer || return 1
+   if [[ "${AUTO_PULL_UPDATE_ENABLE}" == "1" ]]; then
+-    systemctl enable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+-    systemctl enable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
++    sc_start_timer_if_changed sc-1forcr-pull-update.timer || return 1
++    sc_start_timer_if_changed sc-1forcr-pull-summary-update.timer || return 1
+   else
+-    systemctl disable --now sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+-    systemctl disable --now sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
++    systemctl stop sc-1forcr-pull-update.timer sc-1forcr-pull-summary-update.timer || return 1
+   fi
+ }
+ 
+@@ -34699,17 +34801,17 @@
+     systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+   fi
+   if [[ "${ONLINE_NOTIFY_ENABLE:-1}" == "1" ]]; then
+-    systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+     systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+   else
+     systemctl stop sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+   fi
+   if [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" == "1" ]]; then
+-    systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+-    systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+-  fi
+-  systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+-  systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
++  fi
++  systemctl is-enabled --quiet sc-1forcr-god-update.timer 2>/dev/null || systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++  systemctl start sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+   if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
+     systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+     systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
+@@ -41365,17 +41467,17 @@
+     systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+   fi
+   if [[ "${ONLINE_NOTIFY_ENABLE:-1}" == "1" ]]; then
+-    systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+     systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+   else
+     systemctl stop sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+   fi
+   if [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" == "1" ]]; then
+-    systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+-    systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+-  fi
+-  systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+-  systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
++  fi
++  systemctl is-enabled --quiet sc-1forcr-god-update.timer 2>/dev/null || systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++  systemctl start sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+   if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
+     systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+     systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true
+@@ -41538,11 +41640,11 @@
+ systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+ systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+ systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+-systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+-systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+-systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+-systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+-systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++systemctl start sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
++systemctl start sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
++systemctl start sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
++systemctl is-enabled --quiet sc-1forcr-god-update.timer 2>/dev/null || systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++systemctl start sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+ systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+ exit 0
+ EOF

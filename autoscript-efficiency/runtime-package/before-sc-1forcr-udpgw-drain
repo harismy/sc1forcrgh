@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+runtime_value() {
+  local key="${1}" fallback="${2:-}" env_file parsed value=""
+  for env_file in /etc/sc-1forcr.env /opt/sc-1forcr/.env; do
+    [[ -r "${env_file}" ]] || continue
+    parsed="$(awk -v key="${key}" 'index($0, key "=")==1 {value=substr($0, length(key)+2)} END {print value}' "${env_file}" 2>/dev/null || true)"
+    [[ -n "${parsed}" ]] && value="${parsed}"
+  done
+  printf '%s' "${value:-${fallback}}"
+}
+
+SSHWS_UDPGW_PORTS="$(runtime_value SSHWS_UDPGW_PORTS "${SSHWS_UDPGW_PORTS:-7300,7200}")"
+SSHWS_UDPGW_SINGLE_PROCESS="$(runtime_value SSHWS_UDPGW_SINGLE_PROCESS "${SSHWS_UDPGW_SINGLE_PROCESS:-1}")"
+
+case "$(printf '%s' "${SSHWS_UDPGW_SINGLE_PROCESS:-1}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on|enable|enabled) ;;
+  *) exit 0 ;;
+esac
+
+raw="$(printf '%s' "${SSHWS_UDPGW_PORTS:-7300,7200}" | tr -cd '0-9,')"
+mapfile -t ports < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}')
+(( ${#ports[@]} > 1 )) || exit 0
+
+for alias_port in "${ports[@]:1}"; do
+  unit="sc-1forcr-udpgw@${alias_port}.service"
+  # `systemctl disable` tanpa --no-reload ikut menjalankan daemon-reload penuh.
+  # Drain jalan tiap 2 menit, dan reload beruntun itu mereset OnActiveSec timer
+  # lain, sehingga notif online, auto-backup, dan pull-update tidak pernah jalan
+  # setelah reboot. Disable hanya bila masih enabled, dan tanpa reload.
+  if [[ "$(systemctl is-enabled "${unit}" 2>/dev/null || true)" == enabled* ]]; then
+    systemctl disable --no-reload "${unit}" >/dev/null 2>&1 || true
+  fi
+  if ! systemctl is-active --quiet "${unit}"; then
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    continue
+  fi
+  established="$(ss -Htn state established 2>/dev/null | awk -v wanted="${alias_port}" '
+    function p(v,   s,n,a,port) { s=v; gsub(/^\[/,"",s); gsub(/\]$/,"",s); n=split(s,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port : ""); }
+    { local_ep=$3; if (p(local_ep)=="") local_ep=$4; if (p(local_ep)==wanted) count++; }
+    END {print count+0}')"
+  if [[ "${established}" == "0" ]]; then
+    systemctl stop "${unit}" >/dev/null 2>&1 || true
+    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+    logger -t sc-1forcr-udpgw "Drain selesai; proses alias UDPGW port ${alias_port} dihentikan." || true
+  fi
+done

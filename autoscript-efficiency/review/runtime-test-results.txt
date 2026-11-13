@@ -1,0 +1,11 @@
+6 tests passed in 109.927 seconds.
+- active updater lock aborts
+- apply is idempotent and rollback restores bytes/modes
+- changed live file aborts before writes
+- check mode has no writes
+- corrupt payload aborts
+- partial write failure restores prior file
+
+Read-only live preflight: 4 BASE files, CHECK OK.
+Escalated application rejected by permission policy before execution.
+Production patch NOT applied.

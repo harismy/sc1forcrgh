@@ -1,0 +1,125 @@
+--- before/usr/local/sbin/sc-1forcr-udpgw-drain
++++ after/usr/local/sbin/sc-1forcr-udpgw-drain
+@@ -23,6 +23,8 @@
+ mapfile -t ports < <(printf '%s' "${raw}" | tr ',' '\n' | awk '$1>=1 && $1<=65535 && !seen[$1]++ {print $1}')
+ (( ${#ports[@]} > 1 )) || exit 0
+ 
++declare -A established_by_port=()
++snapshot_ready=0
+ for alias_port in "${ports[@]:1}"; do
+   unit="sc-1forcr-udpgw@${alias_port}.service"
+   # `systemctl disable` tanpa --no-reload ikut menjalankan daemon-reload penuh.
+@@ -32,14 +34,29 @@
+   if [[ "$(systemctl is-enabled "${unit}" 2>/dev/null || true)" == enabled* ]]; then
+     systemctl disable --no-reload "${unit}" >/dev/null 2>&1 || true
+   fi
+-  if ! systemctl is-active --quiet "${unit}"; then
+-    systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
++  active_state="$(systemctl show "${unit}" --property=ActiveState --value 2>/dev/null)" || active_state=unknown
++  if [[ "${active_state}" != active ]]; then
++    if [[ "${active_state}" == failed ]]; then
++      systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
++    fi
+     continue
+   fi
+-  established="$(ss -Htn state established 2>/dev/null | awk -v wanted="${alias_port}" '
+-    function p(v,   s,n,a,port) { s=v; gsub(/^\[/,"",s); gsub(/\]$/,"",s); n=split(s,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port : ""); }
+-    { local_ep=$3; if (p(local_ep)=="") local_ep=$4; if (p(local_ep)==wanted) count++; }
+-    END {print count+0}')"
++  if (( snapshot_ready == 0 )); then
++    if ! sockets="$(ss -Htn state established 2>/dev/null)"; then
++      logger -t sc-1forcr-udpgw "Drain ditunda: snapshot koneksi gagal; proses aktif dipertahankan." || true
++      exit 1
++    fi
++    while read -r endpoint_port endpoint_count; do
++      [[ "${endpoint_port}" =~ ^[0-9]+$ ]] || continue
++      established_by_port["${endpoint_port}"]="${endpoint_count}"
++    done < <(awk '
++      function p(v,   n,a,port) { n=split(v,a,":"); port=a[n]; return (port ~ /^[0-9]+$/ && port+0>=1 && port+0<=65535 ? port : ""); }
++      { port=p($3); if (port=="") port=p($4); if (port!="") count[port]++; }
++      END {for (port in count) print port, count[port]}
++    ' <<< "${sockets}")
++    snapshot_ready=1
++  fi
++  established="${established_by_port[${alias_port}]:-0}"
+   if [[ "${established}" == "0" ]]; then
+     systemctl stop "${unit}" >/dev/null 2>&1 || true
+     systemctl reset-failed "${unit}" >/dev/null 2>&1 || true
+--- before/usr/local/sbin/sc-1forcr-postboot-health
++++ after/usr/local/sbin/sc-1forcr-postboot-health
+@@ -28,23 +28,27 @@
+ listener_present() {
+   local port="$1"
+   [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+-  ss -H -lnt 2>/dev/null | awk -v want="${port}" '
++  awk -v want="${port}" '
+     {
+       address=$4;
+       sub(/^.*:/, "", address);
+       if (address == want) found=1;
+     }
+     END { exit(found ? 0 : 1) }
+-  '
++  ' <<< "$2"
+ }
+ 
+ unit_healthy() {
+   local unit="$1"
+   shift
+   systemctl is-active --quiet "${unit}" 2>/dev/null || return 1
+-  local port
++  # One fresh snapshot per health attempt, shared by this unit's ports.
++  # Never reuse it after sleep/restart: recovery must observe current listeners.
++  local port listeners
++  (( $# > 0 )) || return 0
++  listeners="$(ss -H -lnt 2>/dev/null)" || return 1
+   for port in "$@"; do
+-    listener_present "${port}" || return 1
++    listener_present "${port}" "${listeners}" || return 1
+   done
+   return 0
+ }
+--- before/usr/local/sbin/restart_update_safe_services
++++ after/usr/local/sbin/restart_update_safe_services
+@@ -4,10 +4,10 @@
+ systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+ systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+ systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+-systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+-systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+-systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+-systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+-systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++systemctl start sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
++systemctl start sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
++systemctl start sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
++systemctl is-enabled --quiet sc-1forcr-god-update.timer 2>/dev/null || systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++systemctl start sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+ systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+ exit 0
+--- before/opt/sc-1forcr/menu-sc-1forcr.sh
++++ after/opt/sc-1forcr/menu-sc-1forcr.sh
+@@ -5445,17 +5445,17 @@
+     systemctl disable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+   fi
+   if [[ "${ONLINE_NOTIFY_ENABLE:-1}" == "1" ]]; then
+-    systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+     systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+   else
+     systemctl stop sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+   fi
+   if [[ "${AUTO_PULL_UPDATE_ENABLE:-1}" == "1" ]]; then
+-    systemctl restart sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
+-    systemctl restart sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
+-  fi
+-  systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+-  systemctl restart sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-pull-update.timer >/dev/null 2>&1 || true
++    systemctl start sc-1forcr-pull-summary-update.timer >/dev/null 2>&1 || true
++  fi
++  systemctl is-enabled --quiet sc-1forcr-god-update.timer 2>/dev/null || systemctl enable --now sc-1forcr-god-update.timer >/dev/null 2>&1 || true
++  systemctl start sc-1forcr-god-update.timer >/dev/null 2>&1 || true
+   if [[ "${RESOURCE_AUTOTUNE_ENABLE:-1}" == "1" ]]; then
+     systemctl restart sc-1forcr-capacity-tune.timer >/dev/null 2>&1 || true
+     systemctl start sc-1forcr-capacity-tune.service >/dev/null 2>&1 || true

@@ -267,7 +267,11 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+const summaryJsonParser = express.json({ limit: '2mb' });
+app.use((req, res, next) => {
+  if (req.path === '/internal/restore-backup') return next();
+  return summaryJsonParser(req, res, next);
+});
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
 const HOST = String(process.env.SUMMARY_HOST || '0.0.0.0').trim() || '0.0.0.0';
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
@@ -299,6 +303,8 @@ const RUNTIME_SETTINGS_KEYS = Object.freeze([
   'AUTO_PULL_UPDATE_ENABLE',
   'AUTO_PULL_UPDATE_INTERVAL_MINUTES',
   'AUTO_PULL_UPDATE_FAIL_COOLDOWN_MINUTES',
+  'TELEGRAM_BOT_TOKEN',
+  'TELEGRAM_CHAT_ID',
   'ONLINE_NOTIFY_ENABLE',
   'ONLINE_NOTIFY_INTERVAL_HOURS',
   'ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS',
@@ -2692,6 +2698,7 @@ async function postCoreApi(endpoint, body = {}, timeoutMs = 120000) {
     return { ok: false, statusCode: 500, message: core.message };
   }
   const path = String(endpoint || '').startsWith('/') ? String(endpoint || '') : `/${String(endpoint || '')}`;
+  const rawBackup = path === '/vps/backup/import' && typeof body === 'string';
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(5000, Number(timeoutMs || 120000)));
   try {
@@ -2699,9 +2706,9 @@ async function postCoreApi(endpoint, body = {}, timeoutMs = 120000) {
       method: 'POST',
       headers: {
         Authorization: core.token,
-        'Content-Type': 'application/json'
+        'Content-Type': rawBackup ? 'text/plain' : 'application/json'
       },
-      body: JSON.stringify(body || {}),
+      body: rawBackup ? body : JSON.stringify(body || {}),
       signal: controller.signal
     });
     const text = await resp.text();
@@ -2841,6 +2848,35 @@ app.get('/internal/vnstat-daily', (req, res) => {
     return sendVnstatDaily(res);
   });
 });
+
+// Native migration carries the same account/identity payload as the AutoSC web UI.
+for (const [route, endpoint] of [
+  ['/internal/export-backup', '/vps/backup/export'],
+  ['/internal/restore-backup', '/vps/backup/import']
+]) {
+  const parser = route === '/internal/restore-backup'
+    ? express.text({ limit: '50mb', type: () => true })
+    : express.json({ limit: '2mb' });
+  app.post(route, (req, res, next) => {
+    return authorizeAndRun(req, res, (db) => {
+      db.close();
+      // Authenticate before accepting a large body; never parse the private-key JSON here.
+      return parser(req, res, (error) => {
+        if (error) return next(error);
+        postCoreApi(endpoint, req.body || {}, 600000).then((result) => {
+          res.set('Cache-Control', 'no-store');
+          if (!result.ok || result.core_response?.meta?.code >= 400) {
+            const message = result.statusCode === 404
+              ? 'Update AutoSC pada VPS ini untuk memakai backup/restore lengkap.'
+              : String(result.core_response?.message || result.message || 'Backup/restore lengkap gagal pada API AutoSC.').slice(0, 300);
+            return res.status(result.statusCode === 404 ? 409 : (result.statusCode >= 400 ? result.statusCode : 500)).json({ ok: false, message });
+          }
+          return res.json({ ok: true, ...(result.core_response?.data || {}) });
+        }).catch(() => res.status(500).json({ ok: false, message: 'Backup/restore lengkap gagal.' }));
+      });
+    });
+  });
+}
 
 app.get('/internal/export-accounts', (req, res) => {
   const type = String(req.query.type || '').trim();

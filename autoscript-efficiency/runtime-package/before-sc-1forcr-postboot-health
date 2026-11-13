@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+LOCK_FILE="/run/sc-1forcr-postboot-health.lock"
+ACCESS_LOCK_FILE="/etc/sc-1forcr-access.lock"
+HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
+REPAIR_STAMP_DIR="/run/sc-1forcr-health"
+REPAIR_COOLDOWN_SECONDS="$(sed -n 's/^SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES=//p' /etc/sc-1forcr.env 2>/dev/null | tail -n1 | tr -cd '0-9')"
+[[ -z "${REPAIR_COOLDOWN_SECONDS}" ]] && REPAIR_COOLDOWN_SECONDS="15"
+REPAIR_COOLDOWN_SECONDS="$(( REPAIR_COOLDOWN_SECONDS * 60 ))"
+declare -a repaired_units=()
+failed=0
+
+mkdir -p /run >/dev/null 2>&1 || true
+exec 9>"${LOCK_FILE}"
+flock -n 9 || exit 0
+
+log_health() {
+  logger -t sc-1forcr-postboot -- "$*" 2>/dev/null || true
+}
+
+unit_managed() {
+  local unit="$1"
+  systemctl is-active --quiet "${unit}" 2>/dev/null || \
+    systemctl is-enabled --quiet "${unit}" 2>/dev/null
+}
+
+listener_present() {
+  local port="$1"
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  ss -H -lnt 2>/dev/null | awk -v want="${port}" '
+    {
+      address=$4;
+      sub(/^.*:/, "", address);
+      if (address == want) found=1;
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+unit_healthy() {
+  local unit="$1"
+  shift
+  systemctl is-active --quiet "${unit}" 2>/dev/null || return 1
+  local port
+  for port in "$@"; do
+    listener_present "${port}" || return 1
+  done
+  return 0
+}
+
+config_valid_for_unit() {
+  local unit="$1"
+  case "${unit}" in
+    nginx.service)
+      nginx -t >/dev/null 2>&1
+      ;;
+    haproxy.service)
+      haproxy -c -f "${HAPROXY_CONFIG}" >/dev/null 2>&1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+# Watchdog jalan berkala, jadi unit yang rusak permanen tidak boleh
+# di-restart tiap siklus (boros CPU/RAM di VPS kecil dan bisa menutupi
+# crash loop). Simpan stempel waktu restart terakhir di /run (tmpfs).
+repair_cooldown_active() {
+  local unit="$1" stamp_file last now
+  [[ "${REPAIR_COOLDOWN_SECONDS}" -gt 0 ]] || return 1
+  stamp_file="${REPAIR_STAMP_DIR}/${unit//\//_}"
+  [[ -f "${stamp_file}" ]] || return 1
+  last="$(cat "${stamp_file}" 2>/dev/null | tr -cd '0-9')"
+  [[ "${last}" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  (( now - last < REPAIR_COOLDOWN_SECONDS ))
+}
+
+mark_repair_attempt() {
+  local unit="$1"
+  mkdir -p "${REPAIR_STAMP_DIR}" >/dev/null 2>&1 || return 0
+  date +%s > "${REPAIR_STAMP_DIR}/${unit//\//_}" 2>/dev/null || true
+}
+
+repair_unit_if_needed() {
+  local unit="$1"
+  shift
+  unit_managed "${unit}" || return 0
+  unit_healthy "${unit}" "$@" && return 0
+
+  # Konfirmasi sekali lagi agar listener yang baru start tidak dianggap gagal.
+  sleep 3
+  unit_healthy "${unit}" "$@" && return 0
+  if repair_cooldown_active "${unit}"; then
+    log_health "SKIP ${unit}: masih dalam cooldown restart watchdog"
+    failed=1
+    return 1
+  fi
+  if ! config_valid_for_unit "${unit}"; then
+    log_health "SKIP ${unit}: konfigurasi tidak valid"
+    failed=1
+    return 1
+  fi
+  mark_repair_attempt "${unit}"
+  if ! systemctl restart "${unit}" >/dev/null 2>&1; then
+    log_health "GAGAL restart ${unit}"
+    failed=1
+    return 1
+  fi
+
+  local attempt
+  for attempt in {1..10}; do
+    sleep 2
+    if unit_healthy "${unit}" "$@"; then
+      repaired_units+=("${unit}")
+      return 0
+    fi
+  done
+  log_health "GAGAL sehat setelah restart: ${unit}"
+  failed=1
+  return 1
+}
+
+if [[ -f "${ACCESS_LOCK_FILE}" ]]; then
+  log_health "Pemeriksaan dilewati: akses SC sedang dikunci"
+  exit 0
+fi
+
+# Self-heal rule ACCEPT service inti agar selalu berada di puncak chain INPUT.
+# Tanpa ini, rule lama (connlimit/hashlimit) bisa diam-diam memblokir port SSH/WS.
+if command -v iptables >/dev/null 2>&1; then
+  iptables -w 10 -C INPUT -i lo -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -i lo -j ACCEPT >/dev/null 2>&1 || true
+  iptables -w 10 -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || true
+  iptables -w 10 -C INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || \
+    iptables -w 10 -I INPUT -p tcp -m multiport --dports 80,443,109,143 -j ACCEPT >/dev/null 2>&1 || true
+fi
+
+# Pembatas trafik tunnel (layanan lokal/privat/metadata dan port penyalahgunaan)
+# dan batas brute force sshd: dipasang ulang kalau hilang. Dijalankan sebelum
+# gerbang ON/OFF supaya gerbang tetap menjadi aturan pertama.
+if [[ -x /usr/local/sbin/sc-1forcr-tunnel-guard ]]; then
+  /usr/local/sbin/sc-1forcr-tunnel-guard apply >/dev/null 2>&1 || \
+    log_health "GAGAL menerapkan pembatas trafik tunnel"
+fi
+
+# Rapikan ACCEPT berulang dari restart backend UDP, tanpa mengubah urutan gate.
+if [[ -x /usr/local/sbin/sc-1forcr-udp-firewall ]]; then
+  /usr/local/sbin/sc-1forcr-udp-firewall cleanup >/dev/null 2>&1 || true
+fi
+
+# SlowDNS: aturan UDP 53 -> dnstt dipasang ulang kalau hilang atau tergeser
+# DNAT 1:65535 milik UDP Custom. Sebelum gerbang ON/OFF, karena aturan INPUT-nya
+# disisipkan di puncak chain. SlowDNS mati (default) = tidak menyentuh iptables.
+if [[ -x /usr/local/sbin/sc-1forcr-slowdns ]]; then
+  /usr/local/sbin/sc-1forcr-slowdns apply >/dev/null 2>&1 || \
+    log_health "GAGAL menerapkan aturan SlowDNS"
+fi
+
+# Layanan yang dimatikan lewat menu ON/OFF LAYANAN: gerbang iptables-nya
+# dipasang ulang kalau hilang (reboot tanpa netfilter-persistent) atau
+# tergeser dari puncak chain oleh rule ACCEPT di atas. Semua ON = no-op.
+if [[ -x /usr/local/sbin/sc-1forcr-service-gate ]]; then
+  /usr/local/sbin/sc-1forcr-service-gate apply >/dev/null 2>&1 || \
+    log_health "GAGAL menerapkan status ON/OFF layanan"
+fi
+
+# Port TLS/NTLS tambahan: pasang ulang aturan REDIRECT kalau hilang, dan lepas
+# port yang belakangan dipakai program lain. Tidak menulis apa pun kalau sama.
+if [[ -x /usr/local/sbin/sc-1forcr-extra-ports ]]; then
+  /usr/local/sbin/sc-1forcr-extra-ports apply >/dev/null 2>&1 || \
+    log_health "GAGAL menerapkan port TLS/NTLS tambahan"
+fi
+
+# Dependensi diperiksa lebih dulu. Unit yang sudah aktif dan listen tidak disentuh.
+repair_unit_if_needed ssh.service || true
+repair_unit_if_needed dropbear.service || true
+repair_unit_if_needed xray.service || true
+repair_unit_if_needed sc-1forcr-api.service || true
+# Hanya kalau SlowDNS diaktifkan (unit enabled); port-nya UDP, jadi cukup status.
+repair_unit_if_needed sc-1forcr-slowdns.service || true
+
+declare -a nginx_ports=()
+declare -a sshws_ports=()
+if [[ -r "${HAPROXY_CONFIG}" ]]; then
+  mapfile -t nginx_ports < <(awk '
+    $1 == "server" && ($2 == "nginx_local" || $2 == "nginx_grpc") {
+      n=split($3, address, ":"); port=address[n];
+      if (port ~ /^[0-9]+$/ && !seen[port]++) print port;
+    }
+  ' "${HAPROXY_CONFIG}")
+  mapfile -t sshws_ports < <(awk '
+    $1 == "server" && $2 == "sshws_local" {
+      n=split($3, address, ":"); port=address[n];
+      if (port ~ /^[0-9]+$/ && !seen[port]++) print port;
+    }
+  ' "${HAPROXY_CONFIG}")
+fi
+
+repair_unit_if_needed sc-1forcr-sshws.service "${sshws_ports[@]}" || true
+repair_unit_if_needed nginx.service "${nginx_ports[@]}" || true
+repair_unit_if_needed haproxy.service 443 || true
+
+if [[ "${failed}" == "1" ]]; then
+  log_health "Health-check selesai dengan kegagalan; cek systemctl dan journal"
+  exit 1
+fi
+if (( ${#repaired_units[@]} > 0 )); then
+  log_health "Pulih otomatis: ${repaired_units[*]}"
+else
+  log_health "Semua layanan inti sehat; tidak ada restart"
+fi

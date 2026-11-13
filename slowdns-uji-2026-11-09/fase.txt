@@ -1,0 +1,19 @@
+A1_idle mulai 1794222984
+A1_idle selesai 1794223158
+A2_download mulai 1794223266
+A2_download selesai 1794223336
+A3_upload mulai 1794223425
+A3_upload selesai 1794223500
+A4_speedtest mulai 1794223542
+A4_speedtest selesai 1794223626  app: dl=5.3Mbps ul=15Mbps ping_idle=52ms ping_loaded=246ms
+RESTART_B 1794223690
+B1_idle mulai 1794223850
+B1_idle selesai 1794223934
+B2_download mulai 1794223971
+B2_download selesai 1794224051
+B3_upload mulai 1794224166
+B3_upload selesai 1794224234
+B4_speedtest mulai 1794224255
+B4_speedtest selesai 1794224322  app: dl=4.1Mbps ul=120Mbps(?) ping_idle=49ms ping_loaded=442ms
+PULIHKAN mulai 1794224536
+RESTART_PULIH 1794224574

@@ -1,0 +1,12 @@
+{
+  "checked_at": "2026-11-07T19:17:41.111583+00:00",
+  "production_applied": false,
+  "preflight": "4 live files match base",
+  "runtime_tests": {
+    "passed": 6,
+    "elapsed_seconds": 109.927
+  },
+  "execution_attempt": "rejected before command execution",
+  "reason": "Managed approval policy disables sandbox_approval; escalated execution rejected",
+  "command": "python3 /root/autoscript-efficiency/apply-runtime.py --apply"
+}

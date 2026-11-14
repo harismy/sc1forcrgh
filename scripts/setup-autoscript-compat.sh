@@ -213,7 +213,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.132}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.133}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -9143,6 +9143,7 @@ function sz(n){n=Number(n)||0;if(n<1024)return n+' B';if(n<1048576)return (n/102
 function dt(s){try{return new Date(Number(s)*1000).toLocaleString('id-ID')}catch(e){return '-'}}
 function api(path,opt){opt=opt||{};opt.headers=Object.assign({'Authorization':'Bearer '+tok()},opt.headers||{});return fetch(path,opt)}
 function unwrap(j){var c=j&&j.meta?Number(j.meta.code):0;if(c!==200)throw new Error((j&&(j.message||(j.meta&&j.meta.message)))||'gagal');return j.data}
+function restoreLines(d){var l=d&&d.summary&&d.summary.lines;return (l&&l.length)?'\\n'+l.join('\\n'):''}
 function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function loadList(){
   if(!tok())return say('Isi API token dulu.',1);
@@ -9187,7 +9188,7 @@ function rs(name){
   api('/vps/backup/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file:name})})
   .then(function(r){return r.json()}).then(function(j){
     var d=unwrap(j);
-    say('Restore selesai dari '+name+'.')
+    say('Restore selesai dari '+name+'.'+restoreLines(d))
   }).catch(function(e){say('Restore gagal: '+e.message,1)})
 }
 function upRestore(){
@@ -9203,7 +9204,7 @@ function upRestore(){
     api('/vps/backup/restore',{method:'POST',headers:{'Content-Type':'text/plain'},body:fr.result})
     .then(function(r){return r.json()}).then(function(j){
       var d=unwrap(j);
-      say('Restore selesai dari file unggahan.');loadList()
+      say('Restore selesai dari file unggahan.'+restoreLines(d));loadList()
     }).catch(function(e){say('Restore gagal: '+e.message,1)})
   };
   fr.onerror=function(){say('Gagal membaca file.',1)};
@@ -9267,6 +9268,7 @@ async function restoreAccountBackup(req, res) {
   const body = req.body;
   let target = '';
   let tempFile = '';
+  let summaryFile = '';
   let source = 'upload';
   try {
     if (body && typeof body === 'object' && body.file) {
@@ -9285,14 +9287,36 @@ async function restoreAccountBackup(req, res) {
     } else {
       return fail(res, 400, 'kirim JSON {file:"nama.json"} atau isi file backup sebagai teks');
     }
-    await runScriptAsync('/usr/local/sbin/sc-1forcr-restore-backup', [target], 600000);
-    return ok(res, { restored: true, source });
+    summaryFile = require('path').join(require('os').tmpdir(), `sc1forcr-restore-summary-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.json`);
+    await runScriptAsync('/usr/local/sbin/sc-1forcr-restore-backup', [target, summaryFile], 600000);
+    return ok(res, { restored: true, source, summary: readRestoreSummary(summaryFile) });
   } catch (e) {
     return fail(res, 500, `restore gagal: ${e.message}`);
   } finally {
     if (tempFile) {
       try { fs.unlinkSync(tempFile); } catch (_) {}
     }
+    if (summaryFile) {
+      try { fs.unlinkSync(summaryFile); } catch (_) {}
+    }
+  }
+}
+
+// Ringkasan hasil restore dari skrip (jumlah akun, domain, pubkey SlowDNS).
+// Skrip versi lama tidak menulis file ini: hasilnya null, restore tetap sukses.
+function readRestoreSummary(file) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const lines = Array.isArray(parsed?.lines)
+      ? parsed.lines.map((line) => String(line || '').slice(0, 300)).filter(Boolean).slice(0, 20)
+      : [];
+    return {
+      lines,
+      identity: parsed?.identity === true,
+      slowdns_pubkey: /^[0-9a-f]{64}$/.test(String(parsed?.slowdns_pubkey || '')) ? String(parsed.slowdns_pubkey) : ''
+    };
+  } catch (_) {
+    return null;
   }
 }
 app.post('/vps/backup/restore', restoreBodyParser, restoreAccountBackup);
@@ -19302,8 +19326,11 @@ exec 9>/run/sc-1forcr-account-restore.lock
 flock -n 9 || { echo "Restore lain masih berjalan."; exit 1; }
 
 backup_file="${1:-}"
+# Opsional: API menulis ringkasan hasil restore (JSON) ke file ini supaya web
+# dan bot bisa menampilkan apa yang benar-benar dipulihkan.
+summary_file="${2:-}"
 if [[ -z "${backup_file}" || ! -f "${backup_file}" ]]; then
-  echo "Usage: sc-1forcr-restore-backup /path/backup.json"
+  echo "Usage: sc-1forcr-restore-backup /path/backup.json [ringkasan.json]"
   exit 1
 fi
 
@@ -19638,7 +19665,7 @@ EOF_TIMER
   fi
 }
 
-python3 - "${backup_file}" "${DB_PATH}" <<'PY'
+python3 - "${backup_file}" "${DB_PATH}" "${summary_file}" <<'PY'
 import json
 import sqlite3
 import sys
@@ -19647,6 +19674,7 @@ import shlex
 
 backup_path = sys.argv[1]
 db_path = sys.argv[2]
+summary_path = sys.argv[3] if len(sys.argv) > 3 else ""
 
 with open(backup_path, "r", encoding="utf-8") as f:
     root = json.load(f)
@@ -20083,6 +20111,17 @@ try:
         ssh_runtime.append(dict(zip(("username", "password", "date_exp", "status"), values)))
     # DB rows alone do not create SSH/Dropbear login users on a fresh VPS.
     undo_ssh = state.sync_ssh(ssh_runtime, previous_ssh_users)
+    # Status akhir per akun (setelah expired dan kunci kuota diterapkan).
+    account_counts = {}
+    for kind, table in (("ssh", "account_sshs"), ("vmess", "account_vmesses"),
+                        ("vless", "account_vlesses"), ("trojan", "account_trojans")):
+        names = [row["username"] for row in data.get(kind) or [] if row.get("username")]
+        active = 0
+        for name in names:
+            got = cur.execute(f"SELECT status FROM {table} WHERE username=?", (name,)).fetchone()
+            if got and str(got[0] or "").strip().upper() == "AKTIF":
+                active += 1
+        account_counts[kind] = (len(names), active)
     conn.commit()
 except Exception:
     conn.rollback()
@@ -20096,6 +20135,43 @@ finally:
     conn.close()
 if restored_settings:
     print(f"Runtime settings restored: {restored_settings}", file=sys.stderr)
+
+# Ringkasan untuk menu, web, dan bot. Pubkey SlowDNS memang publik (dibagikan
+# ke pengguna); private key tidak pernah ditulis di sini.
+labels = {"ssh": "SSH/UDP", "vmess": "VMESS", "vless": "VLESS", "trojan": "TROJAN"}
+summary_lines = []
+for kind in ("ssh", "vmess", "vless", "trojan"):
+    total, active = account_counts.get(kind, (0, 0))
+    if total:
+        summary_lines.append(f"{labels[kind]}: {total} akun (aktif {active})")
+restored_pubkey = ""
+if not isinstance(data.get("identity"), dict):
+    summary_lines.append("Domain & kunci SlowDNS: TIDAK ada di file backup ini (backup format lama), jadi milik VPS ini tidak diubah.")
+else:
+    restored_domain = identity.updates.get("DOMAIN", "")
+    summary_lines.append("Domain: " + (restored_domain or "tidak ada di backup, tidak diubah"))
+    if identity.slowdns is None:
+        summary_lines.append("Kunci SlowDNS: tidak ada di backup, kunci VPS ini tidak diubah.")
+    else:
+        restored_pubkey = (identity.files.get(state.KEY_DIR + "/server.pub") or ("",))[0].strip()
+        if restored_pubkey:
+            summary_lines.append("Kunci SlowDNS: dipulihkan dari backup. Pubkey: " + restored_pubkey)
+        else:
+            summary_lines.append("Kunci SlowDNS: backup tidak berisi kunci, kunci VPS ini tidak diubah.")
+        summary_lines.append("SlowDNS: " + ("aktif" if identity.slowdns.get("enabled") else "nonaktif") + " (mengikuti backup)")
+summary = {
+    "lines": summary_lines,
+    "identity": isinstance(data.get("identity"), dict),
+    "slowdns_pubkey": restored_pubkey,
+}
+for line in summary_lines:
+    print(line)
+if summary_path:
+    try:
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False)
+    except Exception:
+        pass
 PY
 
 chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
@@ -22114,7 +22190,7 @@ main_pull_update() {
     ack_update "${base_url}" "${version}" "success" "update selesai; rollback=${rollback_snapshot:-tidak-ada}" "${vps_ip}"
     log_msg "Update trigger ${version} selesai."
   else
-    msg="$(tail -c 1400 /var/log/sc-1forcr-pull-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
+    msg="$(tail -c 1000 /var/log/sc-1forcr-pull-update.log 2>/dev/null | tr '\n' ' ')"
     ack_update "${base_url}" "${version}" "failed" "${msg:-update gagal}" "${vps_ip}"
     log_msg "Update trigger ${version} gagal."
     exit 1
@@ -22345,7 +22421,7 @@ main_pull_summary_update() {
     ack_summary_update "${base_url}" "${version}" "success" "summary update selesai" "${vps_ip}"
     log_msg "Update Summary API trigger ${version} selesai."
   else
-    msg="$(tail -c 1400 /var/log/sc-1forcr-pull-summary-update.log 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
+    msg="$(tail -c 1000 /var/log/sc-1forcr-pull-summary-update.log 2>/dev/null | tr '\n' ' ')"
     ack_summary_update "${base_url}" "${version}" "failed" "${msg:-summary update gagal}" "${vps_ip}"
     log_msg "Update Summary API trigger ${version} gagal."
     exit 1
@@ -22452,6 +22528,17 @@ clear_attempt() {
   rm -f "${ATTEMPT_CAMPAIGN_FILE}" "${ATTEMPT_AT_FILE}" >/dev/null 2>&1 || true
 }
 
+# Build Summary API yang sedang menjawab port-nya ("summary-<16 hex>").
+# Kosong kalau tidak menjawab atau versi lama yang belum melaporkan build.
+summary_running_build() {
+  local port body
+  port="$(awk -F= '$1 == "SUMMARY_PORT" {gsub(/[[:space:]\r]/, "", $2); print $2; exit}' /root/tunnel-sync/.env 2>/dev/null || true)"
+  port="$(printf '%s' "${port}" | tr -cd '0-9')"
+  [[ -n "${port}" && "${port}" -ge 1 && "${port}" -le 65535 ]] || port="8789"
+  body="$(curl -fsS --connect-timeout 3 --max-time 8 "http://127.0.0.1:${port}/health" 2>/dev/null || true)"
+  printf '%s' "${body}" | jq -r '.build // empty' 2>/dev/null | grep -E '^summary-[0-9a-f]{16}$' || true
+}
+
 ack_god_update() {
   local preferred_base="$1" campaign="$2" status="$3" message="$4" vps_ip="$5"
   local payload candidate license_url base candidates
@@ -22486,7 +22573,7 @@ main_god_update() {
 
   local vps_ip payload resp base_url license_url candidates ok mandatory campaign components note
   local script_url script_urls script_version summary_url summary_urls summary_version
-  local script_done summary_done failure_message
+  local script_done summary_done failure_message summary_running
   vps_ip="$(detect_public_ipv4_god)"
   payload="{\"script_version\":$(json_escape "${SCRIPT_VERSION:-}"),\"ip\":$(json_escape "${vps_ip}")}"
   resp=""
@@ -22543,7 +22630,7 @@ main_god_update() {
          /usr/local/sbin/menu-sc-1forcr update >>"${LOG_FILE}" 2>&1; then
         touch "${script_done}"
       else
-        failure_message="$(tail -c 1400 "${LOG_FILE}" 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
+        failure_message="$(tail -c 1000 "${LOG_FILE}" 2>/dev/null | tr '\n' ' ')"
         ack_god_update "${base_url}" "${campaign}" failed "script gagal: ${failure_message:-unknown}" "${vps_ip}" || true
         exit 1
       fi
@@ -22555,16 +22642,26 @@ main_god_update() {
       if SUMMARY_UPDATE_SAFE_MODE=1 SUMMARY_API_SETUP_URL="${summary_url}" \
          SUMMARY_API_SETUP_URLS="${summary_urls}" \
          /usr/local/sbin/menu-sc-1forcr update-summary >>"${LOG_FILE}" 2>&1; then
+        # Installer selesai belum tentu berarti versi baru yang menjawab port.
+        # Bandingkan build yang jalan dengan versi campaign dari bot.
+        summary_running="$(summary_running_build)"
+        if [[ "${summary_version}" =~ ^summary-[0-9a-f]{16}$ && "${summary_running}" != "${summary_version}" ]]; then
+          ack_god_update "${base_url}" "${campaign}" failed "summary gagal: Summary API yang menjawab port ${summary_running:-tidak melaporkan build (versi lama/tidak menjawab)}, seharusnya ${summary_version}." "${vps_ip}" || true
+          exit 1
+        fi
         touch "${summary_done}"
       else
-        failure_message="$(tail -c 1400 "${LOG_FILE}" 2>/dev/null | tr '\n' ' ' | cut -c1-1000)"
+        failure_message="$(tail -c 1000 "${LOG_FILE}" 2>/dev/null | tr '\n' ' ')"
         ack_god_update "${base_url}" "${campaign}" failed "summary gagal: ${failure_message:-unknown}" "${vps_ip}" || true
         exit 1
       fi
     fi
   fi
 
-  if ! ack_god_update "${base_url}" "${campaign}" success "God Mode selesai: ${components}; script=${script_version:-skip}; summary=${summary_version:-skip}" "${vps_ip}"; then
+  if [[ "${components}" == "summary" || "${components}" == "both" ]]; then
+    summary_running="$(summary_running_build)"
+  fi
+  if ! ack_god_update "${base_url}" "${campaign}" success "God Mode selesai: ${components}; script=${script_version:-skip}; summary=${summary_version:-skip}; summary_jalan=${summary_running:-skip}" "${vps_ip}"; then
     log_msg "Komponen God Mode ${campaign} selesai, tetapi ACK belum terkirim; akan dicoba lagi."
     exit 1
   fi
@@ -31622,6 +31719,12 @@ XRAY_PATHS_TROJAN="$(normalize_xray_paths_csv "${XRAY_PATHS_TROJAN:-/trojan}" "/
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
+  # Semua aksi akun lewat API memakai curl. Pernah terjadi curl hilang dari
+  # VPS dan menu hanya menampilkan "curl: command not found".
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Gagal: curl tidak terpasang di VPS ini. Pasang dulu: apt-get install -y curl" >&2
+    return 127
+  fi
   if [[ -n "${data}" ]]; then
     curl -sS -X "${method}" "${API_BASE}${path}" \
       -H "Authorization: ${AUTH_TOKEN}" \

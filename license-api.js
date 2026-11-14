@@ -902,7 +902,13 @@ async function recordGodUpdateAck(ip, version, status, message) {
   const safeVersion = String(version || '').trim().slice(0, 80);
   const rawStatus = String(status || '').trim().toLowerCase();
   const safeStatus = ['running', 'success', 'failed'].includes(rawStatus) ? rawStatus : '';
-  const safeMessage = String(message || '').replace(/\s+/g, ' ').trim().slice(0, 700);
+  // Pesan gagal berisi ujung log VPS dan sebabnya ada di bagian paling akhir.
+  // Kalau terlalu panjang, simpan awalan ("script gagal:"/"summary gagal:")
+  // dan ujungnya, bukan 700 huruf pertama yang membuang sebab itu.
+  const cleanMessage = String(message || '').replace(/\s+/g, ' ').trim();
+  const safeMessage = cleanMessage.length <= 700
+    ? cleanMessage
+    : `${cleanMessage.slice(0, 40)} ... ${cleanMessage.slice(-650)}`;
   if (!safeIp || !safeVersion || !safeStatus) return { ok: false, message: 'ip/version/status invalid' };
   const campaign = await dbGet(
     "SELECT version FROM god_update_campaigns WHERE version=? AND status IN ('scheduled','active') LIMIT 1",

@@ -33,6 +33,7 @@ function engine(mode, root, input, output) {
     const child = spawn(python, [pyTest, 'engine', mode, root, input || '-', output || '-'], { stdio: ['ignore', 'pipe', 'pipe'] });
     let err = '';
     child.stderr.on('data', (data) => { err += data; });
+    child.stdout.on('data', () => {}); // Ringkasan restore dicetak ke stdout; jangan biarkan pipe penuh.
     child.on('error', reject);
     child.on('close', (code) => code === 0 ? resolve('') : reject(new Error(err || 'engine failed')));
   });
@@ -119,7 +120,7 @@ async function core(root) {
     fail: (res, code, message) => res.status(code).json({ meta: { code }, message }),
     backupFileFullPath: (name) => /^[a-z0-9._-]+\.json$/i.test(name) ? path.join(root, name) : '',
     runScriptAsync: (cmd, args) => cmd.endsWith('auto-backup')
-      ? engine('export', root, '-', args[1]) : engine('import', root, args[0]),
+      ? engine('export', root, '-', args[1]) : engine('import', root, args[0], args[1]),
   };
   vm.createContext(context);
   vm.runInContext(extract(installer, 'function restoreBodyParser(req, res, next) {', '\n\nconst BACKUP_WEB_PAGE'), context);
@@ -194,6 +195,11 @@ async function main() {
     const restoreBot = (...args) => restoreFn(...args, async () => {});
     await restoreBot(ctx, { host: 'destination', key: 'server-token' }, backup, backup.data, true, apiPost, userState, () => ({}));
     assert(replies.some((r) => r.startsWith('Restore lengkap selesai.')));
+    // Bot menyebut pubkey yang dipulihkan, jadi pubkey lama tidak lolos diam-diam.
+    const restoreReply = replies.find((r) => r.startsWith('Restore lengkap selesai.'));
+    assert(restoreReply.includes(`Kunci SlowDNS: dipulihkan dari backup. Pubkey: ${backup.data.identity.slowdns.public_key}`), restoreReply);
+    assert(restoreReply.includes('SSH/UDP: 1 akun (aktif 1)'), restoreReply);
+    assert(restoreReply.includes('Domain: old.example.com'), restoreReply);
     assert.strictEqual(fs.readFileSync(path.join(destination, 'etc/sc-1forcr/slowdns/server.pub'), 'utf8').trim(), backup.data.identity.slowdns.public_key);
     assertNotificationRestored(destination, sourceNotifyToken, sourceNotifyChat);
     assert.strictEqual(fs.readFileSync(path.join(destination, 'etc/sc-1forcr/banner.html'), 'utf8'), sourceBannerHtml);
@@ -209,7 +215,13 @@ async function main() {
     backup.data.banner_html = '<p>' + 'a'.repeat(2 * 1024 * 1024) + '</p>';
     backup.data.banner_txt = 'Web restore text banner';
     const web = await fetch(`${coreDest.url}/vps/backup/restore`, { method: 'POST', headers: { authorization: 'target-token', 'content-type': 'text/plain' }, body: JSON.stringify(backup) });
-    assert.strictEqual(web.status, 200, await web.text());
+    const webText = await web.text();
+    assert.strictEqual(web.status, 200, webText);
+    const webSummary = JSON.parse(webText).data.summary;
+    assert.strictEqual(webSummary.slowdns_pubkey, backup.data.identity.slowdns.public_key);
+    assert.strictEqual(webSummary.identity, true);
+    assert(webSummary.lines.some((line) => line.startsWith('Kunci SlowDNS: dipulihkan')));
+    assert(!webText.includes(backup.data.identity.slowdns.private_key), 'private key tidak boleh ikut di respons');
     const db = new DatabaseSync(path.join(destination, 'accounts.db'));
     assert.strictEqual(db.prepare("SELECT status FROM account_sshs WHERE username='e2euser'").get().status, 'AKTIF');
     db.close();
@@ -237,7 +249,11 @@ async function main() {
     const bannerConfigs = ['etc/ssh/sshd_config', 'etc/default/dropbear', 'etc/systemd/system/dropbear.service.d/override.conf'];
     const beforeLegacy = bannerConfigs.map((file) => fs.readFileSync(path.join(destination, file), 'utf8'));
     const legacy = { meta: { format: 'sc1forcr-accounts-backup-v2' }, data: { ssh: backup.data.ssh, settings: { ONLINE_NOTIFY_INTERVAL_HOURS: '4' } } };
-    await post(`${destBridge.url}/internal/restore-backup`, legacy);
+    const legacyResult = await post(`${destBridge.url}/internal/restore-backup`, legacy);
+    // Backup format lama tidak membawa kunci: ringkasan wajib bilang begitu.
+    assert(legacyResult.summary.lines.some((line) => line.includes('TIDAK ada di file backup ini')), JSON.stringify(legacyResult.summary));
+    assert.strictEqual(legacyResult.summary.identity, false);
+    assert.strictEqual(legacyResult.summary.slowdns_pubkey, '');
     assertNotificationRestored(destination, sourceNotifyToken, sourceNotifyChat);
     assert.strictEqual(fs.readFileSync(path.join(destination, 'etc/sc-1forcr/banner.html'), 'utf8'), '<p>Keep current banner</p>');
     assert.strictEqual(fs.readFileSync(path.join(destination, 'etc/sc-1forcr/banner.txt'), 'utf8'), 'Keep current text banner');

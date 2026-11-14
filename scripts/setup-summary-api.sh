@@ -9,6 +9,27 @@ POTATO_DB="${POTATO_DB:-/usr/sbin/potatonc/potato.db}"
 SSH_TUNNEL_SHELL="${SSH_TUNNEL_SHELL:-/usr/local/sbin/sc-1forcr-tunnel-shell}"
 SUMMARY_UPDATE_SAFE_MODE="${SUMMARY_UPDATE_SAFE_MODE:-1}"
 
+# Build id = "summary-" + 16 hex pertama sha256 file installer ini. Rumusnya
+# sama dengan summary_version di license-api.js (file yang sama, LF), jadi bot
+# dan God Mode bisa memastikan Summary API yang benar-benar menjawab port
+# sudah versi terbaru. Dijalankan lewat pipe (tanpa file) = "unknown".
+summary_build_id() {
+  local self="${BASH_SOURCE[0]:-}" digest=""
+  if [[ -n "${self}" && -f "${self}" && -r "${self}" ]]; then
+    digest="$(sha256sum "${self}" 2>/dev/null | awk '{print $1}')" || digest=""
+  fi
+  if [[ "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'summary-%s\n' "${digest:0:16}"
+  else
+    printf 'unknown\n'
+  fi
+}
+SUMMARY_BUILD_ID="$(summary_build_id)"
+# Langkah yang sedang jalan dan sebab gagalnya, dicetak sebagai baris
+# terakhir saat installer gagal (dibaca God Mode dari ujung log).
+SUMMARY_STEP="persiapan"
+SUMMARY_FAIL_DETAIL=""
+
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Please run as root (or use sudo)."
   exit 1
@@ -274,6 +295,10 @@ app.use((req, res, next) => {
 });
 const PORT = Number(process.env.SUMMARY_PORT || 8789);
 const HOST = String(process.env.SUMMARY_HOST || '0.0.0.0').trim() || '0.0.0.0';
+// Diisi unit systemd dari installer; dilaporkan /health untuk cek versi.
+const SUMMARY_BUILD_ID = /^summary-[0-9a-f]{16}$/.test(String(process.env.SUMMARY_BUILD_ID || '').trim())
+  ? String(process.env.SUMMARY_BUILD_ID).trim()
+  : 'unknown';
 const DB = process.env.POTATO_DB || '/usr/sbin/potatonc/potato.db';
 const DEFAULT_TUNNEL_SHELL = '/usr/local/sbin/sc-1forcr-tunnel-shell';
 const SSH_TUNNEL_SHELL = String(process.env.SSH_TUNNEL_SHELL || DEFAULT_TUNNEL_SHELL).trim() || DEFAULT_TUNNEL_SHELL;
@@ -2819,7 +2844,7 @@ function authorizeAndRun(req, res, runHandler) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'tunnel-summary', useDbAuth: USE_DB_AUTH });
+  res.json({ ok: true, service: 'tunnel-summary', useDbAuth: USE_DB_AUTH, build: SUMMARY_BUILD_ID });
 });
 
 app.get('/internal/account-summary', (req, res) => {
@@ -3211,6 +3236,7 @@ install_dependencies() {
     >/tmp/sc-1forcr-summary-build-deps.log 2>&1; then
     log "Install paket build Summary API gagal. Cek log: /tmp/sc-1forcr-summary-build-deps.log"
     tail -n 80 /tmp/sc-1forcr-summary-build-deps.log || true
+    SUMMARY_FAIL_DETAIL="apt-get install paket build gagal ($(tail -n 1 /tmp/sc-1forcr-summary-build-deps.log 2>/dev/null | cut -c1-160 || true))"
     exit 1
   fi
 
@@ -3240,6 +3266,7 @@ install_dependencies() {
     if ! npm install express dotenv sqlite3@5.1.7 --omit=dev --foreground-scripts >/tmp/sc-1forcr-summary-npm-install.log 2>&1; then
       log "Install npm dependency Summary API gagal. Cek log: /tmp/sc-1forcr-summary-npm-install.log"
       tail -n 80 /tmp/sc-1forcr-summary-npm-install.log || true
+      SUMMARY_FAIL_DETAIL="npm install express/dotenv/sqlite3 gagal"
       exit 1
     fi
   fi
@@ -3249,6 +3276,7 @@ install_dependencies() {
     if ! npm rebuild sqlite3 --build-from-source --foreground-scripts >/tmp/sc-1forcr-summary-npm-rebuild.log 2>&1; then
       log "Rebuild sqlite3 Summary API gagal. Cek log: /tmp/sc-1forcr-summary-npm-rebuild.log"
       tail -n 80 /tmp/sc-1forcr-summary-npm-rebuild.log || true
+      SUMMARY_FAIL_DETAIL="rebuild sqlite3 gagal"
       exit 1
     fi
   fi
@@ -3256,6 +3284,7 @@ install_dependencies() {
   if ! node -e "${node_deps_check}" >/tmp/sc-1forcr-summary-node-check.log 2>&1; then
     log "Dependency Summary API masih gagal setelah rebuild. Cek log: /tmp/sc-1forcr-summary-node-check.log"
     cat /tmp/sc-1forcr-summary-node-check.log || true
+    SUMMARY_FAIL_DETAIL="modul sqlite3/express tetap tidak bisa dimuat setelah rebuild"
     exit 1
   fi
 
@@ -3288,17 +3317,32 @@ open_summary_firewall() {
   fi
 }
 
+# Sehat = service aktif DAN /health melaporkan build installer ini. Tanpa cek
+# build, proses lain yang masih memegang port (Summary API lama dari PM2/nohup)
+# ikut lolos health-check, update dianggap berhasil, padahal yang menjawab
+# masih kode lama.
 summary_health_check() {
-  local attempt port
+  local attempt port body want holder
   port="$(echo "${SUMMARY_PORT:-8789}" | tr -cd '0-9')"
   [[ -z "${port}" || "${port}" -lt 1 || "${port}" -gt 65535 ]] && port="8789"
+  want="${SUMMARY_BUILD_ID:-unknown}"
   for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    body=""
     if systemctl is-active --quiet sc-1forcr-summary-api.service && \
-       curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
-      return 0
+       body="$(curl -fsS --connect-timeout 2 --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null)"; then
+      if [[ "${want}" == "unknown" || "${body}" == *"\"build\":\"${want}\""* ]]; then
+        return 0
+      fi
     fi
     sleep 1
   done
+  if [[ -n "${body}" ]]; then
+    holder="$(ss -H -ltnp "sport = :${port}" 2>/dev/null | head -n 3 | tr '\n' ' ' || true)"
+    SUMMARY_FAIL_DETAIL="port ${port} masih dijawab Summary API lain/versi lama (harusnya build ${want}; /health: ${body:0:120}; pemilik port: ${holder:-tidak terbaca})"
+  else
+    SUMMARY_FAIL_DETAIL="service sc-1forcr-summary-api tidak menjawab /health di port ${port} (lihat journal di atas)"
+  fi
+  log "${SUMMARY_FAIL_DETAIL}"
   return 1
 }
 
@@ -3368,6 +3412,7 @@ WorkingDirectory=${APP_DIR}
 EnvironmentFile=${APP_DIR}/.env
 Environment=NODE_ENV=production
 Environment=UV_THREADPOOL_SIZE=2
+Environment=SUMMARY_BUILD_ID=${SUMMARY_BUILD_ID}
 ExecStart=/usr/bin/node ${APP_DIR}/summary-api.js
 Restart=always
 RestartSec=3
@@ -3526,14 +3571,27 @@ print_result() {
 SUMMARY_TRANSACTION_SNAPSHOT=""
 SUMMARY_TRANSACTION_COMMITTED="0"
 
+summary_failure_line() {
+  log "GAGAL di langkah ${SUMMARY_STEP:-?}: ${SUMMARY_FAIL_DETAIL:-lihat log di atas} (exit ${1:-1})"
+}
+
+# Baris "GAGAL di langkah ..." dicetak sebelum dan sesudah rollback. God Mode
+# mengirim ujung log ke bot, dan versi lamanya memotong ~400 byte terakhir;
+# baris sebelum rollback tetap terbaca di sana, baris sesudahnya untuk versi baru.
 rollback_summary_transaction_on_exit() {
   local rc="$?"
   trap - EXIT
+  if [[ "${rc}" -ne 0 ]]; then
+    summary_failure_line "${rc}"
+  fi
   if [[ "${SUMMARY_TRANSACTION_COMMITTED:-0}" != "1" && -n "${SUMMARY_TRANSACTION_SNAPSHOT:-}" && \
         -x /usr/local/sbin/sc-1forcr-update-manager ]]; then
     log "Update Summary API gagal; menjalankan rollback otomatis."
     /usr/local/sbin/sc-1forcr-update-manager rollback "${SUMMARY_TRANSACTION_SNAPSHOT}" || \
       log "PERINGATAN: rollback otomatis gagal. Snapshot: ${SUMMARY_TRANSACTION_SNAPSHOT}"
+    if [[ "${rc}" -ne 0 ]]; then
+      summary_failure_line "${rc}"
+    fi
   fi
   exit "${rc}"
 }
@@ -3571,13 +3629,18 @@ commit_summary_transaction() {
   trap - EXIT
 }
 
-install_node_if_missing
-install_vnstat_if_missing
-begin_summary_transaction
-write_files
-install_dependencies
-start_systemd_service
-install_summary_watchdog
-open_summary_firewall
-commit_summary_transaction
+# Trap dipasang sejak awal supaya kegagalan sebelum snapshot pun tetap
+# mencetak sebabnya. Rollback tetap hanya jalan kalau snapshot ada.
+trap rollback_summary_transaction_on_exit EXIT
+log "Build Summary API: ${SUMMARY_BUILD_ID}"
+SUMMARY_STEP="install Node.js"; install_node_if_missing
+SUMMARY_STEP="install vnstat"; install_vnstat_if_missing
+SUMMARY_STEP="snapshot update aman"; begin_summary_transaction
+SUMMARY_STEP="tulis file Summary API"; write_files
+SUMMARY_STEP="install dependency (apt/npm)"; install_dependencies
+SUMMARY_STEP="start service + health-check"; start_systemd_service
+SUMMARY_STEP="watchdog"; install_summary_watchdog
+SUMMARY_STEP="firewall port Summary API"; open_summary_firewall
+SUMMARY_STEP="commit snapshot"; commit_summary_transaction
+trap - EXIT
 print_result

@@ -15,6 +15,7 @@ const serverMigration = require('./lib/server-migration');
 const vpsRebuild = require('./lib/vps-rebuild');
 const antiSales = require('./lib/anti-sales');
 const revenueReport = require('./lib/revenue-report');
+const godUpdateReport = require('./lib/god-update-report');
 
 const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
 if (!BOT_TOKEN) {
@@ -2183,6 +2184,53 @@ async function getGodUpdateCampaignLastActivity(version, fallback) {
   return lastAt > 0 ? lastAt : Number(fallback || 0);
 }
 
+// Rincian hasil per komponen (Script SC / Summary API) dan daftar VPS yang
+// belum berhasil beserta sebabnya. Dipakai layar status dan laporan akhir,
+// supaya admin tahu bagian mana yang gagal tanpa harus login ke VPS.
+async function buildGodUpdateDetailLines(campaign, limit = 10) {
+  const rows = await dbAll(
+    'SELECT vps_ip, status, message FROM god_update_targets WHERE version=? ORDER BY updated_at DESC',
+    [campaign.version]
+  );
+  const lines = ['', 'Hasil per komponen:', ...godUpdateReport.breakdownLines(campaign.components, rows)];
+  const problems = godUpdateReport.problemLines(campaign.components, rows, limit);
+  if (problems.total > 0) {
+    lines.push('', `VPS belum berhasil (${problems.shown} dari ${problems.total} ditampilkan):`, ...problems.lines);
+  }
+  return { lines, problems: problems.total };
+}
+
+// Cek versi Summary API langsung ke VPS (GET http://IP:8789/health, tanpa
+// key). Ini bukti dari proses yang benar-benar menjawab port, bukan dari ack
+// God Mode, jadi VPS yang update-nya diam-diam gagal tetap ketahuan.
+const SUMMARY_PROBE_TIMEOUT_MS = 5000;
+const SUMMARY_PROBE_CONCURRENCY = 10;
+let summaryVersionCheckRunning = false;
+
+async function probeSummaryHealth(ip) {
+  if (!isIpv4(ip)) return { ip, ok: false, build: '' };
+  try {
+    const res = await axios.get(`http://${ip}:8789/health`, {
+      timeout: SUMMARY_PROBE_TIMEOUT_MS,
+      maxContentLength: 16 * 1024,
+      validateStatus: () => true
+    });
+    const ok = Number(res.status) === 200 && res.data?.ok === true;
+    return { ip, ok, build: ok ? String(res.data?.build || '') : '' };
+  } catch (_) {
+    return { ip, ok: false, build: '' };
+  }
+}
+
+async function runSummaryVersionCheck() {
+  const summaryPath = await getSummaryApiLocalPath().catch(() => DEFAULT_SUMMARY_API_LOCAL_PATH);
+  if (!fs.existsSync(summaryPath)) return { error: `Installer Summary API belum ada: ${summaryPath}` };
+  const expected = godUpdateReport.summaryBuildId(fs.readFileSync(summaryPath, 'utf8'));
+  const hosts = (await listActiveScHosts(5000)).filter((ip) => isIpv4(ip));
+  const results = await godUpdateReport.mapWithConcurrency(hosts, SUMMARY_PROBE_CONCURRENCY, probeSummaryHealth);
+  return { expected, results };
+}
+
 // Tutup campaign (baik karena semua sukses, macet/timeout, atau ditutup
 // manual oleh admin) dan kirim satu laporan akhir ke admin. Dipakai bareng
 // oleh job otomatis dan tombol "Tuntaskan Sekarang".
@@ -2193,12 +2241,7 @@ async function finalizeGodUpdateCampaign(campaign, summary, expected, reasonNote
     [finishedAt, finishedAt, campaign.version]
   );
   if (Number(completed?.changes || 0) < 1) return false;
-  const pendingRows = summary.pending > 0
-    ? await dbAll(
-        "SELECT vps_ip FROM god_update_targets WHERE version=? AND LOWER(TRIM(status))='pending' ORDER BY updated_at ASC LIMIT 10",
-        [campaign.version]
-      )
-    : [];
+  const detail = await buildGodUpdateDetailLines(campaign).catch(() => ({ lines: [], problems: 0 }));
   const lines = [
     `Campaign : ${campaign.version}`,
     `Paket    : ${godUpdateComponentLabel(campaign.components)}`,
@@ -2210,9 +2253,12 @@ async function finalizeGodUpdateCampaign(campaign, summary, expected, reasonNote
     '',
     reasonNote
   ];
-  if (pendingRows.length) {
-    lines.push('', `VPS masih pending (${pendingRows.length} dari ${summary.pending} ditampilkan):`);
-    for (const row of pendingRows) lines.push(`- ${row.vps_ip}`);
+  lines.push(...detail.lines);
+  if (detail.problems > 0) {
+    lines.push(
+      '',
+      'VPS di atas tidak ditawari campaign ini lagi. Jalankan campaign baru, atau update manual di VPS itu: menu-sc-1forcr update lalu menu-sc-1forcr update-summary.'
+    );
   }
   const notification = await notifyGodUpdateAdmins(uiBox('GOD MODE SELESAI', lines), campaign.created_by);
   if (Number(notification?.sent || 0) < 1) {
@@ -6607,6 +6653,7 @@ bot.action('m_admin_god_update', async (ctx) => {
     buttons.push([Markup.button.callback('Script + Summary API', 'm_admin_god_component_both')]);
   }
   buttons.push([Markup.button.callback('Cek Status God Mode', 'm_admin_god_status')]);
+  buttons.push([Markup.button.callback('Cek Versi Summary API di VPS', 'm_admin_god_summary_check')]);
   if (openCampaign) buttons.push([Markup.button.callback('Batalkan Campaign', 'm_admin_god_cancel')]);
   buttons.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
   return ctx.reply(uiBox('GOD MODE UPDATE WAJIB', rows.filter(Boolean)), Markup.inlineKeyboard(buttons));
@@ -6680,10 +6727,7 @@ bot.action('m_admin_god_status', async (ctx) => {
   const campaign = await getLatestGodUpdateCampaign().catch(() => null);
   if (!campaign) return ctx.reply('Belum ada campaign God Mode.', adminMenu());
   const summary = await getGodUpdateCampaignSummary(campaign.version);
-  const failed = await dbAll(
-    "SELECT vps_ip, message FROM god_update_targets WHERE version=? AND status='failed' ORDER BY updated_at DESC LIMIT 10",
-    [campaign.version]
-  );
+  const detail = await buildGodUpdateDetailLines(campaign).catch(() => ({ lines: [], problems: 0 }));
   const lines = [
     `Campaign : ${campaign.version}`,
     `Status   : ${campaign.status}`,
@@ -6695,10 +6739,7 @@ bot.action('m_admin_god_status', async (ctx) => {
     `Gagal    : ${summary.failed}`,
     `Pending  : ${summary.pending}`
   ];
-  if (failed.length) {
-    lines.push('', 'Gagal terakhir:');
-    for (const row of failed) lines.push(`- ${row.vps_ip}: ${String(row.message || '-').slice(0, 90)}`);
-  }
+  lines.push(...detail.lines);
   const isOpen = ['scheduled', 'active'].includes(String(campaign.status || ''));
   // Termasuk kasus semua target gagal: di situ pending dan running nol, tapi
   // campaign tetap perlu bisa dituntaskan manual supaya laporannya keluar.
@@ -6708,8 +6749,43 @@ bot.action('m_admin_god_status', async (ctx) => {
   if (isOpen && notFullySuccessful) {
     buttons.push([Markup.button.callback('Tuntaskan Sekarang', `m_admin_god_finish_${campaign.version}`)]);
   }
+  if (godUpdateReport.normalizeComponents(campaign.components) !== 'script') {
+    buttons.push([Markup.button.callback('Cek Versi Summary API di VPS', 'm_admin_god_summary_check')]);
+  }
   buttons.push([Markup.button.callback('Kembali', 'm_admin_menu')]);
   return ctx.reply(uiBox('STATUS GOD MODE', lines), Markup.inlineKeyboard(buttons));
+});
+
+bot.action('m_admin_god_summary_check', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  if (!isAdmin(ctx.from.id)) return ctx.reply('Akses ditolak. Hanya admin.');
+  if (summaryVersionCheckRunning) return ctx.reply('Cek versi Summary API masih berjalan. Tunggu hasilnya.');
+  summaryVersionCheckRunning = true;
+  try {
+    await ctx.reply('Mengecek versi Summary API di semua VPS aktif (port 8789)...');
+    const check = await runSummaryVersionCheck();
+    if (check.error) return ctx.reply(check.error, adminMenu());
+    const report = godUpdateReport.summaryProbeLines(check.expected, check.results, 15);
+    const lines = [...report.lines];
+    if (report.problems > 0) {
+      lines.push(
+        '',
+        'Versi lama: jalankan God Mode Summary API lagi, atau di VPS itu: menu-sc-1forcr update-summary.',
+        'Tidak menjawab: VPS mati, Summary API mati, atau port 8789 ditutup firewall.'
+      );
+    }
+    return ctx.reply(
+      uiBox('VERSI SUMMARY API', lines),
+      Markup.inlineKeyboard([
+        [Markup.button.callback('Cek Ulang', 'm_admin_god_summary_check')],
+        [Markup.button.callback('Kembali', 'm_admin_god_update')]
+      ])
+    );
+  } catch (error) {
+    return ctx.reply(`Cek versi Summary API gagal: ${parseErr(error)}`, adminMenu());
+  } finally {
+    summaryVersionCheckRunning = false;
+  }
 });
 
 bot.action(/^m_admin_god_finish_(god-\d+)$/, async (ctx) => {
@@ -9952,7 +10028,7 @@ bot.on('text', async (ctx) => {
       userState.delete(ctx.chat.id);
       await ctx.replyWithDocument(
         { source: content, filename },
-        { caption: `Backup selesai.\nIP VPS: ${state.host}\nSSH/ZIVPN: ${backupPayload.data.ssh.length}, VMESS: ${backupPayload.data.vmess.length}, VLESS: ${backupPayload.data.vless.length}, TROJAN: ${backupPayload.data.trojan.length}\nSettings: ${Object.keys(runtimeSettings).length}` }
+        { caption: `Backup selesai (format lama).\nIP VPS: ${state.host}\nSSH/ZIVPN: ${backupPayload.data.ssh.length}, VMESS: ${backupPayload.data.vmess.length}, VLESS: ${backupPayload.data.vless.length}, TROJAN: ${backupPayload.data.trojan.length}\nSettings: ${Object.keys(runtimeSettings).length}\nDomain dan kunci SlowDNS TIDAK ikut. Update AutoSC dan Summary API VPS ini lalu backup ulang kalau mau pindah lengkap.` }
       );
       return;
     }
@@ -10221,11 +10297,27 @@ bot.on('document', async (ctx) => {
         if (restored.restored !== true) throw new Error('Restore lengkap belum dikonfirmasi VPS tujuan.');
         await dbRun("UPDATE sc_registrations SET last_used_at = ?, updated_at = ? WHERE user_id = ? AND vps_ip = ? AND status = 'active'", [Date.now(), Date.now(), ctx.from.id, state.host]).catch(() => {});
         userState.delete(ctx.chat.id);
-        await ctx.reply(`Restore lengkap selesai.\nTarget: ${state.host}\nAkun, pengaturan bot notifikasi, dan banner dipulihkan; domain/kunci mengikuti isi backup. Arahkan DNS domain ke IP VPS baru.`, mainMenu());
+        // Ringkasan dari skrip restore VPS: jumlah akun, domain, dan pubkey
+        // SlowDNS yang benar-benar dipulihkan. AutoSC lama tidak mengirimnya.
+        const summaryLines = Array.isArray(restored.summary?.lines)
+          ? restored.summary.lines.map((line) => String(line || '').slice(0, 300)).filter(Boolean).slice(0, 20)
+          : [];
+        const detail = summaryLines.length
+          ? summaryLines.join('\n')
+          : 'Akun, pengaturan bot notifikasi, dan banner dipulihkan; domain/kunci mengikuti isi backup.';
+        await ctx.reply(`Restore lengkap selesai.\nTarget: ${state.host}\n\n${detail}\n\nArahkan DNS domain ke IP VPS baru.`, mainMenu());
         return;
       } catch (error) {
         if (Number(error?.response?.status) !== 404) throw error;
-        if (backupData.identity) throw new Error('Update AutoSC dan Summary API tujuan dahulu agar domain dan kunci SlowDNS dapat dipulihkan.');
+        // 404 hanya datang dari Summary API lama yang belum punya route ini.
+        // Summary API baru menjawab 409 kalau AutoSC-nya yang lama, dengan
+        // pesan sendiri, jadi di sini yang ketinggalan pasti Summary API tujuan.
+        if (backupData.identity) {
+          throw new Error(
+            `Summary API di VPS tujuan ${state.host} masih versi lama, jadi domain dan kunci SlowDNS belum bisa dipulihkan.\n` +
+              'Update AutoSC dan Summary API di VPS tujuan dulu: buka menu SC > Tools > [4] Update / Rollback SC, lalu Tools > [2] Install API 1FORCR. Setelah itu kirim ulang file backup ini.'
+          );
+        }
         // Older destinations retain the legacy account-only migration path.
       }
     }

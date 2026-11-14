@@ -113,7 +113,9 @@ def run_engine(mode, root, input_path, output_path):
     if mode == "export":
         run_code(EXPORT, root, [root / "accounts.db", "old.example.com", output_path])
     else:
-        run_code(IMPORT, root, [input_path, root / "accounts.db"])
+        # Argumen ke-3 opsional: file ringkasan JSON yang dibaca API.
+        extra = [output_path] if output_path and output_path != "-" else []
+        run_code(IMPORT, root, [input_path, root / "accounts.db"] + extra)
 
 
 def seed_notifier_state(root):

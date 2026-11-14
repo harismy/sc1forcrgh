@@ -17,6 +17,8 @@ function fixture() {
   const files = new Map([['/var/lib/sc-1forcr/slowdns.state', 'ENABLED=1\n']]);
   const pending = new Map(), actions = [], histories = [], notifications = [];
   let raw = '', calls = 0, failWrite = false, failPrepare = false, accountLimit = 1, locked = false, lockedUntil = 0;
+  let xrayRows = [];
+  const modes = [];
   const context = vm.createContext({
     console, crypto, require, process: { pid: 7 },
     SLOWDNS_AUTO_LOCK_ENABLED: true, SLOWDNS_ACTIVITY_FILE: activity, SLOWDNS_LOCK_SECONDS: 900,
@@ -24,6 +26,11 @@ function fixture() {
     SSHWS_HARD_LIMIT_CONFIRM_CYCLES: 2, SSHWS_HARD_LIMIT_MIN_GAP_SECONDS: 90, SSHWS_HARD_LIMIT_MAX_GAP_SECONDS: 420,
     AUTO_LOCK_ENABLED: true, IPLIMIT_DEBUG: false, ZIVPN_AUTH_MODE: 'http', XRAY_IP_GROUP_MASK: 16,
     SSHWS_ACCOUNT_SESSION_HARD_LIMIT: 8, LOCK_SECONDS: 3600,
+    XRAY_LIMIT_CONFIRM_CYCLES: 2, XRAY_LIMIT_MIN_GAP_SECONDS: 90, XRAY_LIMIT_MAX_GAP_SECONDS: 420, XRAY_BLOCK_TCP_PORTS: [80, 443],
+    sampleXrayIpLimit: async () => ({ candidate: false, confirmed: false, hits: 0, signal: '' }),
+    addTcpDropRule: () => { actions.push(['tcp-drop']); return true; }, disconnectXrayIpNow() {},
+    rebuildXrayFromDb: async () => { actions.push(['rebuild-xray']); },
+    detectLockedUsersStillInXrayConfig: async () => ({ changed: false, users: [] }), stopXrayFailClosed() {},
     fs: {
       readFileSync(file) { if (!files.has(file)) throw Error('ENOENT'); return files.get(file); },
       mkdirSync() {},
@@ -32,41 +39,46 @@ function fixture() {
     },
     execFileSync(command, args) {
       assert.strictEqual(command, '/usr/local/sbin/sc-1forcr-slowdns');
-      assert.strictEqual(args[0], 'sessions'); calls++; return raw;
+      assert.strictEqual(args[0], 'sessions'); calls++; modes.push(args[1]); return raw;
     },
     async run(sql, params = []) {
       const s = String(sql).replace(/\s+/g, ' ');
+      // Query Xray membawa account_type=? di depan: [tipe, akun, signal].
+      const p = s.includes('account_type=?') || s.includes('VALUES(?, ?, ?, ?, ?, ?, ?)') ? params.slice(1) : params;
       if (s.includes('DELETE FROM iplimit_violation_pending')) {
         for (const [key, row] of pending) {
-          if (row.username !== params[0]) continue;
-          if (s.includes("LIKE 'slowdns-%'")) {
-            if (row.signal.startsWith('slowdns-') && row.signal !== params[1]) pending.delete(key);
-          } else if (!s.includes('signal=?') || row.signal === params[1]) pending.delete(key);
+          if (row.username !== p[0]) continue;
+          const like = (s.match(/signal LIKE '([a-z-]+)%'/) || [])[1];
+          if (like) {
+            if (row.signal.startsWith(like) && row.signal !== p[1]) pending.delete(key);
+          } else if (!s.includes('signal=?') || row.signal === p[1]) pending.delete(key);
         }
       } else if (s.includes('INSERT OR REPLACE INTO iplimit_violation_pending')) {
-        const [username, signal, first_seen, last_seen, hits, detected] = params;
+        const [username, signal, first_seen, last_seen, hits, detected] = p;
         pending.set(username + '|' + signal, { username, signal, first_seen, last_seen, hits, detected });
       } else if (s.includes('INSERT OR REPLACE INTO temp_ip_locks')) {
         if (failPrepare) throw Error('database write failed');
-        locked = true; lockedUntil = params[1]; actions.push(['temporary-lock', ...params]);
-      } else if (s.includes("UPDATE account_sshs SET status='LOCK_TMP'")) {
+        locked = true; lockedUntil = s.includes('VALUES(?, ?, ?, 0)') ? params[2] : params[1];
+        actions.push(['temporary-lock', ...params]);
+      } else if (/UPDATE account_\w+ SET status='LOCK_TMP'/.test(s)) {
         actions.push(['status', ...params]);
       }
       return { changes: 1 };
     },
     async get(sql, params = []) {
       if (sql.startsWith('SELECT l.locked_until')) return { locked_until: lockedUntil, status: 'LOCK_TMP' };
-      if (sql.includes('iplimit_violation_pending')) return pending.get(params[0] + '|' + params[1]);
+      if (sql.includes('iplimit_violation_pending')) return pending.get(params.at(-2) + '|' + params.at(-1));
       if (sql.includes('temp_ip_locks')) return locked ? { ok: 1 } : undefined;
       return undefined;
     },
     async all(sql) {
       if (sql.includes('FROM account_sshs WHERE')) return [{ username: 'alice', password: 'example', limitip: accountLimit }];
+      if (sql.includes('FROM account_vlesses WHERE')) return xrayRows;
       return [];
     },
     parseSshAndUdpUsage: () => Object.fromEntries(['ipMap', 'sessionMap', 'recentAuthMap', 'procSessionMap', 'wsClientPortMap', 'sshWsIpMap', 'udphcSessionMap', 'udphcIpMap', 'zivpnSessionMap', 'zivpnIpMap'].map((k) => [k, new Map()])),
     readZivpnLiveMap: async () => ({ sessionMap: new Map(), ipMap: new Map() }),
-    parseXrayRecentIpMap: () => new Map(), readXrayLiveSocketMap: () => new Map(),
+    parseXrayRecentIpMap: () => new Map(), readXrayLiveSocketMap: () => ({ available: false, sockets: new Map() }),
     getActiveUdpLockPort: () => 5667, countEffectiveDevices: (set) => set.size, countIpGroups: (set) => set.size,
     sampleSshDeviceLimit: async () => ({ confirmed: false }), sampleSshwsHardLimit: async () => ({ confirmed: false }),
     extractIp: (s) => s, isLoopbackIp: () => false,
@@ -79,14 +91,15 @@ function fixture() {
     notifyMultiLoginLock: async (...args) => notifications.push(args),
     notifyLongTermIpWarning: async () => {}
   });
-  new vm.Script(policy + '\n' + lock + '\nglobalThis.api={readSlowdnsTunnelUsage,sampleSlowdnsTunnelLimit,lockIfExceeded,parseSlowdnsSessions,readSlowdnsQuotaCounters};').runInContext(context);
+  new vm.Script(policy + '\n' + lock + '\nglobalThis.api={readSlowdnsTunnelUsage,sampleSlowdnsTunnelLimit,sampleXraySlowdnsLimit,lockIfExceeded,parseSlowdnsSessions,readSlowdnsQuotaCounters};').runInContext(context);
   const snapshot = (rows, instance = '1008.1234567890') => {
     raw = 'SC_SLOWDNS_USERS_V1|' + instance + '\n' + rows.map(([cid, up, port, started = 500]) =>
       `alice|${cid.repeat(16)}|${up}|${port}|${BigInt(started) * 1000000000n}`).join('\n') + '\nEND\n';
   };
   return {
-    api: context.api, context, files, pending, actions, histories, notifications, snapshot,
-    raw(value) { raw = value; }, limit(n) { accountLimit = n; }, failWrite() { failWrite = true; }, failPrepare() { failPrepare = true; }, calls: () => calls
+    api: context.api, context, files, pending, actions, histories, notifications, snapshot, modes,
+    raw(value) { raw = value; }, limit(n) { accountLimit = n; }, failWrite() { failWrite = true; }, failPrepare() { failPrepare = true; }, calls: () => calls,
+    xrayAccounts(rows) { xrayRows = rows; }
   };
 }
 
@@ -168,6 +181,73 @@ function fixture() {
   assert.strictEqual(f.actions.length, 0);
   f.context.AUTO_LOCK_ENABLED = false;
   const before = f.calls(); await f.api.lockIfExceeded(1540); assert.strictEqual(f.calls(), before);
+
+  // SlowDNS Xray (V.1FSC.135): tunnel per akun Xray dari baris X helper
+  // `sessions 3`. Ambang limit x2 (aturan Xray), bukti sama dengan SSH, dua cek
+  // berturut-turut, lock 900 detik lewat jalur lock Xray tanpa blokir IP.
+  {
+    const x = fixture();
+    x.xrayAccounts([{ username: 'carol', limitip: 1 }]);
+    const xsnap = (rows, extra = '') => x.raw('SC_SLOWDNS_USERS_V3|1008.1234567890|2\n' + extra +
+      rows.map(([cid, up, port]) => `X|vless|carol|${cid.repeat(16)}|${up}|${port}|500000000000|0\n`).join('') + 'END\n');
+    // Dua tunnel dengan limit 1 (ambang 2): tidak pernah lock.
+    for (const [at, bytes] of [[1000, 100], [1180, 200], [1360, 300]]) {
+      xsnap([['a', bytes, 45001], ['b', bytes, 45002]]); await x.api.lockIfExceeded(at);
+    }
+    assert(!x.actions.some((a) => a[0] === 'temporary-lock'), 'limit 1 x2: dua tunnel (mis. Load Balance) aman');
+    assert(x.modes.every((m) => m === '3'), 'checker meminta format V3');
+    // Tiga tunnel: cek pertama = baseline, kedua = kandidat, ketiga = lock.
+    const y = fixture();
+    y.xrayAccounts([{ username: 'carol', limitip: 1, owner_telegram_id: 77 }]);
+    const ysnap = (bytes) => y.raw('SC_SLOWDNS_USERS_V3|1008.1234567890|2\n' +
+      // Akun SSH alice tetap di bawah limit; baris SSH tidak tercampur dengan X.
+      `alice|${'d'.repeat(16)}|${bytes}|40001|500000000000|0\n` +
+      ['a', 'b', 'c'].map((c, i) => `X|vless|carol|${c.repeat(16)}|${bytes}|${45001 + i}|500000000000|0\n`).join('') + 'END\n');
+    ysnap(100); await y.api.lockIfExceeded(1000);
+    ysnap(200); await y.api.lockIfExceeded(1180);
+    assert(!y.actions.some((a) => a[0] === 'temporary-lock'), 'satu cek belum boleh lock');
+    ysnap(300); await y.api.lockIfExceeded(1360);
+    const lockRow = y.actions.find((a) => a[0] === 'temporary-lock');
+    assert(lockRow && lockRow[1] === 'vless' && lockRow[2] === 'carol' && lockRow[3] === 1360 + 900, JSON.stringify(y.actions));
+    assert(y.actions.some((a) => a[0] === 'rebuild-xray'), 'akun dicabut dari config Xray');
+    assert(!y.actions.some((a) => a[0] === 'tcp-drop'), 'lock SlowDNS tidak memblokir IP (sumbernya 127.0.0.1)');
+    assert(!y.actions.some((a) => a[0] === 'passwd'), 'akun SSH alice tidak tersentuh');
+    const h = y.histories[0];
+    assert.strictEqual(h.account_type, 'vless');
+    assert.strictEqual(h.service, 'slowdns');
+    assert.strictEqual(h.limitip, 2, 'batas tunnel = limit x2');
+    assert.strictEqual(h.detected, 3);
+    assert.strictEqual(h.locked_until - h.locked_at, 900);
+    assert(/VLESS lewat SlowDNS: 3 tunnel aktif; batas 2/.test(h.device_detected_label), h.device_detected_label);
+    assert.strictEqual(y.notifications[0][0], 'slowdns');
+    assert.strictEqual(y.notifications[0][7].unlock_minutes, 15);
+    // Saklar auto-lock SlowDNS OFF: tidak ada bukti tunnel (Xray juga).
+    const z = fixture();
+    z.xrayAccounts([{ username: 'carol', limitip: 1 }]);
+    z.files.set('/etc/sc-1forcr.env', 'SLOWDNS_AUTO_LOCK_ENABLE=0\n');
+    for (const [at, bytes] of [[1000, 100], [1180, 200], [1360, 300]]) {
+      z.raw('SC_SLOWDNS_USERS_V3|1008.1234567890|2\n' + ['a', 'b', 'c'].map((c, i) =>
+        `X|vless|carol|${c.repeat(16)}|${bytes}|${45001 + i}|500000000000|0\n`).join('') + 'END\n');
+      await z.api.lockIfExceeded(at);
+    }
+    assert(!z.actions.some((a) => a[0] === 'temporary-lock'), 'auto-lock SlowDNS OFF juga untuk Xray');
+    // Helper lama (tidak mengenal mode 3, mencetak V1): ulang dengan mode 2.
+    const w = fixture();
+    w.raw('SC_SLOWDNS_USERS_V1|1008.1234567890\nalice|' + 'a'.repeat(16) + '|100|40001|500000000000\nEND\n');
+    w.api.readSlowdnsTunnelUsage(1000);
+    assert.deepStrictEqual(w.modes, ['3', '2'], 'helper lama: fallback ke sessions 2 (kuota SSH tetap terhitung)');
+    // Parser V3.
+    const p = w.api.parseSlowdnsSessions;
+    const v3 = p('SC_SLOWDNS_USERS_V3|1.2|2\nalice|' + 'a'.repeat(16) + '|1|40001|500000000000|1\n' +
+      'X|trojan|dave|' + 'b'.repeat(16) + '|5|40001|500000000000|6\nEND');
+    assert(v3 && v3.live.length === 1 && v3.xray.length === 1 && v3.xray[0].proto === 'trojan' && v3.xray[0].port === 40001,
+      'port X boleh sama dengan port SSH (koneksi ke tujuan lain)');
+    assert.strictEqual(p('SC_SLOWDNS_USERS_V3|1.2|2\nX|ssh|dave|' + 'b'.repeat(16) + '|5|40001|500000000000|6\nEND'), null, 'protokol X tidak dikenal = rusak');
+    assert.strictEqual(p('SC_SLOWDNS_USERS_V3|1.2|2\nX|vless|dave|' + 'b'.repeat(16) + '|5|40001|500000000000|6\n' +
+      'X|vless|erin|' + 'c'.repeat(16) + '|5|40001|500000000000|6\nEND'), null, 'port X ganda = rusak');
+    assert.strictEqual(p('SC_SLOWDNS_USERS_V2|1.2|2\nX|vless|dave|' + 'b'.repeat(16) + '|5|40001|500000000000|6\nEND'), null,
+      'baris X hanya sah di V3');
+  }
   // Kuota SSH lewat SlowDNS (V.1FSC.130): upload+download per stream yang
   // username-nya terverifikasi, stream putus dipetakan dari sampel saat masih
   // hidup, dan data tidak utuh atau binary lama tidak menghasilkan pemakaian.

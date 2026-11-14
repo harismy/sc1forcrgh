@@ -140,7 +140,7 @@ assert(bytesPy.includes('\npatch_session_bytes(mod)\n') &&
   // milik resolver; app ber-buffer 512/1024/tanpa EDNS menerima TC=1 dan tidak
   // pernah konek. Respons dibatasi ukuran yang terbukti sampai, lalu diprobe.
   const sizePy = bytesPy.split('\npatch_session_bytes(mod)\n')[1] || '';
-  assert(helper.includes('DNSTT_PATCH_ID="sc-fast11"') && sizePy.includes('\npatch_response_size(mod)\n') &&
+  assert(sizePy.includes('\npatch_response_size(mod)\n') &&
     sizePy.includes("'sc_size.go'") && sizePy.includes('scSizeFloor    = 512') &&
     sizePy.includes('plan := scSizeCaps(rec)') && sizePy.includes('maxPayloadForResponse(rec.Resp, plan.base)') &&
     sizePy.includes('!scSizeExtend(&limit, &probeExtra, &probing, p, plan.fresh)') &&
@@ -158,7 +158,26 @@ assert(bytesPy.includes('\npatch_session_bytes(mod)\n') &&
   assert(sizePy.includes("'\\t\\t\\t\\tif cand := computeMaxEncodedPayload(edns) - 2; cand > permtu {\\n'") &&
     sizePy.includes('TXT/NULL tetap kapasitas respons 512 byte'),
     'sc-fast11: MTU awal TXT/NULL = kapasitas respons 512 byte, naik hanya lewat bukti');
+  // V.1FSC.135: SlowDNS Xray lewat domain NS kedua (satu proses, satu kunci).
+  const routePy = sizePy.split('\npatch_response_size(mod)\n')[1] || '';
+  assert(helper.includes('DNSTT_PATCH_ID="sc-fast12"') && routePy.includes('\npatch_xray_route(mod)\n') &&
+    routePy.includes("'sc_route.go'") && routePy.includes('scRouteFlags()') &&
+    routePy.includes('scTrimTunnelDomain(question.Name, domain)') &&
+    routePy.includes('route := scQueryRoute(&query, domain)') &&
+    routePy.includes('scHandleStream(conn, stream, upstream, clientID)') &&
+    routePy.includes('tujuan wajib alamat loopback') && routePy.includes('ip.IsLoopback()') &&
+    routePy.includes('X|%d|%s|%d|%d|%d') && routePy.includes('delete(clientRoute, cid)') &&
+    routePy.includes("'\\t\\t\\tdelete(clientRoute, k)\\n'") &&
+    routePy.includes('scRouteSSHOff  atomic.Bool') && routePy.includes('ROUTE_XRAY=0'),
+    'patch sc-fast12 setelah sc-fast11: domain NS Xray, rute path WS loopback, ON/OFF dari file state');
+  // Nilai nol = ON: jalur yang belum disetel tidak pernah mati diam-diam.
+  assert(!/scRoute(SSH|Xray)On\b/.test(routePy), 'sc-fast12: saklar jalur memakai nilai nol = ON');
 }
+assert(helper.includes('XRAY_ROUTE="/vmess=127.0.0.1:10001,/vless=127.0.0.1:10002,/trojan=127.0.0.1:10003"') &&
+  /bin_has_routes\(\) \{[\s\S]*?-h 2>&1 \| grep -q -- '-routes-file'/.test(helper) &&
+  helper.includes('-mtu ${MTU}${args} ${NS} 127.0.0.1:${TARGET_PORT}') &&
+  helper.includes('ROUTE_SSH=${ROUTE_SSH}\nROUTE_XRAY=${xray_route}"'),
+  'helper: flag jalur hanya dipasang kalau binary mendukung, ON/OFF jalur lewat file state');
 assert(helper.includes('  sessions) cmd_sessions "${2:-1}" ;;') &&
   helper.includes("printf 'SC_SLOWDNS_USERS_V2|%s|%s\\n'") && helper.includes("printf 'SC_SLOWDNS_USERS_V1|%s\\n'"),
   'helper: sessions (V1, limit tunnel) tetap ada, sessions 2 (V2) untuk kuota SSH');
@@ -601,6 +620,82 @@ try {
   assert(/Delegasi NS sudah benar/.test(r.out), r.out);
   assert(/dns\.google\/resolve\?name=cek\d+a\.ns-sg1\.contoh\.net&type=TXT/.test(read('curl.log')), read('curl.log'));
 
+  // ── 8b. SlowDNS Xray (sc-fast12): domain NS kedua, ON/OFF tanpa restart ──
+  {
+    const routeDnstt = fakeDnstt.replace('\nexit 1\n', '\nif [[ "$1" == "-h" ]]; then echo "  -routes-file string" >&2; exit 0; fi\nexit 1\n');
+    fs.writeFileSync(dnsttBin, routeDnstt);
+    const xrayEnv = { SLOWDNS_ENABLE: '1', SLOWDNS_NS_DOMAIN: 'ns-sg1.contoh.net', SLOWDNS_XRAY_ENABLE: '1', SLOWDNS_XRAY_NS_DOMAIN: 'NSX-SG1.contoh.net.' };
+    setEnv(xrayEnv);
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+    const unitX = fs.readFileSync(unitFile, 'utf8');
+    assert(unitX.includes(` -mtu 1232 -routes-file ${toBashPath(stateFile)} -xray-domain nsx-sg1.contoh.net ` +
+      '-xray-route /vmess=127.0.0.1:10001,/vless=127.0.0.1:10002,/trojan=127.0.0.1:10003 ns-sg1.contoh.net 127.0.0.1:109'), unitX);
+    assert(mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'), 'unit berubah (domain Xray baru): restart sekali');
+    assert.deepStrictEqual([state().XRAY_ENABLED, state().XRAY_NS, state().ROUTE_SSH, state().ROUTE_XRAY],
+      ['1', 'nsx-sg1.contoh.net', '1', '1'], JSON.stringify(state()));
+    // Layanan SSH OFF (menu ON/OFF): jalur SSH OFF lewat file state, tanpa restart.
+    setEnv({ ...xrayEnv, SERVICE_SSH_ENABLE: '0' });
+    r = run('apply');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.deepStrictEqual([state().ROUTE_SSH, state().ROUTE_XRAY], ['0', '1']);
+    assert.deepStrictEqual(mutatingSystemctl(), [], 'ON/OFF jalur tidak menyentuh systemd');
+    // VMess/VLESS/Trojan semua OFF: jalur Xray OFF.
+    setEnv({ ...xrayEnv, SERVICE_VMESS_ENABLE: '0', SERVICE_VLESS_ENABLE: 'off', SERVICE_TROJAN_ENABLE: 'no' });
+    run('apply');
+    assert.deepStrictEqual([state().ROUTE_SSH, state().ROUTE_XRAY], ['1', '0']);
+    setEnv({ ...xrayEnv, SERVICE_VMESS_ENABLE: '0', SERVICE_VLESS_ENABLE: '0' });
+    run('apply');
+    assert.strictEqual(state().ROUTE_XRAY, '1', 'satu protokol Xray ON cukup');
+    setEnv(xrayEnv);
+    run('setup');
+    // xray-disable / xray-enable: tanpa restart, SSH tidak terganggu.
+    r = run('xray-disable');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.deepStrictEqual([envValue('SLOWDNS_XRAY_ENABLE'), state().ROUTE_XRAY, state().ROUTE_SSH], ['0', '0', '1']);
+    assert(!mutatingSystemctl().some((c) => /^(restart|stop|disable) /.test(c)), mutatingSystemctl().join('\n'));
+    assert(read('gate.log').includes('apply'), 'gerbang diterapkan ulang setelah jalur berubah');
+    r = run('xray-enable');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.strictEqual(state().ROUTE_XRAY, '1');
+    assert(!mutatingSystemctl().some((c) => /^restart /.test(c)), 'domain Xray sama: tanpa restart');
+    assert(/NS  nsx-sg1\.contoh\.net  ->  sg1\.contoh\.net   \(SlowDNS Xray\)/.test(r.out), r.out);
+    for (const [bad, why] of [['ns-sg1.contoh.net', /berbeda dari domain NS SSH/], ['sg1.contoh.net', /domain utama/], ['bukan domain', /tidak valid/]]) {
+      r = run('xray-enable', bad);
+      assert(r.status !== 0 && why.test(r.out), `${bad}: ${r.out}`);
+      assert.strictEqual(envValue('SLOWDNS_XRAY_NS_DOMAIN'), 'nsx-sg1.contoh.net', 'input salah tidak menyentuh env');
+    }
+    r = run('set-ns', 'nsx-sg1.contoh.net');
+    assert(r.status !== 0 && /domain NS Xray/.test(r.out), `NS SSH tidak boleh sama dengan NS Xray: ${r.out}`);
+    // ssh-route off/on: jalur SSH saja, Xray tetap.
+    r = run('ssh-route', 'off');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.deepStrictEqual([envValue('SLOWDNS_SSH_ENABLE'), state().ROUTE_SSH, state().ROUTE_XRAY], ['0', '0', '1']);
+    assert(!mutatingSystemctl().some((c) => /^restart /.test(c)));
+    r = run('ssh-route', 'on');
+    assert.deepStrictEqual([state().ROUTE_SSH, state().ROUTE_XRAY], ['1', '1']);
+    assert.notStrictEqual(run('ssh-route', 'mungkin').status, 0);
+    // check memeriksa kedua domain NS.
+    r = run('check');
+    assert.strictEqual(r.status, 0, r.out);
+    assert(/name=cek\d+a\.ns-sg1\.contoh\.net/.test(read('curl.log')) && /name=cek\d+a\.nsx-sg1\.contoh\.net/.test(read('curl.log')), read('curl.log'));
+    assert.strictEqual(run('suggest', 'xray').out.trim(), 'nsx-sg1.contoh.net');
+    // Binary lama (tanpa sc-fast12): unit tanpa flag baru, Xray tidak diiklankan,
+    // xray-enable ditolak dan env dikembalikan.
+    installFakeDnstt();
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+    assert(!fs.readFileSync(unitFile, 'utf8').includes('-routes-file'), 'binary lama: unit tanpa flag yang belum dikenal');
+    assert.strictEqual(state().ROUTE_XRAY, '0', 'binary lama: jalur Xray tidak diiklankan');
+    run('xray-disable');
+    r = run('xray-enable');
+    assert(r.status !== 0 && /belum bisa diaktifkan/.test(r.out), r.out);
+    assert.strictEqual(envValue('SLOWDNS_XRAY_ENABLE'), '0', 'xray-enable gagal: saklar dikembalikan');
+    setEnv({ SLOWDNS_ENABLE: '1', SLOWDNS_NS_DOMAIN: 'ns-sg1.contoh.net' });
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+  }
+
   // ── 9. regen-key: pubkey baru, service di-restart ────────────────────────
   const oldPub = state().PUBKEY;
   r = run('regen-key');
@@ -754,6 +849,49 @@ for (const bad of [goodState.replace('ACTIVE=1', 'ACTIVE=0'), goodState.replace(
 }
 assert.strictEqual(payload(goodState.replace('PUBLIC_IP=203.0.113.7', 'PUBLIC_IP=')).slowdns.dns, '', 'IP tidak diketahui: DNS kosong');
 
+// ── API: SlowDNS Xray (V.1FSC.135) per protokol + link 1FTunnel ─────────────
+{
+  const xrayInfo = (stateText, protocol, toggles = {}) => {
+    const ctx = vm.createContext({
+      fs: { readFileSync: () => { if (stateText === null) throw new Error('ENOENT'); return stateText; } },
+      readServiceToggles: () => toggles, Date
+    });
+    new vm.Script(`${slowdnsSrc}\nthis.x = slowdnsXrayInfo(${JSON.stringify(protocol)}); this.s = slowdnsInfo();`).runInContext(ctx);
+    return { xray: ctx.x, ssh: ctx.s };
+  };
+  const xState = goodState + '\nXRAY_NS=nsx-sg1.contoh.net\nROUTE_SSH=1\nROUTE_XRAY=1';
+  const pub = 'ab'.repeat(32);
+  assert.strictEqual(JSON.stringify(xrayInfo(xState, 'vless').xray), JSON.stringify({ ns: 'nsx-sg1.contoh.net', pubkey: pub, dns: '203.0.113.7:53' }));
+  assert.strictEqual(xrayInfo(xState, 'vless', { SERVICE_VLESS_ENABLE: '0' }).xray, null, 'VLESS OFF: SlowDNS Xray VLESS tidak diiklankan');
+  assert(xrayInfo(xState, 'vmess', { SERVICE_VLESS_ENABLE: '0' }).xray, 'protokol lain tetap');
+  assert.strictEqual(xrayInfo(xState.replace('ROUTE_XRAY=1', 'ROUTE_XRAY=0'), 'vless').xray, null, 'jalur Xray mati');
+  assert.strictEqual(xrayInfo(goodState, 'vless').xray, null, 'state lama tanpa XRAY_NS');
+  assert.strictEqual(xrayInfo(xState.replace('XRAY_NS=nsx-sg1.contoh.net', 'XRAY_NS=ns-sg1.contoh.net'), 'vless').xray, null, 'NS Xray sama dengan NS SSH ditolak');
+  assert.strictEqual(xrayInfo(xState, 'ssh').xray, null);
+  const sshOff = xrayInfo(xState.replace('ROUTE_SSH=1', 'ROUTE_SSH=0'), 'trojan');
+  assert(sshOff.ssh === null && sshOff.xray, 'SlowDNS SSH OFF tidak mematikan SlowDNS Xray');
+  assert(xrayInfo(goodState, 'vless').ssh, 'state lama tanpa ROUTE_SSH: SSH tetap ON');
+
+  const linkSrc = extract(api, '\nfunction slowdnsLinkQuery(', '\nfunction addFrontBugLink(', true);
+  const lctx = vm.createContext({ Buffer, XRAY_PATH_VMESS: '/vmess', XRAY_PATH_VLESS: '/vless', XRAY_PATH_TROJAN: '/trojan' });
+  new vm.Script(`${linkSrc}\nthis.f = { vmessSlowdnsLink, vlessSlowdnsLink, trojanSlowdnsLink };`).runInContext(lctx);
+  const info = { ns: 'nsx-sg1.contoh.net', pubkey: pub, dns: '203.0.113.7:53' };
+  assert.strictEqual(lctx.f.vlessSlowdnsLink('sg1.contoh.net', 'uuid-1', info, 'budi'),
+    `vless://uuid-1@sg1.contoh.net:80?type=ws&path=%2Fvless&security=none&host=sg1.contoh.net&encryption=none&slowdns=nsx-sg1.contoh.net&slowdnskey=${pub}#budi-slowdns`);
+  assert.strictEqual(lctx.f.trojanSlowdnsLink('sg1.contoh.net', 'pass-1', info, 'budi'),
+    `trojan://pass-1@sg1.contoh.net:80?type=ws&path=%2Ftrojan&security=none&host=sg1.contoh.net&slowdns=nsx-sg1.contoh.net&slowdnskey=${pub}#budi-slowdns`);
+  const vm1 = JSON.parse(Buffer.from(lctx.f.vmessSlowdnsLink('sg1.contoh.net', 'uuid-2', info, 'budi').slice(8), 'base64').toString());
+  assert.deepStrictEqual([vm1.add, vm1.port, vm1.net, vm1.path, vm1.tls, vm1.host, vm1.slowdns, vm1.slowdnskey, vm1.ps],
+    ['sg1.contoh.net', '80', 'ws', '/vmess', 'none', 'sg1.contoh.net', 'nsx-sg1.contoh.net', pub, 'budi-slowdns']);
+  // Path link = path inbound WS yang dipetakan dnstt (-xray-route).
+  for (const p of ['/vmess', '/vless', '/trojan']) assert(helper.includes(`${p}=127.0.0.1:1000`), `rute dnstt memuat ${p}`);
+  const create = extract(api, '\nasync function createXray(', '\n}\n');
+  assert.strictEqual((create.match(/\.\.\.slowdnsPort \}\)/g) || []).length, 3, 'port.slowdns di ketiga protokol');
+  assert.strictEqual((create.match(/\.\.\.slowdnsData\n/g) || []).length, 3, 'data.slowdns di ketiga protokol');
+  for (const fn of ['vmessSlowdnsLink', 'vlessSlowdnsLink', 'trojanSlowdnsLink']) assert(create.includes(`...(slowdns ? { slowdns: ${fn}(`), `${fn} dipakai createXray`);
+  assert(extract(api, '\nasync function renewXray(', '\n}\n').includes('slowdnsXrayInfo(meta.protocol)'), 'renew Xray ikut membawa SlowDNS');
+}
+
 // ── Gerbang ON/OFF: SSH OFF ikut menutup port SlowDNS ───────────────────────
 const gate = extract(installer, "cat > /usr/local/sbin/sc-1forcr-service-gate <<'SERVICE_GATE_EOF'\n", '\nSERVICE_GATE_EOF\n');
 const buildRules = extract(gate, '\nbuild_rules() {', '\n}\n');
@@ -774,6 +912,14 @@ try {
   assert.strictEqual(port('ENABLED=0\nLISTEN=5300\n'), '', 'SlowDNS mati: tidak ada rule');
   assert.strictEqual(port(null), '', 'tanpa state: tidak ada rule');
   assert.strictEqual(port('ENABLED=1\nLISTEN=53\n'), '', 'port 53 tidak pernah ditolak gerbang');
+  // SlowDNS Xray aktif: port dipakai bersama, SSH OFF ditangani dnstt (ROUTE_SSH=0).
+  assert.strictEqual(port('ENABLED=1\nLISTEN=5300\nROUTE_SSH=0\nROUTE_XRAY=1\n'), '', 'jalur Xray aktif: port SlowDNS tidak ditutup');
+  assert.strictEqual(port('ENABLED=1\nLISTEN=5300\nROUTE_SSH=0\nROUTE_XRAY=0\n'), '5300', 'tanpa jalur Xray: perilaku lama');
+  const setFn = extract(gate, '\ncmd_set() {', '\n}\n');
+  assert(setFn.indexOf('slowdns_routes_apply') > 0 && setFn.indexOf('slowdns_routes_apply') < setFn.indexOf('if ! cmd_apply; then'),
+    'gerbang: jalur SlowDNS diperbarui sebelum rule disusun');
+  assert(/slowdns_routes_apply\(\) \{[\s\S]*?"\$\{bin\}" apply >\/dev\/null 2>&1 \|\| true/.test(gate),
+    'gerbang memanggil helper apply (tanpa restart, gagal tidak menggagalkan ON/OFF)');
 } finally {
   fs.rmSync(gateTmp, { recursive: true, force: true });
 }
@@ -794,7 +940,8 @@ for (const [name, body, gateCall] of [['update aman', safePath, '\n    apply_ser
 assert(/^setup_slowdns\(\) \{\n  install_slowdns_manager \|\| return 0\n[\s\S]*?\n  return 0\n\}/m.test(installer),
   'setup_slowdns tidak boleh menggagalkan install/update');
 const envKeys = ['SLOWDNS_ENABLE', 'SLOWDNS_NS_DOMAIN', 'SLOWDNS_LISTEN_PORT', 'SLOWDNS_MTU', 'SLOWDNS_MEMORY_MAX',
-  'SLOWDNS_KCP_WINDOW', 'SLOWDNS_KCP_INTERVAL', 'SLOWDNS_KCP_ACK_NODELAY', 'SLOWDNS_BIN_URL', 'SLOWDNS_BIN_SHA256'];
+  'SLOWDNS_KCP_WINDOW', 'SLOWDNS_KCP_INTERVAL', 'SLOWDNS_KCP_ACK_NODELAY', 'SLOWDNS_BIN_URL', 'SLOWDNS_BIN_SHA256',
+  'SLOWDNS_SSH_ENABLE', 'SLOWDNS_XRAY_ENABLE', 'SLOWDNS_XRAY_NS_DOMAIN'];
 const envDump = extract(installer, '\n  cat > /etc/sc-1forcr.env <<EOF\n', '\nEOF\n');
 const pending = extract(installer, '\npersist_pending_install_env() {', '\n}\n');
 const menuUpdate = extract(installer, 'echo "Menjalankan update installer..."', 'bash "${tmp}" 2>&1 | tee "${update_log}"');

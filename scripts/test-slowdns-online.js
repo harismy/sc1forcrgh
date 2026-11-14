@@ -232,6 +232,52 @@ try {
   run('sessions', 1, '2');
   write('native', nativeV2.replace('E|39999|', 'E|x|'));
   run('sessions', 1, '2');
+
+  // SlowDNS Xray (sc-fast12): stream dnstt -> inbound WS Xray dipetakan ke akun
+  // lewat peta tracker xray-live (port sumber dnstt + PID Xray). Port yang lahir
+  // setelah peta ditulis tidak dihitung sebagai tunnel; sessions 2 tidak berubah.
+  exe('xray-live', 'printf "%s\\n" "$*" >> "$FAKE_DIR/xlive.log"; exit 0');
+  env.SLOWDNS_XRAY_LIVE_BIN = B(path.join(bin, 'xray-live'));
+  env.XRAY_LIVE_STATE_FILE = B(F('xray.map'));
+  const xfuture = String((BigInt(Date.now()) + 600000n) * 1000000n);
+  const xsockets = [
+    pair(45001, 700, { target: 10002 }),
+    pair(45002, 702, { target: 10002 }), // PID Xray di peta beda: tidak terverifikasi
+    pair(45003, 700, { target: 10003 }),
+    pair(45004, 700, { target: 10002 }), // port dipakai ulang setelah peta ditulis
+    pair(45005, 700, { target: 10001, owner: 9000 }) // nginx/mux biasa, bukan dnstt
+  ].join('\n');
+  write('sockets', mixed + xsockets + '\n');
+  write('xray.map', '45001|700|vless|carol|-\n45002|701|vless|mallory|-\n45003|700|trojan|dave|-\n45004|700|vless|erin|-\n45005|700|vmess|zed|-\n');
+  write('native', nativeV2.replace('END\n',
+    'X|45001|1111111111111111|500|1000000000|900\nX|45002|4444444444444444|5|1000000000|5\n' +
+    `X|45003|2222222222222222|50|1000000000|60\nX|45004|3333333333333333|1|${xfuture}|1\nEND\n`));
+  write('env', 'SLOWDNS_ENABLE=1\nDROPBEAR_PORT=109\nSLOWDNS_XRAY_ENABLE=1\nSLOWDNS_XRAY_NS_DOMAIN=nsx.contoh.net\n');
+  write('xlive.log', '');
+  out = run();
+  assert(/Akun Xray\s*: 3 akun unik terverifikasi/.test(out), out);
+  assert(/Koneksi Xray\s*: 4 melalui SlowDNS \(1 belum terpetakan\)/.test(out), out);
+  assert(/Tunnel Xray\s*: 2 identitas/.test(out), out);
+  assert(/^carol\s+vless\s+1\s+1$/m.test(out) && /^dave\s+trojan\s+1\s+1$/m.test(out) && /^erin\s+vless\s+1\s+0$/m.test(out), out);
+  assert(!/mallory|zed/.test(out), out);
+  assert(/Akun online\s*: 2 akun unik/.test(out), 'jalur SSH tetap dihitung sama: ' + out);
+  assert.strictEqual(read('xlive.log').trim(), 'raw', 'tracker Xray disegarkan sekali');
+  out = run('sessions', 0, '3');
+  assert(out.startsWith('SC_SLOWDNS_USERS_V3|1008.1234567890|2\n'), out);
+  assert(/^X\|vless\|carol\|1111111111111111\|500\|45001\|1000000000\|900$/m.test(out) &&
+    /^X\|trojan\|dave\|2222222222222222\|50\|45003\|1000000000\|60$/m.test(out), out);
+  assert(!/erin|mallory|4444444444444444|3333333333333333/.test(out), out);
+  assert(/^alice\|aaaaaaaaaaaaaaaa\|100\|40001\|1000000000\|7000$/m.test(out) && out.endsWith('END\n'), out);
+  out = run('sessions', 0, '2');
+  assert(out.startsWith('SC_SLOWDNS_USERS_V2|') && !/^X\|/m.test(out), 'sessions 2 tidak berubah untuk pembaca lama: ' + out);
+  // Jalur Xray mati: tracker tidak dijalankan, baris X dari monitor diabaikan.
+  write('env', 'SLOWDNS_ENABLE=1\nDROPBEAR_PORT=109\n');
+  write('xlive.log', '');
+  out = run();
+  assert(!/Akun Xray/.test(out) && /Tunnel aktif\s*: 2 identitas/.test(out), out);
+  assert.strictEqual(read('xlive.log'), '', 'Xray mati: tracker Xray tidak dipanggil');
+  config();
+  write('sockets', mixed);
   write('native', native);
   out = run('set-lock', 0, '0');
   assert(/SLOWDNS_AUTO_LOCK_ENABLE=0/.test(read('env')), out);

@@ -240,7 +240,9 @@ assert(installer.includes('const hasSocketEvidence = xrayLive.available && liveS
 assert(installer.includes('const hasStrongLogEvidence = cnt > 0 && lockIpSet.size > 0;'));
 assert(installer.includes('const hasLiveEvidence = hasSocketEvidence || hasStrongLogEvidence;'));
 assert(installer.includes('observed_ip_raw_count: evidence.observedRaw'));
-assert(installer.includes('if (!violation.confirmed) continue;'));
+// Lock Xray hanya dari pelanggaran yang sudah terkonfirmasi dua cek: IP-limit
+// atau (V.1FSC.135) tunnel SlowDNS Xray. Tidak ada jalur lock dari satu sampel.
+assert(installer.includes('if (!violation.confirmed && !slowdnsSample.confirmed) continue;'));
 assert(installer.includes('active=($3+0 > 0 && $4+0 > 0 ? 1 : 0);'));
 assert(installer.includes('else out="OFFLINE";'));
 assert(installer.includes('tracker_schema="6"'));

@@ -267,6 +267,62 @@
         }
       },
       "expected": "=============================\n        TROJAN ACCOUNT\n=============================\n\n[ TROJAN DETAILS ]\n-----------------------------\nREMARKS     : dewi\nHOST        : id1.example.com\nPORT TLS    : 443, 8443\nPORT NTLS   : 80, 8080\nPORT GRPC   : 443\nPORT ANY    : 443\nPASSWORD    : 9a1c3e5f-7b2d-4f6a-8c0e-1d3f5a7b9c2e\nSECURITY    : tls / none\nNETWORK     : ws, grpc, upgrade\nPATH WS     : /trojan atau path bebas\nSERVICE     : trojan-grpc\nPATH UPGRADE: /uptrojan\nEXPIRED     : 2026-11-06 14:05:09\nQUOTA       : 100 GB\nIP LIMIT    : 2 pengguna\n\n[ TROJAN URL ]\n-----------------------------\nTLS:\ntrojan://ws-tls\n\nNon-TLS:\ntrojan://ws-ntls\n\ngRPC:\ntrojan://grpc\n\nUp TLS:\ntrojan://up-tls\n\nUp Non-TLS:\ntrojan://up-ntls\n\nOneRing (1FTunnel):\ntrojan://onering\n\n[ HOST INFORMATION ]\n-----------------------------\nDomain      : id1.example.com\nSNI         : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\n\n[ PORTS ]\n-----------------------------\nWS TLS      : 443, 8443\nWS NTLS     : 80, 8080\nGRPC TLS    : 443\nANY PORT    : 443\n-----------------------------\nTerima kasih telah menggunakan layanan kami."
+    },
+    {
+      "name": "trojan-create-slowdns",
+      "type": "trojan",
+      "mode": "create",
+      "data": {
+        "hostname": "id1.example.com",
+        "username": "dewi",
+        "password": "9a1c3e5f-7b2d-4f6a-8c0e-1d3f5a7b9c2e",
+        "uuid": "9a1c3e5f-7b2d-4f6a-8c0e-1d3f5a7b9c2e",
+        "expired": "2026-11-06 14:05:09",
+        "exp": "2026-11-06 14:05:09",
+        "time": "14:05:09",
+        "wildcard_hosts": [],
+        "front_hosts": [],
+        "city": "Jakarta",
+        "isp": "PT Contoh Net",
+        "port": {
+          "tls": "443",
+          "none": "80",
+          "tls_all": "443, 8443",
+          "none_all": "80, 8080",
+          "any": "443",
+          "grpc": "443",
+          "slowdns": "53"
+        },
+        "path": {
+          "ws": "/trojan",
+          "stn": "/trojan",
+          "multi": "/yourbug/trojan",
+          "upgrade": "/uptrojan",
+          "aliases": [
+            "/trojan"
+          ],
+          "any": true
+        },
+        "serviceName": "trojan-grpc",
+        "limitip": "2",
+        "iplimit": "2",
+        "quota": "100",
+        "link": {
+          "tls": "trojan://ws-tls",
+          "none": "trojan://ws-ntls",
+          "grpc": "trojan://grpc",
+          "uptls": "trojan://up-tls",
+          "upntls": "trojan://up-ntls",
+          "onering": "trojan://onering",
+          "slowdns": "trojan://slowdns"
+        },
+        "slowdns": {
+          "ns": "nsx-id1.example.com",
+          "pubkey": "1f8d8075eb40d51939fc76966530df3ee51099038e3ee50655d44a60a804d054",
+          "dns": "203.0.113.10:53"
+        }
+      },
+      "expected": "=============================\n        TROJAN ACCOUNT\n=============================\n\n[ TROJAN DETAILS ]\n-----------------------------\nREMARKS     : dewi\nHOST        : id1.example.com\nPORT TLS    : 443, 8443\nPORT NTLS   : 80, 8080\nPORT GRPC   : 443\nPORT ANY    : 443\nPASSWORD    : 9a1c3e5f-7b2d-4f6a-8c0e-1d3f5a7b9c2e\nSECURITY    : tls / none\nNETWORK     : ws, grpc, upgrade\nPATH WS     : /trojan atau path bebas\nSERVICE     : trojan-grpc\nPATH UPGRADE: /uptrojan\nEXPIRED     : 2026-11-06 14:05:09\nQUOTA       : 100 GB\nIP LIMIT    : 2 pengguna\n\n[ TROJAN URL ]\n-----------------------------\nTLS:\ntrojan://ws-tls\n\nNon-TLS:\ntrojan://ws-ntls\n\ngRPC:\ntrojan://grpc\n\nUp TLS:\ntrojan://up-tls\n\nUp Non-TLS:\ntrojan://up-ntls\n\nOneRing (1FTunnel):\ntrojan://onering\n\nSlowDNS (1FTunnel):\ntrojan://slowdns\n\n[ SLOWDNS ]\n------------------------------\nNS          : nsx-id1.example.com\nPubkey      : 1f8d8075eb40d51939fc76966530df3ee51099038e3ee50655d44a60a804d054\nDNS         : 203.0.113.10:53\n\n[ HOST INFORMATION ]\n-----------------------------\nDomain      : id1.example.com\nSNI         : id1.example.com\nCity        : Jakarta\nISP         : PT Contoh Net\n\n[ PORTS ]\n-----------------------------\nWS TLS      : 443, 8443\nWS NTLS     : 80, 8080\nGRPC TLS    : 443\nANY PORT    : 443\n-----------------------------\nTerima kasih telah menggunakan layanan kami."
     }
   ]
 }

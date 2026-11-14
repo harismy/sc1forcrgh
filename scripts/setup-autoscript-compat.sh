@@ -96,6 +96,9 @@ set -euo pipefail
 #   SLOWDNS_KCP_INTERVAL=10                     (opsional, interval KCP 10-50 ms untuk uji CPU; default 10)
 #   SLOWDNS_KCP_ACK_NODELAY=0                   (opsional, 1=ACK KCP dikirim langsung; default 0)
 #   SLOWDNS_AUTO_LOCK_ENABLE=1                  (batas tunnel aktif mengikuti limit akun SSH; lock sementara 15 menit)
+#   SLOWDNS_SSH_ENABLE=1                        (jalur SSH SlowDNS; 0 = OFF tanpa restart, jalur Xray tetap)
+#   SLOWDNS_XRAY_ENABLE=0                       (1 = SlowDNS Xray lewat domain NS kedua, atur di menu Tools)
+#   SLOWDNS_XRAY_NS_DOMAIN=                     (domain NS kedua untuk VMess/VLESS/Trojan, beda dengan NS SSH)
 #   SLOWDNS_BIN_URL= / SLOWDNS_BIN_SHA256=      (opsional, binary dnstt-server siap pakai; default build dari source)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_URL=              (opsional, endpoint bot pembuat akun untuk event multi-login)
 #   BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN=            (opsional, default otomatis pakai AUTH_TOKEN/API_AUTH_TOKEN server)
@@ -213,7 +216,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.134}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.135}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -284,6 +287,9 @@ SLOWDNS_KCP_ACK_NODELAY="${SLOWDNS_KCP_ACK_NODELAY:-0}"
 SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}"
 SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}"
 SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}"
+SLOWDNS_SSH_ENABLE="${SLOWDNS_SSH_ENABLE:-1}"
+SLOWDNS_XRAY_ENABLE="${SLOWDNS_XRAY_ENABLE:-0}"
+SLOWDNS_XRAY_NS_DOMAIN="${SLOWDNS_XRAY_NS_DOMAIN:-}"
 SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}"
 SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}"
 BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}"
@@ -8186,6 +8192,31 @@ function trojanOneringLink(host, pass, username = '') {
   const remark = encodeURIComponent(`${String(username || `trojan-${host}`).trim() || `trojan-${host}`}-onering`);
   return `trojan://${pass}@${host}:443?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=tls&sni=${encodeURIComponent(oneringSni(host))}&host=${host}&alpn=http%2F1.1&allowInsecure=1#${remark}`;
 }
+
+// SlowDNS Xray khusus aplikasi 1FTunnel (V.1FSC.135): link WS non-TLS biasa
+// ditambah parameter slowdns (domain NS Xray) dan slowdnskey (pubkey). 1FTunnel
+// membawa koneksi WS itu lewat DNSTT; dnstt-server meneruskannya ke inbound WS
+// sesuai path. App lain mengabaikan parameter itu dan konek langsung ke port 80.
+function slowdnsLinkQuery(info) {
+  return `slowdns=${encodeURIComponent(info.ns)}&slowdnskey=${encodeURIComponent(info.pubkey)}`;
+}
+function vmessSlowdnsLink(host, id, info, username = '') {
+  const remark = `${String(username || `vmess-${host}`).trim() || `vmess-${host}`}-slowdns`;
+  const payload = {
+    v: '2', ps: remark, add: host, port: '80', id, aid: '0', scy: 'auto',
+    net: 'ws', type: 'none', host, path: XRAY_PATH_VMESS, tls: 'none',
+    slowdns: info.ns, slowdnskey: info.pubkey
+  };
+  return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+}
+function vlessSlowdnsLink(host, id, info, username = '') {
+  const remark = encodeURIComponent(`${String(username || `vless-${host}`).trim() || `vless-${host}`}-slowdns`);
+  return `vless://${id}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_VLESS)}&security=none&host=${host}&encryption=none&${slowdnsLinkQuery(info)}#${remark}`;
+}
+function trojanSlowdnsLink(host, pass, info, username = '') {
+  const remark = encodeURIComponent(`${String(username || `trojan-${host}`).trim() || `trojan-${host}`}-slowdns`);
+  return `trojan://${pass}@${host}:80?type=ws&path=${encodeURIComponent(XRAY_PATH_TROJAN)}&security=none&host=${host}&${slowdnsLinkQuery(info)}#${remark}`;
+}
 function addFrontBugLink(protocol, links, secret, username = '') {
   if (!Array.isArray(XRAY_FRONT_TARGETS) || XRAY_FRONT_TARGETS.length < 1) return links;
   const frontTlsLinks = [];
@@ -9375,11 +9406,13 @@ function udpcustomPublicPort() {
 // 30 detik. Hanya dikirim saat service dan aturan UDP 53 aktif dan layanan SSH
 // ON, jadi respons VPS tanpa SlowDNS tidak berubah sama sekali.
 const SLOWDNS_STATE_FILE = '/var/lib/sc-1forcr/slowdns.state';
-let slowdnsCache = { at: 0, info: null };
-function slowdnsInfo() {
+let slowdnsCache = { at: 0, info: null, xray: null };
+// Jalur SSH: NS utama, ROUTE_SSH tidak 0. Jalur Xray (V.1FSC.135): XRAY_NS
+// dengan ROUTE_XRAY=1 (helper hanya menulis 1 kalau unit dnstt melayaninya).
+function slowdnsState() {
   const now = Date.now();
   if (now - slowdnsCache.at >= 30000) {
-    let info = null;
+    let info = null, xray = null;
     try {
       const kv = {};
       for (const line of fs.readFileSync(SLOWDNS_STATE_FILE, 'utf8').split(/\r?\n/)) {
@@ -9387,18 +9420,35 @@ function slowdnsInfo() {
         if (m) kv[m[1]] = m[2].trim();
       }
       const ns = String(kv.NS || '').toLowerCase();
+      const xns = String(kv.XRAY_NS || '').toLowerCase();
       const pubkey = String(kv.PUBKEY || '').toLowerCase();
-      if (kv.ENABLED === '1' && kv.ACTIVE === '1' && kv.RULES === '1'
-        && /^[0-9a-f]{64}$/.test(pubkey) && /^([a-z0-9-]+\.){2,}[a-z]{2,63}$/.test(ns)) {
+      const validNs = (d) => /^([a-z0-9-]+\.){2,}[a-z]{2,63}$/.test(d);
+      if (kv.ENABLED === '1' && kv.ACTIVE === '1' && kv.RULES === '1' && /^[0-9a-f]{64}$/.test(pubkey)) {
         const ip = /^\d{1,3}(\.\d{1,3}){3}$/.test(kv.PUBLIC_IP || '') ? kv.PUBLIC_IP : '';
-        info = { ns, pubkey, dns: ip ? `${ip}:53` : '' };
+        const dns = ip ? `${ip}:53` : '';
+        if (validNs(ns) && kv.ROUTE_SSH !== '0') info = { ns, pubkey, dns };
+        if (kv.ROUTE_XRAY === '1' && validNs(xns) && xns !== ns) xray = { ns: xns, pubkey, dns };
       }
     } catch (_) {}
-    slowdnsCache = { at: now, info };
+    slowdnsCache = { at: now, info, xray };
   }
-  if (!slowdnsCache.info) return null;
-  const ssh = String(readServiceToggles().SERVICE_SSH_ENABLE ?? '1').trim().toLowerCase();
-  return ['0', 'false', 'no', 'off'].includes(ssh) ? null : slowdnsCache.info;
+  return slowdnsCache;
+}
+function serviceToggleOff(key) {
+  const value = String(readServiceToggles()[key] ?? '1').trim().toLowerCase();
+  return ['0', 'false', 'no', 'off'].includes(value);
+}
+function slowdnsInfo() {
+  const info = slowdnsState().info;
+  if (!info) return null;
+  return serviceToggleOff('SERVICE_SSH_ENABLE') ? null : info;
+}
+// SlowDNS Xray untuk satu protokol: null kalau jalurnya mati atau protokol
+// itu OFF di menu ON/OFF (gerbang menutup inbound-nya, termasuk lewat SlowDNS).
+function slowdnsXrayInfo(protocol) {
+  const info = slowdnsState().xray;
+  if (!info || !/^(vmess|vless|trojan)$/.test(String(protocol || ''))) return null;
+  return serviceToggleOff(`SERVICE_${String(protocol).toUpperCase()}_ENABLE`) ? null : info;
 }
 
 // ovpntcp/ovpnudp/sshohp tetap dikirim supaya bot lain yang membacanya tanpa
@@ -9966,6 +10016,11 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
   const expDate = trial ? dateExpPlusMinutes(60) : dateExpPlusDays(expDays);
   const xrayHost = XRAY_LINK_HOST;
   const location = await getVpsLocationInfo();
+  // SlowDNS Xray: hanya dikirim saat jalurnya aktif untuk protokol ini, jadi
+  // respons VPS tanpa SlowDNS Xray tidak berubah sama sekali.
+  const slowdns = slowdnsXrayInfo(protocol);
+  const slowdnsPort = slowdns ? { slowdns: '53' } : {};
+  const slowdnsData = slowdns ? { slowdns } : {};
   let data = null;
   if (protocol === 'vmess') {
     await ensureUsernameNotExists('account_vmesses', finalUsername);
@@ -10008,7 +10063,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
-      port: publicPorts({ any: '443', grpc: '443' }),
+      port: publicPorts({ any: '443', grpc: '443', ...slowdnsPort }),
       path: { ws: XRAY_PATH_VMESS, stn: XRAY_PATH_VMESS, multi: '/yourbug', upgrade: XRAY_UPGRADE_PATH.vmess, aliases: XRAY_PATHS_VMESS, any: xrayMultipathActive() },
       serviceName: 'vmess-grpc',
       limitip: String(limitip),
@@ -10020,9 +10075,11 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
         grpc: vmessGrpcLink(xrayHost, uuid, finalUsername),
         uptls: vmessUpgradeLink(xrayHost, uuid, true, finalUsername),
         upntls: vmessUpgradeLink(xrayHost, uuid, false, finalUsername),
-        onering: vmessOneringLink(xrayHost, uuid, finalUsername)
+        onering: vmessOneringLink(xrayHost, uuid, finalUsername),
+        ...(slowdns ? { slowdns: vmessSlowdnsLink(xrayHost, uuid, slowdns, finalUsername) } : {})
       }, uuid, finalUsername),
-      bug_profile: bugCfg ? { config: bugCfg, vmess: bugVmess } : null
+      bug_profile: bugCfg ? { config: bugCfg, vmess: bugVmess } : null,
+      ...slowdnsData
     };
   } else if (protocol === 'vless') {
     await ensureUsernameNotExists('account_vlesses', finalUsername);
@@ -10036,7 +10093,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
-      port: publicPorts({ any: '443', grpc: '443' }),
+      port: publicPorts({ any: '443', grpc: '443', ...slowdnsPort }),
       path: {
         ws: XRAY_PATH_VLESS, stn: XRAY_PATH_VLESS, multi: '/yourbug/vless', upgrade: XRAY_UPGRADE_PATH.vless, aliases: XRAY_PATHS_VLESS, any: xrayMultipathActive(),
         ...(XRAY_XHTTP_ENABLED ? { xhttp: XRAY_XHTTP_PATH_VLESS } : {})
@@ -10055,8 +10112,10 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
           xhttptls: vlessXhttpLink(xrayHost, uuid, true, finalUsername),
           xhttpntls: vlessXhttpLink(xrayHost, uuid, false, finalUsername)
         } : {}),
-        onering: vlessOneringLink(xrayHost, uuid, finalUsername)
-      }, uuid, finalUsername)
+        onering: vlessOneringLink(xrayHost, uuid, finalUsername),
+        ...(slowdns ? { slowdns: vlessSlowdnsLink(xrayHost, uuid, slowdns, finalUsername) } : {})
+      }, uuid, finalUsername),
+      ...slowdnsData
     };
   } else if (protocol === 'trojan') {
     await ensureUsernameNotExists('account_trojans', finalUsername);
@@ -10070,7 +10129,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
       wildcard_hosts: XRAY_ALIAS_HOSTS,
       front_hosts: XRAY_FRONT_HOSTS,
       city: location.city, isp: location.isp,
-      port: publicPorts({ any: '443', grpc: '443' }),
+      port: publicPorts({ any: '443', grpc: '443', ...slowdnsPort }),
       path: { ws: XRAY_PATH_TROJAN, stn: XRAY_PATH_TROJAN, multi: '/yourbug/trojan', upgrade: XRAY_UPGRADE_PATH.trojan, aliases: XRAY_PATHS_TROJAN, any: xrayMultipathActive() },
       serviceName: 'trojan-grpc',
       limitip: String(limitip),
@@ -10082,8 +10141,10 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
         grpc: trojanGrpcLink(xrayHost, pass, finalUsername),
         uptls: trojanUpgradeLink(xrayHost, pass, true, finalUsername),
         upntls: trojanUpgradeLink(xrayHost, pass, false, finalUsername),
-        onering: trojanOneringLink(xrayHost, pass, finalUsername)
-      }, pass, finalUsername)
+        onering: trojanOneringLink(xrayHost, pass, finalUsername),
+        ...(slowdns ? { slowdns: trojanSlowdnsLink(xrayHost, pass, slowdns, finalUsername) } : {})
+      }, pass, finalUsername),
+      ...slowdnsData
     };
   }
   if (trial) await markTrialAccount(protocol, finalUsername);
@@ -10215,7 +10276,9 @@ async function renewXray(table, username, exp, req) {
     status: nextStatus,
     limitip: String(nextLimitIp),
     created: false,
-    time: nowTime()
+    time: nowTime(),
+    // SlowDNS Xray (NS/pubkey/dns) ikut seperti renew SSH; null kalau jalurnya mati.
+    ...(slowdnsXrayInfo(meta.protocol) ? { slowdns: slowdnsXrayInfo(meta.protocol), port: { slowdns: '53' } } : {})
   };
   await notifyAccountEvent('renew', meta.protocol, { ...renewPayload, added_days: exp }, owner);
   return renewPayload;
@@ -14852,6 +14915,7 @@ async function cleanupExpiredGrace(nowTs) {
 // selalu menghasilkan nol bukti, sehingga akun tidak terkunci karena data rusak.
 function readSlowdnsTunnelUsage(nowTs) {
   const result = new Map();
+  result.xray = new Map();
   let configured = SLOWDNS_AUTO_LOCK_ENABLED;
   try {
     const conf = fs.readFileSync('/etc/sc-1forcr.env', 'utf8');
@@ -14882,6 +14946,20 @@ function readSlowdnsTunnelUsage(nowTs) {
       if (!result.has(user)) result.set(user, new Set());
       result.get(user).add(`${instance}:${cid}`);
     }
+    // SlowDNS Xray: aturan bukti sama (umur >=90 detik, byte klien baru sejak
+    // baseline). Kunci "x|" terpisah dari SSH; hasil di result.xray dengan
+    // kunci "protokol|akun".
+    for (const row of snap.xray || []) {
+      const { proto, user, cid, up, port, started } = row;
+      const key = `x|${proto}|${user}|${cid}|${port}|${started}`;
+      current[key] = up;
+      const old = baseline[key];
+      const startedSec = Number(started.slice(0, -9));
+      if (!baselineValid || !Number.isSafeInteger(old) || up <= old || nowTs - startedSec < 90) continue;
+      const accountKey = `${proto}|${user}`;
+      if (!result.xray.has(accountKey)) result.xray.set(accountKey, new Set());
+      result.xray.get(accountKey).add(`${instance}:${cid}`);
+    }
     fs.mkdirSync(require('path').dirname(SLOWDNS_ACTIVITY_FILE), { recursive: true });
     const tmp = `${SLOWDNS_ACTIVITY_FILE}.tmp.${process.pid}`;
     fs.writeFileSync(tmp, JSON.stringify({ instance, updatedAt: nowTs, rows: current }), { mode: 0o600 });
@@ -14900,11 +14978,14 @@ function readSlowdnsTunnelUsage(nowTs) {
 function parseSlowdnsSessions(raw) {
   const lines = String(raw || '').trim().split(/\r?\n/);
   const head = lines.shift() || '';
-  let m = /^SC_SLOWDNS_USERS_V2\|([0-9]+\.[0-9]+)\|([12])$/.exec(head);
-  let v2 = true, bytes = false, instance = '';
+  // V3 (V.1FSC.135) = V2 + baris X|protokol|akun|cid|up|port|started|down
+  // untuk SlowDNS Xray. Port X terpisah dari port SSH (koneksi ke tujuan lain).
+  let m = /^SC_SLOWDNS_USERS_V([23])\|([0-9]+\.[0-9]+)\|([12])$/.exec(head);
+  let v2 = true, v3 = false, bytes = false, instance = '';
   if (m) {
-    instance = m[1];
-    bytes = m[2] === '2';
+    v3 = m[1] === '3';
+    instance = m[2];
+    bytes = m[3] === '2';
   } else {
     m = /^SC_SLOWDNS_USERS_V1\|([0-9]+\.[0-9]+)$/.exec(head);
     if (!m) return null;
@@ -14912,8 +14993,17 @@ function parseSlowdnsSessions(raw) {
     instance = m[1];
   }
   if (lines.pop() !== 'END') return null;
-  const live = [], ended = [], observed = new Set();
+  const live = [], ended = [], xray = [], observed = new Set(), observedX = new Set();
   for (const line of lines) {
+    if (v3 && line.startsWith('X|')) {
+      const x = /^X\|(vmess|vless|trojan)\|([a-z0-9._-]+)\|([0-9a-f]{16})\|([0-9]+)\|([0-9]+)\|([0-9]{10,20})\|([0-9]+)$/.exec(line);
+      if (!x) return null;
+      const up = Number(x[4]), port = Number(x[5]), down = Number(x[7]);
+      if (!Number.isSafeInteger(up) || !Number.isSafeInteger(down) || port < 1 || port > 65535 || observedX.has(port)) return null;
+      observedX.add(port);
+      xray.push({ proto: x[1], user: x[2], cid: x[3], up, port, started: x[6], down });
+      continue;
+    }
     if (v2 && line.startsWith('E|')) {
       const e = /^E\|([0-9a-f]{16})\|([0-9]+)\|([0-9]+)\|([0-9]{10,20})\|([0-9]+)\|([0-9]{10,20})$/.exec(line);
       if (!e || !bytes) return null;
@@ -14933,14 +15023,18 @@ function parseSlowdnsSessions(raw) {
     observed.add(port);
     live.push({ user: r[1], cid: r[2], up, port, started: r[5], down });
   }
-  return { instance, bytes, live, ended };
+  return { instance, bytes, live, ended, xray };
 }
 
 function readSlowdnsSnapshot() {
+  const read = (mode) => execFileSync('/usr/local/sbin/sc-1forcr-slowdns', ['sessions', mode], {
+    encoding: 'utf8', timeout: 12000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']
+  });
   try {
-    const raw = execFileSync('/usr/local/sbin/sc-1forcr-slowdns', ['sessions', '2'], {
-      encoding: 'utf8', timeout: 12000, maxBuffer: 2 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore']
-    });
+    let raw = read('3');
+    // Helper lama belum mengenal mode 3 dan mencetak V1 (tanpa byte kuota):
+    // ulangi dengan mode 2 supaya kuota SSH SlowDNS tetap terhitung.
+    if (/^SC_SLOWDNS_USERS_V1\|/.test(raw)) raw = read('2');
     return parseSlowdnsSessions(raw);
   } catch (_) {
     return null;
@@ -15008,6 +15102,49 @@ async function sampleSlowdnsTunnelLimit(username, tunnels, limit, nowTs) {
   ).catch(() => {});
   if (!candidate) return { candidate: false, confirmed: false, hits: 0 };
   return sampleSshwsViolation(user, signal, ids.length, true, nowTs);
+}
+
+// SlowDNS Xray (V.1FSC.135): identitas tunnel DNSTT per akun Xray. Ambang
+// mengikuti aturan Xray (limit x2): 1FTunnel Load Balance membuka dua tunnel
+// dari satu HP. Wajib melewati ambang dengan sidik jari tunnel yang sama di dua
+// pengecekan berturut-turut (jeda dan siklus sama dengan IP-limit Xray).
+async function sampleXraySlowdnsLimit(accountTypeRaw, username, tunnels, limit, nowTs) {
+  const accountType = String(accountTypeRaw || '').trim().toLowerCase();
+  const user = String(username || '').trim().toLowerCase();
+  if (!/^(vmess|vless|trojan)$/.test(accountType) || !/^[a-z0-9._-]+$/.test(user)) {
+    return { candidate: false, confirmed: false, hits: 0 };
+  }
+  const ids = [...new Set(tunnels || [])].sort();
+  const candidate = Number(limit) > 0 && ids.length > Number(limit);
+  const signal = candidate ? `xray-slowdns-${crypto.createHash('sha256').update(JSON.stringify(ids)).digest('hex').slice(0, 20)}` : '';
+  await run(
+    "DELETE FROM iplimit_violation_pending WHERE account_type=? AND username=? AND signal LIKE 'xray-slowdns-%' AND signal<>?",
+    [accountType, user, signal]
+  ).catch(() => {});
+  if (!candidate) return { candidate: false, confirmed: false, hits: 0 };
+  const previous = await get(
+    "SELECT first_seen, last_seen, hits FROM iplimit_violation_pending WHERE account_type=? AND username=? AND signal=?",
+    [accountType, user, signal]
+  ).catch(() => null);
+  const previousLastSeen = Number(previous?.last_seen || 0);
+  const elapsed = nowTs - previousLastSeen;
+  const validPrevious = previousLastSeen > 0 && previousLastSeen <= nowTs + 60;
+  const tooSoon = validPrevious && elapsed >= 0 && elapsed < XRAY_LIMIT_MIN_GAP_SECONDS;
+  const consecutive = validPrevious
+    && elapsed >= XRAY_LIMIT_MIN_GAP_SECONDS
+    && elapsed <= XRAY_LIMIT_MAX_GAP_SECONDS;
+  const firstSeen = (tooSoon || consecutive) ? Number(previous?.first_seen || nowTs) : nowTs;
+  const hits = consecutive
+    ? Math.min(XRAY_LIMIT_CONFIRM_CYCLES, Number(previous?.hits || 0) + 1)
+    : (tooSoon ? Math.max(1, Number(previous?.hits || 1)) : 1);
+  const lastSeen = tooSoon ? previousLastSeen : nowTs;
+  await run(
+    `INSERT OR REPLACE INTO iplimit_violation_pending
+       (account_type, username, signal, first_seen, last_seen, hits, detected)
+     VALUES(?, ?, ?, ?, ?, ?, ?)`,
+    [accountType, user, signal, firstSeen, lastSeen, hits, ids.length]
+  ).catch(() => {});
+  return { candidate: true, confirmed: hits >= XRAY_LIMIT_CONFIRM_CYCLES, hits };
 }
 
 async function sampleSshwsViolation(username, signalRaw, detected, candidate, nowTs) {
@@ -15344,6 +15481,7 @@ async function lockIfExceeded(nowTs) {
   }
   const sshUsage = parseSshAndUdpUsage();
   const slowdnsTunnels = readSlowdnsTunnelUsage(nowTs);
+  const slowdnsXrayTunnels = slowdnsTunnels.xray || new Map();
   const zivpnLive = await readZivpnLiveMap(nowTs);
   const sshIpMap = sshUsage.ipMap;
   const sshSessionMap = sshUsage.sessionMap;
@@ -15705,15 +15843,22 @@ async function lockIfExceeded(nowTs) {
         hasLiveEvidence ? xrayDeviceLimit : Number.MAX_SAFE_INTEGER,
         nowTs
       );
+      // SlowDNS Xray: tunnel DNSTT per akun (bukan IP resolver), ambang limit x2.
+      const xraySlowdnsTunnels = slowdnsXrayTunnels.get(`${item.type}|${userKey}`) || new Set();
+      const slowdnsSample = await sampleXraySlowdnsLimit(item.type, userKey, xraySlowdnsTunnels, xrayDeviceLimit, nowTs);
       if (IPLIMIT_DEBUG) {
         const ips = Array.from(lockIpSet).slice(0, 8).join(',');
-        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cntGrouped=${cntGrouped} cnt=${cnt} mask=${XRAY_IP_GROUP_MASK} liveTracker=${xrayLive.available ? 1 : 0} liveSockets=${liveSocketCount} socketEvidence=${hasSocketEvidence ? 1 : 0} logEvidence=${hasStrongLogEvidence ? 1 : 0} candidate=${violation.candidate ? 1 : 0} confirm=${violation.hits}/${XRAY_LIMIT_CONFIRM_CYCLES} ips=${ips}`);
+        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cntRaw=${cntRaw} cntGrouped=${cntGrouped} cnt=${cnt} mask=${XRAY_IP_GROUP_MASK} liveTracker=${xrayLive.available ? 1 : 0} liveSockets=${liveSocketCount} socketEvidence=${hasSocketEvidence ? 1 : 0} logEvidence=${hasStrongLogEvidence ? 1 : 0} candidate=${violation.candidate ? 1 : 0} confirm=${violation.hits}/${XRAY_LIMIT_CONFIRM_CYCLES} slowdnsTunnels=${xraySlowdnsTunnels.size} slowdnsConfirm=${slowdnsSample.hits}/${XRAY_LIMIT_CONFIRM_CYCLES} ips=${ips}`);
       }
-      if (!violation.confirmed) continue;
+      if (!violation.confirmed && !slowdnsSample.confirmed) continue;
       if (graceMap.has(`${item.type}|${userKey}`)) continue;
       const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]);
       if (exists) continue;
-      const lockIps = Array.from(lockIpSet);
+      const lockBySlowdns = slowdnsSample.confirmed && !violation.confirmed;
+      const lockSeconds = lockBySlowdns ? SLOWDNS_LOCK_SECONDS : LOCK_SECONDS;
+      // Lock karena SlowDNS: tidak ada IP pembeli untuk diblokir (sumbernya
+      // dnstt di 127.0.0.1); akun dicabut dari config Xray seperti biasa.
+      const lockIps = lockBySlowdns ? [] : Array.from(lockIpSet);
       await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       for (const ipRaw of lockIps) {
         const ip = String(ipRaw || '').trim();
@@ -15731,9 +15876,9 @@ async function lockIfExceeded(nowTs) {
         }
       }
       await run(`UPDATE ${item.table} SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
-      await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES(?, ?, ?, 0)", [item.type, user, nowTs + LOCK_SECONDS]).catch(() => {});
+      await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES(?, ?, ?, 0)", [item.type, user, nowTs + lockSeconds]).catch(() => {});
       await run(
-        "DELETE FROM iplimit_violation_pending WHERE account_type=? AND username=? AND signal LIKE 'xray-ip-%'",
+        "DELETE FROM iplimit_violation_pending WHERE account_type=? AND username=? AND (signal LIKE 'xray-ip-%' OR signal LIKE 'xray-slowdns-%')",
         [item.type, userKey]
       ).catch(() => {});
       // Terapkan lock ke runtime sebelum menunggu webhook/Telegram.
@@ -15743,34 +15888,42 @@ async function lockIfExceeded(nowTs) {
         stopXrayFailClosed(`locked credential remains after immediate lock users=${leakedAfterLock.users.join(',')}`);
         throw new Error('Immediate Xray lock verification failed.');
       }
-      const lockReasonText = 'pemakaian IP aktif bersamaan melewati limit akun';
+      const slowdnsLabel = `${item.type.toUpperCase()} lewat SlowDNS: ${xraySlowdnsTunnels.size} tunnel aktif; batas ${xrayDeviceLimit} (limit x2)`;
+      const lockReasonText = lockBySlowdns
+        ? `tunnel SlowDNS aktif melewati batas akun selama ${XRAY_LIMIT_CONFIRM_CYCLES} kali pengecekan (bukan hitungan HP/IP resolver)`
+        : 'pemakaian IP aktif bersamaan melewati limit akun';
+      const notifyService = lockBySlowdns ? 'slowdns' : item.type;
+      const notifyLimit = lockBySlowdns ? xrayDeviceLimit : lim;
+      const notifyDetected = lockBySlowdns ? xraySlowdnsTunnels.size : cnt;
       const historyId = await createIpLimitLockHistory({
         account_type: item.type,
-        service: item.type,
+        service: notifyService,
         username: user,
-        limitip: lim,
-        detected: cnt,
-        detected_raw: cntRaw,
-        detected_effective: cnt,
+        limitip: notifyLimit,
+        detected: notifyDetected,
+        detected_raw: lockBySlowdns ? notifyDetected : cntRaw,
+        detected_effective: notifyDetected,
         ips: lockIps,
         lock_reason: lockReasonText,
+        ...(lockBySlowdns ? { device_detected_label: slowdnsLabel } : {}),
         owner_telegram_id: Number(r.owner_telegram_id || 0) || null,
         owner_telegram_chat_id: Number(r.owner_telegram_chat_id || 0) || null,
         locked_at: nowTs,
-        locked_until: nowTs + LOCK_SECONDS
+        locked_until: nowTs + lockSeconds
       });
       await notifyMultiLoginLock(
-        item.type,
+        notifyService,
         user,
-        lim,
-        cnt,
+        notifyLimit,
+        notifyDetected,
         lockIps,
         Number(r.owner_telegram_id || 0) || null,
         Number(r.owner_telegram_chat_id || 0) || null,
         {
-          detected_raw: cntRaw,
-          detected_effective: cnt,
-          lock_reason: lockReasonText
+          detected_raw: lockBySlowdns ? notifyDetected : cntRaw,
+          detected_effective: notifyDetected,
+          lock_reason: lockReasonText,
+          ...(lockBySlowdns ? { device_detected_label: slowdnsLabel, unlock_minutes: lockSeconds / 60 } : {})
         },
         historyId
       );
@@ -18426,7 +18579,8 @@ SLOWDNS_KEYS = (
     "SLOWDNS_NS_DOMAIN", "SLOWDNS_LISTEN_PORT", "SLOWDNS_MTU",
     "SLOWDNS_MEMORY_MAX", "SLOWDNS_KCP_WINDOW", "SLOWDNS_KCP_INTERVAL",
     "SLOWDNS_KCP_ACK_NODELAY", "SLOWDNS_GOMAXPROCS", "SLOWDNS_GOGC",
-    "SLOWDNS_AUTO_LOCK_ENABLE",
+    "SLOWDNS_AUTO_LOCK_ENABLE", "SLOWDNS_SSH_ENABLE", "SLOWDNS_XRAY_ENABLE",
+    "SLOWDNS_XRAY_NS_DOMAIN",
 )
 
 
@@ -23263,6 +23417,11 @@ slowdns_port() {
   local f="${SLOWDNS_STATE_FILE:-/var/lib/sc-1forcr/slowdns.state}" port
   [[ -r "${f}" ]] || return 0
   [[ "$(sed -n 's/^ENABLED=//p' "${f}" | tail -n1)" == "1" ]] || return 0
+  # Port dipakai bersama SlowDNS Xray (sc-fast12): jangan ditutup. Jalur SSH
+  # ditolak dnstt sendiri lewat ROUTE_SSH=0 di file state, tanpa restart.
+  if [[ "$(sed -n 's/^ROUTE_XRAY=//p' "${f}" | tail -n1)" == "1" ]]; then
+    return 0
+  fi
   port="$(sed -n 's/^LISTEN=//p' "${f}" | tail -n1 | tr -cd '0-9')"
   printf '%s' "${port}" | join_ports "53 67 68 123"
 }
@@ -23434,6 +23593,18 @@ set_xhttp() {
   die "Xray tidak sehat setelah XHTTP diubah; pengaturan dikembalikan ke semula"
 }
 
+# Jalur SlowDNS SSH/Xray mengikuti saklar layanan. Helper menulis ROUTE_* ke
+# file state (dibaca dnstt tanpa restart) sebelum rule gerbang disusun, jadi
+# keputusan menutup port SlowDNS memakai status jalur terbaru. Helper apply
+# tidak memanggil gerbang, jadi tidak ada putaran saling panggil.
+slowdns_routes_apply() {
+  local bin="${SERVICE_GATE_SLOWDNS_BIN:-/usr/local/sbin/sc-1forcr-slowdns}"
+  if [[ -x "${bin}" ]]; then
+    "${bin}" apply >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 cmd_set() {
   local svc="${1:-}" want="${2:-}" key value previous
   key="$(service_key "${svc}")" || die "layanan tidak dikenal: ${svc:-kosong} (pilih: ${SERVICES[*]})"
@@ -23451,8 +23622,10 @@ cmd_set() {
     die "iptables tidak tersedia, layanan tidak bisa ditutup"
   fi
   write_flag "${key}" "${value}"
+  slowdns_routes_apply
   if ! cmd_apply; then
     write_flag "${key}" "${previous}"
+    slowdns_routes_apply
     cmd_apply || true
     die "rule iptables gagal dipasang; status ${svc} dikembalikan"
   fi
@@ -24391,7 +24564,13 @@ install_slowdns_manager() {
   mkdir -p /usr/local/sbin /var/lib/sc-1forcr
   cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
 #!/usr/bin/env bash
-# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|records|suggest|check|info|clear}
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}
+#
+# - xray-enable/xray-disable/set-xray-ns : jalur Xray (domain NS kedua, kunci
+#               sama). Query domain itu diteruskan dnstt ke inbound WS Xray
+#               lokal sesuai path (/vmess, /vless, /trojan). Butuh binary sc-fast12.
+# - ssh-route : ON/OFF jalur SSH SlowDNS. ON/OFF jalur ditulis ke file state
+#               (ROUTE_SSH/ROUTE_XRAY) dan dibaca dnstt tanpa restart.
 #
 # - setup     : pasang binary, kunci, dan unit lalu nyalakan atau matikan service
 #               sesuai SLOWDNS_ENABLE. Dipanggil install/update dan menu. Hanya
@@ -24428,6 +24607,12 @@ SERVICE_GATE_BIN="${SLOWDNS_SERVICE_GATE_BIN:-/usr/local/sbin/sc-1forcr-service-
 SSH_LIVE_BIN="${SLOWDNS_SSH_LIVE_BIN:-/usr/local/sbin/sc-1forcr-ssh-live}"
 SSH_LIVE_MAP="${SSH_LIVE_STATE_FILE:-/run/sc-1forcr/ssh-live.map}"
 SESSION_SOCKET="${SLOWDNS_SESSION_SOCKET:-/run/sc-1forcr-slowdns/sessions.sock}"
+XRAY_LIVE_BIN="${SLOWDNS_XRAY_LIVE_BIN:-/usr/local/sbin/sc-1forcr-xray-live}"
+XRAY_LIVE_MAP="${XRAY_LIVE_STATE_FILE:-/run/sc-1forcr/xray-live.map}"
+# Inbound WebSocket Xray lokal (path dikunci installer ke /vmess /vless /trojan).
+# Port yang sama dipakai gerbang ON/OFF, jadi VMess/VLESS/Trojan OFF ikut
+# menutup jalurnya lewat SlowDNS.
+XRAY_ROUTE="/vmess=127.0.0.1:10001,/vless=127.0.0.1:10002,/trojan=127.0.0.1:10003"
 SERVICE="sc-1forcr-slowdns.service"
 SVC_USER="sc-1forcr-slowdns"
 CHAIN="SC1FORCR_SLOWDNS"
@@ -24448,7 +24633,9 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # sc-fast10: byte download per stream + stream putus disimpan 30 menit (kuota SSH).
 # sc-fast11: ukuran respons terbukti per klien. Lewat resolver (8.8.8.8 dkk)
 # EDNS di query milik resolver, jadi app ber-buffer kecil dulu tidak bisa konek.
-DNSTT_PATCH_ID="sc-fast11"
+# sc-fast12: domain NS kedua untuk Xray (path WS ke inbound lokal) + ON/OFF
+# jalur SSH/Xray dari file state tanpa restart.
+DNSTT_PATCH_ID="sc-fast12"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -24735,6 +24922,58 @@ load_config() {
   TARGET_PORT="${REPLY}"
   env_val DOMAIN
   DOMAIN_MAIN="${REPLY,,}"
+  # Jalur Xray (sc-fast12): domain NS kedua, kunci dan proses yang sama.
+  XRAY_ENABLED=0
+  env_val SLOWDNS_XRAY_ENABLE
+  if flag_on "${REPLY}"; then XRAY_ENABLED=1; fi
+  XRAY_NS=""
+  env_val SLOWDNS_XRAY_NS_DOMAIN
+  if normalize_ns "${REPLY}" && [[ "${REPLY}" != "${NS}" ]]; then XRAY_NS="${REPLY}"; fi
+  SSH_ROUTE_ENABLED=1
+  env_val SLOWDNS_SSH_ENABLE
+  if [[ -n "${REPLY}" ]] && ! flag_on "${REPLY}"; then SSH_ROUTE_ENABLED=0; fi
+  # Jalur ikut saklar layanan global (menu ON/OFF): SSH OFF menutup SlowDNS SSH,
+  # VMess/VLESS/Trojan OFF semua menutup SlowDNS Xray (per protokol ditutup
+  # gerbang lewat port inbound-nya).
+  ROUTE_SSH=0
+  if (( SSH_ROUTE_ENABLED )) && svc_on SERVICE_SSH_ENABLE; then ROUTE_SSH=1; fi
+  ROUTE_XRAY=0
+  if (( XRAY_ENABLED )) && [[ -n "${XRAY_NS}" ]] && \
+     { svc_on SERVICE_VMESS_ENABLE || svc_on SERVICE_VLESS_ENABLE || svc_on SERVICE_TROJAN_ENABLE; }; then
+    ROUTE_XRAY=1
+  fi
+}
+
+# Saklar layanan global; kosong = ON (default menu ON/OFF).
+svc_on() {
+  env_val "$1"
+  [[ -z "${REPLY}" ]] || flag_on "${REPLY}"
+}
+
+# Binary mendukung jalur Xray + file routes (sc-fast12)? Dicek lewat -h hanya
+# saat menyusun unit, supaya unit tidak pernah memakai flag yang belum dikenal
+# binary lama (build gagal saat update = binary lama tetap jalan).
+bin_has_routes() {
+  [[ -x "${BIN}" ]] || return 1
+  "${BIN}" -h 2>&1 | grep -q -- '-routes-file'
+}
+
+# Argumen tambahan ExecStart -> REPLY. Flag Xray dipasang selama domain NS
+# Xray terisi (ON/OFF lewat file state), jadi menyalakan/mematikan jalur Xray
+# tidak me-restart service.
+route_args() {
+  REPLY=""
+  bin_has_routes || return 0
+  REPLY=" -routes-file ${STATE_FILE}"
+  if [[ -n "${XRAY_NS}" ]]; then
+    REPLY+=" -xray-domain ${XRAY_NS} -xray-route ${XRAY_ROUTE}"
+  fi
+}
+
+# Unit yang terpasang sudah melayani domain Xray?
+unit_has_xray() {
+  [[ -n "${XRAY_NS}" && -r "${UNIT_FILE}" ]] || return 1
+  [[ "$(< "${UNIT_FILE}")" == *" -xray-domain ${XRAY_NS} "* ]]
 }
 
 go_arch() {
@@ -26389,6 +26628,481 @@ func scMinInt(a, b int) int {
 
 patch_response_size(mod)
 
+# sc-fast12: SlowDNS untuk Xray lewat domain NS kedua. Satu proses dnstt dan
+# satu kunci melayani dua domain: query untuk -xray-domain menandai ClientID
+# sebagai jalur Xray, dan stream sesi itu diteruskan ke inbound WebSocket Xray
+# lokal sesuai path di baris permintaan HTTP pertama (-xray-route). Jalur SSH
+# tetap ke Dropbear seperti sebelumnya. ON/OFF tiap jalur dibaca dari file state
+# helper (ROUTE_SSH/ROUTE_XRAY), dicek paling sering tiap 3 detik, tanpa restart:
+# query jalur yang OFF dijawab NXDOMAIN tanpa membuat sesi KCP.
+def patch_xray_route(mod):
+    path = os.path.join(mod, 'dnstt-server', 'main.go')
+    src = io.open(path, encoding='utf-8').read()
+    def replace(old, new):
+        nonlocal src
+        if src.count(old) != 1:
+            raise RuntimeError('route anchor count %d: %r' % (src.count(old), old[:90]))
+        src = src.replace(old, new)
+    replace('\tflag.StringVar(&scOnlineSocket, "sc-online", "", "read SC session monitor Unix socket")\n',
+            '\tflag.StringVar(&scOnlineSocket, "sc-online", "", "read SC session monitor Unix socket")\n'
+            '\tscRouteFlags()\n')
+    replace('\t\terr = run(privkey, domain, upstream, dnsConn)\n',
+            '\t\tif err := scRouteSetup(domain); err != nil {\n'
+            '\t\t\tfmt.Fprintf(os.Stderr, "%v\\n", err)\n'
+            '\t\t\tos.Exit(1)\n'
+            '\t\t}\n'
+            '\t\terr = run(privkey, domain, upstream, dnsConn)\n')
+    replace('\tprefix, ok := question.Name.TrimSuffix(domain)\n',
+            '\tprefix, ok := scTrimTunnelDomain(question.Name, domain)\n')
+    replace('\t\tresp, payload := responseFor(&query, domain)\n',
+            '\t\tresp, payload := responseFor(&query, domain)\n'
+            '\t\t// Jalur yang OFF: NXDOMAIN tanpa sesi KCP (hemat CPU).\n'
+            '\t\troute := scQueryRoute(&query, domain)\n'
+            '\t\tif route == scRouteRefused {\n'
+            '\t\t\tif resp != nil && resp.Rcode() == dns.RcodeNoError {\n'
+            '\t\t\t\tresp.Flags |= dns.RcodeNameError\n'
+            '\t\t\t}\n'
+            '\t\t\tpayload = nil\n'
+            '\t\t}\n')
+    replace('\t\t\twatch := clientEdnsRecord(clientID, size, query.Question[0].Type)\n',
+            '\t\t\twatch := clientEdnsRecord(clientID, size, query.Question[0].Type, uint16(route))\n')
+    replace('        if len(kinds) != 0 { clientKinds[cid] = kinds[0] }\n',
+            '        if len(kinds) != 0 { clientKinds[cid] = kinds[0] }\n'
+            '\t\tif len(kinds) > 1 && kinds[1] == scRouteXray {\n'
+            '\t\t\tclientRoute[cid] = scRouteXray\n'
+            '\t\t}\n')
+    replace('\tdelete(clientSize, cid)\n\tclientEdnsMu.Unlock()\n',
+            '\tdelete(clientSize, cid)\n\tdelete(clientRoute, cid)\n\tclientEdnsMu.Unlock()\n')
+    replace('\t\t\terr := handleStream(stream, upstream, conn.GetConv(), clientID)\n',
+            '\t\t\terr := scHandleStream(conn, stream, upstream, clientID)\n')
+    io.open(path, 'w', encoding='utf-8', newline='\n').write(src)
+
+    gpath = os.path.join(mod, 'dnstt-server', 'sc_guard.go')
+    gsrc = io.open(gpath, encoding='utf-8').read()
+    old = '\t\t\tdelete(clientSize, k)\n'
+    if gsrc.count(old) != 1:
+        raise RuntimeError('route sweep anchor count: ' + str(gsrc.count(old)))
+    gsrc = gsrc.replace(old, old + '\t\t\tdelete(clientRoute, k)\n')
+    io.open(gpath, 'w', encoding='utf-8', newline='\n').write(gsrc)
+
+    # Monitor sesi: stream Xray ikut dicatat sebagai baris "X|..." (hanya ada
+    # kalau -xray-domain dipasang, jadi pembaca lama tidak pernah melihatnya).
+    spath = os.path.join(mod, 'dnstt-server', 'sc_sessions.go')
+    ssrc = io.open(spath, encoding='utf-8').read()
+    old = '    scPruneEndedLocked(time.Now().UnixNano())\n    for _, s := range scEnded {\n'
+    if ssrc.count(old) != 1:
+        raise RuntimeError('route monitor anchor count: ' + str(ssrc.count(old)))
+    ssrc = ssrc.replace(old,
+        '    for _, s := range scXSessions {\n'
+        '        fmt.Fprintf(&b, "X|%d|%s|%d|%d|%d\\n", s.port, s.clientID, atomic.LoadUint64(&s.up), s.started, atomic.LoadUint64(&s.down))\n'
+        '    }\n' + old)
+    io.open(spath, 'w', encoding='utf-8', newline='\n').write(ssrc)
+
+    io.open(os.path.join(mod, 'dnstt-server', 'sc_route.go'), 'w', encoding='utf-8', newline='\n').write(r'''package main
+
+import (
+	"bufio"
+	"bytes"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/smux"
+	"www.bamsoftware.com/git/dnstt.git/dns"
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+)
+
+// Jalur SlowDNS kedua untuk Xray (sc-fast12).
+//
+// Satu proses dan satu kunci melayani dua domain NS. Query untuk -xray-domain
+// menandai ClientID sebagai jalur Xray (tanda pertama yang menang); stream sesi
+// itu dibaca baris permintaan HTTP-nya ("GET /vless HTTP/1.1"), lalu
+// diteruskan apa adanya ke inbound WebSocket Xray lokal milik path itu
+// (-xray-route). Tujuan wajib alamat loopback, jadi salah konfigurasi tidak
+// membuka proxy ke luar. Koneksi masuk langsung ke port inbound, sehingga log
+// akses Xray mencatat port sumber dnstt dan tracker xray-live bisa memetakan
+// stream ke akun; kuota tetap dari statistik per akun Xray.
+//
+// ON/OFF tiap jalur dibaca dari file -routes-file (ROUTE_SSH / ROUTE_XRAY,
+// nilai 0/1; kunci tidak ada = ON). File dicek paling sering tiap 3 detik dan
+// hanya dibaca ulang kalau ukuran/waktu ubahnya berubah. Query jalur yang OFF
+// dijawab NXDOMAIN tanpa membuat sesi, dan stream baru sesi jalur itu ditolak.
+const (
+	scRouteSSH     = 0
+	scRouteXray    = 1
+	scRouteRefused = -1
+
+	scXrayHeadTimeout  = 20 * time.Second
+	scXrayHeadMax      = 2048
+	scRoutesCheckEvery = int64(3 * time.Second)
+	scRoutesFileMax    = 64 << 10
+)
+
+var (
+	scXrayDomainFlag string
+	scXrayRouteFlag  string
+	scRoutesFileFlag string
+
+	scXrayDomain dns.Name
+	scXrayRoutes map[string]string
+
+	// Nilai nol = ON: jalur yang belum disetel (mis. test yang memanggil
+	// recvLoop langsung) tidak pernah mati diam-diam.
+	scRouteSSHOff  atomic.Bool
+	scRouteXrayOff atomic.Bool
+
+	// Hanya disentuh goroutine recvLoop (dan scRouteSetup sebelum goroutine mulai).
+	scRoutesNextCheck int64
+	scRoutesModTime   int64
+	scRoutesSize      int64
+
+	// Dijaga clientEdnsMu; hanya jalur Xray yang disimpan (tidak ada = SSH).
+	clientRoute = make(map[turbotunnel.ClientID]uint16)
+
+	errSCRouteDisabled = errors.New("jalur SlowDNS ini sedang OFF")
+
+	// Stream jalur Xray untuk monitor sesi (baris "X|"), dijaga scSessionsMu.
+	scXSessions = make(map[int]*scSession)
+)
+
+func scRouteFlags() {
+	flag.StringVar(&scXrayDomainFlag, "xray-domain", "", "second tunnel domain whose sessions are forwarded to Xray")
+	flag.StringVar(&scXrayRouteFlag, "xray-route", "", "Xray WebSocket routes PATH=HOST:PORT[,PATH=HOST:PORT...] (loopback only)")
+	flag.StringVar(&scRoutesFileFlag, "routes-file", "", "file with ROUTE_SSH/ROUTE_XRAY switches (0/1), re-read when it changes")
+}
+
+// scParseXrayRoutes: "/vmess=127.0.0.1:10001,/vless=127.0.0.1:10002".
+func scParseXrayRoutes(raw string) (map[string]string, error) {
+	routes := make(map[string]string)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		eq := strings.IndexByte(item, '=')
+		if eq <= 0 {
+			return nil, fmt.Errorf("xray-route %q: format PATH=HOST:PORT", item)
+		}
+		path, addr := item[:eq], item[eq+1:]
+		if !strings.HasPrefix(path, "/") || len(path) > 128 || strings.ContainsAny(path, " ?#\t") {
+			return nil, fmt.Errorf("xray-route %q: path tidak valid", item)
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil || port == "" || port == "0" {
+			return nil, fmt.Errorf("xray-route %q: alamat tidak valid", item)
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("xray-route %q: tujuan wajib alamat loopback", item)
+		}
+		routes[path] = addr
+	}
+	if len(routes) == 0 {
+		return nil, errors.New("xray-route kosong")
+	}
+	return routes, nil
+}
+
+// scRouteSetup dipanggil sekali setelah flag dibaca, sebelum goroutine mulai.
+func scRouteSetup(domain dns.Name) error {
+	scRouteSSHOff.Store(false)
+	scRouteXrayOff.Store(false)
+	scXrayDomain = nil
+	scXrayRoutes = nil
+	if scXrayDomainFlag == "" {
+		if scXrayRouteFlag != "" {
+			return errors.New("-xray-route butuh -xray-domain")
+		}
+	} else {
+		name, err := dns.ParseName(scXrayDomainFlag)
+		if err != nil || len(name) == 0 {
+			return fmt.Errorf("invalid xray domain %+q: %v", scXrayDomainFlag, err)
+		}
+		if scNameEqualFold(name, domain) {
+			return errors.New("xray-domain tidak boleh sama dengan domain SSH")
+		}
+		routes, err := scParseXrayRoutes(scXrayRouteFlag)
+		if err != nil {
+			return err
+		}
+		scXrayDomain, scXrayRoutes = name, routes
+		log.Printf("xray route: %s (%d path)", name, len(routes))
+	}
+	scRoutesNextCheck = 0
+	scRoutesMaybeReload(time.Now().UnixNano())
+	return nil
+}
+
+// scLabelEqualFold: label sama, huruf ASCII tanpa membedakan besar-kecil.
+// Tanpa alokasi (bytes.ToLower membuat salinan per label).
+func scLabelEqualFold(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}
+
+func scNameEqualFold(a, b dns.Name) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !scLabelEqualFold(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func scNameHasSuffix(name, suffix dns.Name) bool {
+	if len(suffix) == 0 || len(name) < len(suffix) {
+		return false
+	}
+	off := len(name) - len(suffix)
+	for i := range suffix {
+		if !scLabelEqualFold(name[off+i], suffix[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// scXrayWins: name milik domain Xray (domain yang lebih spesifik menang kalau
+// keduanya cocok, misalnya x.ns.contoh.com di bawah ns.contoh.com).
+func scXrayWins(name, domain dns.Name) bool {
+	if len(scXrayDomain) == 0 || !scNameHasSuffix(name, scXrayDomain) {
+		return false
+	}
+	return len(scXrayDomain) > len(domain) || !scNameHasSuffix(name, domain)
+}
+
+// scTrimTunnelDomain menggantikan name.TrimSuffix(domain) di responseFor.
+func scTrimTunnelDomain(name, domain dns.Name) (dns.Name, bool) {
+	if scXrayWins(name, domain) {
+		return name[:len(name)-len(scXrayDomain)], true
+	}
+	return name.TrimSuffix(domain)
+}
+
+// scQueryRoute: jalur query ini, atau scRouteRefused kalau jalurnya OFF.
+// Dipanggil hanya dari recvLoop.
+func scQueryRoute(query *dns.Message, domain dns.Name) int {
+	scRoutesMaybeReload(0)
+	route := scRouteSSH
+	if len(query.Question) == 1 && scXrayWins(query.Question[0].Name, domain) {
+		route = scRouteXray
+	}
+	if route == scRouteXray && scRouteXrayOff.Load() || route == scRouteSSH && scRouteSSHOff.Load() {
+		return scRouteRefused
+	}
+	return route
+}
+
+// scRoutesMaybeReload membaca ulang -routes-file kalau berubah. now 0 = ambil
+// jam sendiri (sekali per query; murah dibanding parsing DNS).
+func scRoutesMaybeReload(now int64) {
+	if scRoutesFileFlag == "" {
+		return
+	}
+	if now == 0 {
+		now = time.Now().UnixNano()
+	}
+	if now < scRoutesNextCheck {
+		return
+	}
+	scRoutesNextCheck = now + scRoutesCheckEvery
+	st, err := os.Stat(scRoutesFileFlag)
+	if err != nil || !st.Mode().IsRegular() || st.Size() > scRoutesFileMax {
+		return
+	}
+	if st.ModTime().UnixNano() == scRoutesModTime && st.Size() == scRoutesSize {
+		return
+	}
+	data, err := os.ReadFile(scRoutesFileFlag)
+	if err != nil {
+		return
+	}
+	scRoutesModTime, scRoutesSize = st.ModTime().UnixNano(), st.Size()
+	sshOn, xrayOn := scParseRoutes(data)
+	if scRouteSSHOff.Swap(!sshOn) != !sshOn || scRouteXrayOff.Swap(!xrayOn) != !xrayOn {
+		log.Printf("jalur SlowDNS: ssh %s, xray %s", scOnOff(sshOn), scOnOff(xrayOn))
+	}
+}
+
+// scParseRoutes: kunci yang tidak ada atau bernilai selain 0 = ON, supaya file
+// rusak tidak pernah mematikan layanan diam-diam.
+func scParseRoutes(data []byte) (sshOn, xrayOn bool) {
+	sshOn, xrayOn = true, true
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		switch {
+		case bytes.Equal(line, []byte("ROUTE_SSH=0")):
+			sshOn = false
+		case bytes.Equal(line, []byte("ROUTE_XRAY=0")):
+			xrayOn = false
+		}
+	}
+	return
+}
+
+func scOnOff(on bool) string {
+	if on {
+		return "ON"
+	}
+	return "OFF"
+}
+
+func scSessionRoute(conn *kcp.UDPSession) int {
+	cid, ok := conn.RemoteAddr().(turbotunnel.ClientID)
+	if !ok {
+		return scRouteSSH
+	}
+	clientEdnsMu.Lock()
+	route := clientRoute[cid]
+	clientEdnsMu.Unlock()
+	if route == scRouteXray {
+		return scRouteXray
+	}
+	return scRouteSSH
+}
+
+// scHandleStream menggantikan handleStream di acceptStreams.
+func scHandleStream(conn *kcp.UDPSession, stream *smux.Stream, upstream, clientID string) error {
+	if scSessionRoute(conn) == scRouteXray {
+		if scRouteXrayOff.Load() {
+			return errSCRouteDisabled
+		}
+		return scHandleXrayStream(stream, conn.GetConv(), clientID)
+	}
+	if scRouteSSHOff.Load() {
+		return errSCRouteDisabled
+	}
+	return handleStream(stream, upstream, conn.GetConv(), clientID)
+}
+
+// scXrayTarget: tujuan untuk baris permintaan "GET /path?query HTTP/1.1".
+func scXrayTarget(line []byte) (string, bool) {
+	if !bytes.HasPrefix(line, []byte("GET ")) {
+		return "", false
+	}
+	rest := line[4:]
+	sp := bytes.IndexByte(rest, ' ')
+	if sp <= 0 || !bytes.HasPrefix(rest[sp+1:], []byte("HTTP/1.")) {
+		return "", false
+	}
+	path := rest[:sp]
+	if i := bytes.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	addr, ok := scXrayRoutes[string(path)]
+	return addr, ok
+}
+
+func scTrackXrayStream(conn *net.TCPConn, clientID string) *scSession {
+	if !scMonitorEnabled || len(clientID) != 16 {
+		return nil
+	}
+	addr, ok := conn.LocalAddr().(*net.TCPAddr)
+	if !ok {
+		return nil
+	}
+	s := &scSession{port: addr.Port, clientID: clientID, started: time.Now().UnixNano()}
+	scSessionsMu.Lock()
+	scXSessions[s.port] = s
+	scSessionsMu.Unlock()
+	return s
+}
+
+func scUntrackXrayStream(s *scSession) {
+	if s == nil {
+		return
+	}
+	scSessionsMu.Lock()
+	if scXSessions[s.port] == s {
+		delete(scXSessions, s.port)
+	}
+	scSessionsMu.Unlock()
+}
+
+// scHandleXrayStream meneruskan stream WebSocket Xray ke inbound lokal milik
+// path-nya. Baris pertama dibaca dengan tenggat; byte permintaan diteruskan
+// utuh (Xray sendiri yang menjawab upgrade WebSocket).
+func scHandleXrayStream(stream *smux.Stream, conv uint32, clientID string) error {
+	stream.SetReadDeadline(time.Now().Add(scXrayHeadTimeout))
+	br := bufio.NewReaderSize(stream, scXrayHeadMax)
+	line, err := br.ReadSlice('\n')
+	if err != nil {
+		return fmt.Errorf("stream %08x:%d xray request: %v", conv, stream.ID(), err)
+	}
+	target, ok := scXrayTarget(line)
+	if !ok {
+		return fmt.Errorf("stream %08x:%d xray path tidak dikenal", conv, stream.ID())
+	}
+	head := append([]byte(nil), line...)
+	stream.SetReadDeadline(time.Time{})
+
+	dialer := net.Dialer{Timeout: upstreamDialTimeout}
+	upstreamConn, err := dialer.Dial("tcp", target)
+	if err != nil {
+		return fmt.Errorf("stream %08x:%d connect xray: %v", conv, stream.ID(), err)
+	}
+	defer upstreamConn.Close()
+	upstreamTCPConn := upstreamConn.(*net.TCPConn)
+	tracked := scTrackXrayStream(upstreamTCPConn, clientID)
+	defer scUntrackXrayStream(tracked)
+
+	up := scSessionWriter(upstreamTCPConn, tracked)
+	if _, err := up.Write(head); err != nil {
+		return fmt.Errorf("stream %08x:%d write xray: %v", conv, stream.ID(), err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(scStreamWriter(stream, tracked), upstreamTCPConn)
+		if err != nil && err != io.EOF && !errors.Is(err, io.ErrClosedPipe) {
+			log.Printf("stream %08x:%d copy stream←xray: %v", conv, stream.ID(), err)
+		}
+		upstreamTCPConn.CloseRead()
+		stream.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(up, br)
+		if err != nil && err != io.EOF && !errors.Is(err, io.ErrClosedPipe) {
+			log.Printf("stream %08x:%d copy xray←stream: %v", conv, stream.ID(), err)
+		}
+		upstreamTCPConn.CloseWrite()
+	}()
+	wg.Wait()
+	return nil
+}
+''')
+
+
+patch_xray_route(mod)
+
 SLOWDNS_PATCH_PY
   then
     rm -rf "${work}"
@@ -26472,8 +27186,10 @@ ensure_key() {
 }
 
 unit_content() {
-  local mem
+  local mem args
   mem="$(memory_max)"
+  route_args
+  args="${REPLY}"
   cat <<UNIT
 [Unit]
 Description=SC 1FORCR SlowDNS (dnstt-server)
@@ -26484,7 +27200,7 @@ Wants=network-online.target
 Type=simple
 User=${SVC_USER}
 Group=${SVC_USER}
-ExecStart=${BIN} -udp :${LISTEN} -privkey-file ${KEY_DIR}/server.key -mtu ${MTU} ${NS} 127.0.0.1:${TARGET_PORT}
+ExecStart=${BIN} -udp :${LISTEN} -privkey-file ${KEY_DIR}/server.key -mtu ${MTU}${args} ${NS} 127.0.0.1:${TARGET_PORT}
 Restart=always
 RestartSec=3
 Environment=GOMEMLIMIT=$(go_mem_limit "${mem}")
@@ -26697,8 +27413,11 @@ rules_sync() {
 }
 
 write_state() {
-  local active=0 pub="" ip version body tmp
+  local active=0 pub="" ip version body tmp xray_route=0
   if (( ENABLED == 1 )) && systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then active=1; fi
+  # ROUTE_XRAY=1 hanya kalau unit benar-benar melayani domain Xray (binary
+  # lama tanpa sc-fast12 = 0), supaya API tidak mengiklankan jalur yang mati.
+  if (( ROUTE_XRAY == 1 )) && unit_has_xray; then xray_route=1; fi
   if key_ready; then pubkey_val; pub="${REPLY}"; fi
   state_val PUBLIC_IP
   ip="${PUBLIC_IP_NEW:-${REPLY}}"
@@ -26715,7 +27434,11 @@ LISTEN=${LISTEN}
 TARGET=127.0.0.1:${TARGET_PORT}
 MTU=${MTU}
 PUBLIC_IP=${ip}
-VERSION=${version}"
+VERSION=${version}
+XRAY_ENABLED=${XRAY_ENABLED}
+XRAY_NS=${XRAY_NS}
+ROUTE_SSH=${ROUTE_SSH}
+ROUTE_XRAY=${xray_route}"
   STATE_LOADED=0
   if [[ -f "${STATE_FILE}" && "$(< "${STATE_FILE}")" == "${body}" ]]; then
     return 0
@@ -26802,6 +27525,9 @@ cmd_records() {
   host="${DOMAIN_MAIN:-domain-utama}"
   say "Buat record ini di DNS domain Anda:"
   say "  NS  ${NS:-$(suggest_ns "${DOMAIN_MAIN}")}  ->  ${host}"
+  if [[ -n "${XRAY_NS}" ]]; then
+    say "  NS  ${XRAY_NS}  ->  ${host}   (SlowDNS Xray)"
+  fi
   say "Syarat: ${host} punya A record ke ${ip} TANPA proxy Cloudflare (awan abu-abu)."
   say "Kalau domain utama memakai proxy, buat A record baru tanpa proxy"
   say "(misalnya dns-${host} -> ${ip}) lalu arahkan record NS ke sana."
@@ -26821,6 +27547,7 @@ cmd_enable() {
   if [[ -n "${DOMAIN_MAIN}" && "${ns}" == "${DOMAIN_MAIN}" ]]; then
     die "domain NS tidak boleh sama dengan domain utama; pakai subdomain lain, misalnya $(suggest_ns "${DOMAIN_MAIN}")"
   fi
+  same_as_xray_ns "${ns}" && die "domain NS SSH tidak boleh sama dengan domain NS Xray (${ns})"
   set_env_value SLOWDNS_NS_DOMAIN "${ns}" || die "env ${SC_ENV} gagal ditulis"
   set_env_value SLOWDNS_ENABLE 1 || die "env ${SC_ENV} gagal ditulis"
   if ! ( cmd_setup ); then
@@ -26855,6 +27582,7 @@ cmd_set_ns() {
   if [[ -n "${DOMAIN_MAIN}" && "${ns}" == "${DOMAIN_MAIN}" ]]; then
     die "domain NS tidak boleh sama dengan domain utama"
   fi
+  same_as_xray_ns "${ns}" && die "domain NS SSH tidak boleh sama dengan domain NS Xray (${ns})"
   set_env_value SLOWDNS_NS_DOMAIN "${ns}" || die "env ${SC_ENV} gagal ditulis"
   if (( ENABLED == 1 )) && ! ( cmd_setup ); then
     set_env_value SLOWDNS_NS_DOMAIN "${prev_ns}" || true
@@ -26865,6 +27593,111 @@ cmd_set_ns() {
   STATE_LOADED=0
   say "Berhasil: domain NS = ${ns}"
   cmd_records
+}
+
+# Domain sama dengan domain NS Xray yang tersimpan? (dibaca dari env, bukan
+# XRAY_NS hasil load_config yang sudah membuang nilai bentrok).
+same_as_xray_ns() {
+  local want="$1"
+  env_val SLOWDNS_XRAY_NS_DOMAIN
+  normalize_ns "${REPLY}" && [[ "${REPLY}" == "${want}" ]]
+}
+
+# Usulan domain NS Xray: sg.contoh.net -> nsx-sg.contoh.net.
+suggest_xray_ns() {
+  local d="${1:-}"
+  [[ -n "${d}" ]] || return 0
+  if [[ "${d}" == *.*.* ]]; then printf 'nsx-%s' "${d}"; else printf 'nsx.%s' "${d}"; fi
+}
+
+# Jalur Xray: domain NS kedua, kunci dan service yang sama. Domain baru/beda
+# mengubah unit (service di-restart sekali); menyalakan ulang domain yang sama
+# hanya menulis file state (tanpa restart).
+cmd_xray_enable() {
+  local ns prev_enable prev_ns
+  env_val SLOWDNS_XRAY_ENABLE
+  prev_enable="${REPLY}"
+  env_val SLOWDNS_XRAY_NS_DOMAIN
+  prev_ns="${REPLY}"
+  load_config
+  (( ENABLED == 1 )) || die "aktifkan SlowDNS dulu (menu 1); jalur Xray memakai service dan kunci yang sama"
+  normalize_ns "${1:-${prev_ns}}" || \
+    die "domain NS Xray tidak valid: ${1:-kosong} (contoh: $(suggest_xray_ns "${DOMAIN_MAIN:-sg.domainanda.com}"))"
+  ns="${REPLY}"
+  [[ "${ns}" != "${NS}" ]] || die "domain NS Xray harus berbeda dari domain NS SSH (${NS})"
+  if [[ -n "${DOMAIN_MAIN}" && "${ns}" == "${DOMAIN_MAIN}" ]]; then
+    die "domain NS Xray tidak boleh sama dengan domain utama"
+  fi
+  set_env_value SLOWDNS_XRAY_NS_DOMAIN "${ns}" || die "env ${SC_ENV} gagal ditulis"
+  set_env_value SLOWDNS_XRAY_ENABLE 1 || die "env ${SC_ENV} gagal ditulis"
+  if ! ( cmd_setup ) || ! { load_config; unit_has_xray; }; then
+    set_env_value SLOWDNS_XRAY_ENABLE "${prev_enable:-0}" || true
+    set_env_value SLOWDNS_XRAY_NS_DOMAIN "${prev_ns}" || true
+    ( cmd_setup ) >/dev/null 2>&1 || true
+    die "SlowDNS Xray belum bisa diaktifkan (binary dnstt ${DNSTT_PATCH_ID} belum terpasang?); pengaturan dikembalikan"
+  fi
+  service_gate_apply
+  load_config
+  STATE_LOADED=0
+  pubkey_val
+  say "Berhasil: SlowDNS Xray aktif (domain NS ${ns})."
+  say "Pubkey: ${REPLY} (sama dengan SlowDNS SSH)"
+  if (( ROUTE_XRAY == 0 )); then
+    say "Peringatan: VMess, VLESS, dan Trojan sedang OFF; jalur Xray baru melayani saat salah satunya ON."
+  fi
+  cmd_records
+}
+
+cmd_xray_disable() {
+  set_env_value SLOWDNS_XRAY_ENABLE 0 || die "env ${SC_ENV} gagal ditulis"
+  load_config
+  rules_sync
+  write_state
+  service_gate_apply
+  say "Berhasil: SlowDNS Xray dimatikan tanpa restart; SlowDNS SSH tidak terganggu."
+}
+
+cmd_set_xray_ns() {
+  local prev_ns ns
+  env_val SLOWDNS_XRAY_NS_DOMAIN
+  prev_ns="${REPLY}"
+  load_config
+  normalize_ns "${1:-}" || die "domain NS Xray tidak valid: ${1:-kosong}"
+  ns="${REPLY}"
+  [[ "${ns}" != "${NS}" ]] || die "domain NS Xray harus berbeda dari domain NS SSH (${NS})"
+  if [[ -n "${DOMAIN_MAIN}" && "${ns}" == "${DOMAIN_MAIN}" ]]; then
+    die "domain NS Xray tidak boleh sama dengan domain utama"
+  fi
+  set_env_value SLOWDNS_XRAY_NS_DOMAIN "${ns}" || die "env ${SC_ENV} gagal ditulis"
+  if (( ENABLED == 1 )) && ! ( cmd_setup ); then
+    set_env_value SLOWDNS_XRAY_NS_DOMAIN "${prev_ns}" || true
+    ( cmd_setup ) >/dev/null 2>&1 || true
+    die "domain NS Xray baru gagal diterapkan; pengaturan dikembalikan"
+  fi
+  load_config
+  STATE_LOADED=0
+  say "Berhasil: domain NS Xray = ${ns}"
+  cmd_records
+}
+
+# ON/OFF jalur SSH SlowDNS tanpa restart (jalur Xray tidak terganggu).
+cmd_ssh_route() {
+  local value
+  case "${1:-}" in
+    on|1) value=1 ;;
+    off|0) value=0 ;;
+    *) die "Gunakan ssh-route on atau ssh-route off" ;;
+  esac
+  set_env_value SLOWDNS_SSH_ENABLE "${value}" || die "env ${SC_ENV} gagal ditulis"
+  load_config
+  rules_sync
+  write_state
+  service_gate_apply
+  if (( value )); then
+    say "Berhasil: SlowDNS SSH ON."
+  else
+    say "Berhasil: SlowDNS SSH OFF tanpa restart; query domain NS SSH ditolak."
+  fi
 }
 
 cmd_regen_key() {
@@ -26962,7 +27795,15 @@ cmd_set_key() {
 # Username wajib cocok dengan port DAN PID Dropbear pada snapshot saat ini;
 # state/log lama tidak boleh menghidupkan kembali akun yang sudah disconnect.
 collect_online() {
-  local pid sockets map data native cutoff kind a b c d e
+  local pid sockets map data native cutoff kind a b c d e xmap=/dev/null xmapts=0 xports=""
+  ONLINE_X_ENABLED=0
+  ONLINE_X_CONNECTIONS=0
+  ONLINE_X_USERS=0
+  ONLINE_X_VERIFIED=0
+  ONLINE_X_UNKNOWN=0
+  ONLINE_X_TUNNELS=0
+  ONLINE_X_ROWS=""
+  ONLINE_X_SESSION_ROWS=""
   ONLINE_AVAILABLE=0
   ONLINE_CONNECTIONS=0
   ONLINE_USERS=0
@@ -27007,7 +27848,24 @@ collect_online() {
   [[ -r "${map}" ]] || map=/dev/null
   native=""
   if [[ -x "${BIN}" ]]; then native="$(timeout 3 "${BIN}" -sc-online "${SESSION_SOCKET}" 2>/dev/null)" || native=""; fi
-  if ! data="$(awk -F'|' -v owner="${pid}" -v target="${TARGET_PORT}" -v cutoff="${cutoff}" '
+  # Jalur Xray: tracker xray-live memetakan port sumber dnstt -> akun dari log
+  # akses Xray. Dijalankan setelah snapshot ss; stream hanya dipetakan kalau
+  # lahir sebelum peta itu ditulis (port bekas akun lain tidak terpinjam).
+  if (( XRAY_ENABLED )) && [[ -n "${XRAY_NS}" ]]; then
+    ONLINE_X_ENABLED=1
+    xports="10001:vmess,10002:vless,10003:trojan"
+    if [[ -x "${XRAY_LIVE_BIN}" ]]; then "${XRAY_LIVE_BIN}" raw >/dev/null 2>&1 || true; fi
+    if [[ -r "${XRAY_LIVE_MAP}" ]]; then
+      xmap="${XRAY_LIVE_MAP}"
+      xmapts="$(stat -c %Y "${XRAY_LIVE_MAP}" 2>/dev/null || echo 0)"
+    fi
+  fi
+  if ! data="$(awk -F'|' -v owner="${pid}" -v target="${TARGET_PORT}" -v cutoff="${cutoff}" \
+      -v xports="${xports}" -v xmapts="${xmapts}" '
+    BEGIN {
+      n=split(xports, xp, ",");
+      for (i=1; i<=n; i++) { split(xp[i], kv, ":"); if (kv[1] ~ /^[0-9]+$/) xproto[kv[1]]=kv[2]; }
+    }
     FILENAME==ARGV[1] {
       if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[a-z0-9._-]+$/ &&
           $3!="root" && $3!="priv" && $3!="net" && $3!="unknown") {
@@ -27018,6 +27876,7 @@ collect_online() {
     FILENAME==ARGV[2] {
       # V1: port|cid|up|started. V2 (sc-fast10): + |down, dan baris
       # E|port|cid|up|started|down|ended untuk stream yang sudah putus.
+      # sc-fast12: X|port|cid|up|started|down = stream jalur Xray yang hidup.
       if (($1=="SC_SLOWDNS_SESSIONS_V1" || $1=="SC_SLOWDNS_SESSIONS_V2") && $2==owner && $3 ~ /^[0-9]+$/) {
         native=1; nver=($1=="SC_SLOWDNS_SESSIONS_V2" ? 2 : 1); instance=$2 "." $3; next;
       }
@@ -27029,6 +27888,12 @@ collect_online() {
         gone[++gone_n]=$3 "|" $4 "|" $2 "|" $5 "|" $6 "|" $7;
         next;
       }
+      if (nver==2 && $1=="X" && NF==6 && $2 ~ /^[0-9]+$/ && $2+0>0 && $2+0<=65535 &&
+          $3 ~ /^[0-9a-f]+$/ && length($3)==16 && $4 ~ /^[0-9]+$/ &&
+          $5 ~ /^[0-9]+$/ && length($5)>=10 && length($5)<=20 && $6 ~ /^[0-9]+$/ && !($2 in xcid)) {
+        xcid[$2]=$3; xup[$2]=$4; xstarted[$2]=$5; xdown[$2]=$6;
+        next;
+      }
       if ($1 ~ /^[0-9]+$/ && $1+0>0 && $1+0<=65535 && $2 ~ /^[0-9a-f]+$/ && length($2)==16 &&
           $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && length($4)>=10 && length($4)<=20 && !($1 in cid) &&
           ((nver==2 && NF==5 && $5 ~ /^[0-9]+$/) || (nver!=2 && NF==4))) {
@@ -27036,6 +27901,13 @@ collect_online() {
         next;
       }
       bad=1; next;
+    }
+    FILENAME==ARGV[3] {
+      # Peta xray-live: port_sumber|pid_xray|protokol|akun|ip.
+      if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^(vmess|vless|trojan)$/ && $4 ~ /^[a-z0-9._-]+$/) {
+        xauth_pid[$1 SUBSEP $3]=$2; xauth_user[$1 SUBSEP $3]=$4;
+      }
+      next;
     }
     function port_of(v, p) {
       p=v; sub(/^.*:/, "", p);
@@ -27070,10 +27942,35 @@ collect_online() {
         else if (first_pid($0)=="") hidden=1;
       }
       if (lp==target) server_pid[endpoint(r) SUBSEP endpoint(l)]=first_pid($0);
+      # Jalur Xray: socket dnstt -> inbound WS, dan socket Xray di seberangnya.
+      if ((rp in xproto) && $0 ~ ("pid=" owner "([^0-9]|$)")) xclient[endpoint(l) SUBSEP endpoint(r)]=lp SUBSEP xproto[rp];
+      if (lp in xproto) xserver_pid[endpoint(r) SUBSEP endpoint(l)]=first_pid($0);
     }
     END {
       total=0; verified=0; users=0; tunnelCount=0;
       ready=native && ended && !bad;
+      xtotal=0; xverified=0; xusers=0; xtunnels=0;
+      for (key in xclient) {
+        split(xclient[key], xc, SUBSEP); p=xc[1]; pr=xc[2]; ak=p SUBSEP pr;
+        xtotal++;
+        if (xserver_pid[key]=="" || xauth_pid[ak]!=xserver_pid[key] || xauth_user[ak]=="") continue;
+        xu=pr SUBSEP xauth_user[ak]; xper_user[xu]++; xverified++;
+        # Stream harus lahir sebelum snapshot ss dan sebelum peta xray-live
+        # ditulis, supaya port bekas koneksi akun lain tidak terpinjam.
+        st=(p in xcid) ? substr(xstarted[p],1,length(xstarted[p])-9)+0 : 0;
+        if (ready && (p in xcid) && st < cutoff+0 && st < xmapts+0) {
+          tk=xu SUBSEP xcid[p];
+          if (!(tk in xtunnel)) { xtunnel[tk]=1; xuser_tunnels[xu]++; }
+          if (!(xcid[p] in xall)) { xall[xcid[p]]=1; xtunnels++; }
+          print "xstream|" pr "|" xauth_user[ak] "|" xcid[p] "|" xup[p] "|" p "|" xstarted[p] "|" xdown[p];
+        }
+      }
+      for (xu in xper_user) xusers++;
+      if (length(xports) > 0) print "xsummary|" xtotal "|" xusers "|" xverified "|" (xtotal-xverified) "|" xtunnels;
+      for (xu in xper_user) {
+        split(xu, xk, SUBSEP);
+        print "xuser|" xk[1] "|" xk[2] "|" xper_user[xu] "|" (ready ? xuser_tunnels[xu]+0 : "-");
+      }
       for (key in client) {
         p=client[key];
         total++;
@@ -27096,13 +27993,19 @@ collect_online() {
       if (hidden) print "hidden|1";
       for (u in per_user) print "user|" u "|" per_user[u] "|" (ready ? user_tunnels[u]+0 : "-");
     }
-  ' "${map}" <(printf '%s\n' "${native}") - <<< "${sockets}" | LC_ALL=C sort)"; then
+  ' "${map}" <(printf '%s\n' "${native}") "${xmap}" - <<< "${sockets}" | LC_ALL=C sort)"; then
     ONLINE_NOTE="Data koneksi belum dapat dibaca"
     return 0
   fi
   ONLINE_AVAILABLE=1
-  while IFS='|' read -r kind a b c d e f; do
+  while IFS='|' read -r kind a b c d e f g; do
     case "${kind}" in
+      xsummary)
+        ONLINE_X_CONNECTIONS="${a}"; ONLINE_X_USERS="${b}"
+        ONLINE_X_VERIFIED="${c}"; ONLINE_X_UNKNOWN="${d}"; ONLINE_X_TUNNELS="${e}"
+        ;;
+      xstream) ONLINE_X_SESSION_ROWS+="X|${a}|${b}|${c}|${d}|${e}|${f}|${g}"$'\n' ;;
+      xuser) ONLINE_X_ROWS+="${a}|${b}|${c}|${d}"$'\n' ;;
       summary)
         ONLINE_CONNECTIONS="${a}"; ONLINE_USERS="${b}"
         ONLINE_AUTHENTICATED="${c}"; ONLINE_UNKNOWN="${d}"
@@ -27149,6 +28052,13 @@ print_online_summary() {
   else
     printf '%-14s: %s\n' "Auto-lock" "OFF"
   fi
+  if (( ONLINE_X_ENABLED )); then
+    printf '%-14s: %s\n' "Akun Xray" "${ONLINE_X_USERS} akun unik terverifikasi"
+    printf '%-14s: %s\n' "Koneksi Xray" "${ONLINE_X_CONNECTIONS} melalui SlowDNS (${ONLINE_X_UNKNOWN} belum terpetakan)"
+    if (( ONLINE_TUNNELS_AVAILABLE )); then
+      printf '%-14s: %s\n' "Tunnel Xray" "${ONLINE_X_TUNNELS} identitas tunnel terverifikasi"
+    fi
+  fi
   if [[ -n "${ONLINE_NOTE}" ]]; then printf '%-14s: %s\n' "Keterangan" "${ONLINE_NOTE}"; fi
   return 0
 }
@@ -27163,6 +28073,14 @@ cmd_online() {
       [[ -n "${user}" ]] || continue
       printf '%-24s %-14s %s\n' "${user}" "${connections}" "${tunnels}"
     done <<< "${ONLINE_ROWS}"
+  fi
+  if [[ -n "${ONLINE_X_ROWS}" ]]; then
+    local proto
+    printf '\n%-24s %-8s %-14s %s\n' "AKUN XRAY" "PROTOKOL" "KONEKSI" "TUNNEL"
+    while IFS='|' read -r proto user connections tunnels; do
+      [[ -n "${user}" ]] || continue
+      printf '%-24s %-8s %-14s %s\n' "${user}" "${proto}" "${connections}" "${tunnels}"
+    done <<< "${ONLINE_X_ROWS}"
   fi
   say ""
   say "Akun dihitung unik; satu akun bisa dipakai beberapa perangkat."
@@ -27179,7 +28097,11 @@ cmd_online() {
 cmd_sessions() {
   collect_online
   (( ONLINE_AVAILABLE && ONLINE_TUNNELS_AVAILABLE )) || return 1
-  if [[ "${1:-1}" == "2" ]]; then
+  if [[ "${1:-1}" == "3" ]]; then
+    # V3 = V2 + baris X|protokol|akun|cid|up|port|started|down (jalur Xray).
+    printf 'SC_SLOWDNS_USERS_V3|%s|%s\n' "${ONLINE_INSTANCE}" "${ONLINE_NATIVE_VERSION}"
+    printf '%s' "${ONLINE_SESSION_ROWS2}" "${ONLINE_GONE_ROWS}" "${ONLINE_X_SESSION_ROWS}"
+  elif [[ "${1:-1}" == "2" ]]; then
     printf 'SC_SLOWDNS_USERS_V2|%s|%s\n' "${ONLINE_INSTANCE}" "${ONLINE_NATIVE_VERSION}"
     printf '%s' "${ONLINE_SESSION_ROWS2}" "${ONLINE_GONE_ROWS}"
   else
@@ -27260,6 +28182,25 @@ cmd_status() {
   if [[ -n "${ip}" ]]; then ip="${ip}:${PUBLIC_PORT}"; else ip="-"; fi
   printf '%-14s: %s\n' "DNS" "${ip}"
   printf '%-14s: %s\n' "Jalur" "UDP ${PUBLIC_PORT} -> ${LISTEN} -> Dropbear 127.0.0.1:${TARGET_PORT}"
+  if (( ROUTE_SSH )); then
+    printf '%-14s: %s\n' "SlowDNS SSH" "ON"
+  elif (( SSH_ROUTE_ENABLED )); then
+    printf '%-14s: %s\n' "SlowDNS SSH" "OFF (layanan SSH OFF di menu ON/OFF)"
+  else
+    printf '%-14s: %s\n' "SlowDNS SSH" "OFF"
+  fi
+  if (( XRAY_ENABLED )) && [[ -n "${XRAY_NS}" ]]; then
+    state_val ROUTE_XRAY
+    if [[ "${REPLY}" == "1" ]]; then
+      printf '%-14s: %s\n' "SlowDNS Xray" "ON (NS ${XRAY_NS} -> WS VMess/VLESS/Trojan)"
+    elif (( ROUTE_XRAY == 0 )); then
+      printf '%-14s: %s\n' "SlowDNS Xray" "OFF (VMess/VLESS/Trojan OFF; NS ${XRAY_NS})"
+    else
+      printf '%-14s: %s\n' "SlowDNS Xray" "BELUM AKTIF (binary dnstt ${DNSTT_PATCH_ID} belum terpasang)"
+    fi
+  else
+    printf '%-14s: %s\n' "SlowDNS Xray" "OFF${XRAY_NS:+ (NS ${XRAY_NS})}"
+  fi
   printf '%-14s: %s\n' "Aturan UDP 53" "${rules}"
   printf '%-14s: %s\n' "MTU / RAM" "${MTU} / $(memory_max)"
   kcp_ack_nodelay_val
@@ -27278,25 +28219,35 @@ nat_counter() {
 # Query TXT acak lewat DoH Google dan Cloudflare. Kalau delegasi NS benar,
 # resolver publik mengirim query itu ke VPS ini dan penghitung rule naik.
 cmd_check() {
-  local before after label url
+  local rc=0 ns
   load_config
   (( ENABLED == 1 )) && [[ -n "${NS}" ]] || die "SlowDNS belum aktif"
   command -v curl >/dev/null 2>&1 || die "curl tidak tersedia"
+  for ns in "${NS}" ${XRAY_NS:+"${XRAY_NS}"}; do
+    check_delegation "${ns}" || rc=1
+  done
+  if (( rc )); then
+    say "Cek record NS dan A record tujuannya (tanpa proxy Cloudflare), dan firewall"
+    say "panel provider untuk UDP 53. Record baru bisa butuh beberapa menit sampai beberapa jam."
+  fi
+  return "${rc}"
+}
+
+check_delegation() {
+  local ns="$1" before after label url
   before="$(nat_counter)"
   label="cek$(date +%s)$(( RANDOM % 1000 ))"
-  for url in "https://dns.google/resolve?name=${label}a.${NS}&type=TXT" \
-             "https://cloudflare-dns.com/dns-query?name=${label}b.${NS}&type=TXT"; do
+  for url in "https://dns.google/resolve?name=${label}a.${ns}&type=TXT" \
+             "https://cloudflare-dns.com/dns-query?name=${label}b.${ns}&type=TXT"; do
     curl -fsS --connect-timeout 5 --max-time 12 -H 'accept: application/dns-json' "${url}" >/dev/null 2>&1 || true
   done
   sleep 1
   after="$(nat_counter)"
   if (( after > before )); then
-    say "Berhasil: query DNS untuk ${NS} dari resolver publik sampai ke VPS ini. Delegasi NS sudah benar."
+    say "Berhasil: query DNS untuk ${ns} dari resolver publik sampai ke VPS ini. Delegasi NS sudah benar."
     return 0
   fi
-  say "Gagal: query untuk ${NS} belum sampai ke VPS ini."
-  say "Cek record NS dan A record tujuannya (tanpa proxy Cloudflare), dan firewall"
-  say "panel provider untuk UDP 53. Record baru bisa butuh beberapa menit sampai beberapa jam."
+  say "Gagal: query untuk ${ns} belum sampai ke VPS ini."
   return 1
 }
 
@@ -27345,13 +28296,21 @@ case "${1:-status}" in
   sessions) cmd_sessions "${2:-1}" ;;
   set-lock) acquire_lock; cmd_set_lock "${2:-}" ;;
   set-kcp) acquire_lock; cmd_set_kcp "${2:-}" "${3:-}" ;;
+  xray-enable) acquire_lock; cmd_xray_enable "${2:-}" ;;
+  xray-disable) acquire_lock; cmd_xray_disable ;;
+  set-xray-ns) acquire_lock; cmd_set_xray_ns "${2:-}" ;;
+  ssh-route) acquire_lock; cmd_ssh_route "${2:-}" ;;
   records) load_config; cmd_records ;;
-  suggest) load_config; suggest_ns "${DOMAIN_MAIN}"; echo ;;
+  suggest)
+    load_config
+    if [[ "${2:-}" == "xray" ]]; then suggest_xray_ns "${DOMAIN_MAIN}"; else suggest_ns "${DOMAIN_MAIN}"; fi
+    echo
+    ;;
   check) cmd_check ;;
   info) cat "${STATE_FILE}" 2>/dev/null || true ;;
   clear) acquire_lock; cmd_clear ;;
   *)
-    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|records|suggest|check|info|clear}"
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions [2|3]|set-lock 0/1|set-kcp INTERVAL ACK|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}"
     exit 1
     ;;
 esac
@@ -28139,7 +29098,8 @@ const XRAY_LINK_FIELDS = [
   { label: 'Up Non-TLS', keys: ['upntls', 'upgrade_none', 'upgrade_ntls'] },
   { label: 'XHTTP TLS', keys: ['xhttptls'], optional: true },
   { label: 'XHTTP Non-TLS', keys: ['xhttpntls'], optional: true },
-  { label: 'OneRing (1FTunnel)', keys: ['onering'], optional: true }
+  { label: 'OneRing (1FTunnel)', keys: ['onering'], optional: true },
+  { label: 'SlowDNS (1FTunnel)', keys: ['slowdns'], optional: true }
 ];
 
 function pickXrayLink(links, keys) {
@@ -28272,6 +29232,8 @@ function formatXrayAccountMessage(protocol, s, { trial = false, username, quota,
     `*[ ${title} URL ]*`,
     '-----------------------------',
     buildXrayLinkLines(links),
+    // SlowDNS Xray (V.1FSC.135): blok sama dengan SSH, hanya kalau API mengirimnya.
+    ...sshSlowdnsLines(s),
     '',
     '*[ HOST INFORMATION ]*',
     '-----------------------------',
@@ -31153,6 +32115,9 @@ IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 IPLIMIT_LOCK_HISTORY_RETENTION_DAYS=${IPLIMIT_LOCK_HISTORY_RETENTION_DAYS}
 IPLIMIT_AUTO_LOCK_ENABLE=${IPLIMIT_AUTO_LOCK_ENABLE}
 SLOWDNS_AUTO_LOCK_ENABLE=${SLOWDNS_AUTO_LOCK_ENABLE}
+SLOWDNS_SSH_ENABLE=${SLOWDNS_SSH_ENABLE}
+SLOWDNS_XRAY_ENABLE=${SLOWDNS_XRAY_ENABLE}
+SLOWDNS_XRAY_NS_DOMAIN=${SLOWDNS_XRAY_NS_DOMAIN}
 QUOTA_LOCK_ENABLE=${QUOTA_LOCK_ENABLE}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
@@ -33314,6 +34279,7 @@ EOT_ZIVPN
     vmess|vless|trojan)
       local title heading host user secret exp exp_text quota lim city isp domain sni tls none grpc any_port path_ws path_upgrade service_name network
       local linktls linknone linkgrpc linkuptls linkupntls linkxhttptls linkxhttpntls linkonering path_xhttp
+      local linkslowdns xslowdns_ns xslowdns_pubkey xslowdns_dns
       title="${type^^}"
       heading="        ${title} ACCOUNT"
       [[ "${mode}" == "trial" ]] && heading="    TRIAL ${title} ACCOUNT"
@@ -33348,6 +34314,11 @@ EOT_ZIVPN
       linkxhttptls="$(created_json_value "${raw}" '.data.link.xhttptls // .data.link.xhttp_tls' '')"
       linkxhttpntls="$(created_json_value "${raw}" '.data.link.xhttpntls // .data.link.xhttp_ntls' '')"
       linkonering="$(created_json_value "${raw}" '.data.link.onering' '')"
+      # SlowDNS Xray (V.1FSC.135): hanya ada kalau API mengirimnya (jalur aktif).
+      linkslowdns="$(created_json_value "${raw}" '.data.link.slowdns' '')"
+      xslowdns_ns="$(created_json_value "${raw}" '.data.slowdns.ns' '')"
+      xslowdns_pubkey="$(created_json_value "${raw}" '.data.slowdns.pubkey' '')"
+      xslowdns_dns="$(created_json_value "${raw}" '.data.slowdns.dns' '')"
       path_xhttp="$(created_json_value "${raw}" '.data.path.xhttp' '')"
       network="ws, grpc, upgrade"
       if [[ -n "${linkxhttptls}" || -n "${linkxhttpntls}" ]]; then
@@ -33432,6 +34403,23 @@ EOT_XRAY_LINKS
 OneRing (1FTunnel):
 ${linkonering}
 EOT_XRAY_ONERING
+      fi
+      if [[ -n "${linkslowdns}" ]]; then
+        cat <<EOT_XRAY_SLOWDNS_LINK | ui_fx
+
+SlowDNS (1FTunnel):
+${linkslowdns}
+EOT_XRAY_SLOWDNS_LINK
+      fi
+      if [[ -n "${xslowdns_ns}" && -n "${xslowdns_pubkey}" ]]; then
+        {
+          printf '\n[ SLOWDNS ]\n------------------------------\n'
+          printf 'NS          : %s\n' "${xslowdns_ns}"
+          printf 'Pubkey      : %s\n' "${xslowdns_pubkey}"
+          if [[ -n "${xslowdns_dns}" ]]; then
+            printf 'DNS         : %s\n' "${xslowdns_dns}"
+          fi
+        } | ui_fx
       fi
       cat <<EOT_XRAY_FOOTER | ui_fx
 
@@ -36204,6 +37192,36 @@ show_slowdns_online() {
   return 0
 }
 
+# SlowDNS Xray (V.1FSC.135): domain NS kedua, kunci dan service yang sama.
+# Menyalakan/mematikan jalur tidak me-restart service; domain NS Xray baru
+# me-restart sekali (pengguna SlowDNS SSH tersambung ulang otomatis).
+slowdns_xray_enable_menu() {
+  local bin="$1" ns def_ns ans current
+  if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" != "1" ]]; then
+    echo "Aktifkan SlowDNS dulu (menu 1); jalur Xray memakai service dan kunci yang sama."
+    return 0
+  fi
+  current="${SLOWDNS_XRAY_NS_DOMAIN:-}"
+  def_ns="${current}"
+  [[ -n "${def_ns}" ]] || def_ns="$("${bin}" suggest xray 2>/dev/null || true)"
+  echo "Domain NS Xray = subdomain KEDUA yang didelegasikan ke VPS ini, beda dengan NS SSH (${SLOWDNS_NS_DOMAIN:--})."
+  echo "Usulan: ${def_ns:-nsx-...}. Kosongkan = pakai usulan, 'batal' = kembali."
+  if ! prompt_input ns "Domain NS Xray [${def_ns}]: "; then
+    return 0
+  fi
+  [[ "${ns,,}" == "batal" ]] && return 0
+  [[ -z "${ns}" ]] && ns="${def_ns}"
+  if [[ "${ns,,}" != "${current,,}" ]]; then
+    echo "Peringatan: domain NS Xray baru me-restart service SlowDNS sekali; pengguna SlowDNS SSH tersambung ulang otomatis."
+    if ! prompt_input ans "Lanjut? [y/N]: " || [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
+      echo "Dibatalkan."
+      return 0
+    fi
+  fi
+  "${bin}" xray-enable "${ns}" 2>&1 | ui_fx || true
+  return 0
+}
+
 # Uji CPU KCP (patch sc-fast8). Ubah satu hal per percobaan, lalu bandingkan CPU
 # dan speed SlowDNS di jam ramai yang sama. Default = 10 ms, ACK biasa.
 slowdns_kcp_menu() {
@@ -36307,9 +37325,10 @@ set_slowdns_menu() {
   draw_menu_header "SLOWDNS (DNS TUNNEL)"
   "${bin}" status | ui_fx
   echo
-  echo "SlowDNS = SSH lewat query DNS: tetap konek di jaringan yang cuma buka DNS."
+  echo "SlowDNS = SSH (dan Xray) lewat query DNS: tetap konek di jaringan yang cuma buka DNS."
   echo "Syarat: buat record NS di DNS domain -> VPS ini (pilih menu 5 untuk panduannya)."
   echo "Di app: pilih Type NULL, isi NS + Pubkey + DNS dari detail akun, akun SSH biasa."
+  echo "SlowDNS Xray (menu 10): NS kedua, untuk VMess/VLESS/Trojan lewat aplikasi 1FTunnel."
   echo
   if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
     echo "1) Nonaktifkan SlowDNS"
@@ -36328,8 +37347,19 @@ set_slowdns_menu() {
     echo "8) Aktifkan Auto-lock SlowDNS"
   fi
   echo "9) Uji CPU KCP (interval/ACK)"
+  if [[ "$(normalize_bool_01 "${SLOWDNS_XRAY_ENABLE:-0}")" == "1" ]]; then
+    echo "10) Nonaktifkan SlowDNS Xray"
+  else
+    echo "10) Aktifkan SlowDNS Xray (VMess/VLESS/Trojan)"
+  fi
+  echo "11) Ganti Domain NS Xray"
+  if [[ "$(normalize_bool_01 "${SLOWDNS_SSH_ENABLE:-1}")" == "1" ]]; then
+    echo "12) Nonaktifkan SlowDNS SSH (Xray tetap jalan)"
+  else
+    echo "12) Aktifkan SlowDNS SSH"
+  fi
   echo "0) Kembali"
-  if ! prompt_input choice "Pilih [0-9]: "; then
+  if ! prompt_input choice "Pilih [0-12]: "; then
     return 0
   fi
   case "${choice}" in
@@ -36359,6 +37389,27 @@ set_slowdns_menu() {
       fi
       ;;
     9) slowdns_kcp_menu "${bin}" ;;
+    10)
+      if [[ "$(normalize_bool_01 "${SLOWDNS_XRAY_ENABLE:-0}")" == "1" ]]; then
+        "${bin}" xray-disable 2>&1 | ui_fx || true
+      else
+        slowdns_xray_enable_menu "${bin}"
+      fi
+      ;;
+    11)
+      echo "Domain NS Xray sekarang: ${SLOWDNS_XRAY_NS_DOMAIN:--}"
+      echo "Peringatan: service SlowDNS di-restart sekali; pengguna tersambung ulang otomatis."
+      if prompt_input ns "Domain NS Xray baru (kosong = batal): " && [[ -n "${ns}" ]]; then
+        "${bin}" set-xray-ns "${ns}" 2>&1 | ui_fx || true
+      fi
+      ;;
+    12)
+      if [[ "$(normalize_bool_01 "${SLOWDNS_SSH_ENABLE:-1}")" == "1" ]]; then
+        "${bin}" ssh-route off 2>&1 | ui_fx || true
+      else
+        "${bin}" ssh-route on 2>&1 | ui_fx || true
+      fi
+      ;;
     *) return 0 ;;
   esac
   safe_source_env_file /etc/sc-1forcr.env
@@ -40927,6 +41978,9 @@ update_script_from_repo() {
     SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}" \
     SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}" \
     SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}" \
+    SLOWDNS_SSH_ENABLE="${SLOWDNS_SSH_ENABLE:-1}" \
+    SLOWDNS_XRAY_ENABLE="${SLOWDNS_XRAY_ENABLE:-0}" \
+    SLOWDNS_XRAY_NS_DOMAIN="${SLOWDNS_XRAY_NS_DOMAIN:-}" \
     SLOWDNS_BIN_URL="${SLOWDNS_BIN_URL:-}" \
     SLOWDNS_BIN_SHA256="${SLOWDNS_BIN_SHA256:-}" \
     BOT_ACCOUNT_EVENT_WEBHOOK_URL="${BOT_ACCOUNT_EVENT_WEBHOOK_URL:-}" \
@@ -43862,7 +44916,7 @@ persist_pending_install_env() {
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
-    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_KCP_INTERVAL SLOWDNS_KCP_ACK_NODELAY SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
+    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_KCP_INTERVAL SLOWDNS_KCP_ACK_NODELAY SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_SSH_ENABLE SLOWDNS_XRAY_ENABLE SLOWDNS_XRAY_NS_DOMAIN SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE

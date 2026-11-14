@@ -24391,7 +24391,7 @@ install_slowdns_manager() {
   mkdir -p /usr/local/sbin /var/lib/sc-1forcr
   cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
 #!/usr/bin/env bash
-# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|records|suggest|check|info|clear}
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|records|suggest|check|info|clear}
 #
 # - setup     : pasang binary, kunci, dan unit lalu nyalakan atau matikan service
 #               sesuai SLOWDNS_ENABLE. Dipanggil install/update dan menu. Hanya
@@ -24400,6 +24400,9 @@ install_slowdns_manager() {
 #               Aman untuk tiap siklus watchdog: tidak menyentuh systemd, dan
 #               iptables hanya ditulis kalau aturan hilang atau tergeser.
 # - enable/disable/set-ns/regen-key : menu Tools > SlowDNS.
+# - set-key   : pasang kunci sendiri (pindah dari VPS lain tanpa restore).
+#               stdin baris 1 = private key, baris 2 = pubkey (opsional, wajib
+#               cocok). Private key tidak lewat argumen supaya tidak terlihat di ps.
 # - set-kcp   : uji CPU KCP, interval 10-50 ms + ACK langsung 0/1 (default 10 0).
 # - records   : record DNS yang harus dibuat pemilik domain.
 # - check     : uji delegasi NS lewat resolver publik (DoH Google/Cloudflare).
@@ -24454,6 +24457,9 @@ WAIT_SECONDS="${WAIT_SECONDS//[^0-9]/}"
 WAIT_SECONDS="${WAIT_SECONDS:-8}"
 BINARY_CHANGED=0
 KEY_CHANGED=0
+# set-key mengganti isi file kunci yang sudah ada (ensure_key tidak melihatnya
+# sebagai perubahan), jadi restart service dipaksa lewat penanda ini.
+FORCE_RESTART=0
 RULES_CHANGED=0
 RULES_OK=0
 PUBLIC_IP_NEW=""
@@ -26290,7 +26296,7 @@ cmd_setup() {
   fi
   systemctl is-enabled --quiet "${SERVICE}" 2>/dev/null || \
     systemctl enable --no-reload "${SERVICE}" >/dev/null 2>&1 || true
-  if (( unit_changed || BINARY_CHANGED || KEY_CHANGED )) || ! systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then
+  if (( unit_changed || BINARY_CHANGED || KEY_CHANGED || FORCE_RESTART )) || ! systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then
     systemctl restart "${SERVICE}" >/dev/null 2>&1 || true
   fi
   wait_listening || true
@@ -26414,6 +26420,74 @@ cmd_regen_key() {
   pubkey_val
   say "Berhasil: kunci baru dibuat. Pubkey lama tidak berlaku; kirim pubkey baru ke pengguna."
   say "Pubkey: ${REPLY}"
+}
+
+# Hex -> byte mentah (byte NUL ikut), tanpa xxd yang belum tentu terpasang.
+hex_bytes() {
+  local hex="$1" out="" i
+  for ((i = 0; i < ${#hex}; i += 2)); do out+="\\x${hex:i:2}"; done
+  printf '%b' "${out}"
+}
+
+# Pubkey X25519 dari private key (sama dengan dnstt -gen-key) -> REPLY.
+# DER PKCS#8 X25519 = awalan 16 byte + 32 byte private key; SPKI hasil openssl
+# = 12 byte awalan + 32 byte pubkey.
+derive_pubkey() {
+  local hex
+  REPLY=""
+  command -v openssl >/dev/null 2>&1 || return 1
+  hex="$(hex_bytes "302e020100300506032b656e04220420${1}" | \
+    openssl pkey -inform DER -pubout -outform DER 2>/dev/null | od -An -v -tx1 | tr -d ' \n')" || return 1
+  [[ ${#hex} -eq 88 && "${hex:0:24}" == "302a300506032b656e032100" ]] || return 1
+  REPLY="${hex:24}"
+  valid_hex_key "${REPLY}"
+}
+
+cmd_set_key() {
+  local priv="" pub="" derived
+  load_config
+  IFS= read -r priv || true
+  IFS= read -r pub || true
+  priv="${priv//[[:space:]]/}"
+  priv="${priv,,}"
+  pub="${pub//[[:space:]]/}"
+  pub="${pub,,}"
+  valid_hex_key "${priv}" || die "private key harus 64 karakter hex (isi file server.key)"
+  derive_pubkey "${priv}" || die "pubkey tidak bisa dihitung dari private key (openssl)"
+  derived="${REPLY}"
+  if [[ -n "${pub}" ]]; then
+    valid_hex_key "${pub}" || die "pubkey harus 64 karakter hex"
+    [[ "${pub}" == "${derived}" ]] || die "private key dan pubkey tidak cocok. Pubkey dari private key ini: ${derived}"
+  fi
+  if pubkey_val && [[ "${REPLY}" == "${derived}" ]] && read_key_file "${KEY_DIR}/server.key" && [[ "${REPLY}" == "${priv}" ]]; then
+    say "Kunci ini sudah dipakai VPS ini; tidak ada yang diubah."
+    say "Pubkey: ${derived}"
+    return 0
+  fi
+  ensure_user || die "user ${SVC_USER} gagal dibuat"
+  mkdir -p "${KEY_DIR}" || die "folder kunci gagal dibuat"
+  rm -f "${KEY_DIR}/server.key.bak" "${KEY_DIR}/server.pub.bak" "${KEY_DIR}/server.key.new" "${KEY_DIR}/server.pub.new"
+  ( umask 077; printf '%s\n' "${priv}" > "${KEY_DIR}/server.key.new" ) || die "kunci gagal ditulis"
+  printf '%s\n' "${derived}" > "${KEY_DIR}/server.pub.new" || die "pubkey gagal ditulis"
+  [[ -f "${KEY_DIR}/server.key" ]] && mv -f "${KEY_DIR}/server.key" "${KEY_DIR}/server.key.bak"
+  [[ -f "${KEY_DIR}/server.pub" ]] && mv -f "${KEY_DIR}/server.pub" "${KEY_DIR}/server.pub.bak"
+  mv -f "${KEY_DIR}/server.key.new" "${KEY_DIR}/server.key" || die "kunci gagal dipasang"
+  mv -f "${KEY_DIR}/server.pub.new" "${KEY_DIR}/server.pub" || die "pubkey gagal dipasang"
+  if (( ENABLED == 1 )); then
+    FORCE_RESTART=1
+    if ! ( cmd_setup ); then
+      mv -f "${KEY_DIR}/server.key.bak" "${KEY_DIR}/server.key" 2>/dev/null || true
+      mv -f "${KEY_DIR}/server.pub.bak" "${KEY_DIR}/server.pub" 2>/dev/null || true
+      ( cmd_setup ) >/dev/null 2>&1 || true
+      die "kunci gagal diterapkan; kunci lama dikembalikan"
+    fi
+  else
+    # Izin file kunci untuk user service; kunci yang ada tidak dibuat ulang.
+    ensure_key || die "izin file kunci gagal diatur"
+    write_state
+  fi
+  say "Berhasil: kunci SlowDNS dipasang."
+  say "Pubkey: ${derived}"
 }
 
 # Diambil hanya saat status/layar online dibuka, bukan di watchdog. PID pemilik
@@ -26798,6 +26872,7 @@ case "${1:-status}" in
   disable) acquire_lock; cmd_disable ;;
   set-ns) acquire_lock; cmd_set_ns "${2:-}" ;;
   regen-key) acquire_lock; cmd_regen_key ;;
+  set-key) acquire_lock; cmd_set_key ;;
   status) cmd_status ;;
   online) cmd_online ;;
   sessions) cmd_sessions "${2:-1}" ;;
@@ -26809,7 +26884,7 @@ case "${1:-status}" in
   info) cat "${STATE_FILE}" 2>/dev/null || true ;;
   clear) acquire_lock; cmd_clear ;;
   *)
-    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|records|suggest|check|info|clear}"
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|records|suggest|check|info|clear}"
     exit 1
     ;;
 esac
@@ -35699,6 +35774,62 @@ slowdns_kcp_menu() {
   return 0
 }
 
+# Baca input tanpa menampilkannya (private key). Gaya prompt sama dengan
+# prompt_input.
+prompt_secret() {
+  local var_name="$1" prompt="$2"
+  if [[ "${prompt}" != *$'\033'* ]] && declare -F ui_init >/dev/null 2>&1; then
+    if [[ -z "${UI_MODE:-}" ]]; then ui_init; fi
+    prompt=" ${UI_ACC2}◆${UI_NC} ${UI_VAL}${prompt}${UI_NC}"
+  fi
+  if ! read -rsp "${prompt}" "${var_name}" </dev/tty; then
+    printf '\n'
+    cancelled
+    return 130
+  fi
+  printf '\n'
+  return 0
+}
+
+slowdns_key_menu() {
+  local bin="$1" choice ans priv="" pub=""
+  echo "Pubkey sekarang: $(tr -d '[:space:]' < /etc/sc-1forcr/slowdns/server.pub 2>/dev/null || echo -)"
+  echo "1) Buat kunci baru (acak)"
+  echo "2) Pasang kunci sendiri (private key + pubkey)"
+  echo "0) Batal"
+  if ! prompt_input choice "Pilih [0-2]: "; then
+    return 0
+  fi
+  case "${choice}" in
+    1)
+      echo "Peringatan: semua pengguna SlowDNS harus mengganti pubkey di aplikasinya."
+      if prompt_input ans "Buat kunci baru? [y/N]: " && [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
+        "${bin}" regen-key 2>&1 | ui_fx || true
+      else
+        echo "Dibatalkan."
+      fi
+      ;;
+    2)
+      echo "Dipakai untuk memindahkan kunci dari VPS lain tanpa restore backup."
+      echo "Di VPS lama: cat /etc/sc-1forcr/slowdns/server.key (private) dan server.pub (pubkey)."
+      echo "Kalau kuncinya sama dengan VPS lama, pengguna tidak perlu ganti pubkey."
+      if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
+        echo "Peringatan: service SlowDNS di-restart; pengguna tersambung ulang otomatis."
+      fi
+      prompt_secret priv "Private key (64 hex, tidak ditampilkan): " || return 0
+      if [[ -z "${priv}" ]]; then
+        echo "Dibatalkan."
+        return 0
+      fi
+      prompt_input pub "Pubkey (64 hex, kosong = hitung dari private key): " || return 0
+      printf '%s\n%s\n' "${priv}" "${pub}" | "${bin}" set-key 2>&1 | ui_fx || true
+      priv=""
+      ;;
+    *) echo "Dibatalkan." ;;
+  esac
+  return 0
+}
+
 set_slowdns_menu() {
   local bin="/usr/local/sbin/sc-1forcr-slowdns" choice ns ans
   if [[ ! -x "${bin}" ]]; then
@@ -35720,7 +35851,7 @@ set_slowdns_menu() {
   fi
   echo "2) Ganti Domain NS"
   echo "3) Cek Delegasi NS"
-  echo "4) Buat Ulang Kunci (pubkey baru)"
+  echo "4) Kunci SlowDNS (buat baru / pasang sendiri)"
   echo "5) Lihat Record DNS yang Dibutuhkan"
   echo "6) Lihat Log SlowDNS"
   echo "7) Lihat Akun Online SlowDNS"
@@ -35749,14 +35880,7 @@ set_slowdns_menu() {
       fi
       ;;
     3) "${bin}" check 2>&1 | ui_fx || true ;;
-    4)
-      echo "Peringatan: semua pengguna SlowDNS harus mengganti pubkey di aplikasinya."
-      if prompt_input ans "Buat kunci baru? [y/N]: " && [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
-        "${bin}" regen-key 2>&1 | ui_fx || true
-      else
-        echo "Dibatalkan."
-      fi
-      ;;
+    4) slowdns_key_menu "${bin}" ;;
     5) "${bin}" records | ui_fx || true ;;
     6) journalctl -u sc-1forcr-slowdns.service -n 40 --no-pager -o cat 2>/dev/null || echo "Log SlowDNS belum tersedia." ;;
     7) ui_monitor show_slowdns_online ;;

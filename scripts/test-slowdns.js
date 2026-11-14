@@ -584,6 +584,71 @@ try {
   assert.notStrictEqual(state().PUBKEY, oldPub, 'pubkey berganti');
   assert(mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'));
 
+  // ── 9b. set-key: kunci sendiri (pindah dari VPS lain tanpa restore) ──────
+  // Kunci X25519 asli; pubkey dihitung helper lewat openssl, sama dengan dnstt.
+  const x25519Pair = () => {
+    const { privateKey, publicKey } = crypto.generateKeyPairSync('x25519');
+    return {
+      priv: privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32).toString('hex'),
+      pub: publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('hex')
+    };
+  };
+  const setKey = (input) => {
+    for (const f of ['writes', 'persist', 'systemctl.log', 'gate.log', 'curl.log']) fs.rmSync(F(f), { force: true });
+    const r = spawnSync(bash, ['-c', 'export PATH="${FAKE_BIN}:${PATH}"; exec bash "$0" set-key', toBashPath(scriptPath)], {
+      encoding: 'utf8',
+      input,
+      timeout: 120000,
+      env: {
+        ...process.env,
+        FAKE_BIN: toBashPath(bin),
+        FAKE_DIR: toBashPath(tmp),
+        SC_ENV_FILE: toBashPath(envFile),
+        SLOWDNS_STATE_FILE: toBashPath(stateFile),
+        SLOWDNS_KEY_DIR: toBashPath(keyDir),
+        SLOWDNS_BIN_PATH: toBashPath(dnsttBin),
+        SLOWDNS_UNIT_FILE: toBashPath(unitFile),
+        SLOWDNS_LOCK_FILE: toBashPath(F('lock')),
+        SLOWDNS_BUILD_ROOT: toBashPath(buildRoot),
+        SLOWDNS_WAIT_SECONDS: '1',
+        SLOWDNS_SERVICE_GATE_BIN: toBashPath(path.join(bin, 'service-gate'))
+      }
+    });
+    assert(!r.error, `set-key macet: ${r.error && r.error.message}`);
+    return { status: r.status, out: `${r.stdout}${r.stderr}` };
+  };
+  const keyFile = (name) => fs.readFileSync(path.join(keyDir, name), 'utf8').trim();
+  const opensslOk = spawnSync(bash, ['-c', 'command -v openssl >/dev/null && command -v od >/dev/null'], { encoding: 'utf8' }).status === 0;
+  if (opensslOk) {
+    const manual = x25519Pair();
+    const before = { priv: keyFile('server.key'), pub: keyFile('server.pub') };
+    // Pubkey salah: ditolak, kunci lama utuh, service tidak disentuh.
+    let k = setKey(`${manual.priv}\n${x25519Pair().pub}\n`);
+    assert.notStrictEqual(k.status, 0, k.out);
+    assert(/tidak cocok/.test(k.out) && k.out.includes(manual.pub), k.out);
+    assert.deepStrictEqual({ priv: keyFile('server.key'), pub: keyFile('server.pub') }, before);
+    assert(!mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'));
+    k = setKey('bukan-hex\n\n');
+    assert.notStrictEqual(k.status, 0, k.out);
+    assert(/64 karakter hex/.test(k.out), k.out);
+    // Pasangan benar saat SlowDNS aktif: kunci terpasang dan service di-restart.
+    k = setKey(`${manual.priv.toUpperCase()}\n${manual.pub}\n`);
+    assert.strictEqual(k.status, 0, k.out);
+    assert(k.out.includes(`Pubkey: ${manual.pub}`), k.out);
+    assert.strictEqual(keyFile('server.key'), manual.priv);
+    assert.strictEqual(keyFile('server.pub'), manual.pub);
+    assert.strictEqual(state().PUBKEY, manual.pub);
+    assert(mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'), 'kunci baru wajib me-restart dnstt');
+    assert(!read('systemctl.log').includes(manual.priv), 'private key tidak boleh lewat argumen');
+    // Kunci yang sama lagi: tidak ada perubahan, tidak ada restart.
+    k = setKey(`${manual.priv}\n\n`);
+    assert.strictEqual(k.status, 0, k.out);
+    assert(/tidak ada yang diubah/.test(k.out), k.out);
+    assert(!mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'));
+  } else {
+    console.log('test slowdns: uji set-key dilewati (openssl/od tidak ada)');
+  }
+
   // ── 10. disable: aturan dilepas, kunci disimpan ─────────────────────────
   const pubBefore = state().PUBKEY;
   r = run('disable');
@@ -593,6 +658,17 @@ try {
   assert(!rules(4, 'filter').some((l) => l.includes('sc-slowdns')), 'aturan INPUT dilepas');
   assert.strictEqual(state().ENABLED, '0');
   assert.strictEqual(state().PUBKEY, pubBefore, 'kunci tetap disimpan');
+
+  // ── 10b. set-key saat SlowDNS mati: kunci dipasang, service tetap mati ───
+  if (opensslOk) {
+    const off = x25519Pair();
+    const k = setKey(`${off.priv}\n${off.pub}\n`);
+    assert.strictEqual(k.status, 0, k.out);
+    assert.strictEqual(keyFile('server.key'), off.priv);
+    assert.strictEqual(state().PUBKEY, off.pub, 'state ikut pubkey baru walau SlowDNS mati');
+    assert.strictEqual(state().ENABLED, '0');
+    assert(!mutatingSystemctl().some((c) => /^(restart|start|enable) /.test(c)), mutatingSystemctl().join('\n'));
+  }
 
   // ── 11. Binary dari URL wajib checksum; binary lama dipakai kalau gagal ──
   fs.writeFileSync(F('dnstt-download'), fakeDnstt);

@@ -213,7 +213,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.133}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.134}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -24446,7 +24446,9 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # sc-fast9: tahan banjir sesi palsu (batas waktu handshake, entri EDNS basi
 # dibuang, antrean kirim baru dibuat saat ada paket untuk klien).
 # sc-fast10: byte download per stream + stream putus disimpan 30 menit (kuota SSH).
-DNSTT_PATCH_ID="sc-fast10"
+# sc-fast11: ukuran respons terbukti per klien. Lewat resolver (8.8.8.8 dkk)
+# EDNS di query milik resolver, jadi app ber-buffer kecil dulu tidak bisa konek.
+DNSTT_PATCH_ID="sc-fast11"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -25921,6 +25923,471 @@ func scStreamWriter(stream io.Writer, s *scSession) io.Writer {
 
 
 patch_session_bytes(mod)
+
+# sc-fast11: ukuran respons terbukti per klien. Lewat resolver publik (8.8.8.8,
+# 1.1.1.1, 9.9.9.9) buffer EDNS di query adalah milik resolver, bukan milik app.
+# App yang mengiklankan buffer kecil (512 / tanpa EDNS) ke resolver menerima
+# TC=1 tanpa jawaban setiap kali respons lebih besar dari buffernya, sehingga
+# sesi tidak pernah naik (terbukti di sg4 14-11-2026: buffer klien 512/1024/
+# tanpa EDNS gagal lewat 8.8.8.8, 1.1.1.1, dan 9.9.9.9; 1100 ke atas jalan).
+# Respons TXT/NULL kini dibatasi ke ukuran yang sudah terbukti sampai (mulai
+# 512, MTU KCP 215). Ukuran lebih besar dicoba lewat respons probe yang membawa
+# segmen PUSH KCP baru dan diisi padding sampai ukuran probe; terbukti saat
+# klien menerima segmen itu (una melewatinya atau ACK sn+ts yang sama) tanpa
+# transmisi ulang di respons lain. Terbukti = batas dan MTU sesi naik; gagal =
+# pencarian biner ke bawah. Detail di sc_size.go.
+def patch_response_size(mod):
+    path = os.path.join(mod, 'dnstt-server', 'main.go')
+    src = io.open(path, encoding='utf-8').read()
+    def replace(old, new):
+        nonlocal src
+        if src.count(old) != 1:
+            raise RuntimeError('size anchor count %d: %r' % (src.count(old), old[:90]))
+        src = src.replace(old, new)
+    # recvLoop tahu klien mana yang sedang diuji tanpa kunci tambahan.
+    replace('func clientEdnsRecord(cid turbotunnel.ClientID, size int, kinds ...uint16) {',
+            'func clientEdnsRecord(cid turbotunnel.ClientID, size int, kinds ...uint16) bool {')
+    replace('\tscEdnsMarkSeen(cid)\n\tclientEdnsMu.Unlock()\n}\n',
+            '\tscEdnsMarkSeen(cid)\n\twatch := scSizeWatchLocked(cid)\n\tclientEdnsMu.Unlock()\n\treturn watch\n}\n')
+    replace('\tdelete(clientSeen, cid)\n\tclientEdnsMu.Unlock()\n',
+            '\tdelete(clientSeen, cid)\n\tdelete(clientSize, cid)\n\tclientEdnsMu.Unlock()\n')
+    replace('\t\t\tclientEdnsRecord(clientID, size, query.Question[0].Type)\n',
+            '\t\t\twatch := clientEdnsRecord(clientID, size, query.Question[0].Type)\n')
+    replace('\t\t\t\t// Feed the incoming packet to KCP.\n\t\t\t\tttConn.QueueIncoming(p, clientID)\n',
+            '\t\t\t\tif watch {\n\t\t\t\t\tscSizeCheckClient(clientID, p)\n\t\t\t\t}\n'
+            '\t\t\t\t// Feed the incoming packet to KCP.\n\t\t\t\tttConn.QueueIncoming(p, clientID)\n')
+    # MTU awal TXT/NULL = kapasitas respons 512 byte; naik lewat bukti.
+    replace('\t\t\tif edns > 0 {\n'
+            '\t\t\t\tif cand := computeMaxEncodedPayload(edns) - 2; cand > permtu {\n'
+            '\t\t\t\t\tpermtu = cand\n'
+            '\t\t\t\t}\n'
+            '\t\t\t}\n',
+            '\t\t\t// sc-fast11: EDNS di query bisa milik resolver, jadi MTU awal\n'
+            '\t\t\t// TXT/NULL tetap kapasitas respons 512 byte. MTU naik setelah\n'
+            '\t\t\t// klien terbukti menerima respons lebih besar (sc_size.go).\n')
+    replace('\t\tif rc := conn.SetMtu(permtu); !rc {\n\t\t\tpanic(rc)\n\t\t}\n',
+            '\t\tif rc := conn.SetMtu(permtu); !rc {\n\t\t\tpanic(rc)\n\t\t}\n\t\tscSizeAttach(conn, permtu)\n')
+    replace('\tmtuCeil := computeMaxEncodedPayload(maxUDPPayload) - 2\n',
+            '\tmtuCeil := computeMaxEncodedPayload(maxUDPPayload) - 2\n\tscMTUCeil = mtuCeil\n')
+    # sendLoop: batas terbukti + satu perpanjangan probe per respons.
+    replace('\t\tif rec.Resp.Rcode() == dns.RcodeNoError && len(rec.Resp.Question) == 1 {\n',
+            '\t\tvar scPayload []byte\n'
+            '\t\tscProbe := 0\n'
+            '\t\tif rec.Resp.Rcode() == dns.RcodeNoError && len(rec.Resp.Question) == 1 {\n')
+    replace('\t\t\tlimit := maxPayloadForResponse(rec.Resp, rec.Size)\n',
+            '\t\t\tplan := scSizeCaps(rec)\n'
+            '\t\t\tlimit := maxPayloadForResponse(rec.Resp, plan.base)\n'
+            '\t\t\tprobeLimit, probeExtra, probing := 0, 0, false\n'
+            '\t\t\tif plan.probe > plan.base {\n'
+            '\t\t\t\tprobeLimit = maxPayloadForResponse(rec.Resp, plan.probe)\n'
+            '\t\t\t\tprobeExtra = probeLimit - limit\n'
+            '\t\t\t}\n')
+    replace('\t\t\t\t} else if limit < 0 {\n',
+            '\t\t\t\t} else if limit < 0 && !scSizeExtend(&limit, &probeExtra, &probing, p, plan.fresh) {\n')
+    replace('            answers, encodeErr := dns.TunnelAnswers(rec.Resp.Question[0], responseTTL, payload.Bytes())\n',
+            '            if !probing && probeLimit > 0 && scPayloadHasFreshPush(payload.Bytes(), plan.fresh) {\n'
+            '                probing = true\n'
+            '            }\n'
+            '            if probing {\n'
+            '                scSizePad(&payload, probeLimit)\n'
+            '                scProbe = plan.probe\n'
+            '            }\n'
+            '            if probing || plan.track {\n'
+            '                scPayload = payload.Bytes()\n'
+            '            }\n'
+            '            answers, encodeErr := dns.TunnelAnswers(rec.Resp.Question[0], responseTTL, payload.Bytes())\n')
+    # Dicatat sebelum dikirim, supaya ACK klien tidak pernah mendahului catatan.
+    replace('\t\t// Now we actually send the message as a UDP packet.\n',
+            '\t\tif scPayload != nil {\n\t\t\tscSizeSent(rec.ClientID, scPayload, len(buf), scProbe)\n\t\t}\n'
+            '\t\t// Now we actually send the message as a UDP packet.\n')
+    io.open(path, 'w', encoding='utf-8', newline='\n').write(src)
+
+    gpath = os.path.join(mod, 'dnstt-server', 'sc_guard.go')
+    gsrc = io.open(gpath, encoding='utf-8').read()
+    old = '\t\t\tdelete(clientSeen, k)\n'
+    if gsrc.count(old) != 1:
+        raise RuntimeError('size sweep anchor count: ' + str(gsrc.count(old)))
+    gsrc = gsrc.replace(old, old + '\t\t\tdelete(clientSize, k)\n')
+    io.open(gpath, 'w', encoding='utf-8', newline='\n').write(gsrc)
+
+    io.open(os.path.join(mod, 'dnstt-server', 'sc_size.go'), 'w', encoding='utf-8', newline='\n').write(r'''package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"log"
+	"time"
+
+	"github.com/xtaci/kcp-go/v5"
+	"www.bamsoftware.com/git/dnstt.git/dns"
+	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+)
+
+// Ukuran respons terbukti per klien (sc-fast11).
+//
+// Lewat resolver publik, buffer EDNS di query adalah milik resolver (>= 1232),
+// bukan milik app. App yang mengiklankan buffer lebih kecil menerima TC=1
+// tanpa jawaban setiap kali respons lebih besar, jadi sesi macet. Respons
+// TXT/NULL dibatasi ke ukuran yang sudah terbukti sampai ke klien (mulai 512,
+// MTU KCP awal 215). Ukuran lebih besar dicoba lewat respons probe: respons
+// pertama yang membawa segmen PUSH KCP baru (biasanya balasan handshake Noise),
+// atau respons yang datanya melebihi batas terbukti, lalu diisi paket padding
+// sampai tepat ukuran probe. Paket padding berisi nol: kcp-go klien
+// membuangnya (kurang dari 24 byte, atau conv 0 tidak cocok).
+//
+// Probe dini itu penting untuk RAM: selama MTU masih 215, data unduhan besar
+// dipecah menjadi segmen 191 byte yang masing-masing memegang buffer 1500 byte
+// kcp-go, sehingga window 2048 segmen penuh (~3 MB per sesi, bukan ~1,7 MB).
+// Dengan probe di balasan handshake, MTU sudah naik sebelum unduhan dimulai.
+//
+// Probe terbukti sampai kalau klien menerima salah satu segmennya: una klien
+// melewati sn segmen itu, atau ACK dengan sn+ts transmisi yang sama. kcp-go
+// hanya mengirim ACK satuan untuk segmen terakhir/di luar urutan, jadi una
+// bukti utama. Karena itu hanya transmisi pertama (sn >= freshSn) yang dicatat
+// sebagai bukti, dan catatan batal kalau sn yang sama dikirim ulang di respons
+// lain. Selama sesi diuji, setiap respons dicatat supaya freshSn tepat.
+//
+// Terbukti = batas naik dan MTU KCP sesi dinaikkan (aman: segmen lama yang
+// kecil tetap muat). Probe tanpa bukti dalam scSizeTimeout dihitung gagal
+// (ukuran awal dicoba scSizeTopTries kali karena paket bisa hilang biasa).
+// Ukuran berikutnya dicari secara biner di antara terbukti dan gagal terkecil,
+// sampai selisihnya kurang dari scSizeMinStep. Setelah itu sesi tidak diuji
+// dan tidak dicatat lagi.
+const (
+	scSizeFloor    = 512
+	scSizeTimeout  = int64(2500 * time.Millisecond)
+	scSizeWatchFor = int64(15 * time.Second)
+	scSizeTopTries = 2
+	scSizeMinStep  = 128
+	scSizeRing     = 8
+	scSizePerProbe = 4
+	scKCPOverhead  = 24
+	scKCPCmdPush   = 81
+	scKCPCmdAck    = 82
+)
+
+type scSizeState struct {
+	proven, ceil, top int    // terbukti, ukuran probe berikut, batas awal
+	failedAt          int    // ukuran probe gagal terkecil (top+1 = belum ada)
+	fails             int    // probe gagal beruntun di ukuran awal
+	pendingSize       int    // ukuran probe yang buktinya ditunggu (0 = tidak ada)
+	pendingAt         int64  // UnixNano probe dikirim
+	watchUntil        int64  // paket klien dibaca sampai saat ini (0 = tidak)
+	freshSn           uint32 // segmen PUSH dengan sn >= ini belum pernah dikirim
+	sn, ts            [scSizeRing]uint32
+	sizes             [scSizeRing]int // 0 = kosong / tidak berlaku lagi
+	next              int
+	mtu               int
+	sess              *kcp.UDPSession
+}
+
+// scSizePlan: batas respons biasa, batas probe (0 = tanpa probe), apakah isi
+// respons perlu dicatat (scSizeSent), dan sn pertama yang belum pernah dikirim.
+type scSizePlan struct {
+	base, probe int
+	track       bool
+	fresh       uint32
+}
+
+var (
+	// Dijaga clientEdnsMu. Umur entri = umur sesi KCP: dibuat saat sesi
+	// diterima, dibuang bersama clientEdns saat sesi berakhir atau disapu.
+	clientSize = make(map[turbotunnel.ClientID]*scSizeState)
+	// scMTUCeil diisi run() sebelum goroutine mulai.
+	scMTUCeil int
+	scZeros   [2048]byte
+)
+
+// scSizeAttach dipanggil acceptSessions setelah MTU awal sesi dipasang.
+func scSizeAttach(conn *kcp.UDPSession, mtu int) {
+	cid, ok := conn.RemoteAddr().(turbotunnel.ClientID)
+	if !ok {
+		return
+	}
+	st := &scSizeState{proven: scSizeFloor, ceil: maxUDPPayload, top: maxUDPPayload, failedAt: maxUDPPayload + 1, mtu: mtu, sess: conn}
+	clientEdnsMu.Lock()
+	clientSize[cid] = st
+	clientEdnsMu.Unlock()
+}
+
+// scSizeWatchLocked (clientEdnsMu terkunci): true selama probe klien ini masih
+// bisa dibuktikan, supaya hanya paket klien itu yang dibaca header KCP-nya.
+func scSizeWatchLocked(cid turbotunnel.ClientID) bool {
+	st := clientSize[cid]
+	if st == nil || st.watchUntil == 0 {
+		return false
+	}
+	if time.Now().UnixNano() < st.watchUntil {
+		return true
+	}
+	st.watchUntil = 0
+	return false
+}
+
+// scSizeCaps menyusun rencana ukuran untuk respons ini. Tipe selain TXT/NULL
+// punya MTU sendiri dan tidak diubah.
+func scSizeCaps(rec *record) scSizePlan {
+	if t := rec.Resp.Question[0].Type; t != dns.RRTypeTXT && t != rrTypeNULL {
+		return scSizePlan{base: rec.Size}
+	}
+	clientEdnsMu.Lock()
+	defer clientEdnsMu.Unlock()
+	st := clientSize[rec.ClientID]
+	if st == nil {
+		return scSizePlan{base: scMinInt(rec.Size, scSizeFloor)}
+	}
+	if st.pendingSize != 0 && time.Now().UnixNano()-st.pendingAt > scSizeTimeout {
+		scSizeFailLocked(st)
+	}
+	plan := scSizePlan{
+		base:  scMinInt(rec.Size, st.proven),
+		track: st.ceil > st.proven || st.pendingSize != 0 || st.watchUntil != 0,
+		fresh: st.freshSn,
+	}
+	if st.pendingSize == 0 && st.ceil > st.proven {
+		if probe := scMinInt(rec.Size, st.ceil); probe > plan.base {
+			plan.probe = probe
+		}
+	}
+	return plan
+}
+
+// scSizeNextLocked memilih ukuran probe berikut (pencarian biner).
+func scSizeNextLocked(st *scSizeState) {
+	st.ceil = (st.proven + st.failedAt) / 2
+	if st.ceil > st.top {
+		st.ceil = st.top
+	}
+	if st.ceil-st.proven < scSizeMinStep {
+		st.ceil = st.proven
+	}
+}
+
+// scSizeFailLocked: probe tidak terbukti sampai sebelum tenggat.
+func scSizeFailLocked(st *scSizeState) {
+	failed := st.pendingSize
+	st.pendingSize = 0
+	st.fails++
+	if failed >= st.top && st.fails < scSizeTopTries {
+		return
+	}
+	st.fails = 0
+	if failed < st.failedAt {
+		st.failedAt = failed
+	}
+	scSizeNextLocked(st)
+	if st.ceil == st.proven && st.sess != nil {
+		log.Printf("session %08x respons dibatasi %d byte (respons %d byte tidak sampai ke klien)", st.sess.GetConv(), st.proven, st.failedAt)
+	}
+}
+
+// scSizeExtend: paket p tidak muat di batas terbukti. Kalau probe diizinkan,
+// p membawa data baru (segmen PUSH yang belum pernah dikirim), dan p muat di
+// ruang probe, respons ini dijadikan probe dengan menaikkan batasnya sekali.
+func scSizeExtend(limit, extra *int, probing *bool, p []byte, fresh uint32) bool {
+	if *extra <= 0 || *limit+*extra < 0 || !scKCPHasFreshPush(p, fresh) {
+		return false
+	}
+	*limit += *extra
+	*extra = 0
+	*probing = true
+	return true
+}
+
+// scPayloadHasFreshPush: payload respons (paket berawalan panjang 2 byte)
+// memuat segmen PUSH transmisi pertama.
+func scPayloadHasFreshPush(payload []byte, fresh uint32) bool {
+	for len(payload) >= 2 {
+		n := int(binary.BigEndian.Uint16(payload))
+		payload = payload[2:]
+		if n > len(payload) {
+			return false
+		}
+		if scKCPHasFreshPush(payload[:n], fresh) {
+			return true
+		}
+		payload = payload[n:]
+	}
+	return false
+}
+
+// scKCPHasFreshPush memeriksa apakah paket KCP p memuat segmen PUSH dengan
+// sn >= fresh (transmisi pertama).
+func scKCPHasFreshPush(p []byte, fresh uint32) bool {
+	for off := 0; off+scKCPOverhead <= len(p); {
+		if p[off+4] == scKCPCmdPush && int32(binary.LittleEndian.Uint32(p[off+12:])-fresh) >= 0 {
+			return true
+		}
+		n := binary.LittleEndian.Uint32(p[off+20:])
+		if uint64(n) > uint64(len(p)-off-scKCPOverhead) {
+			return false
+		}
+		off += scKCPOverhead + int(n)
+	}
+	return false
+}
+
+// scSizePad mengisi payload probe dengan satu paket nol sampai limit, supaya
+// respons tepat seukuran probe dan buktinya berlaku untuk ukuran itu.
+func scSizePad(payload *bytes.Buffer, limit int) {
+	n := limit - payload.Len() - 2
+	if n < 1 || n > len(scZeros) {
+		return
+	}
+	var prefix [2]byte
+	binary.BigEndian.PutUint16(prefix[:], uint16(n))
+	payload.Write(prefix[:])
+	payload.Write(scZeros[:n])
+}
+
+// scSizeSent dipanggil sebelum respons dikirim, selama sesi diuji atau saat
+// respons ini probe (probe = ukuran probe, 0 = bukan probe). payload = paket
+// berawalan panjang 2 byte dari sendLoop, size = ukuran wire. Setiap segmen
+// PUSH membatalkan catatan probe lama untuk sn yang sama (transmisi ulang).
+// Kalau respons ini probe, hanya segmen transmisi pertama yang dicatat: una
+// klien yang melewati segmen kiriman ulang tidak membuktikan probe ini sampai.
+func scSizeSent(cid turbotunnel.ClientID, payload []byte, size, probe int) {
+	if probe > size {
+		size = probe
+	}
+	clientEdnsMu.Lock()
+	defer clientEdnsMu.Unlock()
+	st := clientSize[cid]
+	if st == nil {
+		return
+	}
+	probing := probe > 0 && size > st.proven
+	added := 0
+	for len(payload) >= 2 {
+		n := int(binary.BigEndian.Uint16(payload))
+		payload = payload[2:]
+		if n > len(payload) {
+			break
+		}
+		p := payload[:n]
+		payload = payload[n:]
+		for off := 0; off+scKCPOverhead <= len(p); {
+			l := binary.LittleEndian.Uint32(p[off+20:])
+			if p[off+4] == scKCPCmdPush {
+				ts := binary.LittleEndian.Uint32(p[off+8:])
+				sn := binary.LittleEndian.Uint32(p[off+12:])
+				for i := range st.sn {
+					if st.sizes[i] != 0 && st.sn[i] == sn {
+						st.sizes[i] = 0
+					}
+				}
+				if int32(sn-st.freshSn) >= 0 {
+					if probing && added < scSizePerProbe {
+						st.sn[st.next], st.ts[st.next], st.sizes[st.next] = sn, ts, size
+						st.next = (st.next + 1) % scSizeRing
+						added++
+					}
+					st.freshSn = sn + 1
+				}
+			}
+			if uint64(l) > uint64(len(p)-off-scKCPOverhead) {
+				break
+			}
+			off += scKCPOverhead + int(l)
+		}
+	}
+	if added > 0 {
+		now := time.Now().UnixNano()
+		st.pendingSize = size
+		st.pendingAt = now
+		st.watchUntil = now + scSizeWatchFor
+	}
+}
+
+// scSizeCheckClient membaca header segmen KCP dari klien yang sedang diuji.
+// Probe terbukti kalau una klien melewati sn segmennya atau ada ACK dengan
+// sn+ts yang sama; batas dan MTU sesi lalu naik.
+func scSizeCheckClient(cid turbotunnel.ClientID, p []byte) {
+	if len(p) < scKCPOverhead {
+		return
+	}
+	clientEdnsMu.Lock()
+	st := clientSize[cid]
+	if st == nil {
+		clientEdnsMu.Unlock()
+		return
+	}
+	best := 0
+	for off := 0; off+scKCPOverhead <= len(p); {
+		cmd := p[off+4]
+		ts := binary.LittleEndian.Uint32(p[off+8:])
+		sn := binary.LittleEndian.Uint32(p[off+12:])
+		una := binary.LittleEndian.Uint32(p[off+16:])
+		l := binary.LittleEndian.Uint32(p[off+20:])
+		for i := range st.sn {
+			if st.sizes[i] == 0 {
+				continue
+			}
+			if int32(una-st.sn[i]) > 0 || (cmd == scKCPCmdAck && sn == st.sn[i] && ts == st.ts[i]) {
+				if st.sizes[i] > best {
+					best = st.sizes[i]
+				}
+				st.sizes[i] = 0
+			}
+		}
+		if uint64(l) > uint64(len(p)-off-scKCPOverhead) {
+			break
+		}
+		off += scKCPOverhead + int(l)
+	}
+	if best == 0 {
+		clientEdnsMu.Unlock()
+		return
+	}
+	if best >= st.pendingSize {
+		st.pendingSize = 0
+		st.fails = 0
+	}
+	if best <= st.proven {
+		clientEdnsMu.Unlock()
+		return
+	}
+	st.proven = best
+	if st.failedAt <= st.proven {
+		st.failedAt = st.top + 1
+	}
+	scSizeNextLocked(st)
+	if st.pendingSize == 0 && st.ceil <= st.proven {
+		st.watchUntil = 0
+	}
+	sess, cur, proven := st.sess, st.mtu, st.proven
+	clientEdnsMu.Unlock()
+	if sess == nil {
+		return
+	}
+	m := computeMaxEncodedPayload(proven) - 2
+	if m > scMTUCeil {
+		m = scMTUCeil
+	}
+	if m <= cur {
+		return
+	}
+	clientEdnsMu.Lock()
+	if clientSize[cid] != st || m <= st.mtu {
+		clientEdnsMu.Unlock()
+		return
+	}
+	st.mtu = m
+	clientEdnsMu.Unlock()
+	sess.SetMtu(m)
+	log.Printf("session %08x mtu %d (respons %d byte terbukti sampai)", sess.GetConv(), m, proven)
+}
+
+func scMinInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+''')
+
+
+patch_response_size(mod)
 
 SLOWDNS_PATCH_PY
   then

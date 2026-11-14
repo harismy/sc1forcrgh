@@ -129,12 +129,36 @@ assert(guardPy.includes('OutgoingQueue tetap selalu membuat antrean') &&
   guardPy.includes("rreplace('\\t\\t\\tSendQueue: make(chan []byte, QueueSize),"),
   'sc-fast9: hanya Peek yang malas; OutgoingQueue milik dnstt-client tetap selalu membuat antrean');
 const bytesPy = guardPy.split('\npatch_session_guard(mod)\n')[1] || '';
-assert(helper.includes('DNSTT_PATCH_ID="sc-fast10"') && bytesPy.includes('\npatch_session_bytes(mod)\n') &&
+assert(bytesPy.includes('\npatch_session_bytes(mod)\n') &&
   bytesPy.includes('SC_SLOWDNS_SESSIONS_V2|%d|%d') && bytesPy.includes('E|%d|%s|%d|%d|%d|%d') &&
   bytesPy.includes('scEndedKeepNanos = int64(30 * time.Minute)') && bytesPy.includes('scEndedMax = 4096') &&
   bytesPy.includes('io.Copy(scStreamWriter(stream, tracked), upstreamTCPConn)') &&
   bytesPy.includes('atomic.AddUint64(&w.session.down, uint64(n))'),
   'patch sc-fast10 setelah sc-fast9: byte download per stream + stream putus disimpan 30 menit untuk kuota SSH');
+{
+  // V.1FSC.134 (sg4 14-11-2026): lewat 8.8.8.8/1.1.1.1/9.9.9.9 EDNS di query
+  // milik resolver; app ber-buffer 512/1024/tanpa EDNS menerima TC=1 dan tidak
+  // pernah konek. Respons dibatasi ukuran yang terbukti sampai, lalu diprobe.
+  const sizePy = bytesPy.split('\npatch_session_bytes(mod)\n')[1] || '';
+  assert(helper.includes('DNSTT_PATCH_ID="sc-fast11"') && sizePy.includes('\npatch_response_size(mod)\n') &&
+    sizePy.includes("'sc_size.go'") && sizePy.includes('scSizeFloor    = 512') &&
+    sizePy.includes('plan := scSizeCaps(rec)') && sizePy.includes('maxPayloadForResponse(rec.Resp, plan.base)') &&
+    sizePy.includes('!scSizeExtend(&limit, &probeExtra, &probing, p, plan.fresh)') &&
+    sizePy.includes('scSizePad(&payload, probeLimit)') &&
+    // Probe dini di respons data pertama: MTU naik sebelum unduhan besar,
+    // supaya window tidak penuh segmen 191 byte (RAM ~3 MB per sesi).
+    sizePy.includes('if !probing && probeLimit > 0 && scPayloadHasFreshPush(payload.Bytes(), plan.fresh) {') &&
+    // Dicatat sebelum WriteTo: ACK klien tidak boleh mendahului catatan probe.
+    /scSizeSent\(rec\.ClientID, scPayload, len\(buf\), scProbe\)\\n\\t\\t\}\\n'\s+'\\t\\t\/\/ Now we actually send the message/.test(sizePy) &&
+    sizePy.includes('scSizeCheckClient(clientID, p)') && sizePy.includes('scSizeAttach(conn, permtu)') &&
+    sizePy.includes('int32(una-st.sn[i]) > 0') && sizePy.includes('int32(sn-st.freshSn) >= 0') &&
+    sizePy.includes('delete(clientSize, cid)') && sizePy.includes("'\\t\\t\\tdelete(clientSeen, k)\\n'"),
+    'patch sc-fast11 setelah sc-fast10: ukuran respons terbukti per klien (probe + bukti una/ACK, dicatat sebelum kirim)');
+  // MTU awal tidak lagi diambil dari EDNS query (bisa milik resolver).
+  assert(sizePy.includes("'\\t\\t\\t\\tif cand := computeMaxEncodedPayload(edns) - 2; cand > permtu {\\n'") &&
+    sizePy.includes('TXT/NULL tetap kapasitas respons 512 byte'),
+    'sc-fast11: MTU awal TXT/NULL = kapasitas respons 512 byte, naik hanya lewat bukti');
+}
 assert(helper.includes('  sessions) cmd_sessions "${2:-1}" ;;') &&
   helper.includes("printf 'SC_SLOWDNS_USERS_V2|%s|%s\\n'") && helper.includes("printf 'SC_SLOWDNS_USERS_V1|%s\\n'"),
   'helper: sessions (V1, limit tunnel) tetap ada, sessions 2 (V2) untuk kuota SSH');

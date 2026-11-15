@@ -95,6 +95,8 @@ set -euo pipefail
 #   SLOWDNS_MEMORY_MAX=auto                     (opsional, batas RAM service SlowDNS; auto 128M di VPS 1 GB)
 #   SLOWDNS_KCP_INTERVAL=10                     (opsional, interval KCP 10-50 ms untuk uji CPU; default 10)
 #   SLOWDNS_KCP_ACK_NODELAY=0                   (opsional, 1=ACK KCP dikirim langsung; default 0)
+#   SLOWDNS_DIRECT_BIND=0                       (opsional, 1=dnstt bind langsung UDP 53 tanpa conntrack/NAT)
+#   SLOWDNS_UDP_BATCH=0                         (opsional, batch recvmmsg/sendmmsg: 0=mati, 2-64 paket)
 #   SLOWDNS_AUTO_LOCK_ENABLE=1                  (batas tunnel aktif mengikuti limit akun SSH; lock sementara 15 menit)
 #   SLOWDNS_SSH_ENABLE=1                        (jalur SSH SlowDNS; 0 = OFF tanpa restart, jalur Xray tetap)
 #   SLOWDNS_XRAY_ENABLE=0                       (1 = SlowDNS Xray lewat domain NS kedua, atur di menu Tools)
@@ -216,7 +218,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.135}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.136}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -284,6 +286,8 @@ SLOWDNS_MEMORY_MAX="${SLOWDNS_MEMORY_MAX:-auto}"
 SLOWDNS_KCP_WINDOW="${SLOWDNS_KCP_WINDOW:-auto}"
 SLOWDNS_KCP_INTERVAL="${SLOWDNS_KCP_INTERVAL:-10}"
 SLOWDNS_KCP_ACK_NODELAY="${SLOWDNS_KCP_ACK_NODELAY:-0}"
+SLOWDNS_DIRECT_BIND="${SLOWDNS_DIRECT_BIND:-0}"
+SLOWDNS_UDP_BATCH="${SLOWDNS_UDP_BATCH:-0}"
 SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}"
 SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}"
 SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}"
@@ -14619,32 +14623,170 @@ async function addQuotaSessionDeltas(type, username, sessionCounters, cleanupPre
   return Math.max(0, Math.floor(totalDelta));
 }
 
-function setupSshQuotaAccounting(rows = []) {
-  if (!Array.isArray(rows) || rows.length === 0) return new Map();
-  if (!safeExec('iptables', ['-N', 'SC_1FORCR_QUOTA_OUT'])) {
-    // chain may already exist
+// Penghitung kuota SSH berbasis owner (V.1FSC.136). Satu rule per UID akun
+// aktif. Dulu rule tidak pernah dibuang saat akun dihapus: di id2 ada 88 rule
+// untuk 68 UID, dan rule akun lama (scquota:slowdnstest, UID 1000) berada di
+// atas rule akun baru yang memakai ulang UID itu, sehingga trafik akun baru
+// masuk ke penghitung akun lama (iptables berhenti di RETURN pertama).
+const SSH_QUOTA_CHAIN = 'SC_1FORCR_QUOTA_OUT';
+// Rule yang harus tetap di atas jump kuota: gerbang ON/OFF dan ACCEPT balasan
+// dnstt (setiap jawaban DNS dulu menelusuri semua rule owner di chain ini).
+const SSH_QUOTA_PINNED_OUT = /^-A OUTPUT (-j SC1FORCR_SVC_OUT$|.* --comment sc-slowdns( |$))/;
+
+function readPasswdUids() {
+  const map = new Map();
+  try {
+    for (const line of fs.readFileSync('/etc/passwd', 'utf8').split(/\r?\n/)) {
+      const f = line.split(':');
+      if (f.length >= 3 && f[0] && /^\d+$/.test(f[2]) && !map.has(f[0])) map.set(f[0], f[2]);
+    }
+  } catch (_) {}
+  return map;
+}
+
+// Rule yang terpasang beserta counter-nya, urut seperti di chain. null = chain
+// belum ada. foreign = rule lain yang bukan bentuk penghitung SC.
+function readSshQuotaRules() {
+  const out = readExec('iptables', ['-w', '10', '-L', SSH_QUOTA_CHAIN, '-vxn']);
+  if (!out.trim()) return null;
+  const rules = [];
+  let foreign = 0;
+  let num = 0;
+  for (const line of out.split(/\r?\n/)) {
+    if (!/^\s*\d+\s+\d+\s/.test(line)) continue;
+    num++;
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+RETURN\s.*\bowner UID match (\d+) \/\*\s*scquota:([^*\s]+)\s*\*\//);
+    if (!m) {
+      foreign++;
+      continue;
+    }
+    rules.push({ num, pkts: m[1], bytes: m[2], uid: m[3], user: m[4].toLowerCase() });
   }
-  if (!safeExec('iptables', ['-C', 'OUTPUT', '-j', 'SC_1FORCR_QUOTA_OUT'])) {
-    safeExec('iptables', ['-I', 'OUTPUT', '1', '-j', 'SC_1FORCR_QUOTA_OUT']);
-  }
+  return { rules, foreign };
+}
+
+// Akun aktif -> [{uid, user}]: satu rule per UID dan per username. UID 0 dan
+// akun tanpa UID dilewati. UID dibaca dari /etc/passwd sekali per siklus (dulu
+// satu proses `id` per akun tiap 5 menit).
+function desiredSshQuotaRules(rows) {
+  const passwd = readPasswdUids();
+  const out = [];
+  const uids = new Set();
+  const users = new Set();
   for (const row of rows) {
     const user = String(row?.username || '').trim();
-    if (!user) continue;
-    const uid = readExec('id', ['-u', user]).trim();
-    if (!/^\d+$/.test(uid)) continue;
-    const comment = `scquota:${user.toLowerCase()}`;
-    if (!safeExec('iptables', ['-C', 'SC_1FORCR_QUOTA_OUT', '-m', 'owner', '--uid-owner', uid, '-m', 'comment', '--comment', comment, '-j', 'RETURN'])) {
-      safeExec('iptables', ['-A', 'SC_1FORCR_QUOTA_OUT', '-m', 'owner', '--uid-owner', uid, '-m', 'comment', '--comment', comment, '-j', 'RETURN']);
-    }
+    const key = user.toLowerCase();
+    if (!user || users.has(key)) continue;
+    let uid = passwd.get(user);
+    if (uid === undefined) uid = readExec('id', ['-u', user]).trim();
+    if (!/^\d+$/.test(uid) || uid === '0' || uids.has(uid)) continue;
+    uids.add(uid);
+    users.add(key);
+    out.push({ uid, user: key });
   }
-  const out = readExec('iptables', ['-L', 'SC_1FORCR_QUOTA_OUT', '-vxn']);
+  return out;
+}
+
+const sshQuotaRuleKey = (r) => `${r.uid}|${r.user}`;
+const sshQuotaRuleSpec = (r) => ['-m', 'owner', '--uid-owner', r.uid, '-m', 'comment', '--comment', `scquota:${r.user}`, '-j', 'RETURN'];
+
+// Bangun ulang chain dalam satu commit iptables-restore (--noflush hanya
+// mengosongkan chain ini). Counter rule yang tetap (UID dan akun sama) dibawa
+// ke rule baru, jadi byte yang sudah terhitung tidak hilang; hanya trafik di
+// antara pembacaan counter dan commit (milidetik) yang tidak terhitung.
+function rebuildSshQuotaChain(want, currentRules) {
+  const carry = new Map();
+  for (const r of currentRules) {
+    if (!carry.has(sshQuotaRuleKey(r))) carry.set(sshQuotaRuleKey(r), r);
+  }
+  const lines = ['*filter', `:${SSH_QUOTA_CHAIN} - [0:0]`];
+  for (const r of want) {
+    const c = carry.get(sshQuotaRuleKey(r));
+    lines.push(`${c ? `[${c.pkts}:${c.bytes}] ` : ''}-A ${SSH_QUOTA_CHAIN} ${sshQuotaRuleSpec(r).join(' ')}`);
+  }
+  lines.push('COMMIT', '');
+  return safeExec('iptables-restore', ['-w', '10', '--noflush', '--counters'], lines.join('\n'));
+}
+
+// Posisi jump kuota: tepat di bawah rule yang dipin (gerbang + ACCEPT dnstt).
+function sshQuotaJumpPosition() {
+  let pos = 1;
+  for (const line of readExec('iptables', ['-w', '10', '-S', 'OUTPUT']).split(/\r?\n/)) {
+    if (!line.startsWith('-A OUTPUT ')) continue;
+    if (!SSH_QUOTA_PINNED_OUT.test(line)) break;
+    pos++;
+  }
+  return pos;
+}
+
+// Jump hanya untuk paket milik rentang UID akun (dibulatkan per 1000 supaya
+// jarang berubah). Paket Xray (nobody), root, dnstt, dan user sistem lain tidak
+// lagi menelusuri semua rule owner. Rentang ditolak kernel = jump polos lama.
+function ensureSshQuotaJump(want) {
+  const uids = want.map((r) => Number(r.uid));
+  const lo = Math.min(...uids);
+  const hi = Math.max(...uids);
+  const from = lo >= 1000 ? Math.floor(lo / 1000) * 1000 : lo;
+  let to = Math.max(hi, Math.ceil((hi + 1) / 1000) * 1000 - 1);
+  // nobody (65534, Xray) jangan ikut kecuali memang ada akun di atasnya.
+  if (hi < 65534) to = Math.min(to, 65533);
+  const desired = ['-m', 'owner', '--uid-owner', `${from}-${to}`, '-j', SSH_QUOTA_CHAIN];
+  const jumps = readExec('iptables', ['-w', '10', '-S', 'OUTPUT']).split(/\r?\n/)
+    .filter((l) => l.startsWith('-A OUTPUT ') && new RegExp(`-j ${SSH_QUOTA_CHAIN}(\\s|$)`).test(l));
+  if (jumps.length === 1 && safeExec('iptables', ['-w', '10', '-C', 'OUTPUT', ...desired])) return;
+  for (const line of jumps) safeExec('iptables', ['-w', '10', '-D', ...line.slice(3).trim().split(/\s+/)]);
+  const pos = String(sshQuotaJumpPosition());
+  if (!safeExec('iptables', ['-w', '10', '-I', 'OUTPUT', pos, ...desired])) {
+    safeExec('iptables', ['-w', '10', '-I', 'OUTPUT', pos, '-j', SSH_QUOTA_CHAIN]);
+  }
+}
+
+function setupSshQuotaAccounting(rows = []) {
+  // Daftar akun kosong bisa berarti database gagal dibaca: rule yang ada dibiarkan.
+  if (!Array.isArray(rows) || rows.length === 0) return new Map();
+  const want = desiredSshQuotaRules(rows);
+  if (want.length === 0) return new Map();
+  let current = readSshQuotaRules();
+  if (!current) {
+    safeExec('iptables', ['-w', '10', '-N', SSH_QUOTA_CHAIN]);
+    current = readSshQuotaRules() || { rules: [], foreign: 0 };
+  }
+  const wantKeys = new Set(want.map(sshQuotaRuleKey));
+  const seen = new Set();
+  let stale = current.foreign > 0;
+  for (const r of current.rules) {
+    const k = sshQuotaRuleKey(r);
+    if (!wantKeys.has(k) || seen.has(k)) stale = true;
+    seen.add(k);
+  }
+  const missing = want.filter((r) => !seen.has(sshQuotaRuleKey(r)));
+  if (stale && !rebuildSshQuotaChain(want, current.rules)) {
+    // iptables-restore gagal: buang rule basi satu per satu menurut nomor
+    // rule, dari bawah supaya nomor di atasnya tetap. "-D spec" menghapus
+    // salinan pertama, padahal salinan pertama yang dipertahankan (counter
+    // rule yang tetap tidak tersentuh). Rule asing tanpa bentuk SC dibiarkan.
+    const kept = new Set();
+    const drop = [];
+    for (const r of current.rules) {
+      const k = sshQuotaRuleKey(r);
+      if (wantKeys.has(k) && !kept.has(k)) {
+        kept.add(k);
+        continue;
+      }
+      drop.push(r.num);
+    }
+    for (const num of drop.sort((a, b) => b - a)) {
+      safeExec('iptables', ['-w', '10', '-D', SSH_QUOTA_CHAIN, String(num)]);
+    }
+    for (const r of missing) safeExec('iptables', ['-w', '10', '-A', SSH_QUOTA_CHAIN, ...sshQuotaRuleSpec(r)]);
+  } else if (!stale) {
+    for (const r of missing) safeExec('iptables', ['-w', '10', '-A', SSH_QUOTA_CHAIN, ...sshQuotaRuleSpec(r)]);
+  }
+  ensureSshQuotaJump(want);
   const map = new Map();
-  for (const line of out.split(/\r?\n/)) {
-    const m = line.match(/^\s*\d+\s+(\d+)\s+.*\/\*\s*scquota:([^*]+?)\s*\*\//);
-    if (!m) continue;
-    const bytes = Number(m[1] || 0);
-    const user = String(m[2] || '').trim().toLowerCase();
-    if (user && Number.isFinite(bytes)) map.set(user, bytes);
+  for (const r of (readSshQuotaRules() || { rules: [] }).rules) {
+    const bytes = Number(r.bytes);
+    if (wantKeys.has(sshQuotaRuleKey(r)) && !map.has(r.user) && Number.isFinite(bytes)) map.set(r.user, bytes);
   }
   return map;
 }
@@ -18578,7 +18720,8 @@ SLOWDNS_UNIT = "/etc/systemd/system/sc-1forcr-slowdns.service"
 SLOWDNS_KEYS = (
     "SLOWDNS_NS_DOMAIN", "SLOWDNS_LISTEN_PORT", "SLOWDNS_MTU",
     "SLOWDNS_MEMORY_MAX", "SLOWDNS_KCP_WINDOW", "SLOWDNS_KCP_INTERVAL",
-    "SLOWDNS_KCP_ACK_NODELAY", "SLOWDNS_GOMAXPROCS", "SLOWDNS_GOGC",
+    "SLOWDNS_KCP_ACK_NODELAY", "SLOWDNS_DIRECT_BIND", "SLOWDNS_UDP_BATCH",
+    "SLOWDNS_GOMAXPROCS", "SLOWDNS_GOGC",
     "SLOWDNS_AUTO_LOCK_ENABLE", "SLOWDNS_SSH_ENABLE", "SLOWDNS_XRAY_ENABLE",
     "SLOWDNS_XRAY_NS_DOMAIN",
 )
@@ -23426,6 +23569,17 @@ slowdns_port() {
   printf '%s' "${port}" | join_ports "53 67 68 123"
 }
 
+# Bind langsung SlowDNS (V.1FSC.136): query ke IP:53 tidak lewat REDIRECT, jadi
+# tidak tertutup oleh rule port listen. Yang ditolak hanya query UDP 53 yang
+# di-NOTRACK helper SlowDNS (UNTRACKED), bukan DNS lain di VPS.
+slowdns_direct_active() {
+  local f="${SLOWDNS_STATE_FILE:-/var/lib/sc-1forcr/slowdns.state}"
+  [[ -r "${f}" ]] || return 1
+  [[ "$(sed -n 's/^ENABLED=//p' "${f}" | tail -n1)" == "1" ]] || return 1
+  [[ "$(sed -n 's/^ROUTE_XRAY=//p' "${f}" | tail -n1)" != "1" ]] || return 1
+  [[ -n "$(sed -n 's/^DIRECT=//p' "${f}" | tail -n1 | tr -cd '0-9.,')" ]]
+}
+
 xray_rule() {
   printf -- '-o lo -p tcp -d 127.0.0.1 -m multiport --dports %s -m comment --comment sc-svc-%s -j REJECT --reject-with tcp-reset' "$2" "$1"
 }
@@ -23444,6 +23598,9 @@ build_rules() {
     ports="$(slowdns_port)"
     if [[ -n "${ports}" ]]; then
       RULES_IN+=("! -i lo -p udp -m multiport --dports ${ports} -m comment --comment sc-svc-ssh -j DROP")
+    fi
+    if slowdns_direct_active; then
+      RULES_IN+=("! -i lo -p udp -m udp --dport 53 -m conntrack --ctstate UNTRACKED -m comment --comment sc-svc-ssh -j DROP")
     fi
   fi
   if ! service_enabled vmess; then RULES_OUT+=("$(xray_rule vmess "${VMESS_PORTS}")"); fi
@@ -24564,7 +24721,13 @@ install_slowdns_manager() {
   mkdir -p /usr/local/sbin /var/lib/sc-1forcr
   cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
 #!/usr/bin/env bash
-# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}
+#
+# - set-direct : bind langsung UDP 53 tanpa conntrack/NAT per query (opt-in,
+#               butuh binary sc-fast13). "off" = rollback ke REDIRECT.
+# - set-batch  : batch recvmmsg/sendmmsg (opt-in, Linux, binary sc-fast13).
+# - cpu-stat   : ukur CPU dnstt per jendela (user/sys per jawaban, query/s,
+#               Udp snmp, conntrack, softirq). Read-only.
 #
 # - xray-enable/xray-disable/set-xray-ns : jalur Xray (domain NS kedua, kunci
 #               sama). Query domain itu diteruskan dnstt ke inbound WS Xray
@@ -24635,7 +24798,10 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # EDNS di query milik resolver, jadi app ber-buffer kecil dulu tidak bisa konek.
 # sc-fast12: domain NS kedua untuk Xray (path WS ke inbound lokal) + ON/OFF
 # jalur SSH/Xray dari file state tanpa restart.
-DNSTT_PATCH_ID="sc-fast12"
+# sc-fast13: hemat CPU per query (satu timer sendLoop, log per query dibatasi,
+# query dibuang dihitung), -udp beberapa alamat (bind langsung IP:53), dan
+# batch recvmmsg/sendmmsg opsional (SLOWDNS_UDP_BATCH).
+DNSTT_PATCH_ID="sc-fast13"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -24942,6 +25108,28 @@ load_config() {
      { svc_on SERVICE_VMESS_ENABLE || svc_on SERVICE_VLESS_ENABLE || svc_on SERVICE_TROJAN_ENABLE; }; then
     ROUTE_XRAY=1
   fi
+  # Bind langsung UDP 53 (V.1FSC.136, opt-in): dnstt mendengar IP:53 sendiri
+  # dan query-nya dikecualikan dari conntrack, tanpa NAT per query.
+  DIRECT_WANT=0
+  env_val SLOWDNS_DIRECT_BIND
+  if flag_on "${REPLY}"; then DIRECT_WANT=1; fi
+}
+
+# Batch recvmmsg/sendmmsg (sc-fast13, Linux, opt-in): 0 = mati, on/1 = 16,
+# atau 2..64 paket per syscall. Hasil di REPLY.
+udp_batch_val() {
+  env_val SLOWDNS_UDP_BATCH
+  REPLY="${REPLY,,}"
+  case "${REPLY}" in
+    on|true|yes|1) REPLY=16 ;;
+    *)
+      if [[ "${REPLY}" =~ ^[0-9]{1,2}$ ]] && (( 10#${REPLY} >= 2 && 10#${REPLY} <= 64 )); then
+        REPLY="$((10#${REPLY}))"
+      else
+        REPLY=0
+      fi
+      ;;
+  esac
 }
 
 # Saklar layanan global; kosong = ON (default menu ON/OFF).
@@ -24954,8 +25142,27 @@ svc_on() {
 # saat menyusun unit, supaya unit tidak pernah memakai flag yang belum dikenal
 # binary lama (build gagal saat update = binary lama tetap jalan).
 bin_has_routes() {
-  [[ -x "${BIN}" ]] || return 1
-  "${BIN}" -h 2>&1 | grep -q -- '-routes-file'
+  bin_help
+  [[ "${REPLY}" == *"-routes-file"* ]]
+}
+
+# Teks -h binary (sekali per proses helper) -> REPLY.
+BIN_HELP=""
+BIN_HELP_DONE=0
+bin_help() {
+  if (( BIN_HELP_DONE == 0 )); then
+    BIN_HELP=""
+    if [[ -x "${BIN}" ]]; then BIN_HELP="$("${BIN}" -h 2>&1 || true)"; fi
+    BIN_HELP_DONE=1
+  fi
+  REPLY="${BIN_HELP}"
+}
+
+# Binary sc-fast13: -udp menerima beberapa alamat (pisah koma) dan mendukung
+# batch UDP. Dipakai untuk bind langsung UDP 53 dan SLOWDNS_UDP_BATCH.
+bin_has_multi_listen() {
+  bin_help
+  [[ "${REPLY}" == *"comma-separated"* ]]
 }
 
 # Argumen tambahan ExecStart -> REPLY. Flag Xray dipasang selama domain NS
@@ -25016,6 +25223,7 @@ install_binary() {
   cp -f "${src}" "${BIN}.new" && chmod 755 "${BIN}.new" && mv -f "${BIN}.new" "${BIN}" || return 1
   printf '%s\n' "${id}" > "${BIN}.version"
   BINARY_CHANGED=1
+  BIN_HELP_DONE=0
 }
 
 # Binary siap pakai dari URL sendiri (VPS yang tidak bisa menjangkau go.dev).
@@ -27103,6 +27311,692 @@ func scHandleXrayStream(stream *smux.Stream, conv uint32, clientID string) error
 
 patch_xray_route(mod)
 
+# sc-fast13 (V.1FSC.136): hemat CPU per query tanpa mengubah format DNS yang
+# dilihat klien. (1) -udp boleh beberapa alamat (pisah koma): bind langsung
+# IP:53 + port listen cadangan dalam satu proses; tiap query membawa soket
+# asalnya dan dijawab dari soket yang sama, tetap satu sendLoop. (2) sendLoop
+# memakai satu timer untuk semua query (dulu time.NewTimer per query) dan paket
+# kedua dst. diambil tanpa blok (dulu timer.Reset(0) per respons). Semantik
+# sama: satu jawaban per query, paket pertama ditunggu sampai maxResponseDelay
+# atau sampai query baru datang. (3) Batch recvmmsg/sendmmsg (Linux,
+# SLOWDNS_UDP_BATCH, default mati); batch dikirim sebelum sendLoop menunggu,
+# jadi jawaban tidak tertahan. (4) Query yang dibuang karena antrean jawaban
+# penuh dihitung dan diringkas per menit; log per query dibatasi 5 baris per
+# menit per jenis. (5) Satu alokasi untuk nama+payload query, panjang paket
+# ditulis tanpa binary.Write.
+def patch_cpu_saver(mod):
+    path = os.path.join(mod, 'dnstt-server', 'main.go')
+    src = io.open(path, encoding='utf-8').read()
+    def replace(old, new):
+        nonlocal src
+        if src.count(old) != 1:
+            raise RuntimeError('cpu anchor count %d: %r' % (src.count(old), old[:90]))
+        src = src.replace(old, new)
+    # (1) record membawa soket asal query.
+    replace('\tClientID turbotunnel.ClientID\n\tSize     int\n}\n',
+            '\tClientID turbotunnel.ClientID\n\tSize     int\n'
+            '\tConn     net.PacketConn // soket asal query (nil = soket utama sendLoop)\n}\n')
+    # recvLoop: pembaca paket (batch opsional), log dibatasi.
+    replace('\tvar buf [4096]byte\n\tfor {\n\t\tn, addr, err := dnsConn.ReadFrom(buf[:])\n'
+            '\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n'
+            '\t\t// Got a UDP packet. Try to parse it as a DNS message.\n'
+            '\t\tquery, err := dns.MessageFromWireFormat(buf[:n])\n'
+            '\t\tif err != nil {\n\t\t\tlog.Printf("cannot parse DNS query: %v", err)\n',
+            '\trd := scNewPacketReader(dnsConn)\n\tfor {\n\t\tpkt, addr, err := rd.read()\n'
+            '\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n\n'
+            '\t\t// Got a UDP packet. Try to parse it as a DNS message.\n'
+            '\t\tquery, err := dns.MessageFromWireFormat(pkt)\n'
+            '\t\tif err != nil {\n\t\t\tscLogf("cannot parse DNS query: %v", err)\n')
+    replace('\t\tn = copy(clientID[:], payload)\n', '\t\tn := copy(clientID[:], payload)\n')
+    replace('\t\t\tcase ch <- &record{resp, addr, clientID, size}:\n\t\t\tdefault:\n\t\t\t}\n',
+            '\t\t\tcase ch <- &record{resp, addr, clientID, size, dnsConn}:\n\t\t\tdefault:\n'
+            '\t\t\t\t// Antrean jawaban penuh: query tidak dijawab (dihitung).\n'
+            '\t\t\t\tscRecordDropped()\n\t\t\t}\n')
+    for old in ('log.Printf("FORMERR: more than one OPT RR")',
+                'log.Printf("BADVERS: EDNS version %d != 0", version)',
+                'log.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))',
+                'log.Printf("NXDOMAIN: not authoritative for %s", question.Name)',
+                'log.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())',
+                'log.Printf("NXDOMAIN: base32 decoding: %v", err)',
+                'log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)',
+                'log.Printf("resp WireFormat: %v", err)',
+                'log.Printf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)'):
+        replace(old, 'scLogf(' + old[len('log.Printf('):])
+    # (5) Nama query: satu alokasi untuk gabungan label dan hasil decode.
+    replace('\tencoded := bytes.ToUpper(bytes.Join(prefix, nil))\n'
+            '\tpayload := make([]byte, base32Encoding.DecodedLen(len(encoded)))\n',
+            '\tencoded, payload := scJoinUpperDecodeBuf(prefix)\n')
+    replace('\t\t\t\tbinary.Write(&payload, binary.BigEndian, uint16(len(p)))\n',
+            '\t\t\t\tpayload.WriteByte(byte(len(p) >> 8))\n\t\t\t\tpayload.WriteByte(byte(len(p)))\n')
+    if 'binary.' not in src:
+        replace('\t"encoding/binary"\n', '')
+    # (2)+(3) sendLoop.
+    replace('\tvar nextRec *record\n\tfor {\n\t\trec := nextRec\n\t\tnextRec = nil\n\n'
+            '\t\tif rec == nil {\n\t\t\tvar ok bool\n\t\t\trec, ok = <-ch\n\t\t\tif !ok {\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n',
+            '\tvar nextRec *record\n'
+            '\t// Satu timer untuk semua query, dibuat berhenti.\n'
+            '\ttimer := time.NewTimer(time.Hour)\n'
+            '\ttimer.Stop()\n'
+            '\tw := scNewPacketWriter()\n'
+            '\tfor {\n\t\trec := nextRec\n\t\tnextRec = nil\n\n'
+            '\t\tif rec == nil {\n\t\t\tvar ok bool\n'
+            '\t\t\tselect {\n'
+            '\t\t\tcase rec, ok = <-ch:\n'
+            '\t\t\tdefault:\n'
+            '\t\t\t\t// Tidak ada query menunggu: kirim batch tertunda dulu.\n'
+            '\t\t\t\tif err := w.flush(); err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n'
+            '\t\t\t\trec, ok = <-ch\n'
+            '\t\t\t}\n'
+            '\t\t\tif !ok {\n\t\t\t\tbreak\n\t\t\t}\n\t\t}\n')
+    replace('\t\t\ttimer := time.NewTimer(maxResponseDelay)\n\t\t\ttimerExpired := false\n\t\t\tfor {\n',
+            '\t\t\t// waiting = timer sedang jalan untuk query ini.\n'
+            '\t\t\twaiting, first := false, true\n\t\t\tfor {\n')
+    replace('\t\t\t\t\tdefault:\n'
+            '\t\t\t\t\t\tselect {\n'
+            '\t\t\t\t\t\tcase p = <-unstash:\n'
+            '\t\t\t\t\t\tcase p = <-outgoing:\n'
+            '\t\t\t\t\t\tcase <-timer.C:\n'
+            '\t\t\t\t\t\t\ttimerExpired = true\n'
+            '\t\t\t\t\t\tcase nextRec = <-ch:\n',
+            '\t\t\t\t\tdefault:\n'
+            '\t\t\t\t\t\tif !first {\n'
+            '\t\t\t\t\t\t\t// Paket kedua dst. harus sudah tersedia\n'
+            '\t\t\t\t\t\t\t// (p kosong = respons ini selesai).\n'
+            '\t\t\t\t\t\t\tbreak\n'
+            '\t\t\t\t\t\t}\n'
+            '\t\t\t\t\t\tif !waiting {\n'
+            '\t\t\t\t\t\t\t// Akan menunggu: kirim batch tertunda dulu.\n'
+            '\t\t\t\t\t\t\tif err := w.flush(); err != nil {\n'
+            '\t\t\t\t\t\t\t\treturn err\n'
+            '\t\t\t\t\t\t\t}\n'
+            '\t\t\t\t\t\t\ttimer.Reset(maxResponseDelay)\n'
+            '\t\t\t\t\t\t\twaiting = true\n'
+            '\t\t\t\t\t\t}\n'
+            '\t\t\t\t\t\tselect {\n'
+            '\t\t\t\t\t\tcase p = <-unstash:\n'
+            '\t\t\t\t\t\tcase p = <-outgoing:\n'
+            '\t\t\t\t\t\tcase <-timer.C:\n'
+            '\t\t\t\t\t\t\twaiting = false\n'
+            '\t\t\t\t\t\tcase nextRec = <-ch:\n')
+    replace('\t\t\t\t// We wait for the first packet in a bundle\n'
+            '\t\t\t\t// only. The second and later packets must be\n'
+            '\t\t\t\t// immediately available or they will be omitted\n'
+            '\t\t\t\t// from this bundle.\n'
+            '\t\t\t\tif !timerExpired && !timer.Stop() {\n'
+            '\t\t\t\t\t<-timer.C\n'
+            '\t\t\t\t}\n'
+            '\t\t\t\ttimer.Reset(0)\n'
+            '\t\t\t\ttimerExpired = false\n\n'
+            '\t\t\t\tif len(p) == 0 {\n'
+            '\t\t\t\t\t// timer expired or receive on ch, we\n'
+            '\t\t\t\t\t// are done with this response.\n'
+            '\t\t\t\t\tbreak\n'
+            '\t\t\t\t}\n',
+            '\t\t\t\t// We wait for the first packet in a bundle\n'
+            '\t\t\t\t// only. The second and later packets must be\n'
+            '\t\t\t\t// immediately available or they will be omitted\n'
+            '\t\t\t\t// from this bundle.\n'
+            '\t\t\t\tif len(p) == 0 {\n'
+            '\t\t\t\t\t// timer expired or receive on ch, we\n'
+            '\t\t\t\t\t// are done with this response.\n'
+            '\t\t\t\t\tbreak\n'
+            '\t\t\t\t}\n'
+            '\t\t\t\tfirst = false\n')
+    replace('\t\t\t\tpayload.Write(p)\n\t\t\t}\n\t\t\tif !timerExpired && !timer.Stop() {\n\t\t\t\t<-timer.C\n\t\t\t}\n',
+            '\t\t\t\tpayload.Write(p)\n\t\t\t}\n'
+            '\t\t\t// Timer yang belum diterima dihentikan (Go >= 1.23: nilai\n'
+            '\t\t\t// basi tidak pernah terkirim; sebelumnya dikuras di sini).\n'
+            '\t\t\tif waiting && !timer.Stop() {\n\t\t\t\tselect {\n\t\t\t\tcase <-timer.C:\n\t\t\t\tdefault:\n\t\t\t\t}\n\t\t\t}\n')
+    replace('\t\t// Now we actually send the message as a UDP packet.\n'
+            '\t\t_, err = dnsConn.WriteTo(buf, rec.Addr)\n'
+            '\t\tif err != nil {\n'
+            '\t\t\t// net.ErrClosed means we\'ll never be able to send on\n'
+            '\t\t\t// dnsConn, so terminate the loop. Treat all other\n'
+            '\t\t\t// errors as temporary and simply log them.\n'
+            '\t\t\tif errors.Is(err, net.ErrClosed) {\n'
+            '\t\t\t\treturn err\n'
+            '\t\t\t}\n'
+            '\t\t\tlog.Printf("WriteTo error: %v", err)\n'
+            '\t\t\tcontinue\n'
+            '\t\t}\n'
+            '\t}\n'
+            '\treturn nil\n}\n',
+            '\t\t// Now we actually send the message as a UDP packet, from the\n'
+            '\t\t// socket that received the query (sc-fast13). Without batch\n'
+            '\t\t// this is a plain WriteTo; errors other than a closed socket\n'
+            '\t\t// are logged (rate-limited) and the packet is skipped.\n'
+            '\t\tconn := rec.Conn\n'
+            '\t\tif conn == nil {\n'
+            '\t\t\tconn = dnsConn\n'
+            '\t\t}\n'
+            '\t\tif err := w.send(conn, buf, rec.Addr); err != nil {\n'
+            '\t\t\treturn err\n'
+            '\t\t}\n'
+            '\t}\n'
+            '\treturn w.flush()\n}\n')
+    # run(): soket tambahan (-udp beberapa alamat) dan laporan per menit.
+    replace('func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn) error {\n'
+            '\tdefer dnsConn.Close()\n',
+            'func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, extraConns ...net.PacketConn) error {\n'
+            '\tdefer dnsConn.Close()\n'
+            '\tfor _, c := range extraConns {\n'
+            '\t\tdefer c.Close()\n'
+            '\t}\n')
+    replace('\tch := make(chan *record, 100)\n\tdefer close(ch)\n',
+            '\tch := make(chan *record, 100)\n\tdefer close(ch)\n'
+            '\tstopReport := make(chan struct{})\n'
+            '\tdefer close(stopReport)\n'
+            '\tgo scCPUReport(cap(ch), stopReport)\n')
+    replace('\t\terr := recvLoop(domain, dnsConn, ttConn, ch)\n'
+            '\t\tif err != nil {\n'
+            '\t\t\tlog.Printf("recvLoop: %v", err)\n'
+            '\t\t}\n'
+            '\t}()\n',
+            '\t\terr := recvLoop(domain, dnsConn, ttConn, ch)\n'
+            '\t\tif err != nil {\n'
+            '\t\t\tlog.Printf("recvLoop: %v", err)\n'
+            '\t\t}\n'
+            '\t}()\n'
+            '\tfor _, c := range extraConns {\n'
+            '\t\tc := c\n'
+            '\t\tgo func() {\n'
+            '\t\t\tdefer done()\n'
+            '\t\t\terr := recvLoop(domain, c, ttConn, ch)\n'
+            '\t\t\tif err != nil {\n'
+            '\t\t\t\tlog.Printf("recvLoop %v: %v", c.LocalAddr(), err)\n'
+            '\t\t\t}\n'
+            '\t\t}()\n'
+            '\t}\n')
+    # main(): -udp daftar alamat.
+    replace('\tflag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")\n',
+            '\tflag.StringVar(&udpAddr, "udp", "", "UDP address(es) to listen on, comma-separated (required)")\n')
+    replace('\t\tdnsConn, err := net.ListenPacket("udp", udpAddr)\n'
+            '\t\tif err != nil {\n'
+            '\t\t\tfmt.Fprintf(os.Stderr, "opening UDP listener: %v\\n", err)\n'
+            '\t\t\tos.Exit(1)\n'
+            '\t\t}\n'
+            '\t\tscSetUDPReadBuffer(dnsConn)\n',
+            '\t\tdnsConn, scExtraConns, err := scListenUDP(udpAddr)\n'
+            '\t\tif err != nil {\n'
+            '\t\t\tfmt.Fprintf(os.Stderr, "opening UDP listener: %v\\n", err)\n'
+            '\t\t\tos.Exit(1)\n'
+            '\t\t}\n')
+    replace('\t\terr = run(privkey, domain, upstream, dnsConn)\n',
+            '\t\terr = run(privkey, domain, upstream, dnsConn, scExtraConns...)\n')
+    io.open(path, 'w', encoding='utf-8', newline='\n').write(src)
+    io.open(os.path.join(mod, 'dnstt-server', 'sc_cpu.go'), 'w', encoding='utf-8', newline='\n').write(r'''package main
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Hemat CPU per query (sc-fast13, V.1FSC.136).
+//
+// - Log per query dibatasi: tiap format log paling banyak scLogBurst baris per
+//   menit, sisanya hanya dihitung lalu diringkas sekali per menit. Banjir
+//   query scanner ke UDP 53 dulu menulis satu baris journal per query.
+// - Query yang dibuang karena antrean jawaban (record) penuh dihitung dan
+//   diringkas tiap menit, sebagai dasar sebelum kapasitasnya diubah.
+// - -udp menerima beberapa alamat (pisah koma): bind langsung IP:53 plus port
+//   listen cadangan dalam satu proses, jadi sesi dan kunci tetap satu.
+// - Batch recvmmsg/sendmmsg (Linux, SLOWDNS_UDP_BATCH=2..64, default mati).
+const (
+	scLogBurst       = 5
+	scUDPBatchMax    = 64
+	scUDPReadBufSize = 4096
+)
+
+var (
+	scLogMu      sync.Mutex
+	scLogCounts  = map[string]*scLogCount{}
+	scRecordDrop uint64
+)
+
+type scLogCount struct {
+	minute     int64
+	shown      int
+	suppressed uint64
+}
+
+// scLogf menggantikan log.Printf untuk log yang bisa muncul per query/paket.
+func scLogf(format string, args ...interface{}) {
+	minute := time.Now().Unix() / 60
+	scLogMu.Lock()
+	c := scLogCounts[format]
+	if c == nil {
+		c = &scLogCount{minute: minute}
+		scLogCounts[format] = c
+	}
+	if c.minute != minute {
+		c.minute = minute
+		c.shown = 0
+	}
+	show := c.shown < scLogBurst
+	if show {
+		c.shown++
+	} else {
+		c.suppressed++
+	}
+	scLogMu.Unlock()
+	if show {
+		log.Printf(format, args...)
+	}
+}
+
+func scRecordDropped() { atomic.AddUint64(&scRecordDrop, 1) }
+
+// scCPUReport menulis ringkasan tiap menit: query yang dibuang karena antrean
+// jawaban penuh, dan log per query yang tidak ditampilkan.
+func scCPUReport(queueCap int, stop <-chan struct{}) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		scCPUReportOnce(queueCap)
+	}
+}
+
+func scCPUReportOnce(queueCap int) {
+	if n := atomic.SwapUint64(&scRecordDrop, 0); n > 0 {
+		log.Printf("antrean jawaban penuh: %d query dibuang dalam 1 menit terakhir (kapasitas %d)", n, queueCap)
+	}
+	scLogMu.Lock()
+	var lines []string
+	for format, c := range scLogCounts {
+		if c.suppressed > 0 {
+			lines = append(lines, fmt.Sprintf("%d x %q", c.suppressed, format))
+			c.suppressed = 0
+		}
+	}
+	scLogMu.Unlock()
+	if len(lines) > 0 {
+		log.Printf("log per query diringkas (1 menit): %s", strings.Join(lines, ", "))
+	}
+}
+
+// scJoinUpperDecodeBuf menggabung label nama (huruf besar ASCII) dan
+// menyiapkan buffer hasil decode base32 dalam satu alokasi. Dulu tiga alokasi
+// per query (bytes.Join, bytes.ToUpper, make). Label DNS tunnel ASCII; byte
+// non-ASCII tetap gagal decode base32 seperti sebelumnya.
+func scJoinUpperDecodeBuf(labels [][]byte) (encoded, payload []byte) {
+	n := 0
+	for _, l := range labels {
+		n += len(l)
+	}
+	buf := make([]byte, n+base32Encoding.DecodedLen(n))
+	encoded = buf[:0:n]
+	for _, l := range labels {
+		encoded = append(encoded, l...)
+	}
+	for i, c := range encoded {
+		if 'a' <= c && c <= 'z' {
+			encoded[i] = c - ('a' - 'A')
+		}
+	}
+	return encoded, buf[n:]
+}
+
+// scListenUDP membuka satu soket per alamat di daftar (pisah koma). Dengan
+// beberapa alamat, alamat yang gagal (mis. IP:53 sudah dipakai program lain)
+// dilewati dan dilog; gagal semua = error. Soket pertama yang berhasil menjadi
+// soket utama.
+func scListenUDP(list string) (net.PacketConn, []net.PacketConn, error) {
+	var addrs []string
+	for _, a := range strings.Split(list, ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			addrs = append(addrs, a)
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, nil, errors.New("alamat -udp kosong")
+	}
+	var conns []net.PacketConn
+	var firstErr error
+	for _, a := range addrs {
+		c, err := net.ListenPacket("udp", a)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			if len(addrs) > 1 {
+				log.Printf("UDP listener %s gagal: %v; dilewati", a, err)
+			}
+			continue
+		}
+		scSetUDPReadBuffer(c)
+		if len(addrs) > 1 {
+			log.Printf("UDP listener %s", c.LocalAddr())
+		}
+		conns = append(conns, c)
+	}
+	if len(conns) == 0 {
+		return nil, nil, firstErr
+	}
+	return conns[0], conns[1:], nil
+}
+
+// ── Batch UDP ─────────────────────────────────────────────────────────────
+
+// scMsg satu paket di batch baca/tulis.
+type scMsg struct {
+	buf  []byte
+	n    int
+	addr net.Addr
+}
+
+// scBatchIO: implementasi Linux memakai recvmmsg/sendmmsg (x/net). readBatch
+// mengisi ms[i].n dan ms[i].addr; writeBatch mengirim ms[i].buf[:ms[i].n] ke
+// ms[i].addr dan mengembalikan jumlah yang terkirim.
+type scBatchIO interface {
+	readBatch(ms []scMsg) (int, error)
+	writeBatch(ms []scMsg) (int, error)
+}
+
+// scNewBatchIO diganti test; default = implementasi platform (nil di luar Linux).
+var scNewBatchIO = scPlatformBatchIO
+
+// scUDPBatchSize: SLOWDNS_UDP_BATCH 2..64 = paket per syscall, selain itu 0
+// (mati, satu paket per syscall seperti dnstt resmi).
+func scUDPBatchSize() int {
+	raw := strings.TrimSpace(os.Getenv("SLOWDNS_UDP_BATCH"))
+	if raw == "" || raw == "0" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 2 || n > scUDPBatchMax {
+		log.Printf("SLOWDNS_UDP_BATCH=%q tidak valid (0 atau 2..%d); batch mati", raw, scUDPBatchMax)
+		return 0
+	}
+	return n
+}
+
+var (
+	scBatchOnce sync.Once
+	scBatchN    int
+)
+
+func scBatchSize() int {
+	scBatchOnce.Do(func() {
+		scBatchN = scUDPBatchSize()
+		if scBatchN > 0 {
+			log.Printf("batch UDP %d paket per syscall", scBatchN)
+		}
+	})
+	return scBatchN
+}
+
+// scBatchUnsupported: kernel/seccomp menolak recvmmsg/sendmmsg -> kembali ke
+// satu paket per syscall (pola yang sama dengan kcp-go).
+func scBatchUnsupported(err error) bool {
+	var se *os.SyscallError
+	return errors.As(err, &se) && (se.Syscall == "recvmmsg" || se.Syscall == "sendmmsg")
+}
+
+// scPacketReader membaca query satu per satu dari soket; dengan batch, satu
+// recvmmsg mengisi beberapa query sekaligus lalu dikeluarkan berurutan.
+// Buffer dipakai ulang: pemanggil wajib selesai memakai paket sebelum read
+// berikutnya (parser DNS menyalin label/RDATA, nextPacket menyalin payload).
+type scPacketReader struct {
+	conn  net.PacketConn
+	buf   [scUDPReadBufSize]byte
+	batch scBatchIO
+	msgs  []scMsg
+	n, i  int
+}
+
+func scNewPacketReader(conn net.PacketConn) *scPacketReader {
+	r := &scPacketReader{conn: conn}
+	if size := scBatchSize(); size > 0 {
+		if b := scNewBatchIO(conn); b != nil {
+			r.batch = b
+			r.msgs = make([]scMsg, size)
+			for i := range r.msgs {
+				r.msgs[i].buf = make([]byte, scUDPReadBufSize)
+			}
+		}
+	}
+	return r
+}
+
+func (r *scPacketReader) read() ([]byte, net.Addr, error) {
+	if r.batch != nil {
+		if r.i < r.n {
+			m := &r.msgs[r.i]
+			r.i++
+			return m.buf[:m.n], m.addr, nil
+		}
+		n, err := r.batch.readBatch(r.msgs)
+		if err == nil && n > 0 {
+			r.n, r.i = n, 1
+			return r.msgs[0].buf[:r.msgs[0].n], r.msgs[0].addr, nil
+		}
+		if err != nil && !scBatchUnsupported(err) {
+			return nil, nil, err
+		}
+		if err != nil {
+			log.Printf("batch UDP baca tidak didukung (%v); kembali ke satu paket per syscall", err)
+		}
+		r.batch = nil
+	}
+	n, addr, err := r.conn.ReadFrom(r.buf[:])
+	if err != nil {
+		return nil, nil, err
+	}
+	return r.buf[:n], addr, nil
+}
+
+// scPacketWriter mengirim jawaban DNS. Tanpa batch: WriteTo langsung (perilaku
+// lama). Dengan batch: jawaban ditahan sampai batch penuh atau sampai sendLoop
+// akan menunggu (flush), jadi tidak ada jawaban yang tertahan selama sendLoop
+// menganggur. Error kirim selain soket tertutup hanya dilog (dibatasi) dan
+// paket itu dilewati, sama seperti WriteTo dulu.
+type scPacketWriter struct {
+	size    int
+	conn    net.PacketConn // soket tujuan batch yang tertunda
+	pending []scMsg
+	batches map[net.PacketConn]scBatchIO
+}
+
+func scNewPacketWriter() *scPacketWriter {
+	return &scPacketWriter{size: scBatchSize(), batches: map[net.PacketConn]scBatchIO{}}
+}
+
+func scWriteOne(conn net.PacketConn, buf []byte, addr net.Addr) error {
+	if _, err := conn.WriteTo(buf, addr); err != nil {
+		// net.ErrClosed means we'll never be able to send on dnsConn, so
+		// terminate the loop. Treat all other errors as temporary.
+		if errors.Is(err, net.ErrClosed) {
+			return err
+		}
+		scLogf("WriteTo error: %v", err)
+	}
+	return nil
+}
+
+func (w *scPacketWriter) send(conn net.PacketConn, buf []byte, addr net.Addr) error {
+	if w.size == 0 {
+		return scWriteOne(conn, buf, addr)
+	}
+	if len(w.pending) > 0 && w.conn != conn {
+		// Satu batch = satu soket.
+		if err := w.flush(); err != nil {
+			return err
+		}
+	}
+	w.conn = conn
+	w.pending = append(w.pending, scMsg{buf: buf, n: len(buf), addr: addr})
+	if len(w.pending) >= w.size {
+		return w.flush()
+	}
+	return nil
+}
+
+func (w *scPacketWriter) flush() error {
+	if len(w.pending) == 0 {
+		return nil
+	}
+	all := w.pending
+	w.pending = w.pending[:0]
+	conn := w.conn
+	// Jawaban yang sudah dikirim tidak ditahan GC lewat backing array.
+	defer func() {
+		for i := range all {
+			all[i] = scMsg{}
+		}
+	}()
+	b, ok := w.batches[conn]
+	if !ok {
+		b = scNewBatchIO(conn)
+		w.batches[conn] = b
+	}
+	msgs := all
+	for len(msgs) > 0 {
+		if b == nil {
+			if err := scWriteOne(conn, msgs[0].buf[:msgs[0].n], msgs[0].addr); err != nil {
+				return err
+			}
+			msgs = msgs[1:]
+			continue
+		}
+		n, err := b.writeBatch(msgs)
+		if n > 0 {
+			msgs = msgs[n:]
+		}
+		if err == nil {
+			if n == 0 {
+				// Tidak ada kemajuan tanpa error: kirim satu per satu.
+				b = nil
+			}
+			continue
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return err
+		}
+		if scBatchUnsupported(err) {
+			log.Printf("batch UDP kirim tidak didukung (%v); kembali ke satu paket per syscall", err)
+			w.batches[conn] = nil
+			b = nil
+			continue
+		}
+		// sendmmsg gagal di paket pertama sisa batch (paket sebelumnya sudah
+		// terkirim): lewati paket itu, sama seperti WriteTo error dulu.
+		scLogf("WriteTo error: %v", err)
+		if len(msgs) > 0 {
+			msgs = msgs[1:]
+		}
+	}
+	return nil
+}
+''')
+    io.open(os.path.join(mod, 'dnstt-server', 'sc_batch_linux.go'), 'w', encoding='utf-8', newline='\n').write(r'''//go:build linux
+
+package main
+
+import (
+	"net"
+
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
+)
+
+// Batch recvmmsg/sendmmsg lewat x/net (sudah dipakai kcp-go untuk hal yang
+// sama, jadi tanpa dependensi baru). Soket IPv4 memakai ipv4.PacketConn,
+// soket dual-stack/IPv6 memakai ipv6.PacketConn, seperti kcp-go.
+type scXConn interface {
+	ReadBatch(ms []ipv4.Message, flags int) (int, error)
+	WriteBatch(ms []ipv4.Message, flags int) (int, error)
+}
+
+type scLinuxBatch struct {
+	x  scXConn
+	rd []ipv4.Message
+	wr []ipv4.Message
+}
+
+func scPlatformBatchIO(c net.PacketConn) scBatchIO {
+	uc, ok := c.(*net.UDPConn)
+	if !ok {
+		return nil
+	}
+	addr, ok := uc.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return nil
+	}
+	var x scXConn
+	if addr.IP.To4() != nil {
+		x = ipv4.NewPacketConn(uc)
+	} else {
+		x = ipv6.NewPacketConn(uc)
+	}
+	return &scLinuxBatch{x: x}
+}
+
+func (b *scLinuxBatch) readBatch(ms []scMsg) (int, error) {
+	if len(b.rd) != len(ms) {
+		b.rd = make([]ipv4.Message, len(ms))
+		for i := range b.rd {
+			b.rd[i].Buffers = make([][]byte, 1)
+		}
+	}
+	for i := range ms {
+		b.rd[i].Buffers[0] = ms[i].buf
+		b.rd[i].Addr = nil
+		b.rd[i].N = 0
+	}
+	n, err := b.x.ReadBatch(b.rd, 0)
+	for i := 0; i < n; i++ {
+		ms[i].n = b.rd[i].N
+		ms[i].addr = b.rd[i].Addr
+	}
+	return n, err
+}
+
+func (b *scLinuxBatch) writeBatch(ms []scMsg) (int, error) {
+	if cap(b.wr) < len(ms) {
+		b.wr = make([]ipv4.Message, len(ms))
+	}
+	wr := b.wr[:len(ms)]
+	for i := range ms {
+		if len(wr[i].Buffers) != 1 {
+			wr[i].Buffers = make([][]byte, 1)
+		}
+		wr[i].Buffers[0] = ms[i].buf[:ms[i].n]
+		wr[i].Addr = ms[i].addr
+	}
+	n, err := b.x.WriteBatch(wr, 0)
+	for i := range wr {
+		wr[i].Buffers[0] = nil
+		wr[i].Addr = nil
+	}
+	return n, err
+}
+''')
+    io.open(os.path.join(mod, 'dnstt-server', 'sc_batch_other.go'), 'w', encoding='utf-8', newline='\n').write(r'''//go:build !linux
+
+package main
+
+import "net"
+
+// Di luar Linux tidak ada recvmmsg/sendmmsg: selalu satu paket per syscall.
+func scPlatformBatchIO(net.PacketConn) scBatchIO { return nil }
+''')
+
+
+patch_cpu_saver(mod)
+
 SLOWDNS_PATCH_PY
   then
     rm -rf "${work}"
@@ -27186,10 +28080,25 @@ ensure_key() {
 }
 
 unit_content() {
-  local mem args
+  local mem args udp=":${LISTEN}" extra=""
   mem="$(memory_max)"
   route_args
   args="${REPLY}"
+  # Baris tambahan hanya muncul kalau fiturnya dipakai, jadi unit default sama
+  # persis dengan versi sebelumnya (tanpa restart karena unit berubah).
+  if bin_has_multi_listen; then
+    if (( DIRECT_WANT )); then
+      direct_candidates
+      if [[ -n "${REPLY}" ]]; then
+        # IP:53 untuk bind langsung, port listen tetap sebagai jalur cadangan
+        # (IPv6, IP lain, dan saat soket IP:53 belum ada).
+        udp="${REPLY//,/:${PUBLIC_PORT},}:${PUBLIC_PORT},:${LISTEN}"
+        extra+=$'\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE'
+      fi
+    fi
+    udp_batch_val
+    if (( REPLY > 0 )); then extra+=$'\n'"Environment=SLOWDNS_UDP_BATCH=${REPLY}"; fi
+  fi
   cat <<UNIT
 [Unit]
 Description=SC 1FORCR SlowDNS (dnstt-server)
@@ -27200,7 +28109,7 @@ Wants=network-online.target
 Type=simple
 User=${SVC_USER}
 Group=${SVC_USER}
-ExecStart=${BIN} -udp :${LISTEN} -privkey-file ${KEY_DIR}/server.key -mtu ${MTU}${args} ${NS} 127.0.0.1:${TARGET_PORT}
+ExecStart=${BIN} -udp ${udp} -privkey-file ${KEY_DIR}/server.key -mtu ${MTU}${args} ${NS} 127.0.0.1:${TARGET_PORT}
 Restart=always
 RestartSec=3
 Environment=GOMEMLIMIT=$(go_mem_limit "${mem}")
@@ -27209,7 +28118,7 @@ Environment=SLOWDNS_KCP_INTERVAL=$(kcp_interval)
 Environment=SLOWDNS_KCP_ACK_NODELAY=$(kcp_ack_nodelay)
 Environment=GOMAXPROCS=$(go_maxprocs)
 Environment=GOGC=$(go_gc)
-Environment=SLOWDNS_SESSION_SOCKET=/run/sc-1forcr-slowdns/sessions.sock
+Environment=SLOWDNS_SESSION_SOCKET=/run/sc-1forcr-slowdns/sessions.sock${extra}
 RuntimeDirectory=sc-1forcr-slowdns
 RuntimeDirectoryMode=0700
 MemoryMax=${mem}
@@ -27273,6 +28182,18 @@ detect_public_ip() {
 # harus mendahului semua rule non-TCP di PREROUTING, karena UDP Custom memasang
 # DNAT --dport 1:65535 yang juga menelan port 53. Hanya paket ke alamat VPS ini
 # (dst-type LOCAL) yang dialihkan; DNS milik docker/VPN pemilik tidak ikut.
+#
+# Bind langsung (V.1FSC.136, SLOWDNS_DIRECT_BIND=1): dnstt juga mendengar IP:53
+# sendiri (CAP_NET_BIND_SERVICE, tetap non-root). Query ke IP itu dikecualikan
+# dari conntrack di tabel raw (CT --notrack), jadi tidak ada entri conntrack,
+# NAT, dan pembersihan per query. "-m socket" membuat NOTRACK hanya berlaku
+# selama soket IP:53 memang ada; tanpa soket (dnstt restart, bind gagal) paket
+# tetap ditangkap REDIRECT ke port listen seperti biasa. IPv6 tetap REDIRECT.
+RAW_PRE="SC1FORCR_SDNS_PRE"
+RAW_OUT="SC1FORCR_SDNS_OUT"
+GATE_OUT="SC1FORCR_SVC_OUT"
+DIRECT_IPS=""
+RAW_CHECK=0
 
 nat_rules_ok() {
   local tool="$1" rules
@@ -27301,55 +28222,255 @@ remove_jumps() {
 }
 
 input_spec() {
-  printf -- '-p udp -m udp --dport %s -m comment --comment %s -j ACCEPT' "${LISTEN}" "${TAG}"
+  printf -- '-p udp -m udp --dport %s -m comment --comment %s -j ACCEPT' "${1:-${LISTEN}}" "${TAG}"
 }
 
-# Balasan dnstt keluar dari port listen. Service jalan non-root, jadi balasannya
-# bisa kena chain OUTPUT lain (penghitung kuota SC_1FORCR_QUOTA_OUT, rule owner,
-# atau DROP non-SC) -> "sendto: operation not permitted" -> jawaban DNS hilang ->
-# throughput anjlok. Rule ini meloloskannya lebih dulu. PotatoNC tidak kena ini
-# karena jalan sebagai root; SC sengaja non-root demi keamanan.
+# Balasan dnstt keluar dari port listen (dan port 53 saat bind langsung).
+# Service jalan non-root, jadi balasannya bisa kena chain OUTPUT lain
+# (penghitung kuota SC_1FORCR_QUOTA_OUT, rule owner, atau DROP non-SC) ->
+# "sendto: operation not permitted" -> jawaban DNS hilang -> throughput anjlok.
+# Rule ini meloloskannya lebih dulu. PotatoNC tidak kena ini karena jalan
+# sebagai root; SC sengaja non-root demi keamanan.
 output_spec() {
-  printf -- '-p udp -m udp --sport %s -m comment --comment %s -j ACCEPT' "${LISTEN}" "${TAG}"
+  printf -- '-p udp -m udp --sport %s -m comment --comment %s -j ACCEPT' "${1:-${LISTEN}}" "${TAG}"
 }
 
-remove_input_rules() {
-  local tool="$1" keep="${2:-}" line
+# Hapus rule bertanda TAG di chain filter kecuali spec yang disebut.
+remove_tagged_rules() {
+  local tool="$1" chain="$2" line k keep
+  shift 2
   while IFS= read -r line; do
-    [[ "${line}" == "-A INPUT "*" ${TAG} "* && "${line}" != "${keep}" ]] || continue
+    [[ "${line}" == "-A ${chain} "*" ${TAG} "* ]] || continue
+    keep=0
+    for k in "$@"; do
+      if [[ "${line}" == "-A ${chain} ${k}" ]]; then keep=1; fi
+    done
+    (( keep )) && continue
     # shellcheck disable=SC2086
     if "${tool}" -w 10 -D ${line#-A } >/dev/null 2>&1; then RULES_CHANGED=1; fi
-  done < <("${tool}" -w 10 -S INPUT 2>/dev/null)
+  done < <("${tool}" -w 10 -S "${chain}" 2>/dev/null)
 }
 
-remove_output_rules() {
-  local tool="$1" keep="${2:-}" line
+# Rule ACCEPT balasan dnstt wajib di puncak OUTPUT. Dulu hanya dicek ada atau
+# tidaknya (-C), padahal jump kuota (id2, V.1FSC.135: 92 rule owner) yang
+# disisipkan belakangan di posisi 1 membuat setiap jawaban DNS menelusuri
+# semua rule itu dulu. Hanya jump gerbang ON/OFF yang boleh di atasnya, karena
+# gerbang memaksa dirinya pertama. Dicek berdasarkan TAG + -C, bukan teks
+# persis, supaya beda format cetak iptables tidak membuat rule ditulis ulang
+# tiap siklus. 0 = posisi dan isi benar. OUTPUT_TOP = posisi sisip.
+output_rules_ok() {
+  local tool="$1" line i lead=0 n=0 spec
+  local -a lines=()
+  shift
   while IFS= read -r line; do
-    [[ "${line}" == "-A OUTPUT "*" ${TAG} "* && "${line}" != "${keep}" ]] || continue
-    # shellcheck disable=SC2086
-    if "${tool}" -w 10 -D ${line#-A } >/dev/null 2>&1; then RULES_CHANGED=1; fi
+    [[ "${line}" == "-A OUTPUT "* ]] && lines+=("${line}")
   done < <("${tool}" -w 10 -S OUTPUT 2>/dev/null)
+  OUTPUT_TOP=1
+  if [[ "${lines[0]:-}" == "-A OUTPUT -j ${GATE_OUT}" ]]; then
+    lead=1
+    OUTPUT_TOP=2
+  fi
+  for (( i = 0; i < ${#lines[@]}; i++ )); do
+    [[ "${lines[i]}" == *" --comment ${TAG} "* ]] || continue
+    (( i >= lead && i < lead + $# )) || return 1
+    n=$(( n + 1 ))
+  done
+  (( n == $# )) || return 1
+  for spec in "$@"; do
+    # shellcheck disable=SC2086
+    "${tool}" -w 10 -C OUTPUT ${spec} >/dev/null 2>&1 || return 1
+  done
+  return 0
 }
 
-# 0 = aturan lengkap terpasang, 1 = gagal. RULES_CHANGED=1 kalau ada yang ditulis.
-apply_tool() {
-  local tool="$1"
-  command -v "${tool}" >/dev/null 2>&1 || return 1
-  "${tool}" -w 10 -t nat -S PREROUTING >/dev/null 2>&1 || return 1
-  remove_input_rules "${tool}" "-A INPUT $(input_spec)"
-  # shellcheck disable=SC2046
-  if ! "${tool}" -w 10 -C INPUT $(input_spec) >/dev/null 2>&1; then
-    # shellcheck disable=SC2046
-    "${tool}" -w 10 -I INPUT $(input_spec) >/dev/null 2>&1 || return 1
+place_output_rules() {
+  local tool="$1" j
+  shift
+  output_rules_ok "${tool}" "$@" && return 0
+  remove_tagged_rules "${tool}" OUTPUT
+  local -a specs=("$@")
+  for (( j = ${#specs[@]} - 1; j >= 0; j-- )); do
+    # shellcheck disable=SC2086
+    "${tool}" -w 10 -I OUTPUT "${OUTPUT_TOP}" ${specs[j]} >/dev/null 2>&1 || return 1
+  done
+  RULES_CHANGED=1
+  return 0
+}
+
+place_input_rules() {
+  local tool="$1" spec
+  shift
+  remove_tagged_rules "${tool}" INPUT "$@"
+  for spec in "$@"; do
+    # shellcheck disable=SC2086
+    if ! "${tool}" -w 10 -C INPUT ${spec} >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      "${tool}" -w 10 -I INPUT ${spec} >/dev/null 2>&1 || return 1
+      RULES_CHANGED=1
+    fi
+  done
+  return 0
+}
+
+# Alamat IPv4 untuk bind langsung -> REPLY (pisah koma). Hanya alamat global
+# di interface rute default (maks 4), dilewati kalau port 53 di alamat itu
+# atau wildcard (0.0.0.0, ::, *) sudah dipakai program lain. Resolver lokal
+# systemd-resolved (127.0.0.53) tidak bentrok karena alamatnya berbeda.
+# Hanya dipanggil saat menyusun unit (setup), bukan tiap siklus watchdog.
+direct_candidates() {
+  local devs dev addr rows
+  local -a out=()
+  REPLY=""
+  command -v ip >/dev/null 2>&1 || return 0
+  devs="$(ip -4 -o route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1) }' | sort -u)"
+  [[ -n "${devs}" ]] || return 0
+  rows="$(udp_port_rows)"
+  if awk -v p="${PUBLIC_PORT}" '
+    $0 !~ /"dnstt-server"/ {
+      a = $4; port = a; sub(/^.*:/, "", port); host = a; sub(/:[0-9]+$/, "", host)
+      if (port == p && (host == "0.0.0.0" || host == "*" || host == "[::]" || host == "[::ffff:0.0.0.0]")) f = 1
+    }
+    END { exit(f ? 0 : 1) }' <<< "${rows}"; then
+    return 0
+  fi
+  for dev in ${devs}; do
+    while read -r addr; do
+      addr="${addr%%/*}"
+      valid_ipv4 "${addr}" || continue
+      [[ " ${out[*]} " == *" ${addr} "* ]] && continue
+      if awk -v want="${addr}:${PUBLIC_PORT}" '$4 == want && $0 !~ /"dnstt-server"/ { f = 1 } END { exit(f ? 0 : 1) }' <<< "${rows}"; then
+        continue
+      fi
+      out+=("${addr}")
+      (( ${#out[@]} >= 4 )) && break 2
+    done < <(ip -4 -o addr show dev "${dev}" scope global 2>/dev/null | awk '{ print $4 }')
+  done
+  local IFS=,
+  REPLY="${out[*]}"
+}
+
+# IP bind langsung di unit terpasang -> REPLY (pisah koma). Builtin bash saja.
+unit_direct_ips() {
+  local u item
+  local -a items=() out=()
+  REPLY=""
+  [[ -r "${UNIT_FILE}" ]] || return 0
+  u="$(< "${UNIT_FILE}")"
+  [[ "${u}" =~ [[:space:]]-udp[[:space:]]([^[:space:]]+) ]] || return 0
+  IFS=, read -r -a items <<< "${BASH_REMATCH[1]}"
+  for item in "${items[@]}"; do
+    [[ "${item}" == *":${PUBLIC_PORT}" ]] || continue
+    item="${item%:*}"
+    valid_ipv4 "${item}" && out+=("${item}")
+  done
+  local IFS=,
+  REPLY="${out[*]}"
+}
+
+# IP dari unit yang soket IP:53-nya benar-benar milik dnstt -> REPLY. Program
+# lain yang merebut IP:53 tidak pernah mendapat NOTRACK.
+direct_live_ips() {
+  local want rows ip
+  local -a out=()
+  unit_direct_ips
+  want="${REPLY}"
+  REPLY=""
+  [[ -n "${want}" ]] || return 0
+  rows="$(ss -H -lnup 2>/dev/null || true)"
+  for ip in ${want//,/ }; do
+    if awk -v want="${ip}:${PUBLIC_PORT}" '$4 == want && /"dnstt-server"/ { f = 1 } END { exit(f ? 0 : 1) }' <<< "${rows}"; then
+      out+=("${ip}")
+    fi
+  done
+  local IFS=,
+  REPLY="${out[*]}"
+}
+
+# Chain raw dibangun ulang hanya kalau tanda tangan isinya berubah (pola sama
+# dengan gerbang ON/OFF), jadi siklus watchdog tanpa perubahan tidak menulis.
+raw_chain_sync() {
+  local tool="$1" chain="$2" parent="$3" sig="$4" current spec
+  shift 4
+  current="$("${tool}" -w 10 -t raw -S "${chain}" 2>/dev/null || true)"
+  if [[ "${current}" != *"${sig}"* ]]; then
+    if [[ -z "${current}" ]]; then
+      "${tool}" -w 10 -t raw -N "${chain}" >/dev/null 2>&1 || return 1
+    fi
+    "${tool}" -w 10 -t raw -F "${chain}" >/dev/null 2>&1 || return 1
+    RULES_CHANGED=1
+    for spec in "$@"; do
+      # shellcheck disable=SC2086
+      "${tool}" -w 10 -t raw -A "${chain}" ${spec} >/dev/null 2>&1 || return 1
+    done
+    "${tool}" -w 10 -t raw -A "${chain}" -m comment --comment "${sig}" -j RETURN >/dev/null 2>&1 || return 1
+  fi
+  if ! "${tool}" -w 10 -t raw -C "${parent}" -p udp -j "${chain}" >/dev/null 2>&1; then
+    "${tool}" -w 10 -t raw -I "${parent}" 1 -p udp -j "${chain}" >/dev/null 2>&1 || return 1
     RULES_CHANGED=1
   fi
-  # Loloskan balasan dnstt di puncak OUTPUT, sebelum penghitung kuota / drop lain.
-  remove_output_rules "${tool}" "-A OUTPUT $(output_spec)"
-  # shellcheck disable=SC2046
-  if ! "${tool}" -w 10 -C OUTPUT $(output_spec) >/dev/null 2>&1; then
-    # shellcheck disable=SC2046
-    "${tool}" -w 10 -I OUTPUT 1 $(output_spec) >/dev/null 2>&1 || return 1
+  return 0
+}
+
+raw_clear() {
+  local tool="$1" pair chain parent
+  command -v "${tool}" >/dev/null 2>&1 || return 0
+  for pair in "${RAW_PRE}:PREROUTING" "${RAW_OUT}:OUTPUT"; do
+    chain="${pair%%:*}"
+    parent="${pair#*:}"
+    "${tool}" -w 10 -t raw -S "${chain}" >/dev/null 2>&1 || continue
+    while "${tool}" -w 10 -t raw -D "${parent}" -p udp -j "${chain}" >/dev/null 2>&1; do :; done
+    "${tool}" -w 10 -t raw -F "${chain}" >/dev/null 2>&1 || true
+    "${tool}" -w 10 -t raw -X "${chain}" >/dev/null 2>&1 || true
     RULES_CHANGED=1
+  done
+}
+
+# NOTRACK untuk IP bind langsung ($2, pisah koma). Gagal (modul socket/CT tidak
+# ada di kernel) = chain raw dibuang, semua query tetap lewat REDIRECT.
+raw_sync() {
+  local tool="$1" ips="$2" sig ip
+  local -a pre=() out=()
+  for ip in ${ips//,/ }; do
+    pre+=("-d ${ip}/32 -p udp -m udp --dport ${PUBLIC_PORT} -m socket -m comment --comment ${TAG} -j CT --notrack")
+    out+=("-s ${ip}/32 -p udp -m udp --sport ${PUBLIC_PORT} -m comment --comment ${TAG} -j CT --notrack")
+  done
+  sig="sc-slowdns-raw-$(printf '%s\n' "${pre[@]}" | cksum | awk '{ print $1 }')"
+  if raw_chain_sync "${tool}" "${RAW_PRE}" PREROUTING "${sig}" "${pre[@]}" && \
+     raw_chain_sync "${tool}" "${RAW_OUT}" OUTPUT "${sig}" "${out[@]}"; then
+    return 0
+  fi
+  raw_clear "${tool}"
+  return 1
+}
+
+# 0 = aturan lengkap terpasang, 1 = gagal. RULES_CHANGED=1 kalau ada yang
+# ditulis. $2 = IP bind langsung (iptables saja); DIRECT_IPS dikosongkan kalau
+# NOTRACK gagal dipasang.
+apply_tool() {
+  local tool="$1" direct="${2:-}"
+  local -a in_specs out_specs
+  command -v "${tool}" >/dev/null 2>&1 || return 1
+  "${tool}" -w 10 -t nat -S PREROUTING >/dev/null 2>&1 || return 1
+  in_specs=("$(input_spec "${LISTEN}")")
+  out_specs=("$(output_spec "${LISTEN}")")
+  # Rule filter untuk port 53 dipasang sebelum NOTRACK, supaya query yang
+  # tidak lagi lewat REDIRECT langsung diterima INPUT.
+  if [[ -n "${direct}" ]]; then
+    in_specs+=("$(input_spec "${PUBLIC_PORT}")")
+    out_specs+=("$(output_spec "${PUBLIC_PORT}")")
+  fi
+  place_input_rules "${tool}" "${in_specs[@]}" || return 1
+  # Loloskan balasan dnstt di puncak OUTPUT, sebelum penghitung kuota / drop lain.
+  place_output_rules "${tool}" "${out_specs[@]}" || return 1
+  if [[ -n "${direct}" ]]; then
+    if ! raw_sync "${tool}" "${direct}"; then
+      DIRECT_IPS=""
+      direct=""
+      place_input_rules "${tool}" "${in_specs[0]}" || return 1
+      place_output_rules "${tool}" "${out_specs[0]}" || return 1
+    fi
+  elif (( RAW_CHECK )); then
+    raw_clear "${tool}"
   fi
   if ! "${tool}" -w 10 -t nat -S "${CHAIN}" >/dev/null 2>&1; then
     "${tool}" -w 10 -t nat -N "${CHAIN}" >/dev/null 2>&1 || return 1
@@ -27375,14 +28496,16 @@ apply_tool() {
 clear_tool() {
   local tool="$1"
   command -v "${tool}" >/dev/null 2>&1 || return 0
+  # NOTRACK dilepas dulu: query kembali ke REDIRECT sebelum rule lain dibuang.
+  raw_clear "${tool}"
   remove_jumps "${tool}"
   if "${tool}" -w 10 -t nat -S "${CHAIN}" >/dev/null 2>&1; then
     "${tool}" -w 10 -t nat -F "${CHAIN}" >/dev/null 2>&1 || true
     "${tool}" -w 10 -t nat -X "${CHAIN}" >/dev/null 2>&1 || true
     RULES_CHANGED=1
   fi
-  remove_input_rules "${tool}"
-  remove_output_rules "${tool}"
+  remove_tagged_rules "${tool}" INPUT
+  remove_tagged_rules "${tool}" OUTPUT
 }
 
 ip6_nat_usable() {
@@ -27400,8 +28523,20 @@ persist_rules() {
 rules_sync() {
   RULES_CHANGED=0
   RULES_OK=0
+  DIRECT_IPS=""
   if (( ENABLED == 1 )) && [[ -n "${NS}" && -x "${BIN}" ]] && key_ready; then
-    if apply_tool iptables; then RULES_OK=1; fi
+    # Bind langsung hanya untuk IP yang ada di unit dan soket IP:53-nya milik
+    # dnstt. Raw hanya diperiksa kalau dipakai, sedang dilepas (state lama),
+    # atau diminta setup, supaya watchdog default tidak bertambah kerja.
+    if (( DIRECT_WANT )); then
+      direct_live_ips
+      DIRECT_IPS="${REPLY}"
+      RAW_CHECK=1
+    else
+      state_val DIRECT
+      if [[ -n "${REPLY}" ]]; then RAW_CHECK=1; fi
+    fi
+    if apply_tool iptables "${DIRECT_IPS}"; then RULES_OK=1; else DIRECT_IPS=""; fi
     # dnstt listen dual-stack; IPv6 hanya kalau VPS punya alamat global.
     if ip6_nat_usable; then apply_tool ip6tables || true; fi
   else
@@ -27438,7 +28573,8 @@ VERSION=${version}
 XRAY_ENABLED=${XRAY_ENABLED}
 XRAY_NS=${XRAY_NS}
 ROUTE_SSH=${ROUTE_SSH}
-ROUTE_XRAY=${xray_route}"
+ROUTE_XRAY=${xray_route}
+DIRECT=${DIRECT_IPS}"
   STATE_LOADED=0
   if [[ -f "${STATE_FILE}" && "$(< "${STATE_FILE}")" == "${body}" ]]; then
     return 0
@@ -27461,6 +28597,8 @@ service_gate_apply() {
 cmd_setup() {
   local want unit_changed=0
   load_config
+  # Setup selalu memeriksa chain raw bind langsung (dilepas kalau tidak dipakai).
+  RAW_CHECK=1
   if (( ENABLED == 0 )); then
     if [[ -f "${UNIT_FILE}" ]] && { systemctl is-active --quiet "${SERVICE}" 2>/dev/null || \
          systemctl is-enabled --quiet "${SERVICE}" 2>/dev/null; }; then
@@ -27483,6 +28621,12 @@ cmd_setup() {
     printf '%s\n' "${want}" > "${UNIT_FILE}" || die "unit ${UNIT_FILE} gagal ditulis"
     systemctl daemon-reload >/dev/null 2>&1 || true
     unit_changed=1
+    # IP bind langsung yang tidak ada lagi di unit baru dilepas dari NOTRACK
+    # sebelum restart, supaya query-nya langsung kembali lewat REDIRECT.
+    state_val DIRECT
+    if [[ -n "${REPLY}" ]]; then
+      rules_sync
+    fi
   fi
   systemctl is-enabled --quiet "${SERVICE}" 2>/dev/null || \
     systemctl enable --no-reload "${SERVICE}" >/dev/null 2>&1 || true
@@ -28160,6 +29304,124 @@ cmd_set_kcp() {
   fi
 }
 
+# Bind langsung UDP 53 (V.1FSC.136): set-direct on|off. Opt-in sampai terukur
+# di VPS. Saat SlowDNS aktif service di-restart lewat setup (pengguna SlowDNS
+# tersambung ulang otomatis); gagal = pengaturan lama dikembalikan. "off" adalah
+# jalur rollback: NOTRACK dilepas dulu, lalu unit kembali persis seperti lama.
+cmd_set_direct() {
+  local want prev
+  case "${1:-}" in
+    on|1) want=1 ;;
+    off|0) want=0 ;;
+    *) die "Gunakan set-direct on atau set-direct off" ;;
+  esac
+  env_val SLOWDNS_DIRECT_BIND
+  prev="${REPLY}"
+  set_env_value SLOWDNS_DIRECT_BIND "${want}" || die "env ${SC_ENV} gagal ditulis"
+  load_config
+  if (( ENABLED == 1 )) && ! ( cmd_setup ); then
+    set_env_value SLOWDNS_DIRECT_BIND "${prev:-0}" || true
+    ( cmd_setup ) >/dev/null 2>&1 || true
+    die "mode bind langsung gagal diterapkan; pengaturan dikembalikan"
+  fi
+  service_gate_apply
+  STATE_LOADED=0
+  state_val DIRECT
+  if (( want == 0 )); then
+    say "Berhasil: bind langsung OFF. Query UDP 53 kembali lewat REDIRECT ke port ${LISTEN}."
+  elif [[ -n "${REPLY}" ]]; then
+    say "Berhasil: bind langsung AKTIF di ${REPLY//,/ } port ${PUBLIC_PORT} (tanpa conntrack/NAT per query)."
+    say "Rollback: sc-1forcr-slowdns set-direct off"
+  elif (( ENABLED == 1 )); then
+    say "Peringatan: disimpan, tapi belum aktif (binary belum ${DNSTT_PATCH_ID}, port 53 dipakai program lain, atau modul socket/CT tidak ada). Query tetap lewat REDIRECT."
+  else
+    say "SlowDNS nonaktif; mode ini dipakai saat SlowDNS diaktifkan."
+  fi
+}
+
+# Batch recvmmsg/sendmmsg: set-batch on|off|N (2..64). Linux saja, opt-in.
+cmd_set_batch() {
+  local want prev
+  case "${1:-}" in
+    on|1) want=16 ;;
+    off|0) want=0 ;;
+    *)
+      if [[ "${1:-}" =~ ^[0-9]{1,2}$ ]] && (( 10#$1 >= 2 && 10#$1 <= 64 )); then
+        want="$((10#$1))"
+      else
+        die "Gunakan set-batch on, set-batch off, atau set-batch N (2-64)"
+      fi
+      ;;
+  esac
+  env_val SLOWDNS_UDP_BATCH
+  prev="${REPLY}"
+  set_env_value SLOWDNS_UDP_BATCH "${want}" || die "env ${SC_ENV} gagal ditulis"
+  load_config
+  if (( ENABLED == 1 )) && ! ( cmd_setup ); then
+    set_env_value SLOWDNS_UDP_BATCH "${prev:-0}" || true
+    ( cmd_setup ) >/dev/null 2>&1 || true
+    die "batch UDP gagal diterapkan; pengaturan dikembalikan"
+  fi
+  if (( want == 0 )); then
+    say "Berhasil: batch UDP OFF (satu paket per syscall)."
+  else
+    say "Berhasil: batch UDP ${want} paket per syscall. Rollback: sc-1forcr-slowdns set-batch off"
+    if ! bin_has_multi_listen; then
+      say "Peringatan: binary belum ${DNSTT_PATCH_ID}; nilai ini baru berlaku setelah binary diperbarui."
+    fi
+  fi
+}
+
+# Ukur CPU dnstt per jendela waktu (read-only): cpu-stat [DETIK] [JENDELA].
+# CPU user/sys proses dari /proc/PID/stat, query (INPUT) dan jawaban (OUTPUT)
+# dari counter rule sc-slowdns, Udp di /proc/net/snmp, conntrack, softirq dan
+# steal dari /proc/stat. us/q = CPU per jawaban.
+cpu_stat_sample() {
+  local pid="$1" st rest u s qin qout snmp ct cpu rss
+  local -a f=()
+  st="$(< "/proc/${pid}/stat")" || return 1
+  rest="${st##*) }"
+  read -r -a f <<< "${rest}"
+  u="${f[11]}"
+  s="${f[12]}"
+  qin="$(iptables -w 10 -L INPUT -vxn 2>/dev/null | awk -v t="/* ${TAG} */" 'index($0, t) { n += $1 } END { print n + 0 }')"
+  qout="$(iptables -w 10 -L OUTPUT -vxn 2>/dev/null | awk -v t="/* ${TAG} */" 'index($0, t) { n += $1 } END { print n + 0 }')"
+  snmp="$(awk '/^Udp:/ { if (!h) { for (i = 2; i <= NF; i++) k[i] = $i; h = 1 } else { for (i = 2; i <= NF; i++) v[k[i]] = $i } } END { print v["InDatagrams"] + 0, v["OutDatagrams"] + 0, v["RcvbufErrors"] + 0 }' /proc/net/snmp 2>/dev/null)"
+  ct="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)"
+  cpu="$(awk '/^cpu / { t = 0; for (i = 2; i <= NF; i++) t += $i; print t, $8, $9 }' /proc/stat)"
+  rss="$(awk '/^VmRSS:/ { print $2 }' "/proc/${pid}/status" 2>/dev/null)"
+  printf '%s %s %s %s %s %s %s %s %s\n' "$(date +%s.%N)" "${u}" "${s}" "${qin}" "${qout}" "${snmp:-0 0 0}" "${ct:-0}" "${cpu}" "${rss:-0}"
+}
+
+cmd_cpu_stat() {
+  local total="${1:-60}" win="${2:-10}" pid clk prev cur i jam
+  [[ "${total}" =~ ^[0-9]{1,5}$ && "${win}" =~ ^[0-9]{1,4}$ ]] && (( win >= 1 && total >= win )) || \
+    die "Gunakan cpu-stat [DETIK] [JENDELA], contoh: cpu-stat 120 10"
+  pid="$(systemctl show -p MainPID --value "${SERVICE}" 2>/dev/null)"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/stat" ]] || die "dnstt-server tidak berjalan"
+  clk="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+  printf '%-8s %6s %6s %7s %7s %7s %7s %8s %8s %6s %7s %6s %6s %6s\n' \
+    jam usr% sys% q/s jwb/s us/q_u us/q_s udpIn/s udpOut/s rcvErr ct sirq% steal% rssMB
+  prev="$(cpu_stat_sample "${pid}")" || die "data proses tidak terbaca"
+  for (( i = 0; i < total / win; i++ )); do
+    sleep "${win}"
+    cur="$(cpu_stat_sample "${pid}")" || die "dnstt-server berhenti saat diukur"
+    printf -v jam '%(%H:%M:%S)T' -1
+    # Satu sampel = 13 kolom: waktu, utime, stime, query, jawaban, UdpIn,
+    # UdpOut, RcvbufErrors, conntrack, cpu total, softirq, steal, RSS KB.
+    awk -v clk="${clk}" -v jam="${jam}" '{
+      dt = $14 - $1; if (dt <= 0) dt = 1
+      du = ($15 - $2) / clk; ds = ($16 - $3) / clk; dq = $17 - $4; dr = $18 - $5
+      q = (dr > 0 ? dr : dq); dtot = $23 - $10
+      printf "%-8s %6.1f %6.1f %7.0f %7.0f %7.1f %7.1f %8.0f %8.0f %6d %7d %6.1f %6.1f %6.1f\n",
+        jam, 100 * du / dt, 100 * ds / dt, dq / dt, dr / dt,
+        (q > 0 ? 1e6 * du / q : 0), (q > 0 ? 1e6 * ds / q : 0), ($19 - $6) / dt, ($20 - $7) / dt, $21 - $8, $22,
+        (dtot > 0 ? 100 * ($24 - $11) / dtot : 0), (dtot > 0 ? 100 * ($25 - $12) / dtot : 0), $26 / 1024
+    }' <<< "${prev} ${cur}"
+    prev="${cur}"
+  done
+}
+
 cmd_status() {
   local svc="tidak jalan" rules="BELUM" ip version pub ack
   load_config
@@ -28182,6 +29444,24 @@ cmd_status() {
   if [[ -n "${ip}" ]]; then ip="${ip}:${PUBLIC_PORT}"; else ip="-"; fi
   printf '%-14s: %s\n' "DNS" "${ip}"
   printf '%-14s: %s\n' "Jalur" "UDP ${PUBLIC_PORT} -> ${LISTEN} -> Dropbear 127.0.0.1:${TARGET_PORT}"
+  state_val DIRECT
+  if [[ -n "${REPLY}" ]]; then
+    printf '%-14s: %s\n' "Bind langsung" "AKTIF ${REPLY//,/ }:${PUBLIC_PORT} tanpa conntrack (IPv6/IP lain tetap REDIRECT)"
+  elif (( DIRECT_WANT )); then
+    if bin_has_multi_listen; then
+      printf '%-14s: %s\n' "Bind langsung" "BELUM AKTIF (port 53 dipakai program lain, atau modul socket/CT tidak ada)"
+    else
+      printf '%-14s: %s\n' "Bind langsung" "BELUM AKTIF (binary dnstt ${DNSTT_PATCH_ID} belum terpasang)"
+    fi
+  else
+    printf '%-14s: %s\n' "Bind langsung" "OFF (REDIRECT ${PUBLIC_PORT} -> ${LISTEN})"
+  fi
+  udp_batch_val
+  if (( REPLY > 0 )); then
+    printf '%-14s: %s\n' "Batch UDP" "ON (${REPLY} paket per syscall)"
+  else
+    printf '%-14s: %s\n' "Batch UDP" "OFF"
+  fi
   if (( ROUTE_SSH )); then
     printf '%-14s: %s\n' "SlowDNS SSH" "ON"
   elif (( SSH_ROUTE_ENABLED )); then
@@ -28212,8 +29492,13 @@ cmd_status() {
   print_online_summary
 }
 
+# Query dari luar yang sampai ke dnstt: REDIRECT (entri conntrack baru) +
+# NOTRACK bind langsung. Dipakai "check" untuk melihat delegasi NS.
 nat_counter() {
-  iptables -w 10 -t nat -L "${CHAIN}" -n -v -x 2>/dev/null | awk '/REDIRECT/ { s += $1 } END { print s + 0 }'
+  local nat raw
+  nat="$(iptables -w 10 -t nat -L "${CHAIN}" -n -v -x 2>/dev/null | awk '/REDIRECT/ { s += $1 } END { print s + 0 }')"
+  raw="$(iptables -w 10 -t raw -L "${RAW_PRE}" -n -v -x 2>/dev/null | awk '/CT/ { s += $1 } END { print s + 0 }')"
+  printf '%s\n' "$(( ${nat:-0} + ${raw:-0} ))"
 }
 
 # Query TXT acak lewat DoH Google dan Cloudflare. Kalau delegasi NS benar,
@@ -28296,6 +29581,9 @@ case "${1:-status}" in
   sessions) cmd_sessions "${2:-1}" ;;
   set-lock) acquire_lock; cmd_set_lock "${2:-}" ;;
   set-kcp) acquire_lock; cmd_set_kcp "${2:-}" "${3:-}" ;;
+  set-direct) acquire_lock; cmd_set_direct "${2:-}" ;;
+  set-batch) acquire_lock; cmd_set_batch "${2:-}" ;;
+  cpu-stat) load_config; cmd_cpu_stat "${2:-60}" "${3:-10}" ;;
   xray-enable) acquire_lock; cmd_xray_enable "${2:-}" ;;
   xray-disable) acquire_lock; cmd_xray_disable ;;
   set-xray-ns) acquire_lock; cmd_set_xray_ns "${2:-}" ;;
@@ -28310,7 +29598,7 @@ case "${1:-status}" in
   info) cat "${STATE_FILE}" 2>/dev/null || true ;;
   clear) acquire_lock; cmd_clear ;;
   *)
-    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions [2|3]|set-lock 0/1|set-kcp INTERVAL ACK|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}"
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions [2|3]|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}"
     exit 1
     ;;
 esac
@@ -32080,6 +33368,8 @@ SLOWDNS_MEMORY_MAX=${SLOWDNS_MEMORY_MAX}
 SLOWDNS_KCP_WINDOW=${SLOWDNS_KCP_WINDOW}
 SLOWDNS_KCP_INTERVAL=${SLOWDNS_KCP_INTERVAL}
 SLOWDNS_KCP_ACK_NODELAY=${SLOWDNS_KCP_ACK_NODELAY}
+SLOWDNS_DIRECT_BIND=${SLOWDNS_DIRECT_BIND}
+SLOWDNS_UDP_BATCH=${SLOWDNS_UDP_BATCH}
 SLOWDNS_GOMAXPROCS=${SLOWDNS_GOMAXPROCS}
 SLOWDNS_GOGC=${SLOWDNS_GOGC}
 SLOWDNS_BIN_URL=${SLOWDNS_BIN_URL}
@@ -37259,6 +38549,49 @@ slowdns_kcp_menu() {
   return 0
 }
 
+# Hemat CPU SlowDNS (V.1FSC.136): bind langsung UDP 53, batch UDP, dan ukur
+# CPU. Keduanya opt-in dan bisa dikembalikan dari menu yang sama.
+slowdns_perf_menu() {
+  local bin="$1" choice ans
+  echo "Bind langsung UDP 53 : $([[ "$(normalize_bool_01 "${SLOWDNS_DIRECT_BIND:-0}")" == "1" ]] && echo ON || echo OFF)"
+  echo "Batch UDP            : ${SLOWDNS_UDP_BATCH:-0} (0 = OFF)"
+  echo "Bind langsung: query UDP 53 tidak lewat conntrack/NAT (hemat CPU kernel)."
+  echo "Batch UDP: beberapa paket DNS per syscall. Ubah satu hal saja, lalu bandingkan"
+  echo "CPU (menu 3), speed, dan ping di jam ramai yang sama. Kalau memburuk, matikan lagi."
+  echo "1) Bind langsung UDP 53: $([[ "$(normalize_bool_01 "${SLOWDNS_DIRECT_BIND:-0}")" == "1" ]] && echo "matikan (rollback)" || echo "nyalakan")"
+  echo "2) Batch UDP: $([[ "${SLOWDNS_UDP_BATCH:-0}" =~ ^0*$ ]] && echo "nyalakan (16 paket)" || echo "matikan")"
+  echo "3) Ukur CPU SlowDNS 60 detik"
+  echo "0) Batal"
+  if ! prompt_input choice "Pilih [0-3]: "; then
+    return 0
+  fi
+  case "${choice}" in
+    1|2)
+      if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
+        echo "Peringatan: service SlowDNS di-restart; pengguna SlowDNS tersambung ulang otomatis dalam beberapa detik."
+        if ! prompt_input ans "Lanjut? [y/N]: " || [[ "${ans,,}" != "y" && "${ans,,}" != "yes" ]]; then
+          echo "Dibatalkan."
+          return 0
+        fi
+      fi
+      if [[ "${choice}" == "1" ]]; then
+        if [[ "$(normalize_bool_01 "${SLOWDNS_DIRECT_BIND:-0}")" == "1" ]]; then
+          "${bin}" set-direct off 2>&1 | ui_fx || true
+        else
+          "${bin}" set-direct on 2>&1 | ui_fx || true
+        fi
+      elif [[ "${SLOWDNS_UDP_BATCH:-0}" =~ ^0*$ ]]; then
+        "${bin}" set-batch on 2>&1 | ui_fx || true
+      else
+        "${bin}" set-batch off 2>&1 | ui_fx || true
+      fi
+      ;;
+    3) "${bin}" cpu-stat 60 10 2>&1 || true ;;
+    *) echo "Dibatalkan." ;;
+  esac
+  return 0
+}
+
 # Baca input tanpa menampilkannya (private key). Gaya prompt sama dengan
 # prompt_input.
 prompt_secret() {
@@ -37358,8 +38691,9 @@ set_slowdns_menu() {
   else
     echo "12) Aktifkan SlowDNS SSH"
   fi
+  echo "13) Hemat CPU (bind langsung UDP 53 / batch UDP / ukur CPU)"
   echo "0) Kembali"
-  if ! prompt_input choice "Pilih [0-12]: "; then
+  if ! prompt_input choice "Pilih [0-13]: "; then
     return 0
   fi
   case "${choice}" in
@@ -37410,6 +38744,7 @@ set_slowdns_menu() {
         "${bin}" ssh-route on 2>&1 | ui_fx || true
       fi
       ;;
+    13) slowdns_perf_menu "${bin}" ;;
     *) return 0 ;;
   esac
   safe_source_env_file /etc/sc-1forcr.env
@@ -41975,6 +43310,8 @@ update_script_from_repo() {
     SLOWDNS_KCP_WINDOW="${SLOWDNS_KCP_WINDOW:-auto}" \
     SLOWDNS_KCP_INTERVAL="${SLOWDNS_KCP_INTERVAL:-10}" \
     SLOWDNS_KCP_ACK_NODELAY="${SLOWDNS_KCP_ACK_NODELAY:-0}" \
+    SLOWDNS_DIRECT_BIND="${SLOWDNS_DIRECT_BIND:-0}" \
+    SLOWDNS_UDP_BATCH="${SLOWDNS_UDP_BATCH:-0}" \
     SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}" \
     SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}" \
     SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}" \
@@ -44916,7 +46253,7 @@ persist_pending_install_env() {
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
-    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_KCP_INTERVAL SLOWDNS_KCP_ACK_NODELAY SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_SSH_ENABLE SLOWDNS_XRAY_ENABLE SLOWDNS_XRAY_NS_DOMAIN SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
+    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_KCP_INTERVAL SLOWDNS_KCP_ACK_NODELAY SLOWDNS_DIRECT_BIND SLOWDNS_UDP_BATCH SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_SSH_ENABLE SLOWDNS_XRAY_ENABLE SLOWDNS_XRAY_NS_DOMAIN SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE

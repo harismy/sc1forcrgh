@@ -72,15 +72,19 @@ function procStats(pid) {
     const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
     const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
     const kb = (k) => Number((status.match(new RegExp(`${k}:\\s+(\\d+)`)) || [])[1] || 0) * 1024;
-    return { cpu: (Number(f[11]) + Number(f[12])) / clkTck, rss: kb('VmRSS'), peak: kb('VmHWM') };
+    // utime dan stime dipisah (V.1FSC.136): CPU kernel (syscall, netfilter,
+    // conntrack) per query adalah sasaran utama hemat CPU SlowDNS.
+    const usr = Number(f[11]) / clkTck;
+    const sys = Number(f[12]) / clkTck;
+    return { cpu: usr + sys, usr, sys, rss: kb('VmRSS'), peak: kb('VmHWM') };
   }
   if (process.platform === 'win32') {
-    const cmd = `$p=Get-Process -Id ${pid}; [string]::Format([cultureinfo]::InvariantCulture,'{0} {1} {2}',` +
-      '$p.TotalProcessorTime.TotalSeconds,$p.WorkingSet64,$p.PeakWorkingSet64)';
+    const cmd = `$p=Get-Process -Id ${pid}; [string]::Format([cultureinfo]::InvariantCulture,'{0} {1} {2} {3} {4}',` +
+      '$p.TotalProcessorTime.TotalSeconds,$p.WorkingSet64,$p.PeakWorkingSet64,$p.UserProcessorTime.TotalSeconds,$p.PrivilegedProcessorTime.TotalSeconds)';
     const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', cmd], { encoding: 'utf8', windowsHide: true });
-    const [cpu, rss, peak] = r.stdout.trim().split(/\s+/).map(Number);
+    const [cpu, rss, peak, usr, sys] = r.stdout.trim().split(/\s+/).map(Number);
     assert(Number.isFinite(cpu), `Get-Process gagal: ${r.stdout}${r.stderr}`);
-    return { cpu, rss, peak };
+    return { cpu, rss, peak, usr, sys };
   }
   throw Error('platform belum didukung untuk ukur CPU');
 }
@@ -464,7 +468,7 @@ async function runConfig(cfg, opt, bins) {
         kcp.rtoMax = Math.max(0, ...(k1.Sessions || []).map((s) => s.RTO));
         delta.kcp = kcp;
       }
-      out.phases[name] = { wall, cpu: s1.cpu - s0.cpu, udpDrops: d0 === null ? null : d1 - d0, ...delta, ...extra };
+      out.phases[name] = { wall, cpu: s1.cpu - s0.cpu, usr: s1.usr - s0.usr, sys: s1.sys - s0.sys, udpDrops: d0 === null ? null : d1 - d0, ...delta, ...extra };
     };
     // 1. Idle: semua klien tersambung tanpa trafik.
     await phase('idle', async () => { await sleep(opt['idle-sec'] * 1000); return { clients: ports.length }; });
@@ -563,6 +567,9 @@ function summarize(results, labels) {
       downQps: m((r) => (r.phases.download ? r.phases.download.queries / r.phases.download.wall : null)),
       downQPerMiB: m((r) => (r.phases.download ? r.phases.download.queries / r.phases.download.mib : null)),
       downCpuPerKQ: m((r) => (r.phases.download ? 1e6 * r.phases.download.cpu / r.phases.download.queries : null)),
+      // CPU per query (us) user/sys per fase transfer.
+      ...Object.fromEntries(['download', 'upload', 'parallel'].flatMap((n) => ['usr', 'sys'].map((k) => [`${n}_${k}_us`,
+        m((r) => (r.phases[n] && r.phases[n].queries > 0 && Number.isFinite(r.phases[n][k]) ? 1e6 * r.phases[n][k] / r.phases[n].queries : null))]))),
       // Retransmisi server per MiB download, dipecah menurut jenis (instrumen kcp-go).
       kRetr: kcp('download', (k, p) => k.RetransSegs / p.mib),
       kLost: kcp('download', (k, p) => k.LostSegs / p.mib),
@@ -611,6 +618,9 @@ function printTable(rows) {
       ['Query/MiB download', (r) => fmtM(r.downQPerMiB, 0)],
       ['Query/s download', (r) => fmtM(r.downQps, 0)],
       ['CPU-ms/1000 query', (r) => fmtM(r.downCpuPerKQ, 1)],
+      ['us/query user/sys down', (r) => `${fmtM(r.download_usr_us, 1)}/${fmtM(r.download_sys_us, 1)}`],
+      ['us/query user/sys up', (r) => `${fmtM(r.upload_usr_us, 1)}/${fmtM(r.upload_sys_us, 1)}`],
+      ['us/query user/sys paralel', (r) => `${fmtM(r.parallel_usr_us, 1)}/${fmtM(r.parallel_sys_us, 1)}`],
       ['Retrans/MiB total (RTO/fast/early)', (r) => `${fmtM(r.kRetr, 0)} (${fmtM(r.kLost, 0)}/${fmtM(r.kFast, 0)}/${fmtM(r.kEarly, 0)})`],
       ['Dedup dibuang/MiB', (r) => fmtM(r.kDedup, 0)],
       ['Antrean keluar avg/max', (r) => `${fmtM(r.kQAvg, 0)}/${fmtM(r.kQMax, 0)}`],

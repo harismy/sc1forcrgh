@@ -160,7 +160,7 @@ assert(bytesPy.includes('\npatch_session_bytes(mod)\n') &&
     'sc-fast11: MTU awal TXT/NULL = kapasitas respons 512 byte, naik hanya lewat bukti');
   // V.1FSC.135: SlowDNS Xray lewat domain NS kedua (satu proses, satu kunci).
   const routePy = sizePy.split('\npatch_response_size(mod)\n')[1] || '';
-  assert(helper.includes('DNSTT_PATCH_ID="sc-fast12"') && routePy.includes('\npatch_xray_route(mod)\n') &&
+  assert(routePy.includes('\npatch_xray_route(mod)\n') &&
     routePy.includes("'sc_route.go'") && routePy.includes('scRouteFlags()') &&
     routePy.includes('scTrimTunnelDomain(question.Name, domain)') &&
     routePy.includes('route := scQueryRoute(&query, domain)') &&
@@ -172,11 +172,31 @@ assert(bytesPy.includes('\npatch_session_bytes(mod)\n') &&
     'patch sc-fast12 setelah sc-fast11: domain NS Xray, rute path WS loopback, ON/OFF dari file state');
   // Nilai nol = ON: jalur yang belum disetel tidak pernah mati diam-diam.
   assert(!/scRoute(SSH|Xray)On\b/.test(routePy), 'sc-fast12: saklar jalur memakai nilai nol = ON');
+  // V.1FSC.136: hemat CPU per query (sc-fast13) setelah sc-fast12.
+  const cpuPy = routePy.split('\npatch_xray_route(mod)\n')[1] || '';
+  assert(helper.includes('DNSTT_PATCH_ID="sc-fast13"') && cpuPy.includes('\npatch_cpu_saver(mod)\n') &&
+    cpuPy.includes("'sc_cpu.go'") && cpuPy.includes("'sc_batch_linux.go'") && cpuPy.includes("'sc_batch_other.go'") &&
+    cpuPy.includes('case ch <- &record{resp, addr, clientID, size, dnsConn}:') && cpuPy.includes('scRecordDropped()') &&
+    cpuPy.includes('rd := scNewPacketReader(dnsConn)') && cpuPy.includes('w := scNewPacketWriter()') &&
+    cpuPy.includes('timer.Reset(maxResponseDelay)') && cpuPy.includes('waiting, first := false, true') &&
+    cpuPy.includes('scListenUDP(udpAddr)') && cpuPy.includes('comma-separated') &&
+    cpuPy.includes('encoded, payload := scJoinUpperDecodeBuf(prefix)') &&
+    cpuPy.includes('SLOWDNS_UDP_BATCH') && cpuPy.includes('ipv6.NewPacketConn(uc)') &&
+    cpuPy.includes('se.Syscall == "recvmmsg" || se.Syscall == "sendmmsg"'),
+    'patch sc-fast13 setelah sc-fast12: satu timer sendLoop, -udp beberapa alamat, batch UDP opsional, query dibuang dihitung');
+  // Anchor build uji (scripts/go/slowdns-bench) tetap ada setelah sc-fast13.
+  assert(cpuPy.includes("'\\t\\t\\t\\tpayload.Write(p)\\n\\t\\t\\t}\\n'") && !cpuPy.includes('ttConn.Stash('),
+    'sc-fast13 tidak mengubah baris Stash/payload.Write yang dikait build uji');
+  // Log per query dibatasi (banjir scanner ke UDP 53).
+  for (const fmt of ['NXDOMAIN: not authoritative for %s', 'cannot parse DNS query: %v', 'WriteTo error: %v']) {
+    assert(cpuPy.includes(fmt), `log per query dibatasi: ${fmt}`);
+  }
 }
 assert(helper.includes('XRAY_ROUTE="/vmess=127.0.0.1:10001,/vless=127.0.0.1:10002,/trojan=127.0.0.1:10003"') &&
-  /bin_has_routes\(\) \{[\s\S]*?-h 2>&1 \| grep -q -- '-routes-file'/.test(helper) &&
+  /bin_has_routes\(\) \{\n  bin_help\n  \[\[ "\$\{REPLY\}" == \*"-routes-file"\* \]\]/.test(helper) &&
+  /BIN_HELP="\$\("\$\{BIN\}" -h 2>&1 \|\| true\)"/.test(helper) && /\n  BIN_HELP_DONE=0\n\}/.test(helper) &&
   helper.includes('-mtu ${MTU}${args} ${NS} 127.0.0.1:${TARGET_PORT}') &&
-  helper.includes('ROUTE_SSH=${ROUTE_SSH}\nROUTE_XRAY=${xray_route}"'),
+  helper.includes('ROUTE_SSH=${ROUTE_SSH}\nROUTE_XRAY=${xray_route}\nDIRECT=${DIRECT_IPS}"'),
   'helper: flag jalur hanya dipasang kalau binary mendukung, ON/OFF jalur lewat file state');
 assert(helper.includes('  sessions) cmd_sessions "${2:-1}" ;;') &&
   helper.includes("printf 'SC_SLOWDNS_USERS_V2|%s|%s\\n'") && helper.includes("printf 'SC_SLOWDNS_USERS_V1|%s\\n'"),
@@ -228,7 +248,8 @@ st="\${FAKE_DIR}/rules\${fam}.\${table}"
 lines=()
 if [[ -f "\${st}" ]]; then mapfile -t lines < "\${st}"; fi
 op="\${args[0]}"; chain="\${args[1]:-}"; rest=("\${args[@]:2}")
-if [[ "\${op}" == "-I" && "\${rest[0]:-}" =~ ^[0-9]+$ ]]; then rest=("\${rest[@]:1}"); fi
+pos=1
+if [[ "\${op}" == "-I" && "\${rest[0]:-}" =~ ^[0-9]+$ ]]; then pos="\${rest[0]}"; rest=("\${rest[@]:1}"); fi
 spec="\${rest[*]}"
 [[ "\${table}" == "nat" && -f "\${FAKE_DIR}/no-nat\${fam}" ]] && exit 1
 if [[ -f "\${FAKE_DIR}/no-addrtype" && " \${spec} " == *" addrtype "* ]]; then exit 1; fi
@@ -263,7 +284,25 @@ case "\${op}" in
     done
     lines=("\${new[@]}"); save ;;
   -A) builtin_chain "\${chain}" || has_chain "\${chain}" || exit 1; lines+=("\${chain} \${spec}"); save ;;
-  -I) lines=("\${chain} \${spec}" "\${lines[@]}"); save ;;
+  -I)
+    # Sisip sebelum rule ke-pos milik chain ini (iptables asli: nomor rule per chain).
+    # Chain tanpa rule (atau posisi melewati akhir): di awal file / setelah
+    # rule terakhir chain itu, seperti tiruan lama yang selalu menyisip di atas.
+    new=(); n=0; done=0; last=-1
+    for l in "\${lines[@]}"; do
+      if [[ "\${l}" == "\${chain} "* ]]; then
+        n=$((n + 1))
+        if (( !done && n == pos )); then new+=("\${chain} \${spec}"); done=1; fi
+        new+=("\${l}"); last=$(( \${#new[@]} - 1 ))
+        continue
+      fi
+      new+=("\${l}")
+    done
+    if (( !done )); then
+      if (( last < 0 )); then new=("\${chain} \${spec}" "\${new[@]}")
+      else new=("\${new[@]:0:last+1}" "\${chain} \${spec}" "\${new[@]:last+1}"); fi
+    fi
+    lines=("\${new[@]}"); save ;;
   -C) for l in "\${lines[@]}"; do [[ "\${l}" == "\${chain} \${spec}" ]] && exit 0; done; exit 1 ;;
   -D)
     new=(); found=0
@@ -326,7 +365,14 @@ esac
   id: '#!/usr/bin/env bash\n[[ "$1" == -u && -f "${FAKE_DIR}/user-$2" ]] && echo 990\n',
   chown: '#!/usr/bin/env bash\nexit 0\n',
   nproc: '#!/usr/bin/env bash\necho 1\n',
-  ip: '#!/usr/bin/env bash\n[[ -f "${FAKE_DIR}/has-ipv6" ]] && echo "    inet6 2001:db8::7/64 scope global"\nexit 0\n',
+  ip: `#!/usr/bin/env bash
+case "$*" in
+  *"route show default"*) echo "default via 203.0.113.1 dev eth0 onlink" ;;
+  *"addr show dev eth0"*) echo "2: eth0    inet 203.0.113.7/24 brd 203.0.113.255 scope global eth0" ;;
+  *) [[ -f "\${FAKE_DIR}/has-ipv6" ]] && echo "    inet6 2001:db8::7/64 scope global" ;;
+esac
+exit 0
+`,
   'netfilter-persistent': '#!/usr/bin/env bash\necho save >> "${FAKE_DIR}/persist"\n',
   'service-gate': '#!/usr/bin/env bash\necho "$*" >> "${FAKE_DIR}/gate.log"\n'
 };
@@ -696,6 +742,139 @@ try {
     assert.strictEqual(r.status, 0, r.out);
   }
 
+  // ── 8c. Hemat CPU V.1FSC.136: urutan OUTPUT, bind langsung, batch ───────
+  {
+    const multiDnstt = fakeDnstt.replace('\nexit 1\n', '\nif [[ "$1" == "-h" ]]; then echo "  -routes-file string" >&2; ' +
+      'echo "  -udp string  UDP address(es) to listen on, comma-separated (required)" >&2; exit 0; fi\nexit 1\n');
+    fs.writeFileSync(dnsttBin, multiDnstt);
+    const base = { SLOWDNS_ENABLE: '1', SLOWDNS_NS_DOMAIN: 'ns-sg1.contoh.net' };
+    const dnsttOn53 = 'UNCONN 0 0 203.0.113.7:53 0.0.0.0:* users:(("dnstt-server",pid=99,fd=4))\n';
+    const out5300 = 'OUTPUT -p udp -m udp --sport 5300 -m comment --comment sc-slowdns -j ACCEPT';
+    const out53 = 'OUTPUT -p udp -m udp --sport 53 -m comment --comment sc-slowdns -j ACCEPT';
+    const in53 = 'INPUT -p udp -m udp --dport 53 -m comment --comment sc-slowdns -j ACCEPT';
+    const outRules = () => rules(4, 'filter').filter((l) => l.startsWith('OUTPUT '));
+    const unitNow = () => fs.readFileSync(unitFile, 'utf8');
+    setEnv(base);
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+    // Binary sc-fast13 tanpa fitur opsional: unit sama persis dengan versi lama.
+    assert(unitNow().includes(' -udp :5300 -privkey-file ') && !/Ambient|Capability|SLOWDNS_UDP_BATCH/.test(unitNow()), unitNow());
+
+    // id2 (V.1FSC.135): jump kuota (92 rule owner) di posisi 1 di atas ACCEPT dnstt.
+    fs.writeFileSync(F('rules4.filter'), ['OUTPUT -j SC_1FORCR_QUOTA_OUT', ...rules(4, 'filter')].join('\n') + '\n');
+    r = run('apply');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.deepStrictEqual(outRules().slice(0, 2), [out5300, 'OUTPUT -j SC_1FORCR_QUOTA_OUT'], outRules().join('\n'));
+    assert(read('persist').includes('save'), 'urutan baru disimpan');
+    r = run('apply');
+    assert.strictEqual(read('writes'), '', 'posisi sudah benar: apply berikutnya tidak menulis');
+    // Gerbang ON/OFF boleh di atasnya (gerbang memaksa dirinya pertama).
+    fs.writeFileSync(F('rules4.filter'), ['OUTPUT -j SC1FORCR_SVC_OUT', ...rules(4, 'filter')].join('\n') + '\n');
+    r = run('apply');
+    assert.strictEqual(read('writes'), '', 'jump gerbang di atas ACCEPT dnstt tidak dianggap menggeser');
+    // Rule lain disisip di puncak (di atas gerbang juga): ACCEPT dnstt naik ke
+    // puncak; apply gerbang berikutnya memindah jump gerbang ke atasnya lagi,
+    // dan posisi itu stabil (tidak saling geser tiap siklus watchdog).
+    fs.writeFileSync(F('rules4.filter'), ['OUTPUT -p tcp -m tcp --dport 25 -j REJECT', ...rules(4, 'filter')].join('\n') + '\n');
+    r = run('apply');
+    assert.deepStrictEqual(outRules().slice(0, 2), [out5300, 'OUTPUT -p tcp -m tcp --dport 25 -j REJECT'], outRules().join('\n'));
+    assert.strictEqual(outRules().filter((l) => l.includes('sc-slowdns')).length, 1, 'tidak dobel');
+    fs.writeFileSync(F('rules4.filter'), ['OUTPUT -j SC1FORCR_SVC_OUT',
+      ...rules(4, 'filter').filter((l) => l !== 'OUTPUT -j SC1FORCR_SVC_OUT')].join('\n') + '\n');
+    r = run('apply');
+    assert.strictEqual(read('writes'), '', 'gerbang kembali pertama: ACCEPT dnstt di bawahnya sudah benar');
+    assert.deepStrictEqual(outRules().slice(0, 3), ['OUTPUT -j SC1FORCR_SVC_OUT', out5300, 'OUTPUT -p tcp -m tcp --dport 25 -j REJECT']);
+
+    // Bind langsung: unit IP:53 + port cadangan, CAP_NET_BIND_SERVICE (tetap non-root).
+    setEnv({ ...base, SLOWDNS_DIRECT_BIND: '1' });
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+    assert(unitNow().includes(' -udp 203.0.113.7:53,:5300 -privkey-file ') && unitNow().includes('AmbientCapabilities=CAP_NET_BIND_SERVICE') &&
+      unitNow().includes('CapabilityBoundingSet=CAP_NET_BIND_SERVICE') && unitNow().includes('User=sc-1forcr-slowdns'), unitNow());
+    assert(mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'), 'unit berubah: restart sekali');
+    assert.strictEqual(state().DIRECT, '', 'soket IP:53 belum terlihat milik dnstt: belum NOTRACK');
+    assert(!rules(4, 'raw').some((l) => l.includes('SDNS')));
+    fs.writeFileSync(F('udp'), dnsttOn53);
+    r = run('apply');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.strictEqual(state().DIRECT, '203.0.113.7');
+    const raw = rules(4, 'raw');
+    for (const want of ['PREROUTING -p udp -j SC1FORCR_SDNS_PRE', 'OUTPUT -p udp -j SC1FORCR_SDNS_OUT',
+      'SC1FORCR_SDNS_PRE -d 203.0.113.7/32 -p udp -m udp --dport 53 -m socket -m comment --comment sc-slowdns -j CT --notrack',
+      'SC1FORCR_SDNS_OUT -s 203.0.113.7/32 -p udp -m udp --sport 53 -m comment --comment sc-slowdns -j CT --notrack']) {
+      assert(raw.includes(want), `raw wajib memuat ${want}:\n${raw.join('\n')}`);
+    }
+    assert(rules(4, 'filter').includes(in53), 'INPUT menerima query port 53 yang tidak lewat REDIRECT');
+    assert.deepStrictEqual(outRules().slice(0, 3), ['OUTPUT -j SC1FORCR_SVC_OUT', out5300, out53], outRules().join('\n'));
+    assert(rules(4, 'nat').includes('SC1FORCR_SLOWDNS -p udp -m udp --dport 53 -m comment --comment sc-slowdns -j REDIRECT --to-ports 5300'),
+      'REDIRECT tetap ada sebagai jalur cadangan (IPv6, IP lain, soket IP:53 hilang)');
+    r = run('apply');
+    assert.strictEqual(read('writes'), '', 'bind langsung: apply berikutnya tidak menulis');
+    r = run('status');
+    assert(/Bind langsung : AKTIF 203\.0\.113\.7:53/.test(r.out), r.out);
+    // IP:53 direbut program lain: NOTRACK dilepas, query kembali lewat REDIRECT.
+    fs.writeFileSync(F('udp'), 'UNCONN 0 0 203.0.113.7:53 0.0.0.0:* users:(("named",pid=7,fd=4))\n');
+    r = run('apply');
+    assert.strictEqual(state().DIRECT, '');
+    assert(!rules(4, 'raw').some((l) => l.includes('SDNS')) && !rules(4, 'filter').includes(in53) && !outRules().includes(out53));
+    // Setup saat port 53 dipakai program lain (alamat itu atau wildcard): unit tanpa IP:53.
+    for (const busy of ['UNCONN 0 0 203.0.113.7:53 0.0.0.0:* users:(("named",pid=7,fd=4))\n',
+      'UNCONN 0 0 0.0.0.0:53 0.0.0.0:* users:(("dnsmasq",pid=7,fd=4))\n', 'UNCONN 0 0 *:53 *:* users:(("unbound",pid=7,fd=4))\n']) {
+      fs.writeFileSync(F('udp'), busy);
+      r = run('setup');
+      assert.strictEqual(r.status, 0, r.out);
+      assert(unitNow().includes(' -udp :5300 ') && !unitNow().includes('Ambient'), `port 53 sibuk (${busy.trim()}): ${unitNow()}`);
+    }
+    // systemd-resolved (127.0.0.53) tidak bentrok dengan IP publik.
+    fs.writeFileSync(F('udp'), 'UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* users:(("systemd-resolve",pid=5,fd=13))\n' + dnsttOn53);
+    r = run('setup');
+    assert(unitNow().includes(' -udp 203.0.113.7:53,:5300 '), unitNow());
+    run('apply');
+    assert.strictEqual(state().DIRECT, '203.0.113.7');
+    // Rollback: set-direct off melepas NOTRACK dan unit kembali seperti semula.
+    r = run('set-direct', 'off');
+    assert.strictEqual(r.status, 0, r.out);
+    assert(/Berhasil: bind langsung OFF/.test(r.out), r.out);
+    assert.strictEqual(envValue('SLOWDNS_DIRECT_BIND'), '0');
+    assert(unitNow().includes(' -udp :5300 -privkey-file ') && !/Ambient|Capability/.test(unitNow()), unitNow());
+    assert(!rules(4, 'raw').some((l) => l.includes('SDNS')) && !rules(4, 'filter').includes(in53), 'raw dan rule port 53 dilepas');
+    assert.strictEqual(state().DIRECT, '');
+    assert(read('gate.log').includes('apply'), 'gerbang diterapkan ulang');
+    assert.notStrictEqual(run('set-direct', 'mungkin').status, 0);
+    r = run('set-direct', 'on');
+    assert.strictEqual(r.status, 0, r.out);
+    assert(/Berhasil: bind langsung AKTIF di 203\.0\.113\.7/.test(r.out), r.out);
+    // Binary lama (tanpa -udp beberapa alamat): unit tidak berubah, status menjelaskan.
+    installFakeDnstt();
+    r = run('setup');
+    assert(unitNow().includes(' -udp :5300 ') && !unitNow().includes('Ambient'), unitNow());
+    r = run('apply');
+    assert.strictEqual(state().DIRECT, '', 'binary lama: tidak ada NOTRACK');
+    assert(/Bind langsung : BELUM AKTIF \(binary dnstt sc-fast13/.test(run('status').out));
+    // Batch UDP: hanya baris env, opt-in, rollback lewat set-batch off.
+    fs.writeFileSync(dnsttBin, multiDnstt);
+    setEnv(base);
+    run('setup');
+    for (const [arg, want] of [['on', '16'], ['8', '8'], ['off', '0']]) {
+      r = run('set-batch', arg);
+      assert.strictEqual(r.status, 0, r.out);
+      assert.strictEqual(envValue('SLOWDNS_UDP_BATCH'), want);
+      const line = (unitNow().match(/^Environment=SLOWDNS_UDP_BATCH=(.*)$/m) || [])[1];
+      assert.strictEqual(line, want === '0' ? undefined : want, unitNow());
+    }
+    for (const bad of ['1x', '99', '', 'nyala']) {
+      assert.notStrictEqual(run('set-batch', bad).status, 0, `set-batch ${bad} harus ditolak`);
+      assert.strictEqual(envValue('SLOWDNS_UDP_BATCH'), '0', 'input salah tidak menyentuh env');
+    }
+    r = run('cpu-stat', 'x');
+    assert(r.status !== 0 && /cpu-stat \[DETIK\] \[JENDELA\]/.test(r.out), r.out);
+    fs.rmSync(F('udp'), { force: true });
+    installFakeDnstt();
+    setEnv(base);
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+  }
+
   // ── 9. regen-key: pubkey baru, service di-restart ────────────────────────
   const oldPub = state().PUBKEY;
   r = run('regen-key');
@@ -899,7 +1078,11 @@ const sshBlock = buildRules.slice(0, buildRules.indexOf('service_enabled vmess')
 assert(sshBlock.includes('ports="$(slowdns_port)"') &&
   sshBlock.includes('! -i lo -p udp -m multiport --dports ${ports} -m comment --comment sc-svc-ssh -j DROP'),
   'SSH OFF wajib menolak port listen SlowDNS');
-const gateFns = extract(gate, '\njoin_ports() {', '\n}\n', true) + '\n}\n' + extract(gate, '\nslowdns_port() {', '\n}\n', true) + '\n}\n';
+assert(sshBlock.includes('if slowdns_direct_active; then') &&
+  sshBlock.includes('! -i lo -p udp -m udp --dport 53 -m conntrack --ctstate UNTRACKED -m comment --comment sc-svc-ssh -j DROP'),
+  'SSH OFF juga menolak query bind langsung (UNTRACKED), bukan DNS lain di VPS');
+const gateFns = extract(gate, '\njoin_ports() {', '\n}\n', true) + '\n}\n' + extract(gate, '\nslowdns_port() {', '\n}\n', true) + '\n}\n' +
+  extract(gate, '\nslowdns_direct_active() {', '\n}\n', true) + '\n}\n';
 const gateTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'sc-slowdns-gate-'));
 try {
   const st = path.join(gateTmp, 'state');
@@ -915,6 +1098,15 @@ try {
   // SlowDNS Xray aktif: port dipakai bersama, SSH OFF ditangani dnstt (ROUTE_SSH=0).
   assert.strictEqual(port('ENABLED=1\nLISTEN=5300\nROUTE_SSH=0\nROUTE_XRAY=1\n'), '', 'jalur Xray aktif: port SlowDNS tidak ditutup');
   assert.strictEqual(port('ENABLED=1\nLISTEN=5300\nROUTE_SSH=0\nROUTE_XRAY=0\n'), '5300', 'tanpa jalur Xray: perilaku lama');
+  const direct = (text) => {
+    fs.writeFileSync(st, text);
+    return spawnSync(bash, ['-c', `${gateFns}\nif slowdns_direct_active; then echo ya; else echo tidak; fi`],
+      { encoding: 'utf8', env: { ...process.env, SLOWDNS_STATE_FILE: toBashPath(st) } }).stdout.trim();
+  };
+  assert.strictEqual(direct('ENABLED=1\nLISTEN=5300\nDIRECT=203.0.113.7\n'), 'ya');
+  assert.strictEqual(direct('ENABLED=1\nLISTEN=5300\nDIRECT=\n'), 'tidak', 'tanpa bind langsung: tidak ada rule tambahan');
+  assert.strictEqual(direct('ENABLED=1\nLISTEN=5300\nDIRECT=203.0.113.7\nROUTE_XRAY=1\n'), 'tidak', 'jalur Xray aktif: port dipakai bersama');
+  assert.strictEqual(direct('ENABLED=0\nDIRECT=203.0.113.7\n'), 'tidak');
   const setFn = extract(gate, '\ncmd_set() {', '\n}\n');
   assert(setFn.indexOf('slowdns_routes_apply') > 0 && setFn.indexOf('slowdns_routes_apply') < setFn.indexOf('if ! cmd_apply; then'),
     'gerbang: jalur SlowDNS diperbarui sebelum rule disusun');
@@ -940,7 +1132,8 @@ for (const [name, body, gateCall] of [['update aman', safePath, '\n    apply_ser
 assert(/^setup_slowdns\(\) \{\n  install_slowdns_manager \|\| return 0\n[\s\S]*?\n  return 0\n\}/m.test(installer),
   'setup_slowdns tidak boleh menggagalkan install/update');
 const envKeys = ['SLOWDNS_ENABLE', 'SLOWDNS_NS_DOMAIN', 'SLOWDNS_LISTEN_PORT', 'SLOWDNS_MTU', 'SLOWDNS_MEMORY_MAX',
-  'SLOWDNS_KCP_WINDOW', 'SLOWDNS_KCP_INTERVAL', 'SLOWDNS_KCP_ACK_NODELAY', 'SLOWDNS_BIN_URL', 'SLOWDNS_BIN_SHA256',
+  'SLOWDNS_KCP_WINDOW', 'SLOWDNS_KCP_INTERVAL', 'SLOWDNS_KCP_ACK_NODELAY', 'SLOWDNS_DIRECT_BIND', 'SLOWDNS_UDP_BATCH',
+  'SLOWDNS_BIN_URL', 'SLOWDNS_BIN_SHA256',
   'SLOWDNS_SSH_ENABLE', 'SLOWDNS_XRAY_ENABLE', 'SLOWDNS_XRAY_NS_DOMAIN'];
 const envDump = extract(installer, '\n  cat > /etc/sc-1forcr.env <<EOF\n', '\nEOF\n');
 const pending = extract(installer, '\npersist_pending_install_env() {', '\n}\n');
@@ -950,7 +1143,7 @@ for (const key of envKeys) {
   assert(new RegExp(`\\b${key}\\b`).test(pending), `${key} wajib ada di persist_pending_install_env`);
   assert(menuUpdate.includes(`${key}="\${${key}:-`), `${key} wajib diteruskan update dari menu`);
 }
-for (const [key, def] of [['SLOWDNS_KCP_INTERVAL', '10'], ['SLOWDNS_KCP_ACK_NODELAY', '0']]) {
+for (const [key, def] of [['SLOWDNS_KCP_INTERVAL', '10'], ['SLOWDNS_KCP_ACK_NODELAY', '0'], ['SLOWDNS_DIRECT_BIND', '0'], ['SLOWDNS_UDP_BATCH', '0']]) {
   assert(installer.includes(`\n${key}="\${${key}:-${def}}"\n`), `${key} default ${def} di installer`);
   assert(menuUpdate.includes(`${key}="\${${key}:-${def}}"`), `${key} default ${def} saat update dari menu`);
 }
@@ -960,6 +1153,10 @@ for (const pair of ['1) interval=10; ack=0', '2) interval=20; ack=0', '3) interv
 }
 assert(kcpMenu.includes('"${bin}" set-kcp "${interval}" "${ack}"') && installer.includes('    9) slowdns_kcp_menu "${bin}" ;;'),
   'menu Tools > SlowDNS [9] memanggil set-kcp');
+const perfMenu = extract(installer, '\nslowdns_perf_menu() {', '\n}\n');
+assert(perfMenu.includes('"${bin}" set-direct off') && perfMenu.includes('"${bin}" set-direct on') &&
+  perfMenu.includes('"${bin}" set-batch on') && perfMenu.includes('"${bin}" set-batch off') && perfMenu.includes('"${bin}" cpu-stat 60 10') &&
+  installer.includes('    13) slowdns_perf_menu "${bin}" ;;'), 'menu Tools > SlowDNS [13]: bind langsung, batch UDP, ukur CPU (dengan rollback)');
 const uninstall = extract(installer, '\n/usr/local/sbin/sc-1forcr-extra-ports clear', '\necho "Uninstall SC 1FORCR selesai');
 assert(uninstall.includes('/usr/local/sbin/sc-1forcr-slowdns clear') && uninstall.includes('rm -f /usr/local/sbin/sc-1forcr-slowdns'),
   'uninstall melepas SlowDNS');

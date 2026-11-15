@@ -218,7 +218,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.136}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.137}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -28668,7 +28668,7 @@ cmd_records() {
   ip="${REPLY:-IP_VPS}"
   host="${DOMAIN_MAIN:-domain-utama}"
   say "Buat record ini di DNS domain Anda:"
-  say "  NS  ${NS:-$(suggest_ns "${DOMAIN_MAIN}")}  ->  ${host}"
+  say "  NS  ${NS:-$(suggest_ns "${DOMAIN_MAIN}")}  ->  ${host}   (SlowDNS SSH)"
   if [[ -n "${XRAY_NS}" ]]; then
     say "  NS  ${XRAY_NS}  ->  ${host}   (SlowDNS Xray)"
   fi
@@ -28721,21 +28721,21 @@ cmd_set_ns() {
   env_val SLOWDNS_NS_DOMAIN
   prev_ns="${REPLY}"
   load_config
-  normalize_ns "${1:-}" || die "domain NS tidak valid: ${1:-kosong}"
+  normalize_ns "${1:-}" || die "domain NS SSH tidak valid: ${1:-kosong}"
   ns="${REPLY}"
   if [[ -n "${DOMAIN_MAIN}" && "${ns}" == "${DOMAIN_MAIN}" ]]; then
-    die "domain NS tidak boleh sama dengan domain utama"
+    die "domain NS SSH tidak boleh sama dengan domain utama"
   fi
   same_as_xray_ns "${ns}" && die "domain NS SSH tidak boleh sama dengan domain NS Xray (${ns})"
   set_env_value SLOWDNS_NS_DOMAIN "${ns}" || die "env ${SC_ENV} gagal ditulis"
   if (( ENABLED == 1 )) && ! ( cmd_setup ); then
     set_env_value SLOWDNS_NS_DOMAIN "${prev_ns}" || true
     ( cmd_setup ) >/dev/null 2>&1 || true
-    die "domain NS baru gagal diterapkan; pengaturan dikembalikan"
+    die "domain NS SSH baru gagal diterapkan; pengaturan dikembalikan"
   fi
   load_config
   STATE_LOADED=0
-  say "Berhasil: domain NS = ${ns}"
+  say "Berhasil: domain NS SSH = ${ns}"
   cmd_records
 }
 
@@ -29500,7 +29500,7 @@ cmd_status() {
   else
     printf '%-14s: %s\n' "SlowDNS" "NONAKTIF"
   fi
-  printf '%-14s: %s\n' "NS" "${NS:--}"
+  printf '%-14s: %s\n' "NS SSH" "${NS:--}"
   printf '%-14s: %s\n' "Pubkey" "${pub}"
   if [[ -n "${ip}" ]]; then ip="${ip}:${PUBLIC_PORT}"; else ip="-"; fi
   printf '%-14s: %s\n' "DNS" "${ip}"
@@ -38517,9 +38517,9 @@ slowdns_enable_menu() {
   local bin="$1" ns def_ns ans
   def_ns="${SLOWDNS_NS_DOMAIN:-}"
   [[ -n "${def_ns}" ]] || def_ns="$("${bin}" suggest 2>/dev/null || true)"
-  echo "Domain NS = subdomain khusus yang didelegasikan ke VPS ini (jangan sama dengan ${DOMAIN:-domain utama})."
+  echo "Domain NS SSH = subdomain khusus yang didelegasikan ke VPS ini (jangan sama dengan ${DOMAIN:-domain utama})."
   echo "Usulan: ${def_ns:-ns-...}. Kosongkan = pakai usulan, 'batal' = kembali."
-  if ! prompt_input ns "Domain NS [${def_ns}]: "; then
+  if ! prompt_input ns "Domain NS SSH [${def_ns}]: "; then
     return 0
   fi
   [[ "${ns,,}" == "batal" ]] && return 0
@@ -38827,7 +38827,7 @@ slowdns_screen() {
   ui_kv_text "BINARY" "${SLOWDNS_BRIEF[BINARY]:-belum terpasang}"
 
   dasar=("$(slowdns_on_off "${SLOWDNS_ENABLE:-0}" "1) Nonaktifkan SlowDNS" "1) Aktifkan SlowDNS")"
-         "2) Ganti Domain NS" "3) Cek Delegasi NS" "5) Record DNS (panduan)")
+         "2) Ganti Domain NS SSH" "3) Cek Delegasi Semua NS" "5) Record DNS (panduan)")
   xray=("$(slowdns_on_off "${SLOWDNS_XRAY_ENABLE:-0}" "10) Matikan SlowDNS Xray" "10) Aktifkan SlowDNS Xray")"
         "11) Ganti Domain NS Xray"
         "$(slowdns_on_off "${SLOWDNS_SSH_ENABLE:-1}" "12) Matikan SlowDNS SSH" "12) Aktifkan SlowDNS SSH")")
@@ -38879,8 +38879,9 @@ set_slowdns_menu() {
       fi
       ;;
     2)
-      echo "Domain NS sekarang: ${SLOWDNS_NS_DOMAIN:--}"
-      if prompt_input ns "Domain NS baru (kosong = batal): " && [[ -n "${ns}" ]]; then
+      echo "Domain NS SSH sekarang : ${SLOWDNS_NS_DOMAIN:--}"
+      echo "Domain NS Xray (tetap) : ${SLOWDNS_XRAY_NS_DOMAIN:--} (ganti lewat pilihan 11)"
+      if prompt_input ns "Domain NS SSH baru (kosong = batal): " && [[ -n "${ns}" ]]; then
         "${bin}" set-ns "${ns}" 2>&1 | ui_fx || true
       fi
       ;;
@@ -38905,7 +38906,8 @@ set_slowdns_menu() {
       fi
       ;;
     11)
-      echo "Domain NS Xray sekarang: ${SLOWDNS_XRAY_NS_DOMAIN:--}"
+      echo "Domain NS Xray sekarang : ${SLOWDNS_XRAY_NS_DOMAIN:--}"
+      echo "Domain NS SSH (tetap)   : ${SLOWDNS_NS_DOMAIN:--} (ganti lewat pilihan 2)"
       echo "Peringatan: service SlowDNS di-restart sekali; pengguna tersambung ulang otomatis."
       if prompt_input ns "Domain NS Xray baru (kosong = batal): " && [[ -n "${ns}" ]]; then
         "${bin}" set-xray-ns "${ns}" 2>&1 | ui_fx || true

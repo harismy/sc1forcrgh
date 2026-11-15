@@ -636,7 +636,8 @@ echo "RESULT m=\${m} rc=\${rc} reads=\${READ_LOG} ticks=\${TICKS} live=\${DASH_L
           for (const n of ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '0']) {
             assert(new RegExp(`(^|\\s)${n}\\) `).test(text), `pilihan ${n}) wajib tampil cols=${cols}`);
           }
-          for (const want of ['STATUS   › AKTIF', 'langsung ON', 'batch 16', '12 akun SSH', 'OFF layanan', '[ LANJUTAN ]']) {
+          for (const want of ['STATUS   › AKTIF', 'langsung ON', 'batch 16', '12 akun SSH', 'OFF layanan', '[ LANJUTAN ]',
+            '2) Ganti Domain NS SSH', '11) Ganti Domain NS Xray', 'NS SSH   ›', 'NS XRAY  ›']) {
             assert(text.includes(want), `layar SlowDNS memuat ${want} (cols=${cols}):\n${text}`);
           }
           assert(lines.includes(` Pubkey: ${'ab'.repeat(32)}`), 'pubkey utuh di luar kotak supaya bisa disalin');

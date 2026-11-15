@@ -848,7 +848,7 @@ try {
     r = run('brief');
     assert.strictEqual(r.status, 0, r.out);
     for (const want of ['ENABLED=1', 'SERVICE=active', 'NS=ns-sg1.contoh.net', 'SSH_STATE=ON', 'XRAY_STATE=OFF',
-      'DNS=203.0.113.7:53', 'DIRECT=ON', 'BATCH=0', 'AUTOLOCK=ON']) {
+      'DNS=1.1.1.1 / 8.8.8.8 (bebas)', 'DIRECT=ON', 'BATCH=0', 'AUTOLOCK=ON']) {
       assert(r.out.split('\n').includes(want), `brief wajib memuat ${want}:\n${r.out}`);
     }
     assert(/^PUBKEY=[0-9a-f]{64}$/m.test(r.out) && /^BINARY=v1\.20260501\.0\+sc-fast13$/m.test(r.out), r.out);
@@ -1026,7 +1026,11 @@ function payload(stateText, toggles = {}) {
 }
 const goodState = ['ENABLED=1', 'ACTIVE=1', 'RULES=1', 'NS=ns-sg1.contoh.net', `PUBKEY=${'ab'.repeat(32)}`, 'PUBLIC_IP=203.0.113.7'].join('\n');
 let p = payload(goodState);
-assert.strictEqual(JSON.stringify(p.slowdns), JSON.stringify({ ns: 'ns-sg1.contoh.net', pubkey: 'ab'.repeat(32), dns: '203.0.113.7:53' }));
+// DNS untuk aplikasi = resolver publik, bukan IP VPS:53 (V.1FSC.138).
+assert.strictEqual(JSON.stringify(p.slowdns), JSON.stringify({ ns: 'ns-sg1.contoh.net', pubkey: 'ab'.repeat(32), dns: '1.1.1.1 / 8.8.8.8 (bebas)' }));
+assert(!JSON.stringify(p).includes('203.0.113.7:53'), 'IP VPS:53 tidak lagi dikirim sebagai DNS aplikasi');
+assert.strictEqual((api.match(/const SLOWDNS_PUBLIC_DNS = '([^']+)'/) || [])[1], (helper.match(/^PUBLIC_DNS_HINT="([^"]+)"/m) || [])[1],
+  'teks DNS aplikasi di api.js sama dengan helper');
 assert.strictEqual(p.port.slowdns, '53');
 assert.strictEqual(payload(goodState, { SERVICE_SSH_ENABLE: '0' }).slowdns, undefined, 'SSH OFF: SlowDNS tidak diiklankan');
 for (const bad of [goodState.replace('ACTIVE=1', 'ACTIVE=0'), goodState.replace('RULES=1', 'RULES=0'),
@@ -1034,7 +1038,8 @@ for (const bad of [goodState.replace('ACTIVE=1', 'ACTIVE=0'), goodState.replace(
   p = payload(bad);
   assert(!('slowdns' in p) && !('slowdns' in p.port), `state tidak sehat tidak boleh mengiklankan SlowDNS: ${bad}`);
 }
-assert.strictEqual(payload(goodState.replace('PUBLIC_IP=203.0.113.7', 'PUBLIC_IP=')).slowdns.dns, '', 'IP tidak diketahui: DNS kosong');
+assert.strictEqual(payload(goodState.replace('PUBLIC_IP=203.0.113.7', 'PUBLIC_IP=')).slowdns.dns, '1.1.1.1 / 8.8.8.8 (bebas)',
+  'IP VPS tidak terdeteksi: DNS aplikasi tetap terisi');
 
 // ── API: SlowDNS Xray (V.1FSC.135) per protokol + link 1FTunnel ─────────────
 {
@@ -1048,7 +1053,7 @@ assert.strictEqual(payload(goodState.replace('PUBLIC_IP=203.0.113.7', 'PUBLIC_IP
   };
   const xState = goodState + '\nXRAY_NS=nsx-sg1.contoh.net\nROUTE_SSH=1\nROUTE_XRAY=1';
   const pub = 'ab'.repeat(32);
-  assert.strictEqual(JSON.stringify(xrayInfo(xState, 'vless').xray), JSON.stringify({ ns: 'nsx-sg1.contoh.net', pubkey: pub, dns: '203.0.113.7:53' }));
+  assert.strictEqual(JSON.stringify(xrayInfo(xState, 'vless').xray), JSON.stringify({ ns: 'nsx-sg1.contoh.net', pubkey: pub, dns: '1.1.1.1 / 8.8.8.8 (bebas)' }));
   assert.strictEqual(xrayInfo(xState, 'vless', { SERVICE_VLESS_ENABLE: '0' }).xray, null, 'VLESS OFF: SlowDNS Xray VLESS tidak diiklankan');
   assert(xrayInfo(xState, 'vmess', { SERVICE_VLESS_ENABLE: '0' }).xray, 'protokol lain tetap');
   assert.strictEqual(xrayInfo(xState.replace('ROUTE_XRAY=1', 'ROUTE_XRAY=0'), 'vless').xray, null, 'jalur Xray mati');

@@ -200,6 +200,24 @@ function assertLayout(text, title) {
     assert(msg.includes(`${label}:\n${vlink(value)}`), `link ${label} harus tampil:\n${msg}`);
   }
   assert(msg.includes('XHTTP    : /xhvless'), 'path XHTTP tampil di bagian koneksi');
+  assert(!/SlowDNS/.test(msg), 'tanpa data.slowdns jalur Xray: baris SlowDNS tidak tampil');
+
+  // SlowDNS Xray (V.1FSC.138): NS Xray, pubkey, DNS, dan link 1FTunnel ikut
+  // notif bot kalau API mengirimnya (jalur Xray aktif dan protokol ON).
+  const tlink = (tag) => `trojan://pass-3@sg1.contoh.com:80?type=${tag}#dewi`;
+  await A.notifyAccountEvent('create', 'trojan', {
+    username: 'dewi', password: 'pass-3', exp: ymdPlus(30), limitip: '1', quota: '0',
+    port: { tls: '443', none: '80', grpc: '443', slowdns: '53' }, path: { ws: '/trojan', upgrade: '/uptrojan' }, serviceName: 'trojan-grpc',
+    link: { tls: tlink('ws-tls'), none: tlink('ws'), grpc: tlink('grpc'), slowdns: tlink('ws&slowdns=nsx-sg1.contoh.com') },
+    slowdns: { ns: 'nsx-sg1.contoh.com', pubkey: 'cd'.repeat(32), dns: '1.1.1.1 / 8.8.8.8 (bebas)' }
+  }, owner);
+  const xs = takeCopyable()[0];
+  assertLayout(xs.text, 'AKUN TROJAN BARU');
+  assert(/SlowDNS NS\s*: nsx-sg1\.contoh\.com/.test(xs.text) && /SlowDNS Key\s*: (cd){32}\n/.test(xs.text),
+    `NS Xray dan pubkey tampil di notif Xray:\n${xs.text}`);
+  assert(/SlowDNS DNS\s*: 1\.1\.1\.1 \/ 8\.8\.8\.8 \(bebas\)/.test(xs.text), 'DNS aplikasi = resolver publik');
+  assert(xs.text.includes(`SlowDNS (1FTunnel):\n${tlink('ws&slowdns=nsx-sg1.contoh.com')}`), 'link SlowDNS 1FTunnel tampil');
+  assert(xs.codes.includes('nsx-sg1.contoh.com') && xs.codes.includes('cd'.repeat(32)), 'NS Xray & pubkey bisa disalin sekali sentuh');
 
   await A.notifyAccountEvent('delete', 'trojan', { username: 'citra', password: 'rahasia-jangan-tampil', exp: ymdPlus(5) }, owner);
   [{ text: msg, codes }] = takeCopyable();

@@ -218,7 +218,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.137}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.138}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -6969,7 +6969,7 @@ function isRenewLikeAction(action) {
 
 function accountXrayLinkBundle(service, account = {}) {
   const serviceText = normalizedXrayService(service);
-  if (!serviceText) return { tls: '', ntls: '', grpc: '', uptls: '', upntls: '', xhttptls: '', xhttpntls: '', onering: '' };
+  if (!serviceText) return { tls: '', ntls: '', grpc: '', uptls: '', upntls: '', xhttptls: '', xhttpntls: '', onering: '', slowdns: '' };
   const links = account.link && typeof account.link === 'object' ? account.link : {};
   let tls = accountFirstLinkValue(links.tls, links.ws_tls, links.uptls, links.bugtls, links.front_tls, links.bugtls_all, links.front_tls_all);
   let ntls = accountFirstLinkValue(links.none, links.ntls, links.ws_ntls, links.upntls, links.bugntls, links.front_none, links.bugntls_all, links.front_none_all);
@@ -7004,8 +7004,16 @@ function accountXrayLinkBundle(service, account = {}) {
     upntls: upntls || ntls,
     xhttptls: accountFirstLinkValue(links.xhttptls, links.xhttp_tls),
     xhttpntls: accountFirstLinkValue(links.xhttpntls, links.xhttp_ntls),
-    onering: accountFirstLinkValue(links.onering)
+    onering: accountFirstLinkValue(links.onering),
+    slowdns: accountFirstLinkValue(links.slowdns)
   };
+}
+
+// SlowDNS hanya ada kalau VPS mengaktifkannya (API mengirim account.slowdns):
+// jalur SSH untuk akun SSH, jalur Xray (NS kedua) untuk VMess/VLESS/Trojan.
+function accountSlowdnsInfo(account = {}) {
+  const info = account.slowdns && typeof account.slowdns === 'object' ? account.slowdns : null;
+  return info && notifyValue(info.ns, '') && notifyValue(info.pubkey, '') ? info : null;
 }
 
 function accountPathPart(account = {}, key = 'ws', fallback = '-') {
@@ -7032,10 +7040,7 @@ function formatSshCreateNotification(action, service, account = {}, owner = {}, 
   const ntlsPort = notifyPortValue(port, ['none', 'ntls', 'ws'], '80');
   const udpgw = notifyPortValue(port, ['udpgw'], Array.isArray(account.udpgw?.ports) ? account.udpgw.ports.join(',') : '');
   const udpCustom = notifyPortValue(port, ['udpcustom', 'udp_custom', 'udphc'], notifyValue(account.udpcustom_port || account.udp_custom_port, ''));
-  // SlowDNS hanya ada kalau VPS mengaktifkannya (API mengirim account.slowdns).
-  const slowdns = account.slowdns && typeof account.slowdns === 'object'
-    && notifyValue(account.slowdns.ns, '') && notifyValue(account.slowdns.pubkey, '')
-    ? account.slowdns : null;
+  const slowdns = accountSlowdnsInfo(account);
 
   return notifyMessage(isTrialAction(action, username) ? 'AKUN TRIAL SSH' : 'AKUN SSH BARU', [
     {
@@ -7104,6 +7109,8 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
   pushLink('XHTTP TLS', links.xhttptls);
   pushLink('XHTTP Non-TLS', links.xhttpntls);
   pushLink('OneRing (1FTunnel)', links.onering);
+  pushLink('SlowDNS (1FTunnel)', links.slowdns);
+  const slowdns = accountSlowdnsInfo(account);
 
   return notifyMessage(isTrialAction(action, username) ? `AKUN TRIAL ${title}` : `AKUN ${title} BARU`, [
     {
@@ -7128,6 +7135,9 @@ function formatXrayCreateNotification(action, service, account = {}, owner = {},
         notifyRow('Upgrade', accountPathPart(account, 'upgrade', `/up${serviceText}`)),
         links.xhttptls || links.xhttpntls ? notifyRow('XHTTP', accountPathPart(account, 'xhttp', '/xhvless')) : null,
         notifyRow('Service', notifyValue(account.serviceName || `${serviceText}-grpc`)),
+        slowdns ? notifyCopyRow('SlowDNS NS', notifyValue(slowdns.ns)) : null,
+        slowdns ? notifyCopyRow('SlowDNS Key', notifyValue(slowdns.pubkey)) : null,
+        slowdns ? notifyRow('SlowDNS DNS', notifyValue(slowdns.dns)) : null,
         notifyRow('Lokasi', notifyLocation(account, location))
       ]
     },
@@ -9410,6 +9420,11 @@ function udpcustomPublicPort() {
 // 30 detik. Hanya dikirim saat service dan aturan UDP 53 aktif dan layanan SSH
 // ON, jadi respons VPS tanpa SlowDNS tidak berubah sama sekali.
 const SLOWDNS_STATE_FILE = '/var/lib/sc-1forcr/slowdns.state';
+// DNS yang diisi pembeli di aplikasi (V.1FSC.138): resolver publik, bukan IP
+// VPS:53. Lewat resolver, query sampai ke VPS lewat delegasi NS, dan jalur ini
+// yang dipakai pembeli sehari-hari (operator sering memblok DNS ke IP lain).
+// Teks yang sama dipakai helper sc-1forcr-slowdns (status/brief).
+const SLOWDNS_PUBLIC_DNS = '1.1.1.1 / 8.8.8.8 (bebas)';
 let slowdnsCache = { at: 0, info: null, xray: null };
 // Jalur SSH: NS utama, ROUTE_SSH tidak 0. Jalur Xray (V.1FSC.135): XRAY_NS
 // dengan ROUTE_XRAY=1 (helper hanya menulis 1 kalau unit dnstt melayaninya).
@@ -9428,8 +9443,7 @@ function slowdnsState() {
       const pubkey = String(kv.PUBKEY || '').toLowerCase();
       const validNs = (d) => /^([a-z0-9-]+\.){2,}[a-z]{2,63}$/.test(d);
       if (kv.ENABLED === '1' && kv.ACTIVE === '1' && kv.RULES === '1' && /^[0-9a-f]{64}$/.test(pubkey)) {
-        const ip = /^\d{1,3}(\.\d{1,3}){3}$/.test(kv.PUBLIC_IP || '') ? kv.PUBLIC_IP : '';
-        const dns = ip ? `${ip}:53` : '';
+        const dns = SLOWDNS_PUBLIC_DNS;
         if (validNs(ns) && kv.ROUTE_SSH !== '0') info = { ns, pubkey, dns };
         if (kv.ROUTE_XRAY === '1' && validNs(xns) && xns !== ns) xray = { ns: xns, pubkey, dns };
       }
@@ -24781,6 +24795,8 @@ SVC_USER="sc-1forcr-slowdns"
 CHAIN="SC1FORCR_SLOWDNS"
 TAG="sc-slowdns"
 PUBLIC_PORT="53"
+# DNS yang diisi di aplikasi: resolver publik (sama dengan SLOWDNS_PUBLIC_DNS di api.js).
+PUBLIC_DNS_HINT="1.1.1.1 / 8.8.8.8 (bebas)"
 DNSTT_VERSION="v1.20260501.0"
 DNSTT_MODULE="www.bamsoftware.com/git/dnstt.git"
 # Checksum zip source module (proxy.golang.org) untuk versi di atas. Deps lain
@@ -29449,8 +29465,7 @@ cmd_brief() {
   else
     echo "XRAY_STATE=OFF"
   fi
-  state_val PUBLIC_IP
-  printf 'DNS=%s\n' "${REPLY:+${REPLY}:${PUBLIC_PORT}}"
+  printf 'DNS=%s\n' "${PUBLIC_DNS_HINT}"
   pubkey_val
   printf 'PUBKEY=%s\n' "${REPLY}"
   state_val DIRECT
@@ -29503,7 +29518,8 @@ cmd_status() {
   printf '%-14s: %s\n' "NS SSH" "${NS:--}"
   printf '%-14s: %s\n' "Pubkey" "${pub}"
   if [[ -n "${ip}" ]]; then ip="${ip}:${PUBLIC_PORT}"; else ip="-"; fi
-  printf '%-14s: %s\n' "DNS" "${ip}"
+  printf '%-14s: %s\n' "DNS (app)" "${PUBLIC_DNS_HINT}"
+  printf '%-14s: %s\n' "IP server" "${ip}"
   printf '%-14s: %s\n' "Jalur" "UDP ${PUBLIC_PORT} -> ${LISTEN} -> Dropbear 127.0.0.1:${TARGET_PORT}"
   state_val DIRECT
   if [[ -n "${REPLY}" ]]; then

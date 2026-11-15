@@ -24721,7 +24721,7 @@ install_slowdns_manager() {
   mkdir -p /usr/local/sbin /var/lib/sc-1forcr
   cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
 #!/usr/bin/env bash
-# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|brief|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}
 #
 # - set-direct : bind langsung UDP 53 tanpa conntrack/NAT per query (opt-in,
 #               butuh binary sc-fast13). "off" = rollback ke REDIRECT.
@@ -29422,6 +29422,67 @@ cmd_cpu_stat() {
   done
 }
 
+# Ringkasan untuk layar menu SlowDNS (KEY=VALUE, satu per baris). Isinya sama
+# dengan status, hanya yang perlu dipindai cepat; detail tetap di status.
+cmd_brief() {
+  load_config
+  printf 'ENABLED=%s\n' "${ENABLED}"
+  if systemctl is-active --quiet "${SERVICE}" 2>/dev/null; then echo "SERVICE=active"; else echo "SERVICE=inactive"; fi
+  printf 'NS=%s\n' "${NS}"
+  if (( ROUTE_SSH )); then
+    echo "SSH_STATE=ON"
+  elif (( SSH_ROUTE_ENABLED )); then
+    echo "SSH_STATE=OFF_SVC"
+  else
+    echo "SSH_STATE=OFF"
+  fi
+  printf 'XRAY_NS=%s\n' "${XRAY_NS}"
+  if (( XRAY_ENABLED )) && [[ -n "${XRAY_NS}" ]]; then
+    state_val ROUTE_XRAY
+    if [[ "${REPLY}" == "1" ]]; then
+      echo "XRAY_STATE=ON"
+    elif (( ROUTE_XRAY == 0 )); then
+      echo "XRAY_STATE=OFF_SVC"
+    else
+      echo "XRAY_STATE=WAIT_BIN"
+    fi
+  else
+    echo "XRAY_STATE=OFF"
+  fi
+  state_val PUBLIC_IP
+  printf 'DNS=%s\n' "${REPLY:+${REPLY}:${PUBLIC_PORT}}"
+  pubkey_val
+  printf 'PUBKEY=%s\n' "${REPLY}"
+  state_val DIRECT
+  if [[ -n "${REPLY}" ]]; then
+    echo "DIRECT=ON"
+  elif (( DIRECT_WANT )); then
+    echo "DIRECT=WAIT"
+  else
+    echo "DIRECT=OFF"
+  fi
+  udp_batch_val
+  printf 'BATCH=%s\n' "${REPLY}"
+  first_line "${BIN}.version" || true
+  printf 'BINARY=%s\n' "${REPLY}"
+  env_val SLOWDNS_AUTO_LOCK_ENABLE
+  if ! flag_on "${REPLY:-1}"; then
+    echo "AUTOLOCK=OFF"
+  else
+    env_val IPLIMIT_AUTO_LOCK_ENABLE
+    if flag_on "${REPLY:-1}"; then echo "AUTOLOCK=ON"; else echo "AUTOLOCK=OFF_GLOBAL"; fi
+  fi
+  # Data online hanya diambil saat SlowDNS aktif (butuh ss + tracker).
+  if (( ENABLED == 1 )); then
+    collect_online
+    if (( ONLINE_AVAILABLE )); then
+      printf 'ONLINE_SSH=%s\nONLINE_SSH_CONN=%s\n' "${ONLINE_USERS}" "${ONLINE_CONNECTIONS}"
+      if (( ONLINE_X_ENABLED )); then printf 'ONLINE_XRAY=%s\n' "${ONLINE_X_USERS}"; fi
+    fi
+  fi
+  return 0
+}
+
 cmd_status() {
   local svc="tidak jalan" rules="BELUM" ip version pub ack
   load_config
@@ -29577,6 +29638,7 @@ case "${1:-status}" in
   regen-key) acquire_lock; cmd_regen_key ;;
   set-key) acquire_lock; cmd_set_key ;;
   status) cmd_status ;;
+  brief) cmd_brief ;;
   online) cmd_online ;;
   sessions) cmd_sessions "${2:-1}" ;;
   set-lock) acquire_lock; cmd_set_lock "${2:-}" ;;
@@ -29598,7 +29660,7 @@ case "${1:-status}" in
   info) cat "${STATE_FILE}" 2>/dev/null || true ;;
   clear) acquire_lock; cmd_clear ;;
   *)
-    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|online|sessions [2|3]|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}"
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|brief|online|sessions [2|3]|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}"
     exit 1
     ;;
 esac
@@ -38648,6 +38710,155 @@ slowdns_key_menu() {
   return 0
 }
 
+# Layar SlowDNS (V.1FSC.136): satu kotak status ringkas + menu berkelompok.
+# Dulu status lengkap (±22 baris), keterangan, dan 13 pilihan polos dicetak
+# berurutan (±40 baris). Nomor pilihan sengaja tidak berubah supaya panduan
+# lama tetap benar; status lengkap pindah ke pilihan 14.
+declare -gA SLOWDNS_BRIEF=()
+
+slowdns_brief_load() {
+  local bin="$1" key val
+  SLOWDNS_BRIEF=()
+  while IFS='=' read -r key val; do
+    if [[ "${key}" =~ ^[A-Z_]+$ ]]; then SLOWDNS_BRIEF["${key}"]="${val}"; fi
+  done < <("${bin}" brief 2>/dev/null || true)
+  return 0
+}
+
+# Baris NS: domain (dipotong agar muat) + status jalur berwarna.
+slowdns_kv_ns() {
+  local label="$1" ns="$2" state="$3" tag room
+  case "${state}" in
+    ON) tag="${UI_OK}${UI_BOLD}ON${UI_NC}" ;;
+    OFF_SVC) tag="${UI_WARN}OFF layanan${UI_NC}" ;;
+    WAIT_BIN) tag="${UI_WARN}tunggu binary${UI_NC}" ;;
+    *) tag="${UI_MUTED}OFF${UI_NC}" ;;
+  esac
+  if [[ -z "${ns}" ]]; then
+    ui_kv "${label}" "${UI_MUTED}-${UI_NC}"
+    return 0
+  fi
+  ui_width "${tag}"
+  room=$(( UI_IW - 2 - 11 - 2 - UI_W ))
+  if (( room < 8 )); then room=8; fi
+  ui_fit "${ns}" "${room}"
+  ui_kv "${label}" "${UI_VAL}${UI_OUT}${UI_NC}  ${tag}"
+}
+
+# Pilihan menu: dua kolom kalau semua pilihan muat (SLOWDNS_MENU_COLW > 0,
+# dihitung sekali untuk seluruh layar supaya semua kelompok seragam), satu
+# kolom di layar sempit (HP).
+SLOWDNS_MENU_COLW=0
+slowdns_menu_rows() {
+  local -a items=("$@")
+  local i colw="${SLOWDNS_MENU_COLW}" left
+  if (( colw > 0 )); then
+    for (( i = 0; i < ${#items[@]}; i += 2 )); do
+      menu_panel_item "${items[i]}"
+      left="${UI_OUT}"
+      ui_width "${items[i]}"
+      ui_pad "$(( colw + 2 - UI_W ))"
+      left+="${UI_TMP}"
+      if (( i + 1 < ${#items[@]} )); then
+        menu_panel_item "${items[i + 1]}"
+        left+="${UI_OUT}"
+      fi
+      ui_row "${left}"
+    done
+  else
+    for i in "${items[@]}"; do
+      menu_panel_item "${i}"
+      ui_row "${UI_OUT}"
+    done
+  fi
+  return 0
+}
+
+# Label pilihan ON/OFF: $1 = nilai env, $2 = label saat ON, $3 = saat OFF.
+slowdns_on_off() {
+  if [[ "$(normalize_bool_01 "$1")" == "1" ]]; then printf '%s' "$2"; else printf '%s' "$3"; fi
+}
+
+slowdns_screen() {
+  local bin="$1" st online="" cpu lock i
+  local -a dasar xray monitor lanjut
+  slowdns_brief_load "${bin}"
+  ui_layout
+  ui_line_top "SLOWDNS (DNS TUNNEL)"
+  if [[ "${SLOWDNS_BRIEF[ENABLED]:-0}" == "1" ]]; then
+    if [[ "${SLOWDNS_BRIEF[SERVICE]:-}" == "active" ]]; then
+      st="${UI_OK}${UI_BOLD}AKTIF${UI_NC}  ${UI_MUTED}service berjalan${UI_NC}"
+    else
+      st="${UI_BAD}${UI_BOLD}AKTIF${UI_NC}  ${UI_BAD}service tidak jalan${UI_NC}"
+    fi
+  else
+    st="${UI_MUTED}${UI_BOLD}NONAKTIF${UI_NC}"
+  fi
+  ui_kv "STATUS" "${st}"
+  slowdns_kv_ns "NS SSH" "${SLOWDNS_BRIEF[NS]:-}" "${SLOWDNS_BRIEF[SSH_STATE]:-OFF}"
+  slowdns_kv_ns "NS XRAY" "${SLOWDNS_BRIEF[XRAY_NS]:-}" "${SLOWDNS_BRIEF[XRAY_STATE]:-OFF}"
+  ui_kv_text "DNS" "${SLOWDNS_BRIEF[DNS]:--}"
+  if [[ -n "${SLOWDNS_BRIEF[ONLINE_SSH]:-}" ]]; then
+    online="${UI_VAL}${SLOWDNS_BRIEF[ONLINE_SSH]}${UI_NC} ${UI_MUTED}akun SSH${UI_NC}"
+    if [[ -n "${SLOWDNS_BRIEF[ONLINE_XRAY]:-}" ]]; then
+      ui_kv_parts "ONLINE" "${online}" "${UI_VAL}${SLOWDNS_BRIEF[ONLINE_XRAY]}${UI_NC} ${UI_MUTED}akun Xray${UI_NC}"
+    else
+      ui_kv_parts "ONLINE" "${online}" "${UI_MUTED}${SLOWDNS_BRIEF[ONLINE_SSH_CONN]:-0} koneksi${UI_NC}"
+    fi
+  elif [[ "${SLOWDNS_BRIEF[ENABLED]:-0}" == "1" ]]; then
+    ui_kv "ONLINE" "${UI_MUTED}belum terbaca${UI_NC}"
+  fi
+  case "${SLOWDNS_BRIEF[AUTOLOCK]:-ON}" in
+    ON) lock="${UI_OK}ON${UI_NC}  ${UI_MUTED}ikut limit akun SSH${UI_NC}" ;;
+    OFF_GLOBAL) lock="${UI_WARN}OFF${UI_NC}  ${UI_MUTED}saklar global mati${UI_NC}" ;;
+    *) lock="${UI_MUTED}OFF${UI_NC}" ;;
+  esac
+  ui_kv "LOCK" "${lock}"
+  case "${SLOWDNS_BRIEF[DIRECT]:-OFF}" in
+    ON) cpu="${UI_OK}langsung ON${UI_NC}" ;;
+    WAIT) cpu="${UI_WARN}langsung belum aktif${UI_NC}" ;;
+    *) cpu="${UI_MUTED}langsung OFF${UI_NC}" ;;
+  esac
+  if [[ "${SLOWDNS_BRIEF[BATCH]:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    ui_kv_parts "CPU" "${cpu}" "${UI_OK}batch ${SLOWDNS_BRIEF[BATCH]}${UI_NC}"
+  else
+    ui_kv_parts "CPU" "${cpu}" "${UI_MUTED}batch OFF${UI_NC}"
+  fi
+  ui_kv_text "BINARY" "${SLOWDNS_BRIEF[BINARY]:-belum terpasang}"
+
+  dasar=("$(slowdns_on_off "${SLOWDNS_ENABLE:-0}" "1) Nonaktifkan SlowDNS" "1) Aktifkan SlowDNS")"
+         "2) Ganti Domain NS" "3) Cek Delegasi NS" "5) Record DNS (panduan)")
+  xray=("$(slowdns_on_off "${SLOWDNS_XRAY_ENABLE:-0}" "10) Matikan SlowDNS Xray" "10) Aktifkan SlowDNS Xray")"
+        "11) Ganti Domain NS Xray"
+        "$(slowdns_on_off "${SLOWDNS_SSH_ENABLE:-1}" "12) Matikan SlowDNS SSH" "12) Aktifkan SlowDNS SSH")")
+  monitor=("6) Log SlowDNS" "7) Akun Online" "14) Status Lengkap")
+  lanjut=("4) Kunci / Pubkey"
+          "$(slowdns_on_off "${SLOWDNS_AUTO_LOCK_ENABLE:-1}" "8) Matikan Auto-lock" "8) Aktifkan Auto-lock")"
+          "9) Uji KCP" "13) Hemat CPU")
+  SLOWDNS_MENU_COLW=$(( (UI_IW - 4) / 2 ))
+  for i in "${dasar[@]}" "${xray[@]}" "${monitor[@]}" "${lanjut[@]}"; do
+    ui_width "${i}"
+    if (( UI_W > SLOWDNS_MENU_COLW )); then SLOWDNS_MENU_COLW=0; break; fi
+  done
+  ui_line_sep "DASAR"
+  slowdns_menu_rows "${dasar[@]}"
+  ui_line_sep "XRAY / JALUR"
+  slowdns_menu_rows "${xray[@]}"
+  ui_line_sep "MONITOR"
+  slowdns_menu_rows "${monitor[@]}"
+  ui_line_sep "LANJUTAN"
+  slowdns_menu_rows "${lanjut[@]}"
+  ui_line_sep
+  slowdns_menu_rows "0) Kembali"
+  ui_line_bot
+  # Pubkey dicetak utuh di luar kotak supaya bisa disalin.
+  if [[ -n "${SLOWDNS_BRIEF[PUBKEY]:-}" ]]; then
+    echo " Pubkey: ${SLOWDNS_BRIEF[PUBKEY]}"
+  fi
+  echo " Di app: Type NULL, isi NS + Pubkey + DNS dari detail akun."
+  return 0
+}
+
 set_slowdns_menu() {
   local bin="/usr/local/sbin/sc-1forcr-slowdns" choice ns ans
   if [[ ! -x "${bin}" ]]; then
@@ -38655,45 +38866,8 @@ set_slowdns_menu() {
     return 0
   fi
   safe_source_env_file /etc/sc-1forcr.env
-  draw_menu_header "SLOWDNS (DNS TUNNEL)"
-  "${bin}" status | ui_fx
-  echo
-  echo "SlowDNS = SSH (dan Xray) lewat query DNS: tetap konek di jaringan yang cuma buka DNS."
-  echo "Syarat: buat record NS di DNS domain -> VPS ini (pilih menu 5 untuk panduannya)."
-  echo "Di app: pilih Type NULL, isi NS + Pubkey + DNS dari detail akun, akun SSH biasa."
-  echo "SlowDNS Xray (menu 10): NS kedua, untuk VMess/VLESS/Trojan lewat aplikasi 1FTunnel."
-  echo
-  if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
-    echo "1) Nonaktifkan SlowDNS"
-  else
-    echo "1) Aktifkan SlowDNS"
-  fi
-  echo "2) Ganti Domain NS"
-  echo "3) Cek Delegasi NS"
-  echo "4) Kunci SlowDNS (buat baru / pasang sendiri)"
-  echo "5) Lihat Record DNS yang Dibutuhkan"
-  echo "6) Lihat Log SlowDNS"
-  echo "7) Lihat Akun Online SlowDNS"
-  if [[ "$(normalize_bool_01 "${SLOWDNS_AUTO_LOCK_ENABLE:-1}")" == "1" ]]; then
-    echo "8) Nonaktifkan Auto-lock SlowDNS"
-  else
-    echo "8) Aktifkan Auto-lock SlowDNS"
-  fi
-  echo "9) Uji CPU KCP (interval/ACK)"
-  if [[ "$(normalize_bool_01 "${SLOWDNS_XRAY_ENABLE:-0}")" == "1" ]]; then
-    echo "10) Nonaktifkan SlowDNS Xray"
-  else
-    echo "10) Aktifkan SlowDNS Xray (VMess/VLESS/Trojan)"
-  fi
-  echo "11) Ganti Domain NS Xray"
-  if [[ "$(normalize_bool_01 "${SLOWDNS_SSH_ENABLE:-1}")" == "1" ]]; then
-    echo "12) Nonaktifkan SlowDNS SSH (Xray tetap jalan)"
-  else
-    echo "12) Aktifkan SlowDNS SSH"
-  fi
-  echo "13) Hemat CPU (bind langsung UDP 53 / batch UDP / ukur CPU)"
-  echo "0) Kembali"
-  if ! prompt_input choice "Pilih [0-13]: "; then
+  slowdns_screen "${bin}"
+  if ! prompt_input choice "Pilih [0-14]: "; then
     return 0
   fi
   case "${choice}" in
@@ -38745,6 +38919,7 @@ set_slowdns_menu() {
       fi
       ;;
     13) slowdns_perf_menu "${bin}" ;;
+    14) "${bin}" status | ui_fx || true ;;
     *) return 0 ;;
   esac
   safe_source_env_file /etc/sc-1forcr.env

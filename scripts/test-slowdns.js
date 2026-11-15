@@ -844,6 +844,14 @@ try {
     r = run('set-direct', 'on');
     assert.strictEqual(r.status, 0, r.out);
     assert(/Berhasil: bind langsung AKTIF di 203\.0\.113\.7/.test(r.out), r.out);
+    // Ringkasan untuk layar menu SlowDNS (KEY=VALUE).
+    r = run('brief');
+    assert.strictEqual(r.status, 0, r.out);
+    for (const want of ['ENABLED=1', 'SERVICE=active', 'NS=ns-sg1.contoh.net', 'SSH_STATE=ON', 'XRAY_STATE=OFF',
+      'DNS=203.0.113.7:53', 'DIRECT=ON', 'BATCH=0', 'AUTOLOCK=ON']) {
+      assert(r.out.split('\n').includes(want), `brief wajib memuat ${want}:\n${r.out}`);
+    }
+    assert(/^PUBKEY=[0-9a-f]{64}$/m.test(r.out) && /^BINARY=v1\.20260501\.0\+sc-fast13$/m.test(r.out), r.out);
     // Binary lama (tanpa -udp beberapa alamat): unit tidak berubah, status menjelaskan.
     installFakeDnstt();
     r = run('setup');

@@ -601,6 +601,58 @@ echo "RESULT m=\${m} rc=\${rc} reads=\${READ_LOG} ticks=\${TICKS} live=\${DASH_L
     mainLoop.indexOf('menu_rc == 200') < mainLoop.indexOf('menu_rc != 0'),
     'a real terminal resize must redraw the full menu (not be treated as cancel)');
 
+  // Layar SlowDNS (V.1FSC.136): satu kotak status + menu berkelompok, nomor
+  // pilihan sama dengan versi lama, dua kolom di layar lebar, satu di HP.
+  {
+    const sdStart = menuRuntime.indexOf('\n# Layar SlowDNS (V.1FSC.136)');
+    const sdBlock = menuRuntime.slice(sdStart, menuRuntime.indexOf('\nset_slowdns_menu() {', sdStart));
+    const nbStart = menuRuntime.indexOf('\nnormalize_bool_01() {');
+    const nbBlock = menuRuntime.slice(nbStart, menuRuntime.indexOf('\n}\n', nbStart)) + '\n}\n';
+    assert(sdStart > 0 && nbStart > 0, 'fungsi layar SlowDNS ada di menu');
+    const fakeBin = path.join(tmpDir, 'sc-1forcr-slowdns');
+    fs.writeFileSync(fakeBin, `#!/bin/bash\n[[ "$1" == brief ]] || exit 1\ncat <<'X'\nENABLED=1\nSERVICE=active\n` +
+      'NS=ns-id2.contoh-domain-yang-cukup-panjang.example.net\nSSH_STATE=ON\nXRAY_NS=nsx-id2.example.net\nXRAY_STATE=OFF_SVC\n' +
+      `DNS=203.0.113.10:53\nPUBKEY=${'ab'.repeat(32)}\nDIRECT=ON\nBATCH=16\nBINARY=v1.20260501.0+sc-fast13\nAUTOLOCK=ON\n` +
+      'ONLINE_SSH=12\nONLINE_SSH_CONN=15\nONLINE_XRAY=3\nX\n');
+    fs.chmodSync(fakeBin, 0o755);
+    for (const mode of ['truecolor', 'none']) {
+      for (const locale of ['C', 'C.UTF-8']) {
+        for (const cols of [44, 62, 80]) {
+          const colorFile = path.join(tmpDir, `color-sd-${mode}`);
+          fs.writeFileSync(colorFile, `${mode}\n`);
+          const script = path.join(tmpDir, 'render-sd.sh');
+          fs.writeFileSync(script, `set -euo pipefail\n${engine}\n${nbBlock}\n${sdBlock}\nclear() { :; }\n` +
+            `MENU_COLOR_FILE='${toBashPath(colorFile)}'\nMENU_COLS=${cols}\nUI_MODE=''\nSLOWDNS_ENABLE=1\n` +
+            `slowdns_screen '${toBashPath(fakeBin)}'\n`);
+          const r = spawnSync(bash, [toBashPath(script)], { encoding: 'utf8', env: { ...process.env, LC_ALL: locale, LANG: locale } });
+          assert.strictEqual(r.status, 0, `layar SlowDNS gagal cols=${cols} mode=${mode} locale=${locale}:\n${r.stderr}`);
+          const lines = r.stdout.split('\n').filter((l) => l.length > 0).map(stripAnsi);
+          const frame = lines.filter((l) => /^ [╭│├╰]/.test(l));
+          const bw = Math.min(78, Math.max(40, cols - 2));
+          for (const line of frame) {
+            assert.strictEqual(Array.from(line).length, bw + 1, `bingkai SlowDNS miring cols=${cols} mode=${mode} locale=${locale}:\n${line}`);
+          }
+          const text = lines.join('\n');
+          for (const n of ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '0']) {
+            assert(new RegExp(`(^|\\s)${n}\\) `).test(text), `pilihan ${n}) wajib tampil cols=${cols}`);
+          }
+          for (const want of ['STATUS   › AKTIF', 'langsung ON', 'batch 16', '12 akun SSH', 'OFF layanan', '[ LANJUTAN ]']) {
+            assert(text.includes(want), `layar SlowDNS memuat ${want} (cols=${cols}):\n${text}`);
+          }
+          assert(lines.includes(` Pubkey: ${'ab'.repeat(32)}`), 'pubkey utuh di luar kotak supaya bisa disalin');
+          const twoCol = lines.some((l) => /1\) Nonaktifkan SlowDNS\s+2\) Ganti Domain NS/.test(l));
+          assert.strictEqual(twoCol, cols >= 62, `dua kolom hanya di layar lebar (cols=${cols})`);
+          assert(frame.length <= 30, `layar SlowDNS ringkas: ${frame.length} baris bingkai (cols=${cols})`);
+          if (mode === 'none') assert(!r.stdout.includes('\x1b['), 'mode none tanpa kode warna');
+        }
+      }
+    }
+    const setMenu = menuRuntime.slice(menuRuntime.indexOf('\nset_slowdns_menu() {'), menuRuntime.indexOf('\nset_menu_color_menu() {'));
+    assert(setMenu.includes('slowdns_screen "${bin}"') && setMenu.includes('Pilih [0-14]: ') &&
+      setMenu.includes('    14) "${bin}" status | ui_fx || true ;;') && !setMenu.includes('"${bin}" status | ui_fx\n  echo'),
+      'menu SlowDNS memakai layar ringkas; status lengkap di pilihan 14');
+  }
+
   console.log('menu ui tests passed');
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true });

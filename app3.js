@@ -13,6 +13,7 @@ const autoGoPay = require('./lib/autogopay');
 const { parseForeignBackupBuffer } = require('./lib/foreign-backup-parser');
 const serverMigration = require('./lib/server-migration');
 const vpsRebuild = require('./lib/vps-rebuild');
+const machineReset = require('./lib/machine-reset');
 const antiSales = require('./lib/anti-sales');
 const revenueReport = require('./lib/revenue-report');
 const godUpdateReport = require('./lib/god-update-report');
@@ -474,6 +475,7 @@ async function initDb() {
     updated_at INTEGER NOT NULL
   )`);
   await dbRun('CREATE INDEX IF NOT EXISTS idx_vps_rebuild_status ON vps_rebuild_jobs(status)').catch(() => {});
+  await machineReset.ensureMachineResetSchema({ run: dbRun, get: dbGet, all: dbAll });
   // Job yang ketinggalan (mis. bot mati lama) ditutup supaya tidak dipoll selamanya.
   await dbRun(
     "UPDATE vps_rebuild_jobs SET status='timeout', note=COALESCE(note,'')||' (ditutup saat start)', finished_at=?, updated_at=? WHERE status='running' AND started_at < ?",
@@ -3326,7 +3328,7 @@ function mainMenu() {
     [coloredButton('Top Up Saldo', 'm_topup_saldo', 'success'), coloredButton('Cek Saldo', 'm_cek_saldo', 'success')],
     [Markup.button.callback('Link Instalasi', 'm_install_link'), Markup.button.callback('Fitur SC 1FORCR NEXUS', 'm_sc_features')],
     [Markup.button.callback('Migrasi Akun', 'm_migrate_accounts'), Markup.button.callback('Hapus Semua Akun', 'm_delete_all_accounts')],
-    [coloredButton('Rebuild VPS (Install Ulang OS)', 'm_rebuild_vps', 'danger')],
+    [coloredButton('Rebuild VPS (Install Ulang OS)', 'm_rebuild_vps', 'danger'), coloredButton('Reset Machine ID', 'm_reset_machine', 'danger')],
     [Markup.button.callback('Backup SC', 'm_backup_now'), Markup.button.callback('Restore SC', 'm_restore_upload')],
     [Markup.button.callback('Jadi Reseller', 'm_become_reseller'), Markup.button.callback('Grup SC 1FORCR', 'm_group_sc_1forcr')],
     [Markup.button.callback('Menu Admin', 'm_admin_menu')]
@@ -4311,7 +4313,7 @@ function licenseDenyHint(reasonInput) {
     return 'IP publik VPS berbeda dengan IP terdaftar. Ganti IP lewat menu "Ganti IP VPS".';
   }
   if (reason.includes('machine-id')) {
-    return 'Machine-id VPS berubah (VPS di-reinstall). Pakai "Reset Binding VPS", lalu jalankan installer lagi di VPS.';
+    return 'Machine-id VPS berubah (VPS di-reinstall). Pemilik bisa reset sendiri lewat menu "Reset Machine ID" dengan kode dari installer (maks 2x per 7 hari), atau admin pakai "Reset Binding VPS".';
   }
   if (reason.includes('expired') && !reason.includes('lease-grace-expired')) {
     return 'Masa aktif SC sudah habis. Perpanjang dulu, lalu buka kunci lagi.';
@@ -7938,7 +7940,7 @@ async function sendRebuildDoneNotif(job, uncertain) {
   lines.push(`Login sebagai <b>root</b> pakai password yang kamu masukkan tadi (port SSH ${job.ssh_port}).`);
   lines.push('');
   lines.push('Langkah berikutnya: install ulang SC 1FORCR di VPS ini dengan panduan di bawah.');
-  lines.push('Catatan: karena OS diganti, machine-id VPS berubah. Kalau installer menolak dengan alasan machine-id, pakai menu admin "Reset Binding VPS" lalu jalankan installer lagi.');
+  lines.push('Catatan: karena OS diganti, machine-id VPS berubah. Installer akan menampilkan kode reset 6 digit; buka menu "Reset Machine ID", pilih IP VPS ini, masukkan kodenya, lalu jalankan installer yang sama lagi.');
   lines.push('');
   const header = lines.join('\n');
   const body = guide && guide.text ? `${header}\n${guide.text}` : header;
@@ -8116,6 +8118,100 @@ bot.action('m_rebuild_forget', async (ctx) => {
   await finishRebuildJob(job.id, 'cancelled', 'stop pantau manual').catch(() => {});
   rebuildSecrets.delete(job.id);
   await ctx.reply(`Berhenti memantau rebuild VPS ${job.vps_ip}. Kamu bisa mulai rebuild baru kapan saja.`, mainMenu());
+});
+
+// ===== Reset Machine ID mandiri (setelah VPS di-rebuild) =====
+// Installer di VPS baru yang ditolak "machine-id berbeda" menampilkan kode 6
+// digit dari license API, terikat ke machine-id mesin itu. Pemilik registrasi
+// IP memasukkannya di sini; binding pindah ke mesin baru tanpa admin. Maks 2x
+// per 7 hari per IP (lib/machine-reset.js). Orang yang hanya memegang IP bekas
+// tidak bisa memakai kode karena IP itu bukan miliknya di bot.
+function machineResetWhen(ts) {
+  return ts ? formatDateTime(ts) : '-';
+}
+
+async function notifyAdminsMachineReset(ctx, ip, usage) {
+  const adminIds = Array.from(new Set(ADMIN_IDS.map((v) => Number(v || 0)).filter((v) => Number.isInteger(v) && v > 0)));
+  if (!adminIds.length) return;
+  const user = telegramUserInfoForAdmin(ctx.from, ctx.from && ctx.from.id);
+  const message = [
+    'RESET MACHINE ID MANDIRI',
+    `IP VPS: ${cleanNotifyText(ip, 64)}`,
+    `ID Telegram: ${user.id || '-'}`,
+    `Username: ${user.username}`,
+    `Nama: ${user.fullName}`,
+    `Sisa jatah 7 hari: ${usage ? usage.left : '-'} dari ${machineReset.RESET_LIMIT}`,
+    `Waktu: ${formatDateTime(Date.now())}`
+  ].join('\n');
+  for (const aid of adminIds) {
+    await bot.telegram.sendMessage(aid, message).catch(() => {});
+  }
+}
+
+bot.action('m_reset_machine', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const hosts = await listUserActiveRebuildHosts(ctx.from.id);
+  if (!hosts.length) {
+    return ctx.reply(
+      uiBox('RESET MACHINE ID', [
+        'Belum ada VPS aktif terdaftar atas namamu.',
+        'Reset hanya untuk IP VPS milikmu di bot ini.'
+      ]),
+      mainMenu()
+    );
+  }
+  const rows = hosts.map((h) => [Markup.button.callback(
+    h.client_name ? `${h.vps_ip} (${String(h.client_name).slice(0, 20)})` : h.vps_ip,
+    `m_rmid_ip_${h.vps_ip}`
+  )]);
+  rows.push([Markup.button.callback('Batal', 'm_rmid_cancel')]);
+  await ctx.reply(
+    uiBox('RESET MACHINE ID', [
+      'Dipakai setelah VPS di-rebuild / OS diinstal ulang,',
+      'saat installer menolak karena Machine ID berbeda.',
+      '',
+      'Jalankan dulu perintah install di VPS baru. Installer',
+      'menampilkan kode 6 digit untuk VPS itu.',
+      '',
+      `Batas: ${machineReset.RESET_LIMIT}x per 7 hari per IP.`,
+      '',
+      'Pilih IP VPS:'
+    ]),
+    Markup.inlineKeyboard(rows)
+  );
+});
+
+bot.action(/^m_rmid_ip_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  const ip = normalizeHost(ctx.match[1]);
+  const hosts = await listUserActiveRebuildHosts(ctx.from.id);
+  if (!isIpv4(ip) || !hosts.some((h) => normalizeHost(h.vps_ip) === ip)) {
+    return ctx.reply(`IP ${ip} tidak terdaftar aktif atas namamu.`, mainMenu());
+  }
+  const usage = await machineReset.machineResetUsage({ run: dbRun, get: dbGet, all: dbAll }, ip).catch(() => null);
+  if (usage && usage.left <= 0) {
+    return ctx.reply(
+      uiBox('RESET MACHINE ID', [
+        `Batas reset mandiri IP ${ip} sudah habis`,
+        `(${machineReset.RESET_LIMIT}x per 7 hari).`,
+        `Bisa lagi mulai: ${machineResetWhen(usage.nextAt)}`,
+        '',
+        'Kalau mendesak, hubungi admin.'
+      ]),
+      mainMenu()
+    );
+  }
+  userState.set(ctx.chat.id, { step: 'reset_machine_code', ip });
+  const lines = [`IP VPS: ${ip}`];
+  if (usage) lines.push(`Sisa jatah 7 hari: ${usage.left} dari ${machineReset.RESET_LIMIT}`);
+  lines.push('', 'Kirim kode 6 digit yang tampil di installer VPS ini.', 'Ketik "batal" untuk membatalkan.');
+  await ctx.reply(uiBox('RESET MACHINE ID', lines));
+});
+
+bot.action('m_rmid_cancel', async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  userState.delete(ctx.chat.id);
+  await ctx.reply('Reset Machine ID dibatalkan.', mainMenu());
 });
 
 bot.action('m_rebuild_vps', async (ctx) => {
@@ -8306,6 +8402,53 @@ bot.on('text', async (ctx) => {
         ]),
         mainMenu()
       );
+    }
+
+    if (state.step === 'reset_machine_code') {
+      const ip = normalizeHost(state.ip);
+      const code = text.replace(/\s+/g, '');
+      if (!/^\d{6}$/.test(code)) {
+        return ctx.reply('Kode harus 6 angka, sesuai yang tampil di installer. Atau ketik "batal".');
+      }
+      const owner = await getRegistrationStateByIp(ctx.from.id, ip, false).catch(() => null);
+      const active = owner && String(owner.status || '').toLowerCase() === 'active' &&
+        (!Number(owner.expires_at) || Number(owner.expires_at) > Date.now());
+      if (!active) {
+        userState.delete(ctx.chat.id);
+        return ctx.reply(`IP ${ip} tidak terdaftar aktif atas namamu. Reset dibatalkan.`, mainMenu());
+      }
+      const result = await machineReset.redeemMachineResetCode(
+        { run: dbRun, get: dbGet, all: dbAll },
+        { userId: ctx.from.id, ip, code }
+      );
+      if (result.ok) {
+        userState.delete(ctx.chat.id);
+        console.warn(`[license] reset machine-id mandiri ip=${ip} user=${ctx.from.id} sisa=${result.usage.left}`);
+        await notifyAdminsMachineReset(ctx, ip, result.usage);
+        return ctx.reply(
+          uiBox('RESET MACHINE ID BERHASIL', [
+            `IP VPS: ${ip}`,
+            '',
+            'Machine ID baru sudah terikat ke lisensi.',
+            'Jalankan lagi perintah install yang sama di VPS itu.',
+            '',
+            `Sisa jatah 7 hari: ${result.usage.left} dari ${machineReset.RESET_LIMIT}`
+          ]),
+          mainMenu()
+        );
+      }
+      const reasons = {
+        'no-code': 'Belum ada kode untuk IP ini. Jalankan perintah install di VPS dulu, lalu kirim kode yang tampil.',
+        expired: 'Kode sudah kedaluwarsa. Jalankan lagi perintah install di VPS untuk mendapat kode baru.',
+        'too-many-attempts': 'Terlalu banyak kode salah. Jalankan lagi perintah install di VPS untuk mendapat kode baru.',
+        limit: `Batas reset mandiri (${machineReset.RESET_LIMIT}x per 7 hari) sudah habis. Bisa lagi mulai ${machineResetWhen(result.usage && result.usage.nextAt)}.`,
+        'no-key': 'Data key VPS ini belum ada di bot. Hubungi admin.'
+      };
+      if (result.reason === 'wrong-code') {
+        return ctx.reply(`Kode salah. Sisa percobaan: ${result.attemptsLeft}. Kirim lagi kodenya, atau ketik "batal".`);
+      }
+      userState.delete(ctx.chat.id);
+      return ctx.reply(reasons[result.reason] || 'Reset gagal. Coba lagi dari menu Reset Machine ID.', mainMenu());
     }
 
     if (state.step === 'admin_srv_backup_password') {
@@ -8959,6 +9102,8 @@ bot.on('text', async (ctx) => {
       const result = await adminResetMachineBindingForIp(ip);
       userState.delete(ctx.chat.id);
       if (!result.changed) return ctx.reply(`Tidak ada binding/key yang diubah untuk ${ip}.`, adminMenu());
+      await machineReset.recordAdminMachineReset({ run: dbRun, get: dbGet, all: dbAll }, { userId: 0, ip, actorId: ctx.from.id })
+        .catch((e) => console.error(`[license-admin] riwayat reset gagal dicatat: ${e.message}`));
       console.warn(`[license-admin] machine binding reset and server key rotated ip=${ip} rows=${result.changed} actor=${ctx.from.id}`);
       return ctx.reply(
         `Reset binding dan rotasi key berhasil.\n` +

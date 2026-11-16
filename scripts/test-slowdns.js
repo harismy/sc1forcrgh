@@ -174,7 +174,7 @@ assert(bytesPy.includes('\npatch_session_bytes(mod)\n') &&
   assert(!/scRoute(SSH|Xray)On\b/.test(routePy), 'sc-fast12: saklar jalur memakai nilai nol = ON');
   // V.1FSC.136: hemat CPU per query (sc-fast13) setelah sc-fast12.
   const cpuPy = routePy.split('\npatch_xray_route(mod)\n')[1] || '';
-  assert(helper.includes('DNSTT_PATCH_ID="sc-fast13"') && cpuPy.includes('\npatch_cpu_saver(mod)\n') &&
+  assert(cpuPy.includes('\npatch_cpu_saver(mod)\n') &&
     cpuPy.includes("'sc_cpu.go'") && cpuPy.includes("'sc_batch_linux.go'") && cpuPy.includes("'sc_batch_other.go'") &&
     cpuPy.includes('case ch <- &record{resp, addr, clientID, size, dnsConn}:') && cpuPy.includes('scRecordDropped()') &&
     cpuPy.includes('rd := scNewPacketReader(dnsConn)') && cpuPy.includes('w := scNewPacketWriter()') &&
@@ -191,6 +191,14 @@ assert(bytesPy.includes('\npatch_session_bytes(mod)\n') &&
   for (const fmt of ['NXDOMAIN: not authoritative for %s', 'cannot parse DNS query: %v', 'WriteTo error: %v']) {
     assert(cpuPy.includes(fmt), `log per query dibatasi: ${fmt}`);
   }
+  // V.1FSC.139: kapasitas antrean jawaban (sc-fast14) setelah sc-fast13.
+  const queuePy = cpuPy.split('\npatch_cpu_saver(mod)\n')[1] || '';
+  assert(helper.includes('DNSTT_PATCH_ID="sc-fast14"') && queuePy.includes('\npatch_record_queue(mod)\n') &&
+    queuePy.includes("'sc_queue.go'") && queuePy.includes('make(chan *record, scRecordQueueCap())') &&
+    queuePy.includes("'\\tscRouteFlags()\\n\\tscQueueFlags()\\n\\tflag.Parse()\\n'") &&
+    queuePy.includes('flag.IntVar(&scRecordQueueFlag, "record-queue", 0,') &&
+    queuePy.includes('scRecordQueueDefault = 512') && queuePy.includes('scRecordQueueMax     = 8192'),
+    'patch sc-fast14 setelah sc-fast13: -record-queue mengganti kapasitas antrean tetap 100');
 }
 assert(helper.includes('XRAY_ROUTE="/vmess=127.0.0.1:10001,/vless=127.0.0.1:10002,/trojan=127.0.0.1:10003"') &&
   /bin_has_routes\(\) \{\n  bin_help\n  \[\[ "\$\{REPLY\}" == \*"-routes-file"\* \]\]/.test(helper) &&
@@ -758,7 +766,7 @@ try {
     r = run('setup');
     assert.strictEqual(r.status, 0, r.out);
     // Binary sc-fast13 tanpa fitur opsional: unit sama persis dengan versi lama.
-    assert(unitNow().includes(' -udp :5300 -privkey-file ') && !/Ambient|Capability|SLOWDNS_UDP_BATCH/.test(unitNow()), unitNow());
+    assert(unitNow().includes(' -udp :5300 -privkey-file ') && !/Ambient|Capability|SLOWDNS_UDP_BATCH|record-queue/.test(unitNow()), unitNow());
 
     // id2 (V.1FSC.135): jump kuota (92 rule owner) di posisi 1 di atas ACCEPT dnstt.
     fs.writeFileSync(F('rules4.filter'), ['OUTPUT -j SC_1FORCR_QUOTA_OUT', ...rules(4, 'filter')].join('\n') + '\n');
@@ -848,17 +856,17 @@ try {
     r = run('brief');
     assert.strictEqual(r.status, 0, r.out);
     for (const want of ['ENABLED=1', 'SERVICE=active', 'NS=ns-sg1.contoh.net', 'SSH_STATE=ON', 'XRAY_STATE=OFF',
-      'DNS=1.1.1.1 / 8.8.8.8 (bebas)', 'DIRECT=ON', 'BATCH=0', 'AUTOLOCK=ON']) {
+      'DNS=1.1.1.1 / 8.8.8.8 (bebas)', 'DIRECT=ON', 'BATCH=0', 'QUEUE=100', 'AUTOLOCK=ON']) {
       assert(r.out.split('\n').includes(want), `brief wajib memuat ${want}:\n${r.out}`);
     }
-    assert(/^PUBKEY=[0-9a-f]{64}$/m.test(r.out) && /^BINARY=v1\.20260501\.0\+sc-fast13$/m.test(r.out), r.out);
+    assert(/^PUBKEY=[0-9a-f]{64}$/m.test(r.out) && /^BINARY=v1\.20260501\.0\+sc-fast14$/m.test(r.out), r.out);
     // Binary lama (tanpa -udp beberapa alamat): unit tidak berubah, status menjelaskan.
     installFakeDnstt();
     r = run('setup');
     assert(unitNow().includes(' -udp :5300 ') && !unitNow().includes('Ambient'), unitNow());
     r = run('apply');
     assert.strictEqual(state().DIRECT, '', 'binary lama: tidak ada NOTRACK');
-    assert(/Bind langsung : BELUM AKTIF \(binary dnstt sc-fast13/.test(run('status').out));
+    assert(/Bind langsung : BELUM AKTIF \(binary dnstt sc-fast14/.test(run('status').out));
     // Batch UDP: hanya baris env, opt-in, rollback lewat set-batch off.
     fs.writeFileSync(dnsttBin, multiDnstt);
     setEnv(base);
@@ -876,6 +884,39 @@ try {
     }
     r = run('cpu-stat', 'x');
     assert(r.status !== 0 && /cpu-stat \[DETIK\] \[JENDELA\]/.test(r.out), r.out);
+
+    // Antrean jawaban (sc-fast14): flag hanya kalau binary mengenalnya.
+    const queueOf = () => (unitNow().match(/ -record-queue (\d+) /) || [])[1];
+    assert.strictEqual(queueOf(), undefined, 'binary tanpa -record-queue: unit tanpa flag');
+    assert(/Antrean jawab : 100 \(binary dnstt sc-fast14 belum terpasang\)/.test(run('status').out));
+    fs.writeFileSync(dnsttBin, multiDnstt.replace('echo "  -routes-file string" >&2;',
+      'echo "  -routes-file string" >&2; echo "  -record-queue int" >&2;'));
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+    assert(['512', '1024', '2048'].includes(queueOf()), `auto per tier: ${unitNow()}`);
+    assert(/-mtu 1232 -routes-file \S+ -record-queue \d+ ns-sg1\.contoh\.net 127\.0\.0\.1:109/.test(unitNow()), unitNow());
+    assert(mutatingSystemctl().includes('restart sc-1forcr-slowdns.service'), 'flag baru: restart sekali');
+    r = run('setup');
+    assert(!mutatingSystemctl().includes('restart'), 'setup ulang tanpa perubahan tidak me-restart');
+    r = run('set-queue', '2048');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.strictEqual(envValue('SLOWDNS_RECORD_QUEUE'), '2048');
+    assert.strictEqual(queueOf(), '2048');
+    assert(run('brief').out.split('\n').includes('QUEUE=2048'));
+    assert(/Antrean jawab : 2048 query \(manual\)/.test(run('status').out));
+    for (const bad of ['99', '8193', '1x', '', 'banyak']) {
+      assert.notStrictEqual(run('set-queue', bad).status, 0, `set-queue ${bad} harus ditolak`);
+      assert.strictEqual(envValue('SLOWDNS_RECORD_QUEUE'), '2048', 'input salah tidak menyentuh env');
+    }
+    // Nilai env rusak (diedit tangan) jatuh ke auto, bukan unit rusak.
+    setEnv({ ...base, SLOWDNS_RECORD_QUEUE: '99999999999999999999' });
+    r = run('setup');
+    assert.strictEqual(r.status, 0, r.out);
+    assert(['512', '1024', '2048'].includes(queueOf()), unitNow());
+    r = run('set-queue', 'auto');
+    assert.strictEqual(r.status, 0, r.out);
+    assert.strictEqual(envValue('SLOWDNS_RECORD_QUEUE'), 'auto');
+    assert(/Berhasil: antrean jawaban auto \((512|1024|2048) untuk VPS ini\)/.test(r.out), r.out);
     fs.rmSync(F('udp'), { force: true });
     installFakeDnstt();
     setEnv(base);
@@ -1146,7 +1187,7 @@ assert(/^setup_slowdns\(\) \{\n  install_slowdns_manager \|\| return 0\n[\s\S]*?
   'setup_slowdns tidak boleh menggagalkan install/update');
 const envKeys = ['SLOWDNS_ENABLE', 'SLOWDNS_NS_DOMAIN', 'SLOWDNS_LISTEN_PORT', 'SLOWDNS_MTU', 'SLOWDNS_MEMORY_MAX',
   'SLOWDNS_KCP_WINDOW', 'SLOWDNS_KCP_INTERVAL', 'SLOWDNS_KCP_ACK_NODELAY', 'SLOWDNS_DIRECT_BIND', 'SLOWDNS_UDP_BATCH',
-  'SLOWDNS_BIN_URL', 'SLOWDNS_BIN_SHA256',
+  'SLOWDNS_RECORD_QUEUE', 'SLOWDNS_BIN_URL', 'SLOWDNS_BIN_SHA256',
   'SLOWDNS_SSH_ENABLE', 'SLOWDNS_XRAY_ENABLE', 'SLOWDNS_XRAY_NS_DOMAIN'];
 const envDump = extract(installer, '\n  cat > /etc/sc-1forcr.env <<EOF\n', '\nEOF\n');
 const pending = extract(installer, '\npersist_pending_install_env() {', '\n}\n');
@@ -1156,7 +1197,7 @@ for (const key of envKeys) {
   assert(new RegExp(`\\b${key}\\b`).test(pending), `${key} wajib ada di persist_pending_install_env`);
   assert(menuUpdate.includes(`${key}="\${${key}:-`), `${key} wajib diteruskan update dari menu`);
 }
-for (const [key, def] of [['SLOWDNS_KCP_INTERVAL', '10'], ['SLOWDNS_KCP_ACK_NODELAY', '0'], ['SLOWDNS_DIRECT_BIND', '0'], ['SLOWDNS_UDP_BATCH', '0']]) {
+for (const [key, def] of [['SLOWDNS_KCP_INTERVAL', '10'], ['SLOWDNS_KCP_ACK_NODELAY', '0'], ['SLOWDNS_DIRECT_BIND', '0'], ['SLOWDNS_UDP_BATCH', '0'], ['SLOWDNS_RECORD_QUEUE', 'auto']]) {
   assert(installer.includes(`\n${key}="\${${key}:-${def}}"\n`), `${key} default ${def} di installer`);
   assert(menuUpdate.includes(`${key}="\${${key}:-${def}}"`), `${key} default ${def} saat update dari menu`);
 }
@@ -1169,6 +1210,7 @@ assert(kcpMenu.includes('"${bin}" set-kcp "${interval}" "${ack}"') && installer.
 const perfMenu = extract(installer, '\nslowdns_perf_menu() {', '\n}\n');
 assert(perfMenu.includes('"${bin}" set-direct off') && perfMenu.includes('"${bin}" set-direct on') &&
   perfMenu.includes('"${bin}" set-batch on') && perfMenu.includes('"${bin}" set-batch off') && perfMenu.includes('"${bin}" cpu-stat 60 10') &&
+  perfMenu.includes('"${bin}" set-queue "${ans,,}"') && perfMenu.includes('Pilih [0-4]: ') &&
   installer.includes('    13) slowdns_perf_menu "${bin}" ;;'), 'menu Tools > SlowDNS [13]: bind langsung, batch UDP, ukur CPU (dengan rollback)');
 const uninstall = extract(installer, '\n/usr/local/sbin/sc-1forcr-extra-ports clear', '\necho "Uninstall SC 1FORCR selesai');
 assert(uninstall.includes('/usr/local/sbin/sc-1forcr-slowdns clear') && uninstall.includes('rm -f /usr/local/sbin/sc-1forcr-slowdns'),

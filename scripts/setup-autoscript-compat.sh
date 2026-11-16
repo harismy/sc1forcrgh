@@ -97,6 +97,7 @@ set -euo pipefail
 #   SLOWDNS_KCP_ACK_NODELAY=0                   (opsional, 1=ACK KCP dikirim langsung; default 0)
 #   SLOWDNS_DIRECT_BIND=0                       (opsional, 1=dnstt bind langsung UDP 53 tanpa conntrack/NAT)
 #   SLOWDNS_UDP_BATCH=0                         (opsional, batch recvmmsg/sendmmsg: 0=mati, 2-64 paket)
+#   SLOWDNS_RECORD_QUEUE=auto                   (opsional, antrean jawaban DNS 100-8192; auto 512/1024/2048 per tier VPS)
 #   SLOWDNS_AUTO_LOCK_ENABLE=1                  (batas tunnel aktif mengikuti limit akun SSH; lock sementara 15 menit)
 #   SLOWDNS_SSH_ENABLE=1                        (jalur SSH SlowDNS; 0 = OFF tanpa restart, jalur Xray tetap)
 #   SLOWDNS_XRAY_ENABLE=0                       (1 = SlowDNS Xray lewat domain NS kedua, atur di menu Tools)
@@ -218,7 +219,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.138}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.139}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -288,6 +289,7 @@ SLOWDNS_KCP_INTERVAL="${SLOWDNS_KCP_INTERVAL:-10}"
 SLOWDNS_KCP_ACK_NODELAY="${SLOWDNS_KCP_ACK_NODELAY:-0}"
 SLOWDNS_DIRECT_BIND="${SLOWDNS_DIRECT_BIND:-0}"
 SLOWDNS_UDP_BATCH="${SLOWDNS_UDP_BATCH:-0}"
+SLOWDNS_RECORD_QUEUE="${SLOWDNS_RECORD_QUEUE:-auto}"
 SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}"
 SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}"
 SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}"
@@ -1744,6 +1746,58 @@ license_check_enabled() {
   esac
 }
 
+# Nilai satu kunci tingkat atas dari respons JSON server lisensi (jq kalau ada).
+license_resp_field() {
+  local resp="$1" key="$2" value=""
+  if command -v jq >/dev/null 2>&1; then
+    value="$(printf '%s' "${resp}" | jq -r --arg k "${key}" '.[$k] // empty | tostring' 2>/dev/null || true)"
+  else
+    value="$(printf '%s' "${resp}" | sed -nE "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"?([^\",}]*)\"?.*/\1/p" | head -n1 || true)"
+  fi
+  if [[ "${value}" == "null" ]]; then value=""; fi
+  printf '%s' "${value}"
+}
+
+# VPS di-rebuild / OS diinstal ulang: machine-id berubah dan aktivasi ditolak.
+# Server lisensi memberi kode 6 digit khusus mesin ini; pemilik registrasi IP
+# memasukkannya di bot (menu Reset Machine ID), lalu menjalankan installer yang
+# sama lagi. Kode tidak berguna bagi orang lain karena bot memeriksa pemilik IP.
+license_machine_reset_notice() {
+  local resp="$1" ip="$2" code mins bot left limit avail when=""
+  code="$(license_resp_field "${resp}" reset_code)"
+  mins="$(license_resp_field "${resp}" reset_expires_in_min)"
+  bot="$(license_resp_field "${resp}" reset_bot_url)"
+  left="$(license_resp_field "${resp}" resets_left)"
+  limit="$(license_resp_field "${resp}" reset_limit)"
+  avail="$(license_resp_field "${resp}" reset_available_at)"
+  if [[ ! "${bot}" =~ ^https://[A-Za-z0-9./_-]+$ ]]; then bot="https://t.me/sc1forcrnexusbot"; fi
+  if [[ ! "${limit}" =~ ^[0-9]+$ ]]; then limit="2"; fi
+  echo
+  echo "Install ditolak: Machine ID VPS ini berbeda dengan data lisensi di bot."
+  echo "Biasanya karena VPS baru di-rebuild atau OS diinstal ulang."
+  echo
+  if [[ "${code}" =~ ^[0-9]{6}$ ]]; then
+    echo "Reset sendiri di bot: ${bot}"
+    echo "  1. Buka menu \"Reset Machine ID\", pilih IP ${ip}"
+    echo "  2. Masukkan kode: ${code}"
+    echo "     (berlaku ${mins:-30} menit, hanya untuk VPS ini)"
+    echo "  3. Setelah berhasil, jalankan lagi perintah install yang sama."
+    if [[ "${left}" =~ ^[0-9]+$ ]]; then
+      echo "Sisa reset mandiri: ${left} dari ${limit} per 7 hari."
+    fi
+  else
+    echo "Batas reset mandiri (${limit}x per 7 hari) untuk IP ${ip} sudah habis."
+    if [[ "${avail}" =~ ^[0-9]{10,13}$ ]]; then
+      when="$(date -d "@$(( avail / 1000 ))" '+%d-%m-%Y %H:%M' 2>/dev/null || true)"
+    fi
+    if [[ -n "${when}" ]]; then
+      echo "Reset mandiri bisa lagi mulai ${when}."
+    fi
+    echo "Atau hubungi admin lewat bot: ${bot}"
+  fi
+  return 0
+}
+
 enforce_install_license() {
   local enabled vps_ip machine_id resp ok msg status expires bound_ip key_hash distribution client_name
   local license_candidate license_candidates
@@ -1857,6 +1911,10 @@ enforce_install_license() {
       ;;
     server-key-missing)
       echo "Install ditolak: perintah install tidak membawa key VPS. Ambil ulang perintah install dari bot."
+      exit 1
+      ;;
+    machine-id-mismatch)
+      license_machine_reset_notice "${resp}" "${vps_ip}"
       exit 1
       ;;
   esac
@@ -18735,6 +18793,7 @@ SLOWDNS_KEYS = (
     "SLOWDNS_NS_DOMAIN", "SLOWDNS_LISTEN_PORT", "SLOWDNS_MTU",
     "SLOWDNS_MEMORY_MAX", "SLOWDNS_KCP_WINDOW", "SLOWDNS_KCP_INTERVAL",
     "SLOWDNS_KCP_ACK_NODELAY", "SLOWDNS_DIRECT_BIND", "SLOWDNS_UDP_BATCH",
+    "SLOWDNS_RECORD_QUEUE",
     "SLOWDNS_GOMAXPROCS", "SLOWDNS_GOGC",
     "SLOWDNS_AUTO_LOCK_ENABLE", "SLOWDNS_SSH_ENABLE", "SLOWDNS_XRAY_ENABLE",
     "SLOWDNS_XRAY_NS_DOMAIN",
@@ -24735,11 +24794,13 @@ install_slowdns_manager() {
   mkdir -p /usr/local/sbin /var/lib/sc-1forcr
   cat > /usr/local/sbin/sc-1forcr-slowdns <<'SLOWDNS_EOF'
 #!/usr/bin/env bash
-# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|brief|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}
+# sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|brief|online|sessions|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|set-queue N/auto|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}
 #
 # - set-direct : bind langsung UDP 53 tanpa conntrack/NAT per query (opt-in,
 #               butuh binary sc-fast13). "off" = rollback ke REDIRECT.
 # - set-batch  : batch recvmmsg/sendmmsg (opt-in, Linux, binary sc-fast13).
+# - set-queue  : kapasitas antrean jawaban DNS (binary sc-fast14); auto = per
+#               tier VPS (512/1024/2048).
 # - cpu-stat   : ukur CPU dnstt per jendela (user/sys per jawaban, query/s,
 #               Udp snmp, conntrack, softirq). Read-only.
 #
@@ -24817,7 +24878,9 @@ DNSTT_ZIP_SHA256="e19ef0719ec5de95b5fc38f6ea36646a46e815e22c78b56f25a8dbb399866e
 # sc-fast13: hemat CPU per query (satu timer sendLoop, log per query dibatasi,
 # query dibuang dihitung), -udp beberapa alamat (bind langsung IP:53), dan
 # batch recvmmsg/sendmmsg opsional (SLOWDNS_UDP_BATCH).
-DNSTT_PATCH_ID="sc-fast13"
+# sc-fast14: kapasitas antrean jawaban lewat -record-queue (upstream tetap 100,
+# terbukti membuang ratusan sampai ribuan query per menit saat ramai).
+DNSTT_PATCH_ID="sc-fast14"
 GO_VERSION="go1.27.3"
 GO_SHA256_AMD64="65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
 GO_SHA256_ARM64="a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49"
@@ -25021,6 +25084,31 @@ kcp_window() {
   fi
 }
 
+# Kapasitas antrean jawaban (sc-fast14, query yang menunggu sendLoop). Upstream
+# 100 membuang query saat datang beruntun (id2: 700-3.700 query per menit di jam
+# ramai), dan resolver lalu mengulang. Antrean hanya berisi query (beberapa
+# ratus byte per entri, 2048 < 2 MB), jadi batasnya latensi, bukan RAM: query
+# di ujung antrean menunggu panjang antrean dibagi laju jawab, dan VPS dengan
+# core lebih sedikit menjawab lebih lambat. Tier sama dengan kcp_window.
+# Override SLOWDNS_RECORD_QUEUE (100..8192). Hasil di stdout.
+record_queue() {
+  local raw ram_kb cores
+  raw="$(env_get SLOWDNS_RECORD_QUEUE | tr -cd '0-9')"
+  if [[ -n "${raw}" ]] && (( ${#raw} <= 5 )) && (( 10#${raw} >= 100 && 10#${raw} <= 8192 )); then
+    printf '%s' "$((10#${raw}))"
+    return 0
+  fi
+  ram_kb="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || echo 0)"
+  cores="$(nproc 2>/dev/null || echo 1)"
+  if (( ${ram_kb:-0} >= 3600000 && ${cores:-1} >= 4 )); then
+    printf '2048'
+  elif (( ${ram_kb:-0} >= 1800000 && ${cores:-1} >= 2 )); then
+    printf '1024'
+  else
+    printf '512'
+  fi
+}
+
 # Interval KCP (ms) dan ACK langsung untuk uji CPU (patch sc-fast8). Default
 # 10 ms + ACK biasa = perilaku sc-fast7. Nilai di luar 10..50 atau rusak kembali
 # ke default; binary memvalidasi ulang dengan aturan yang sama. Hasil di REPLY
@@ -25179,6 +25267,12 @@ bin_help() {
 bin_has_multi_listen() {
   bin_help
   [[ "${REPLY}" == *"comma-separated"* ]]
+}
+
+# Binary sc-fast14: kapasitas antrean jawaban lewat -record-queue.
+bin_has_record_queue() {
+  bin_help
+  [[ "${REPLY}" == *"-record-queue"* ]]
 }
 
 # Argumen tambahan ExecStart -> REPLY. Flag Xray dipasang selama domain NS
@@ -28013,6 +28107,79 @@ func scPlatformBatchIO(net.PacketConn) scBatchIO { return nil }
 
 patch_cpu_saver(mod)
 
+
+# sc-fast14 (V.1FSC.139): kapasitas antrean jawaban lewat -record-queue.
+def patch_record_queue(mod):
+    path = os.path.join(mod, 'dnstt-server', 'main.go')
+    src = io.open(path, encoding='utf-8').read()
+    def replace(old, new):
+        nonlocal src
+        if src.count(old) != 1:
+            raise RuntimeError('queue anchor count %d: %r' % (src.count(old), old[:90]))
+        src = src.replace(old, new)
+    replace('\tch := make(chan *record, 100)\n', '\tch := make(chan *record, scRecordQueueCap())\n')
+    replace('\tscRouteFlags()\n\tflag.Parse()\n', '\tscRouteFlags()\n\tscQueueFlags()\n\tflag.Parse()\n')
+    io.open(path, 'w', encoding='utf-8', newline='\n').write(src)
+    io.open(os.path.join(mod, 'dnstt-server', 'sc_queue.go'), 'w', encoding='utf-8', newline='\n').write(r'''package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+)
+
+// Antrean jawaban (sc-fast14). recvLoop menaruh tiap query valid di kanal
+// record, lalu sendLoop (satu goroutine) menjawabnya berurutan. Upstream
+// memakai kapasitas tetap 100: query yang datang saat antrean penuh dibuang
+// (dihitung sejak sc-fast13), resolver mengulang, dan klien kehilangan paket.
+// Di id2 (2 vCPU, ~4.000 query/detik) itu 700-3.700 query per menit.
+//
+// Isi antrean hanya query (beberapa ratus byte per entri), jadi batasnya
+// latensi, bukan RAM: saat sendLoop tertinggal, query di ujung antrean
+// menunggu panjang antrean dibagi laju jawab. Installer mengisi -record-queue
+// per tier VPS; tanpa flag = scRecordQueueDefault.
+const (
+	scRecordQueueDefault = 512
+	scRecordQueueMin     = 100
+	scRecordQueueMax     = 8192
+)
+
+var scRecordQueueFlag int
+
+func scQueueFlags() {
+	flag.IntVar(&scRecordQueueFlag, "record-queue", 0,
+		fmt.Sprintf("capacity of the DNS answer queue (%d..%d, 0 = %d)",
+			scRecordQueueMin, scRecordQueueMax, scRecordQueueDefault))
+}
+
+// scClampRecordQueue: 0/negatif = bawaan, di luar batas = dijepit ke batas.
+func scClampRecordQueue(n int) int {
+	switch {
+	case n <= 0:
+		return scRecordQueueDefault
+	case n < scRecordQueueMin:
+		return scRecordQueueMin
+	case n > scRecordQueueMax:
+		return scRecordQueueMax
+	}
+	return n
+}
+
+// scRecordQueueCap dipanggil sekali di run().
+func scRecordQueueCap() int {
+	n := scClampRecordQueue(scRecordQueueFlag)
+	if scRecordQueueFlag > 0 && n != scRecordQueueFlag {
+		log.Printf("-record-queue %d di luar %d..%d; memakai %d",
+			scRecordQueueFlag, scRecordQueueMin, scRecordQueueMax, n)
+	}
+	log.Printf("antrean jawaban: kapasitas %d query", n)
+	return n
+}
+''')
+
+
+patch_record_queue(mod)
+
 SLOWDNS_PATCH_PY
   then
     rm -rf "${work}"
@@ -28100,6 +28267,9 @@ unit_content() {
   mem="$(memory_max)"
   route_args
   args="${REPLY}"
+  # Binary lama tidak mengenal -record-queue: flag hanya dipasang kalau -h
+  # memuatnya (build gagal saat update = unit dan binary lama tetap).
+  if bin_has_record_queue; then args+=" -record-queue $(record_queue)"; fi
   # Baris tambahan hanya muncul kalau fiturnya dipakai, jadi unit default sama
   # persis dengan versi sebelumnya (tanpa restart karena unit berubah).
   if bin_has_multi_listen; then
@@ -29388,6 +29558,39 @@ cmd_set_batch() {
   fi
 }
 
+# Kapasitas antrean jawaban: set-queue N (100..8192) atau auto (per tier).
+# Service di-restart lewat setup kalau unit berubah; gagal = nilai lama.
+cmd_set_queue() {
+  local want prev
+  case "${1:-}" in
+    auto|default|reset) want=auto ;;
+    *)
+      if [[ "${1:-}" =~ ^[0-9]{3,4}$ ]] && (( 10#$1 >= 100 && 10#$1 <= 8192 )); then
+        want="$((10#$1))"
+      else
+        die "Gunakan set-queue N (100-8192) atau set-queue auto"
+      fi
+      ;;
+  esac
+  env_val SLOWDNS_RECORD_QUEUE
+  prev="${REPLY}"
+  set_env_value SLOWDNS_RECORD_QUEUE "${want}" || die "env ${SC_ENV} gagal ditulis"
+  load_config
+  if (( ENABLED == 1 )) && ! ( cmd_setup ); then
+    set_env_value SLOWDNS_RECORD_QUEUE "${prev:-auto}" || true
+    ( cmd_setup ) >/dev/null 2>&1 || true
+    die "antrean jawaban gagal diterapkan; pengaturan dikembalikan"
+  fi
+  if [[ "${want}" == "auto" ]]; then
+    say "Berhasil: antrean jawaban auto ($(record_queue) untuk VPS ini)."
+  else
+    say "Berhasil: antrean jawaban ${want}. Kembali ke bawaan: sc-1forcr-slowdns set-queue auto"
+  fi
+  if (( ENABLED == 1 )) && ! bin_has_record_queue; then
+    say "Peringatan: binary belum ${DNSTT_PATCH_ID}; nilai ini baru berlaku setelah binary diperbarui."
+  fi
+}
+
 # Ukur CPU dnstt per jendela waktu (read-only): cpu-stat [DETIK] [JENDELA].
 # CPU user/sys proses dari /proc/PID/stat, query (INPUT) dan jawaban (OUTPUT)
 # dari counter rule sc-slowdns, Udp di /proc/net/snmp, conntrack, softirq dan
@@ -29478,6 +29681,7 @@ cmd_brief() {
   fi
   udp_batch_val
   printf 'BATCH=%s\n' "${REPLY}"
+  if bin_has_record_queue; then printf 'QUEUE=%s\n' "$(record_queue)"; else echo "QUEUE=100"; fi
   first_line "${BIN}.version" || true
   printf 'BINARY=%s\n' "${REPLY}"
   env_val SLOWDNS_AUTO_LOCK_ENABLE
@@ -29538,6 +29742,14 @@ cmd_status() {
     printf '%-14s: %s\n' "Batch UDP" "ON (${REPLY} paket per syscall)"
   else
     printf '%-14s: %s\n' "Batch UDP" "OFF"
+  fi
+  env_val SLOWDNS_RECORD_QUEUE
+  # bin_has_record_queue menimpa REPLY, jadi mode disimpan dulu.
+  if [[ "${REPLY}" =~ ^[0-9]+$ ]]; then ack="manual"; else ack="auto"; fi
+  if bin_has_record_queue; then
+    printf '%-14s: %s\n' "Antrean jawab" "$(record_queue) query (${ack})"
+  else
+    printf '%-14s: %s\n' "Antrean jawab" "100 (binary dnstt ${DNSTT_PATCH_ID} belum terpasang)"
   fi
   if (( ROUTE_SSH )); then
     printf '%-14s: %s\n' "SlowDNS SSH" "ON"
@@ -29661,6 +29873,7 @@ case "${1:-status}" in
   set-kcp) acquire_lock; cmd_set_kcp "${2:-}" "${3:-}" ;;
   set-direct) acquire_lock; cmd_set_direct "${2:-}" ;;
   set-batch) acquire_lock; cmd_set_batch "${2:-}" ;;
+  set-queue) acquire_lock; cmd_set_queue "${2:-}" ;;
   cpu-stat) load_config; cmd_cpu_stat "${2:-60}" "${3:-10}" ;;
   xray-enable) acquire_lock; cmd_xray_enable "${2:-}" ;;
   xray-disable) acquire_lock; cmd_xray_disable ;;
@@ -29676,7 +29889,7 @@ case "${1:-status}" in
   info) cat "${STATE_FILE}" 2>/dev/null || true ;;
   clear) acquire_lock; cmd_clear ;;
   *)
-    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|brief|online|sessions [2|3]|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}"
+    echo "Usage: sc-1forcr-slowdns {setup|apply|enable [NS]|disable|set-ns NS|regen-key|set-key|status|brief|online|sessions [2|3]|set-lock 0/1|set-kcp INTERVAL ACK|set-direct on/off|set-batch on/off/N|set-queue N/auto|cpu-stat [DETIK] [JENDELA]|xray-enable [NS]|xray-disable|set-xray-ns NS|ssh-route on/off|records|suggest [xray]|check|info|clear}"
     exit 1
     ;;
 esac
@@ -33448,6 +33661,7 @@ SLOWDNS_KCP_INTERVAL=${SLOWDNS_KCP_INTERVAL}
 SLOWDNS_KCP_ACK_NODELAY=${SLOWDNS_KCP_ACK_NODELAY}
 SLOWDNS_DIRECT_BIND=${SLOWDNS_DIRECT_BIND}
 SLOWDNS_UDP_BATCH=${SLOWDNS_UDP_BATCH}
+SLOWDNS_RECORD_QUEUE=${SLOWDNS_RECORD_QUEUE}
 SLOWDNS_GOMAXPROCS=${SLOWDNS_GOMAXPROCS}
 SLOWDNS_GOGC=${SLOWDNS_GOGC}
 SLOWDNS_BIN_URL=${SLOWDNS_BIN_URL}
@@ -38633,14 +38847,16 @@ slowdns_perf_menu() {
   local bin="$1" choice ans
   echo "Bind langsung UDP 53 : $([[ "$(normalize_bool_01 "${SLOWDNS_DIRECT_BIND:-0}")" == "1" ]] && echo ON || echo OFF)"
   echo "Batch UDP            : ${SLOWDNS_UDP_BATCH:-0} (0 = OFF)"
+  echo "Antrean jawaban      : ${SLOWDNS_RECORD_QUEUE:-auto} (auto = 512/1024/2048 per spek VPS)"
   echo "Bind langsung: query UDP 53 tidak lewat conntrack/NAT (hemat CPU kernel)."
   echo "Batch UDP: beberapa paket DNS per syscall. Ubah satu hal saja, lalu bandingkan"
   echo "CPU (menu 3), speed, dan ping di jam ramai yang sama. Kalau memburuk, matikan lagi."
   echo "1) Bind langsung UDP 53: $([[ "$(normalize_bool_01 "${SLOWDNS_DIRECT_BIND:-0}")" == "1" ]] && echo "matikan (rollback)" || echo "nyalakan")"
   echo "2) Batch UDP: $([[ "${SLOWDNS_UDP_BATCH:-0}" =~ ^0*$ ]] && echo "nyalakan (16 paket)" || echo "matikan")"
   echo "3) Ukur CPU SlowDNS 60 detik"
+  echo "4) Antrean jawaban (sekarang ${SLOWDNS_RECORD_QUEUE:-auto})"
   echo "0) Batal"
-  if ! prompt_input choice "Pilih [0-3]: "; then
+  if ! prompt_input choice "Pilih [0-4]: "; then
     return 0
   fi
   case "${choice}" in
@@ -38665,6 +38881,18 @@ slowdns_perf_menu() {
       fi
       ;;
     3) "${bin}" cpu-stat 60 10 2>&1 || true ;;
+    4)
+      echo "Query yang datang saat antrean penuh dibuang (cek journal: \"antrean jawaban penuh\")."
+      echo "auto = 512 (1 GB), 1024 (2 GB/2 core), 2048 (4 GB/4 core). Angka manual 100-8192."
+      if ! prompt_input ans "Kapasitas baru [auto/100-8192]: " || [[ -z "${ans}" ]]; then
+        echo "Dibatalkan."
+        return 0
+      fi
+      if [[ "$(normalize_bool_01 "${SLOWDNS_ENABLE:-0}")" == "1" ]]; then
+        echo "Peringatan: service SlowDNS di-restart kalau nilainya berubah; pengguna SlowDNS tersambung ulang otomatis."
+      fi
+      "${bin}" set-queue "${ans,,}" 2>&1 | ui_fx || true
+      ;;
     *) echo "Dibatalkan." ;;
   esac
   return 0
@@ -43505,6 +43733,7 @@ update_script_from_repo() {
     SLOWDNS_KCP_ACK_NODELAY="${SLOWDNS_KCP_ACK_NODELAY:-0}" \
     SLOWDNS_DIRECT_BIND="${SLOWDNS_DIRECT_BIND:-0}" \
     SLOWDNS_UDP_BATCH="${SLOWDNS_UDP_BATCH:-0}" \
+    SLOWDNS_RECORD_QUEUE="${SLOWDNS_RECORD_QUEUE:-auto}" \
     SLOWDNS_GOMAXPROCS="${SLOWDNS_GOMAXPROCS:-auto}" \
     SLOWDNS_GOGC="${SLOWDNS_GOGC:-300}" \
     SLOWDNS_AUTO_LOCK_ENABLE="${SLOWDNS_AUTO_LOCK_ENABLE:-1}" \
@@ -46446,7 +46675,7 @@ persist_pending_install_env() {
     SERVICE_HEALTH_INTERVAL_MINUTES SERVICE_HEALTH_REPAIR_COOLDOWN_MINUTES
     TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID BOT_ACCOUNT_EVENT_WEBHOOK_URL BOT_ACCOUNT_EVENT_WEBHOOK_TOKEN
     BOT_PANEL_ENABLE BOT_PANEL_TOKEN BOT_PANEL_ADMIN_IDS BOT_PANEL_MEMORY_MAX
-    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_KCP_INTERVAL SLOWDNS_KCP_ACK_NODELAY SLOWDNS_DIRECT_BIND SLOWDNS_UDP_BATCH SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_SSH_ENABLE SLOWDNS_XRAY_ENABLE SLOWDNS_XRAY_NS_DOMAIN SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
+    SLOWDNS_ENABLE SLOWDNS_NS_DOMAIN SLOWDNS_LISTEN_PORT SLOWDNS_MTU SLOWDNS_MEMORY_MAX SLOWDNS_KCP_WINDOW SLOWDNS_KCP_INTERVAL SLOWDNS_KCP_ACK_NODELAY SLOWDNS_DIRECT_BIND SLOWDNS_UDP_BATCH SLOWDNS_RECORD_QUEUE SLOWDNS_GOMAXPROCS SLOWDNS_GOGC SLOWDNS_AUTO_LOCK_ENABLE SLOWDNS_SSH_ENABLE SLOWDNS_XRAY_ENABLE SLOWDNS_XRAY_NS_DOMAIN SLOWDNS_BIN_URL SLOWDNS_BIN_SHA256
     AUTO_BACKUP_ENABLE AUTO_BACKUP_DIR AUTO_BACKUP_KEEP_DAYS AUTO_BACKUP_INTERVAL_MINUTES AUTO_BACKUP_SCHEDULE_MODE AUTO_BACKUP_WIB_HOUR
     AUTO_REBOOT_ENABLE AUTO_REBOOT_INTERVAL_MINUTES AUTO_REBOOT_SCHEDULE_MODE AUTO_REBOOT_WIB_HOUR ONLINE_NOTIFY_ENABLE ONLINE_NOTIFY_INTERVAL_HOURS ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS
     RESOURCE_AUTOTUNE_ENABLE RESOURCE_TARGET_USAGE_PERCENT RESOURCE_AUTOTUNE_INTERVAL_MINUTES RESOURCE_CAPACITY_STATE_FILE

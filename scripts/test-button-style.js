@@ -80,7 +80,7 @@ assert.deepStrictEqual(
     ['success', 'success'],
     ['primary', 'primary'],
     ['primary', 'danger'],
-    ['danger'],
+    ['danger', 'danger'],
     ['primary', 'primary'],
     ['primary', 'primary'],
     ['primary']
@@ -88,7 +88,9 @@ assert.deepStrictEqual(
   'warna menu utama harus rapi per baris'
 );
 assert.strictEqual(mainRows[4][1].text, 'Hapus Semua Akun', 'tombol merah menu utama: Hapus Semua Akun');
-assert.strictEqual(mainRows[5][0].text, 'Rebuild VPS (Install Ulang OS)', 'baris rebuild VPS merah sendiri');
+assert.strictEqual(mainRows[5][0].text, 'Rebuild VPS (Install Ulang OS)', 'baris rebuild VPS merah');
+assert.strictEqual(mainRows[5][1].text, 'Reset Machine ID', 'Reset Machine ID di baris rebuild VPS');
+assert.strictEqual(mainRows[5][1].callback_data, 'm_reset_machine', 'callback Reset Machine ID');
 
 // Menu admin: biru, merah hanya untuk hapus/nonaktifkan, Kembali tanpa warna.
 const adminButtons = rowsOf(menus.adminMenu()).flat();

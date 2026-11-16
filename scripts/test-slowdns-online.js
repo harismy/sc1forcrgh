@@ -287,7 +287,8 @@ try {
   assert(/SLOWDNS_AUTO_LOCK_ENABLE=1/.test(read('env')));
 
   assert(installer.includes('7) ui_monitor show_slowdns_online ;;'), 'menu memakai monitor refresh/live yang sudah ada');
-  assert(installer.includes('echo "7) Lihat Akun Online SlowDNS"'), 'opsi menu terlihat');
+  // Layar SlowDNS berkelompok (V.1FSC.136): opsi 7 ada di kelompok MONITOR.
+  assert(installer.includes('monitor=("6) Log SlowDNS" "7) Akun Online"'), 'opsi menu terlihat');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

@@ -4,11 +4,14 @@ const crypto = require('crypto');
 require('dotenv').config();
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
+const machineReset = require('./lib/machine-reset');
 
 const DB_PATH = String(process.env.DB_PATH || path.join(__dirname, 'sc1forcrnexus.db')).trim();
 const PORT = Math.max(1, Number(process.env.LICENSE_API_PORT || 8099) || 8099);
 const HOST = String(process.env.LICENSE_API_HOST || '127.0.0.1').trim() || '127.0.0.1';
 const LICENSE_API_TOKEN = String(process.env.LICENSE_API_TOKEN || '').trim();
+// Bot tempat pembeli mendaftar SC; dipakai di pesan installer.
+const LICENSE_BOT_URL = String(process.env.LICENSE_BOT_URL || 'https://t.me/sc1forcrnexusbot').trim();
 const DEFAULT_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'scripts', 'setup-autoscript-compat.sh');
 const LEGACY_SC_INSTALLER_LOCAL_PATH = path.join(__dirname, 'payload', 'setup-autoscript-compat.sh');
 const DEFAULT_SUMMARY_API_LOCAL_PATH = path.join(__dirname, 'scripts', 'setup-summary-api.sh');
@@ -321,6 +324,7 @@ async function initDb() {
   await ensureScRegistrationSchema();
   await ensureScServerKeySchema();
   await ensureScUpdateTriggerSchema();
+  await machineReset.ensureMachineResetSchema({ run: dbRun, get: dbGet, all: dbAll });
   for (const file of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
     try { if (fs.existsSync(file)) fs.chmodSync(file, 0o600); } catch (_) {}
   }
@@ -1395,15 +1399,39 @@ app.post('/sc1forcr/license/activate', requireLicenseClient, async (req, res) =>
       : await bindMachineIdForRegistration(reg, serverKey, machineId);
     if (!machineBinding.ok) {
       logLicenseRejection(req, machineBinding.reason || 'machine-binding-failed', serverKey, `terdaftar=${reg.vps_ip}`);
+      // VPS di-rebuild: kode reset untuk mesin ini, dipakai pemilik di bot
+      // (menu Reset Machine ID). Kode hanya tampil di mesin yang memanggil.
+      const mismatch = machineBinding.reason === 'machine-id-mismatch';
+      const reset = mismatch
+        ? await machineReset.issueMachineResetCode({ run: dbRun, get: dbGet, all: dbAll }, {
+          userId: reg.user_id,
+          ip: cleanIp(reg.vps_ip),
+          machineIdHash: machineBinding.machineIdHash
+        }).catch((e) => {
+          console.error(`[license] kode reset machine-id gagal dibuat: ${e.message}`);
+          return null;
+        })
+        : null;
       return res.status(403).json(attachSignedLease({
         ok: false,
         allowed: false,
         status: 'blocked',
-        message: machineBinding.reason === 'machine-id-mismatch'
+        ...(mismatch ? { code: 'machine-id-mismatch' } : {}),
+        message: mismatch
           ? 'Machine ID VPS tidak cocok dengan registrasi lisensi'
           : 'Machine ID VPS wajib tersedia untuk aktivasi lisensi',
         ip: reg.vps_ip,
-        expires_at: Number(reg.expires_at || 0) || null
+        expires_at: Number(reg.expires_at || 0) || null,
+        ...(mismatch && reset ? {
+          reset_bot_url: LICENSE_BOT_URL,
+          ...(reset.code ? {
+            reset_code: reset.code,
+            reset_expires_in_min: Math.max(1, Math.round((reset.expiresAt - Date.now()) / 60000))
+          } : {}),
+          resets_left: reset.usage ? reset.usage.left : null,
+          reset_limit: machineReset.RESET_LIMIT,
+          reset_available_at: reset.usage && reset.usage.nextAt ? reset.usage.nextAt : null
+        } : {})
       }, {
         reg,
         requestedIp: ip,

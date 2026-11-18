@@ -7,6 +7,7 @@ set -euo pipefail
 # Fitur:
 # - SSH
 # - VMess / VLESS / Trojan (Xray + Nginx + Let's Encrypt)
+# - Payload injector HTTPUpgrade /upvmess, /upvless, /uptrojan (shim Go)
 # - UDP/ZIVPN (jika binary zivpn tersedia)
 # - HTTP API kompatibel endpoint /vps/* yang dipakai bot
 # - Database kompatibel potato.db untuk summary API
@@ -219,7 +220,7 @@ WILDCARD_XRAY_HOSTS="${WILDCARD_XRAY_HOSTS:-}"
 XRAY_PUBLIC_HOST="${XRAY_PUBLIC_HOST:-}"
 XRAY_FRONT_DOMAIN="${XRAY_FRONT_DOMAIN:-}"
 XRAY_FRONT_DOMAINS="${XRAY_FRONT_DOMAINS:-}"
-SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.139}"
+SCRIPT_VERSION="${SC_SCRIPT_VERSION_OVERRIDE:-V.1FSC.140}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-}"
 UPDATE_SCRIPT_URLS="${UPDATE_SCRIPT_URLS:-${UPDATE_SCRIPT_URL:-}}"
 AUTO_INSTALL_SUMMARY_API="${AUTO_INSTALL_SUMMARY_API:-1}"
@@ -4585,7 +4586,297 @@ disable_broken_foreign_nginx_confs() {
   return 0
 }
 
+setup_xray_payload_shim() {
+  # Satu bridge Go untuk semua HTTPUpgrade; WS/gRPC/XHTTP tetap langsung ke
+  # inbound lama. Aktifkan sebelum Nginx beralih agar update tidak membuka 502.
+  local work changed=0 attempt
+  mkdir -p "${APP_DIR}/go" "${APP_DIR}/bin" || return 1
+  work="$(mktemp -d "${APP_DIR}/go/.xray-payload-shim.XXXXXX")" || return 1
+  cat > "${work}/xray_payload_shim.go" <<'XRAY_PAYLOAD_SHIM_GO' || { rm -rf -- "${work}"; return 1; }
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+const (
+	shimListenAddress    = "127.0.0.1:10007"
+	shimMagic            = "HTTP/ 69\r\n\r\n"
+	shimHeaderLimit      = 64 * 1024
+	shimHandshakeTimeout = 8 * time.Second
+)
+
+var shimRoutes = map[string]string{
+	"/upvmess":  "127.0.0.1:10004",
+	"/upvless":  "127.0.0.1:10005",
+	"/uptrojan": "127.0.0.1:10006",
+}
+
+// Keep bytes read beyond the header in the SAME reader for the raw stream.
+func shimReadHeaders(reader *bufio.Reader) ([]byte, error) {
+	var headers []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(headers)+len(part) > shimHeaderLimit {
+			return nil, fmt.Errorf("HTTP header exceeds limit")
+		}
+		headers = append(headers, part...)
+		if bytes.HasSuffix(headers, []byte("\r\n\r\n")) {
+			return headers, nil
+		}
+		if err != nil && err != bufio.ErrBufferFull {
+			return nil, err
+		}
+	}
+}
+
+func shimHeaderToken(value, token string) bool {
+	for _, item := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(item), token) {
+			return true
+		}
+	}
+	return false
+}
+
+func shimUpstreamRequest(request *http.Request) *http.Request {
+	clean := &http.Request{
+		Method: "GET", URL: &url.URL{Path: request.URL.Path}, Host: request.Host,
+		Header: make(http.Header),
+	}
+	clean.Header.Set("Connection", "Upgrade")
+	clean.Header.Set("Upgrade", "websocket")
+	// Recent Xray clients check Sec-WebSocket-Accept even on HTTPUpgrade.
+	for _, name := range []string{"Sec-WebSocket-Key", "Sec-WebSocket-Version"} {
+		if value := request.Header.Get(name); value != "" {
+			clean.Header.Set(name, value)
+		}
+	}
+	// Nginx owns these headers. Preserve the existing trusted real-IP chain;
+	// never replace X-Forwarded-For with this bridge's loopback address.
+	if request.Header.Get("X-SC-Real-IP-Proxy") == "1" {
+		clean.Header.Set("X-SC-Real-IP-Proxy", "1")
+		clean.Header.Set("X-Forwarded-For", request.Header.Get("X-Forwarded-For"))
+	}
+	return clean
+}
+
+// Remove exactly one marker at the beginning, including fragmented markers.
+// A differing prefix (or a partial prefix at EOF) is ordinary protocol data.
+func shimStripMagic(reader *bufio.Reader) ([]byte, error) {
+	prefix := make([]byte, 0, len(shimMagic))
+	for i := 0; i < len(shimMagic); i++ {
+		value, err := reader.ReadByte()
+		if err == io.EOF {
+			return prefix, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		prefix = append(prefix, value)
+		if value != shimMagic[i] {
+			return prefix, nil
+		}
+	}
+	return nil, nil
+}
+
+func shimCloseWrite(conn net.Conn) {
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
+}
+
+func shimHandle(downstream net.Conn, routes map[string]string) {
+	defer downstream.Close()
+	_ = downstream.SetDeadline(time.Now().Add(shimHandshakeTimeout))
+	clientReader := bufio.NewReader(downstream)
+	headers, err := shimReadHeaders(clientReader)
+	if err != nil {
+		return
+	}
+	request, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(headers)))
+	if err != nil {
+		return
+	}
+	target, ok := routes[request.URL.Path]
+	if !ok {
+		_, _ = io.WriteString(downstream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return
+	}
+	if request.Method != "GET" || !shimHeaderToken(request.Header.Get("Connection"), "upgrade") ||
+		!strings.EqualFold(request.Header.Get("Upgrade"), "websocket") || request.ContentLength > 0 || len(request.TransferEncoding) > 0 {
+		_, _ = io.WriteString(downstream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return
+	}
+	upstream, err := net.DialTimeout("tcp", target, shimHandshakeTimeout)
+	if err != nil {
+		_, _ = io.WriteString(downstream, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+		return
+	}
+	defer upstream.Close()
+	_ = upstream.SetDeadline(time.Now().Add(shimHandshakeTimeout))
+	if err := shimUpstreamRequest(request).Write(upstream); err != nil {
+		return
+	}
+	serverReader := bufio.NewReader(upstream)
+	responseHeaders, err := shimReadHeaders(serverReader)
+	if err != nil {
+		return
+	}
+	response, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(responseHeaders)), request)
+	if err != nil {
+		return
+	}
+	if _, err = downstream.Write(responseHeaders); err != nil {
+		return
+	}
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		// Include already-buffered error bodies without waiting for keepalive.
+		_, _ = io.CopyN(downstream, serverReader, int64(serverReader.Buffered()))
+		return
+	}
+	_ = downstream.SetDeadline(time.Time{})
+	_ = upstream.SetDeadline(time.Time{})
+	_ = downstream.SetReadDeadline(time.Now().Add(shimHandshakeTimeout))
+	uploadDone := make(chan struct{})
+	go func() {
+		defer close(uploadDone)
+		prefix, err := shimStripMagic(clientReader)
+		_ = downstream.SetReadDeadline(time.Time{})
+		if err == nil && len(prefix) > 0 {
+			_, err = upstream.Write(prefix)
+		}
+		if err == nil {
+			_, err = io.Copy(upstream, clientReader)
+		}
+		if err != nil {
+			_ = upstream.Close()
+			_ = downstream.Close()
+			return
+		}
+		shimCloseWrite(upstream)
+	}()
+	// Start download immediately: server-first data must not wait for a marker.
+	_, _ = io.Copy(downstream, serverReader)
+	shimCloseWrite(downstream)
+	select {
+	case <-uploadDone:
+	case <-time.After(time.Second):
+	}
+	_ = downstream.Close()
+	_ = upstream.Close()
+	<-uploadDone
+}
+
+func shimServe(listener net.Listener, routes map[string]string, maxConnections int) error {
+	slots := make(chan struct{}, maxConnections)
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return err
+		}
+		select {
+		case slots <- struct{}{}:
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetNoDelay(true)
+				_ = tcp.SetKeepAlive(true)
+				_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+			}
+			go func() {
+				defer func() { <-slots }()
+				shimHandle(conn, routes)
+			}()
+		default:
+			_ = conn.Close()
+		}
+	}
+}
+
+func main() {
+	listener, err := net.Listen("tcp", shimListenAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer listener.Close()
+	log.Printf("HTTPUpgrade payload shim on %s (VMess/VLESS/Trojan)", shimListenAddress)
+	log.Fatal(shimServe(listener, shimRoutes, 256))
+}
+XRAY_PAYLOAD_SHIM_GO
+  if [[ ! -x "${APP_DIR}/bin/xray-payload-shim" ]] ||
+     ! cmp -s "${work}/xray_payload_shim.go" "${APP_DIR}/go/xray_payload_shim.go"; then
+    log "Build Go shim payload HTTPUpgrade (VMess/VLESS/Trojan)..."
+    if ! GO111MODULE=off GOCACHE="${GOCACHE:-${XDG_CACHE_HOME:-${HOME:-/root}/.cache}/go-build}" \
+      go build -ldflags "-s -w" -o "${work}/xray-payload-shim" "${work}/xray_payload_shim.go"; then
+      rm -rf -- "${work}"
+      log "Build shim gagal; konfigurasi Nginx sebelumnya dipertahankan."
+      return 1
+    fi
+    if ! chmod 755 "${work}/xray-payload-shim" ||
+       ! mv -f "${work}/xray-payload-shim" "${APP_DIR}/bin/xray-payload-shim" ||
+       ! install -m 644 "${work}/xray_payload_shim.go" "${APP_DIR}/go/xray_payload_shim.go"; then
+      rm -rf -- "${work}"
+      return 1
+    fi
+    changed=1
+  fi
+  cat > "${work}/shim.service" <<EOF || { rm -rf -- "${work}"; return 1; }
+[Unit]
+Description=SC 1FORCR Xray HTTPUpgrade Payload Shim
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=${APP_DIR}/bin/xray-payload-shim
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+TasksMax=128
+LimitNOFILE=2048
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if ! cmp -s "${work}/shim.service" /etc/systemd/system/sc-1forcr-xray-payload-shim.service; then
+    if ! install -m 644 "${work}/shim.service" /etc/systemd/system/sc-1forcr-xray-payload-shim.service; then
+      rm -rf -- "${work}"
+      return 1
+    fi
+    changed=1
+  fi
+  rm -rf -- "${work}"
+  systemctl daemon-reload || return 1
+  systemctl enable sc-1forcr-xray-payload-shim || return 1
+  if [[ "${changed}" == "1" ]]; then
+    systemctl restart sc-1forcr-xray-payload-shim || return 1
+  else
+    systemctl start sc-1forcr-xray-payload-shim || return 1
+  fi
+  for attempt in {1..10}; do
+    sleep 1
+    if systemctl is-active --quiet sc-1forcr-xray-payload-shim && tcp_listener_present 10007; then
+      return 0
+    fi
+  done
+  log "Shim HTTPUpgrade belum siap di loopback :10007; konfigurasi Nginx sebelumnya dipertahankan."
+  return 1
+}
+
 setup_nginx_and_cert() {
+  setup_xray_payload_shim || return 1
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
   local sshws_nginx_limit_conf sshws_nginx_limit_rules sshws_realip_nginx_map nginx_server_names
@@ -4787,7 +5078,7 @@ ${xray_proxy_realip_headers}
     location /upvmess {
         access_log off;
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:10004;
+        proxy_pass http://127.0.0.1:10007;
         proxy_http_version 1.1;
         proxy_method GET;
         proxy_set_header Upgrade "websocket";
@@ -4803,7 +5094,7 @@ ${xray_proxy_realip_headers}
     location /upvless {
         access_log off;
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:10005;
+        proxy_pass http://127.0.0.1:10007;
         proxy_http_version 1.1;
         proxy_method GET;
         proxy_set_header Upgrade "websocket";
@@ -4819,7 +5110,7 @@ ${xray_proxy_realip_headers}
     location /uptrojan {
         access_log off;
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:10006;
+        proxy_pass http://127.0.0.1:10007;
         proxy_http_version 1.1;
         proxy_method GET;
         proxy_set_header Upgrade "websocket";
@@ -18516,6 +18807,7 @@ if [[ -r "${HAPROXY_CONFIG}" ]]; then
 fi
 
 repair_unit_if_needed sc-1forcr-sshws.service "${sshws_ports[@]}" || true
+repair_unit_if_needed sc-1forcr-xray-payload-shim.service 10007 || true
 repair_unit_if_needed nginx.service "${nginx_ports[@]}" || true
 repair_unit_if_needed haproxy.service 443 || true
 
@@ -39513,7 +39805,7 @@ restart_all_services() {
   else
     echo "Peringatan: helper firewall SSHWS tidak ditemukan, lanjut restart tanpa update firewall allow-rules."
   fi
-  systemctl restart ssh dropbear sc-1forcr-api sc-1forcr-sshws xray nginx >/dev/null 2>&1 || true
+  systemctl restart ssh dropbear sc-1forcr-api sc-1forcr-sshws sc-1forcr-xray-payload-shim xray nginx >/dev/null 2>&1 || true
   if [[ "${haproxy_ok}" == "1" ]]; then
     systemctl restart haproxy >/dev/null 2>&1 || true
   fi
@@ -40274,7 +40566,7 @@ ${xray_proxy_realip_headers}
     location /upvmess {
         access_log off;
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:10004;
+        proxy_pass http://127.0.0.1:10007;
         proxy_http_version 1.1;
         proxy_method GET;
         proxy_set_header Upgrade "websocket";
@@ -40290,7 +40582,7 @@ ${xray_proxy_realip_headers}
     location /upvless {
         access_log off;
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:10005;
+        proxy_pass http://127.0.0.1:10007;
         proxy_http_version 1.1;
         proxy_method GET;
         proxy_set_header Upgrade "websocket";
@@ -40306,7 +40598,7 @@ ${xray_proxy_realip_headers}
     location /uptrojan {
         access_log off;
         proxy_redirect off;
-        proxy_pass http://127.0.0.1:10006;
+        proxy_pass http://127.0.0.1:10007;
         proxy_http_version 1.1;
         proxy_method GET;
         proxy_set_header Upgrade "websocket";
@@ -45722,6 +46014,7 @@ systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-api >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-sshws >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-sshws >/dev/null 2>&1 || true
+systemctl disable --now sc-1forcr-xray-payload-shim >/dev/null 2>&1 || true
 systemctl stop haproxy >/dev/null 2>&1 || true
 systemctl disable haproxy >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
@@ -45793,6 +46086,7 @@ fi
 rm -f /etc/systemd/system/sc-1forcr-api.service
 rm -f /etc/systemd/system/sc-1forcr-botpanel.service
 rm -f /etc/systemd/system/sc-1forcr-sshws.service
+rm -f /etc/systemd/system/sc-1forcr-xray-payload-shim.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
 rm -f /etc/systemd/system/sc-1forcr-autoreboot.service
@@ -46104,7 +46398,7 @@ apply_final_service_restart_chain() {
   sleep 2
   systemctl restart "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl stop haproxy >/dev/null 2>&1 || true
-  for unit in sc-1forcr-sshws xray nginx; do
+  for unit in sc-1forcr-sshws sc-1forcr-xray-payload-shim xray nginx; do
     if ! systemctl restart "${unit}" >/dev/null 2>&1; then
       log "Gagal restart layanan inti: ${unit}"
       systemctl start haproxy >/dev/null 2>&1 || true
@@ -47231,7 +47525,7 @@ PY
     fi
   fi
 
-  for unit in sc-1forcr-api.service sc-1forcr-sshws.service nginx.service haproxy.service; do
+  for unit in sc-1forcr-api.service sc-1forcr-sshws.service sc-1forcr-xray-payload-shim.service nginx.service haproxy.service; do
     if unit_is_installed "${unit}" && ! systemctl is-active --quiet "${unit}"; then
       failures+=("${unit} tidak aktif")
     fi
@@ -47504,7 +47798,7 @@ update_ensure_auto_backup_timer_armed() {
 restart_after_restore() {
   local unit backend zivpn_unit udpcustom_unit udpgw_ports_raw udpgw_port
   systemctl daemon-reload >/dev/null 2>&1 || true
-  for unit in sc-1forcr-api.service sc-1forcr-sshws.service; do
+  for unit in sc-1forcr-api.service sc-1forcr-sshws.service sc-1forcr-xray-payload-shim.service; do
     unit_is_installed "${unit}" && systemctl restart "${unit}" >/dev/null 2>&1 || true
   done
   for unit in xray.service nginx.service haproxy.service; do
@@ -47618,7 +47912,7 @@ restore_summary_runtime() {
 }
 
 rollback_snapshot() {
-  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard snapshot_has_udpgw_refactor snapshot_has_postboot_health restore_version
+  local snapshot_dir pre_snapshot rollback_db db_dir db_tmp snapshot_name snapshot_has_signed_guard snapshot_has_udpgw_refactor snapshot_has_postboot_health snapshot_has_xray_payload_shim restore_version
   local SUMMARY_RUNTIME_STATE_RECORDED="0" SUMMARY_SYSTEMD_PRESENT="0" SUMMARY_SYSTEMD_ACTIVE="0" SUMMARY_SYSTEMD_ENABLED="0"
   local SUMMARY_PM2_PRESENT="0" SUMMARY_WATCHDOG_ACTIVE="0" SUMMARY_WATCHDOG_ENABLED="0"
   snapshot_dir="$(verify_snapshot "${1:-latest}")" || return 1
@@ -47627,6 +47921,20 @@ rollback_snapshot() {
   pre_snapshot="$(create_snapshot "pre-rollback-to-${snapshot_name}" 2>/dev/null || true)"
   # shellcheck disable=SC1090
   source "${snapshot_dir}/state.env"
+
+  # Snapshot sebelum fitur ini harus mematikan shim baru juga; tar tidak
+  # menghapus file yang belum ada saat snapshot dibuat.
+  systemctl stop sc-1forcr-xray-payload-shim.service >/dev/null 2>&1 || true
+  snapshot_has_xray_payload_shim="0"
+  if tar -tzf "${snapshot_dir}/files.tar.gz" 2>/dev/null | \
+     awk '$0=="etc/systemd/system/sc-1forcr-xray-payload-shim.service" {found=1} END{exit found?0:1}'; then
+    snapshot_has_xray_payload_shim="1"
+  fi
+  if [[ "${snapshot_has_xray_payload_shim}" != "1" ]]; then
+    systemctl disable sc-1forcr-xray-payload-shim.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/sc-1forcr-xray-payload-shim.service
+    rm -f "${APP_DIR:-/opt/sc-1forcr}/bin/xray-payload-shim" "${APP_DIR:-/opt/sc-1forcr}/go/xray_payload_shim.go"
+  fi
 
   snapshot_has_signed_guard="0"
   if tar -tzf "${snapshot_dir}/files.tar.gz" 2>/dev/null | \
@@ -47971,7 +48279,9 @@ main() {
   run_install_step "10_dropbear" 40 "Setup Dropbear" setup_dropbear
   run_install_step "11_database" 44 "Inisialisasi database" init_db
   run_install_step "12_harden_shells" 47 "Harden shell akun tunnel" harden_ssh_tunnel_shells
-  run_install_step "13_nginx_cert" 52 "Setup Nginx dan sertifikat" setup_nginx_and_cert
+  # Checkpoint baru: lanjut-install dari versi lama tetap memasang shim DAN
+  # route Nginx baru, walau langkah 13_nginx_cert lama sudah selesai.
+  run_install_step "13_nginx_httpupgrade" 52 "Setup Nginx, payload HTTPUpgrade dan sertifikat" setup_nginx_and_cert
   run_install_step "14_haproxy_mux" 56 "Setup HAProxy TLS mux" setup_haproxy_tls_mux
   run_install_step "14b_cert_sync" 57 "Setup sinkron sertifikat TLS" setup_cert_sync
   run_install_step "15_zivpn_service" 60 "Setup ZIVPN" setup_zivpn_service_if_possible

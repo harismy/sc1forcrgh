@@ -51,6 +51,12 @@ UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setu
 SUMMARY_API_SETUP_URL=https://raw.githubusercontent.com/harismy/sc1forcrgh/main/setup-summary-api.sh menu-sc-1forcr update-summary
 ```
 
+## Payload injector HTTPUpgrade
+
+`V.1FSC.140` menambahkan shim Go untuk marker injector `HTTP/ 69` pada
+`/upvmess`, `/upvless`, dan `/uptrojan`, baik TLS maupun non-TLS. Koneksi tanpa
+marker tetap didukung. Lihat [alur, contoh payload, dan pemeriksaan service](docs/HTTPUPGRADE-PAYLOAD.md).
+
 ## Akun Online SlowDNS
 
 Sesudah memperbarui AutoSC, buka **Tools > SlowDNS > 7) Lihat Akun Online SlowDNS**,

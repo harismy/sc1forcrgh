@@ -4,7 +4,7 @@
   "private": true,
   "main": "app3.js",
   "scripts": {
-    "test": "npm run test:license && npm run test:backup-restore && npm run test:xray-iplimit && npm run test:iplimit-devices && npm run test:xray-hot-add && npm run test:resource-guards && npm run test:xray-monitor && npm run test:online-notify && npm run test:watchdog-snapshots && npm run test:menu-ui && npm run test:sc-renewal-payment && npm run test:dns-guard && npm run test:foreign-backup && npm run test:server-migration && npm run test:button-style && npm run test:telegram-notify && npm run test:service-gate && npm run test:udpcustom-port-range && npm run test:extra-ports && npm run test:slowdns && npm run test:quota-chain && npm run test:cert-sync && npm run test:mux-multipath && npm run test:tunnel-security && npm run test:bot-panel && npm run test:online-monitor && npm run test:xray-links && npm run test:account-parity && npm run test:license-recovery && npm run test:machine-reset && npm run test:bullseye-repo && npm run test:installer-ui && npm run test:install-guide && npm run test:os-support && npm run test:vps-rebuild && npm run test:anti-sales && npm run test:autogopay && npm run test:revenue-report && npm run test:god-update-report && npm run test:update-compat && npm run test:cli-output",
+    "test": "npm run test:license && npm run test:backup-restore && npm run test:xray-iplimit && npm run test:iplimit-devices && npm run test:xray-hot-add && npm run test:xray-payload-shim && npm run test:resource-guards && npm run test:xray-monitor && npm run test:online-notify && npm run test:watchdog-snapshots && npm run test:menu-ui && npm run test:sc-renewal-payment && npm run test:dns-guard && npm run test:foreign-backup && npm run test:server-migration && npm run test:button-style && npm run test:telegram-notify && npm run test:service-gate && npm run test:udpcustom-port-range && npm run test:extra-ports && npm run test:slowdns && npm run test:quota-chain && npm run test:cert-sync && npm run test:mux-multipath && npm run test:tunnel-security && npm run test:bot-panel && npm run test:online-monitor && npm run test:xray-links && npm run test:account-parity && npm run test:license-recovery && npm run test:machine-reset && npm run test:bullseye-repo && npm run test:installer-ui && npm run test:install-guide && npm run test:os-support && npm run test:vps-rebuild && npm run test:anti-sales && npm run test:autogopay && npm run test:revenue-report && npm run test:god-update-report && npm run test:update-compat && npm run test:cli-output",
     "start": "node app3.js",
     "start:api": "node license-api.js",
     "start:expiry": "node app3.js --run-sc-expiry-scheduler",
@@ -14,6 +14,7 @@
     "test:xray-iplimit": "node scripts/test-xray-iplimit.js",
     "test:iplimit-devices": "node scripts/test-iplimit-devices.js",
     "test:xray-hot-add": "node scripts/test-xray-hot-add.js",
+    "test:xray-payload-shim": "node scripts/test-xray-payload-shim.js",
     "test:resource-guards": "node scripts/test-resource-guards.js",
     "test:xray-monitor": "node scripts/test-xray-monitor.js",
     "test:online-notify": "node scripts/test-online-notify.js",

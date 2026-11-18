@@ -140,7 +140,8 @@ assert(h1Xhttp.includes('proxy_pass http://127.0.0.1:12002;') && h1Xhttp.include
   'port 80/8083 must stream XHTTP over HTTP/1.1');
 assert(extract(h2Server, '    location /xhvless {', '\n    }\n').includes('grpc_pass grpc://127.0.0.1:12002;'), 'port 8081 must forward XHTTP h2');
 for (const [loc, port] of [['/upvmess', 10004], ['/upvless', 10005], ['/uptrojan', 10006]]) {
-  assert(extract(wsServer, `    location ${loc} {`, '\n    }\n').includes(`proxy_pass http://127.0.0.1:${port};`), `${loc} must reach Xray`);
+  assert(extract(wsServer, `    location ${loc} {`, '\n    }\n').includes('proxy_pass http://127.0.0.1:10007;'), `${loc} must reach the payload shim`);
+  assert(new RegExp(`"${loc}":\\s*"127\\.0\\.0\\.1:${port}"`).test(installer), `${loc} shim must reach the original Xray inbound`);
 }
 
 // --- Manager real-IP memasang header di semua location Xray, termasuk /up* dan /xhvless ---
